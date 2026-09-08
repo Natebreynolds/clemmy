@@ -1,4 +1,5 @@
 import { tool, type Tool } from '@openai/agents';
+import { registeredToolSideEffect } from './tool-registry.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
@@ -50,6 +51,7 @@ import {
   type ToolSearchCandidateSource,
   type ToolSearchPlanningDisclosureOutcome,
   type ToolSearchPlanningDisclosureCandidate,
+  type ToolSearchPlanningDisclosureControl,
 } from './tool-search-tool.js';
 import { markFreshPlanDisclosureSearch } from './tool-search-mode.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
@@ -62,12 +64,14 @@ import {
   isInvalidArgumentsTextResult,
   isSdkToolInputValidationError,
   textResult,
+  localNonWriteStatus,
 } from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import {
   HostLocalExecutionFailureResult,
+  HostLocalNonWriteResult,
   InvalidArgumentsPreDispatchResult,
 } from '../runtime/harness/attempt-settlement.js';
 
@@ -87,7 +91,7 @@ interface CapturedLocalTool {
 
 function resultToText(
   result: unknown,
-): string | ExternalWritePreDispatchResult | HostLocalExecutionFailureResult {
+): string | ExternalWritePreDispatchResult | HostLocalExecutionFailureResult | HostLocalNonWriteResult {
   // Preserve nominal pre-dispatch truth through the local Tool adapter. Turning
   // this into its model-facing string here would make the outer harness see a
   // normal returned local execution and could incorrectly settle it succeeded.
@@ -111,6 +115,11 @@ function resultToText(
         .join('\n');
       if (text) {
         const formatted = formatRecallableToolText(text);
+        // A typed NON-WRITE is not an execution failure: the tool ran fine and
+        // reported, in a field, that it changed nothing. Flattening it into the
+        // failure carrier lost that distinction and the status token with it.
+        const nonWrite = localNonWriteStatus(result);
+        if (nonWrite) return new HostLocalNonWriteResult(formatted, nonWrite);
         return (result as { isError?: unknown }).isError === true
           ? new HostLocalExecutionFailureResult(formatted)
           : formatted;
@@ -356,10 +365,62 @@ function invalidLocalToolInputResult(
  * input-validation errors append schema guidance and ride the nominal
  * invalid-arguments carrier (same bytes in `.output`), and memory_remember
  * keeps its narrow required-prefix recovery. */
+
+/** An errorFunction may return a REFUSAL, or — when the input was repaired
+ *  from the tool's own schema — a genuine tool result of any local kind. */
+type LocalToolErrorFunctionResult =
+  | string
+  | InvalidArgumentsPreDispatchResult
+  | ExternalWritePreDispatchResult
+  | HostLocalExecutionFailureResult
+  | HostLocalNonWriteResult;
+
+/**
+ * AN OMITTED NULLABLE FIELD MEANS NULL.
+ *
+ * Strict tool schemas make every property required and express "optional" as
+ * `nullable`, so a model that simply leaves an optional field out is refused
+ * before the tool body ever runs. The args_json carrier already repairs this
+ * (materializeStrictNullableFields); the first-class lane did not — so ADDING
+ * an optional parameter to a native tool silently invalidated every call shape
+ * that predated it. session_history gained `search_receipt_id` and a plain
+ * history read began failing schema validation instead of reading history.
+ *
+ * Fill null ONLY for keys the caller omitted, then re-validate. The re-validate
+ * is the check: a field that genuinely may not be null still fails, so this
+ * admits nothing the tool's own schema did not already permit. Anything else
+ * (bad types, malformed JSON, unknown keys) keeps the ordinary visible refusal.
+ */
+export function recoverOmittedNullableFields(
+  error: unknown,
+  parameters: z.ZodTypeAny,
+): Record<string, unknown> | null {
+  if (!error || typeof error !== 'object') return null;
+  if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
+  const raw = (error as { toolInvocation?: { input?: unknown } }).toolInvocation?.input;
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 200_000) return null;
+  let parsedInput: unknown;
+  try { parsedInput = JSON.parse(raw); } catch { return null; }
+  if (!parsedInput || typeof parsedInput !== 'object' || Array.isArray(parsedInput)) return null;
+
+  const first = parameters.safeParse(parsedInput);
+  if (first.success) return null;
+  const omitted = first.error.issues.filter((issue) => (
+    issue.path.length === 1
+    && typeof issue.path[0] === 'string'
+    && /received undefined/i.test(issue.message)
+  ));
+  if (omitted.length === 0 || omitted.length !== first.error.issues.length) return null;
+
+  const repaired: Record<string, unknown> = { ...(parsedInput as Record<string, unknown>) };
+  for (const issue of omitted) repaired[issue.path[0] as string] = null;
+  return parameters.safeParse(repaired).success ? repaired : null;
+}
+
 export function buildLocalToolErrorFunction(
   localTool: CapturedLocalTool,
-): (runContext: unknown, error: unknown) => Promise<string | InvalidArgumentsPreDispatchResult> {
-  return async (runContext: unknown, error: unknown): Promise<string | InvalidArgumentsPreDispatchResult> => {
+): (runContext: unknown, error: unknown) => Promise<LocalToolErrorFunctionResult> {
+  return async (runContext: unknown, error: unknown): Promise<LocalToolErrorFunctionResult> => {
     if (localTool.name === 'memory_remember') {
       const recovered = recoverMemoryRememberRequiredPrefix(error);
       if (!recovered) {
@@ -377,6 +438,27 @@ export function buildLocalToolErrorFunction(
           const result = resultToText(await localTool.handler(recovered));
           return `${result}\n[Recovered valid kind/content; malformed optional graph annotations were ignored.]`;
         },
+      );
+    }
+    // READS ONLY. Filling a null and re-validating is a repair of the CALL, but
+    // proceeding turns a refusal into a real invocation — and a refusal that
+    // becomes a write is a far worse failure than the one being fixed. A read
+    // that was refused for an omitted optional field can simply run; anything
+    // that can leave a mark keeps the visible refusal and lets the model retry
+    // with the field named.
+    const repaired = registeredToolSideEffect(localTool.name) === 'read'
+      ? recoverOmittedNullableFields(
+          error,
+          z.object(normalizeShapeForResponses(localTool.parameters)),
+        )
+      : null;
+    if (repaired) {
+      const recoveredDetails = error && typeof error === 'object'
+        ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details
+        : undefined;
+      return withToolOutputContext(
+        toolOutputContextFromSdk(localTool.name, runContext, recoveredDetails),
+        async () => resultToText(await localTool.handler(repaired)),
       );
     }
     const details = error instanceof Error ? error.toString() : String(error);
@@ -502,6 +584,7 @@ export function buildScopedLocalToolSearch(
   candidateSources?: readonly ToolSearchCandidateSource[],
   discloseForPlanning?: (
     candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+    control?: Readonly<ToolSearchPlanningDisclosureControl>,
   ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
     | Readonly<Record<string, string>>
     | ToolSearchPlanningDisclosureOutcome,

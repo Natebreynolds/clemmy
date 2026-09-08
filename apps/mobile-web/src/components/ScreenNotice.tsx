@@ -26,6 +26,11 @@ interface Props {
    *  there is no transport failure to report. ONE line per screen: the
    *  transport truth outranks it. */
   note?: ScreenNote | null;
+  /** When the data on screen came off the service worker's shelf rather than
+   *  from the Mac (lib/last-good.ts). It arrives as an ordinary 200, so the
+   *  screen would otherwise look live — this line is what makes it honest, and
+   *  it keeps the retry so re-checking is one tap. */
+  lastGood?: string | null;
 }
 
 function presentable(error: string): string {
@@ -35,8 +40,16 @@ function presentable(error: string): string {
   return error;
 }
 
-export function ScreenNotice({ error, offline, onRetry, hasData, note }: Props) {
+export function ScreenNotice({ error, offline, onRetry, hasData, note, lastGood }: Props) {
   if (!error && !offline) {
+    if (lastGood) {
+      return (
+        <div class="screen-notice screen-notice-offline screen-notice-banner" role="status">
+          <span class="screen-notice-text">{lastGood}</span>
+          <button class="screen-notice-retry" onClick={onRetry}>Check again</button>
+        </div>
+      );
+    }
     if (!note) return null;
     return (
       <div

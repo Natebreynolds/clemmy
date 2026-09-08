@@ -56,6 +56,9 @@ export interface MemoryRecallResult {
 }
 
 export interface MemoryRecallContext {
+  /** Whole-task contextual priors versus a targeted evidence question.
+   * Omitted preserves the existing targeted retrieval contract. */
+  purpose?: 'ambient' | 'targeted';
   limit?: number;
   perStore?: number;
   graphDepth?: 0 | 1 | 2;
@@ -622,12 +625,16 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const contextNowMs = context.now ? Date.parse(context.now) : Date.now();
   const nowMs = Number.isFinite(contextNowMs) ? contextNowMs : Date.now();
   const timeZone = resolveRecallTimeZone(context.timeZone);
-  const recallTime = resolveAsOf(objective, context.asOf, nowMs, timeZone);
+  const ambient = context.purpose === 'ambient';
+  // A whole business objective can name several unrelated dates and types.
+  // Such words do not authorize a global historical/meeting filter. Explicit
+  // asOf remains a caller-supplied scope; targeted query behavior is unchanged.
+  const recallTime = resolveAsOf(ambient ? '' : objective, context.asOf, nowMs, timeZone);
   const asOfMs = recallTime.ms;
   const historicalAsOf = recallTime.iso;
-  const temporalMeetingDate = resolveTemporalMeetingDate(objective, { nowMs, timeZone });
+  const temporalMeetingDate = ambient ? null : resolveTemporalMeetingDate(objective, { nowMs, timeZone });
   const temporalMeetingTopicQuery = Boolean(temporalMeetingDate && MEETING_TOPIC_INTENT_RE.test(objective));
-  const temporalWindow = resolveTemporalQueryWindow(objective, { nowMs, timeZone });
+  const temporalWindow = ambient ? null : resolveTemporalQueryWindow(objective, { nowMs, timeZone });
   const searchFactsAsGraphBridge = wanted.has('fact') || depth > 0;
 
   // Always run the full recall (lexical + semantic + vault). A durable
@@ -660,7 +667,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       ? legTimeout(findSimilarFactsScored(objective, { topK: perStore, asOf: historicalAsOf }), [])
       : Promise.resolve([]),
     wanted.has('note')
-      ? legTimeout(recallHybrid(objective, { limit: perStore, nowMs, timeZone }), [])
+      ? legTimeout(recallHybrid(objective, { limit: perStore, nowMs, timeZone, purpose: context.purpose }), [])
       : Promise.resolve([]),
   ]);
 
@@ -1092,7 +1099,8 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     : hits.some((hit) => hit.evidence.length > 0 && hit.score >= 0.45);
   return {
     hits,
-    answerability: supported ? 'supported' : hits.length > 0 ? 'partial' : 'insufficient',
+    // Contextual relevance is not proof that memory answers the whole task.
+    answerability: supported && !ambient ? 'supported' : hits.length > 0 ? 'partial' : 'insufficient',
     diagnostics: {
       candidates: merged.size,
       stores: Array.from(usedStores),

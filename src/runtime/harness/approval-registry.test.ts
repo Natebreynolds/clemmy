@@ -14,11 +14,119 @@ import assert from 'node:assert/strict';
 import type { NewConversationalApprovalPresentation } from './approval-registry.js';
 
 const reg = await import('./approval-registry.js');
+const { actionBus } = await import('../action-bus.js');
 const pending = await import('./pending-actions.js');
 const { appendEvent, createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
 const { addNotification, listNotifications } = await import('../notifications.js');
 const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
+
+test('approval acknowledgement rollback does not resolve or wake the waiting call', () => {
+  const session = createSession({ id: 'approval-atomic-control', kind: 'chat', channel: 'desktop' });
+  const approval = reg.register({ sessionId: session.id, channel: 'desktop',
+    subject: 'Update the test record', tool: 'fixture_update_record', args: { id: 'fixture' } });
+  let wakes = 0;
+  reg.onApprovalResolved((row) => { if (row.approvalId === approval.approvalId) wakes++; });
+  assert.throws(() => reg.withApprovalControlCommit((resolveDecision) => {
+    assert.equal(resolveDecision(approval.approvalId, 'approved', 'owner').ok, true);
+    assert.equal(wakes, 0);
+    appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received',
+      data: { text: 'approve', failedAcknowledgement: true } });
+    throw new Error('acknowledgement persistence failed');
+  }), /acknowledgement persistence failed/);
+  assert.equal(reg.get(approval.approvalId)?.status, 'pending');
+  assert.equal(wakes, 0);
+  assert.equal(openEventLog().prepare("SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = 'user_input_received'")
+    .get(session.id)?.n, 0);
+  reg.withApprovalControlCommit((resolveDecision) => {
+    assert.equal(resolveDecision(approval.approvalId, 'approved', 'owner').ok, true);
+    assert.equal(wakes, 0);
+  });
+  assert.equal(wakes, 1);
+  assert.equal(reg.get(approval.approvalId)?.resolution, 'approved');
+});
+
+test('managed approval publication waits for the outer commit and discards only rolled-back nested work', () => {
+  const session = createSession({ id: 'approval-nested-publication', kind: 'chat' });
+  const cards = ['outer', 'inner', 'rolled-back'].map((subject) => reg.register({
+    sessionId: session.id, subject, tool: 'request_approval',
+  }));
+  const seen: string[] = [];
+  const transactionStates: boolean[] = [];
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (event.kind !== 'harness.public_event' || event.sessionId !== session.id) return;
+    transactionStates.push(openEventLog().inTransaction);
+    seen.push(String(event.event.data.text));
+  });
+  reg.onApprovalResolved((row) => {
+    if (cards.some((card) => card.approvalId === row.approvalId)) seen.push(`wake:${row.subject}`);
+  });
+  const append = (text: string) => appendEvent({ sessionId: session.id, turn: 0, role: 'user',
+    type: 'user_input_received', data: { text } });
+  try {
+    const result = reg.withApprovalControlCommit((outerResolve) => {
+      append('outer-before');
+      outerResolve(cards[0].approvalId, 'approved', 'owner');
+      assert.equal(reg.withApprovalControlCommit((innerResolve) => {
+        append('inner-kept');
+        innerResolve(cards[1].approvalId, 'approved', 'owner');
+        return 'nested-result';
+      }), 'nested-result');
+      assert.throws(() => reg.withApprovalControlCommit((innerResolve) => {
+        append('inner-rolled-back');
+        innerResolve(cards[2].approvalId, 'approved', 'owner');
+        throw new Error('nested savepoint failed');
+      }), /nested savepoint failed/);
+      append('outer-after');
+      assert.deepEqual(seen, [], 'neither nested publications nor waiters may escape the outer transaction');
+      return 'outer-result';
+    });
+    assert.equal(result, 'outer-result');
+    assert.deepEqual(seen, ['outer-before', 'inner-kept', 'outer-after', 'wake:outer', 'wake:inner']);
+    assert.deepEqual(transactionStates, [false, false, false]);
+    assert.equal(reg.get(cards[2].approvalId)?.status, 'pending');
+    const rows = openEventLog().prepare("SELECT data_json FROM events WHERE session_id = ? AND type = 'user_input_received' ORDER BY seq")
+      .all(session.id) as Array<{ data_json: string }>;
+    assert.deepEqual(rows.map((row) => JSON.parse(row.data_json).text), ['outer-before', 'inner-kept', 'outer-after']);
+    append('ordinary-after');
+    assert.equal(seen.at(-1), 'ordinary-after', 'ordinary append still publishes synchronously without a managed boundary');
+  } finally { unsubscribe(); }
+});
+
+test('outer rollback discards nested approval publications and wakeups; unmanaged and asynchronous boundaries fail before publication', () => {
+  const session = createSession({ id: 'approval-outer-publication-rollback', kind: 'chat' });
+  const card = reg.register({ sessionId: session.id, subject: 'Rollback exact decision', tool: 'request_approval' });
+  const seen: string[] = [];
+  const unsubscribe = actionBus.subscribe((event) => {
+    if ((event.kind === 'harness.event' || event.kind === 'harness.public_event') && event.sessionId === session.id) seen.push(event.kind);
+  });
+  reg.onApprovalResolved((row) => { if (row.approvalId === card.approvalId) seen.push('wake'); });
+  try {
+    assert.throws(() => reg.withApprovalControlCommit(() => {
+      reg.withApprovalControlCommit((resolveDecision) => {
+        appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'nested decision' } });
+        resolveDecision(card.approvalId, 'approved', 'owner');
+      });
+      throw new Error('outer commit failed');
+    }), /outer commit failed/);
+    assert.deepEqual(seen, []);
+    assert.equal(reg.get(card.approvalId)?.status, 'pending');
+    assert.equal(openEventLog().prepare('SELECT COUNT(*) AS n FROM events WHERE session_id = ?').get(session.id)?.n, 0);
+    let entered = false;
+    openEventLog().transaction(() => {
+      assert.throws(() => reg.withApprovalControlCommit(() => { entered = true; }), /ownership of the outer transaction/);
+    })();
+    assert.equal(entered, false, 'unmanaged nesting refuses before any decision or event is written');
+    assert.throws(() => reg.withApprovalControlCommit(() => {
+      appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'async result' } });
+      return Promise.resolve();
+    }), /must be synchronous/);
+    assert.deepEqual(seen, []);
+    assert.equal(openEventLog().prepare('SELECT COUNT(*) AS n FROM events WHERE session_id = ?').get(session.id)?.n, 0);
+    appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'ordinary append' } });
+    assert.deepEqual(seen, ['harness.event', 'harness.public_event'], 'a failed boundary leaves no publication context behind');
+  } finally { unsubscribe(); }
+});
 
 function conversationalPresentation(
   sourceUserSeq: number,

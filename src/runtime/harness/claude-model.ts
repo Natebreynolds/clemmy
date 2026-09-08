@@ -1013,12 +1013,13 @@ function codexFallbackTarget(): FallbackTarget | null {
 }
 
 export class ClaudeModelProvider implements ModelProvider {
-  getModel(modelName?: string): Model {
+  getModel(modelName?: string, options: { allowOverloadFallback?: boolean } = {}): Model {
     // A claude-* id is used verbatim; any other id (e.g. a gpt-5* tier name) maps
     // to the configured Claude brain model so the whole harness runs on Claude.
     const id = isClaudeModelId(modelName) ? (modelName as string) : getClaudeBrainModel();
     const primary = getClaudeModel(id);
-    if (!overloadFallbackEnabled()) return primary;
+    // An accepted completion judge pin cannot be replaced inside this adapter.
+    if (options.allowOverloadFallback === false || !overloadFallbackEnabled()) return primary;
     // Overload chain: primary -> Sonnet (unless already Sonnet) -> Codex (if any).
     const chain: FallbackTarget[] = [{ label: id, provider: 'claude', model: id, getModel: () => primary }];
     if (id !== SONNET_FALLBACK_ID) {

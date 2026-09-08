@@ -9,7 +9,11 @@
     "forceConsistentCasingInFileNames": true,
     "declaration": false,
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "paths": {
+      "@clem/chat-engine": ["./packages/chat-engine/src/index.ts"],
+      "@clem/chat-engine/*": ["./packages/chat-engine/src/*"]
+    }
   },
   "include": [
     "src/**/*.ts"

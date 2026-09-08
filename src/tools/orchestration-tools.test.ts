@@ -26,7 +26,7 @@ const {
   resetToolSchemaCache,
 } = await import('./composio-schema-cache.js');
 
-type ToolResult = { content: Array<{ type: 'text'; text: string }> };
+type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
 const handlers = new Map<string, ToolHandler>();
@@ -715,6 +715,78 @@ test('workflow_create and workflow_update persist reviewed transform JSON as typ
   assert.deepEqual(readWorkflow('reviewed-transform-wf')!.data.steps[0].transform, second);
 });
 
+test('workflow_get exposes the saved transform and exact-slug updates preserve its definition and settings', async () => {
+  const slug = 'clemmy-live-native-workflow-0905';
+  const transform = {
+    version: 1 as const,
+    expression: { op: 'literal' as const, value: 'Planning becomes execution.' },
+  };
+  writeWorkflow(slug, {
+    name: 'Clem Live Native Workflow', description: 'Before exact-slug update.',
+    enabled: false, trigger: { manual: true }, allowSends: false,
+    inputs: { label: { type: 'string', default: 'Preserve this default.' } },
+    steps: [{ id: 'message', sideEffect: 'read', transform, output: { type: 'string' } }],
+  });
+  const before = readWorkflow(slug)!;
+  const metadataText = resultText(await workflowGet()({ name: slug, section: 'metadata' }));
+  const metadata = JSON.parse(metadataText.slice(metadataText.indexOf('{')));
+  assert.deepEqual(metadata.steps[0].executor, { kind: 'transform', version: 1 });
+  assert.doesNotMatch(metadataText, /Planning becomes execution\./,
+    'metadata keeps the executor identity without pulling expression content into its bounded view');
+  assert.ok(metadataText.length < 2_000);
+
+  for (const args of [{ name: slug }, { name: 'Clem Live Native Workflow', step: 'message' }]) {
+    const text = resultText(await workflowGet()(args));
+    const encoded = text.split('\n').find((line) => line.startsWith('    transform: '))?.slice('    transform: '.length);
+    assert.ok(encoded, 'full and step reads carry the actual stored transform JSON');
+    assert.deepEqual(JSON.parse(encoded), before.data.steps[0].transform);
+  }
+
+  const updated = await workflowUpdate()({ name: slug, description: 'After exact-slug update.' });
+  assert.equal(updated.isError, undefined);
+  const commit = parseHostLocalWriteCommitFacts(resultText(updated));
+  assert.equal(commit?.createdId, slug);
+  const reopened = readWorkflow(slug)!;
+  assert.deepEqual(reopened.data, { ...before.data, description: 'After exact-slug update.' });
+  assert.deepEqual(workflowRunFiles(), [], 'a disabled metadata-only patch schedules no execution');
+
+  const renamedDescription = await workflowUpdate()({
+    name: 'Clem Live Native Workflow', description: 'Exact display name still works.',
+  });
+  assert.equal(renamedDescription.isError, undefined);
+  assert.deepEqual(readWorkflow(slug)!.data.steps, before.data.steps);
+  assert.deepEqual(readWorkflow(slug)!.data.trigger, before.data.trigger);
+});
+
+test('workflow_update refuses fuzzy names and exact name/slug collisions without changing either workflow', async () => {
+  const firstSlug = 'native-transform-one';
+  const secondSlug = 'native-transform-two';
+  const definition = {
+    description: 'Exact target only.', enabled: false, trigger: { manual: true },
+    steps: [{ id: 'message', sideEffect: 'read' as const,
+      transform: { version: 1 as const, expression: { op: 'literal' as const, value: 'unchanged' } } }],
+  };
+  writeWorkflow(firstSlug, { ...definition, name: 'Native Transform One' });
+  const firstFile = readWorkflow(firstSlug)!.filePath;
+  const original = readFileSync(firstFile, 'utf8');
+  const fuzzy = await workflowUpdate()({ name: 'native transform', description: 'Must not save.' });
+  assert.equal(fuzzy.isError, true);
+  assert.match(resultText(fuzzy), /not found.*exact saved name or slug/);
+  assert.equal(readFileSync(firstFile, 'utf8'), original);
+
+  writeWorkflow(secondSlug, { ...definition, name: firstSlug });
+  const secondFile = readWorkflow(secondSlug)!.filePath;
+  const secondOriginal = readFileSync(secondFile, 'utf8');
+  for (const handler of [workflowGet(), workflowUpdate()]) {
+    const collision = await handler({ name: firstSlug, description: 'Must not save.' });
+    assert.equal(collision.isError, true);
+    assert.match(resultText(collision), /ambiguous/);
+  }
+  assert.equal(readFileSync(firstFile, 'utf8'), original);
+  assert.equal(readFileSync(secondFile, 'utf8'), secondOriginal);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
 test('workflow_create accepts a call-only read step and queues a creation test', async () => {
   const result = await workflowCreate()({
     name: 'call-grounded-wf',
@@ -1032,21 +1104,24 @@ test('workflow_create preserves the primary model authored business graph exactl
   assert.equal(saved.some((step) => /^(research|gather|send|deliver)/.test(step.id)), false);
 });
 
-test('workflow_create auto-repairs a missing summary output contract and pinned goal', async () => {
+test('workflow_create saves the authored text task and exposes typed runtime inputs without inventing a URL or goal', async () => {
+  const prompt = 'Draft a short status summary from the text supplied at runtime. Use the supplied source text as the only material and produce a concise status summary. Do not send, publish, or take any other action.';
   const result = await workflowCreate()({
     name: 'plain-wf',
-    description: 'x',
-    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.' }],
+    description: 'QUALIFICATION INITIAL',
+    steps: [{ id: 's', prompt, sideEffect: 'read',
+      inputs: { source_text: { type: 'string', required: true, description: 'Source text supplied at runtime.' } } }],
   });
   const text = resultText(result);
   assert.match(text, /Created workflow "plain-wf"/);
-  assert.match(text, /Added output contract/);
-  assert.match(text, /Pinned a workflow goal/);
+  assert.doesNotMatch(text, /Added output contract|Pinned a workflow goal/);
+  assert.match(text, /source_text \(required\)/);
 
   const saved = readWorkflow('plain-wf')!.data;
-  assert.deepEqual(saved.steps[0].output?.required_keys, ['summary']);
-  assert.deepEqual(saved.steps[0].output?.non_empty, ['summary']);
-  assert.equal(saved.goal?.objective, 'Fetch the prospect site and return a summary.');
+  assert.equal(saved.steps[0].output, undefined);
+  assert.equal(saved.steps[0].prompt, prompt);
+  assert.equal(saved.goal, undefined);
+  assert.equal(saved.inputs?.source_text.required, true);
 });
 
 test('workflow_create keeps workflows with readiness gaps disabled', async () => {
@@ -1631,71 +1706,51 @@ function cliChoice(): ToolChoiceRecord {
   };
 }
 
-test('bindStepsToToolChoices: HIGH cli match → bakes the command + locks allowedTools (drops composio)', () => {
-  const steps = [
-    { id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['composio_execute_tool', 'run_shell_command'] },
-  ];
+test('remembered capability hints never rewrite authored prompts or allowedTools', () => {
+  const steps = [{ id: 'find', prompt: 'Query Salesforce for new prospects via a SOQL query.',
+    sideEffect: 'read' as const, allowedTools: ['composio_execute_tool', 'run_shell_command'] }];
+  const before = structuredClone(steps);
   const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 1);
-  assert.match(steps[0].prompt, /sf data query/, 'command baked into the prompt');
-  assert.deepEqual(steps[0].allowedTools, ['run_shell_command'], 'locked to family, composio dropped');
+  assert.deepEqual(res.boundNotes, []);
+  assert.deepEqual(steps, before);
+  assert.doesNotMatch(res.advisories.join('\n'), /locked|Bake|must|mixed read\/write|Split the effects/);
 });
 
-test('bindStepsToToolChoices: a mixed step keeps discovery open instead of locking to one remembered read', () => {
-  const steps = [
-    {
-      id: 'sync',
-      prompt: 'Query Salesforce for new prospect accounts via a SOQL query, then create a follow-up record.',
-      allowedTools: ['composio_execute_tool', 'run_shell_command'],
-    },
-  ];
-  const before = { prompt: steps[0].prompt, allowedTools: [...steps[0].allowedTools] };
+test('unspecified or compound prose cannot become an authored effect or required topology', () => {
+  const steps = [{ id: 'sync', prompt: 'Query Salesforce for new prospects via a SOQL query, then create a follow-up record.' }];
+  const before = structuredClone(steps);
   const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-
-  assert.equal(res.boundNotes.length, 0);
-  assert.equal(res.advisories.length, 1);
-  assert.match(res.advisories[0] ?? '', /mixed read\/write work/);
-  assert.match(res.advisories[0] ?? '', /keep discovery available/);
-  assert.equal(steps[0].prompt, before.prompt, 'one remembered read is not baked into a compound step');
-  assert.deepEqual(steps[0].allowedTools, before.allowedTools, 'the other effect remains discoverable');
+  assert.deepEqual(res, { boundNotes: [], advisories: [] });
+  assert.deepEqual(steps, before, 'no effect, tool scope or topology is inferred');
 });
 
-test('bindStepsToToolChoices: a wildcard/undefined allowedTools is locked to the family on auto-bind', () => {
-  const steps = [{ id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.' }];
-  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 1);
-  assert.deepEqual((steps[0] as { allowedTools?: string[] }).allowedTools, ['run_shell_command']);
-});
-
-test('bindStepsToToolChoices: composio match → ADVISE only, never mutates the step', () => {
-  const composio: ToolChoiceRecord = {
-    intent: 'salesforce.query.soql',
-    description: 'Run a Salesforce SOQL query',
+test('a compatible declared operation can receive an optional retrieval candidate', () => {
+  const choice: ToolChoiceRecord = {
+    intent: 'salesforce.query.soql', description: 'Run a Salesforce SOQL query',
     choice: { kind: 'composio', identifier: 'SALESFORCE_RUN_SOQL_QUERY', testedAt: '2026-06-01T00:00:00Z' },
-    fallbacks: [],
-    body: '',
-    filePath: '/tmp/c.md',
+    fallbacks: [], body: '', filePath: '/tmp/candidate.md',
   };
-  const steps = [{ id: 'find', prompt: 'Query Salesforce with a SOQL query for prospects.', allowedTools: ['composio_execute_tool'] }];
-  const before = steps[0].prompt;
-  const res = bindStepsToToolChoices(steps, { choices: [composio] });
-  assert.equal(res.boundNotes.length, 0);
-  assert.equal(res.advisories.length, 1);
-  assert.equal(steps[0].prompt, before, 'composio match must not mutate the prompt');
+  const steps = [{ id: 'find', prompt: 'Query Salesforce with a SOQL query for prospects.',
+    sideEffect: 'read' as const, allowedTools: ['composio_execute_tool'] }];
+  const before = structuredClone(steps);
+  const res = bindStepsToToolChoices(steps, { choices: [choice] });
+  assert.deepEqual(res.boundNotes, []);
+  assert.equal(res.advisories.length, 1, 'typed compatible retrieval remains useful');
+  assert.match(res.advisories[0]!, /Optional discovery candidate/);
+  assert.match(res.advisories[0]!, /current argument and account contract/);
+  assert.deepEqual(steps, before);
 });
 
-test('bindStepsToToolChoices: an already-bound step is left untouched (no note, no advisory)', () => {
-  const steps = [{ id: 'find', prompt: 'Query Salesforce: run `sf data query --json --query "SELECT Id FROM Account"`.', allowedTools: ['run_shell_command'] }];
-  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 0);
-  assert.equal(res.advisories.length, 0);
-});
-
-test('bindStepsToToolChoices: a usesSkill step is never re-bound (the skill owns its tools)', () => {
-  const steps = [{ id: 'find', prompt: 'Query Salesforce for new prospects via SOQL.', usesSkill: 'analyze-deals' }];
-  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 0);
-  assert.equal(res.advisories.length, 0);
+test('explicit calls, embedded bindings and skills retain their authored authority', () => {
+  for (const step of [
+    { id: 'find', prompt: 'Query Salesforce: run `sf data query --json --query "SELECT Id FROM Account"`.', sideEffect: 'read' as const, allowedTools: ['run_shell_command'] },
+    { id: 'find', prompt: 'Query Salesforce for new prospects via SOQL.', sideEffect: 'read' as const, usesSkill: 'analyze-deals' },
+    { id: 'find', prompt: 'Query Salesforce for new prospects via SOQL.', sideEffect: 'read' as const, call: { tool: 'SALESFORCE_RUN_SOQL_QUERY', args: { query: 'SELECT Id FROM Account' } } },
+  ]) {
+    const before = structuredClone(step);
+    assert.deepEqual(bindStepsToToolChoices([step], { choices: [cliChoice()] }), { boundNotes: [], advisories: [] });
+    assert.deepEqual(step, before);
+  }
 });
 
 // ── Feature D: chat recall of running workflows ───────────────────────────
@@ -1738,61 +1793,51 @@ test('renderWorkflowRunsOverview: nothing active → says so (still lists recent
   assert.match(out, /No workflows are running right now/);
 });
 
-// ── Feature A: adversarial-review regression fixes ────────────────────────
-
-test('bindStepsToToolChoices: a {{template}} command is neutralized to <var> (workflow_create no longer rejects its own injected token)', () => {
-  const steps = [{ id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['composio_execute_tool', 'run_shell_command'] }];
-  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 1);
-  assert.ok(!steps[0].prompt.includes('{{'), 'no raw {{template}} token survives into the saved prompt');
-  assert.match(steps[0].prompt, /<soql>/, 'placeholder rendered as guidance');
-  assert.match(steps[0].prompt, /sf data query/);
-});
-
-test('bindStepsToToolChoices: re-binding an already engine-bound step is a no-op (no double-append, no drift to a 2nd choice)', () => {
-  const steps: Array<{ id: string; prompt: string; allowedTools?: string[] }> = [
-    { id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.' },
-  ];
-  const first = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(first.boundNotes.length, 1);
-  const afterFirst = steps[0].prompt;
-  // A second authoring pass (e.g. workflow_update resending steps) must not touch it.
-  const second = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(second.boundNotes.length, 0);
-  assert.equal(second.advisories.length, 0);
-  assert.equal(steps[0].prompt, afterFirst, 'prompt unchanged on the second pass');
-});
-
-test('bindStepsToToolChoices: a deliberately read-only step is ADVISED, never auto-bound (no privilege escalation)', () => {
-  const steps = [{ id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['read_file', 'tool_output_query'] }];
-  const before = steps[0].prompt;
-  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
-  assert.equal(res.boundNotes.length, 0, 'not auto-bound — would have added run_shell_command the author excluded');
-  assert.equal(res.advisories.length, 1, 'advised instead');
-  assert.equal(steps[0].prompt, before, 'prompt not mutated');
-  assert.deepEqual(steps[0].allowedTools, ['read_file', 'tool_output_query'], 'scope untouched');
-});
-
-test('workflow_create: a generic salesforce step is auto-bound AND saved (the flagship case, end to end)', async () => {
-  resetState();
+test('workflow_create preserves the exact read-only status draft and emits no invented Slack or URL work', async () => {
   const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
-  rememberToolChoice({
-    intent: 'salesforce.cli.query',
-    description: 'Run a SOQL query against Salesforce via the sf CLI',
-    choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "{{soql}}"' },
+  rememberToolChoice({ intent: 'status.summary.send', description: 'Draft and send a short status summary',
+    choice: { kind: 'composio', identifier: 'SLACK_SEND_MESSAGE' } });
+  const prompt = 'Draft a short status summary from the text supplied at runtime. Use the supplied source text as the only material and produce a concise status summary. Do not send, publish, or take any other action.\n\nSource text:\n{{input.text}}';
+  const result = await workflowCreate()({ name: 'status-draft-receipt', description: 'QUALIFICATION INITIAL',
+    inputs: JSON.stringify({ text: { type: 'string' } }),
+    steps: [{ id: 'draft_status_summary', prompt, sideEffect: 'read' }],
   });
-  const result = await workflowCreate()({
-    name: 'sf-airtable-flow',
-    description: 'Pull Salesforce prospects and add them to Airtable.',
-    steps: [{ id: 'find', prompt: 'Query Salesforce for new prospect accounts via a SOQL query.', allowedTools: ['composio_execute_tool', 'run_shell_command'] }],
-  });
-  const text = resultText(result);
-  assert.match(text, /Created workflow "sf-airtable-flow"/, 'workflow saved (NOT rejected on an injected {{token}})');
-  assert.match(text, /Bound step `find`/, 'reports the auto-bind');
-  const saved = readWorkflow('sf-airtable-flow')!.data.steps[0];
-  assert.match(saved.prompt, /sf data query/, 'command baked into the saved prompt');
-  assert.ok(!saved.prompt.includes('{{'), 'no raw template token saved');
-  assert.deepEqual(saved.allowedTools, ['run_shell_command'], 'locked off composio');
+  assert.match(resultText(result), /Created workflow "status-draft-receipt"/);
+  assert.doesNotMatch(resultText(result), /SLACK_SEND_MESSAGE|mixed read\/write|Split the effects|url_present|no pinned `goal`|Bake|locked its tools/);
+  const saved = readWorkflow('status-draft-receipt')!.data;
+  assert.equal(saved.steps[0].prompt, prompt);
+  assert.equal(saved.steps[0].sideEffect, 'read');
+  assert.equal(saved.steps[0].allowedTools, undefined);
+  assert.equal(saved.steps[0].output, undefined);
+  assert.equal(saved.goal, undefined);
+  assert.equal(saved.inputs?.text.type, 'string');
+  assert.deepEqual(workflowRunFiles(), [], 'creating a draft cannot run the remembered send or queue a workflow');
+});
+
+test('workflow create and update preserve explicit write contract and capability scope beside remembered alternatives', async () => {
+  const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
+  rememberToolChoice({ intent: 'salesforce.cli.query', description: 'Run a SOQL query against Salesforce via the sf CLI',
+    choice: { kind: 'cli', identifier: 'sf', invocationTemplate: 'sf data query --json --query "{{soql}}"' } });
+  const step = { id: 'update', prompt: 'Query Salesforce with a SOQL query, then update the saved tracker.',
+    sideEffect: 'write' as const, requiresApproval: true,
+    allowedTools: ['composio_execute_tool', 'write_file'],
+    output: { type: 'object' as const, required_keys: ['path'], verify: { path_exists: ['path'] } } };
+  const created = await workflowCreate()({ name: 'explicit-tracker-write', description: 'Update the saved tracker.',
+    steps: [step], goal: { objective: 'Update the saved tracker and return its path.' } });
+  assert.match(resultText(created), /Created workflow "explicit-tracker-write"/);
+  const before = readWorkflow('explicit-tracker-write')!.data;
+  assert.equal(before.steps[0].sideEffect, 'write');
+  assert.equal(before.steps[0].requiresApproval, true);
+  assert.equal(before.steps[0].prompt, step.prompt);
+  assert.deepEqual(before.steps[0].allowedTools, step.allowedTools);
+  assert.deepEqual(before.steps[0].output, step.output);
+  const updated = await workflowUpdate()({ name: 'explicit-tracker-write', description: 'Updated description only', steps: [step] });
+  assert.doesNotMatch(resultText(updated), /Bound step|mixed read\/write|Bake|locked its tools/);
+  const after = readWorkflow('explicit-tracker-write')!.data;
+  assert.equal(after.description, 'Updated description only');
+  assert.deepEqual(after.steps[0], before.steps[0]);
+  assert.deepEqual(after.goal, before.goal);
+  assert.deepEqual(workflowRunFiles(), []);
 });
 
 // ─── J2b: chat → workflow promotion (draftToDefinition + canonical author) ──

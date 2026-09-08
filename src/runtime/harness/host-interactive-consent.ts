@@ -7,6 +7,7 @@
  * is an amendable projection, not a later consent authority. Tool and provider
  * names never enter the reducer as policy branches.
  */
+import { admitMutationIntoAcceptedScope } from './accepted-mutation-scope.js';
 import { createHash } from 'node:crypto';
 import { closedCanonicalJson, ClosedCanonicalJsonError } from '../../shared/closed-canonical-json.js';
 import {
@@ -60,6 +61,34 @@ import {
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
 } from './host-call-capability-binding.js';
+
+export interface HostNativeConsentAdmissionExpectationV1 {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  toolName: string;
+  argumentDigest: string;
+  hostCapabilityBindingDigest: string;
+  capabilityRef: string;
+  schemaFingerprint: string;
+  envelopeFingerprint: string;
+  authorityDigest: string;
+  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work';
+}
+
+const issuedNativeConsentAdmissions = new WeakMap<object, Readonly<HostNativeConsentAdmissionExpectationV1>>();
+
+/** Only the evaluated exact native call can issue this process-local proof.
+ * Failed transplants consume it as well; public fields cannot recreate it. */
+export function consumeHostNativeConsentAdmission(input: {
+  admission: object;
+  expected: HostNativeConsentAdmissionExpectationV1;
+}): boolean {
+  const issued = issuedNativeConsentAdmissions.get(input.admission);
+  issuedNativeConsentAdmissions.delete(input.admission);
+  return !!issued && closedCanonicalJson(issued) === closedCanonicalJson(input.expected);
+}
 
 export interface HostInteractiveConsentSubjectV1 {
   version: 1;
@@ -681,6 +710,9 @@ async function exactLocalDefinitionForPrepared(input: {
       && loaded.definition.carrier === 'work_call'
       && loaded.definition.schemaFingerprint === current.schemaFingerprint
       && loaded.definition.envelopeFingerprint === current.envelopeFingerprint
+      && (!binding.capabilityId.startsWith('cap:local:')
+        || (binding.schemaFingerprint === loaded.definition.schemaFingerprint
+          && binding.operationId === loaded.definition.name))
       && localPlanningArgumentsMatch(loaded.definition, input.prepared.targetArgs)
     ) candidates.push(loaded.definition);
   }
@@ -1195,7 +1227,8 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
 /**
  * Evaluate a graph-neutral mutation. An exact catalog call reopens its already
  * admitted source/call binding as coverage; the graph is not an entrance. The
- * legacy uncovered local projection remains non-authorizing.
+ * Native calls additionally require the exact source-disclosed local
+ * definition and mint a one-shot handoff; no work graph is synthesized.
  */
 export async function evaluateUncoveredHostMutationConsent(input: {
   attestation: HostCallAttestation;
@@ -1204,7 +1237,15 @@ export async function evaluateUncoveredHostMutationConsent(input: {
   durableApproval?: DurableHostConsentApproval;
 }): Promise<HostInteractiveConsentResult> {
   const attestation = input.attestation;
-  if (attestation.bindingKind === 'catalog_manifest') {
+  // The host persists an exact call binding before evaluating consent for
+  // both catalog calls and source-disclosed native nominations. Reopen that
+  // authority before deriving coverage. A local carrier without a nominated
+  // definition still takes the uncovered path below; its envelope alone
+  // cannot authorize a business mutation.
+  if (attestation.bindingKind === 'catalog_manifest'
+    || (attestation.bindingKind === 'local_envelope'
+      && attestation.effect === 'local_write'
+      && attestation.capabilityId.startsWith('cap:local:'))) {
     const loaded = loadHostCallCapabilityBinding({ db: openEventLog(), ...attestation });
     if (loaded.status !== 'ok' || !hostCallCapabilityBindingMatchesAttestation(loaded.binding, attestation)) {
       return { status: 'hold', reason: 'exact_host_call_durable_authority_reopen_mismatch', retryable: true };
@@ -1228,6 +1269,35 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       return { ...semanticResolution, retryable: true };
     }
     const semantic = semanticResolution.semantic;
+
+    // ACCEPTED-JOB SCOPE, before any coverage is built from this call.
+    //
+    // Everything below proves the call is consistent with ITSELF: same source,
+    // same schema, same binding. Live source 142281 was all of those while
+    // patching a pre-existing workflow the owner never asked to change. The
+    // scope comparison is the one fact the proposed call cannot supply.
+    if (semantic.effect === 'local_write' && binding.bindingKind === 'local_envelope') {
+      const scopeDefinition = await exactLocalDefinitionForPrepared({ prepared: target });
+      const scopeVerdict = admitMutationIntoAcceptedScope({
+        sessionId: binding.sessionId,
+        sourceUserSeq: binding.sourceUserSeq,
+        turn: 0,
+        logicalToolCallId: binding.logicalToolCallId,
+        operationId: semantic.operationId,
+        deliverableKind: scopeDefinition?.descriptor.deliverableKind ?? 'unknown',
+        destinationPosture: semantic.destination.posture,
+      });
+      if (!scopeVerdict.allowed) {
+        // A repair, not a hard stop: the model can explain the collision and
+        // ask for a changed instruction, which is the honest endpoint here.
+        return {
+          status: 'repair',
+          reason: `outside_accepted_scope: ${scopeVerdict.detail}`,
+          retryable: true,
+        };
+      }
+    }
+
     const source = sourceFromHostBinding(binding);
     const { call, coverage } = buildHostConsentEvidence({ call: {
       source,
@@ -1258,6 +1328,30 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
       durableApproval: input.durableApproval,
     });
+    if (binding.bindingKind === 'local_envelope' && decision.kind === 'proceed'
+      && (decision.basis === 'exact_reversible_work' || decision.basis === 'exact_ordinary_work')) {
+      const definition = await exactLocalDefinitionForPrepared({ prepared: target });
+      if (!definition || definition.schemaFingerprint !== semantic.schemaFingerprint
+        || definition.envelopeFingerprint !== semantic.semanticBasis.digest) {
+        return { status: 'hold', reason: 'exact_native_definition_changed_during_consent', retryable: true };
+      }
+      const admission = Object.freeze({});
+      issuedNativeConsentAdmissions.set(admission, Object.freeze({
+        sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
+        acceptedTaskId: binding.acceptedTaskId, logicalToolCallId: binding.logicalToolCallId,
+        toolName: binding.toolName, argumentDigest: binding.effectiveArgumentDigest,
+        hostCapabilityBindingDigest: binding.durableBindingDigest,
+        capabilityRef: definition.capabilityRef, schemaFingerprint: definition.schemaFingerprint,
+        envelopeFingerprint: definition.envelopeFingerprint, authorityDigest: decision.authorityDigest,
+        consentBasis: decision.basis,
+      }));
+      const { issueExactNativeCallAdmission } = await import('./nested-tool-approval-admission.js');
+      const nestedAdmission = issueExactNativeCallAdmission({ hostCapabilityBinding: binding,
+        targetArgs: input.args, definition, authorityDigest: decision.authorityDigest,
+        consentBasis: decision.basis, consentAdmission: admission });
+      if (!nestedAdmission) return { status: 'conflict', reason: 'exact native call admission could not be issued' };
+      return { status: 'decided', decision, call, coverage, nestedAdmission };
+    }
     return { status: 'decided', decision, call, coverage,
       ...(decision.kind === 'needs_user' && decision.need === 'approval' ? { consentSubject } : {}) };
   }
@@ -1276,6 +1370,29 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     ? currentLocal.definitions.filter((definition) => localPlanningArgumentsMatch(definition, input.args))
     : [];
   const definition = matchingDefinitions.length === 1 ? matchingDefinitions[0]! : null;
+  // An un-nominated native carrier remains uncovered even if the current
+  // registry recognizes its arguments. Scope checking here cannot replace
+  // the source-disclosed definition and durable call binding required above.
+  if (attestation.effect === 'local_write' && definition) {
+    const scopeVerdict = admitMutationIntoAcceptedScope({
+      sessionId: attestation.sessionId,
+      sourceUserSeq: attestation.sourceUserSeq,
+      turn: 0,
+      logicalToolCallId: attestation.logicalToolCallId,
+      operationId: attestation.operationId,
+      deliverableKind: definition.descriptor.deliverableKind ?? 'unknown',
+      destinationPosture: definition.descriptor.destinationPosture ?? 'not_applicable',
+    });
+    if (!scopeVerdict.allowed) {
+      // A repair, not a hard stop: the model can explain the collision and ask
+      // for a changed instruction, which is the honest endpoint here.
+      return {
+        status: 'repair',
+        reason: `outside_accepted_scope: ${scopeVerdict.detail}`,
+        retryable: true,
+      };
+    }
+  }
   const safeMode = definition !== null;
   const destination: InteractiveConsentDestination = definition
     ? {

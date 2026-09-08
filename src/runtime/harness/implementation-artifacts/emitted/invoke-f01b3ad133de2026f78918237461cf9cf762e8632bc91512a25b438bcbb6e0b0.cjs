@@ -36,6 +36,26 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// src/shared/closed-canonical-json.ts
+var CLOSED_CANONICAL_JSON_DEFAULTS, SEALED_CALL_CANONICAL_LIMITS;
+var init_closed_canonical_json = __esm({
+  "src/shared/closed-canonical-json.ts"() {
+    "use strict";
+    CLOSED_CANONICAL_JSON_DEFAULTS = Object.freeze({
+      maxDepth: 32,
+      maxNodes: 2e4,
+      maxStringBytes: 64e3,
+      maxTotalBytes: 512e3
+    });
+    SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
+      maxDepth: 32,
+      maxNodes: 2e6,
+      maxStringBytes: 8e6,
+      maxTotalBytes: 8e6
+    });
+  }
+});
+
 // src/runtime/security.ts
 function isPlaceholderSecret(value) {
   const normalized = value.trim().toLowerCase();
@@ -535,6 +555,7 @@ var SCHEMA_TTL_MS, cache;
 var init_composio_schema_cache = __esm({
   "src/tools/composio-schema-cache.ts"() {
     "use strict";
+    init_closed_canonical_json();
     init_tool_contract_store();
     SCHEMA_TTL_MS = 30 * 6e4;
     cache = /* @__PURE__ */ new Map();
@@ -687,26 +708,6 @@ function parseOperationVerificationContract(value) {
 var init_mutation_verification_contract = __esm({
   "src/runtime/harness/mutation-verification-contract.ts"() {
     "use strict";
-  }
-});
-
-// src/shared/closed-canonical-json.ts
-var CLOSED_CANONICAL_JSON_DEFAULTS, SEALED_CALL_CANONICAL_LIMITS;
-var init_closed_canonical_json = __esm({
-  "src/shared/closed-canonical-json.ts"() {
-    "use strict";
-    CLOSED_CANONICAL_JSON_DEFAULTS = Object.freeze({
-      maxDepth: 32,
-      maxNodes: 2e4,
-      maxStringBytes: 64e3,
-      maxTotalBytes: 512e3
-    });
-    SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
-      maxDepth: 32,
-      maxNodes: 2e6,
-      maxStringBytes: 8e6,
-      maxTotalBytes: 8e6
-    });
   }
 });
 

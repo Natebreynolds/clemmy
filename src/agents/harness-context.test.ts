@@ -434,7 +434,8 @@ test('a cross-session action retains only a bounded historical focus pointer, no
     focusInput: 'Review the status of the previous sheet run.',
     partition: 'volatile',
   });
-  assert.match(review, /exec-old/);
+  assert.match(review, /RELATED HISTORICAL focus|sheet-focus-fixture/);
+  assert.doesNotMatch(review, /exec-old|old-write-123|old-read-456/);
 
   const sameSession = renderHarnessMemoryContext({
     sessionId: 'sess-prior-run',

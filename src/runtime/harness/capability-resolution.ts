@@ -31,6 +31,7 @@ import {
   type ToolChoiceKind,
 } from '../../memory/tool-choice-store.js';
 import type { VerifiedReadCapabilityOrigin } from '../../memory/verified-read-origin.js';
+import type { SourceAccountRoutingEvidence } from '../../tools/source-account-routing.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 import { appendEvent, listEvents } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
@@ -50,6 +51,8 @@ export interface CapabilityResolutionEntry {
   /** Joined from the connection registry for composio-kind capabilities. */
   connection: ConnectionState;
   accountIdentity?: string;
+  /** Checked routing evidence, not consent. Scoped to exact accepted sources. */
+  sourceAccountRouting?: SourceAccountRoutingEvidence;
   /** previously_failed only. */
   failedAt?: string;
   failureReason?: string;
@@ -407,6 +410,7 @@ export function recordCapabilityResolution(
         resolution,
       );
       discoveryGovernor.initializeTask({
+        claimKeyVersion: 'exact_request_v1',
         sessionId,
         sourceUserSeq: sourceUserSeq as number,
         knownCapability: authoritativeForTask

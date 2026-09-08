@@ -1,6 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseClaudeCredential, assertSubscriptionToken, loadFreshClaudeAccessToken, claudeVaultRefreshDead, claudeVaultFallbackReady, getClaudeAuthSnapshot, ClaudeAuthError, __test__ } from './claude-oauth.js';
@@ -326,4 +327,172 @@ test('fresh loader never falls back to a Claude Code api03 key', async () => {
     __test__.setRawCredentialReaderForTests(null);
     __test__.setRefreshClaudeTokensForTests(null);
   }
+});
+
+
+function resetKeychainFixture() {
+  __test__.setKeychainProbeForTests(null);
+  __test__.setVaultTokenReaderForTests(null);
+  __test__.setRawCredentialReaderForTests(null);
+  __test__.setRefreshClaudeTokensForTests(null);
+  __test__.resetDegradedStateForTests();
+}
+const cliPayload = (expiresAt = FUTURE, accessToken = 'sk-ant-oat01-keychain-fixture') => JSON.stringify({
+  claudeAiOauth: { accessToken, expiresAt, refreshToken: 'cli-owned-never-rotate' },
+});
+
+test('cold keychain readiness is one awaited probe for concurrent async callers; sync status never probes', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let probes = 0;
+  let release!: (value: { raw: string }) => void;
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    return new Promise(resolve => { release = resolve; });
+  });
+  try {
+    assert.equal(getClaudeAuthSnapshot().configured, false);
+    assert.equal(probes, 0, 'status-only readers do not initiate a keychain prompt');
+    const pending = Promise.all([loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken()]);
+    let timerRan = false;
+    await new Promise<void>(resolve => setTimeout(() => { timerRan = true; resolve(); }, 5));
+    assert.equal(timerRan, true, 'waiting for readiness never blocks the event loop');
+    assert.equal(probes, 1);
+    release({ raw: cliPayload() });
+    assert.deepEqual(await pending, Array(3).fill('sk-ant-oat01-keychain-fixture'));
+    assert.equal(getClaudeAuthSnapshot().configured, true);
+    assert.equal(probes, 1);
+  } finally { resetKeychainFixture(); }
+});
+
+test('a known-dead vault awaits cold CLI access without rotating either refresh grant', async () => {
+  resetKeychainFixture();
+  const refreshToken = 'known-dead-vault-fixture';
+  __test__.setVaultTokenReaderForTests(() => ({ accessToken: 'sk-ant-oat01-expired-vault', refreshToken,
+    expiresAt: Date.now() - 60_000, source: 'vault' }));
+  writeFileSync(path.join(TMP, 'claude-auth-dead.json'), JSON.stringify({
+    refreshTokenHash: createHash('sha256').update(refreshToken).digest('hex'), reason: 'fixture invalid_grant', since: new Date().toISOString(),
+  }));
+  let refreshes = 0;
+  let probes = 0;
+  __test__.setRefreshClaudeTokensForTests(async () => { refreshes += 1; throw new Error('must not refresh'); });
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return { raw: cliPayload() };
+  });
+  try {
+    const results = await Promise.all([loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken()]);
+    assert.deepEqual(results, Array(2).fill('sk-ant-oat01-keychain-fixture'));
+    assert.equal(refreshes, 0);
+    assert.equal(probes, 1);
+    assert.equal(getClaudeAuthSnapshot().source, 'claude-code');
+  } finally { resetKeychainFixture(); }
+});
+
+test('keychain timeout settles every waiter, caches the negative, and ignores a late result after a newer probe', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let now = Date.now();
+  let probes = 0;
+  let late!: (value: { raw: string }) => void;
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    if (probes === 1) return new Promise(resolve => { late = resolve; });
+    return { raw: cliPayload(FUTURE, 'sk-ant-oat01-new-generation') };
+  }, { now: () => now, timeoutMs: 25 });
+  try {
+    const first = await Promise.allSettled([loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken()]);
+    assert.ok(first.every(result => result.status === 'rejected' && result.reason instanceof ClaudeAuthError && result.reason.kind === 'missing'));
+    assert.equal(probes, 1);
+    await assert.rejects(loadFreshClaudeAccessToken(), (e: unknown) => e instanceof ClaudeAuthError && e.kind === 'missing');
+    assert.equal(probes, 1, 'timeout negative remains cached');
+    now += 5 * 60_000 + 1;
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-new-generation');
+    late({ raw: cliPayload(FUTURE, 'sk-ant-oat01-stale-generation') });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-new-generation');
+    assert.equal(probes, 2);
+  } finally { resetKeychainFixture(); }
+});
+
+test('missing, denied, and thrown keychain probes keep the negative TTL without prompt storms', async () => {
+  for (const outcome of ['missing', 'denied', 'throw'] as const) {
+    resetKeychainFixture();
+    __test__.setVaultTokenReaderForTests(() => null);
+    let probes = 0;
+    __test__.setKeychainProbeForTests(async () => {
+      probes += 1;
+      if (outcome === 'throw') throw new Error('fixture failure');
+      return { raw: null, ...(outcome === 'denied' ? { errorCode: 'EACCES' } : {}) };
+    });
+    try {
+      for (let index = 0; index < 3; index += 1) await assert.rejects(loadFreshClaudeAccessToken(), ClaudeAuthError);
+      assert.equal(probes, 1, outcome);
+    } finally { resetKeychainFixture(); }
+  }
+});
+
+test('expired positive keychain access permits a bounded reread inside the TTL without retrying unchanged expired output', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let now = Date.now();
+  let probes = 0;
+  let refreshes = 0;
+  __test__.setRefreshClaudeTokensForTests(async () => { refreshes += 1; throw new Error('CLI refresh must never run'); });
+  __test__.setKeychainProbeForTests(async () => ({ raw: ++probes < 3 ? cliPayload(Date.now() - 60_000) : cliPayload() }), { now: () => now });
+  try {
+    await assert.rejects(loadFreshClaudeAccessToken(), (e: unknown) => e instanceof ClaudeAuthError && e.kind === 'expired');
+    for (let index = 0; index < 3; index += 1) await assert.rejects(loadFreshClaudeAccessToken(), ClaudeAuthError);
+    assert.equal(probes, 1);
+    now += 30_001;
+    await assert.rejects(loadFreshClaudeAccessToken(), ClaudeAuthError);
+    assert.equal(probes, 2, 'expired access can be reread before the five-minute TTL');
+    for (let index = 0; index < 3; index += 1) await assert.rejects(loadFreshClaudeAccessToken(), ClaudeAuthError);
+    assert.equal(probes, 2, 'unchanged expired output has a cooldown');
+    now += 30_001;
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-keychain-fixture');
+    assert.equal(probes, 3);
+    assert.equal(refreshes, 0);
+  } finally { resetKeychainFixture(); }
+});
+
+test('healthy own vault and isolated system access do not probe; keychain API keys remain refused', async () => {
+  resetKeychainFixture();
+  let probes = 0;
+  __test__.setVaultTokenReaderForTests(() => ({ accessToken: 'sk-ant-oat01-healthy-vault', expiresAt: FUTURE, source: 'vault' }));
+  __test__.setKeychainProbeForTests(async () => { probes += 1; return { raw: cliPayload() }; });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-healthy-vault');
+    assert.equal(probes, 0);
+    __test__.setVaultTokenReaderForTests(() => null);
+    __test__.setKeychainProbeForTests(async () => { probes += 1; return { raw: cliPayload() }; }, { enabled: false });
+    await assert.rejects(loadFreshClaudeAccessToken(), ClaudeAuthError);
+    assert.equal(probes, 0, 'the disabled/isolation boundary prevents even the mock probe');
+    for (const key of ['sk-ant-api03-billing-forbidden', 'unknown-key-kind']) {
+      __test__.setKeychainProbeForTests(async () => ({ raw: cliPayload(FUTURE, key) }));
+      await assert.rejects(loadFreshClaudeAccessToken(), (e: unknown) => e instanceof ClaudeAuthError && e.kind === 'not_subscription');
+    }
+  } finally { resetKeychainFixture(); }
+});
+
+
+test('aged healthy CLI access refreshes the positive cache once without waiting for token expiry', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let now = Date.now();
+  let probes = 0;
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    await new Promise(resolve => setTimeout(resolve, 5));
+    return { raw: cliPayload(FUTURE, probes === 1 ? 'sk-ant-oat01-first-valid' : 'sk-ant-oat01-new-valid') };
+  }, { now: () => now });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-first-valid');
+    now += 5 * 60_000 + 1;
+    assert.deepEqual(await Promise.all([loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken()]), Array(2).fill('sk-ant-oat01-new-valid'));
+    assert.equal(probes, 2);
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-new-valid');
+    assert.equal(probes, 2);
+  } finally { resetKeychainFixture(); }
 });

@@ -10,6 +10,8 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.EMBEDDINGS_DISABLED = 'true';
 
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
+const { chunkMarkdown } = await import('./indexer.js');
+const { _setEmbeddingProviderForTest } = await import('./embeddings.js');
 const {
   buildFtsQuery,
   getRecallStats,
@@ -252,4 +254,120 @@ ended_at: 2026-07-14T21:00:00.000Z
   });
   assert.equal(clarifiedQuery[0]?.filePath, meetingPath);
   assert.match(clarifiedQuery[0]?.snippet ?? '', /data integration/);
+});
+
+function insertIndexedMarkdown(filePath: string, content: string): ReturnType<typeof chunkMarkdown> {
+  const chunks = chunkMarkdown(content);
+  chunks.forEach((chunk, chunkIndex) => insertChunk({
+    path: filePath, chunkIndex, title: chunk.title, content: chunk.content,
+  }));
+  return chunks;
+}
+
+test('ambient selected metadata hydrates real title and sibling body from only the exact indexed note', async () => {
+  const filePath = '/fixture-vault/Projects/selected-reference.md';
+  const title = 'Acme Partnership Revenue and Legal Data Integration Review';
+  const chunks = insertIndexedMarkdown(filePath, `---
+lookup_ref: quasaronly482
+title: "${title}"
+started_at: 2026-07-14T20:24:09.442Z
+---
+## Decisions
+Internal Acme team reviewed partnership revenue against 2026 goals and legal data integration gaps.`);
+  insertIndexedMarkdown('/fixture-vault/Other/selected-reference.md', `---
+title: Unrelated same-basename source
+---
+## Decisions
+FOREIGN_BODY_MUST_NOT_BE_ATTACHED`);
+  const hits = await recallHybrid('quasaronly482', { purpose: 'ambient', limit: 1 });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]?.filePath, filePath);
+  assert.equal(hits[0]?.title, title);
+  const indexed = openMemoryDb().prepare('SELECT id FROM vault_chunks WHERE path = ? ORDER BY chunk_index').all(filePath) as Array<{ id: number }>;
+  assert.ok(hits[0]?.snippet.includes(`selected chunk ${indexed[0]!.id}, body chunk ${indexed[1]!.id}`), 'sibling bytes name their actual indexed chunk');
+  assert.ok(hits[0]?.snippet.includes(chunks[1]!.content), 'the complete actual body chunk survives metadata-only selection');
+  assert.match(hits[0]?.snippet ?? '', /2026-07-14T20:24:09.442Z/);
+  assert.match(hits[0]?.snippet ?? '', /Indexed excerpt/);
+  assert.match(hits[0]?.snippet ?? '', /reopen this source/i);
+  assert.doesNotMatch(hits[0]?.snippet ?? '', /FOREIGN_BODY/);
+  assert.equal(hits[0]?.occurredAt, undefined, 'generic frontmatter hydration does not infer a calendar occurrence');
+});
+
+test('ambient selected body preserves source text beyond FTS and old 240-character previews', () => {
+  const filePath = '/fixture-vault/Research/source-preview.md';
+  const body = `## Research\nBODY_START ${'Detailed source observations remain available. '.repeat(17)} bodyneedle739 BODY_END`;
+  const chunks = insertIndexedMarkdown(filePath, body);
+  assert.equal(chunks.length, 1, 'producer fixture is one complete indexed body chunk');
+  const hits = recall('bodyneedle739', { purpose: 'ambient', limit: 1 });
+  assert.equal(hits[0]?.filePath, filePath);
+  assert.ok(hits[0]?.snippet.includes(chunks[0]!.content), 'source content is not replaced with the FTS search-match fragment');
+  assert.match(hits[0]?.snippet ?? '', /BODY_START.*BODY_END/s);
+});
+
+test('metadata-only indexed note stays explicitly partial without invented body or temporal certainty', () => {
+  const filePath = '/fixture-vault/Notes/capture-only.md';
+  insertIndexedMarkdown(filePath, `---
+lookup_ref: unopened571
+title: Capture received, no content transcribed
+recorded_date: 2026-07-14
+---`);
+  const hits = recall('unopened571', { purpose: 'ambient', limit: 1 });
+  assert.equal(hits[0]?.title, 'Capture received, no content transcribed');
+  assert.match(hits[0]?.snippet ?? '', /recorded_date: 2026-07-14/);
+  assert.match(hits[0]?.snippet ?? '', /Indexed excerpt/);
+  assert.doesNotMatch(hits[0]?.snippet ?? '', /partnership revenue|2026-07-15/);
+  assert.equal(hits[0]?.occurredAt, undefined);
+});
+
+test('malformed indexed metadata remains verbatim and cannot fabricate a parsed title', () => {
+  const filePath = '/fixture-vault/Notes/broken-metadata.md';
+  const content = '---\ntitle: [broken\nlookup_ref: malformed802\n---';
+  insertChunk({ path: filePath, content });
+  const hits = recall('malformed802', { purpose: 'ambient', limit: 1 });
+  assert.equal(hits[0]?.title, 'broken-metadata');
+  assert.ok(hits[0]?.snippet.includes(content));
+  assert.equal(hits[0]?.occurredAt, undefined);
+});
+
+test('async rerank cannot attach reindexed sibling content to an older selected chunk', async () => {
+  const filePath = '/fixture-vault/Notes/reindexed-source.md';
+  const oldMetadata = '---\nlookup_ref: snapshotprobe485\ntitle: Original selected title\n---';
+  insertChunk({ path: filePath, chunkIndex: 0, content: oldMetadata, mtime: 1_000 });
+  insertChunk({ path: filePath, chunkIndex: 1, title: 'Body', content: 'Original indexed body.', mtime: 1_000 });
+  const db = openMemoryDb();
+  const row = db.prepare('SELECT id FROM vault_chunks WHERE path = ? AND chunk_index = 0').get(filePath) as { id: number };
+  db.prepare('INSERT INTO embeddings (chunk_id, model, dim, vector, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(row.id, 'preview-snapshot-v1', 2, Buffer.from(new Float32Array([1, 0]).buffer), '2026-07-14T00:00:00Z');
+  let embeddings = 0;
+  _setEmbeddingProviderForTest({
+    name: 'preview-snapshot', model: 'preview-snapshot-v1', dim: 2,
+    async embed(texts) {
+      embeddings += 1;
+      db.prepare('UPDATE vault_chunks SET content = ?, mtime = ? WHERE path = ? AND chunk_index = 0')
+        .run('---\nlookup_ref: snapshotprobe485\ntitle: NEW_VERSION_TITLE\n---', 2_000, filePath);
+      db.prepare('UPDATE vault_chunks SET content = ?, mtime = ? WHERE path = ? AND chunk_index = 1')
+        .run('NEW_VERSION_BODY', 2_000, filePath);
+      return texts.map(() => new Float32Array([1, 0]));
+    },
+  });
+  try {
+    const hits = await recallHybrid('snapshotprobe485', { purpose: 'ambient', limit: 1 });
+    assert.ok(embeddings > 0, 'actual async rerank crossed the injected embedding boundary');
+    assert.equal(hits[0]?.filePath, filePath);
+    assert.ok(hits[0]?.snippet.includes(oldMetadata), 'old selected bytes remain truthful instead of being replaced by a newer index version');
+    assert.match(hits[0]?.snippet ?? '', /sibling context unavailable/);
+    assert.doesNotMatch(hits[0]?.snippet ?? '', /NEW_VERSION/);
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+  }
+});
+
+test('an incomplete frontmatter chunk is source text, not a fully parsed note identity', () => {
+  const filePath = '/fixture-vault/Notes/incomplete-metadata.md';
+  const content = '---\ntitle: Unclosed proposed title\nlookup_ref: incomplete694';
+  insertChunk({ path: filePath, content });
+  const hits = recall('incomplete694', { purpose: 'ambient', limit: 1 });
+  assert.equal(hits[0]?.title, 'incomplete-metadata');
+  assert.ok(hits[0]?.snippet.includes(content));
+  assert.equal(hits[0]?.occurredAt, undefined);
 });

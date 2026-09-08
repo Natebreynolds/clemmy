@@ -32,7 +32,10 @@ const testTmp = path.join(testHome, 'tmp');
 const testHomeRoot = path.join(testHome, 'homes');
 mkdirSync(testTmp, { recursive: true });
 mkdirSync(testHomeRoot, { recursive: true });
-const tsxBin = path.join(repoRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
+// Keep the requested Node runtime across the tsx boundary. Spawning the .bin
+// shebang silently resolves `node` again from PATH, so a caller selecting a
+// patched Node can otherwise run every test on an older global installation.
+const tsxCli = fileURLToPath(import.meta.resolve('tsx/cli'));
 const forwarded = process.argv.slice(2);
 const args = isolatedTestArgs(forwarded);
 
@@ -130,7 +133,7 @@ const childEnv = {
 
 try {
   const budgetMs = fileBudgetMs(args);
-  const child = spawn(tsxBin, args, {
+  const child = spawn(process.execPath, [tsxCli, ...args], {
     cwd: repoRoot,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],

@@ -16,6 +16,7 @@ process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off'; // force lexical, fully offline + d
 
 // eslint-disable-next-line import/first
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
+const { chunkMarkdown } = await import('./indexer.js');
 // eslint-disable-next-line import/first
 const { forgetFact, reactivateFact, rememberFact, supersedeFact } = await import('./facts.js');
 // eslint-disable-next-line import/first
@@ -906,4 +907,127 @@ test('unified recall surfaces deliverables with the YOUR WORK LIVES AT label', a
   const primer = formatUnifiedPrimer(result);
   assert.match(primer, /YOUR WORK LIVES AT/);
   assert.match(primer, /ML-30-AI-Search-Drafts\.md/);
+});
+
+
+// The automatic primer receives the whole objective. A prospective meeting
+// CTA and a start date must not erase the other task's memory context.
+const OUTREACH_OBJECTIVE = "Find me 30 of Brett's market leader accounts that he hasn't touched in the last 15 days. Pull account data and then website SEO data. Create me a 3 email plan that we can start kicking off today and then email every 2 days after as long as they don't respond. These emails need to add value around scorpion and have a clear CTA on why they would want to book a meeting with him.";
+const OUTREACH_CLOCK = { now: '2026-09-07T23:00:00.000Z', timeZone: 'America/Los_Angeles' };
+
+function seedOutreachContext() {
+  const fact = rememberFact({ kind: 'project', occurredAt: '2026-09-01T12:00:00.000Z', content: 'Brett owns the Market Leader prospecting accounts. Scorpion outreach email uses account-specific website SEO research and one clear CTA.' });
+  const entity = upsertEntity({ type: 'person', name: 'Brett' });
+  const pointer = upsertResourcePointer({ app: 'Salesforce', kind: 'object', name: 'Market Leader Accounts', whatsHere: 'Brett market leader accounts and last touched activity timestamps' });
+  const notePath = '/vault/03-Projects/scorpion-outreach-reference.md';
+  const note = 'Scorpion outreach email plan: use specific account website SEO findings to explain value and a clear CTA.';
+  openMemoryDb().prepare(`INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash) VALUES (?, 0, ?, ?, ?, ?, ?)`)
+    .run(notePath, note, 'Scorpion outreach reference', Date.parse(OUTREACH_CLOCK.now), Buffer.byteLength(note), 'outreach-context-fixture');
+  return { fact, entity, pointer, notePath };
+}
+
+for (const hasUnrelatedMeeting of [false, true]) {
+  test(`ambient exact outreach preserves entity, source and brand context with same-day meeting=${hasUnrelatedMeeting}`, async () => {
+    const seeded = seedOutreachContext();
+    if (hasUnrelatedMeeting) {
+      recordMemoryEpisode({ kind: 'tool_result', subtype: 'meeting', title: 'Unrelated facilities budget', sourceApp: 'Recorder',
+        sourceUri: 'meeting://fixture/facilities', occurredAt: '2026-09-07T19:00:00.000Z', content: 'Meeting about replacing the office air conditioning.' });
+      // This is the earlier note-retriever fast-return trap, independent of the
+      // final all-store filter. The brand note must survive this date match too.
+      const content = 'type: meeting-transcript\nstarted_at: 2026-09-07T19:00:00.000Z\nUnrelated facilities budget.';
+      openMemoryDb().prepare(`INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash) VALUES (?, 0, ?, ?, ?, ?, ?)`)
+        .run('/vault/04-Meetings/2026-09-07-facilities.md', content, 'Facilities budget', Date.parse(OUTREACH_CLOCK.now), Buffer.byteLength(content), 'facilities-fixture');
+    }
+    const result = await recallEverything(OUTREACH_OBJECTIVE, { ...OUTREACH_CLOCK, purpose: 'ambient', limit: 30, perStore: 20 });
+    const refs = new Set(result.hits.map(hit => `${hit.type}:${hit.ref}`));
+    assert.ok(refs.has(`fact:${seeded.fact.id}`), 'task context is retained without inventing owner facts');
+    assert.ok(refs.has(`entity:${seeded.entity}`));
+    assert.ok(refs.has(`resource:${seeded.pointer.id}`));
+    assert.ok(refs.has(`vault:${seeded.notePath}`), 'the note leg did not short-circuit to unrelated same-day meetings');
+    assert.equal(result.purpose, 'ambient');
+    assert.equal(result.answerability, 'partial', 'context does not certify all thirty accounts or the whole outreach job');
+    assert.ok(result.hits.every(hit => !hit.whyRecalled?.includes('exact temporal match')), 'ambient date words do not certify targeted meeting evidence');
+    assert.match(formatUnifiedPrimer(result, 6000), /scope: ambient task context/);
+  });
+}
+
+test('targeted meeting recall never falls back to yesterday while ambient context keeps its actual occurrence date', async () => {
+  const occurredAt = '2026-09-06T20:24:00.000Z';
+  const meeting = recordMemoryEpisode({ kind: 'tool_result', subtype: 'meeting', title: 'Scorpion outreach meeting',
+    sourceUri: 'meeting://fixture/yesterday-outreach', occurredAt, content: 'Scorpion outreach meeting: approved account research before writing emails.' });
+  const query = 'What was the Scorpion outreach meeting today about?';
+  const targeted = await recallEverything(query, { ...OUTREACH_CLOCK, stores: ['episode'], graphDepth: 0 });
+  assert.equal(targeted.answerability, 'insufficient');
+  assert.deepEqual(targeted.hits, [], 'an empty exact-date query does not import yesterday as an answer');
+  const ambient = await recallEverything(query, { ...OUTREACH_CLOCK, purpose: 'ambient', stores: ['episode'], graphDepth: 0 });
+  assert.equal(ambient.hits[0]?.ref, meeting.id);
+  assert.equal(ambient.hits[0]?.validFrom, occurredAt);
+  assert.equal(ambient.answerability, 'partial');
+  assert.match(formatUnifiedPrimer(ambient), /occurred_at: 2026-09-06T20:24:00.000Z/);
+  assert.ok(!ambient.hits[0]?.whyRecalled?.includes('exact temporal match'));
+});
+
+test('a compound ambient task may retain both a meeting and separate brand context; targeted meeting scope remains exact', async () => {
+  const seeded = seedOutreachContext();
+  const meeting = recordMemoryEpisode({ kind: 'tool_result', subtype: 'meeting', title: 'Scorpion outreach meeting', sourceUri: 'meeting://fixture/today-outreach',
+    occurredAt: '2026-09-07T18:00:00.000Z', content: 'Meeting: Scorpion outreach meeting\nSummary: Brett requested value-led account research before writing emails and asked the team to use the established brand voice for the account-specific proposals.' });
+  const ambient = await recallEverything("Review today's Scorpion outreach meeting and use Brett's Market Leader account and email brand context to draft a plan.",
+    { ...OUTREACH_CLOCK, purpose: 'ambient', limit: 30, perStore: 20 });
+  assert.ok(ambient.hits.some(hit => hit.type === 'fact' && hit.ref === String(seeded.fact.id)));
+  assert.ok(ambient.hits.some(hit => hit.type === 'episode' && hit.ref === meeting.id));
+  const targeted = await recallMemory('What was the meeting I had today about?', { ...OUTREACH_CLOCK, stores: ['episode'], graphDepth: 0 });
+  assert.equal(targeted.answerability, 'supported');
+  assert.deepEqual(targeted.hits.map(hit => hit.ref.id), [meeting.id]);
+  assert.ok(targeted.hits[0]?.whyRecalled.includes('exact temporal match'));
+});
+
+test('ambient note keeps its complete indexed body with the existing soft primer floor and strict tool budget', async () => {
+  const filePath = '/fixture-vault/Research/selected-note-full-body.md';
+  const title = `Detailed source reference ${'with original title words '.repeat(7)}end of original title`;
+  const body = `## Findings\nBODY_START ${'The selected observation is retained as source evidence. '.repeat(12)} BODY_TAIL_734`;
+  const chunks = chunkMarkdown(`---\nlookup_ref: hydrationonly734\ntitle: "${title}"\nsource_date: 2026-07-14\n---\n${body}`);
+  assert.equal(chunks.length, 2, 'actual producer separates metadata and one complete body section');
+  const insert = openMemoryDb().prepare(`
+    INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  chunks.forEach((chunk, index) => insert.run(filePath, index, chunk.content, chunk.title,
+    Date.now(), Buffer.byteLength(chunk.content), chunk.contentHash));
+  const result = await recallEverything('hydrationonly734', {
+    purpose: 'ambient', stores: ['vault'], graphDepth: 0, limit: 1,
+  });
+  assert.equal(result.hits.length, 1);
+  assert.equal(result.hits[0]?.ref, filePath);
+  assert.equal(result.hits[0]?.title, title);
+  assert.ok(result.hits[0]?.snippet.includes(chunks[1]!.content));
+  assert.equal(result.hits[0]?.truncated, false, 'projection preserves the indexed excerpt; it does not assert whole-note completeness');
+  assert.equal(result.answerability, 'partial');
+  const primer = formatUnifiedPrimer(result, 4_000);
+  assert.ok(primer.includes(title), 'no independent title clipping below the overall budget');
+  assert.match(primer, /BODY_START.*BODY_TAIL_734/s);
+  assert.match(primer, /source_date: 2026-07-14/);
+  assert.match(primer, /Indexed excerpt/);
+  assert.ok(primer.includes(filePath));
+  assert.deepEqual(visibleUnifiedPrimerHits(result, 200).map(hit => hit.ref), [filePath],
+    'the existing nonempty primer floor retains the complete top note and its actual exposure ref');
+  const softFloorPrimer = formatUnifiedPrimer(result, 200);
+  assert.ok(softFloorPrimer.length > 200, 'the primer budget is intentionally soft for its only/top hit');
+  assert.ok(softFloorPrimer.includes(title));
+  assert.match(softFloorPrimer, /BODY_START.*BODY_TAIL_734/s);
+  assert.ok(softFloorPrimer.includes(filePath));
+  assert.deepEqual(visibleUnifiedRecallHits(result, 200), [],
+    'the separate strict tool-output budget omits the whole oversized note and its visible ref');
+  assert.doesNotMatch(formatUnifiedRecall(result, 200), /BODY_START|BODY_TAIL_734/);
+
+  const smallFact = { type: 'fact' as const, ref: 'small-dated-fact', title: 'Dated fact',
+    snippet: 'Snapshot recorded 2026-07-14.', score: 0.1 };
+  const mixed = { ...result, hits: [result.hits[0]!, smallFact], perStore: { vault: 1, fact: 1 } };
+  const smallOnly = { ...mixed, hits: [smallFact] };
+  const mixedBudget = Math.max(formatUnifiedPrimer(smallOnly).length, formatUnifiedRecall(smallOnly).length) + 5;
+  assert.ok(softFloorPrimer.length > mixedBudget);
+  assert.deepEqual(visibleUnifiedPrimerHits(mixed, mixedBudget).map(hit => hit.ref), [smallFact.ref],
+    'an oversized first note does not suppress the later fitting fact or get credited when omitted');
+  assert.deepEqual(visibleUnifiedRecallHits(mixed, mixedBudget).map(hit => hit.ref), [smallFact.ref]);
+  assert.match(formatUnifiedPrimer(mixed, mixedBudget), /Snapshot recorded 2026-07-14/);
+  assert.doesNotMatch(formatUnifiedPrimer(mixed, mixedBudget), /BODY_START|BODY_TAIL_734/);
 });

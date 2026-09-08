@@ -22,6 +22,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-large-catalog-discovery-'));
@@ -45,6 +46,7 @@ const ports = await import('../runtime/harness/production-capability-ports.js');
 const adapters = await import('../runtime/harness/production-capability-adapters.js');
 const catalogAdapter = await import('../runtime/harness/production-capability-adapter.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
+const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const { buildPlanTaskTool } = await import('../tools/plan-tools.js');
 const { buildScopedLocalToolSearch } = await import('../tools/local-runtime-tools.js');
 const providerSources = await import('../tools/tool-search-provider-sources.js');
@@ -288,6 +290,7 @@ interface HostInvocationSession {
     modelRequestBytes: number[],
   ): Promise<unknown>;
   finish(): Promise<void>;
+  readonly settled: boolean;
 }
 
 function createHostInvocationSession(
@@ -312,6 +315,7 @@ function createHostInvocationSession(
   let wake: (() => void) | null = null;
   let finishing = false;
   let emittedCalls = 0;
+  let transcriptSettled = false;
 
   const enqueue = (instruction: QueuedInstruction): void => {
     queued.push(instruction);
@@ -516,9 +520,10 @@ function createHostInvocationSession(
       if (instruction.kind === 'call') instruction.reject(error);
     }
     throw error;
-  });
+  }).finally(() => { transcriptSettled = true; });
 
   return {
+    get settled() { return transcriptSettled; },
     invoke(tool, input, callId, modelRequestBytes) {
       assert.equal(finishing, false, 'cannot append a tool call after finishing the host transcript');
       assert.ok(allTools.includes(tool), `tool ${tool.name} is outside the sealed host transcript`);
@@ -549,6 +554,7 @@ function assertNoCurrentAuthority(identity: { sessionId: string; sourceUserSeq: 
 async function preparePermutation(
   catalog: GeneratedCatalog,
   mutation: 'none' | 'removed' | 'renamed' | 'drifted' | 'missing-version' = 'none',
+  diagnostic?: { failAfterDiscovery?: Error; cleanupObserved?: { settled: boolean; error?: string } },
 ): Promise<{
   identity: { sessionId: string; sourceUserSeq: number; turn: number };
   planning: PlanningContext;
@@ -587,6 +593,15 @@ async function preparePermutation(
     data: { text: catalog.objective },
   });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('the fixture primary model owns planning'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: catalog.objective, toolkit: catalog.toolkit,
+      accountIdentity: `connection-${catalog.seed}`,
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
+  });
 
   // This is intentionally a high-scoring memory/index row with no schema,
   // live definition, manifest, proof, or invoke port. It is advisory poison,
@@ -727,6 +742,7 @@ async function preparePermutation(
     String(source.data.text),
     deliveredPreambles,
   );
+  try {
   const sourceText = returnedText(await invocation.invoke(searchTool, {
     query: 'source role search restaurant records by city',
     role_key: catalog.sourceRole,
@@ -753,6 +769,7 @@ async function preparePermutation(
     })}`);
   }
   const destinationText = returnedText(destinationOutput);
+  if (diagnostic?.failAfterDiscovery) throw diagnostic.failAfterDiscovery;
 
   type SearchBody = {
     results: Array<{ name: string; capabilityRef?: string; planningRefStatus?: string }>;
@@ -878,6 +895,14 @@ async function preparePermutation(
       businessCrossings: 0,
     },
   };
+  } catch (error) {
+    let cleanupError: string | undefined;
+    try { await invocation.finish(); } catch (failure) { cleanupError = String(failure); }
+    if (diagnostic) diagnostic.cleanupObserved = { settled: invocation.settled,
+      ...(cleanupError ? { error: cleanupError } : {}) };
+    if (cleanupError) console.error(`[large-catalog] setup cleanup: ${cleanupError}`);
+    throw error; // The original assertion remains the primary failure.
+  }
 }
 
 let businessCrossings = 0;
@@ -887,6 +912,7 @@ adapters.installProductionTransport(async () => {
 });
 
 after(() => {
+  semanticPorts.installTurnSemanticModelPort(null);
   schemaCache._setToolSchemaLoaderForTests(null);
   schemaCache.resetToolSchemaCache();
   contracts._clearToolContractsForTests();
@@ -902,6 +928,20 @@ after(() => {
   eventlog.closeEventLog();
   globalThis.fetch = originalFetch;
   rmSync(HOME, { recursive: true, force: true });
+});
+
+test('failed preparation releases its already-started real host and rethrows the original assertion', { timeout: 15_000 }, async () => {
+  const original = new assert.AssertionError({ message: 'deliberate preparation assertion',
+    actual: 'fixture failure', expected: 'fixture ready', operator: 'strictEqual' });
+  const diagnostic: { failAfterDiscovery: Error; cleanupObserved?: { settled: boolean; error?: string } } = {
+    failAfterDiscovery: original,
+  };
+  const started = Date.now();
+  await assert.rejects(preparePermutation(generatedCatalog(30_001), 'none', diagnostic), error => error === original);
+  assert.equal(diagnostic.cleanupObserved?.settled, true, 'the real host outcome promise finished before setup rejected');
+  assert.equal(diagnostic.cleanupObserved?.error, undefined);
+  assert.ok(Date.now() - started < 10_000, 'cleanup must not wait for the existing 300-second host budget');
+  assert.equal(businessCrossings, 0);
 });
 
 test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live disclosed refs', {
@@ -1043,6 +1083,15 @@ test('GATE: a legacy input-digest disclosure rebuilds full staged identity after
     data: { text: catalog.objective },
   });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('the fixture primary model owns planning'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: catalog.objective, toolkit: catalog.toolkit,
+      accountIdentity: `connection-${catalog.seed}`,
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
+  });
   const planningCandidates = [catalog.sourceSlug, catalog.destinationSlug].map((name) => ({
     name,
     schema: catalog.schemaOf(name)!,
@@ -1167,6 +1216,15 @@ test('GATE: an initially live selected Composio ref is revalidated after the fir
       data: { text: catalog.objective },
     });
     const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('the fixture primary model owns planning'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: catalog.objective, toolkit: catalog.toolkit,
+      accountIdentity: `connection-${catalog.seed}`,
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
+  });
     const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
     assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
     if (!primed.ok) throw new Error(primed.reason);

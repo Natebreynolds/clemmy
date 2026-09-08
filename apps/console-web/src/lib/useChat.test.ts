@@ -1,7 +1,10 @@
+import { historyToMessages } from '../features/conversations/chat/conversation-history';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ChatPostCancelledError,
+  activeTurnTaskMode,
+  inFlightTurnSince,
   appendLiveApprovalCard,
   applyBridgedWorkflowActivity,
   chatApprovalReply,
@@ -14,6 +17,8 @@ import {
   progressLabel,
   reduceActivity,
   retainPendingChatPost,
+  loadPendingChatPost,
+  savePendingChatPost,
   terminalCompletionPresentation,
   workflowStepLabelFromSession,
   type ActivityItem,
@@ -664,12 +669,20 @@ test('reduceActivity: external_write folds into a plain-human effect row, mirror
   assert.equal(a.length, 1);
   assert.equal(a[0].kind, 'event');
   assert.equal(a[0].variant, 'write');
+  assert.equal(a[0].label, 'Sending a message to paul@example.com');
+  assert.equal(a[0].status, 'running');
+  assert.notEqual(a[0].tone, 'success');
+  a = reduceActivity(a, ev('external_write_succeeded', { callId: 'w1', targets: ['paul@example.com'] }));
+  assert.equal(a.length, 1);
   assert.equal(a[0].label, 'Sent a message to paul@example.com');
   assert.equal(a[0].status, 'done');
   assert.equal(a[0].tone, 'success');
 
   // A create shape reads as a record; targets beyond 3 collapse to a "+N more".
   a = reduceActivity(a, ev('external_write', { shapeKey: 'HUBSPOT_CREATE_CONTACT', targets: ['a', 'b', 'c', 'd', 'e'], callId: 'w2' }));
+  assert.equal(a[1].label, 'Creating a record to a, b, c (+2 more)');
+  assert.equal(a[1].status, 'running');
+  a = reduceActivity(a, ev('external_write_succeeded', { callId: 'w2', targets: ['a', 'b', 'c', 'd', 'e'] }));
   assert.equal(a[1].label, 'Created a record to a, b, c (+2 more)');
 });
 
@@ -980,4 +993,60 @@ test('a delivered rescue completion is a SUCCESS, never "Didn\'t finish"', () =>
     '',
   );
   assert.equal(realFail.status, 'failed');
+});
+
+
+test('pending Plan and Execute posts survive reopen with exact mode, revision, attachments, and request identity', async () => {
+  const values = new Map<string, string>();
+  const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
+  const ref = { planId: 'plan-reviewed', revision: 3, digest: 'e'.repeat(64) };
+  const pending = retainPendingChatPost(null, { input: 'Execute reviewed plan', sessionId: null, attachments: ['attachment-1'], taskMode: { version: 1, kind: 'execute', executeRef: ref } }, () => 'exact-key');
+  savePendingChatPost(storage, 'outbox', pending);
+  ref.revision = 10;
+  const restored = loadPendingChatPost(storage, 'outbox');
+  assert.deepEqual(restored, pending);
+  const calls: unknown[][] = [];
+  await postPendingChatWithRetry(restored!, { retryDelaysMs: [0], wait: async () => {}, transport: async (...args) => {
+    calls.push(args);
+    if (calls.length === 1) throw new TypeError('offline');
+    return { sessionId: 'accepted', streamUrl: '/api/sessions/accepted/events', status: 'started', mode: 'fresh' };
+  } });
+  assert.deepEqual(calls[0], calls[1]);
+  assert.deepEqual(calls[0], [pending.input, null, ['attachment-1'], 'exact-key', pending.taskMode]);
+  const plan = retainPendingChatPost(pending, { input: pending.input, sessionId: null, attachments: pending.attachments, taskMode: { version: 1, kind: 'plan' } }, () => 'plan-key');
+  assert.notEqual(plan.fingerprint, pending.fingerprint);
+  const revision = retainPendingChatPost(pending, { input: pending.input, sessionId: null, attachments: pending.attachments, taskMode: { version: 1, kind: 'execute', executeRef: { ...ref, revision: 4 } } }, () => 'revision-key');
+  assert.notEqual(revision.clientRequestId, pending.clientRequestId);
+  values.set('outbox', JSON.stringify({ ...pending, taskMode: { version: 1, kind: 'normal' } }));
+  assert.equal(loadPendingChatPost(storage, 'outbox'), null, 'changed mode cannot reuse retained request fingerprint');
+});
+
+
+test('desktop history restores exact Plan revision and mode without turning it into legacy approval', () => {
+  const ref = { planId: 'plan-keep', revision: 2, digest: 'f'.repeat(64) };
+  const messages = historyToMessages([
+    { role: 'user', text: 'Plan the workflow and workspace changes', createdAt: 'now', taskMode: { version: 1, kind: 'plan' } },
+    { role: 'assistant', text: 'Review the full plan.', createdAt: 'now', planArtifactRef: ref, taskMode: { version: 1, kind: 'plan' } },
+  ]);
+  assert.equal(messages[0].taskMode?.kind, 'plan');
+  assert.deepEqual(messages[1].planArtifactRef, ref);
+  assert.equal(messages[1].planProposalId, undefined);
+  assert.equal(messages[1].status, 'complete');
+});
+
+
+test('desktop reattach restores Plan and Execute from the exact active source', () => {
+  const ref = { planId: 'plan-restored', revision: 3, digest: 'a'.repeat(64) };
+  for (const taskMode of [{ version: 1, kind: 'plan' }, { version: 1, kind: 'execute', executeRef: ref }]) {
+    const events = [
+      { seq: 10, type: 'user_input_received', data: { taskMode: { version: 1, kind: 'normal' } } },
+      { seq: 11, type: 'conversation_completed', data: {} },
+      { seq: 12, type: 'user_input_received', data: { taskMode } },
+      { seq: 13, type: 'tool_called', data: {} },
+      { seq: 14, type: 'user_input_received', data: { synthetic: true, taskMode: { version: 1, kind: 'normal' } } },
+    ];
+    const source = inFlightTurnSince(events);
+    assert.equal(source, 12);
+    assert.deepEqual(activeTurnTaskMode(events, source!), taskMode);
+  }
 });

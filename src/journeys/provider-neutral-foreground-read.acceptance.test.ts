@@ -35,6 +35,7 @@ process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 process.env.CLEMMY_SEMANTIC_RECALL = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_COMPLETION_REVIEW = 'on';
 process.env.CLEMMY_BRAIN_FALLOVER = 'off';
 process.env.CLEMMY_AUTH_FALLOVER = 'off';
 process.env.CLEMMY_PROACTIVE_REPORT_DEFER = 'off';
@@ -625,9 +626,35 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   assert.equal(settledProviderPages, 2);
   assert.deepEqual(delivery.errors, []);
   assert.deepEqual(delivery.followups, []);
-  assert.equal(delivery.edits.at(-1) ?? delivery.initial.at(-1), success);
+  const deliveredText = delivery.edits.at(-1) ?? delivery.initial.at(-1);
+  assert.ok(deliveredText?.startsWith(`${success}\n\nVerification note:`),
+    'preserve the completed provider read and the truthful unavailable-review note');
 
   const events = eventlog.listEvents(sessionId);
+  const completion = events.find(event => event.type === 'conversation_completed'
+    && event.data.sourceUserSeq === sourceUserSeq);
+  assert.ok(completion);
+  const reviewRef = completion.data.completionVerdictRef as Record<string, unknown>;
+  assert.ok(reviewRef);
+  const review = events.find(event => event.id === reviewRef.eventId);
+  assert.equal(review?.type, 'goal_alignment_judged');
+  assert.equal(review?.seq, reviewRef.seq);
+  assert.equal(review?.data.sourceUserSeq, sourceUserSeq);
+  assert.equal(review?.data.failedOpen, true, 'no completion provider wire is installed by this read-only fixture');
+  assert.equal(review?.data.replyDigest, sha256(success));
+  assert.equal(review?.data.objectiveDigest, sha256(prompt));
+  assert.equal(typeof review?.data.reason, 'string');
+  assert.ok(deliveredText?.includes(`Verification note: ${review!.data.reason}`));
+  assert.match(deliveredText ?? '', /This result remains unreviewed\./);
+  assert.doesNotMatch(deliveredText ?? '', /accepting completion/);
+  assert.equal(reviewRef.verified, false);
+  assert.equal(reviewRef.failedOpen, true);
+  assert.equal(reviewRef.disposition, 'enabled_unavailable');
+  assert.equal(reviewRef.policyEvidence, 'captured');
+  assert.equal(reviewRef.deliveredTextIsJudgedText, false);
+  assert.equal(completion.data.verificationDetail, 'completion_review_failed_open');
+  assert.equal(completion.data.delivered, false, 'business success does not become reviewed terminal acceptance');
+  assert.equal(completion.data.reason, 'blocked');
   assert.equal(events.filter((event) => event.type === 'conversation_completed'
     && event.data.sourceUserSeq === sourceUserSeq).length, 1);
   assert.equal(events.some((event) => event.type === 'turn_graph_compiled'

@@ -1,5 +1,7 @@
+import { workflowOriginCompletionReviewRequired, reviewWorkflowOriginCompletion } from './workflow-origin-completion-review.js';
 import {
   listEvents,
+  getRunAttemptBySourceUserSeq,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
 import {
@@ -188,13 +190,17 @@ function preparedWorkflowOriginTerminal(
         fallbackText: renderedText,
       })
     : renderedText;
+  const parentAttempt = getRunAttemptBySourceUserSeq(input.observer.originSessionId, source.seq);
   return {
     source,
     identity: {
       sessionId: input.observer.originSessionId,
       turn: source.turn,
       sourceUserSeq: source.seq,
+      // Immutable workflow settlement uses the child/group run identity. The
+      // exact parent attempt is separate and wins eventlog's owner lookup.
       runId: input.identityRunId ?? input.runId,
+      ...(parentAttempt ? { attemptId: parentAttempt.attemptId } : {}),
     },
     text,
     renderedDetail: publicReplyText(input.detail, ''),
@@ -271,7 +277,8 @@ export function workflowOriginTerminalNeedsAsyncJudge(
 ): boolean {
   const prepared = preparedWorkflowOriginTerminal(input);
   if (!prepared || workflowOriginTerminalRowExists(prepared)) return false;
-  return Boolean(workflowOriginTerminalAssessment(prepared, input)?.deliveryGap);
+  return workflowOriginCompletionReviewRequired(input, prepared.text)
+    || Boolean(workflowOriginTerminalAssessment(prepared, input)?.deliveryGap);
 }
 
 /** A checkpoint is not allowed to make its own publish-time hold decision.
@@ -348,6 +355,8 @@ export function commitWorkflowOriginTerminal(
 ): DeliveryCommitResult | null {
   const prepared = preparedWorkflowOriginTerminal(input);
   if (!prepared) return null;
+  if (!workflowOriginTerminalRowExists(prepared)
+    && workflowOriginCompletionReviewRequired(input, prepared.text)) return null;
   return commitTurnOutcome(workflowTurnOutcome(
     prepared.identity,
     prepared.renderedDetail ? workflowTerminalProposalOutcome(input.outcome) : 'failed',
@@ -386,6 +395,14 @@ export async function reviewAndCommitWorkflowOriginTerminal(
   // committer decode/fail it on the synchronous path; never spend a judge call
   // after publication already occurred.
   if (workflowOriginTerminalRowExists(prepared)) return commitWorkflowOriginTerminal(input);
+  // Captured optional completion review belongs to the actual joined child
+  // result and exact public reply, never the earlier queue acknowledgement.
+  // Revalidation after await fences stale child bytes/objectives/terminals.
+  const completion = await reviewWorkflowOriginCompletion(input, prepared.text);
+  if (completion === 'stale') return null;
+  if (completion === 'reviewed' || completion === 'unavailable') {
+    return commitWorkflowOriginTerminal(input);
+  }
   const assessment = workflowOriginTerminalAssessment(prepared, input);
   if (!assessment?.deliveryGap) return commitWorkflowOriginTerminal(input);
 

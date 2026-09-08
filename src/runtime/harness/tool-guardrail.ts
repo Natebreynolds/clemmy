@@ -249,6 +249,38 @@ function composioSlugOf(args: unknown): string | undefined {
  *  Proven against the 2026-07-11 historical replay: entity-distinctness splits
  *  the 26 genuine serial-read batches from the 5 refinement/retry false-fires. */
 const FANOUT_ENTITY_KEYS = ['id', 'message_id', 'thread_id', 'target', 'targets', 'url', 'keyword', 'q', 'query', 'tableIdOrName', 'domain'] as const;
+
+/**
+ * Does this call ride an admitted LIVE (off-machine) capability?
+ *
+ * Reads the host-authored `requirement_id` the work-call carrier already
+ * supplies — a typed field this process minted, not a guess about the tool's
+ * name or the user's words. `cap:live:` is the realm marker for a capability
+ * that crosses the boundary.
+ */
+function callCarriesLiveCapability(args: unknown): boolean {
+  const seen = new Set<unknown>();
+  const walk = (value: unknown, depth: number): boolean => {
+    if (depth > 4 || value == null) return false;
+    if (typeof value === 'string') {
+      return value.startsWith('cap:live:');
+    }
+    if (typeof value !== 'object' || seen.has(value)) return false;
+    seen.add(value);
+    const row = value as Record<string, unknown>;
+    const requirement = row.requirement_id ?? row.requirementId;
+    if (typeof requirement === 'string' && requirement.startsWith('cap:live:')) return true;
+    for (const key of ['args', 'args_json', 'arguments', 'input']) {
+      const nested = row[key];
+      if (typeof nested === 'string') {
+        try { if (walk(JSON.parse(nested), depth + 1)) return true; } catch { /* not json */ }
+      } else if (walk(nested, depth + 1)) return true;
+    }
+    return false;
+  };
+  try { return walk(args, 0); } catch { return false; }
+}
+
 function fanoutEntityOf(toolName: string, args: unknown): string | undefined {
   try {
     let inner: unknown = toolName === 'composio_execute_tool'
@@ -1008,7 +1040,28 @@ export function evaluateToolCall(
   // are session plumbing, not per-item external fetches).
   const slug = toolName === 'composio_execute_tool' ? composioSlugOf(args) : undefined;
   const mcpFanoutTool = !slug && toolName.includes('__') && !/clementine/i.test(toolName);
-  const fanoutKey = slug ? `composio::${slug}` : mcpFanoutTool ? `mcp::${toolName}` : undefined;
+  // A LIVE capability is a per-item EXTERNAL fetch whatever its name looks like.
+  //
+  // Fan-out tracking used to be keyed on name spelling alone: a composio slug,
+  // or a `__` in the tool name. `salesforce_sf_soql_query` has neither, so it
+  // was silently treated as local plumbing that "legitimately serializes" —
+  // and 28 sequential per-account SOQL calls were never counted, never nudged,
+  // and never blocked (live 2026-09-07, source 143751: the turn ran 15 minutes
+  // and was killed with nothing written). Spelling is not a realm.
+  //
+  // `requirement_id` is host-authored and names the exact admitted capability;
+  // a `cap:live:` ref means the call leaves this machine. Pure-local tools
+  // (read_file, memory_*, execution_*) carry no live requirement and keep
+  // serializing freely, which is the behaviour the old `__` test was reaching
+  // for.
+  const liveFanoutTool = !slug && !mcpFanoutTool && callCarriesLiveCapability(args);
+  const fanoutKey = slug
+    ? `composio::${slug}`
+    : mcpFanoutTool
+      ? `mcp::${toolName}`
+      : liveFanoutTool
+        ? `live::${toolName}`
+        : undefined;
   const fanoutEntity = fanoutKey ? fanoutEntityOf(toolName, args) : undefined;
   const mutatingCall = classified.mutating;
   const dangerousWrite = classified.dangerousWrite;

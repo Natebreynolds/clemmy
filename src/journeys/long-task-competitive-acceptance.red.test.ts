@@ -951,7 +951,7 @@ test('GATE surface: an advertised worker with a valid packet still requires exac
   assert.equal(eventlog.listEvents(session.id, { types: ['worker_started', 'worker_result', 'turn_graph_compiled', 'approval_requested'] }).length, 0);
 });
 
-test('GATE context: repeated identical small results become one model-visible value plus recall references', () => {
+test('GATE context: small repeated results stay verbatim until actual configured result pressure', () => {
   const session = eventlog.createSession({ id: 'long-task-identical-results', kind: 'chat' });
   const payload = `IDENTICAL_RESULT::${'r'.repeat(700)}`;
   const items: AgentInputItem[] = [userMessage('Inspect the same stable fact across twelve partitions.')];
@@ -964,29 +964,44 @@ test('GATE context: repeated identical small results become one model-visible va
     eventlog.writeToolOutput({ sessionId: session.id, callId, tool: 'partition_read', output: payload });
   }
 
-  const compacted = compaction.compactInFlightToolContext(items, session.id);
+  const original = JSON.stringify(items);
+  const unpressured = compaction.compactInFlightToolContext(items, session.id);
+  assert.ok(unpressured.resultTokensBefore < unpressured.triggerTokens);
+  assert.equal(unpressured.applied, false, 'identical bytes alone are not context pressure');
+  assert.equal(unpressured.nextItems, items, 'the complete small frame, including its newest result, stays verbatim');
+  assert.equal(JSON.stringify(unpressured.nextItems), original);
+  assert.equal(original.split(payload).length - 1, 12);
+  assert.equal(unpressured.retainedPairs, 12);
+  assert.deepEqual(unpressured.callIds, []);
+  assert.equal(unpressured.beforeTokens, unpressured.afterTokens);
+
+  // The same complete fixture crosses an explicitly configured result budget.
+  // Keep the original6KB oracle here, where pair collapse is actually admitted;
+  // the default-budget84-step pressure journey below remains unchanged.
+  const compacted = compaction.compactInFlightToolContext(items, session.id, {
+    resultTriggerTokens: 1_000,
+    retainedResultBudgetTokens: 1_000,
+    minRetainPairs: 1,
+    maxRetainPairs: 1,
+  });
   const visible = JSON.stringify(compacted.nextItems);
   const rawCopies = visible.split(payload).length - 1;
-  const recallReferences = visible.match(/recall_tool_result/g)?.length ?? 0;
   const allCallIdsAddressable = callIds.every((callId) => visible.includes(callId));
   const allRawResultsExact = callIds.every((callId) => eventlog.getToolOutput(session.id, callId)?.output === payload);
   const visibleBytes = Buffer.byteLength(visible, 'utf8');
 
-  assert.deepEqual({
-    compactionApplied: compacted.applied,
-    oneVisibleRawCopy: rawCopies === 1,
-    duplicateReferencesPresent: recallReferences >= 11,
-    allCallIdsAddressable,
-    allRawResultsExact,
-    underSixKilobytes: visibleBytes <= 6_000,
-  }, {
-    compactionApplied: true,
-    oneVisibleRawCopy: true,
-    duplicateReferencesPresent: true,
-    allCallIdsAddressable: true,
-    allRawResultsExact: true,
-    underSixKilobytes: true,
-  }, JSON.stringify({ rawCopies, recallReferences, visibleBytes }));
+  assert.ok(compacted.resultTokensBefore > compacted.triggerTokens);
+  assert.equal(compacted.applied, true);
+  assert.equal(compacted.collapsed, 11);
+  assert.equal(compacted.retainedPairs, 1);
+  assert.deepEqual(compacted.callIds, callIds.slice(0, -1));
+  assert.equal(rawCopies, 1);
+  assert.match(visible, /recall_tool_result/);
+  assert.equal(allCallIdsAddressable, true);
+  assert.equal(allRawResultsExact, true);
+  assert.ok(visibleBytes <= 6_000, JSON.stringify({ rawCopies, visibleBytes }));
+  assert.deepEqual(compacted.nextItems.slice(-2), items.slice(-2), 'the newest observation retains both exact call and result');
+  assert.equal(JSON.stringify(items), original, 'model-only projection never changes canonical history');
 });
 
 function acceptResultTask(label: string) {

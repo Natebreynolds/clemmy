@@ -326,6 +326,7 @@ test('the production planning tool_search card resolves the exact long role to c
   }));
   let fuzzyCalls = 0;
   let exactCalls = 0;
+  const exactBatches: string[][] = [];
   let exactRequested: string[] = [];
   composio.resetComposioClient();
   composio.__test__.setComposioApiKeyOverride('northstar-tool-search-key');
@@ -349,6 +350,7 @@ test('the production planning tool_search card resolves the exact long role to c
         if (Array.isArray(input.tools)) {
           exactCalls += 1;
           exactRequested = [...input.tools];
+          exactBatches.push([...input.tools] as string[]);
           return input.tools.includes(current.slug) ? [current] : [];
         }
         fuzzyCalls += 1;
@@ -387,9 +389,20 @@ test('the production planning tool_search card resolves the exact long role to c
   assert.equal(names.includes(deprecated.slug), false);
   assert.deepEqual(result.schemas?.[current.slug]?.required, ['q']);
   assert.equal(fuzzyCalls, 1, 'planning discovery pays one bounded fuzzy provider call');
-  assert.equal(exactCalls, 1, 'all lifecycle validation shares one exact provider call');
-  assert.ok(exactRequested.length <= 4);
-  assert.ok(exactRequested.includes(current.slug));
+  // TWO exact calls, each with a distinct job, and neither redundant:
+  //   1. lifecycle hydration during search — resolves the successor slugs a
+  //      deprecated row named, bounded to 4;
+  //   2. one batched materialization of the SELECTED window only.
+  // The older single-call shape materialized every discovered row up front,
+  // including the ones ranking never surfaced. Splitting them pays for exactly
+  // what the page shows, and the successor hydrated in (1) must NOT reappear in
+  // (2) — re-fetching a definition already in hand is the round-trip waste this
+  // asserts against.
+  assert.equal(exactCalls, 2, 'lifecycle hydration and window materialization are one call each');
+  assert.ok(exactBatches[0]!.length <= 4, 'lifecycle hydration stays bounded');
+  assert.ok(exactBatches[0]!.includes(current.slug));
+  assert.equal(exactBatches[1]!.includes(current.slug), false,
+    'the already-hydrated successor is reused, never re-fetched');
 });
 
 const LIFECYCLE_SCHEMA = {

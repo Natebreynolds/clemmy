@@ -23,6 +23,8 @@ const semantic = await import('./admit-and-compile-accepted-source.js');
 const namespaceAlignment = await import('./capability-namespace-alignment.js');
 const eventlog = await import('../harness/eventlog.js');
 const catalogs = await import('../harness/host-capability-catalog-factory.js');
+const manifests = await import('../harness/capability-manifest-store.js');
+const semanticPorts = await import('./turn-semantic-port-registry.js');
 const brackets = await import('../harness/brackets.js');
 const production = await import('../harness/production-capability-adapters.js');
 const providerSources = await import('../../tools/tool-search-provider-sources.js');
@@ -55,6 +57,8 @@ let businessCrossings = 0;
 let providerDefinitionRefreshes = 0;
 
 after(() => {
+  semanticPorts.installTurnSemanticModelPort(null);
+  manifests.installCapabilityManifestStore(null);
   schemaCache._setToolSchemaLoaderForTests(null);
   schemaCache.resetToolSchemaCache();
   composio.__test__.setConnectedAccountsLoader(null);
@@ -151,6 +155,15 @@ test('plan_task refuses the live-shaped Outlook-plus-Slack plan before publicati
   eventlog.resetEventLog();
   schemaCache.resetToolSchemaCache();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('the fixture does not author a plan'); },
+    async judgeAccountSelection(call) {
+      assert.equal(call.acceptedText, ACCEPTED_TEXT);
+      assert.equal(call.mode, 'current_source_default');
+      return { verdict: 'default_compatible', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-account-review' };
+    },
+  });
   businessCrossings = 0;
   providerDefinitionRefreshes = 0;
   production.installProductionTransport(async () => {
@@ -159,7 +172,8 @@ test('plan_task refuses the live-shaped Outlook-plus-Slack plan before publicati
   });
   schemaCache._setToolSchemaLoaderForTests(async () => {
     providerDefinitionRefreshes += 1;
-    throw new Error('namespace conflict must refuse before selected-definition refresh');
+    return { inputParameters: INPUT_SCHEMA, outputParameters: OUTPUT_SCHEMA,
+      providerObservedAt: Date.now(), providerOperationVersion: 'fixture-namespace-v1' };
   });
   composio.resetComposioClient();
   composio.__test__.setComposioApiKeyOverride('namespace-fixture-key');
@@ -220,6 +234,12 @@ test('plan_task refuses the live-shaped Outlook-plus-Slack plan before publicati
   });
   assert.equal(refs[OUTLOOK_OPERATION], `cap:resolved:${OUTLOOK_OPERATION.toLowerCase()}`);
   assert.equal(refs[SLACK_OPERATION], `cap:resolved:${SLACK_OPERATION.toLowerCase()}`);
+  const disclosedCatalog = catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [];
+  for (const operation of [OUTLOOK_OPERATION, SLACK_OPERATION]) {
+    assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.get(refs[operation]!)?.manifest?.operationId, operation,
+      'the negative plan starts with both genuinely published current definitions');
+  }
+  providerDefinitionRefreshes = 0;
   // Exact staging is allowed to refresh the provider definition. The
   // namespace assertion below is specifically about the later plan-admission
   // refusal, so establish its own counter baseline after disclosure finishes.
@@ -356,8 +376,8 @@ test('plan_task refuses the live-shaped Outlook-plus-Slack plan before publicati
     types: ['accepted_task_authority_armed', 'conversation_preamble'],
   }).length, 0);
   assert.deepEqual(deliveredPreambles, []);
-  assert.deepEqual(catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [], [],
-    'a rejected namespace never publishes either selected provider definition');
+  assert.deepEqual(catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [], disclosedCatalog,
+    'a rejected namespace does not alter the definitions already published by discovery');
   assert.equal(providerDefinitionRefreshes, 0,
     'the conflict refuses before selected provider definitions are refreshed');
   assert.equal(businessCrossings, 0);

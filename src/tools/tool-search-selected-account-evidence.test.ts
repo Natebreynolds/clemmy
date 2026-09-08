@@ -24,6 +24,11 @@ const providerSources = await import('./tool-search-provider-sources.js');
 const toolSearch = await import('./tool-search-tool.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const manifests = await import('../runtime/harness/capability-manifest-store.js');
+const production = await import('../runtime/harness/production-capability-adapters.js');
+const schemas = await import('./composio-schema-cache.js');
+const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
 
 const OPERATION = 'OUTLOOK_SEARCH_MESSAGES';
@@ -91,6 +96,11 @@ function installTwoOutlookAccounts(): void {
 }
 
 test.after(() => {
+  semanticPorts.installTurnSemanticModelPort(null);
+  production.installProductionTransport(null);
+  catalogs.installHostCapabilityCatalogFactory(null);
+  manifests.installCapabilityManifestStore(null);
+  schemas._setToolSchemaLoaderForTests(null);
   composio.__test__.setConnectedAccountsLoader(null);
   composio.__test__.setComposioApiKeyOverride(null);
   composio.resetComposioClient();
@@ -101,6 +111,14 @@ test.after(() => {
 test('production staging exposes Scorpion on a resolved catalog-only row without leaking Breakthrough', async () => {
   installTwoOutlookAccounts();
   eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  production.installProductionTransport(async () => { businessExecutions += 1; throw new Error('no business dispatch'); });
+  schemas._setToolSchemaLoaderForTests(async () => ({
+    inputParameters: { type: 'object', properties: { query: { type: 'string' } } },
+    outputParameters: { type: 'object', properties: { value: { type: 'array' } } },
+    providerObservedAt: Date.now(), providerOperationVersion: 'fixture-outlook-search-v1',
+  }));
   const prompt = `Using my Scorpion Outlook account, inspect ${OPERATION} and tell me whether it is ready. Do not read any messages.`;
   const session = eventlog.createSession({ id: 'selected-account-evidence', kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -111,6 +129,15 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
     data: { text: prompt },
   });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('catalog evidence does not author a plan'); },
+    async judgeAccountSelection(call) {
+      assert.equal(call.acceptedText, prompt);
+      assert.equal(call.accountIdentity, SCORPION_EMAIL);
+      return { verdict: 'entailed', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-source-account-judge' };
+    },
+  });
+  const accountSelection = { toolkit: 'outlook', identity: SCORPION_EMAIL, source_quote: prompt };
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
   if (!primed.ok) throw new Error(primed.reason);
@@ -132,6 +159,7 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
         candidates,
         signal: control?.signal,
         deadlineAt: control?.deadlineAt,
+        accountSelection,
       });
       const refs = await semantic.disclosePrimaryModelPlanningCapabilities({
         authority: primed.planning.authority,
@@ -149,6 +177,7 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
   })._registeredTools.tool_search.handler;
   const result = await handler({
     query: prompt,
+    account_selection: accountSelection,
     role_key: 'clause-0:read',
     limit: 8,
     cursor: null,
@@ -169,7 +198,7 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
     }>;
   };
   const row = body.results.find((candidate) => candidate.name === OPERATION);
-  assert.match(row?.capabilityRef ?? '', /^cap:resolved:/);
+  assert.match(row?.capabilityRef ?? '', /^cap:resolved:/, raw);
   assert.equal(row?.planningProvenance, 'authorized_composio');
   assert.deepEqual(row?.selectedAccount, {
     toolkit: 'outlook',

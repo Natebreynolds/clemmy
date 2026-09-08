@@ -13,7 +13,6 @@ const { WORKFLOWS_DIR } = await import('../../memory/vault.js');
 const {
   objectiveExplicitlyNamesWorkflow,
   uniqueEnabledWorkflowMatch,
-  uniqueWorkflowRunRequest,
 } = await import('../../tools/named-workflow-match.js');
 const {
   acceptedSourceIsWorkflowInternal,
@@ -24,6 +23,13 @@ const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delive
 const { satisfyNextScheduledWorkflowOccurrence } = await import('../../execution/workflow-scheduler.js');
 const { renderOutputContractSpec } = await import('../../execution/step-output-verify.js');
 const { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+const { registerOrchestrationTools } = await import('../../tools/orchestration-tools.js');
+const { withToolOutputContext } = await import('./tool-output-context.js');
+let runWorkflow: (input: { name: string }) => Promise<{ content: Array<{ text: string }> }>;
+registerOrchestrationTools({ tool(name: string, _description: string, _schema: unknown, handler: typeof runWorkflow) {
+  if (name === 'workflow_run') runWorkflow = handler;
+} } as never);
+
 const { readdirSync, readFileSync } = await import('node:fs');
 
 const REPLY_TARGET = { type: 'origin_chat' } as const;
@@ -88,43 +94,6 @@ test.beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(path.join(path.dirname(CRON_RUNS_DIR), 'workflow-schedule-state.json'), { force: true });
-});
-
-test('uniqueWorkflowRunRequest: an anaphoric run inherits the unique prior accepted identity', () => {
-  writeWorkflow('platform-49-slack-channel-review', {
-    name: 'Platform 49 Slack Channel Review',
-    description: 'Business-hours channel review',
-    enabled: true,
-    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
-    steps: [{ id: 'post', prompt: 'Post the team update.' }],
-  });
-  seedSlackAndFacebook();
-  const liveFollowUp = 'Can you just run that workflow and get the sheet updated please';
-  assert.equal(uniqueWorkflowRunRequest(liveFollowUp), null, 'the follow-up does not name a catalog entry');
-  const inherited = uniqueWorkflowRunRequest(liveFollowUp, [
-    "What's on my calendar Monday",
-    "What's the latest on the platform 49 updates. Anything stand out in terms of request",
-  ]);
-  assert.ok(inherited);
-  assert.equal(inherited?.slug, 'platform-49-slack-channel-review');
-  assert.equal(
-    uniqueWorkflowRunRequest(liveFollowUp, [
-      "What's the latest on the platform 49 updates",
-      'Did the team activity slack updates go out?',
-    ]),
-    null,
-    'two prior unique identities stay unclaimed',
-  );
-  assert.equal(
-    uniqueWorkflowRunRequest("What's the latest on the platform 49 updates"),
-    null,
-    'a retrieve is not a run request',
-  );
-  const explicit = uniqueWorkflowRunRequest('Run my platform 49 workflow please', [
-    'run my team activity slack updates',
-  ]);
-  assert.ok(explicit);
-  assert.equal(explicit?.slug, 'platform-49-slack-channel-review', 'an explicit current name wins over priors');
 });
 
 test('uniqueEnabledWorkflowMatch: spoken "platform 49 workflow" uniquely matches the numbered slug', () => {
@@ -316,7 +285,7 @@ test('tryHostDispatchNamedWorkflow: fuzzy and management phrasing never authoriz
   );
 });
 
-test('tryHostDispatchNamedWorkflow: a unique run request on a disabled workflow does not queue', () => {
+test('structured workflow_run: an exact disabled workflow does not queue', async () => {
   seedSlackAndFacebook();
   const session = createSession({ kind: 'chat', channel: 'desktop' });
   const source = appendEvent({
@@ -330,16 +299,8 @@ test('tryHostDispatchNamedWorkflow: a unique run request on a disabled workflow 
       originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
     },
   });
-  const result = tryHostDispatchNamedWorkflow({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-    userText: String(source.data.text),
-    route: 'act',
-  });
-  assert.equal(result.status, 'blocked');
-  if (result.status === 'blocked') {
-    assert.equal(result.reason, 'disabled');
-  }
+  const result = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => runWorkflow({ name: 'Team Activity Slack Updates' }));
+  assert.match(result.content[0]!.text, /disabled/);
   assert.equal(
     existsSync(WORKFLOW_RUNS_DIR)
       ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json')).length
@@ -349,7 +310,7 @@ test('tryHostDispatchNamedWorkflow: a unique run request on a disabled workflow 
   );
 });
 
-test('tryHostDispatchNamedWorkflow: a unique enabled run request queues through workflow_run', () => {
+test('structured workflow_run: an exact enabled identity queues through existing admission', async () => {
   writeWorkflow('platform-49-slack-channel-review', {
     name: 'Platform 49 Slack Channel Review',
     description: 'Business-hours channel review',
@@ -370,17 +331,11 @@ test('tryHostDispatchNamedWorkflow: a unique enabled run request queues through 
       originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
     },
   });
-  const result = tryHostDispatchNamedWorkflow({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-    userText: String(source.data.text),
-    route: 'act',
-  });
-  assert.equal(result.status, 'dispatched', JSON.stringify(result));
-  if (result.status === 'dispatched') {
-    assert.equal(result.workflowName, 'Platform 49 Slack Channel Review');
-    assert.ok(result.runId);
-  }
+  const automatic = tryHostDispatchNamedWorkflow({ sessionId: session.id, sourceUserSeq: source.seq, userText: String(source.data.text), route: 'act' });
+  assert.equal(automatic.status, 'not_applicable', 'ordinary prose is interpreted by the foreground model');
+  assert.equal(workflowRunFileCount(), 0);
+  const result = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => runWorkflow({ name: 'Platform 49 Slack Channel Review' }));
+  assert.match(result.content[0]!.text, /Platform 49 Slack Channel Review/);
   const runs = existsSync(WORKFLOW_RUNS_DIR)
     ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json'))
     : [];
@@ -393,9 +348,9 @@ test('tryHostDispatchNamedWorkflow: a workflow step\'s own accepted source never
   // Same text + same catalog as chat: the lexical matcher alone says RUN.
   // Only the source class differs, and the class is what must decide.
   assert.equal(
-    uniqueWorkflowRunRequest(text)?.slug,
+    uniqueEnabledWorkflowMatch(text)?.slug,
     'scorpion-facebook-trends',
-    'setup: the real step text is a unique lexical run request',
+    'setup: the real step text retrieves a unique advisory catalog candidate',
   );
   const session = createSession({ kind: 'workflow', channel: 'workflow' });
   const source = appendEvent({
@@ -512,7 +467,7 @@ test('acceptedSourceIsWorkflowInternal: each durable flag decides alone; chat an
   }
 });
 
-test('tryHostDispatchNamedWorkflow: a cron/background execution session is user-originated and still queues', () => {
+test('tryHostDispatchNamedWorkflow: background prose also requires structured workflow selection', () => {
   writeWorkflow('platform-49-slack-channel-review', {
     name: 'Platform 49 Slack Channel Review',
     description: 'Business-hours channel review',
@@ -541,27 +496,8 @@ test('tryHostDispatchNamedWorkflow: a cron/background execution session is user-
     userText: String(source.data.text),
     route: 'act',
   });
-  assert.equal(result.status, 'dispatched', JSON.stringify(result));
-  assert.equal(workflowRunFileCount(), 1, 'an execution-kind source keeps the shortcut');
-});
-
-test('plan_task twin: the plan_not_required "call workflow_run" short-circuit consults the same predicate first', () => {
-  // Lane parity (carrier sweep): plan_task carries the same lexical
-  // short-circuit. A step with a populated planning card would otherwise be
-  // told to call workflow_run, which the step surface denies by construction.
-  const src = readFileSync(new URL('../../tools/plan-tools.ts', import.meta.url), 'utf8');
-  const fn = src.slice(src.indexOf('async function executePlanTask'), src.indexOf('export function buildPlanTaskTool'));
-  const guardAt = fn.indexOf('acceptedSourceIsWorkflowInternal(sessionId, sourceUserSeq)');
-  const uniqueAt = fn.indexOf('uniqueWorkflowRunRequest(');
-  const shortCircuitAt = fn.indexOf("code: 'plan_not_required'");
-  assert.ok(guardAt >= 0, 'plan_task consults acceptedSourceIsWorkflowInternal');
-  assert.ok(uniqueAt > guardAt && shortCircuitAt > uniqueAt,
-    'the source-class guard decides before the lexical short-circuit can name workflow_run');
-  assert.match(
-    src,
-    /import \{ acceptedSourceIsWorkflowInternal \} from '\.\.\/runtime\/harness\/named-workflow-host-dispatch\.js'/,
-    'one predicate, imported from the dispatcher, not a second spelling',
-  );
+  assert.equal(result.status, 'not_applicable', JSON.stringify(result));
+  assert.equal(workflowRunFileCount(), 0, 'an execution-kind source does not turn prose into queue authority');
 });
 
 test('tryHostDispatchNamedWorkflow: a counted set into one sheet is not a named workflow', () => {

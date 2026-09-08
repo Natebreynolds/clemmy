@@ -14,7 +14,7 @@ test('selfJudge compares the resolved backend, not the transport bucket', () => 
     !SRC.includes('selfJudge: checker.provider === brain.provider'),
     'the coarse bucket comparison must be gone',
   );
-  assert.match(SRC, /selfJudge: sameJudgeFamily\(checker, brain\)/);
+  assert.match(SRC, /selfJudge: sameJudgeFamily\(checker, brain, captured\)/);
   assert.match(SRC, /function sameJudgeFamily\(/);
 });
 
@@ -28,6 +28,7 @@ test('two BYO models are the same family only on the same backend URL', () => {
   const fn = SRC.split('function sameJudgeFamily(')[1]!.split('\nexport function')[0]!;
   assert.match(fn, /resolveByoProviderForModel\(modelId\)/, 'must resolve the per-model backend');
   assert.match(fn, /baseURL/, 'the backend identity is the baseURL');
+  assert.match(fn, /capturedByoBackend\(captured\)\.baseURL/, 'a retained selection must use its captured provider identity');
   assert.match(fn, /return judgeBackend === brainBackend;/);
 });
 

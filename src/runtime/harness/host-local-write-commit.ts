@@ -9,6 +9,7 @@
  * marker by itself grants no authority.
  */
 import { createHash } from 'node:crypto';
+import { withWorkspaceSnapshotHandle } from '../../spaces/workspace-snapshot.js';
 import {
   closeSync,
   constants as fsConstants,
@@ -33,12 +34,19 @@ interface HostLocalWorkspaceCommitComponent {
   bytes: number;
 }
 
-interface HostLocalWorkspaceCommitDocument {
+type HostLocalWorkspaceCommitDocument = {
   version: 1;
   kind: 'workspace_bundle_v1';
   createdId: string;
   components: HostLocalWorkspaceCommitComponent[];
-}
+} | {
+  version: 2;
+  kind: 'workspace_bundle_v2';
+  createdId: string;
+  components: HostLocalWorkspaceCommitComponent[];
+  /** A missing data file is an observed fact, never an invented empty JSON document. */
+  dataAbsent: true;
+};
 
 export interface HostLocalWorkspaceCompoundCommitFacts extends HostLocalWriteCommitFacts {
   components: readonly HostLocalWorkspaceCommitComponent[];
@@ -259,7 +267,11 @@ function safeTargetHandle(root: string, filePath: string): string {
   return handle;
 }
 
-function reopenWorkspaceCompoundCommit(
+function reopenWorkspaceCompoundCommit(facts: HostLocalWriteCommitFacts): HostLocalWorkspaceCompoundCommitFacts | null {
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => reopenWorkspaceCompoundCommitUnlocked(facts)); } catch { return null; }
+}
+
+function reopenWorkspaceCompoundCommitUnlocked(
   facts: HostLocalWriteCommitFacts,
 ): HostLocalWorkspaceCompoundCommitFacts | null {
   try {
@@ -268,15 +280,18 @@ function reopenWorkspaceCompoundCommit(
     if (createHash('sha256').update(receipt.bytes).digest('hex') !== facts.contentDigest) return null;
     if (receipt.bytes.byteLength > 16_384) return null;
     const parsed = JSON.parse(receipt.bytes.toString('utf8')) as HostLocalWorkspaceCommitDocument;
+    const dataAbsent = parsed.version === 2
+      && parsed.kind === 'workspace_bundle_v2'
+      && parsed.dataAbsent === true;
     if (
-      parsed.version !== 1
-      || parsed.kind !== 'workspace_bundle_v1'
+      (!(parsed.version === 1 && parsed.kind === 'workspace_bundle_v1') && !dataAbsent)
       || parsed.createdId !== facts.createdId
       || !Array.isArray(parsed.components)
-      || parsed.components.length !== 3
+      || parsed.components.length !== (dataAbsent ? 2 : 3)
     ) return null;
     const workspacePrefix = `spaces/${facts.createdId}/`;
-    const expectedRoles = ['manifest', 'view', 'data'] as const;
+    if (facts.handle !== `${workspacePrefix}${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`) return null;
+    const expectedRoles = dataAbsent ? ['manifest', 'view'] as const : ['manifest', 'view', 'data'] as const;
     for (let index = 0; index < expectedRoles.length; index += 1) {
       const component = parsed.components[index];
       if (
@@ -298,10 +313,29 @@ function reopenWorkspaceCompoundCommit(
         || createHash('sha256').update(reopened.bytes).digest('hex') !== component.contentDigest
       ) return null;
     }
+    if (dataAbsent) {
+      // Only this closed descriptor variant can omit data. Recheck absence
+      // on every redemption: a newly appearing file invalidates the receipt.
+      if (!committedFileIsAbsent(path.resolve(root, `${workspacePrefix}data.json`))) return null;
+      const manifest = safeCommittedFile(root, path.resolve(root, `${workspacePrefix}space.json`));
+      if ((JSON.parse(manifest.bytes.toString('utf8')) as Record<string, unknown>).contentMode === 'static_snapshot') return null;
+      if (JSON.stringify({
+        version: 2, kind: 'workspace_bundle_v2', createdId: parsed.createdId,
+        components: parsed.components, dataAbsent: true,
+      }) !== receipt.bytes.toString('utf8')) return null;
+    }
     if (JSON.stringify(parsed) !== receipt.bytes.toString('utf8')) return null;
     return { ...facts, components: parsed.components };
   } catch {
     return null;
+  }
+}
+
+function committedFileIsAbsent(filePath: string): boolean {
+  try { lstatSync(filePath); return false; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
   }
 }
 
@@ -629,7 +663,13 @@ export function validateHostLocalWorkspaceStructuredCreateArgs(input: {
  * elsewhere in the document are irrelevant: the primary `/posts` collection
  * and its user-visible mobile mirror must both redeem the frozen contract.
  */
-export function proveHostLocalWorkspaceStructuredCollection(input: {
+export function proveHostLocalWorkspaceStructuredCollection(input: Parameters<typeof proveHostLocalWorkspaceStructuredCollectionUnlocked>[0]): ReturnType<typeof proveHostLocalWorkspaceStructuredCollectionUnlocked> {
+  const facts = parseHostLocalWriteCommitFacts(input.result);
+  if (!facts) return null;
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => proveHostLocalWorkspaceStructuredCollectionUnlocked(input)); } catch { return null; }
+}
+
+function proveHostLocalWorkspaceStructuredCollectionUnlocked(input: {
   result: unknown;
   count: number;
   requiredFields: readonly string[];
@@ -671,7 +711,13 @@ export function proveHostLocalWorkspaceStructuredCollection(input: {
  * `space_save` argument bytes to the manifest/view/data generation without
  * treating an arbitrary local receipt marker as derivation authority.
  */
-export function hostLocalWorkspaceCompoundCommitMatchesArgs(input: {
+export function hostLocalWorkspaceCompoundCommitMatchesArgs(input: Parameters<typeof hostLocalWorkspaceCompoundCommitMatchesArgsUnlocked>[0]): ReturnType<typeof hostLocalWorkspaceCompoundCommitMatchesArgsUnlocked> {
+  const facts = parseHostLocalWriteCommitFacts(input.result);
+  if (!facts) return null;
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => hostLocalWorkspaceCompoundCommitMatchesArgsUnlocked(input)); } catch { return null; }
+}
+
+function hostLocalWorkspaceCompoundCommitMatchesArgsUnlocked(input: {
   result: unknown;
   args: unknown;
 }): HostLocalWorkspaceCompoundCommitFacts | null {
@@ -763,7 +809,15 @@ export function hostLocalWorkspaceCompoundCommitMatchesArgs(input: {
  * every handle has one provider-neutral namespace across Workspaces,
  * workflows, and future local authoring capabilities.
  */
-export function withHostLocalWriteCommitFromFile(input: {
+export function withHostLocalWriteCommitFromFile(input: Parameters<typeof withHostLocalWriteCommitFromFileUnlocked>[0]): string {
+  const root = path.resolve(input.rootDir ?? BASE_DIR);
+  const handle = path.relative(root, path.resolve(input.committedPath)).split(path.sep).join('/');
+  return root === path.resolve(BASE_DIR)
+    ? withWorkspaceSnapshotHandle(handle, () => withHostLocalWriteCommitFromFileUnlocked(input))
+    : withHostLocalWriteCommitFromFileUnlocked(input);
+}
+
+function withHostLocalWriteCommitFromFileUnlocked(input: {
   createdId: string;
   committedPath: string;
   result: string;
@@ -788,14 +842,16 @@ export function withHostLocalWriteCommitFromFile(input: {
  * Workspace store publish descriptor + data + view before the manifest
  * visibility barrier while it still holds the slug mutation lock.
  */
-export function writeHostLocalWorkspaceCommitDocument(input: {
+export interface HostLocalWorkspaceCommitDocumentInput {
   createdId: string;
   receiptPath: string;
   manifest: { path: string; bytes: Buffer | string };
   view: { path: string; bytes: Buffer | string };
-  data: { path: string; bytes: Buffer | string };
+  data: { path: string; bytes: Buffer | string } | null;
   rootDir?: string;
-}): string {
+}
+
+export function serializeHostLocalWorkspaceCommitDocument(input: HostLocalWorkspaceCommitDocumentInput): string {
   if (!validCreatedId(input.createdId)) {
     throw new Error('Local Workspace commit supplied an invalid created id.');
   }
@@ -812,24 +868,65 @@ export function writeHostLocalWorkspaceCommitDocument(input: {
       bytes: bytes.byteLength,
     };
   };
-  const document: HostLocalWorkspaceCommitDocument = {
-    version: 1,
-    kind: 'workspace_bundle_v1',
-    createdId: input.createdId,
-    components: [
-      component('manifest', input.manifest),
-      component('view', input.view),
-      component('data', input.data),
-    ],
-  };
+  const components = [component('manifest', input.manifest), component('view', input.view)];
+  const document: HostLocalWorkspaceCommitDocument = input.data
+    ? {
+        version: 1, kind: 'workspace_bundle_v1', createdId: input.createdId,
+        components: [...components, component('data', input.data)],
+      }
+    : {
+        version: 2, kind: 'workspace_bundle_v2', createdId: input.createdId,
+        components, dataAbsent: true,
+      };
   const receiptHandle = safeTargetHandle(root, input.receiptPath);
   if (receiptHandle !== `spaces/${input.createdId}/${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`) {
     throw new Error('Local Workspace compound receipt path is not canonical.');
   }
+  return JSON.stringify(document);
+}
+
+export function writeHostLocalWorkspaceCommitDocument(input: HostLocalWorkspaceCommitDocumentInput): string {
+  const document = serializeHostLocalWorkspaceCommitDocument(input);
   const tempPath = `${input.receiptPath}.${process.pid}.tmp`;
-  writeFileSync(tempPath, JSON.stringify(document), 'utf8');
+  writeFileSync(tempPath, document, 'utf8');
   renameSync(tempPath, input.receiptPath);
   return input.receiptPath;
+}
+
+/** Stamp a final ordinary save from one locked, safely reopened snapshot.
+ * The caller must validate its saved authoring fields before the descriptor is
+ * written. Data here is current observed content, not a claim of acquisition.
+ * Initial static creates keep their stricter save-time generation descriptor. */
+export function withHostLocalWorkspaceCommitFromCurrentFiles(input: {
+  createdId: string;
+  viewEntry: string;
+  result: string;
+  validate: (parts: { manifest: Buffer; view: Buffer; data: Buffer | null }) => void;
+}): string {
+  const handle = `spaces/${input.createdId}/${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`;
+  return withWorkspaceSnapshotHandle(handle, () => {
+    const root = realpathSync(path.resolve(BASE_DIR));
+    const prefix = `spaces/${input.createdId}/`;
+    if (!validCreatedId(input.createdId) || !validRelativeHandle(input.viewEntry)
+      || !input.viewEntry.startsWith('view/')) throw new Error('Invalid Workspace save commit target');
+    const manifest = safeCommittedFile(root, path.resolve(root, prefix, 'space.json'));
+    const view = safeCommittedFile(root, path.resolve(root, prefix, input.viewEntry));
+    const dataPath = path.resolve(root, prefix, 'data.json');
+    const data = committedFileIsAbsent(dataPath) ? null : safeCommittedFile(root, dataPath);
+    if (manifest.handle !== `${prefix}space.json` || view.handle !== `${prefix}${input.viewEntry}`
+      || (data && data.handle !== `${prefix}data.json`)) throw new Error('Workspace save component path changed');
+    input.validate({ manifest: manifest.bytes, view: view.bytes, data: data?.bytes ?? null });
+    const receiptPath = path.resolve(root, handle);
+    writeHostLocalWorkspaceCommitDocument({
+      createdId: input.createdId, receiptPath,
+      manifest: { path: manifest.path, bytes: manifest.bytes },
+      view: { path: view.path, bytes: view.bytes },
+      data: data ? { path: data.path, bytes: data.bytes } : null,
+    });
+    const result = withHostLocalWriteCommitFromFile({ createdId: input.createdId, committedPath: receiptPath, result: input.result });
+    if (!hostLocalWriteCommitResultIsProven(result)) throw new Error('Workspace save components changed before delivery proof');
+    return result;
+  });
 }
 
 /** Test-only fixture constructor for transport tests that do not own a real
@@ -843,4 +940,70 @@ export function _withHostLocalWriteCommitFactsForTest(
     throw new Error('Invalid local-write commit test fixture.');
   }
   return stamped;
+}
+
+/**
+ * Verified current content behind a committed artifact, for completion review.
+ *
+ * A Space is a BUNDLE. Hashing only its descriptor made a real component change
+ * invisible, and reading it through a lexical containment check left both a
+ * symlink and a check/open swap window. This reuses the module's own
+ * `safeCommittedFile` (lstat + O_NOFOLLOW open + fstat) and
+ * `reopenWorkspaceCompoundCommit`, so containment and component verification are
+ * decided by the same code that wrote the commit.
+ *
+ * Digests are over RAW BYTES, never decoded text, and byte counts are reported
+ * so a caller can disclose exact coverage instead of guessing at characters.
+ */
+export interface CommittedArtifactContent {
+  parts: ReadonlyArray<{ handle: string; bytes: Buffer; role: string }>;
+  totalBytes: number;
+  /** True when every part verified against its recorded digest. */
+  verified: boolean;
+  /** Set when the artifact could not be resolved at all (distinct from a mismatch). */
+  unresolvedReason?: string;
+}
+
+export function readCommittedArtifactContent(facts: HostLocalWriteCommitFacts): CommittedArtifactContent {
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => readCommittedArtifactContentUnlocked(facts)); }
+  catch (error) { return { parts: [], totalBytes: 0, verified: false, unresolvedReason: `unreadable:${error instanceof Error ? error.name : 'error'}` }; }
+}
+
+function readCommittedArtifactContentUnlocked(
+  facts: HostLocalWriteCommitFacts,
+): CommittedArtifactContent {
+  const isBundle = facts.handle.endsWith(`/${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`);
+  try {
+    const root = realpathSync(path.resolve(BASE_DIR));
+    if (isBundle) {
+      const reopened = reopenWorkspaceCompoundCommit(facts);
+      if (!reopened) {
+        // A component changed or the descriptor no longer verifies. This is a
+        // real outcome to report, never an artifact that quietly vanishes.
+        return { parts: [], totalBytes: 0, verified: false, unresolvedReason: 'workspace_bundle_unverified' };
+      }
+      const parts: Array<{ handle: string; bytes: Buffer; role: string }> = [];
+      for (const component of reopened.components) {
+        const file = safeCommittedFile(root, path.resolve(root, component.handle));
+        if (createHash('sha256').update(file.bytes).digest('hex') !== component.contentDigest) {
+          return { parts: [], totalBytes: 0, verified: false, unresolvedReason: 'workspace_component_digest_mismatch' };
+        }
+        parts.push({ handle: component.handle, bytes: file.bytes, role: component.role });
+      }
+      return { parts, totalBytes: parts.reduce((sum, part) => sum + part.bytes.byteLength, 0), verified: true };
+    }
+    const file = safeCommittedFile(root, path.resolve(root, facts.handle));
+    const verified = createHash('sha256').update(file.bytes).digest('hex') === facts.contentDigest;
+    return {
+      parts: [{ handle: facts.handle, bytes: file.bytes, role: 'file' }],
+      totalBytes: file.bytes.byteLength,
+      verified,
+      ...(verified ? {} : { unresolvedReason: 'content_digest_mismatch' }),
+    };
+  } catch (error) {
+    return {
+      parts: [], totalBytes: 0, verified: false,
+      unresolvedReason: `unreadable:${error instanceof Error ? error.name : 'error'}`,
+    };
+  }
 }

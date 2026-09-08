@@ -10,7 +10,7 @@ import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickIdentityEvolution } from './identity-evolution.js';
 import { tickTrustGraduation } from '../agents/trust-graduation.js';
-import { reapStaleWorkingMemory } from './working-memory.js';
+import { automaticConversationRetentionPolicy, reapConfiguredConversationHistory } from './conversation-retention.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
 import {
@@ -29,7 +29,6 @@ import {
   countStrongEntityIdentifierCollisionGroups,
   type EntityIdentifierReconciliationResult,
 } from './entity-identity.js';
-import { reapStaleChatCancellations, reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
   loadRecallMeetingSettings,
@@ -716,56 +715,26 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     tickAutoresearchObservatory();
   }
 
-  // v0.5.22 — drop stale tool_outputs (default 14-day TTL). Without
-  // this, harness.db grows ~10MB/day. The reaper itself is one indexed
-  // DELETE; log only when rows were actually dropped.
+  // Keep conversation, result and Stop history unless the operator explicitly
+  // configured an age policy. Context compaction does not delete source data.
   if (tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0) {
-    // Copy recoverable fact evidence before the raw tool-output TTL runs.
-    try { backfillTemporalEvidence(2_000); } catch { /* periodic backfill retries */ }
-    try {
-      const deleted = reapStaleToolOutputs();
-      if (deleted > 0) {
-        logger.info({ deleted }, 'tool_outputs reaper tick');
-      }
-    } catch (err) {
-      logger.warn({ err }, 'tool_outputs reaper tick failed');
+    const retentionPolicy = automaticConversationRetentionPolicy();
+    if (retentionPolicy.toolOutputDays !== null) {
+      // Copy recoverable fact evidence before an explicitly configured purge.
+      try { backfillTemporalEvidence(2_000); } catch { /* periodic backfill retries */ }
     }
-    // Reap terminal sessions (+ cascade their events) so harness.db doesn't
-    // grow unbounded. Active/paused sessions are kept so the user can resume.
+    const reaped = reapConfiguredConversationHistory({ policy: retentionPolicy,
+      onError: (store, err) => logger.warn({ store, err }, 'configured conversation retention failed') });
+    if (Object.values(reaped).some(count => count > 0)) logger.info({ reaped }, 'configured conversation retention tick');
+    // Disposable operational metrics keep their separate storage policy.
     try {
-      const deletedSessions = reapStaleSessions();
-      // 2026-07-22 legacy-audit retention sweeps: the three stores the
-      // session-cascade reap cannot bound (FK-less tombstones + the two
-      // standalone metric DBs).
-      try {
-        const staleCancellations = reapStaleChatCancellations();
-        const { reapStaleOperationalEvents } = await import('../runtime/operational-telemetry.js');
-        const staleOpEvents = reapStaleOperationalEvents();
-        const { reapStaleModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
-        const staleRouteRows = reapStaleModelRouteMetrics();
-        if (staleCancellations > 0 || staleOpEvents > 0 || staleRouteRows > 0) {
-          logger.info({ staleCancellations, staleOpEvents, staleRouteRows }, 'retention sweep tick');
-        }
-      } catch (err) {
-        logger.warn({ err }, 'retention sweep tick failed');
-      }
-      if (deletedSessions > 0) {
-        logger.info({ deletedSessions }, 'sessions reaper tick');
-      }
+      const { reapStaleOperationalEvents } = await import('../runtime/operational-telemetry.js');
+      const staleOpEvents = reapStaleOperationalEvents();
+      const { reapStaleModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
+      const staleRouteRows = reapStaleModelRouteMetrics();
+      if (staleOpEvents > 0 || staleRouteRows > 0) logger.info({ staleOpEvents, staleRouteRows }, 'operational metrics retention tick');
     } catch (err) {
-      logger.warn({ err }, 'sessions reaper tick failed');
-    }
-    // The session reaper drops the session ROW but orphans its per-session
-    // working-memory file (state/working-memory/<sha1>.md). Sweep those on the
-    // same TTL so the dir doesn't grow unbounded. Files live outside the vault,
-    // so this never touches embeddings.
-    try {
-      const reapedWorkingMemory = reapStaleWorkingMemory();
-      if (reapedWorkingMemory > 0) {
-        logger.info({ reapedWorkingMemory }, 'working-memory reaper tick');
-      }
-    } catch (err) {
-      logger.warn({ err }, 'working-memory reaper tick failed');
+      logger.warn({ err }, 'operational metrics retention failed');
     }
     try {
       const expiredPending = reapExpiredPendingReflections();

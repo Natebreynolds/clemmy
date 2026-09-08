@@ -1,4 +1,4 @@
-import type { ChatMessage, MessageStatus } from './types.js';
+import type { ChatMessage, MessageStatus, TerminalFacts } from './types.js';
 import { humanHarnessText } from './types.js';
 
 export const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
@@ -48,6 +48,30 @@ function messageStatusForCanonicalTerminal(status: CanonicalTerminalStatus): Mes
   return 'failed';
 }
 
+
+const PRESENTATION_KINDS: ReadonlySet<string> = new Set(['answer', 'question', 'approval', 'continue']);
+const NEEDS_KINDS: ReadonlySet<string> = new Set(['input', 'approval', 'continue']);
+
+/** Lift the backend's typed terminal onto the message. Never invents: a field
+ * the event does not carry stays absent, and a legacy event yields undefined. */
+export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts | undefined {
+  const status = canonicalTerminalStatus(data);
+  if (!status) return undefined;
+  const presentation = data.presentation && typeof data.presentation === 'object'
+    ? data.presentation as Record<string, unknown> : {};
+  const outcome = data.turnOutcome && typeof data.turnOutcome === 'object'
+    ? data.turnOutcome as Record<string, unknown> : {};
+  const needs = outcome.needs && typeof outcome.needs === 'object'
+    ? (outcome.needs as Record<string, unknown>).kind : undefined;
+  const facts: TerminalFacts = { status };
+  if (typeof presentation.kind === 'string' && PRESENTATION_KINDS.has(presentation.kind)) {
+    facts.kind = presentation.kind as TerminalFacts['kind'];
+  }
+  if (typeof needs === 'string' && NEEDS_KINDS.has(needs)) facts.needs = needs as TerminalFacts['needs'];
+  if (typeof outcome.resumable === 'boolean') facts.resumable = outcome.resumable;
+  return facts;
+}
+
 export function meaningfulCompletionText(value: unknown): string {
   const text = humanHarnessText(value, '');
   // A bare terminal placeholder is not work-product. Treating it as evidence
@@ -59,6 +83,18 @@ export function meaningfulCompletionText(value: unknown): string {
  * that the stream ended; it does not, by itself, prove that the user received
  * an answer. Only explicit/streamed human output earns the success state. */
 export function terminalCompletionPresentation(
+  data: Record<string, unknown>,
+  currentText: string,
+  currentStatus?: MessageStatus,
+): Pick<ChatMessage, 'text' | 'status' | 'progress' | 'terminal'> {
+  // Every branch below decides text/status the same way it always has; the
+  // backend's typed terminal rides along so renderers stop re-deriving it.
+  const terminal = terminalFactsFrom(data);
+  const core = terminalCompletionPresentationCore(data, currentText, currentStatus);
+  return terminal ? { ...core, terminal } : core;
+}
+
+function terminalCompletionPresentationCore(
   data: Record<string, unknown>,
   currentText: string,
   currentStatus?: MessageStatus,

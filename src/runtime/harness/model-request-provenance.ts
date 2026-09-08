@@ -435,10 +435,9 @@ function uniqueVisibleFunctionResults(value: unknown): VisibleFunctionResult[] {
 /** A Layer-1 stub is a presentation of an immutable settled result, not a new
  * result. Prove that presentation from three existing durable owners:
  *
- *  - the exact model-result receipt still matches the losslessly parked bytes
- *    when the deterministic clip transform is reversed;
- *  - the tool-output row proves the original call/tool/character count and is
- *    the recall target named by the stub;
+ *  - the exact model-result receipt still matches when the deterministic clip
+ *    transform is reversed from parked bytes or its sealed accepted frame;
+ *  - that original proves the call/tool/character count named by the stub;
  *  - a later host `condenser_applied` event accounts for every visible stub
  *    carrying this clip timestamp.
  *
@@ -461,25 +460,81 @@ function trustedCompactedLogicalResultMatches(input: {
   ) return false;
 
   const retained = getToolOutput(input.sessionId, clipped.callId);
-  if (
-    !retained
-    || retained.truncatedAtWrite
-    || retained.tool !== clipped.toolName
-    || retained.output.length !== clipped.originalChars
-  ) return false;
-
   const originalBase = { ...input.result.item } as Record<string, unknown>;
   delete originalBase.__clipped;
   delete originalBase.__clippedMeta;
-  const originalCandidates = [
-    { ...originalBase, output: { type: 'text', text: retained.output } },
-    { ...originalBase, output: retained.output },
-  ] as AgentInputItem[];
-  if (!originalCandidates.some((candidate) => (
+  const originalCandidates = retained
+    && !retained.truncatedAtWrite
+    && retained.tool === clipped.toolName
+    && retained.output.length === clipped.originalChars
+    ? [
+        { ...originalBase, output: { type: 'text', text: retained.output } },
+        { ...originalBase, output: retained.output },
+      ] as AgentInputItem[]
+    : [];
+  const reversed = originalCandidates.some((candidate) => (
     logicalModelResultProjectionReceiptMatchesItem(input.receipt, candidate)
-  ))) return false;
+  )) || sealedLogicalFrameReversesStub(input, clipped, originalBase);
+  if (!reversed) return false;
 
   return layer1ClipAccountedFor(input.sessionId, clipped.clippedAt, clippedAtMs, input.visibleResults);
+}
+
+/** A nested carrier can expose a bounded projection while the recall store
+ * parks the inner operation's raw output under the same call id. Those are
+ * distinct representations, so raw recall bytes cannot reverse that clip.
+ * The accepted frame retains the exact model-visible item sealed by the
+ * immutable projection receipt. Restore only its output into the CURRENT
+ * item and verify the whole receipt again; finding a valid historical frame
+ * must never excuse changed namespace, status, or other item metadata. */
+function sealedLogicalFrameReversesStub(
+  input: {
+    sessionId: string;
+    receipt: LogicalModelResultProjectionReceipt;
+  },
+  clipped: NonNullable<ReturnType<typeof describeCanonicalClippedToolResult>>,
+  originalBase: Record<string, unknown>,
+): boolean {
+  const receipt = input.receipt;
+  if (
+    input.sessionId !== receipt.sessionId
+    || clipped.callId !== receipt.callId
+    || clipped.toolName !== receipt.toolName
+  ) return false;
+  const rows = openEventLog().prepare(`
+    SELECT item.value AS item_json
+      FROM accepted_model_batch_checkpoints checkpoint,
+           json_each(checkpoint.history_json) item
+     WHERE checkpoint.session_id = ? AND checkpoint.source_user_seq = ?
+       AND checkpoint.committed_at <= ?
+       AND json_extract(item.value, '$.type') = 'function_call_result'
+       AND json_extract(item.value, '$.callId') = ?
+    UNION
+    SELECT item.value AS item_json
+      FROM accepted_model_batch_admissions admission,
+           json_each(admission.pre_history_json) item
+     WHERE admission.session_id = ? AND admission.source_user_seq = ?
+       AND admission.admitted_at <= ?
+       AND json_extract(item.value, '$.type') = 'function_call_result'
+       AND json_extract(item.value, '$.callId') = ?
+  `).all(
+    receipt.sessionId, receipt.sourceUserSeq, clipped.clippedAt, receipt.callId,
+    receipt.sessionId, receipt.sourceUserSeq, clipped.clippedAt, receipt.callId,
+  ) as Array<{ item_json: string }>;
+  for (const row of rows) {
+    const item = JSON.parse(row.item_json) as Record<string, unknown>;
+    if (item.__clipped === true) continue;
+    if (!logicalModelResultProjectionReceiptMatchesItem(receipt, item as AgentInputItem)) continue;
+    const output = item.output as { type?: unknown; text?: unknown } | string | undefined;
+    const text = typeof output === 'string' ? output
+      : output && typeof output === 'object' && output.type === 'text' && typeof output.text === 'string'
+        ? output.text : null;
+    if (text === null || text.length !== clipped.originalChars) continue;
+    if (logicalModelResultProjectionReceiptMatchesItem(receipt, {
+      ...originalBase, output,
+    } as AgentInputItem)) return true;
+  }
+  return false;
 }
 
 /** The shared third leg of both stub proofs: a later host `condenser_applied`

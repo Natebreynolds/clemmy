@@ -1,3 +1,4 @@
+import type { TaskMode } from '@/lib/task-mode';
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet } from '@/lib/api';
@@ -66,14 +67,14 @@ export function Home() {
     if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
   }, []);
 
-  const sendAndOpen = useCallback((input: { text: string; attachmentIds?: string[]; attachmentNames?: string[] }) => {
+  const sendAndOpen = useCallback((input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }) => {
     if (chat.busy || opening) return;
     setNotice(null);
     setOpening(true);
     // Not awaited: send() resolves only when the whole turn finishes. The
     // session id lands the moment the daemon returns its 202 — that is the
     // handoff point, and the thread route reattaches to the live stream.
-    void chat.send(input);
+    void chat.send(input).catch(error => { setOpening(false); setNotice({ tone: 'error', text: error instanceof Error ? error.message : 'Could not send.' }); });
     const started = Date.now();
     const tick = () => {
       const id = chat.sessionId.current;
@@ -217,6 +218,9 @@ export function Home() {
         <Composer
           inputRef={composerRef}
           busy={chat.busy}
+          mode={chat.composerMode}
+          onModeChange={chat.setComposerMode}
+          activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={async () => { const pending = chat.pendingPost; if (pending) sendAndOpen({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode }); }} onCancelPending={chat.cancelPending}
           onSend={sendAndOpen}
           onStop={chat.stop}
         />

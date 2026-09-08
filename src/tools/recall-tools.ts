@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
 import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -296,9 +297,14 @@ export function registerRecallTools(server: McpServer): void {
       if (!recovered) {
         // Say what is true: recovery failed. Never tell the model its own
         // valid JSON "is not JSON" — it obeys, comes back, and burns the turn.
+        // The successor is COMPUTED. This used to say "use recall_tool_result"
+        // unconditionally, while recall's own exhaustion message said "call
+        // tool_output_query instead" — a closed loop with no exit (live
+        // 2026-09-07 source 146537, the Platform 49 plan that never published).
         return textResult(
           `No JSON value could be recovered from tool output "${callId}" (${row.output.length.toLocaleString()} chars). `
-          + 'It is text, not structured data — use recall_tool_result to read it.',
+          + 'It is text, not structured data. '
+          + retainedResultWayThrough({ sessionId: ctx.sessionId, callId, exclude: ['tool_output_query'] }),
         );
       }
       let parsed: unknown = recovered.value;

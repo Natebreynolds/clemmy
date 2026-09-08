@@ -416,9 +416,14 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
       if (modelCalls === 1) {
         return {
           responseId: 'card-repair-search',
-          output: [functionCall('card-repair-search', 'tool_search', {
-            query: 'write_file', role_key: null, limit: 1,
-          })],
+          output: [
+            functionCall('card-repair-search', 'tool_search', {
+              query: 'write_file', role_key: null, limit: 1,
+            }),
+            functionCall('card-repair-read-search', 'tool_search', {
+              query: 'read_file', role_key: null, limit: 1,
+            }),
+          ],
         };
       }
       if (modelCalls === 2) {
@@ -427,7 +432,7 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
           responseId: 'card-repair-incomplete-plan',
           output: [functionCall('card-repair-incomplete-plan', 'plan_task', {
             preamble: 'I’ll read the source and create the output now.',
-            draft: readThenUnattestedWriteDraft('cap:local:write_file:create'),
+            draft: readThenUnattestedWriteDraft('cap:local:read_file'),
           })],
         };
       }
@@ -446,7 +451,7 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
     sessionId: session.id,
     sourceUserSeq: source.seq,
     hostFreshPlanning: primed.planning,
-    allowedToolNames: ['write_file', 'tool_search'],
+    allowedToolNames: ['read_file', 'write_file', 'tool_search'],
     allowToolJit: true,
     mcpToolScope: {
       authority: 'none', reason: 'isolated local recovery regression',

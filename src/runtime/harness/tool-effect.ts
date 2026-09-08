@@ -681,10 +681,10 @@ export function actionTopologyRoleForRuntimeCall(
 
 /**
  * One structural projection for the boundary between registry control
- * operations and accepted business work. A read-only control remains control;
- * a registry-declared mutation may be bound to an exact expected-work
- * requirement and, once bound, that durable row is the settlement authority.
- * No tool name or provider identity participates in this decision.
+ * operations and accepted business work. A read-only control retains its role;
+ * an explicitly declared native planning read or a registry mutation may bind
+ * an exact expected-work requirement. Eligibility alone grants no authority;
+ * once bound, that durable row is the settlement authority.
  */
 export function runtimeExpectedWorkProjection(
   toolName: string,
@@ -696,10 +696,19 @@ export function runtimeExpectedWorkProjection(
 } {
   const role = actionTopologyRoleForRuntimeCall(toolName, args);
   const decision = classifyRuntimeToolEffect(toolName, args);
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  const declaredNativePlanningRead = decision.source === 'registry'
+    && decision.effect === 'read'
+    && !decision.mutating
+    && effective.composioCarrier !== true
+    && effective.toolName !== null
+    && TOOL_REGISTRY.some((declaration) => declaration.name === localToolTail(effective.toolName!)
+      && declaration.sideEffect === 'read' && declaration.localPlanningRead === true);
   return {
     role,
     decision,
     mayBindBusinessWork: role === 'business'
+      || declaredNativePlanningRead
       || (
         decision.source === 'registry'
         && decision.mutating

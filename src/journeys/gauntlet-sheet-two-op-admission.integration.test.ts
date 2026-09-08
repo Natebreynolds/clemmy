@@ -23,6 +23,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gauntlet-sheet-two-op-'));
@@ -347,6 +348,12 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
     async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
     async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
     async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: 'conn-googlesheets',
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
   });
 
   const gateway = composioTools.getComposioRuntimeTools()
@@ -584,6 +591,18 @@ test('two-op plan re-admitted on the same long-running daemon reuses current exa
     id: 'discord-gauntlet-sheet-two-op-replay',
     kind: 'chat',
     userId: 'discord-user-gauntlet-two-op',
+  });
+
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
+    async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
+    async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: 'conn-googlesheets',
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
   });
 
   let primaryStep = 0;

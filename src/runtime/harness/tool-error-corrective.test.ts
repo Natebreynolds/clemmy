@@ -51,12 +51,19 @@ test('toolFailureCorrective: a TIMEOUT steers to the ASYNC start+poll pattern, N
   assert.doesNotMatch(out, /Retry this EXACT call ONCE\./);
 });
 
-test('asyncJobTimeoutCorrective: names the START + POLL moves and allows a single retry only for a blip', () => {
+test('asyncJobTimeoutCorrective: reconciles an unknown start before a separately admitted poll', () => {
   const out = asyncJobTimeoutCorrective('composio_execute_tool', 'timed out after 300000ms', ' (slug=APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS)');
   assert.match(out, /slug=APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS/);
   assert.match(out, /START the job/i);
   assert.match(out, /POLL/i);
   assert.match(out, /brief network blip/i);
+  assert.match(out, /Do NOT repeat the call or START a replacement while its outcome is unknown/);
+  assert.match(out, /For work that has not started/);
+  assert.match(out, /exact returned run\/job ID/);
+  assert.match(out, /separately admitted tool calls/);
+  assert.match(out, /does not automatically poll or background/);
+  assert.match(out, /A timeout alone does not establish that/);
+  assert.doesNotMatch(out, /auto-resolves|just start it and continue|do NOT need to hand-poll/);
 });
 
 test('toolFailureCorrective: permission says fix auth, not the id', () => {

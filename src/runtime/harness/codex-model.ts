@@ -55,7 +55,7 @@ import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthE
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
 import { recordModelUsage } from '../usage-log.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
@@ -978,10 +978,11 @@ export class CodexModelError extends Error {
 // ----------------------------------------------------------------------
 
 function resolveCodexModel(name: string): string {
-  // Codex only accepts gpt-5* model ids. Fall back to a known good one
-  // so a stray model name (e.g. an experimental autonomous workflow)
-  // doesn't take the harness down.
-  return name && name.startsWith('gpt-5') ? name : 'gpt-5.4';
+  // Preserve IDs that the shared wire registry routes to Codex. A selected
+  // future family must not be reported as selected while this adapter sends
+  // gpt-5.4. Unknown or other-provider names retain the existing fallback;
+  // registry classification does not claim provider availability or access.
+  return name && resolveProvider(name) === 'codex' ? name : 'gpt-5.4';
 }
 
 interface CodexRequestBody {

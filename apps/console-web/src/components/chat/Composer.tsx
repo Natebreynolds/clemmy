@@ -1,3 +1,4 @@
+import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type RefObject } from 'react';
 import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -18,6 +19,12 @@ let localSeq = 0;
 
 export function Composer({
   busy,
+  mode: controlledMode,
+  onModeChange,
+  activeTaskMode,
+  pendingPost,
+  onRetryPending,
+  onCancelPending,
   onSend,
   onStop,
   onBackground,
@@ -25,7 +32,13 @@ export function Composer({
   placeholder = 'Ask Clementine anything…',
 }: {
   busy: boolean;
-  onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => void;
+  mode?: ComposerMode;
+  onModeChange?: (mode: ComposerMode) => void;
+  activeTaskMode?: TaskMode;
+  pendingPost?: { input: string; taskMode?: TaskMode } | null;
+  onRetryPending?: () => Promise<void>;
+  onCancelPending?: () => Promise<void>;
+  onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => Promise<void> | void;
   onStop: () => void;
   /** Detach the running turn to a durable background task (keeps the chat free). */
   onBackground?: () => void;
@@ -34,6 +47,12 @@ export function Composer({
   placeholder?: string;
 }) {
   const [value, setValue] = useState('');
+  const [deliveryError, setDeliveryError] = useState('');
+  const recover = (action?: () => Promise<void>) => { setDeliveryError(''); void action?.().catch(error => setDeliveryError(error instanceof Error ? error.message : 'Request could not be confirmed.')); };
+  const [localMode, setLocalMode] = useState<ComposerMode>('normal');
+  const mode = controlledMode ?? localMode;
+  const planning = busy ? activeTaskMode?.kind === 'plan' : mode === 'plan';
+  const changeMode = (next: ComposerMode) => { setLocalMode(next); onModeChange?.(next); };
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -86,16 +105,20 @@ export function Composer({
   // at the next step without stopping the run. Attachments still wait for the
   // turn to finish (a file mid-run would have to start a new turn).
   const canSend = !uploading
+    && !(pendingPost && !busy)
     && (value.trim().length > 0 || readyIds.length > 0)
-    && !(busy && readyIds.length > 0);
+    && !(busy && readyIds.length > 0)
+    && !(busy && activeTaskMode?.kind === 'execute');
 
   const submit = () => {
     if (!canSend) return;
-    onSend({
+    setDeliveryError('');
+    void Promise.resolve(onSend({
       text: value.trim(),
+      taskMode: busy ? activeTaskMode : { version: 1, kind: mode },
       attachmentIds: readyIds,
       attachmentNames: attachments.filter((a) => a.status === 'ready').map((a) => a.name),
-    });
+    })).catch(error => setDeliveryError(error instanceof Error ? error.message : 'Could not send.'));
     setValue('');
     setAttachments([]);
     requestAnimationFrame(autoGrow);
@@ -121,6 +144,23 @@ export function Composer({
       onDragLeave={() => setDragOver(false)}
       onDrop={(e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); }}
     >
+      {pendingPost && !busy && <div className="border-b border-border p-3 text-small" role="status">
+        <p>Delivery was not confirmed. Retry preserves the exact {pendingPost.taskMode?.kind ?? 'normal'} request.</p>
+        <details><summary>View pending request</summary><p className="whitespace-pre-wrap break-words">{pendingPost.input}</p></details>
+        <button type="button" onClick={() => recover(onRetryPending)} className="mr-3 underline">Retry exact request</button>
+        <button type="button" onClick={() => recover(onCancelPending)} className="underline">Cancel request</button>
+      </div>}
+      {deliveryError && <p role="alert" className="p-3 text-small text-danger">{deliveryError}</p>}
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
+        <button type="button" aria-pressed={planning} disabled={busy}
+          onClick={() => changeMode(mode === 'plan' ? 'normal' : 'plan')}
+          className={cn('rounded-md border px-3 py-1 text-small font-semibold disabled:opacity-60', planning ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted hover:text-fg')}>
+          Plan
+        </button>
+        <span className="text-caption text-muted" role="status">
+          {busy && activeTaskMode?.kind === 'execute' ? 'Executing the reviewed plan' : planning ? (busy ? 'Planning · investigating with read-only tools' : 'Plan mode · investigate first, then review and Execute') : 'Normal · handle the task'}
+        </span>
+      </div>
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 border-b border-border p-2.5">
           {attachments.map((a) => (
@@ -177,7 +217,7 @@ export function Composer({
           }}
           onKeyDown={onKeyDown}
           rows={1}
-          placeholder={placeholder}
+          placeholder={planning ? 'What should Clem investigate and plan?' : placeholder}
           aria-label="Message Clementine"
           className="max-h-[220px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-body-lg text-fg outline-none placeholder:text-faint"
         />

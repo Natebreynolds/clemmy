@@ -24,6 +24,9 @@ import {
 } from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { rememberToolSchema, resetToolSchemaCache } from '../tools/composio-schema-cache.js';
+import { describeInputs } from './workflow-describe.js';
+import { bindStepInputs } from './step-binding.js';
+import { missingWorkflowRunInputs } from './workflow-inputs.js';
 
 function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
@@ -331,9 +334,9 @@ test('autoRepair never invents fan-out topology from multi-item prose', () => {
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
   assert.equal(repaired.steps[1].forEach, undefined);
   assert.doesNotMatch(repairs.join(' '), /Added forEach/);
-  assert.ok(
+  assert.equal(
     checkWorkflowForWrite(def).warnings.some((warning) => warning.includes('has no forEach')),
-    'the validator still gives the author an actionable advisory',
+    false, 'routine validation does not prescribe new topology from prose',
   );
 });
 
@@ -407,18 +410,55 @@ test('autoRepair: undeclared synthesis {{input.X}} gets declared too', () => {
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
 });
 
-test('autoRepair P0-3: derives sideEffect from the prompt when the author omitted it', () => {
-  const def = wf({
-    steps: [
-      { id: 'pull', prompt: 'Read the leads from the CRM.' },
-      { id: 'save', prompt: 'Update the Airtable records with the enriched data.', dependsOn: ['pull'] },
-      { id: 'send', prompt: 'Send the outreach emails to the list.', dependsOn: ['save'], requiresApproval: true },
-    ],
+test('typed step run-input bindings are visible to the owner and satisfy the same runtime binding', () => {
+  const def = wf({ steps: [{ id: 'summary', prompt: 'Summarize the supplied text.', sideEffect: 'read',
+    inputs: { source_text: { type: 'string', required: true, description: 'Text supplied at runtime.' } } }] });
+  const prepared = prepareWorkflowForWrite(def);
+  assert.equal(prepared.ok, true, prepared.errors.join('\n'));
+  assert.equal(describeInputs(prepared.def), 'source_text (required)');
+  assert.deepEqual(missingWorkflowRunInputs(prepared.def, {}), ['source_text']);
+  assert.deepEqual(bindStepInputs(prepared.def.steps[0], { source_text: 'Shipment ready.' }, {}), {
+    values: { source_text: 'Shipment ready.' }, upstream: {}, missing: [],
   });
-  const { def: repaired } = autoRepairWorkflowDefinition(def);
-  assert.equal(repaired.steps[0].sideEffect, 'read');
-  assert.equal(repaired.steps[1].sideEffect, 'write');
-  assert.equal(repaired.steps[2].sideEffect, 'send');
+  assert.equal(prepared.def.steps[0].output, undefined);
+  assert.equal(prepared.def.goal, undefined);
+});
+
+test('typed input repair preserves optional/defaulted values and never promotes upstream or item values', () => {
+  const def = wf({ inputs: { pinned: { type: 'string', required: false } }, steps: [
+    { id: 'records', prompt: 'Read records.', sideEffect: 'read', output: { type: 'array' } },
+    { id: 'use', prompt: 'Use the bound values.', sideEffect: 'read', dependsOn: ['records'], forEach: 'records', inputs: {
+      text: { from: 'input.source_text', required: true },
+      records: { required: true },
+      upstream: { from: 'steps.records.output', required: true },
+      row: { from: 'item', required: true },
+      tone: { default: 'brief' },
+      pinned: { required: true },
+    } },
+  ] });
+  const prepared = autoRepairWorkflowDefinition(def).def;
+  assert.deepEqual(Object.keys(prepared.inputs ?? {}).sort(), ['pinned', 'source_text', 'tone']);
+  assert.equal(prepared.inputs?.pinned.required, false, 'existing authored input metadata stays authoritative');
+  assert.equal(prepared.inputs?.tone.required, false);
+  assert.deepEqual(missingWorkflowRunInputs(prepared, {}), ['source_text']);
+  assert.match(describeInputs(prepared), /tone \(optional\)/);
+  assert.equal(prepared.steps[1].inputs?.tone.default, 'brief');
+});
+
+test('autoRepair keeps omitted effects unspecified at authoring and pre-run', () => {
+  const def = wf({ steps: [
+    { id: 'read', prompt: 'Read the CRM records.' },
+    { id: 'draft', prompt: 'Draft a summary. Do not send, publish, or modify anything.' },
+    { id: 'write', prompt: 'Update the Airtable records.', dependsOn: ['read'] },
+    { id: 'send', prompt: 'Send the outreach emails.', dependsOn: ['write'], requiresApproval: true },
+  ] });
+  for (const preRun of [false, true]) {
+    const { def: repaired, repairs } = autoRepairWorkflowDefinition(def, preRun);
+    assert.equal(repaired, def);
+    assert.deepEqual(repairs, []);
+    assert.equal(repaired.steps.every((step) => step.sideEffect === undefined), true,
+      'unknown work must not acquire read-safe or write/send authority from prose');
+  }
 });
 
 test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
@@ -448,7 +488,7 @@ test('autoRepair: declares COMMON input keys so callers/UI can supply them', () 
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
 });
 
-test('autoRepair: adds inferred output contracts and a pinned goal for deliverable workflows', () => {
+test('automatic preparation leaves output contracts and goals absent until authored', () => {
   const def = wf({
     description: 'Audit a website and produce a report URL with rows of findings.',
     steps: [
@@ -459,24 +499,41 @@ test('autoRepair: adds inferred output contracts and a pinned goal for deliverab
     ],
   });
   const before = checkWorkflowForWrite(def);
-  assert.ok(before.warnings.some((w) => /output contract/.test(w)));
-  assert.ok(before.warnings.some((w) => /no pinned `goal`/.test(w)));
+  assert.equal(before.warnings.some((w) => /output contract/.test(w)), false);
+  assert.equal(before.warnings.some((w) => /no pinned `goal`/.test(w)), false);
 
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
 
-  assert.deepEqual(repaired.steps[0].output?.required_keys?.sort(), ['rows', 'url']);
-  assert.deepEqual(repaired.steps[0].output?.verify?.url_present, ['url']);
-  assert.deepEqual(repaired.steps[0].output?.non_empty, ['rows']);
-  assert.equal(repaired.steps[0].output?.min_items?.rows, 1);
-  assert.ok(repaired.goal?.objective);
-  assert.ok(repaired.goal?.successCriteria?.some((criterion) => criterion.includes('deliver')));
-  assert.ok(repairs.some((repair) => /Added output contract/.test(repair)));
-  assert.ok(repairs.some((repair) => /Pinned a workflow goal/.test(repair)));
+  assert.equal(repaired.steps[0].output, undefined);
+  assert.equal(repaired.goal, undefined);
+  assert.equal(repairs.some((repair) => /output contract|workflow goal/.test(repair)), false);
 
   const after = checkWorkflowForWrite(repaired);
   assert.equal(after.ok, true);
   assert.equal(after.warnings.some((w) => /output contract/.test(w)), false);
   assert.equal(after.warnings.some((w) => /no pinned `goal`/.test(w)), false);
+});
+
+test('automatic preparation cannot turn the live do-not-publish instruction into a URL requirement', () => {
+  const prompt = 'Draft a short status summary from the text supplied at runtime. Use the supplied source text as the only material and produce a concise status summary. Do not send, publish, or take any other action.';
+  const def = wf({ description: 'QUALIFICATION INITIAL', steps: [{ id: 'draft_status_summary', prompt, sideEffect: 'read' }] });
+  for (const preRun of [false, true]) {
+    const prepared = prepareWorkflowForWrite(def, { preRun });
+    assert.equal(prepared.ok, true, prepared.errors.join('\n'));
+    assert.equal(prepared.def.steps[0].prompt, prompt);
+    assert.equal(prepared.def.steps[0].output, undefined);
+    assert.equal(prepared.def.goal, undefined);
+    assert.equal(prepared.def.steps[0].sideEffect, 'read');
+    assert.doesNotMatch(prepared.warnings.join('\n'), /url_present|path_exists|no pinned `goal`|mixed read\/write|SLACK_SEND_MESSAGE/);
+  }
+});
+
+test('automatic preparation does not invent non-empty results for a lookup that may return none', () => {
+  const def = wf({ steps: [{ id: 'lookup', prompt: 'Find matching accounts and return the results. Return an empty list when none match.', sideEffect: 'read' }] });
+  const prepared = prepareWorkflowForWrite(def);
+  assert.equal(prepared.ok, true, prepared.errors.join('\n'));
+  assert.equal(prepared.def.steps[0].output, undefined);
+  assert.equal(prepared.def.goal, undefined);
 });
 
 test('autoRepair: never overrides explicit output contracts or pinned goals', () => {
@@ -561,7 +618,7 @@ test('workflowExecutionSurfaceChanged: reviewed transform semantics are authorit
   assert.equal(workflowExecutionSurfaceChanged(before, after), true);
 });
 
-test('autoRepair: hardens weak live-research contracts with evidence keys', () => {
+test('autoRepair preserves authored live-research contracts and reports evidence advice', () => {
   const def = wf({
     steps: [
       {
@@ -579,12 +636,11 @@ test('autoRepair: hardens weak live-research contracts with evidence keys', () =
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
   const output = repaired.steps[0].output;
 
-  assert.ok(repairs.some((repair) => /Hardened live research output contract/.test(repair)));
-  assert.deepEqual(output?.required_keys?.sort(), ['client', 'domain', 'key_findings', 'source_errors', 'sources']);
-  assert.deepEqual(output?.non_empty?.sort(), ['key_findings', 'sources']);
-  assert.equal(output?.min_items?.sources, 3);
-  assert.equal(output?.min_items?.key_findings, 3);
-  assert.equal(checkWorkflowForWrite(repaired).warnings.some((w) => /live research tools/.test(w)), false);
+  assert.equal(repairs.some((repair) => /Hardened live research output contract/.test(repair)), false);
+  assert.deepEqual(output, def.steps[0].output);
+  assert.equal(output?.non_empty, undefined);
+  assert.equal(output?.min_items, undefined);
+  assert.ok(checkWorkflowForWrite(repaired).warnings.some((w) => /live research tools/.test(w)));
 });
 
 test('autoRepair preserves an explicit evidence-bearing forEach item contract', () => {
@@ -622,7 +678,7 @@ test('autoRepair preserves an explicit evidence-bearing forEach item contract', 
   );
 });
 
-test('autoRepair hardens a live-research array at the root without adding object-only keys', () => {
+test('autoRepair preserves a live-research array without inventing a three-result minimum', () => {
   const def = wf({
     steps: [
       {
@@ -639,11 +695,11 @@ test('autoRepair hardens a live-research array at the root without adding object
   const output = repaired.steps[0].output;
   assert.equal(output?.type, 'array');
   assert.equal(output?.required_keys, undefined);
-  assert.ok(output?.non_empty?.includes(''));
-  assert.equal(output?.min_items?.[''], 3);
+  assert.equal(output?.non_empty, undefined);
+  assert.equal(output?.min_items, undefined);
 });
 
-test('autoRepair preserves an explicitly requested root JSON array instead of inventing a rows wrapper', () => {
+test('autoRepair leaves a prompt-requested root JSON array intact without imposing an output schema', () => {
   const def = wf({
     steps: [
       {
@@ -662,10 +718,8 @@ test('autoRepair preserves an explicitly requested root JSON array instead of in
 
   const { def: repaired } = autoRepairWorkflowDefinition(def);
   const output = repaired.steps.find((step) => step.id === 'synthesize_calendar')?.output;
-  assert.equal(output?.type, 'array');
-  assert.equal(output?.required_keys, undefined);
-  assert.deepEqual(output?.non_empty, ['']);
-  assert.equal(output?.min_items?.[''], 3);
+  assert.equal(output, undefined);
+  assert.equal(repaired.steps.find((step) => step.id === 'synthesize_calendar')?.prompt, def.steps[0].prompt);
 });
 
 test('checkWorkflowForWrite: synthesis participates in validation', () => {
@@ -888,16 +942,16 @@ test('autoRepair never multiplies read, write, or send work from prose', () => {
 // recorded as a run FAILURE. Doing that immediately before a scheduled run
 // could fail a long-working workflow against criteria the host invented and the
 // user never set -- and now that blocked/failed runs persist and escalate, it
-// would notify them about it too. Pinning is an AUTHORING repair.
-test('autoRepair pins a goal while authoring but never on the pre-run path', () => {
+// would notify them about it too. Authoring must preserve the job as well.
+test('autoRepair never invents a goal at authoring or pre-run while structural references still resolve', () => {
   const def = wf({
     description: 'Audit a website and produce a report URL with rows of findings.',
-    steps: [{ id: 'deliver', prompt: 'Create a report URL and return rows of findings for the audit.' }],
+    steps: [{ id: 'deliver', prompt: 'Create a report URL and return rows of findings for {{input.site}}.' }],
   });
 
   const authored = autoRepairWorkflowDefinition(def, false);
-  assert.ok(authored.def.goal?.objective, 'authoring still pins a goal');
-  assert.ok(authored.repairs.some((r) => /Pinned a workflow goal/.test(r)));
+  assert.equal(authored.def.goal, undefined);
+  assert.equal(authored.repairs.some((r) => /Pinned a workflow goal/.test(r)), false);
 
   const preRun = autoRepairWorkflowDefinition(def, true);
   assert.equal(preRun.def.goal?.objective, undefined, 'pre-run must not arm goal-judging');
@@ -907,8 +961,25 @@ test('autoRepair pins a goal while authoring but never on the pre-run path', () 
   );
 
   // Structural repairs are unaffected by the pre-run flag.
-  assert.ok(
-    preRun.def.steps[0].output && Object.keys(preRun.def.steps[0].output).length > 0,
-    'pre-run still applies structural repairs like output contracts',
-  );
+  assert.equal(preRun.def.steps[0].output, undefined);
+  assert.ok(preRun.def.inputs?.site, 'pre-run still declares the exact referenced input');
+  assert.ok(authored.def.inputs?.site);
+});
+
+
+test('automatic preparation preserves explicit write contracts and rejects broken authored topology', () => {
+  const def = wf({
+    goal: { objective: 'Update the saved tracker and return its path.' },
+    steps: [{ id: 'save', prompt: 'Update the saved tracker.', sideEffect: 'write',
+      requiresApproval: true, allowedTools: ['write_file'],
+      output: { type: 'object', required_keys: ['path'], verify: { path_exists: ['path'] } } }],
+  });
+  for (const preRun of [false, true]) {
+    const prepared = prepareWorkflowForWrite(def, { preRun });
+    assert.equal(prepared.ok, true, prepared.errors.join('\n'));
+    assert.deepEqual(prepared.def, def);
+  }
+  const broken = prepareWorkflowForWrite({ ...def, steps: [{ ...def.steps[0], forEach: 'missing_source' }] });
+  assert.equal(broken.ok, false);
+  assert.match(broken.errors.join('\n'), /forEach|missing_source/);
 });

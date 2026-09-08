@@ -77,12 +77,12 @@ for (const requirementCount of [8, 9, 32] as const) {
 
     const card = candidates.renderCapabilityCandidateCard(firstProjection);
     assert.equal(card, candidates.renderCapabilityCandidateCard(firstProjection), 'prompt projection is deterministic');
-    assert.ok(Buffer.byteLength(card, 'utf8') <= 16 * 1024, 'the complete 32-role card stays bounded');
+    assert.ok(Buffer.byteLength(card, 'utf8') <= 16 * 1024, 'the advisory card stays bounded');
     for (const roleKey of roleKeys) {
       assert.equal(
         card.split(`\`${roleKey}\``).length - 1,
-        1,
-        `${roleKey} must appear exactly once in the bounded agent prompt`,
+        0,
+        `${roleKey} remains advisory retrieval bookkeeping and never enters the agent prompt`,
       );
     }
 

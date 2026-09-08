@@ -29,6 +29,8 @@ export interface QuickAction {
 }
 
 export interface HomePreferences {
+  /** The server's epoch marks untouched defaults; saved choices have a real timestamp. */
+  updatedAt?: string;
   landing: HomeLanding;
   panes: {
     /** Render order. Ids absent here render after, in default order. */
@@ -57,16 +59,36 @@ export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
 ];
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
-  landing: 'home',
+  landing: 'last_conversation',
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
-    pinned: ['/home', '/inbox', '/tasks', '/workspaces'],
+    pinned: ['/chat', '/home', '/inbox', '/tasks', '/workspaces'],
     shown: ['/automate', '/connect'],
-    more: ['/chat', '/memory', '/meetings', '/goals', '/agents'],
+    more: ['/memory', '/meetings', '/goals', '/agents'],
   },
   quickActions: [],
   phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
 };
+
+/** Chat is the permanent primary destination; all other nav choices retain
+ * their relative order and grouping. This does not write the shared record. */
+export function primaryChatNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
+  return {
+    pinned: ['/chat', ...nav.pinned.filter(path => path !== '/chat')],
+    shown: nav.shown.filter(path => path !== '/chat'),
+    more: nav.more.filter(path => path !== '/chat'),
+  };
+}
+
+/** Only the server's explicit untouched-default marker changes the landing.
+ * A saved Home or current-project choice remains exactly that choice. */
+export function desktopHomePreferences(prefs: HomePreferences): HomePreferences {
+  return {
+    ...prefs,
+    landing: prefs.updatedAt === '1970-01-01T00:00:00.000Z' ? 'last_conversation' : prefs.landing,
+    nav: primaryChatNavigation(prefs.nav),
+  };
+}
 
 export const HOME_PREFS_KEY = ['settings', 'home'] as const;
 
@@ -78,7 +100,7 @@ export const HOME_PREFS_KEY = ['settings', 'home'] as const;
 export function useHomePreferences() {
   const query = useQuery({
     queryKey: HOME_PREFS_KEY,
-    queryFn: () => apiGet<{ home: HomePreferences }>('/api/console/settings/home').then((r) => r.home),
+    queryFn: () => apiGet<{ home: HomePreferences }>('/api/console/settings/home').then((r) => desktopHomePreferences(r.home)),
     staleTime: 30_000,
     retry: 1,
     placeholderData: DEFAULT_HOME_PREFERENCES,
@@ -91,7 +113,7 @@ export function useSaveHomePreferences() {
   return useMutation({
     mutationFn: (patch: Partial<HomePreferences>) =>
       apiPatch<{ home: HomePreferences }>('/api/console/settings/home', patch).then((r) => r.home),
-    onSuccess: (home) => qc.setQueryData(HOME_PREFS_KEY, home),
+    onSuccess: (home) => qc.setQueryData(HOME_PREFS_KEY, desktopHomePreferences(home)),
   });
 }
 

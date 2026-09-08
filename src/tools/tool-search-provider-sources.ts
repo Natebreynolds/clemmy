@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
 import {
   mcpToolScopeAuthority,
   type McpToolScope,
@@ -52,6 +53,11 @@ import {
   type CapabilityResolutionEntry,
 } from '../runtime/harness/capability-resolution.js';
 import { registerProofProvisionedCapabilities } from '../runtime/harness/proof-provisioned-catalog.js';
+import {
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+} from '../runtime/harness/host-capability-catalog-factory.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { verifiedReadOriginIsCanonical } from '../runtime/read-path/verified-read-origin-authority.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
 import {
@@ -667,6 +673,10 @@ function durableSourceAccountAliasSelection(input: {
     normalizedAccountEmail(connection.accountEmail).includes('@')
   ));
   if (!foundSavedAlias) {
+    // This compatibility path has no semantic no-preference verdict. Even a
+    // lone identity cannot satisfy an unrecognized source-account nomination.
+    // Checked typed/default routing runs before this fallback and can establish
+    // that an unrelated skill mention imposes no account preference.
     return toolkitHasAccountIdentities ? { kind: 'unusable' } : { kind: 'none' };
   }
   if (nominations.size !== 1) return { kind: 'unusable' };
@@ -787,7 +797,7 @@ export function uniqueConnectedAccountQuestion(
   return { choices: eligible[0]!.choices };
 }
 
-function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[] }> {
+function toolSearchResultRows(result: unknown): unknown[] {
   let payload: unknown = result;
   if (typeof payload === 'string') {
     try {
@@ -800,13 +810,19 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
     ? (payload as { results?: unknown }).results
     : null;
   if (!Array.isArray(rows)) return [];
-  const blockers: Array<{ name: string; choices: string[] }> = [];
+  return rows;
+}
+
+function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[]; reason?: 'review_unavailable' }> {
+  const rows = toolSearchResultRows(result);
+  const blockers: Array<{ name: string; choices: string[]; reason?: 'review_unavailable' }> = [];
   for (const row of rows) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
     const record = row as {
       name?: unknown;
       planningRefStatus?: unknown;
       accountChoices?: unknown;
+      accountSelectionReason?: unknown;
     };
     if (typeof record.name !== 'string' || !record.name.trim()) continue;
     if (record.planningRefStatus !== 'account_selection_required') continue;
@@ -817,7 +833,8 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
         .map((choice) => choice.trim()),
     )];
     if (choices.length === 0) continue;
-    blockers.push({ name: record.name.trim(), choices });
+    blockers.push({ name: record.name.trim(), choices,
+      ...(record.accountSelectionReason === 'review_unavailable' ? { reason: 'review_unavailable' as const } : {}) });
   }
   return blockers;
 }
@@ -830,20 +847,27 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
 export function thisTurnSearchAccountSelectionBlockers(input: {
   sessionId: string;
   sourceUserSeq: number;
-}): Array<{ name: string; choices: readonly string[] }> {
-  const byName = new Map<string, string[]>();
+}): Array<{ name: string; choices: readonly string[]; reason?: 'review_unavailable' }> {
+  const byName = new Map<string, { name: string; choices: string[]; reason?: 'review_unavailable' }>();
   try {
     for (const event of listEvents(input.sessionId, { types: ['tool_returned'] })) {
       if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
       if (event.data.tool !== 'tool_search') continue;
+      for (const row of toolSearchResultRows(event.data.result)) {
+        if (!row || typeof row !== 'object') continue;
+        const result = row as { name?: unknown; capabilityRef?: unknown };
+        if (typeof result.name === 'string' && typeof result.capabilityRef === 'string' && result.capabilityRef.trim()) {
+          byName.delete(result.name.trim());
+        }
+      }
       for (const blocker of parseToolSearchAccountBlockers(event.data.result)) {
-        byName.set(blocker.name, blocker.choices);
+        byName.set(blocker.name, blocker);
       }
     }
   } catch {
     return [];
   }
-  return [...byName.entries()].map(([name, choices]) => ({ name, choices }));
+  return [...byName.values()];
 }
 
 export function planningConnectionForOperation(
@@ -948,6 +972,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   candidates: readonly ToolSearchPlanningDisclosureCandidate[];
   signal?: AbortSignal;
   deadlineAt?: number;
+  accountSelection?: SourceAccountNomination | null;
 }): Promise<{ blockers: Readonly<Record<string, ToolSearchPlanningBlocker>> }> {
   const empty = () => ({ blockers: Object.freeze({}) });
   const guard = { signal: input.signal, deadlineAt: input.deadlineAt };
@@ -982,6 +1007,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   const connections = connectionOutcome.value;
   const entries = new Map<string, CapabilityResolutionEntry>();
   const blockers: Record<string, ToolSearchPlanningBlocker> = {};
+  const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   // A task may resolve source and destination in separate foreground searches.
   // Keep the newest accepted-task resolution cumulative so the existing
   // proof publisher can materialize the model-selected subset at plan time.
@@ -1004,17 +1030,42 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   for (const candidate of composioCandidates.slice(0, 20)) {
     if (!discoveryStillActive(guard)) return empty();
     const slug = candidate.name.trim();
-    const selection = planningConnectionForOperation(slug, acceptedText, connections, {
-      sessionId: input.sessionId,
-      sourceUserSeq: input.sourceUserSeq,
-    });
+    const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
+    let routing = routingByToolkit.get(toolkit);
+    if (!routing) {
+      // Review shares the broker clock and leaves time to return its exact
+      // blocker. Many candidate operations use one checked account route.
+      const outcome = await awaitBounded({
+        start: () => resolveSourceAccountRouting({
+          sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+          toolkit, operation: slug, connections, nomination: input.accountSelection,
+        }),
+        signal: input.signal,
+        deadlineAt: Math.min(Date.now() + 8_000, (input.deadlineAt ?? Infinity) - 500),
+      });
+      if (!discoveryStillActive(guard)) return empty();
+      routing = outcome.kind === 'settled' ? outcome.value : {
+        kind: 'account_selection_required', reason: 'review_unavailable',
+        choices: [...new Set(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)
+          .map(connection => normalizedAccountEmail(connection.accountEmail) || connection.connectionId))],
+      };
+      routingByToolkit.set(toolkit, routing);
+    }
+    // Checked nominations and established routes precede legacy prose hints;
+    // uncertainty never silently falls back to grammar or account memory.
+    const selection = routing.kind !== 'none' ? routing
+      : planningConnectionForOperation(slug, acceptedText, connections, {
+          sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+        });
     // Account ambiguity is an input question, never a reason to mint a
     // provider-default manifest behind the model's back. Duplicate re-auths
     // for the same mailbox are one identity, not false ambiguity.
     if (selection.kind === 'account_selection_required') {
+      entries.delete(`composio:${slug.toLowerCase()}`);
       blockers[slug] = Object.freeze({
         code: 'account_selection_required',
         choices: Object.freeze([...selection.choices]),
+        ...('reason' in selection && selection.reason === 'review_unavailable' ? { reason: 'review_unavailable' as const } : {}),
       });
       continue;
     }
@@ -1039,6 +1090,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       status: 'proven',
       connection: 'active',
       accountIdentity: selection.connection.connectionId,
+      ...(routing.kind === 'resolved' ? { sourceAccountRouting: routing.evidence } : {}),
       effectClass,
     });
   }
@@ -1056,17 +1108,61 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     return proof?.effectClass === 'read' || proof?.effectClass === 'write';
   });
   if (provenOperations.length > 0 && discoveryStillActive(guard)) {
-    await registerProofProvisionedCapabilities(
-      { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
-      {
-        allowedIdentifiers: provenOperations.map((candidate) => candidate.name.trim()),
-        expectedSchemaDigests: provenOperations.map((candidate) => ({
-          identifier: candidate.name.trim(),
-          schemaDigest: digestSchema(candidate.schema as Record<string, unknown>),
-        })),
-        publicationGuard: () => discoveryStillActive(guard),
-      },
-    );
+    // Suggestions are independent choices, not an immutable selected plan.
+    // Live readback 132468: four exact definitions finished before the clock,
+    // but two unrelated neighbors finished after it. Revalidating all six as
+    // one selected plan therefore published none, including GET_MESSAGE.
+    // Keep the plan publisher's all-or-none contract; each discovery choice
+    // instead pays its own complete proof. Publication after that await is
+    // synchronous, so the bounded workers cannot overwrite catalog snapshots.
+    // Leave time for the caller to disclose the completed refs and blockers.
+    const publicationGuard = {
+      signal: input.signal,
+      deadlineAt: input.deadlineAt === undefined ? undefined : input.deadlineAt - 500,
+    };
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(4, provenOperations.length) }, async () => {
+      while (next < provenOperations.length) {
+        const candidate = provenOperations[next++]!;
+        const identifier = candidate.name.trim();
+        const publication = await awaitBounded({
+          start: () => registerProofProvisionedCapabilities(
+            { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
+            {
+              allowedIdentifiers: [identifier],
+              expectedSchemaDigests: [{
+                identifier,
+                schemaDigest: digestSchema(candidate.schema as Record<string, unknown>),
+              }],
+              publicationGuard: () => discoveryStillActive(publicationGuard),
+            },
+          ),
+          ...publicationGuard,
+        });
+        const outcome = publication.kind === 'settled' ? publication.value : undefined;
+        const expectedAccount = entries.get(`composio:${identifier.toLowerCase()}`)?.accountIdentity;
+        const registered = outcome?.registered.some((capabilityId) => {
+          const base = `cap:resolved:${identifier.toLowerCase()}`;
+          if (capabilityId !== base && !capabilityId.startsWith(`${base}:definition:`)) return false;
+          const current = peekHostCapabilityCatalogFactory()?.get(capabilityId);
+          const durable = peekCapabilityManifestStore()?.get(capabilityId);
+          return Boolean(current && isCurrentCallableCatalogEntry(current)
+            && current.manifest?.operationId === identifier
+            && current.manifest.accountId === expectedAccount
+            && durable?.manifest.lifecycle.state === 'current'
+            && durable.digest === current.manifestDigest);
+        });
+        if (!registered) {
+          blockers[identifier] = Object.freeze({
+            code: 'capability_publication_required',
+            choices: Object.freeze([]),
+            reason: outcome?.refusal?.code
+              ?? (!discoveryStillActive(publicationGuard)
+                ? 'proof_publication_expired' : 'proof_not_registered'),
+          });
+        }
+      }
+    }));
   }
   if (!discoveryStillActive(guard)) return empty();
   return { blockers: Object.freeze({ ...blockers }) };
@@ -1375,19 +1471,31 @@ export async function provisionExactWorkflowProviderOperations(input: {
   }
 
   const entries: CapabilityResolutionEntry[] = [];
+  const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const operation of operationIds) {
-    const selection = planningConnectionForOperation(
-      operation,
-      input.acceptedInput,
-      connections,
-      { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
-    );
+    const toolkit = registeredToolkitOfSlug(operation).trim().toLowerCase();
+    let selection = routingByToolkit.get(toolkit);
+    if (!selection) {
+      const routing = await awaitBounded({
+        start: () => resolveSourceAccountRouting({
+          sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+          toolkit, operation, connections,
+        }),
+        ...guard,
+      });
+      if (routing.kind !== 'settled' || !discoveryStillActive(guard)) {
+        return { ok: false, code: 'proof_publication_expired', identifier: operation };
+      }
+      selection = routing.value;
+      routingByToolkit.set(toolkit, selection);
+    }
     if (selection.kind === 'account_selection_required') {
       return {
         ok: false,
         code: 'account_selection_required',
         identifier: operation,
         choices: Object.freeze([...selection.choices]),
+        detail: selection.reason,
       };
     }
     if (selection.kind !== 'resolved') {
@@ -1400,6 +1508,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
       status: 'proven',
       connection: 'active',
       accountIdentity: selection.connection.connectionId,
+      sourceAccountRouting: selection.evidence,
       effectClass: classifyComposioSlugEffect(operation) === 'read' ? 'read' : 'write',
     });
   }
@@ -1513,11 +1622,19 @@ async function materializeIndexNominations(input: {
   query: string;
   signal?: AbortSignal;
   deadlineAt?: number;
+  planningIdentity?: { sessionId: string; sourceUserSeq: number };
+  accountSelection?: SourceAccountNomination | null;
 }): Promise<ComposioBrokerCandidate[]> {
   // This is an absolute budget for the whole nomination, including the fresh
   // current-account snapshot. Starting it after that I/O made the nominal 4s
   // bound additive and allowed already-late rows to warm schema authority.
-  const deadlineAt = exactDiscoveryDeadline(input.deadlineAt);
+  let deadlineAt = exactDiscoveryDeadline(input.deadlineAt);
+  // Source review is a separate bounded phase that overlaps fuzzy discovery.
+  // Its result may unlock a fresh metadata budget, always inside the same
+  // outer source deadline. The initial snapshot still owns the original
+  // absolute four-second budget, including for callers without a source.
+  const reviewedDeadlineAt = Math.min(Date.now() + 8_000 + INDEX_NOMINATION_DEADLINE_MS,
+    (input.deadlineAt ?? Infinity) - PROVIDER_SOURCE_RETURN_MARGIN_MS);
   const guard = { signal: input.signal, deadlineAt };
   if (!discoveryStillActive(guard)) return [];
   const indexed = searchCapabilityOperations(input.query, {
@@ -1530,6 +1647,7 @@ async function materializeIndexNominations(input: {
 
   const requests: ExactMaterializationRequest[] = [];
   const requested = new Set<string>();
+  const checkedRoutes = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const hit of indexed) {
     if (!discoveryStillActive(guard)) return [];
     const slug = hit.identifier.trim().toUpperCase();
@@ -1542,10 +1660,31 @@ async function materializeIndexNominations(input: {
       || !indexedCarrier
       || slugToolkit !== indexedCarrier
     ) continue;
-    // Advisory nominations still require one resolved current account before
-    // paying for exact lookup. Genuine ambiguity is surfaced later only when
-    // the user explicitly selected the exact operation above.
-    const selection = planningConnectionForOperation(slug, input.query, usable);
+    // Exact metadata acquisition retains its account boundary. A typed source
+    // route takes precedence over compatibility hints, just as at staging;
+    // an uncertain or failed review must never fall through to those hints.
+    let route = checkedRoutes.get(slugToolkit);
+    if (!route && input.planningIdentity) {
+      const outcome = await awaitBounded({
+        start: () => resolveSourceAccountRouting({
+          ...input.planningIdentity!, toolkit: slugToolkit, operation: slug,
+          connections: usable, nomination: input.accountSelection,
+        }),
+        signal: input.signal,
+        deadlineAt: Math.min(Date.now() + 8_000, reviewedDeadlineAt),
+      });
+      route = outcome.kind === 'settled' ? outcome.value : {
+        kind: 'account_selection_required', choices: [], reason: 'review_unavailable',
+      };
+      checkedRoutes.set(slugToolkit, route);
+      if (route.kind === 'resolved') {
+        deadlineAt = Math.min(Date.now() + INDEX_NOMINATION_DEADLINE_MS, reviewedDeadlineAt);
+        guard.deadlineAt = deadlineAt;
+      }
+    }
+    if (!discoveryStillActive(guard)) return [];
+    const selection = route && route.kind !== 'none' ? route
+      : planningConnectionForOperation(slug, input.query, usable);
     if (selection.kind !== 'resolved') continue;
     requests.push({ slug, toolkit: slugToolkit });
     requested.add(slug);
@@ -1709,9 +1848,18 @@ export function buildAuthorizedToolSearchCandidateSources(
       })()
     : null;
 
+  // Exact/receipt-backed fast paths already observed their current definition.
+  // Keep that preparation inside this source instance only; a durable page or
+  // a newly constructed broker cannot inherit it from serialized metadata.
+  const preparedSearchCandidates = new Map<string, ToolSearchBrokerCandidate>();
+  const rememberPreparedSearchCandidate = (candidate: ToolSearchBrokerCandidate): ToolSearchBrokerCandidate => {
+    preparedSearchCandidates.set(candidate.name, candidate);
+    return candidate;
+  };
   const composio: ToolSearchCandidateSource = {
     kind: 'authorized_composio',
-    async search({ query, signal, deadlineAt }) {
+    async search({ query, signal, deadlineAt, accountSelection, deferPreparation }) {
+      preparedSearchCandidates.clear();
       if (signal?.aborted) return [];
       const exactOperation = exactComposioOperationFromQuery(query);
       if (exactOperation) {
@@ -1758,8 +1906,8 @@ export function buildAuthorizedToolSearchCandidateSources(
             fixedArgs: { tool_slug: candidate.slug },
             payloadField: 'arguments',
           },
-          guidance: `Build the action arguments from this exact live schema. Invoke work_call with inner name composio_execute_tool; set tool_slug to ${candidate.slug} and serialize the action arguments into the arguments field.`,
-        }));
+          guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
+        })).map(rememberPreparedSearchCandidate);
       }
       // A strict confident Tool Memory hit gets one exact provider
       // revalidation and no fuzzy request. Account resolution intentionally
@@ -1796,8 +1944,8 @@ export function buildAuthorizedToolSearchCandidateSources(
               fixedArgs: { tool_slug: candidate.slug },
               payloadField: 'arguments',
             },
-            guidance: `Build the action arguments from this exact live schema. Invoke work_call with inner name composio_execute_tool; set tool_slug to ${candidate.slug} and serialize the action arguments into the arguments field.`,
-          }));
+            guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
+          })).map(rememberPreparedSearchCandidate);
         }
       }
       // Memory/index rows are ranking hints, never completeness or liveness
@@ -1814,6 +1962,9 @@ export function buildAuthorizedToolSearchCandidateSources(
         hit.identifier.trim().toLowerCase(),
         hit.score,
       ]));
+      const indexText = new Map(indexed.map((hit) => [
+        hit.identifier.trim().toLowerCase(), [hit.displayName, hit.description].filter(Boolean).join('\n'),
+      ]));
       // Fuzzy membership and exact advisory nomination are independent live
       // reads. Start them together so their budgets overlap instead of stacking
       // (the live Inbox canary spent the whole host window in this sequence).
@@ -1825,12 +1976,13 @@ export function buildAuthorizedToolSearchCandidateSources(
             ? { deadlineAt: deadlineAt - PROVIDER_SOURCE_RETURN_MARGIN_MS }
             : {}),
         }),
-        materializeIndexNominations({ query, signal, deadlineAt }),
+        deferPreparation ? Promise.resolve([] as ComposioBrokerCandidate[])
+          : materializeIndexNominations({ query, signal, deadlineAt, planningIdentity, accountSelection }),
         // A canonical read receipt may nominate the read phase of mixed work,
         // but it cannot replace bounded live discovery of the requested write.
         // Live calendar failure 2026-08-29: returning only the remembered
         // availability read hid OUTLOOK_CALENDAR_CREATE_EVENT before freeze.
-        rememberedWinner && (requestEffectScope === 'write' || requestEffectScope === 'mixed')
+        !deferPreparation && rememberedWinner && (requestEffectScope === 'write' || requestEffectScope === 'mixed')
           ? materializeRememberedComposioOperations({
               matches: [rememberedWinner],
               signal,
@@ -1840,7 +1992,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       ]);
       if (signal?.aborted) return [];
       const candidates = fuzzyOutcome.kind === 'settled' ? fuzzyOutcome.value : [];
-      if (fuzzyOutcome.kind === 'failed' && nominated.length === 0) {
+      if (fuzzyOutcome.kind === 'failed' && nominated.length === 0 && !(deferPreparation && indexed.length > 0)) {
         throw fuzzyOutcome.error;
       }
       // Provider fuzzy rows win duplicate identity/order; nomination adds only
@@ -1853,18 +2005,33 @@ export function buildAuthorizedToolSearchCandidateSources(
         return true;
       });
       if (signal?.aborted) return [];
-      return merged
+      const liveCandidates = merged
         .map((candidate, index): ToolSearchBrokerCandidate => ({
           name: candidate.slug,
+          relevanceText: indexText.get(candidate.slug.toLowerCase()),
+          lifecycleSuccessor: (candidate as { providerRecommendedSuccessor?: boolean })
+            .providerRecommendedSuccessor === true,
           summary: candidate.description?.trim()
             || `${candidate.name} (${candidate.toolkit})`,
           schema: candidate.inputParameters,
           carrier: 'work_call',
-          // The provider result owns membership. Memory can only nudge the
-          // ordering of those exact live rows, never add a missing row.
+          // Both fuzzy and exact-nominated rows already survived live provider
+          // observation, so BOTH signals are evidence of relevance — and
+          // neither is authority to DEMOTE the other. Take the stronger of the
+          // two, then break ties on provider order.
+          //
+          // A nudge smaller than one provider-rank step left even the index's
+          // best match behind near-duplicate variants; letting the index score
+          // REPLACE provider rank overcorrected, and demoted rows whose
+          // position was live truth rather than a relevance guess — an exact
+          // lifecycle successor the provider hydrated and placed first is not
+          // in the local index at all, so it lost its seat to whatever the
+          // index happened to score well. Max keeps both fixes.
           score: composioDiscoveryScore(
-            boundedRank(index, candidates.length)
-              + Math.min(0.05, Math.max(0, indexScore.get(candidate.slug.toLowerCase()) ?? 0) * 0.05),
+            (Math.max(
+              indexScore.get(candidate.slug.toLowerCase()) ?? 0,
+              boundedRank(index, candidates.length),
+            ) + 0.01 * boundedRank(index, candidates.length)) / 1.01,
             registeredToolkitOfSlug(candidate.slug),
             candidate.slug,
           ),
@@ -1873,13 +2040,60 @@ export function buildAuthorizedToolSearchCandidateSources(
             fixedArgs: { tool_slug: candidate.slug },
             payloadField: 'arguments',
           },
-          guidance: `Build the action arguments from this exact live schema. Invoke work_call with inner name composio_execute_tool; set tool_slug to ${candidate.slug} and serialize the action arguments into the arguments field.`,
+          guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
         }))
+        // A lifecycle successor was hydrated by an EXACT provider lookup in
+        // this same pass — the very category this cache exists for. Without
+        // remembering it, planning materialization re-fetched a definition
+        // already in hand, spending a second provider round-trip to learn
+        // nothing new.
+        .map((candidate) => (candidate.lifecycleSuccessor && candidate.schema !== undefined
+          ? rememberPreparedSearchCandidate(candidate)
+          : candidate));
+      // These rows nominate metadata only. They receive no schema or callable
+      // ref until the visible page asks prepareCandidates for live definitions.
+      // This preserves index reach without reviewing unrelated accounts first.
+      const deferredCandidates: ToolSearchBrokerCandidate[] = deferPreparation
+        ? indexed.filter((hit) => {
+            const slug = hit.identifier.trim().toUpperCase();
+            const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
+            return !seen.has(slug) && isRegisteredToolkitSlug(toolkit)
+              && toolkit === hit.carrier.trim().toLowerCase();
+          }).map((hit) => ({
+            name: hit.identifier.trim().toUpperCase(), summary: hit.description || hit.displayName,
+            carrier: 'work_call', score: hit.score,
+          }))
+        : [];
+      return [...liveCandidates, ...deferredCandidates]
         .sort((left, right) => (right.score ?? 0) - (left.score ?? 0) || left.name.localeCompare(right.name))
         // Keep the broker's full bounded snapshot. tool_search owns visible
         // page size/cursors; truncating here made provider rank nine impossible
         // to recover without another physical discovery epoch.
         .slice(0, 20);
+    },
+    async prepareCandidates({ candidates, signal, deadlineAt, reuseSearchPreparation }) {
+      const requested = new Map(candidates.map((candidate) => [candidate.name.trim().toUpperCase(), candidate]));
+      const alreadyPrepared = [...requested.keys()].flatMap((slug) => {
+        const candidate = reuseSearchPreparation ? preparedSearchCandidates.get(slug) : undefined;
+        return candidate ? [candidate] : [];
+      });
+      const requests = [...requested.keys()].flatMap((slug) => {
+        if (reuseSearchPreparation && preparedSearchCandidates.has(slug)) return [];
+        const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
+        return isRegisteredToolkitSlug(toolkit) ? [{ slug, toolkit }] : [];
+      });
+      const current = await materializeExactProviderBatch({ requests, signal, deadlineAt });
+      return [...alreadyPrepared, ...current.flatMap((candidate): ToolSearchBrokerCandidate[] => {
+        const nominated = requested.get(candidate.slug);
+        return nominated ? [{
+          ...nominated,
+          name: candidate.slug,
+          summary: candidate.description?.trim() || nominated.summary,
+          schema: candidate.inputParameters,
+          carrier: 'work_call',
+          invocation: { name: 'composio_execute_tool', fixedArgs: { tool_slug: candidate.slug }, payloadField: 'arguments' },
+        }] : [];
+      })];
     },
   };
 

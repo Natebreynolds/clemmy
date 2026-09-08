@@ -77,17 +77,29 @@ test('a partial proven capability cannot withhold the first missing-capability d
   assert.ok(first, 'the first search for the unresolved capability is admitted');
   assert.equal(first.category, 'broad_discovery');
 
-  // A synonym carrier shares the durable subject but not its physical provider
-  // authority. A different call id is denied before provider I/O.
+  // A distinct plain request has its own source-bound in-flight identity. The
+  // current owner policy does not infer query equivalence from a toolkit name.
+  assert.ok(admitDiscoveryBoundary({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    attemptId: 'partial-capability-attempt',
+    toolName: 'composio_list_tools',
+    input: { toolkit_slug: 'apify', limit: 200 },
+    callId: 'apify-list-independent-2',
+  }));
+  // Repeating the exact request under a new call ID cannot acquire another
+  // physical owner or manufacture an evidence-progress epoch.
   assert.throws(
     () => admitDiscoveryBoundary({
       sessionId: session.id,
       sourceUserSeq: source.seq,
       turn: 1,
       attemptId: 'partial-capability-attempt',
-      toolName: 'composio_list_tools',
-      input: { toolkit_slug: 'apify', limit: 200 },
-      callId: 'apify-discovery-synonym-2',
+      toolName: 'composio_search_tools',
+      input: { toolkit_slug: 'apify',
+        query: 'run an Apify Google Maps scraper actor and return restaurant results for a location' },
+      callId: 'apify-discovery-duplicate-3',
     }),
     (error: unknown) => error instanceof DiscoveryBudgetDeniedError
       && error.reason === 'new_call_requires_retry_epoch',

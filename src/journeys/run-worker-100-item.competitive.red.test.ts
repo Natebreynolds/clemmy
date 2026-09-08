@@ -19,6 +19,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-run-worker-100-'));
@@ -555,7 +556,21 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   innerDispatch._setInnerDispatchToolsForTests(new Map([['composio_execute_tool', gateway as never]]));
 
   let semanticCalls = 0;
+  let accountReviews = 0;
+  const reviewAccount = currentSourceAccountReviewer({
+    sessionId: () => session.id,
+    acceptedText: PROMPT,
+    toolkit: 'competitive',
+    accountIdentity: 'conn-competitive',
+    acceptedSource: (sessionId, seq) => eventlog.listEvents(sessionId,
+      { sinceSeq: seq - 1, types: ['user_input_received'], limit: 1 })[0],
+  });
   semanticPorts.installTurnSemanticModelPort({
+    async judgeAccountSelection(call) {
+      const verdict = await reviewAccount(call);
+      accountReviews += 1;
+      return verdict;
+    },
     async interpret() { semanticCalls += 1; throw new Error('hidden semantic pass'); },
     async judgeSourceEffect() { semanticCalls += 1; throw new Error('hidden effect judge'); },
     async judgePlanGrounding() { semanticCalls += 1; throw new Error('hidden grounding judge'); },
@@ -735,7 +750,8 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
           },
         })];
       } else if (parentStep === 3) {
-        assert.equal(tools.includes('plan_task'), false);
+        assert.equal(tools.includes('plan_task'), false,
+          `the exact plan must activate before worker execution: ${projectedToolResult(rawRequest, 'plan-benchmark-fanout')}`);
         assert.ok(tools.includes('work_call'));
         assert.ok(tools.includes('run_worker'));
         output = [functionCall('read-benchmark-set', 'work_call', {
@@ -850,6 +866,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     },
   });
 
+  assert.ok(accountReviews > 0, 'the current accepted source/account is reviewed by its real semantic model-port boundary');
   const hostContinuedAfterPlan = result.status === 'completed';
   const hostDb = eventlog.openEventLog();
   const hostReachedWorkerJourney = workerModelCrossings === ITEM_COUNT
@@ -1075,6 +1092,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     workerComposeOnlyEvents: writeBlocks.length,
     discoveryProviderListings: discoveryCalls,
     hiddenSemanticCalls: semanticCalls,
+    currentSourceAccountReviews: accountReviews,
     forbiddenDirectCatalogBodies,
     preambles: deliveredPreambles.length,
   };

@@ -182,19 +182,26 @@ function ensureOriginDeliveries(record: AwaitingInputWorkflowRecord, detail: str
   }
 }
 
+function needsInputProjection(filePath: string, record: AwaitingInputWorkflowRecord): boolean {
+  return path.basename(filePath, '.json') === record.id
+    && record.status === 'awaiting_input'
+    && isWorkflowAwaitingInputState(record.awaitingInput)
+    && record.awaitingInput.answer === undefined
+    && Boolean(record.id?.trim())
+    && Boolean(record.workflow?.trim());
+}
+
 function projectFile(filePath: string): 'projected' | 'skipped' {
+  // Broad idle inventories must not create and fsync an owner/lock directory
+  // for every retained run. Atomic rename gives a complete advisory snapshot;
+  // candidates are still re-read under the strict lock before any projection.
+  const initial = scanWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);
+  if (initial.status !== 'ok' || !needsInputProjection(filePath, initial.record)) return 'skipped';
   return withWorkflowRunRecordLock(filePath, () => {
     const scan = scanWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);
     if (scan.status !== 'ok') return 'skipped';
     const record = scan.record;
-    if (
-      path.basename(filePath, '.json') !== record.id
-      || record.status !== 'awaiting_input'
-      || !isWorkflowAwaitingInputState(record.awaitingInput)
-      || record.awaitingInput.answer !== undefined
-      || !record.id?.trim()
-      || !record.workflow?.trim()
-    ) return 'skipped';
+    if (!needsInputProjection(filePath, record)) return 'skipped';
 
     const detail = detailFor(record);
     ensureWorkflowEvent(record);

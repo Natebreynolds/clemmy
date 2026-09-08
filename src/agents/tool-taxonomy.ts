@@ -43,6 +43,7 @@ import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { isPlainOrClementineLocalTool } from '../runtime/harness/runtime-tool-identity.js';
 import {
   canonicalToolToken,
   extractComposioSlug,
@@ -471,6 +472,11 @@ function classifyComposioSlug(slug: string): ToolKind {
 /** Public — used by every tool family's `needsApproval` factory. */
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
+
+  // This foreground host control persists a reviewed local plan artifact. Its
+  // name is not a remote publication verb, and foreign namespace lookalikes
+  // must never inherit the local classification.
+  if (isPlainOrClementineLocalTool(name, 'publish_plan')) return 'write';
 
   // The embedded word "read" describes the future pilot's effect, not this
   // call's own effect: requesting the pilot writes a durable projection and

@@ -29,14 +29,9 @@ import {
   liveComposioSchemaFingerprint,
 } from '../tools/composio-schema-cache.js';
 import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js';
-import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { parseWorkflowInterval } from '../shared/workflow-interval.js';
-import {
-  outputContractSuggestionFromPrompt,
-  promptLooksDeliverable,
-  textMentionsDeliverable,
-} from './workflow-deliverable-hints.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   argsHaveStaticSendTarget,
@@ -700,13 +695,6 @@ function stepLooksIntentionalAggregateBatch(step: WorkflowStepShape): boolean {
   return true;
 }
 
-function checkParallelismHint(step: WorkflowStepShape): string | null {
-  if (!stepLooksMultiItemWithoutForEach(step)) return null;
-  return `Step "${step.id}" looks like multi-item work but has no forEach — it will run serially in one context. To parallelize safely, have the upstream step emit an ARRAY and add \`forEach: <upstreamStepId>\` to this step; the runner then fans out per item with bounded concurrency and keeps each item's context lean. (run_worker is not the path — it's unavailable inside a workflow step; forEach is the fan-out primitive.)`;
-}
-
-/** Parallelism-hint predicate. This remains advisory: only the authoring model
- *  may add semantic fan-out topology; the host never turns prose into N calls. */
 export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boolean {
   if (step.forEach) return false;
   if (ROW_BOOKKEEPING_RE.test(step.prompt)) return false;
@@ -1037,84 +1025,9 @@ function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   return null;
 }
 
-// A step that produces a concrete artifact (file / URL / report / record)
-// should declare an `output` contract — that's what engages BOTH the
-// deterministic per-step verifier (verifyStepOutput) AND the end-of-run target
-// judge. Without it, runtime can only infer a soft needs-attention advisory
-// when concrete deliverable evidence is missing. Advisory only (regex can't be
-// certain), and skipped when the step already declares output / is a forEach
-// fan-out wrapper (its items carry the shape) / is purely deterministic config.
-function stepLooksDeliverable(step: WorkflowStepShape): boolean {
-  return promptLooksDeliverable(step.prompt ?? '');
-}
-
-function workflowHasGoal(data: WorkflowFrontmatter): boolean {
-  const objective = data.goal?.objective;
-  return typeof objective === 'string' && objective.trim().length >= 4;
-}
-
-function checkOutputContractHint(step: WorkflowStepShape): string | null {
-  if (step.output && Object.keys(step.output).length > 0) return null;
-  if (step.forEach) return null; // the fan-out wrapper aggregates; per-item shape is what matters
-  if (step.transform) return null; // the closed expression is its executable data contract
-  if (step.deterministic) return null; // deterministic steps are handled by checkDeterministicRunner
-  const prompt = step.prompt ?? '';
-  if (!stepLooksDeliverable(step)) return null;
-  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block so the engine can hard-verify the deliverable and the end-of-run target check can use concrete evidence; without it, the runner can only infer a best-effort needs-attention advisory when artifact evidence is missing. ${outputContractSuggestionFromPrompt(prompt)}`;
-}
-
-function checkWorkflowGoalHint(data: WorkflowFrontmatter, steps: WorkflowStepShape[]): string | null {
-  if (workflowHasGoal(data)) return null;
-  const hasDeliverableStep = steps.some((step) => !step.forEach && !step.deterministic && stepLooksDeliverable(step));
-  const synthesisPrompt = data.synthesis?.prompt ?? '';
-  const hasDeliverableSynthesis = textMentionsDeliverable(synthesisPrompt);
-  if (!hasDeliverableStep && !hasDeliverableSynthesis) return null;
-  return 'Workflow appears to produce a deliverable but has no pinned `goal`. Add a goal objective and success criteria so completion is judged against external evidence, not just the model saying it is done.';
-}
-
-// A step that should run a PROVEN cli/mcp tool-choice but leaves its prompt
-// generic AND keeps the composio gateway in scope will re-decide at runtime and
-// can drift onto a stale/expired path (the live SF→Airtable failure). WARNING
-// only (never blocks) — and only fires when binding is both warranted and
-// missing. Auto-bind (workflow_create) resolves most of these before save; this
-// catches medium-confidence matches and hand-edits via the dashboard editor.
-function checkRememberedToolChoiceBinding(
-  step: WorkflowStepShape,
-  choices: ToolChoiceRecord[] | undefined,
-): string | null {
-  if (!choices || choices.length === 0) return null;
-  if (step.usesSkill || step.uses_skill) return null; // a skill owns its tools
-  let matches: ReturnType<typeof matchToolChoicesForStep>;
-  try {
-    matches = matchToolChoicesForStep(step.prompt ?? '', { choices });
-  } catch {
-    return null;
-  }
-  const m = matches.find((x) =>
-    (x.kind === 'cli' || x.kind === 'mcp')
-    && !x.alreadyBound
-    && !/^(?:null|undefined|none|n\/a|na|unknown)?$/i.test((x.command ?? '').trim()));
-  if (!m) return null;
-  const allowed = step.allowedTools;
-  // Drift is possible when the step can still reach composio: an explicit
-  // composio_* entry, OR no allowedTools at all (default = full surface).
-  const canReachComposio =
-    !allowed || allowed.length === 0 || allowed.some((t) => typeof t === 'string' && t.startsWith('composio'));
-  const familyReachable = !!allowed && m.family.every((f) =>
-    allowed.some((t) => t === f || (t.endsWith('*') && f.startsWith(t.slice(0, -1)))));
-  if (familyReachable && m.kind === 'mcp') {
-    const namespace = m.identifier.split('__')[0]?.toLowerCase() ?? '';
-    if (namespace && new RegExp(`\\b${namespace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(step.prompt ?? '')) {
-      return null;
-    }
-  }
-  if (!canReachComposio) return null;
-  return (
-    `Step "${step.id}" looks like it should use your proven ${m.kind} \`${m.command}\`, but its prompt doesn't `
-    + 'embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale '
-    + `path. Bake \`${m.command}\` into the step prompt and set allowedTools to that family.`
-  );
-}
+// Validation checks authored contracts and exact tool identities. Suggested
+// topology, output shapes, goals and remembered tool selections belong to an
+// explicit authoring/proposal action, never a routine save receipt.
 
 function checkSkillReference(step: WorkflowStepShape, installedSkillNames: Set<string> | undefined): string | null {
   const skill = (step.usesSkill ?? step.uses_skill ?? '').trim();
@@ -1563,8 +1476,6 @@ export function validateWorkflowDefinition(
   }
 
   // Workflow-level declared input keys (typed-workflow-contract).
-  const goalIssue = checkWorkflowGoalHint(data, steps);
-  if (goalIssue) warnings.push(goalIssue);
 
   if (data.synthesis?.prompt) {
     const subject = 'Synthesis prompt';
@@ -1650,14 +1561,6 @@ export function validateWorkflowDefinition(
     const missingSkill = checkSkillReference(step, opts.installedSkillNames);
     if (missingSkill) warnings.push(missingSkill);
 
-    const parallelismIssue = checkParallelismHint(step);
-    if (parallelismIssue) warnings.push(parallelismIssue);
-
-    const outputContractIssue = checkOutputContractHint(step);
-    if (outputContractIssue) warnings.push(outputContractIssue);
-
-    const bindingIssue = checkRememberedToolChoiceBinding(step, opts.rememberedToolChoices);
-    if (bindingIssue) warnings.push(bindingIssue);
   }
 
   return {

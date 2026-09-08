@@ -56,6 +56,56 @@ function result(callId: string, name: string, text = 'settled') {
   };
 }
 
+let discoveryCallOrdinal = 0;
+function appendDiscoveryPublication(input: {
+  identity: ReturnType<typeof accepted>;
+  results: unknown[];
+  callId?: string;
+  roleKey?: string;
+  tool?: string;
+  category?: 'broad_discovery' | 'exact_schema_refresh';
+  decision?: 'admitted' | 'denied';
+  outcome?: 'succeeded' | 'failed';
+  output?: string;
+  outcomeSource?: number;
+}): void {
+  const callId = input.callId ?? `published-discovery-${++discoveryCallOrdinal}`;
+  const category = input.category ?? 'broad_discovery';
+  appendEvent({
+    sessionId: input.identity.sessionId, turn: 1, role: 'system',
+    type: 'discovery_governor_decision',
+    data: {
+      sourceUserSeq: input.identity.sourceUserSeq, callId, category,
+      subject: input.roleKey ?? 'unbound-catalog-query',
+      decision: input.decision ?? 'admitted',
+    },
+  });
+  eventlog.writeToolOutput({
+    sessionId: input.identity.sessionId, callId, tool: input.tool ?? 'tool_search',
+    output: input.output ?? JSON.stringify({
+      role_key: input.roleKey, results: input.results,
+    }),
+  });
+  appendEvent({
+    sessionId: input.identity.sessionId, turn: 1, role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: input.outcomeSource ?? input.identity.sourceUserSeq,
+      callId, category, outcome: input.outcome ?? 'succeeded',
+    },
+  });
+}
+
+function appendPublishedCapabilities(
+  identity: ReturnType<typeof accepted>, capabilities: Record<string, unknown>[],
+): void {
+  appendEvent({
+    sessionId: identity.sessionId, turn: 1, role: 'system', type: 'capability_discovered',
+    data: { sourceUserSeq: identity.sourceUserSeq, capabilities },
+  });
+  appendDiscoveryPublication({ identity, results: capabilities });
+}
+
 function initializeDiscoveryRole(
   identity: ReturnType<typeof accepted>,
   roleKey = 'clause-0:unknown',
@@ -147,6 +197,7 @@ function appendSettledDiscoveryStage(input: {
     type: 'discovery_governor_outcome',
     data: {
       sourceUserSeq: input.identity.sourceUserSeq,
+      category: 'broad_discovery',
       callId: input.callId,
       outcome: 'succeeded',
     },
@@ -242,6 +293,7 @@ test('all same-source citable catalog growth collapses to one pre-graph transiti
     },
   });
 
+  appendDiscoveryPublication({ identity, results: [{ capabilityRef: 'capability:one' }] });
   const projected = projectHostNoProgressAuthority(identity);
   assert.equal(projected.status, 'ok');
   if (projected.status !== 'ok') return;
@@ -263,6 +315,9 @@ test('all same-source citable catalog growth collapses to one pre-graph transiti
       ],
     },
   });
+  appendDiscoveryPublication({ identity, results: [
+    { capabilityRef: 'capability:two' }, { capabilityRef: 'capability:three' },
+  ] });
   const grown = projectHostNoProgressAuthority(identity);
   assert.equal(grown.status, 'ok');
   if (grown.status !== 'ok') return;
@@ -271,13 +326,7 @@ test('all same-source citable catalog growth collapses to one pre-graph transiti
 
 test('each distinct exact write ref disclosed is its own effect gain; re-disclosure and siblings are not', () => {
   const identity = accepted('write-refs');
-  const disclose = (capabilities: Record<string, unknown>[]) => appendEvent({
-    sessionId: identity.sessionId,
-    turn: 1,
-    role: 'system',
-    type: 'capability_discovered',
-    data: { sourceUserSeq: identity.sourceUserSeq, capabilities },
-  });
+  const disclose = (capabilities: Record<string, unknown>[]) => appendPublishedCapabilities(identity, capabilities);
   // The first broad search discloses unrelated writes (live 2026-09-01:
   // workflow_run/create/edit_step) plus reads.
   disclose([
@@ -327,6 +376,139 @@ test('each distinct exact write ref disclosed is its own effect gain; re-disclos
   assert.equal(readOnly.status, 'ok');
   if (readOnly.status !== 'ok') return;
   assert.deepEqual(readOnly.authority.effect, exact.authority.effect);
+});
+
+for (const taskMode of [undefined, { version: 1, kind: 'plan' }]) {
+  test(`mobile Space first-page trace credits no hidden or blocked refs (${taskMode?.kind ?? 'normal'})`, () => {
+    // Retained live source 133979, tool call 133993, result 134002: all eight
+    // public rows were blocked, but hidden native/provider preparation caused
+    // authority_progress. Keep the actual query, ranking, and blocker states.
+    const session = createSession({ id: `mobile-space-page-${taskMode?.kind ?? 'normal'}`, kind: 'chat' });
+    const source = appendEvent({
+      sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: {
+        text: 'Create a simple static Space called Clem Planned Space with slug clemmy-planned-native-0905. It should display exactly Planning becomes execution. Include the same content in its mobile view. No data sources, actions, schedules, connector calls, or subagents. Prepare the complete plan for review.',
+        ...(taskMode ? { taskMode } : {}),
+      },
+    });
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+    const roleKey = initializeDiscoveryRole(identity, 'clause-0:write');
+    const baseline = projectHostNoProgressAuthority(identity);
+    assert.equal(baseline.status, 'ok');
+    if (baseline.status !== 'ok') return;
+    appendEvent({
+      sessionId: session.id, turn: 1, role: 'system', type: 'capability_discovered',
+      data: {
+        sourceUserSeq: source.seq,
+        capabilities: [
+          { capabilityRef: 'cap:local:space_edit_view:reversible', effectClass: 'write',
+            descriptor: { id: 'cap:local:space_edit_view:reversible', effect: 'local_write' } },
+          { capabilityRef: 'cap:resolved:airtable_create_base', effectClass: 'write',
+            descriptor: { id: 'cap:resolved:airtable_create_base', effect: 'external_write' } },
+          { capabilityRef: 'cap:resolved:dataforseo_get_app_google_app_reviews_task_get_adv_by_id', effectClass: 'read' },
+        ],
+      },
+    });
+    const page = {
+      query: 'create a static Space/workspace with a slug and fixed display content, plus mobile view',
+      role_key: roleKey,
+      results: [
+        { name: 'MONDAY_CREATE_WORKSPACE', planningRefStatus: 'account_selection_required' },
+        { name: 'MONDAY_ARCHIVE_WORKSPACE', planningRefStatus: 'account_selection_required' },
+        { name: 'MONDAY_ADD_USERS_TO_WORKSPACE', planningRefStatus: 'account_selection_required' },
+        { name: 'AIRTABLE_CREATE_BASE', capabilityRef: 'cap:resolved:airtable_create_base',
+          planningRefStatus: 'materialization_unavailable', materializationReason: 'proof_publication_expired' },
+        { name: 'DATAFORSEO_GET_APP_GOOGLE_APP_REVIEWS_TASK_GET_ADV_BY_ID',
+          capabilityRef: 'cap:resolved:dataforseo_get_app_google_app_reviews_task_get_adv_by_id',
+          planningRefStatus: 'materialization_unavailable', materializationReason: 'proof_publication_expired' },
+        { name: 'GOOGLEDRIVE_CREATE_FILE_FROM_TEXT', planningRefStatus: 'account_selection_required' },
+        { name: 'MONDAY_CREATE_BOARD', planningRefStatus: 'account_selection_required' },
+        { name: 'GOOGLEDRIVE_EXPORT_GOOGLE_WORKSPACE_FILE', planningRefStatus: 'account_selection_required' },
+      ],
+    };
+    appendDiscoveryPublication({ identity, roleKey, results: page.results, output: JSON.stringify(page) });
+    const firstPage = projectHostNoProgressAuthority(identity);
+    assert.equal(firstPage.status, 'ok');
+    if (firstPage.status !== 'ok') return;
+    assert.deepEqual(firstPage.authority, baseline.authority,
+      'hidden native ref and blocked provider refs did not reach the executable surface');
+    const first = observeNoProgress(initializeNoProgressGovernor({
+      taskKey: session.id, authority: baseline.authority,
+    }), { taskKey: session.id, attemptClass: 'authority_acquisition', authority: firstPage.authority });
+    assert.equal(first.reason, 'retry_available');
+    assert.deepEqual(first.gained, []);
+
+    // Once the native ref is actually published, the existing progress lane
+    // opens immediately. Plan mode can inspect writes without executing them.
+    appendPublishedCapabilities(identity, [{
+      capabilityRef: 'cap:local:space_save:reversible', effectClass: 'write',
+    }]);
+    const visible = projectHostNoProgressAuthority(identity);
+    assert.equal(visible.status, 'ok');
+    if (visible.status !== 'ok') return;
+    const next = observeNoProgress(first.state, {
+      taskKey: session.id, attemptClass: 'authority_acquisition', authority: visible.authority,
+    });
+    assert.equal(next.reason, 'authority_progress');
+    assert.deepEqual(next.gained, ['operation', 'effect']);
+  });
+}
+
+test('blocked top-ranked rows do not become role stages; native variants still become public exact refs', () => {
+  const identity = accepted('blocked-stage-native-variants');
+  const roleKey = initializeDiscoveryRole(identity);
+  appendEvent({
+    sessionId: identity.sessionId, turn: 1, role: 'system', type: 'capability_discovered',
+    data: { sourceUserSeq: identity.sourceUserSeq, capabilities: [{
+      capabilityRef: 'cap:local:space_save:reversible', effectClass: 'write',
+      descriptor: { id: 'cap:local:space_save:reversible', effect: 'local_write' },
+    }] },
+  });
+  appendDiscoveryPublication({ identity, roleKey, results: [{
+    capabilityRef: 'cap:local:space_save:reversible', planningRefStatus: 'materialization_unavailable',
+  }] });
+  const blocked = projectHostNoProgressAuthority(identity);
+  assert.equal(blocked.status, 'ok');
+  if (blocked.status !== 'ok') return;
+  assert.deepEqual(blocked.authority.operation, []);
+  assert.deepEqual(blocked.authority.effect, []);
+  appendDiscoveryPublication({ identity, roleKey, tool: 'mcp__clementine__tool_search', results: [{
+    name: 'space_save', capabilityVariants: [{ capabilityRef: 'cap:local:space_save:reversible' }],
+  }] });
+  const visible = projectHostNoProgressAuthority(identity);
+  assert.equal(visible.status, 'ok');
+  if (visible.status !== 'ok') return;
+  assert.equal(visible.authority.operation.length, 1, 'generic exposure only; no invented unique ranked stage');
+  assert.equal(visible.authority.effect.length, 2, 'write class and exact native variant');
+});
+
+test('public exposure requires admitted settled same-source trusted discovery and matching host proof', () => {
+  const identity = accepted('discovery-exposure-negative');
+  const unrelated = accepted('discovery-exposure-unrelated');
+  const capabilityRef = 'cap:discovery:checked';
+  appendEvent({
+    sessionId: identity.sessionId, turn: 1, role: 'system', type: 'capability_discovered',
+    data: { sourceUserSeq: identity.sourceUserSeq, capabilities: [{ capabilityRef, effectClass: 'read' }] },
+  });
+  const base = { identity, results: [{ capabilityRef }] };
+  for (const variation of [
+    { decision: 'denied' as const }, { outcome: 'failed' as const },
+    { outcomeSource: unrelated.sourceUserSeq }, { tool: 'mcp__foreign__tool_search' },
+    { output: '{incomplete' }, { results: [{ capabilityRef: 'cap:model:invented' }] },
+    { results: [], output: JSON.stringify({ hint: capabilityRef, schemas: { [capabilityRef]: {} } }) },
+  ]) {
+    appendDiscoveryPublication({ ...base, ...variation });
+    const projected = projectHostNoProgressAuthority(identity);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') return;
+    assert.deepEqual(projected.authority.operation, [], JSON.stringify(variation));
+    assert.deepEqual(projected.authority.effect, []);
+  }
+  appendDiscoveryPublication({ ...base, category: 'exact_schema_refresh' });
+  const exact = projectHostNoProgressAuthority(identity);
+  assert.equal(exact.status, 'ok');
+  if (exact.status === 'ok') assert.equal(exact.authority.operation.length, 2,
+    'exact refresh pages retain generic exposure and exact read credit');
 });
 
 test('distinct role-bound top-ranked capability stages advance without counting catalog siblings', () => {
@@ -529,6 +711,7 @@ test('uncitable, unproven, unbound, and lower-ranked discovery rows cannot mint 
     type: 'discovery_governor_outcome',
     data: {
       sourceUserSeq: identity.sourceUserSeq,
+      category: 'broad_discovery',
       callId: 'uncitable-top',
       outcome: 'succeeded',
     },
@@ -608,6 +791,7 @@ test('a selected host call gains authority without an expected-work graph; retry
     CREATE TABLE write_evidence_bindings (session_id TEXT, source_user_seq INTEGER, requirement_id TEXT, target_digest TEXT);
     CREATE TABLE write_evidence_proofs (session_id TEXT, source_user_seq INTEGER, manifest_id TEXT, node_id TEXT, obligation TEXT);
     CREATE TABLE discovery_governor_roles (session_id TEXT, source_user_seq INTEGER, role_key TEXT);
+    CREATE TABLE discovery_governor_tasks (session_id TEXT, source_user_seq INTEGER, claim_key_version INTEGER);
   `);
   try {
     const baseline = projectHostNoProgressAuthority(identity, db);
@@ -1051,6 +1235,7 @@ test('varied call ids and irrelevant capability refs cannot buy repeated retries
         }],
       },
     });
+    appendDiscoveryPublication({ identity, callId, results: [{ capabilityRef: `irrelevant-ref-${ordinal}` }] });
     const projected = projectHostNoProgressAuthority(identity);
     assert.equal(projected.status, 'ok');
     if (projected.status !== 'ok') throw new Error(projected.reason);
@@ -1123,6 +1308,7 @@ test('mixed recall discovery and refusal gains one citable path, then repeated l
       capabilities: [{ capabilityRef: 'first-citable-path' }],
     },
   });
+  appendDiscoveryPublication({ identity, results: [{ capabilityRef: 'first-citable-path' }] });
   const refused = buildHostToolDispositionResult({
     callId: 'mixed-refusal',
     toolName: 'opaque_control',
@@ -2125,13 +2311,7 @@ test('a mixed frame and a failed read keep their metered class', () => {
 // Writes already got this treatment on 2026-09-01; reads never did.
 test('each newly citable READ is authority progress, and re-disclosing one is not', () => {
   const identity = accepted('cold-read-discovery');
-  const disclose = (capabilities: Record<string, unknown>[]) => appendEvent({
-    sessionId: identity.sessionId,
-    turn: 1,
-    role: 'system',
-    type: 'capability_discovered',
-    data: { sourceUserSeq: identity.sourceUserSeq, capabilities },
-  });
+  const disclose = (capabilities: Record<string, unknown>[]) => appendPublishedCapabilities(identity, capabilities);
 
   disclose([{ identifier: 'soql', capabilityRef: 'cap:live:soql', effectClass: 'read' }]);
   const first = projectHostNoProgressAuthority(identity);
@@ -2167,4 +2347,75 @@ test('each newly citable READ is authority progress, and re-disclosing one is no
 
   // Reads never grant effect authority — discovering a query cannot change anything.
   assert.deepEqual(second.authority.effect, first.authority.effect);
+});
+
+/* ------------------------------------------------------------------ *
+ * A READ THAT FAILED CHANGED NOTHING.
+ *
+ * Live 2026-09-07, source 144363 (the Salesforce -> Sheet job): two
+ * ActivityHistories queries returned MALFORMED_QUERY from the Salesforce
+ * CLI — the provider had said precisely what was wrong. They settled
+ * `unknown, mutating=0, zero crossings`, mapped to stop_factual, and ended
+ * the job WITHOUT another model step, discarding the Task and Opportunity
+ * rows that had already succeeded. Two retries remained on the budget.
+ * ------------------------------------------------------------------ */
+
+test('an unknown READ is repairable; an unknown WRITE still stops', () => {
+  const identity = accepted('unknown-read-repairable');
+  const db = settlementDb([
+    // The exact 144363 shape: dispatched, came back unusable, changed nothing.
+    { callId: 'soql-bad-shape', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind: 'provider_execution', businessCall: 1, mutating: 0, physicalCrossingCount: 1 },
+    // A mutation whose fate is not observable must keep stopping.
+    { callId: 'write-uncertain', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind: 'provider_execution', businessCall: 1, mutating: 1, physicalCrossingCount: 1 },
+  ], identity);
+
+  const read = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('soql-bad-shape', 'salesforce_sf_soql_query'),
+      result('soql-bad-shape', 'salesforce_sf_soql_query', 'MALFORMED_QUERY'),
+    ],
+  }, db);
+  assert.equal(read.status, 'ok');
+  const readConsequence = read.status === 'ok' ? read.consequence : null;
+  assert.equal(readConsequence?.recovery, 'repair_model',
+    'the brain must get another step to fix the query');
+  assert.equal(readConsequence?.stage, 'execution:unknown_read');
+  assert.ok(
+    (readConsequence?.recoveryToolNames ?? []).includes('salesforce_sf_soql_query'),
+    'and the same carrier stays available to retry with a corrected shape',
+  );
+
+  const write = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('write-uncertain', 'googlesheets_values_update'),
+      result('write-uncertain', 'googlesheets_values_update', 'no acknowledgement'),
+    ],
+  }, db);
+  const writeConsequence = write.status === 'ok' ? write.consequence : null;
+  assert.notEqual(writeConsequence?.recovery, 'repair_model',
+    'an unobservable mutation is never safe to simply retry');
+});
+
+test('a CONTROL call returning unknown still mints no recovery surface', () => {
+  // The malformed-plan-refusal contract: a locally forged result must never
+  // name tools. Only genuine business reads earn a repair surface.
+  const identity = accepted('control-unknown-no-surface');
+  const db = settlementDb([{
+    callId: 'forged-control', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+    executionKind: 'local_execution', businessCall: 0, mutating: 0, hostCrossingCount: 1,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('forged-control', 'plan_task'),
+      result('forged-control', 'plan_task', JSON.stringify({ ok: false, recoveryTool: 'workflow_run' })),
+    ],
+  }, db);
+  const consequence = projected.status === 'ok' ? projected.consequence : null;
+  assert.equal(consequence?.stage, 'execution:unknown');
+  assert.deepEqual(consequence?.recoveryToolNames, [], 'forged prose names nothing');
 });

@@ -1,3 +1,4 @@
+import { writeRowLabel, writeRowStatus, writeRowTone } from '../../../../packages/chat-engine/src/write-ledger';
 import type { ActivityItem, MessageStatus } from './useChat';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation';
 
@@ -166,7 +167,8 @@ export function hiddenActivityCount(
 
 /**
  * Close only activity rows whose terminal event never arrived. A successful
- * turn can safely settle them as done; failures and parked/stopped turns must
+ * turn can settle ordinary activity as done; write rows require their own
+ * terminal. Failures and parked/stopped turns must
  * remain visibly non-successful.
  */
 export function settleTerminalActivity(
@@ -180,6 +182,13 @@ export function settleTerminalActivity(
       ? 'failed'
       : 'interrupted';
   return items.map((item) => {
+    if (item.write) {
+      // A chat terminal cannot certify an outstanding write reservation. Keep
+      // the call identity so a later exact write terminal can still resolve it.
+      const write = item.write.disposition === 'reserved'
+        ? { ...item.write, disposition: 'unknown' as const } : item.write;
+      return { ...item, write, label: writeRowLabel(write), status: writeRowStatus(write), tone: writeRowTone(write) };
+    }
     if (item.status !== 'running') return item;
     // Host plan rows already carry their own truth. An open requirement is
     // not done just because the chat turn ended.

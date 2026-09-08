@@ -16,6 +16,7 @@ const {
   allRegistryNames,
   resolveHotSet,
   rankCatalog,
+  rankCatalogEntriesLexically,
   executionLaneToolSearchEnabled,
 } = await import('./tool-catalog.js');
 const { recordToolHit, getHotSet, _resetHotSetForTest } = await import('./tool-hotset.js');
@@ -250,4 +251,124 @@ test('execution lanes get the deferred surface only while global tool-search is 
     if (priorGlobal === undefined) delete process.env.CLEMMY_CODEX_TOOL_SEARCH;
     else process.env.CLEMMY_CODEX_TOOL_SEARCH = priorGlobal;
   }
+});
+
+
+test('complete query coverage beats a partial tool-name match across create, read, and update families', () => {
+  for (const fixture of [
+    { query: 'create client record', verb: 'create', target: 'ENTITY_INSERT',
+      targetText: 'Create a client record.', neighbor: 'CLIENT_RECORD_EXPORT', neighborText: 'Export archived client record snapshots.' },
+    { query: 'read delivery status', verb: 'read', target: 'ENTRY_LOOKUP',
+      targetText: 'Read delivery status.', neighbor: 'DELIVERY_STATUS_REPAIR', neighborText: 'Modify delivery status retry configuration.' },
+    { query: 'update billing address', verb: 'update', target: 'CONTACT_PATCH',
+      targetText: 'Update the billing address.', neighbor: 'BILLING_ADDRESS_EXPORT', neighborText: 'Export archived billing address data.' },
+  ]) {
+    const ranked = rankCatalogEntriesLexically(fixture.query, [
+      { name: fixture.target, oneLiner: fixture.targetText },
+      { name: fixture.neighbor, oneLiner: fixture.neighborText },
+      // Generic verbs are naturally common in a mixed catalog. Their smaller
+      // IDF must not let matching object words in the wrong operation name win.
+      ...Array.from({ length: 12 }, (_, i) => ({ name: `UNRELATED_OPERATION_${i}`,
+        oneLiner: `${fixture.verb} unrelated scheduled payload ${i}.` })),
+    ]);
+    const target = ranked.find((row) => row.name === fixture.target)!;
+    const neighbor = ranked.find((row) => row.name === fixture.neighbor)!;
+    assert.equal(ranked[0].name, fixture.target, fixture.query);
+    assert.equal(target.fullLexicalCoverage, true);
+    assert.equal(neighbor.fullLexicalCoverage, false);
+    assert.ok(neighbor.score > target.score, 'the old averaged score would pick the partial-name neighbor');
+  }
+});
+
+test('fully covered base and reply operations retain the existing name-specificity tie-break', () => {
+  const entries = [
+    { name: 'MAIL_CREATE_DRAFT', oneLiner: 'Create a draft email message.' },
+    { name: 'MAIL_CREATE_REPLY_DRAFT', oneLiner: 'Create a reply draft email message.' },
+  ];
+  const base = rankCatalogEntriesLexically('create draft email message', entries);
+  assert.ok(base.every((row) => row.fullLexicalCoverage));
+  assert.equal(base[0].name, 'MAIL_CREATE_DRAFT');
+  assert.equal(rankCatalogEntriesLexically('create reply draft email message', entries)[0].name, 'MAIL_CREATE_REPLY_DRAFT');
+});
+
+test('lexical coverage remains advisory and cannot distinguish cross-tool prose that covers the same query', () => {
+  const ranked = rankCatalogEntriesLexically('create client record', [
+    { name: 'ENTITY_INSERT', oneLiner: 'Create client record.' },
+    { name: 'CLIENT_RECORD_EXPORT', oneLiner: 'Export snapshots; to create client record use ENTITY_INSERT instead.' },
+  ]);
+  assert.ok(ranked.every((row) => row.fullLexicalCoverage),
+    'this metric does not claim to understand which clause describes the operation');
+  assert.equal(ranked.length, 2, 'ranking never removes a capability from discovery');
+});
+
+
+test('a complete compound operation name in ordinary word order precedes incidental description coverage', () => {
+  for (const fixture of [
+    { query: 'create a container in Orbit', target: 'ORBIT_CREATE_CONTAINER',
+      targetText: 'Create a container within Orbit.', neighbor: 'ORBIT_CREATE_ITEMS',
+      neighborText: 'Create items in a container within Orbit.' },
+    { query: 'read status in Harbor', target: 'HARBOR_READ_STATUS',
+      targetText: 'Read status within Harbor.', neighbor: 'HARBOR_READ_HISTORY',
+      neighborText: 'Read status history in Harbor.' },
+    { query: 'update address in Atlas', target: 'ATLAS_UPDATE_ADDRESS',
+      targetText: 'Update address within Atlas.', neighbor: 'ATLAS_UPDATE_RECORD',
+      neighborText: 'Update a record and address in Atlas.' },
+  ]) {
+    const entries = [
+      { name: fixture.target, oneLiner: fixture.targetText },
+      { name: fixture.neighbor, oneLiner: fixture.neighborText },
+    ];
+    for (const ordered of [entries, [...entries].reverse()]) {
+      const ranked = rankCatalogEntriesLexically(fixture.query, ordered);
+      const target = ranked.find((row) => row.name === fixture.target)!;
+      const neighbor = ranked.find((row) => row.name === fixture.neighbor)!;
+      assert.equal(ranked[0].name, fixture.target, fixture.query);
+      assert.equal(target.completeCompoundNameMatch, true);
+      assert.equal(neighbor.completeCompoundNameMatch, false);
+      assert.equal(target.fullLexicalCoverage, false, 'the target deliberately does not contain the incidental preposition');
+      assert.equal(neighbor.fullLexicalCoverage, true, 'the old categorical coverage key incorrectly preferred this row');
+    }
+  }
+});
+
+test('single-token and repeated generic names do not receive compound-identifier priority', () => {
+  for (const fixture of [
+    { query: 'create client record', generic: 'CREATE', genericText: 'Create entries.',
+      target: 'ENTITY_INSERT', targetText: 'Create client record.' },
+    { query: 'search shipment history', generic: 'SEARCH_SEARCH', genericText: 'Search entries.',
+      target: 'ARCHIVE_LOOKUP', targetText: 'Search shipment history.' },
+  ]) {
+    const ranked = rankCatalogEntriesLexically(fixture.query, [
+      { name: fixture.generic, oneLiner: fixture.genericText },
+      { name: fixture.target, oneLiner: fixture.targetText },
+    ]);
+    assert.ok(ranked.every((row) => !row.completeCompoundNameMatch));
+    assert.equal(ranked[0].name, fixture.target);
+  }
+  const empty = rankCatalogEntriesLexically('', [{ name: 'ARCHIVE_GET_DATA', oneLiner: 'Get data.' }]);
+  assert.equal(empty[0]!.completeCompoundNameMatch, false);
+  assert.equal(empty[0]!.fullLexicalCoverage, false);
+});
+
+test('complete generic and specific names retain the existing score and base-versus-reply specificity', () => {
+  const generic = rankCatalogEntriesLexically('get data in Archive', [
+    { name: 'GET_DATA', oneLiner: 'Get data in Archive.' },
+    { name: 'ARCHIVE_GET_DATA', oneLiner: 'Get data in Archive.' },
+  ]);
+  assert.ok(generic.every((row) => row.completeCompoundNameMatch && row.fullLexicalCoverage));
+  assert.equal(generic[0]!.name, 'ARCHIVE_GET_DATA');
+  assert.ok(generic[0]!.score > generic[1]!.score, 'the existing score distinguishes a generic subset from the complete specific name');
+
+  const entries = [
+    { name: 'MAIL_CREATE_DRAFT', oneLiner: 'Create a draft email message for a new conversation or reply.' },
+    { name: 'MAIL_CREATE_REPLY_DRAFT', oneLiner: 'Create a reply draft email message.' },
+  ];
+  const base = rankCatalogEntriesLexically('mail create draft', entries);
+  assert.equal(base[0]!.name, 'MAIL_CREATE_DRAFT');
+  assert.equal(base[0]!.completeCompoundNameMatch, true);
+  assert.equal(base[1]!.completeCompoundNameMatch, false, 'an unrequested reply qualifier is not a complete name match');
+  const reply = rankCatalogEntriesLexically('mail create reply draft', entries);
+  assert.ok(reply.every((row) => row.completeCompoundNameMatch && row.fullLexicalCoverage));
+  assert.equal(reply[0]!.name, 'MAIL_CREATE_REPLY_DRAFT');
+  assert.ok(reply[0]!.score > reply[1]!.score);
 });

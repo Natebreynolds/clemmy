@@ -1,10 +1,15 @@
+import { classifyModelError } from './resilient-model.js';
 import { Agent, Runner } from '@openai/agents';
 import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
-import type { BoundaryJudgeRouting } from './debate-model.js';
+import type { BoundaryJudgeRouting, CapturedBoundaryJudgeSelection } from './debate-model.js';
 import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs } from './judge-family.js';
 import { extractJsonCandidate } from './json-repair.js';
+import { estimateMessagesTokens, predictTurnCost } from './budget.js';
+import { renderSkillReference, type SessionSkill } from './skill-execution.js';
+import { effectiveContextWindow } from './model-window-observations.js';
+import { resolveModelCapability } from './model-wire-registry.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -27,6 +32,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
   '- A plan, intention, or "I will work on this next" is NOT complete.',
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
+  '- Check factual claims and limitations against the supplied source evidence. A field omitted from a selected projection is not evidence that the provider omitted it. Inspect the complete source, including nested records, before accepting claims that data is absent, empty or unavailable; distinguish missing values from zero and from values the assistant did not inspect.',
   '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
   '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
@@ -75,6 +81,24 @@ export interface ObjectiveJudgeVerdict {
    */
   failedOpen?: boolean;
   selfJudge?: boolean;
+  /** The judge was an EXPLICIT owner selection, not a no-other-family fallback.
+   *  `selfJudge` stays an honest statement about model family; this says whether
+   *  the owner chose it. Consumers that exist to catch the coherence trap should
+   *  key on both, not on family alone. */
+  ownerSelectedJudge?: boolean;
+  /**
+   * Which model ACTUALLY produced this verdict, and — when that was not the
+   * judge the owner pinned — what they asked for and why a stand-in ran.
+   * Without these on the durable result a cheaper substitute's verdict is
+   * indistinguishable after the fact from the pinned model's, so a substitute
+   * could be reported as successful qualification of a judge that never ran.
+   */
+  judgeModelId?: string;
+  judgeProvider?: BoundaryJudgeRouting['judgeFamily'];
+  judgeProviderId?: string;
+  substituteForExactPin?: boolean;
+  requestedJudgeModelId?: string;
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin';
   /**
    * The judge ruled the turn's deliverable is a genuine direction/authorization
    * question to the user (AWAITING verdict). Treated as done for bounce purposes;
@@ -92,6 +116,30 @@ export interface ObjectiveJudgeGateInput {
   actionIntent: boolean;
   /** Tool calls made across the whole conversation so far. */
   meaningfulToolEvidence: boolean;
+  /** Work attempted for THIS accepted source makes completion review eligible.
+   * Discovery, retained reads and failed calls are work attempts, not proof of
+   * completion. This structural host signal does not depend on request/reply
+   * vocabulary and never uses another source's activity. */
+  sourceWorkAttempted?: boolean;
+  /**
+   * Settled, SUCCESSFUL effects bound to THIS accepted source.
+   *
+   * The gate below was written to catch a completion CLAIM with no evidence, so
+   * it skips whenever tool evidence exists. That made real business turns — the
+   * ones that actually wrote an artifact — the only turns never verified. A
+   * settled source-bound effect makes the turn ELIGIBLE for verification of the
+   * produced artifact against the objective; it is not, on its own, proof that
+   * the objective was met.
+   */
+  settledSourceEffects?: number;
+  /**
+   * FALSE when the durable evidence spine could not be read. A storage failure
+   * previously arrived here as `settledSourceEffects: 0`, indistinguishable from
+   * a truthful "this request wrote nothing" — so the one shape verification
+   * exists for was the shape that silently skipped it. Unknown evidence is
+   * judged, never assumed clean.
+   */
+  settledEvidenceAvailable?: boolean;
   /** A batch/compound objective cannot be certified by one successful tool. */
   multiResultObjective?: boolean;
   /**
@@ -146,7 +194,14 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     input.nextAction === 'completed' &&
     !input.openApprovalCard &&
     input.continuationsUsed < input.maxContinuations &&
-    (Boolean(input.promiseShaped)
+    (input.sourceWorkAttempted === true
+      || Boolean(input.promiseShaped)
+      // VERIFICATION path: this source actually settled an effect, so the
+      // produced artifact can be checked against the objective. Previously this
+      // exact condition caused a SKIP.
+      || (input.actionIntent && (input.settledSourceEffects ?? 0) > 0)
+      // Evidence we could not read is not evidence of nothing.
+      || (input.actionIntent && input.settledEvidenceAvailable === false)
       || (!input.acceptedExecutionEvidence
         && input.actionIntent
         && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
@@ -298,12 +353,17 @@ export function composeJudgedObjective(input: string, priorUserMessages: string[
   ].join('\n');
 }
 
-/** Optional skill-execution rubric: the skills loaded this session + compact
- *  evidence of what tools actually fired. When present, the judge verifies the
- *  agent EXECUTED the skill (produced its deliverables), not just read it. */
+/** Retained framework references plus execution evidence. The effective
+ * accepted objective governs which requirements apply; loading adds no work. */
 export interface SkillExecutionContext {
-  skills: { name: string; body: string }[];
+  skills: SessionSkill[];
   toolCallSummary: string;
+  /** Source-authenticated host evidence is kept whole until the selected
+   * model's request admission. Never independently clip the reply or skills
+   * while claiming this is a complete evidence review. */
+  fullSourceEvidence?: boolean;
+  /** Only the accepted source may supply this; omitted retains legacy routing. */
+  boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
 }
 
 export type ObjectiveJudgeFn = (
@@ -374,10 +434,10 @@ function buildJudgeAgent(routing?: BoundaryJudgeRouting, instructions: string = 
     // the brain-family-safe cheap id when no different family is available (never a
     // repurposed BYO fast slot that would storm an unintended provider).
     model: routing?.model ?? routing?.modelId ?? codexSafeFast(),
-    // A binary done/not-done verdict against an explicit rubric does not need
-    // deep chain-of-thought — low reasoning effort cuts the largest chunk of
-    // per-call latency on this hot path (the judge runs on most action turns).
-    modelSettings: { reasoning: { effort: 'low' } },
+    // Let the selected provider own its reasoning default. An explicit empty
+    // settings object prevents a string fallback from acquiring an SDK-imposed
+    // reasoning tier; the harness imposes no tier.
+    modelSettings: {},
     tools: [],
   });
 }
@@ -426,7 +486,9 @@ export function buildObjectiveJudgePrompt(
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
 ): string {
-  const shown = clipForJudge(assistantResponse, JUDGE_RESPONSE_MAX_CHARS);
+  const shown = skillContext?.fullSourceEvidence
+    ? { text: assistantResponse, truncated: false }
+    : clipForJudge(assistantResponse, JUDGE_RESPONSE_MAX_CHARS);
   const parts = [
     `Objective: ${objective}`,
     '',
@@ -445,15 +507,17 @@ export function buildObjectiveJudgePrompt(
   if (toolSummary && toolSummary !== '(no tool calls made)') {
     parts.push(
       '',
-      `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
+      skillContext?.fullSourceEvidence
+        ? `Authenticated evidence for this accepted source (raw results and retained projections are identified separately): ${toolSummary}`
+        : `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
     );
   }
   if (skillContext && skillContext.skills.length > 0) {
     parts.push(
       '',
-      '=== SKILLS LOADED THIS SESSION — verify they were EXECUTED, not just read ===',
-      'A loaded skill is a procedure the assistant committed to run. For EACH skill below, check the assistant actually carried out its prescribed steps and produced its deliverables (a file, image, URL, record, deploy). Use the tool-call evidence above: if a skill clearly prescribes a step (e.g. generate imagery, run a bundled script, create a file) and the evidence shows that step was NOT done, the objective is NOT done — set done=false and name the specific skipped step. A pure-advice/persona skill with no concrete deliverables has nothing to enforce.',
-      ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 5000 chars) ---\n${s.body.slice(0, 5000)}`),
+      '=== RETAINED SKILL REFERENCES — relevance is governed by the effective accepted objective ===',
+      'Reading a skill supplies reference material; it does not adopt every step or add deliverables. Interpret which framework and requirements the effective accepted objective actually adopts. Planning, inspecting or comparing a skill does not authorize executing it. Prior-source references can explain a framework the owner asks to reuse, but unrelated prior material and unknown scope cannot impose work. Different body digests are different retained versions; do not silently substitute the first or newest version. Check required steps and deliverables when they are applicable to the accepted job, using actual evidence. A missing applicable required step is a real gap; mere non-execution of a read reference is not.',
+      ...skillContext.skills.map(renderSkillReference),
     );
   }
   parts.push('', 'Audit it against the objective and respond with exactly one verdict line.');
@@ -464,6 +528,55 @@ export function buildObjectiveJudgePrompt(
  *  'invalid' (vs transport 'error') in the metric lane. */
 class JudgeVerdictParseError extends Error {}
 
+/** Admission for the one existing judge request, using the selected route's
+ * observed/declared window and shared estimation. No evidence is removed to
+ * manufacture a request that fits. Provider rejection still owns actual token
+ * limits; these counts are explicitly estimates, not billing/tokenizer facts. */
+export function completionJudgeContextAdmission(
+  modelId: string,
+  instructions: string,
+  prompt: string,
+): { fits: boolean; estimatedInputTokens: number; outputReserve: number; estimatedTotalTokens: number; contextWindow: number } {
+  const estimatedInputTokens = estimateMessagesTokens([
+    { role: 'system', content: instructions }, { role: 'user', content: prompt },
+  ]);
+  const outputReserve = resolveModelCapability(modelId).maxOutput;
+  const estimatedTotalTokens = predictTurnCost({
+    currentStateTokens: 0, userInputTokens: estimatedInputTokens,
+    plannedToolCallCount: 0, expectedOutputTokens: outputReserve, staticOverheadTokens: 0,
+  });
+  const contextWindow = effectiveContextWindow(modelId);
+  return { fits: estimatedTotalTokens <= contextWindow, estimatedInputTokens,
+    outputReserve, estimatedTotalTokens, contextWindow };
+}
+
+class JudgeContextUnavailableError extends Error {}
+
+/** The same attempt used by the primary and hedge, exported for a provider-
+ * free test of the actual assembled SDK request. This does not add a judge. */
+export async function runRoutedJudgeAttempt<T>(
+  routing: BoundaryJudgeRouting,
+  instructions: string,
+  prompt: string,
+  parse: (output: unknown) => T | null,
+  requireCompletePrompt = false,
+): Promise<T> {
+  if (requireCompletePrompt) {
+    const admission = completionJudgeContextAdmission(routing.modelId, instructions, prompt);
+    if (!admission.fits) {
+      throw new JudgeContextUnavailableError(`Complete evidence review unavailable: ${routing.modelId} `
+        + `has a ${admission.contextWindow}-token context window; the complete request is estimated at `
+        + `${admission.estimatedInputTokens} input tokens plus ${admission.outputReserve} output reserve. `
+        + 'No source evidence was discarded and no partial prompt was judged.');
+    }
+  }
+  const runner = new Runner({ workflowName: 'clementine-objective-judge' });
+  const result = await runner.run(buildJudgeAgent(routing, instructions), prompt, { maxTurns: 1 });
+  const value = parse(result.finalOutput);
+  if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
+  return value;
+}
+
 interface CompletionJudgeRun {
   /** Parsed verdict from the first attempt to answer, or null. */
   verdict: { done: boolean; reason: string; awaitingUser?: boolean } | null;
@@ -472,6 +585,7 @@ interface CompletionJudgeRun {
   failure: 'timeout' | 'invalid' | 'error' | null;
   /** The winning attempt's routing (primary routing when nothing won). */
   routing?: BoundaryJudgeRouting;
+  unavailableReason?: string;
 }
 
 /**
@@ -492,25 +606,27 @@ export async function runHedgedJudge<T>(
   parse: (finalOutput: unknown) => T | null,
   isPass: (value: T) => boolean,
   lane: JudgeMetricLane = 'completion',
-  opts: { timeoutMs?: number } = {},
-): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting }> {
+  opts: { timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection } = {},
+): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
     const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
-    routing = resolveBoundaryJudge();
-    const hedgeRouting = resolveBoundaryJudgeHedge(routing);
-    const attempt = (r: BoundaryJudgeRouting) => async () => {
-      const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-      const result = await runner.run(buildJudgeAgent(r, instructions), prompt, { maxTurns: 1 });
-      const value = parse(result.finalOutput);
-      if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
-      return value;
-    };
+    routing = resolveBoundaryJudge(opts.boundaryJudgeSelection);
+    const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
+    const attempt = (r: BoundaryJudgeRouting) => () => runRoutedJudgeAttempt(
+      r, instructions, prompt, parse, opts.requireCompletePrompt === true,
+    );
+    // An explicit caller deadline still wins; otherwise use the deadline the
+    // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
+    // exact pin, and ignoring it left a deliberately chosen flagship judge racing
+    // the 25s cheap-checker default and timing out into fail-open — reported to
+    // the owner as if the pinned judge had agreed.
+    const effectiveTimeoutMs = opts.timeoutMs ?? routing.timeoutMs;
     const raced = await withJudgeHedge(
       attempt(routing),
       hedgeRouting ? attempt(hedgeRouting) : null,
-      opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {},
+      effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {},
     );
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
     if (raced.value !== null) {
@@ -524,11 +640,17 @@ export async function runHedgedJudge<T>(
           ? 'invalid'
           : 'error';
     recordCompletionJudgeMetric(failure, startedAt, routing, lane);
-    return { value: null, failure, routing };
+    const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
+    const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
+    const unavailableReason = contextFailure instanceof Error ? contextFailure.message
+      : rateLimited ? 'A completion reviewer was rate-limited; no review was completed. Choose an available reviewer in Settings.'
+        : undefined;
+    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}) };
   } catch (err) {
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
-    return { value: null, failure: 'error', routing };
+    return { value: null, failure: 'error', routing,
+      ...(opts.boundaryJudgeSelection && err instanceof Error ? { unavailableReason: err.message } : {}) };
   }
 }
 
@@ -544,9 +666,12 @@ async function runCompletionJudge(
     parseCompletionVerdict,
     (v) => v.done,
     judge.lane ?? 'completion',
-    judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {},
+    { ...(judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {}),
+      ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
+      ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}) },
   );
-  return { verdict: run.value, failure: run.failure, routing: run.routing };
+  return { verdict: run.value, failure: run.failure, routing: run.routing,
+    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}) };
 }
 
 /** Swallow-with-trace: the judge lanes are fail-open/fail-strict by CONTRACT,
@@ -706,18 +831,38 @@ export async function judgeObjectiveComplete(
   }
   const run = await runCompletionJudge(objective, assistantResponse, skillContext);
   if (!run.verdict) {
+    if (run.unavailableReason) return { done: true, failedOpen: true,
+      reason: run.unavailableReason };
     const why =
       run.failure === 'timeout'
-        ? 'judge timed out — accepting completion'
+        ? 'The completion reviewer timed out; no review was completed.'
         : run.failure === 'invalid'
-          ? 'judge output did not parse — accepting completion'
-          : 'judge unavailable — accepting completion';
+          ? 'The completion reviewer returned an unreadable verdict; no review was completed.'
+          : 'The completion reviewer was unavailable; no review was completed.';
     return { done: true, reason: why, failedOpen: true };
   }
   return {
     done: run.verdict.done,
     reason: run.verdict.reason,
     selfJudge: run.routing?.selfJudge === true,
+    ...(run.routing?.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
+    // Requested-vs-actual identity travels WITH the verdict. A downstream reader
+    // must be able to tell the owner's pinned judge from a stand-in without
+    // re-deriving routing state that no longer exists by then.
+    ...(run.routing?.modelId ? { judgeModelId: run.routing.modelId } : {}),
+    ...(run.routing?.judgeFamily ? { judgeProvider: run.routing.judgeFamily } : {}),
+    ...(run.routing?.judgeProviderId ? { judgeProviderId: run.routing.judgeProviderId } : {}),
+    ...(run.routing?.substituteForExactPin
+      ? {
+          substituteForExactPin: true,
+          ...(run.routing.requestedModelId
+            ? { requestedJudgeModelId: run.routing.requestedModelId }
+            : {}),
+          ...(run.routing.substituteReason
+            ? { substituteReason: run.routing.substituteReason }
+            : {}),
+        }
+      : {}),
     ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}),
   };
 }

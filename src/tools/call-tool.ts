@@ -34,6 +34,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessRunContextStorage,
+  attestToolLocalInputInvalidity,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
 } from '../runtime/harness/brackets.js';
@@ -63,6 +64,7 @@ import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 import { resolveAcceptedExactMcpCarrier } from '../runtime/harness/accepted-mcp-carrier.js';
 import {
+  canonicalCatalogIdentityOf,
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
   type RegisteredHostCapability,
@@ -109,6 +111,12 @@ import {
   type TurnSourceStrategyBindingV1,
 } from '../runtime/harness/turn-control.js';
 import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
+import {
+  hostCallCapabilityBindingMatchesAttestation,
+  loadHostCallCapabilityBinding,
+} from '../runtime/harness/host-call-capability-binding.js';
 
 export { materializeStrictNullableFields } from '../runtime/schema-normalizer.js';
 
@@ -125,6 +133,95 @@ function uniqueCurrentCallableCatalogOperation(name: string): RegisteredHostCapa
     )
   )) ?? [];
   return matches.length === 1 ? matches[0]! : null;
+}
+
+/** Reopen the exact host-selected non-MCP operation. Name-based discovery is
+ * compatibility only when no host attestation exists; it never substitutes a
+ * sibling account/transport for a missing accepted identity. This does not mint
+ * call, effect or consent authority, and performs no provider I/O. */
+function currentCatalogOperationForCall(
+  name: string,
+  args: unknown,
+): { ok: true; entry: RegisteredHostCapability | null } | { ok: false; reason: string } {
+  const attestation = currentHostCallAttestation();
+  if (!attestation) return { ok: true, entry: uniqueCurrentCallableCatalogOperation(name) };
+  // Built-in envelopes and the normalized Composio transport have their own
+  // dispatch boundary. Neither may select another catalog row by bare name.
+  if (attestation.bindingKind !== 'catalog_manifest' || name === 'composio_execute_tool') {
+    return { ok: true, entry: null };
+  }
+  try {
+    const logical = currentLogicalCall();
+    const contract = durableLogicalCallContract(attestation.acceptedTaskId, name, args);
+    if (!logical || !contract
+      || logical.acceptedTaskId !== attestation.acceptedTaskId
+      || logical.logicalToolCallId !== attestation.logicalToolCallId
+      || contract.toolName !== attestation.toolName
+      || name.trim().toLowerCase() !== attestation.operationId.toLowerCase()) {
+      return { ok: false, reason: 'accepted_operation_mismatch' };
+    }
+    const durable = loadHostCallCapabilityBinding({ db: openEventLog(),
+      sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq,
+      logicalToolCallId: attestation.logicalToolCallId });
+    if (durable.status !== 'ok'
+      || !hostCallCapabilityBindingMatchesAttestation(durable.binding, attestation)) {
+      return { ok: false, reason: 'accepted_binding_unavailable' };
+    }
+    if (contract.argumentDigest !== durable.binding.effectiveArgumentDigest) {
+      return { ok: false, reason: 'accepted_arguments_mismatch' };
+    }
+    const stored = peekCapabilityManifestStore()?.get(attestation.manifestId);
+    const manifest = currentCapabilityManifest(stored?.manifest);
+    if (!stored || !manifest
+      || stored.digest !== attestation.manifestDigest
+      || capabilityManifestDigest(manifest) !== attestation.manifestDigest
+      || manifest.manifestId !== attestation.manifestId
+      || manifest.operationId !== attestation.operationId
+      || manifest.definitionFingerprint !== attestation.schemaFingerprint
+      || manifest.accountId !== attestation.accountId
+      || manifest.invokePortId !== attestation.invokePortId
+      || manifest.effect !== attestation.effect
+      || manifest.externalDefinition?.providerInputSchemaDigest !== attestation.providerInputSchemaDigest) {
+      return { ok: false, reason: 'accepted_manifest_unavailable' };
+    }
+    const entry = peekHostCapabilityCatalogFactory()?.get(attestation.capabilityId);
+    const canonical = entry ? canonicalCatalogIdentityOf(entry) : null;
+    if (!entry || !isCurrentCallableCatalogEntry(entry) || !canonical
+      || canonical.capabilityId !== attestation.capabilityId
+      || canonical.manifestId !== manifest.manifestId
+      || canonical.manifestDigest !== attestation.manifestDigest
+      || canonical.operationId !== manifest.operationId
+      || canonical.schemaVersion !== manifest.operationVersion
+      || canonical.schemaDigest !== manifest.definitionFingerprint
+      || canonical.providerKind !== manifest.providerKind
+      || canonical.providerVersion !== manifest.providerVersion
+      || canonical.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
+      || canonical.liveFingerprint !== manifest.definitionFingerprint
+      || canonical.account !== manifest.accountId
+      || canonical.effect !== manifest.effect
+      || canonical.invokePortId !== manifest.invokePortId
+      || canonical.argumentCompiler.id !== manifest.argumentCompiler.id
+      || canonical.argumentCompiler.version !== manifest.argumentCompiler.version) {
+      return { ok: false, reason: 'accepted_catalog_identity_unavailable' };
+    }
+    if (!resolveProductionPortsForManifest(manifest)) {
+      return { ok: false, reason: 'accepted_invoke_port_unavailable' };
+    }
+    return { ok: true, entry };
+  } catch {
+    return { ok: false, reason: 'accepted_binding_unreadable' };
+  }
+}
+
+/** A host-owned identity failure after preparation still returned no business I/O. */
+class ExactCatalogBindingRefusalResult extends ExternalWritePreDispatchResult {
+  readonly policyRefused = true;
+
+  constructor(bindingReason: string) {
+    super(JSON.stringify({ error: 'not_reachable', reason: 'exact_catalog_binding_missing', bindingReason,
+      detail: 'The accepted catalog operation changed before dispatch. Re-disclose that exact operation; changing arguments cannot repair its identity.' }),
+    'exact_catalog_binding_missing');
+  }
 }
 
 /**
@@ -212,7 +309,21 @@ async function invokeCurrentCatalogProductionPort(input: {
     : {};
   const manifestDigest = capabilityManifestDigest(manifest);
   const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq as number);
-  const invokePort = () => port.invoke({
+  const invokePort = () => {
+    if (currentHostCallAttestation()?.bindingKind === 'catalog_manifest') {
+      const current = currentCatalogOperationForCall(input.target, payload);
+      const currentManifest = current.ok && current.entry
+        ? currentCapabilityManifest(current.entry.manifest) : null;
+      if (!current.ok || !current.entry || !currentManifest
+        || current.entry.capabilityId !== entry.capabilityId
+        || capabilityManifestDigest(currentManifest) !== manifestDigest
+        || resolveProductionPortsForManifest(currentManifest)?.invoke !== port.invoke) {
+        return Promise.resolve(new ExactCatalogBindingRefusalResult(
+          current.ok ? 'accepted_invoke_port_changed' : current.reason,
+        ));
+      }
+    }
+    return port.invoke({
     nodeId: input.logicalToolCallId,
     role: 'foreground',
     payload,
@@ -236,7 +347,8 @@ async function invokeCurrentCatalogProductionPort(input: {
       manifest,
       invoke: port.invoke,
     },
-  });
+    });
+  };
   const invokePreparedPort = async (): Promise<unknown> => {
     const preparationMembers = [
       port.admitPreparation,
@@ -388,6 +500,72 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
 function jsonResult(value: unknown): string {
   if (value instanceof ExternalWritePreDispatchResult) return value.output;
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
+}
+
+async function completeLocalDispatchArguments(target: string, args: unknown, optionalKeys: ReadonlySet<string> = new Set()): Promise<unknown> {
+  let completed = args;
+  if (completed && typeof completed === 'object' && !Array.isArray(completed)) {
+    const fields = { ...completed as Record<string, unknown> };
+    for (const key of [...optionalKeys, ...((await nullableRequiredKeys()).get(target) ?? [])]) {
+      if (!(key in fields) || fields[key] === undefined) fields[key] = null;
+    }
+    completed = fields;
+  }
+  const strict = (await strictToolParameters()).get(target);
+  return strict ? materializeStrictNullableFields(completed, strict) : completed;
+}
+
+export type NativeToolArgumentPreparation =
+  | { status: 'unavailable' }
+  | { status: 'prepared'; args: Record<string, unknown>; inputSchema: unknown }
+  | { status: 'invalid'; schema: unknown; detail: string; violations: string[]; guidance?: string };
+
+/** One preparation owner for native argument bytes, before logical refinement.
+ * Deferred local tools keep their lossless canonical Zod schema. Native core
+ * tools use the exact assembled parameters that their SDK parser advertises.
+ * In particular, a closed object cannot silently drop an unknown field and
+ * dispatch with a different digest or a default target such as process.cwd(). */
+export async function prepareNativeToolArguments(target: string, args: unknown): Promise<NativeToolArgumentPreparation> {
+  const local = await localSchemas();
+  const localSchema = local.schemas.get(target);
+  const strictParameters = (await strictToolParameters()).get(target);
+  const inputSchema = localSchema ? z.toJSONSchema(localSchema) : strictParameters;
+  if (!inputSchema) return { status: 'unavailable' };
+  let schema: z.ZodTypeAny;
+  try {
+    schema = localSchema ?? z.fromJSONSchema(inputSchema as Parameters<typeof z.fromJSONSchema>[0]);
+  } catch {
+    return { status: 'invalid', schema: inputSchema,
+      detail: `The exact native input schema for ${target} could not be validated; no tool was dispatched.`,
+      violations: ['(schema)'] };
+  }
+  // Local schemas own semantic defaults first; the core schema already is the
+  // strict wire shape and needs its declared nullable omissions materialized.
+  const candidate = localSchema ? args : await completeLocalDispatchArguments(target, args);
+  const parsed = schema.safeParse(candidate);
+  if (!parsed.success) {
+    const paths = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
+      ? issue.keys.map((key) => [...issue.path, key].join('.'))
+      : [issue.path.join('.') || '(root)']);
+    return { status: 'invalid', schema: inputSchema,
+      ...(local.descriptions.get(target) ? { guidance: local.descriptions.get(target) } : {}),
+      detail: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '),
+      violations: [...new Set(paths)] };
+  }
+  const completed = localSchema
+    ? await completeLocalDispatchArguments(target, parsed.data, local.optionalKeys.get(target))
+    : parsed.data;
+  if (!completed || typeof completed !== 'object' || Array.isArray(completed)) {
+    return { status: 'invalid', schema: inputSchema, detail: `${target} arguments must be an object.`, violations: ['(root)'] };
+  }
+  return { status: 'prepared', args: completed as Record<string, unknown>, inputSchema };
+}
+
+/** Backward-compatible preparation seam for host pre-consent binding. The
+ * carrier uses the same result, so it cannot freeze different effective bytes. */
+export async function materializeLocalRuntimeToolArguments(target: string, args: unknown): Promise<{ args: Record<string, unknown> } | null> {
+  const prepared = await prepareNativeToolArguments(target, args);
+  return prepared.status === 'prepared' ? { args: prepared.args } : null;
 }
 
 /**
@@ -664,15 +842,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       ? ` The confirmed source name was approximated. Retry through work_call with exactly one bound inner name: ${exactNames.map((name) => `"${name}"`).join(', ')}; do not rediscover or switch provider families.`
       : '';
   };
-  return tool({
+  const parameters = z.object({
+    name: z.string().min(1).describe(options.controlOnlyBuiltins
+      ? 'Exact control/recovery tool name returned by tool_search.'
+      : 'Exact built-in name from the catalog, or a connected external MCP tool as <server>__<tool>.'),
+    args_json: z.string().describe('JSON object string of the target\'s arguments ("{}" for none).'),
+  });
+  const configured = tool({
     name: 'call_tool',
     description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
-    parameters: z.object({
-      name: z.string().min(1).describe(options.controlOnlyBuiltins
-        ? 'Exact control/recovery tool name returned by tool_search.'
-        : 'Exact built-in name from the catalog, or a connected external MCP tool as <server>__<tool>.'),
-      args_json: z.string().describe('JSON object string of the target\'s arguments ("{}" for none).'),
-    }),
+    parameters,
     isEnabled: async () => options.modelVisibility
       ? Boolean(await options.modelVisibility())
       : true,
@@ -684,9 +863,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       if (options.propagateInvocationError?.(error) === true) throw error;
       const details = error instanceof Error ? error.toString() : String(error);
       const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
-      // The outer {name, args_json} envelope failed the SDK schema: no inner
-      // tool was resolved, no arg_validation refusal was minted, nothing
-      // dispatched. Same bytes for the model, nominal carrier for settlement.
+      // The outer envelope failed before execute/inner dispatch. The host may
+      // already own the exact inner read identity; the nominal refusal closes
+      // that call without claiming the target ran.
       if (isSdkToolInputValidationError(error)) {
         const guidance = describeInvalidToolInput(error, 'call_tool');
         return new InvalidArgumentsPreDispatchResult(
@@ -854,7 +1033,11 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
                 requestedTarget: target,
               });
           if (proven) {
-            const exactEntry = uniqueCurrentCallableCatalogOperation(target);
+            const selection = currentCatalogOperationForCall(target, resolvedArgs);
+            if (!selection.ok) return refuse({ error: 'not_reachable',
+              reason: 'exact_catalog_binding_missing', bindingReason: selection.reason,
+              detail: 'The accepted catalog operation is unavailable. Re-disclose that exact operation before another call; changing arguments cannot repair its identity.' }, 'policy_denial');
+            const exactEntry = selection.entry;
             const exactManifest = exactEntry
               ? currentCapabilityManifest(exactEntry.manifest)
               : null;
@@ -967,7 +1150,11 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         // also to be a TOOL_REGISTRY builtin bounced the exact name
         // tool_search/plan_task had just cited, so the model fell through
         // to run_shell_command (live 2026-08-29: salesforce_sf_soql_query).
-        const catalogOperation = uniqueCurrentCallableCatalogOperation(target);
+        const selection = currentCatalogOperationForCall(target, resolvedArgs);
+        if (!selection.ok) return refuse({ error: 'not_reachable',
+          reason: 'exact_catalog_binding_missing', bindingReason: selection.reason,
+          detail: 'The accepted catalog operation is unavailable. Re-disclose that exact operation before another call; changing arguments cannot repair its identity.' }, 'policy_denial');
+        const catalogOperation = selection.entry;
         const catalogManifest = catalogOperation
           ? currentCapabilityManifest(catalogOperation.manifest)
           : null;
@@ -1078,58 +1265,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           detail: carrierValidationError.detail,
         });
       }
-      const local = await localSchemas();
-      const schema = local.schemas.get(target);
-      let dispatchArgs = resolvedArgs;
-      if (schema) {
-        const parsed = schema.safeParse(resolvedArgs);
-        if (!parsed.success) {
-          return refuse({
-            error: 'arg_validation',
-            schema: z.toJSONSchema(schema),
-            guidance: local.descriptions.get(target),
-            detail: parsed.error.issues
-              .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
-              .join('; '),
-            // The failing PATHS on their own (no values, no prose): the model
-            // reads `detail`, and the host keys its repair stage on these, so
-            // fixing one field and breaking another counts as progress while
-            // resending the same wrong field is the loop floor.
-            violations: [...new Set(parsed.error.issues
-              .map((i) => i.path.join('.') || '(root)'))],
-          });
-        }
-        dispatchArgs = parsed.data;
-        if (dispatchArgs && typeof dispatchArgs === 'object' && !Array.isArray(dispatchArgs)) {
-          const strictArgs = { ...(dispatchArgs as Record<string, unknown>) };
-          for (const key of local.optionalKeys.get(target) ?? []) {
-            if (!(key in strictArgs) || strictArgs[key] === undefined) strictArgs[key] = null;
-          }
-          dispatchArgs = strictArgs;
-        }
+      const prepared = await prepareNativeToolArguments(target, resolvedArgs);
+      if (prepared.status === 'invalid') {
+        return refuse({ error: 'arg_validation', schema: prepared.schema,
+          ...(prepared.guidance ? { guidance: prepared.guidance } : {}),
+          detail: prepared.detail, violations: prepared.violations });
       }
-      // Core-tool schemas also cover computer/Composio tools that are absent
-      // from getLocalToolSchemas(). Materialize their defaultable strict-null
-      // fields so direct catalog dispatch works without a discovery/retry tax.
-      if (dispatchArgs && typeof dispatchArgs === 'object' && !Array.isArray(dispatchArgs)) {
-        const strictArgs = { ...(dispatchArgs as Record<string, unknown>) };
-        for (const key of (await nullableRequiredKeys()).get(target) ?? []) {
-          if (!(key in strictArgs) || strictArgs[key] === undefined) strictArgs[key] = null;
-        }
-        dispatchArgs = strictArgs;
-      }
-      const strictParameters = (await strictToolParameters()).get(target);
-      if (strictParameters) {
-        dispatchArgs = materializeStrictNullableFields(dispatchArgs, strictParameters);
-      }
-
-      // Local targets execute through the canonical deferred parser above, so
-      // that exact schema owns preparation/evidence too. The provider-strict
-      // projection is a model-facing transport and can lossy-close open JSON
-      // records; it is authority only for non-local core tools.
-      let exactTargetInputSchema: unknown | null = schema
-        ? z.toJSONSchema(schema)
-        : (strictParameters ?? exactMcpInputSchema);
+      const dispatchArgs = prepared.status === 'prepared' ? prepared.args : resolvedArgs;
+      // The canonical deferred schema stays authoritative for local open data;
+      // other native tools use the assembled core schema validated above.
+      // External MCP/provider carriers keep their existing exact schema owner.
+      const exactTargetInputSchema: unknown | null = prepared.status === 'prepared'
+        ? prepared.inputSchema : exactMcpInputSchema;
 
       let evidenceArgs: unknown = dispatchArgs;
       let evidenceInputSchema: unknown | undefined;
@@ -1318,10 +1465,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         return out as unknown as string;
       }
 
+      // A stale post-preparation identity settled a local policy refusal, not
+      // a successful acquisition. Keep its useful corrective without promotion.
+      if (out instanceof ExactCatalogBindingRefusalResult) return out as unknown as string;
+
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);
       return jsonResult(out);
     },
+  });
+  return attestToolLocalInputInvalidity(configured, ({ rawInput, parsedInput }) => {
+    if (typeof rawInput !== 'string') return 'unproven';
+    return parameters.safeParse(parsedInput).success ? 'unproven' : 'invalid';
   });
 }
 

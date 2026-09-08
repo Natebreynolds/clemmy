@@ -13,6 +13,7 @@
  *   2. ENACT the resulting `RecoveryDirective`: move the discovery budget,
  *      credit progress, and hand the caller a typed outcome to act on.
  */
+import { localNonWriteStatus } from '../../tools/shared.js';
 import { openEventLog } from './eventlog.js';
 import { acceptedTaskIdFor, settlementIdentityFor } from './attempt-identity.js';
 import {
@@ -122,8 +123,71 @@ export class HostLocalExecutionFailureResult {
   }
 }
 
+
+/**
+ * An explicit typed negative on a LOCAL tool result.
+ *
+ * Native tools answer with `{ ok: false, status: '<token>', message }` for
+ * outcomes that changed nothing — "already exists", an empty draft, a malformed
+ * transform. The host executing the call successfully is not the operation
+ * succeeding, and only an EXPLICIT `ok: false` counts here: a result that
+ * simply has no success flag stays exactly as permissive as it was.
+ */
+/**
+ * TRUSTED proof that a local call changed NOTHING.
+ *
+ * Only nominal carriers qualify. An `ok:false` object or a copied
+ * `structuredContent` is exactly what an ordinary FAILED WRITE also looks like,
+ * and treating that as no-effect proof let a write whose fate is unknown be
+ * reclassified as repairable and safe to retry. A failed write may already have
+ * changed something; the one thing worse than failing is doing it twice.
+ *
+ * The two accepted carriers are unforgeable by construction: the bridge class
+ * and the producer's module-private identity. Both are only ever attached where
+ * the tool returned BEFORE attempting any write.
+ */
+function localResultTypedNegative(
+  result: unknown,
+): { status?: string } | null {
+  // Survives the local bridge's text flattening.
+  if (result instanceof HostLocalNonWriteResult) return { status: result.status };
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const nominal = localNonWriteStatus(result);
+  return nominal ? { status: nominal } : null;
+}
+
+/**
+ * A local tool's typed NON-WRITE outcome, carried across the local bridge.
+ *
+ * `local-runtime-tools` flattens every local result to text, so a structured
+ * field cannot survive that boundary — measured live 2026-09-07, both the
+ * in-process identity and `structuredContent` were gone by the time the
+ * settlement saw the value, and an `isError` result became a
+ * HostLocalExecutionFailureResult. A duplicate workflow_create therefore
+ * settled `unknown / execution_failed, mutating=1` and the model abandoned a
+ * step it could have repaired in one call.
+ *
+ * This is the same nominal-carrier pattern as its failure sibling: the class
+ * itself is the proof, so provider or model prose can never forge it.
+ */
+export class HostLocalNonWriteResult {
+  readonly executionKind = 'local_execution' as const;
+
+  constructor(readonly output: string, readonly status: string) {}
+
+  toString(): string {
+    return this.output;
+  }
+
+  toJSON(): { ok: false; status: string; error: string } {
+    return { ok: false, status: this.status, error: this.output };
+  }
+}
+
 export function unwrapHostLocalExecutionFailureResult(value: unknown): unknown {
-  return value instanceof HostLocalExecutionFailureResult ? value.output : value;
+  if (value instanceof HostLocalExecutionFailureResult) return value.output;
+  if (value instanceof HostLocalNonWriteResult) return value.output;
+  return value;
 }
 
 /** Translate a nominal returned carrier into the shared settlement signals.
@@ -1195,7 +1259,29 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // Classify what happened independently of whether this call was admitted as
   // evidence for a frozen requirement. Binding controls authority minting; it
   // cannot turn a returned host execution into an unknown outcome.
-  if (returnedLocalResult && outcome.kind === 'unknown' && extracted.executionFailed !== true) {
+  // A tool that states its own outcome in a FIELD outranks every inference made
+  // from the bytes around it. `executionFailed` here is reached by prose
+  // sniffing and by the `isError` flag the non-write result deliberately
+  // carries, so gating on it discarded the very fact it was inferring about:
+  // live 2026-09-07, a duplicate workflow_create settled `unknown /
+  // execution_failed, mutating=1` instead of the repairable
+  // `invalid_arguments / host_reported:duplicate`, and the model gave up on a
+  // step it could have repaired in one call.
+  const typedNegative = returnedLocalResult ? localResultTypedNegative(input.result) : null;
+  // NEVER lift preserved uncertainty. `uncertain_write` is the deliberate
+  // answer when a mutation's fate cannot be observed, and its directive
+  // requires reconciliation before any retry. Replacing it with a repairable
+  // classification would tell the model to try the same mutation again with no
+  // proof the first one did nothing.
+  const preservesUncertainty = outcome.kind === 'uncertain_write';
+  if (typedNegative && !preservesUncertainty) {
+    outcome = classifyAttemptOutcome({
+      ...extracted,
+      hostExecuted: true,
+      hostReportedFailure: true,
+      ...(typedNegative.status ? { hostFailureStatus: typedNegative.status } : {}),
+    });
+  } else if (returnedLocalResult && outcome.kind === 'unknown' && extracted.executionFailed !== true) {
     outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
   }
 

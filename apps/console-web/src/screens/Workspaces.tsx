@@ -129,7 +129,7 @@ export function Workspaces() {
 
   return (
     <Page
-      title="Workspaces"
+      title="Spaces"
       subtitle="Live, interactive surfaces Clementine builds for you — reports, trackers, planners"
       actions={
         <Button onClick={() => setModalOpen(true)}>
@@ -145,8 +145,8 @@ export function Workspaces() {
         </div>
       ) : spaces.isError ? (
         <QueryUnavailable
-          title="Workspaces are unavailable"
-          description="Clementine couldn’t load the workspace index. No workspace has been removed."
+          title="Spaces are unavailable"
+          description="Clementine couldn’t load your spaces. No space has been removed."
           onRetry={() => { void spaces.refetch(); }}
         />
       ) : items.length === 0 ? (

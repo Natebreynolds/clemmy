@@ -26,7 +26,7 @@ import type { CapabilityManifestV1 } from './capability-manifest.js';
 import type { OperationVerificationContractV1 } from './mutation-verification-contract.js';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents, openEventLog } = await import('./eventlog.js');
+const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents, openEventLog, listToolOutputInvocations } = await import('./eventlog.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifests = await import('./capability-manifest.js');
@@ -2355,8 +2355,10 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
           .invoke(null, args, { toolCall: { callId } }),
       );
     assert.equal(await invoke('call-1'), 'memory rows');
-    // hooks.ts persists tool_outputs in prod; seed it so the serve-side peek finds it.
-    writeAuthoritativeToolOutput({ sessionId: sess.id, callId: 'call-1', tool: 'memory_search', output: 'memory rows' });
+    // The real bracket formatter now retains the exact invocation itself.
+    // Seeding a second nonce here would invent a reused call id.
+    assert.equal(listToolOutputInvocations(sess.id, 'call-1').length, 1);
+    assert.equal(listToolOutputInvocations(sess.id, 'call-1')[0]!.output, 'memory rows');
     const r2 = String(await invoke('call-2'));
     assert.ok(r2.includes('[within-task memory]'), 'cache nudge lands in the result');
     assert.ok(r2.includes('recall_tool_result'), 'nudge points at recall_tool_result');
@@ -2376,7 +2378,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
           .invoke(null, wargs, { toolCall: { callId } }),
       );
     await winvoke('w-1');
-    writeAuthoritativeToolOutput({ sessionId: sess2.id, callId: 'w-1', tool: 'memory_search', output: 'rows' });
+    assert.equal(listToolOutputInvocations(sess2.id, 'w-1').length, 1);
     assert.equal(await winvoke('w-2'), 'rows', 'worker-scope repeat carries NO cache nudge');
 
     // Error-shaped prior output: a retry after a transient failure must NOT be discouraged.
@@ -2393,7 +2395,7 @@ test('within-task fetch-memory nudge: appended to the result on an identical CAC
           .invoke(null, eargs, { toolCall: { callId } }),
       );
     await einvoke('e-1');
-    writeAuthoritativeToolOutput({ sessionId: sess3.id, callId: 'e-1', tool: 'memory_search', output: 'ERROR: timed out' });
+    assert.equal(listToolOutputInvocations(sess3.id, 'e-1').length, 1);
     assert.equal(await einvoke('e-2'), 'ERROR: timed out', 'an error-shaped prior result does NOT become a do-not-retry nudge');
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
@@ -2475,13 +2477,9 @@ test('same-source settled Composio read is recovered without a second provider d
     const firstCalled = callEvent('settled-source', scopeOne, source.seq);
     const first = String(await invoke('settled-source', scopeOne, source.seq));
     assert.match(first, /\[harness settled-read\]/, 'first verified result steers away from a duplicate');
-    writeToolOutput({
-      sessionId: sess.id,
-      callId: 'settled-source',
-      invocationNonce: 'nonce-settled-source',
-      tool: 'composio_execute_tool',
-      output: first,
-    });
+    const retainedFirst = listToolOutputInvocations(sess.id, 'settled-source');
+    assert.equal(retainedFirst.length, 1, 'the actual formatter owns one exact invocation');
+    assert.equal(retainedFirst[0]!.output, providerResult, 'host annotations never enter raw provider evidence');
     appendEvent({
       sessionId: sess.id,
       turn: 1,

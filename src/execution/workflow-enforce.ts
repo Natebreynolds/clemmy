@@ -8,12 +8,7 @@ import {
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
-import {
-  hardenWeakLiveResearchOutputContract,
-  proposeWorkflowContractUpgrades,
-  workflowAuthoringAdvisories,
-} from './workflow-contract-proposals.js';
-import { textMentionsDeliverable } from './workflow-deliverable-hints.js';
+import { workflowAuthoringAdvisories } from './workflow-contract-proposals.js';
 import { analyzeWorkflowRouting, renderWorkflowRoutingAdvisories } from './workflow-routing-check.js';
 
 /**
@@ -563,10 +558,9 @@ function forEachSourceStepId(expr: string | undefined): string | null {
 
 export function autoRepairWorkflowDefinition(
   def: WorkflowDefinition,
-  /** True when this runs immediately before a scheduled run rather than while
-   *  the user is authoring. Repairs that CHANGE how a run is judged (pinning a
-   *  goal) are authoring-only; structural repairs still apply either way. */
-  preRun = false,
+  /** Retained for callers distinguishing authoring from pre-run preparation.
+   * Both paths preserve authored outputs and goals without semantic inference. */
+  _preRun = false,
 ): WorkflowAutoRepair {
   const repairs: string[] = [];
   const steps = def.steps.map((s) => ({
@@ -575,25 +569,9 @@ export function autoRepairWorkflowDefinition(
   }));
   const ids = new Set(steps.map((s) => s.id).filter(Boolean));
 
-  // Wave 3 P0-3: persist a derived side-effect class when the author omitted it,
-  // so it's visible + overridable in the SKILL.md and the crash-resume guard has
-  // a durable signal (it still falls back to this same heuristic when absent).
-  // 'read' is the default and is not serialized, so read-only workflows are
-  // byte-identical on disk.
-  let sideEffectChanged = false;
-  for (const step of steps) {
-    if (!step.sideEffect && step.prompt) {
-      const cls = stepLooksLikeIrreversibleSend(step.prompt)
-        ? 'send'
-        : stepLooksMutating(step) ? 'write' : 'read';
-      step.sideEffect = cls;
-      // Only a write/send default is a MEANINGFUL change — it serializes (read
-      // is dropped on write) and arms the crash-resume guard's durable signal.
-      // A 'read' default must NOT force a clone, or the byte-identical /
-      // same-object contract for clean read-only workflows would break.
-      if (cls !== 'read') sideEffectChanged = true;
-    }
-  }
+  // Effect belongs to the authored step or exact runtime operation. Omitted
+  // declarations stay omitted; prose cannot turn a draft into a send or stamp
+  // unknown work read-safe. Runtime call/effect authorization is unchanged.
 
   const directDeps = (): Map<string, string[]> => {
     const m = new Map<string, string[]>();
@@ -666,61 +644,45 @@ export function autoRepairWorkflowDefinition(
   }
   declareReferencedInputs(def.synthesis?.prompt, 'synthesis prompt');
 
-  // Contract hardening: authoring already proposes pinned goals/output contracts
-  // for legacy workflows. Apply the same conservative proposals during repair so
-  // newly-created workflows start self-verifying instead of relying on prose.
-  let contractChanged = false;
-  let goalChanged = false;
-  let repairedGoal = def.goal;
-  const proposalBase: WorkflowDefinition = {
-    ...def,
-    steps,
-    ...(declaredChanged ? { inputs: declared } : {}),
-  };
-  const contractProposal = proposeWorkflowContractUpgrades(proposalBase);
-  const outputByStep = new Map(contractProposal.proposedStepOutputs.map((proposal) => [proposal.stepId, proposal]));
+  // A declared step binding is another exact reference to run input. Match
+  // bindStepInputs: an explicit input.<key>, or the argument's own name when
+  // it is not supplied by a same-named dependency. Expose that existing need
+  // to the caller/UI; prose is not consulted and upstream/item bindings do
+  // not become requests for new owner input.
+  const derivedInputKeys = new Set<string>();
   for (const step of steps) {
-    if (step.output && Object.keys(step.output).length > 0) continue;
-    const proposal = outputByStep.get(step.id);
-    if (!proposal) continue;
-    step.output = proposal.output;
-    contractChanged = true;
-    repairs.push(`Added output contract to step "${step.id}" (${proposal.reasons.join('; ')}).`);
-  }
-  for (const step of steps) {
-    const hardened = hardenWeakLiveResearchOutputContract(proposalBase, step);
-    if (!hardened) continue;
-    step.output = hardened;
-    contractChanged = true;
-    repairs.push(`Hardened live research output contract for step "${step.id}" with source-backed evidence keys.`);
-  }
-  const synthesisLooksDeliverable = textMentionsDeliverable(def.synthesis?.prompt ?? '');
-  // Pin a goal only while a workflow is being AUTHORED, never on the pre-run
-  // path. Pinning arms goal-judging, and a missed goal is recorded as a run
-  // FAILURE -- so pinning immediately before a scheduled run could fail a
-  // long-working workflow against success criteria the host invented and the
-  // user never set. That was silent before; now that blocked/failed occurrences
-  // persist and escalate, it would also notify them about it.
-  //
-  // `enabled` is NOT the right discriminator here: a user can legitimately
-  // author an enabled workflow and should still get a pinned goal.
-  if (
-    !preRun
-    && !repairedGoal?.objective
-    && contractProposal.proposedGoal
-    && (contractProposal.proposedStepOutputs.length > 0 || synthesisLooksDeliverable)
-  ) {
-    repairedGoal = contractProposal.proposedGoal;
-    goalChanged = true;
-    repairs.push('Pinned a workflow goal so completed runs are judged against concrete success criteria.');
+    for (const [name, binding] of Object.entries(step.inputs ?? {})) {
+      const from = binding.from?.trim();
+      const key = from
+        ? /^input\.([A-Za-z0-9_-]+)$/.exec(from)?.[1]
+        : (step.dependsOn ?? []).includes(name) ? undefined : name;
+      if (!key) continue;
+      const required = binding.required !== false && binding.default === undefined;
+      if (key in declared) {
+        if (derivedInputKeys.has(key) && required) declared[key].required = true;
+        continue;
+      }
+      declared[key] = {
+        type: binding.type ?? 'string',
+        required,
+        ...(binding.description ? { description: binding.description } : {}),
+      };
+      derivedInputKeys.add(key);
+      declaredChanged = true;
+      repairs.push(`Declared workflow input "${key}" (step "${step.id}" binds this run input).`);
+    }
   }
 
-  if (repairs.length === 0 && !sideEffectChanged && !contractChanged && !goalChanged) return { def, repairs };
+  // Goals and output contracts describe the authored job. Inferring them from
+  // prose changes that job: "do not publish" used to require a real URL, and
+  // an empty lookup acquired a minimum result count. Keep suggestions advisory;
+  // neither authoring nor pre-run preparation may silently add or strengthen
+  // these requirements. Explicit contracts retain their existing validation.
+  if (repairs.length === 0) return { def, repairs };
   const repaired: WorkflowDefinition = {
     ...def,
     steps,
     ...(declaredChanged ? { inputs: declared } : {}),
-    ...(goalChanged ? { goal: repairedGoal } : {}),
   };
   return { def: repaired, repairs };
 }
@@ -797,7 +759,7 @@ export function prepareWorkflowForWrite(
   opts: {
     allowDisabledExactSendDraft?: boolean;
     exactSendCommittedReplayStepIds?: ReadonlySet<string>;
-    /** Set by the runner's pre-run repair. Suppresses authoring-only repairs. */
+    /** Set by the runner's pre-run repair; both paths preserve authored semantics. */
     preRun?: boolean;
   } = {},
 ): WorkflowWritePrep {

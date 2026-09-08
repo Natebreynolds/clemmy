@@ -7,8 +7,10 @@
  * deterministic-retrieve turns do not register this schema.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
+import { inspectCurrentExactLocalCallAdmission } from '../runtime/harness/nested-tool-approval-admission.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   ActionWorkTopologySchema,
@@ -1244,6 +1246,11 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
    * foreground model's bounded planning card. Final execution authority stays
    * in the host runner and its current catalog/manifest checks. */
   hostPlanningReadCapabilityResolver?: HostPlanningReadCapabilityResolver;
+  /** Operations already disclosed for this request, presented here so the
+   * direct carrier shows what is ready to invoke. They were previously listed
+   * ONLY inside plan_task's description, so the sole place naming a usable
+   * capabilityRef was the planning tool — which is where the model went. */
+  disclosedOperations?: readonly HostCapabilityDescriptorV1[];
 }
 
 export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeContextValue> {
@@ -1255,6 +1262,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     requireHostPlan = false,
     hostPlanningReady,
     hostPlanningReadCapabilityResolver,
+    disclosedOperations,
     ...dispatcherOptions
   } = options;
   const frozenAuthority = formatFrozenWorkCallDescription({
@@ -1371,6 +1379,49 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         targetArgs: resolved.targetArgs,
       });
       const resolvedRuntimeEffect = effectiveTarget.effect;
+      // An ordinary native write may have exact accepted-call consent without
+      // a plan. The host has already reopened its source-bound local definition
+      // and reducer decision; this one-shot token is checked again, then consumed
+      // by the unchanged inner dispatcher. Model arguments cannot create it.
+      const graphNeutralLocalMutation = requireHostPlan
+        && resolvedRuntimeEffect === 'local_write'
+        && !frozenContract
+        && getTurnGraphEventForSource(resolved.sessionId, resolved.sourceUserSeq as number) === null
+        && inspectCurrentExactLocalCallAdmission({
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          logicalToolCallId: resolved.logicalToolCallId,
+          toolName: resolved.targetName,
+          args: resolved.targetArgs,
+        });
+      if (graphNeutralLocalMutation) {
+        return withUnboundWorkRequirement(frame.input.requirement_id, dispatch);
+      }
+      // An ordinary native write whose ONLY missing piece is this source's
+      // current definition must be repaired by exact discovery, not by demanding
+      // a plan. Live C16 build A: the Space edit chose the correct direct
+      // space_save, the current-source definition was absent, and the resulting
+      // plan-required fallback froze a Workspace target onto workflow_update.
+      // Discovery revalidates the operation against the live registry and
+      // publishes it for THIS source, so every source/account/schema/effect
+      // protection still runs — nothing is waived, the repair is just the right
+      // one. Plan remains required for compound/dependent/admin/destructive
+      // work, and explicit desktop/mobile Plan is untouched.
+      if (
+        requireHostPlan
+        && resolvedRuntimeEffect === 'local_write'
+        && !frozenContract
+        && getTurnGraphEventForSource(resolved.sessionId, resolved.sourceUserSeq as number) === null
+        && normalizedProposal(frame.input.proposal) === null
+      ) {
+        frame.refusalKind = 'work_contract_required';
+        return refuse(
+          frame.refusalKind,
+          `${resolved.targetName} is not yet published for this request, so it cannot be invoked directly yet. `
+          + `Call tool_search for the exact name ${resolved.targetName} to publish and revalidate it, then retry this same direct call with its exact requirement_id. `
+          + 'Do not call plan_task for this: an ordinary single native write does not need a plan.',
+        );
+      }
       // Fresh provider reads share work_call's carrier but do not need its
       // graph/once-ness contract. The exact resolved effect is known here,
       // after inner schema/account materialization and before any dispatch.
@@ -1382,7 +1433,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         frame.refusalKind = 'work_contract_required';
         return refuse(
           frame.refusalKind,
-          'This fresh host turn accepts only the graph-derived plan. Call plan_task alone first, then retry work_call with proposal:null.',
+          'This fresh host turn accepts only the graph-derived plan. Call plan_task alone first, then retry work_call with the exact requirement_id from the frozen plan. This call has no proposal field.',
         );
       }
       const durableHostContract = requireHostPlan
@@ -1612,6 +1663,14 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           : {}),
       });
       if (admission.status === 'refused') {
+        // Preparation owns no body execution, including safe reads. The
+        // ordinary invocation may use its semantic read fallback below, but
+        // a preparer must return the actual binding refusal rather than run a
+        // read and later misreport its successful bytes as a refusal.
+        if (frame.preparation) {
+          frame.refusalKind = admission.kind;
+          return refuse(admission.kind, admission.reason, admission.plan ? { plan: admission.plan } : undefined);
+        }
         // Proposal semantics cannot veto an objectively non-mutating host
         // operation. The exact accepted/logical substrate is re-proved first;
         // the inner dispatch still owns lease, capability, and provider gates.
@@ -1845,16 +1904,62 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   const built = tool({
     name: 'work_call',
     description: [
-      'Invoke one plan-selected local read or business tool under the frozen semantic work contract.',
+      frozenAuthority
+        ? 'Invoke one plan-selected local read or business tool under the frozen semantic work contract.'
+        : 'Invoke one exact disclosed local or provider operation through its existing consent and dispatch boundary.',
       frozenAuthority
         ?? (requireHostPlan
-          ? 'This is the proposal-free foreground carrier. Exact calls are decided at the tool edge by the existing allow/deny/ask and dispatch path; this carrier does not compile a hidden plan_task. Pass source_call_ids only when arguments consume or copy one settled result\'s bytes; a read used only for ordering, a condition, or a decision is not content lineage. Compound, each/set, ambiguous, admin, destructive, and unknown-effect work still follows the explicit planning surface.'
+          ? 'This is the proposal-free foreground carrier. Exact calls are decided at the tool edge by the existing allow/deny/ask and dispatch path; this carrier does not compile a hidden plan_task. Pass source_call_ids only when arguments consume or copy one settled result\'s bytes; a read used only for ordering, a condition, or a decision is not content lineage. Coordinated business dependencies, each/set, ambiguous, admin, destructive, and unknown-effect work still follows the explicit planning surface. Contextual reads, one authorized reversible write and ordinary readback can run directly; their order alone does not require planning.'
           : [
               'If the host already froze a contract, pass proposal:null and bind the exact requirement id. Otherwise the FIRST call provides the complete provider-neutral proposal plus the first requirement binding.',
               'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
               `Collect-then-construct ("read the set once, write one artifact once") — a VALID first-call proposal: ${JSON.stringify(WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE)}.`,
               `Count-only fanout ("one write per record from this read") — a VALID first-call proposal only when the graph is genuine per-item work: ${JSON.stringify(WORK_CALL_COUNT_ONLY_EXAMPLE)}. The sealed universe sizes itself from the settled read; memberIdPointer is an RFC 6901 pointer to each record's id (empty string when the record itself is the id).`,
             ].join(' ')),
+      // Neutral presentation of what is READY, with everything needed to CALL
+      // it. Listing refs alone was not enough: a workflow create confused the
+      // capability/schema ref with the callable name (two refusals), and a Space
+      // edit passed view_html to space_edit_view and learned the real schema
+      // only from the refusal. Ordinary independent native work — create one
+      // artifact, edit one existing artifact, read it back — needs no plan;
+      // explicit desktop/mobile Plan and exact Execute are unchanged.
+      ...(disclosedOperations && disclosedOperations.length > 0
+        ? (() => {
+            const ready = disclosedOperations.flatMap((entry) => {
+              // Local registry refs are `cap:local:<callable name>:<variant>`.
+              const match = /^cap:local:([^:]+):/.exec(entry.id);
+              return match
+                ? [{
+                    name: match[1]!,
+                    capability_selector: entry.id,
+                    effect: entry.effect,
+                    purpose: entry.purpose,
+                    deliverableKind: entry.deliverableKind,
+                    destinationPostures: [
+                      ...(entry.destinationPosture ? [entry.destinationPosture] : []),
+                      ...(entry.destinationPostures ?? []),
+                    ],
+                  }]
+                : [];
+            });
+            if (ready.length === 0) return [];
+            return [
+              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name; \`capability_selector\` is the value to pass as requirement_id — they are DIFFERENT strings and neither substitutes for the other.`,
+              `Invocation shape for a direct call: ${JSON.stringify({
+                requirement_id: 'cap:local:<name>:<variant>',
+                name: '<name>',
+                args_json: '{"<arg>":"<value>"}',
+                universe_item_id: null,
+                universe_selector: null,
+                seal_amendment: null,
+                source_call_ids: null,
+                source_record_ids: null,
+              })}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
+              'Use the exact argument schema already provided. If it is missing, call tool_search with the exact operation name before invoking. Do not guess argument names and learn them from a refusal.',
+              'Ordinary native work, including contextual reads, one authorized reversible write and its readback, may proceed directly through these operations without plan_task. Planning stays required for coordinated business dependencies, each/set, admin, destructive or unknown-effect work, and the explicit desktop/mobile Plan review path is unchanged.',
+            ];
+          })()
+        : []),
       'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
       'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
     ].join(' '),

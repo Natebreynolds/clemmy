@@ -42,6 +42,10 @@ const {
   appendEvent,
   beginRunAttempt,
   claimHarnessChatRequest,
+  claimRunAttemptLease,
+  getLatestRunAttemptByRunId,
+  getHarnessChatRequestReceipt,
+  renewRunAttemptLease,
   createSession: createHarnessSession,
   getSession: getHarnessSessionForTest,
   listEvents,
@@ -52,6 +56,7 @@ const {
   isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { actionBus } = await import('../runtime/action-bus.js');
 const { registerResumableApprovalCardAtomically } = await import('../runtime/harness/approval-card.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { queuePendingAction, getPendingAction } = await import('../runtime/harness/pending-actions.js');
@@ -134,6 +139,51 @@ async function loginMobile(h: Harness, label = 'Test phone'): Promise<string> {
   assert.ok(cookie, 'login should issue a session cookie');
   return cookie;
 }
+
+test('mobile Execute double taps rejoin one accepted run before steering or gateway replay', async () => {
+  resetEventLog();
+  const { publishPlanRevision } = await import('../runtime/harness/plan-artifacts.js');
+  const { claimPlanExecutionIngress } = await import('../runtime/harness/plan-execution-ingress.js');
+  let calls = 0;
+  const assistant = { respond: async () => { calls++; throw new Error('duplicate dispatched'); } } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Plan execution phone');
+    const me = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await me.json() as { deviceId: string };
+    const sessionId = 'mobile-reviewed-plan';
+    createHarnessSession({ id: sessionId, kind: 'chat', userId: deviceId, channel: 'mobile' });
+    const planning = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Plan a native Space.', taskMode: { version: 1, kind: 'plan' } } });
+    const plan = publishPlanRevision({ sessionId, principalId: deviceId, sourceUserSeq: planning.seq,
+      fullText: 'Create the reviewed native Space once.', readiness: 'ready' });
+    const ref = { planId: plan.planId, revision: plan.revision, digest: plan.digest };
+    const taskMode = { version: 1 as const, kind: 'execute' as const, executeRef: ref };
+    const message = 'Execute the reviewed plan.';
+    const { reviewedPlanExecuteInputHash } = await import('../runtime/harness/reviewed-plan-owner-control.js');
+    const inputHash = reviewedPlanExecuteInputHash({ text: message, taskMode });
+    const reserved = claimPlanExecutionIngress({ sessionId, principalId: deviceId, ref,
+      requestId: 'mobile-plan-owner', inputHash }, () => claimHarnessChatRequest({
+      requestId: 'mobile-plan-owner', sessionId, runId: 'mobile-plan-run', inputHash, sinceSeq: planning.seq,
+    }));
+    const attempt = beginRunAttempt(sessionId, { runId: reserved.receipt.runId });
+    recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: { text: message, taskMode, runId: reserved.receipt.runId } });
+    const replies = await Promise.all(['mobile-plan-tap-2', 'mobile-plan-tap-3'].map(key => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie, 'idempotency-key': key },
+      body: JSON.stringify({ message, sessionId, taskMode, async: true }),
+    })));
+    for (const reply of replies) {
+      assert.equal(reply.status, 202);
+      const body = await reply.json() as { runId: string; steered?: boolean; replayed: boolean };
+      assert.equal(body.runId, reserved.receipt.runId);
+      assert.equal(body.replayed, true);
+      assert.notEqual(body.steered, true);
+    }
+    assert.equal(calls, 0);
+    assert.equal(getActiveRunAttempt(sessionId)?.attemptId, attempt.attemptId);
+    assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 2);
+  } finally { await h.close(); }
+});
 
 function matchingApprovalInterrupt(tool: string, args: Record<string, unknown>): string {
   const agent = new Agent({ name: 'MobilePendingActionOwnershipTest', instructions: 'test' });
@@ -1051,6 +1101,191 @@ test('mobile approval B is accepted before mutation and owns B terminal, never a
   } finally { await h.close(); }
 });
 
+test('live mobile exact approvals preserve the executor through approve, reject, replay and later steering', async () => {
+  resetEventLog();
+  let modelCalls = 0;
+  let unsubscribePublic = () => {};
+  const h = await startHarness({ assistant: { respond: async () => {
+    modelCalls++;
+    throw new Error('an approval control cannot start a model turn');
+  } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Live approval phone');
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const session = createHarnessSession({ id: 'sess-mobile-live-approval', kind: 'chat', channel: 'mobile', userId: deviceId,
+      metadata: { source: 'mobile', ingressProvider: 'mobile', channelId: 'mobile-live-approval-root', userId: deviceId } });
+    const original = claimRunAttemptLease({ sessionId: session.id, runId: 'mobile:live-owner',
+      ownerId: 'mobile-test-owner', leaseMs: 60_000 }).attempt!;
+    const originalSource = recordRunAttemptUserInput(original, { turn: 0, role: 'user',
+      data: { text: 'Prepare the account report.', displayText: 'Prepare the account report.' } }, { armRunInFlight: true });
+    const first = approvalRegistry.register({ sessionId: session.id, tool: 'request_approval', subject: 'First exact action' });
+    const second = approvalRegistry.register({ sessionId: session.id, tool: 'request_approval', subject: 'Second exact action' });
+    const unrelated = approvalRegistry.register({ sessionId: createHarnessSession({ kind: 'chat' }).id,
+      tool: 'request_approval', subject: 'Unrelated session action' });
+    const wakeProof: boolean[] = [];
+    const publicationOrder: string[] = [];
+    const publicationCommitProof: boolean[] = [];
+    unsubscribePublic = actionBus.subscribe((event) => {
+      if (event.kind !== 'harness.public_event' || event.sessionId !== session.id
+        || !event.event.data.liveApprovalControl) return;
+      publicationOrder.push(event.event.type);
+      const sourceSeq = event.event.type === 'user_input_received' ? event.event.seq : event.event.data.sourceUserSeq;
+      publicationCommitProof.push(!openEventLog().inTransaction && listEvents(session.id, { types: ['conversation_completed'] })
+        .some((row) => row.data.sourceUserSeq === sourceSeq));
+    });
+    approvalRegistry.onApprovalResolved((row) => {
+      if (![first.approvalId, second.approvalId].includes(row.approvalId)) return;
+      publicationOrder.push('waiter');
+      const source = listEvents(session.id, { types: ['user_input_received'] })
+        .find((event) => event.data.approvalId === row.approvalId);
+      wakeProof.push(!!source && listEvents(session.id, { types: ['conversation_completed'] })
+        .some((event) => event.data.sourceUserSeq === source.seq)
+        && getLatestRunAttemptByRunId(session.id, original.runId!)?.finishedAt === null);
+    });
+    const typed = (message: string, key: string, extra: Record<string, unknown> = {}) => fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json', 'idempotency-key': key },
+      body: JSON.stringify({ message, sessionId: session.id, async: true, ...extra }),
+    });
+    const approved = await typed(`approve ${first.approvalId}`, 'approve-live-first');
+    assert.equal(approved.status, 200);
+    const accepted = await approved.json() as { sessionId: string; runId: string; reply: string };
+    assert.equal(accepted.sessionId, session.id);
+    assert.match(accepted.reply, new RegExp(first.approvalId));
+    assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
+    assert.equal(approvalRegistry.get(second.approvalId)?.status, 'pending');
+    assert.equal(approvalRegistry.get(unrelated.approvalId)?.status, 'pending');
+    assert.equal(getLatestRunAttemptByRunId(session.id, original.runId!)?.finishedAt, null);
+    assert.equal(getLatestRunAttemptByRunId(session.id, accepted.runId), null);
+    const reject = () => fetch(`${h.url}/m/api/approvals/${second.approvalId}/reject`, { method: 'POST', headers: { cookie } });
+    assert.equal((await reject()).status, 200);
+    assert.equal(approvalRegistry.get(second.approvalId)?.resolution, 'rejected');
+    _clearMobileChatInFlightForTests();
+    _clearIdempotencyForTests();
+    // Durable replay precedes the now empty pending-card set and never wakes twice.
+    const replay = await typed(`approve ${first.approvalId}`, 'approve-live-first');
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get('idempotent-replay'), '1');
+    assert.deepEqual(await replay.json(), accepted);
+    assert.equal((await reject()).headers.get('idempotent-replay'), '1');
+    const conflict = await typed(`reject ${first.approvalId}`, 'approve-live-first');
+    assert.equal(conflict.status, 409);
+    assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
+    assert.deepEqual(wakeProof, [true, true], 'waiting calls observe committed exact sources and terminals before waking');
+    assert.deepEqual(publicationOrder, ['user_input_received', 'conversation_completed', 'waiter',
+      'user_input_received', 'conversation_completed', 'waiter']);
+    assert.deepEqual(publicationCommitProof, [true, true, true, true],
+      'public source and terminal are emitted after commit, before the waiting call resumes');
+    assert.equal(renewRunAttemptLease(original, 'mobile-test-owner', 60_000), true);
+    const controls = listEvents(session.id, { types: ['user_input_received'] }).filter((event) => event.data.liveApprovalControl);
+    assert.equal(controls.length, 2);
+    const { projectHarnessEventForPublic, projectHarnessEventsForPublic } = await import('../runtime/harness/public-presentation.js');
+    for (const source of controls) {
+      assert.equal(source.parentEventId, originalSource.id);
+      assert.deepEqual(source.data.liveApprovalControl,
+        { version: 1, ownerAttemptId: original.attemptId, ownerSourceUserSeq: originalSource.seq });
+      const receipt = getHarnessChatRequestReceipt(String(source.data.clientRequestId));
+      assert.equal(receipt?.sessionId, session.id);
+      assert.equal(receipt?.runId, source.data.runId);
+      assert.equal(getLatestRunAttemptByRunId(session.id, String(source.data.runId)), null);
+      const terminals = listEvents(session.id, { types: ['conversation_completed'] })
+        .filter((event) => event.data.sourceUserSeq === source.seq);
+      assert.equal(terminals.length, 1);
+      assert.equal((terminals[0].data.turnOutcome as { status: string }).status, 'done');
+      const publicSource = projectHarnessEventForPublic(source);
+      const publicTerminal = projectHarnessEventForPublic(terminals[0]);
+      assert.equal(publicSource?.seq, source.seq);
+      assert.equal(publicSource?.sessionId, session.id);
+      assert.equal(publicSource?.parentEventId, null, 'execution topology stays private');
+      assert.deepEqual(publicSource?.data.liveApprovalControl, source.data.liveApprovalControl);
+      assert.deepEqual(publicTerminal?.data.liveApprovalControl, source.data.liveApprovalControl,
+        'the typed terminal derives the exact relationship from its accepted source');
+      assert.equal(publicTerminal?.data.sourceUserSeq, source.seq);
+      assert.equal((publicTerminal?.data.presentation as { identity: { sourceUserSeq: number } }).identity.sourceUserSeq, source.seq);
+      const projectedPair = projectHarnessEventsForPublic([source, terminals[0]]);
+      assert.equal(projectedPair.length, 2);
+      assert.deepEqual(projectedPair.map((event) => event.data.liveApprovalControl),
+        [source.data.liveApprovalControl, source.data.liveApprovalControl]);
+      assert.equal(projectHarnessEventForPublic({ ...source, parentEventId: 'wrong-source' }), null);
+      const wrongOwner = { version: 1, ownerAttemptId: 'nonexistent-owner', ownerSourceUserSeq: originalSource.seq };
+      assert.equal(projectHarnessEventForPublic({ ...source,
+        data: { ...source.data, liveApprovalControl: wrongOwner } }), null);
+      assert.equal(projectHarnessEventForPublic({ ...terminals[0],
+        data: { ...terminals[0].data, liveApprovalControl: wrongOwner } })?.data.liveApprovalControl, undefined);
+      assert.equal(projectHarnessEventForPublic({ ...terminals[0], sessionId: 'wrong-session' })?.data.liveApprovalControl, undefined);
+    }
+    const steer = await typed('Include the regional total too.', 'steer-after-live-approval', { steerOnly: true });
+    assert.equal(steer.status, 200);
+    assert.equal((await steer.json() as { steered: boolean }).steered, true);
+    const { steerBlockForToolBoundary, adoptedSteerNotesForSource } = await import('../runtime/harness/steer-notes.js');
+    assert.match(steerBlockForToolBoundary(session.id), /Include the regional total too/);
+    assert.deepEqual(adoptedSteerNotesForSource({ sessionId: session.id, sourceUserSeq: originalSource.seq })
+      .map((note) => note.text), ['Include the regional total too.']);
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, original.attemptId);
+    assert.equal(renewRunAttemptLease(original, 'mobile-test-owner', 60_000), true);
+    assert.equal(modelCalls, 0);
+  } finally { unsubscribePublic(); await h.close(); }
+});
+
+test('a failed live mobile approval acknowledgement rolls back its receipt, source and decision without waking the executor', async () => {
+  resetEventLog();
+  let unsubscribeEvents = () => {};
+  const h = await startHarness({ assistant: { respond: async () => {
+    throw new Error('a failed approval cannot enter the model');
+  } } as Parameters<typeof createMobileRouter>[0]['assistant'] });
+  try {
+    const cookie = await loginMobile(h, 'Atomic approval phone');
+    const session = createHarnessSession({ id: 'sess-mobile-atomic-approval', kind: 'chat', channel: 'mobile' });
+    const original = claimRunAttemptLease({ sessionId: session.id, runId: 'mobile:atomic-owner',
+      ownerId: 'mobile-atomic-owner', leaseMs: 60_000 }).attempt!;
+    recordRunAttemptUserInput(original, { turn: 0, role: 'user', data: { text: 'Complete the account report.' } }, { armRunInFlight: true });
+    const card = approvalRegistry.register({ sessionId: session.id, tool: 'request_approval', subject: 'Atomic exact decision' });
+    let wakes = 0;
+    approvalRegistry.onApprovalResolved((row) => { if (row.approvalId === card.approvalId) wakes++; });
+    const requestId = `mobile-approval:${card.approvalId}:approve`;
+    const emitted: string[] = [];
+    unsubscribeEvents = actionBus.subscribe((event) => {
+      if ((event.kind === 'harness.event' || event.kind === 'harness.public_event') && event.sessionId === session.id) {
+        emitted.push(`${event.kind}:${event.event.type}`);
+      }
+    });
+    openEventLog().exec(`CREATE TRIGGER reject_mobile_control_terminal BEFORE INSERT ON events
+      WHEN NEW.session_id = 'sess-mobile-atomic-approval' AND NEW.type = 'conversation_completed'
+      BEGIN SELECT RAISE(ABORT, 'fixture acknowledgement commit failed'); END`);
+    const post = () => fetch(`${h.url}/m/api/approvals/${card.approvalId}/approve`, { method: 'POST', headers: { cookie } });
+    const whoami = await fetch(`${h.url}/m/api/whoami`, { headers: { cookie } });
+    const { deviceId } = await whoami.json() as { deviceId: string };
+    const typedKey = 'atomic-live-approval';
+    const typedRequestId = `mobile:${createHash('sha256').update(deviceId).update('\0').update(typedKey).digest('hex')}`;
+    const failedTyped = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json', 'idempotency-key': typedKey },
+      body: JSON.stringify({ sessionId: session.id, message: `approve ${card.approvalId}`, async: true }),
+    });
+    assert.equal(failedTyped.status, 500);
+    assert.equal(getHarnessChatRequestReceipt(typedRequestId), null, 'typed-chat acceptance belongs to the same failed transaction');
+    assert.equal((await post()).status, 500);
+    assert.equal(approvalRegistry.get(card.approvalId)?.status, 'pending');
+    assert.equal(getHarnessChatRequestReceipt(requestId), null);
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0);
+    assert.equal(wakes, 0);
+    assert.deepEqual(emitted, [], 'neither raw nor public SSE emits a rolled-back approval source');
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, original.attemptId);
+    assert.equal(renewRunAttemptLease(original, 'mobile-atomic-owner', 60_000), true);
+    openEventLog().exec('DROP TRIGGER reject_mobile_control_terminal');
+    assert.equal((await post()).status, 200);
+    assert.equal(wakes, 1);
+    assert.deepEqual(emitted, ['harness.event:user_input_received', 'harness.public_event:user_input_received',
+      'harness.event:conversation_completed', 'harness.public_event:conversation_completed']);
+    assert.equal(approvalRegistry.get(card.approvalId)?.resolution, 'approved');
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, original.attemptId);
+  } finally {
+    unsubscribeEvents();
+    openEventLog().exec('DROP TRIGGER IF EXISTS reject_mobile_control_terminal');
+    await h.close();
+  }
+});
+
 test('mobile approvals reject and expire correctly', async () => {
   const h = await startHarness();
   try {
@@ -1966,6 +2201,9 @@ test('mobile typed exact approval, cancel, and new controls execute on their bou
     );
     assert.equal(approvalReplay.status, 200);
     assert.equal(approvalReplay.headers.get('idempotent-replay'), '1');
+    const changedApprovalReplay = await send(`reject ${approval.approvalId}`, parent.id, 'mobile-typed-exact-approval');
+    assert.equal(changedApprovalReplay.status, 409);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved');
     assert.deepEqual(await approvalReplay.json(), approvedBody);
     assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 1);
 
@@ -4668,5 +4906,68 @@ test('GET /m/api/workflows lists each workflow\'s unbound required resources so 
     assert.ok(unbound && plain, 'both workflows are listed');
     assert.ok((unbound!.resourceGaps ?? []).some((gap) => gap.startsWith('Pipeline sheet:')), 'the unbound resource is named');
     assert.deepEqual(plain!.resourceGaps, [], 'no resources, no gaps');
+  } finally { await h.close(); }
+});
+
+test('mobile origin raw pages preserve terminals across private rows and bridged child overflow', async () => {
+  resetEventLog();
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Raw page phone');
+    const origin = createHarnessSession({ kind: 'chat', channel: 'mobile' });
+    const foreign = createHarnessSession({ kind: 'chat', channel: 'mobile' });
+    const { queueWorkflowRun, readWorkflowRunOriginSessionIds } = await import('../tools/workflow-run-queue.js');
+    const slug = `mobile-page-work-${Date.now()}`;
+    writeWorkflow(slug, { name: slug, description: 'Isolated bridge fixture', enabled: true, trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only fixture.', sideEffect: 'read' }] });
+    const run = queueWorkflowRun(slug, {}, { originSessionId: origin.id });
+    const unrelated = queueWorkflowRun(slug, { distinct: 'foreign' }, { originSessionId: foreign.id });
+    assert.equal(run.status, 'queued', JSON.stringify(run));
+    assert.equal(unrelated.status, 'queued', JSON.stringify(unrelated));
+    // The legacy observer sidecar is installed by real duplicate admission.
+    // Fresh inline origin fields alone are not the bridge's membership proof.
+    const observed = queueWorkflowRun(slug, {}, { originSessionId: origin.id });
+    const otherObserved = queueWorkflowRun(slug, { distinct: 'foreign' }, { originSessionId: foreign.id });
+    assert.equal(observed.status, 'duplicate');
+    assert.equal(observed.id, run.id);
+    assert.equal(otherObserved.status, 'duplicate');
+    assert.ok(readWorkflowRunOriginSessionIds(run.id!).includes(origin.id), 'real duplicate queue owner installed origin membership');
+    const hidden = Array.from({ length: 4 }, () => appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'guardrail_tripped', data: { prompt: 'PRIVATE' } }));
+    const source = appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Run the fixture.' } });
+    const sourceGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+    const sourceGroupDigest = 'b'.repeat(64);
+    appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'async_work_dispatched', data: {
+      version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: source.seq,
+      sourceGroupId, sourceGroupDigest, dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}`,
+      replyTargetDigest: 'c'.repeat(64), runIds: [run.id, unrelated.id],
+    } });
+    const terminal = appendEvent({ sessionId: origin.id, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'The complete mobile answer.' } });
+    const child = createHarnessSession({ id: `workflow:${run.id}:read`, kind: 'workflow' });
+    const otherChild = createHarnessSession({ id: `workflow:${unrelated.id}:read`, kind: 'workflow' });
+    for (let i = 0; i < 200; i++) appendEvent({ sessionId: child.id, turn: 1, role: 'system', type: 'heartbeat', data: { marker: `child-${i}` } });
+    appendEvent({ sessionId: otherChild.id, turn: 1, role: 'system', type: 'heartbeat', data: { marker: 'UNRELATED CHILD' } });
+    const get = async (query: string) => {
+      const response = await fetch(`${h.url}/m/api/chat/sessions/${origin.id}/events/recent${query}`, { headers: { cookie } });
+      assert.equal(response.status, 200);
+      return response.json() as Promise<{ events: Array<{ seq: number; sessionId: string; data: Record<string, unknown> }>; latestSeq: number; page: { version: 1; scannedThroughSeq: number; snapshotSeq: number; hasMore: boolean } }>;
+    };
+    const first = await get('?limit=4');
+    assert.deepEqual(first.events, []);
+    assert.equal(first.page.scannedThroughSeq, hidden.at(-1)!.seq);
+    assert.equal(first.page.snapshotSeq, terminal.seq);
+    const next = await get(`?limit=200&sinceSeq=${first.page.scannedThroughSeq}&throughSeq=${first.page.snapshotSeq}`);
+    assert.ok(next.events.some(event => event.seq === terminal.seq && event.data.reply === 'The complete mobile answer.'));
+    assert.equal(next.events.filter(event => event.sessionId === child.id).length, 200, 'child activity cannot consume the origin page');
+    assert.equal(next.page.scannedThroughSeq, terminal.seq);
+    assert.equal(next.latestSeq, terminal.seq);
+    assert.equal(next.page.hasMore, false);
+    assert.ok(!JSON.stringify(next).includes('UNRELATED CHILD'));
+    const reopened = await fetch(`${h.url}/m/api/chat/sessions/${origin.id}?limit=4`, { headers: { cookie } });
+    const initial = await reopened.json() as { events: unknown[]; page: { scannedThroughSeq: number; hasMore: boolean } };
+    assert.deepEqual(initial.events, []);
+    assert.equal(initial.page.scannedThroughSeq, hidden.at(-1)!.seq);
+    assert.equal(initial.page.hasMore, true, 'reopen supplies the real raw continuation instead of skipping to latest');
+    for (const query of ['sinceSeq=1.5', 'sinceSeq=-1', 'sinceSeq=Infinity', 'sinceSeq=1&throughSeq=0']) {
+      assert.equal((await fetch(`${h.url}/m/api/chat/sessions/${origin.id}/events/recent?${query}`, { headers: { cookie } })).status, 400);
+    }
   } finally { await h.close(); }
 });

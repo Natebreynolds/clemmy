@@ -81,9 +81,10 @@ interface Props {
   onReply: (sessionId: string | null, draft: string) => void;
   onOpenSettings: () => void;
   onOpenWorkflows: () => void;
+  onOpenRun: (sessionId: string) => void;
 }
 
-export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings, onOpenWorkflows }: Props) {
+export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings, onOpenWorkflows, onOpenRun }: Props) {
   // Partial endpoint failures keep the last successful value for that exact
   // source. `undefined` means “never known”; an empty array means a successful
   // authoritative zero. This distinction prevents a transport miss from
@@ -157,7 +158,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       updatesKnown: lastGood.current.notifications !== undefined,
     };
   }, [initialNotificationId]);
-  const { data, loading, refreshing, error, offline, refresh } = useScreenData(load, { intervalMs: 6_000 });
+  const { data, loading, refreshing, error, offline, refresh } = useScreenData(load, { intervalMs: 6_000, resourceKey: initialNotificationId ?? 'inbox' });
   const [tab, setTab] = useState<InboxTab>('needs');
   const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
   const [reading, setReading] = useState<string | null>(null);
@@ -498,6 +499,9 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               <h2>{row.title || 'Update from Clem'}</h2>
               {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
               {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
+              {row.context.runSessionId ? (
+                <button type="button" class="btn-reply" onClick={() => onOpenRun(row.context.runSessionId!)}>Open run</button>
+              ) : null}
               {!row.read ? (
                 <div class="inbox-card-actions">
                   <button type="button" class="btn-reply" disabled={reading !== null} onClick={() => void markRead(row)}>

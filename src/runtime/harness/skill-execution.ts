@@ -1,33 +1,57 @@
 /**
- * Skill-execution enforcement helpers (global "run the skill as designed" fix).
- *
- * Layer 1 (the execution-contract framing) lives in skill-tools.ts. This module
- * is the shared Layer-2 plumbing: figure out which installed skills were loaded
- * in a session and surface them as a rubric so the completion gate can verify
- * the skill was actually EXECUTED, not just read. It reads each skill's own
- * content — no per-skill code — so it works for whatever skills a given user
- * has installed (north star: global, not curated).
- *
- * Two consumers, by the nature of their gate:
- *   - Chat: the LLM objective judge gets the skill bodies + tool-call evidence
- *     and verifies execution (catches PARTIAL skips, e.g. "redesign skill says
- *     generate imagery; no image tool fired").
- *   - Workflow step: the deterministic step verifier uses the cheap binary
- *     `sessionReadAnySkill` (declared usesSkill ⇒ skill_read actually ran).
- *
- * Everything here is FAIL-OPEN: any error returns the permissive value ([] /
- * false / '') so a bug in skill verification can never wedge a real completion.
+ * Retained skill references for semantic review and explicit workflow contracts.
+ * Full bodies retain their read/source/version provenance. Reading a skill does
+ * not create work; the effective accepted objective determines applicability.
+ * Explicit workflow usesSkill validation keeps its separate body checker below.
  */
-import { listEvents, resolveToolOutputForAuthority } from './eventlog.js';
-import { projectCanonicalTopLevelToolEvents } from './tool-effect.js';
+import { listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
+import { acceptedTaskIdFor } from './attempt-identity.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
+import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { createHash } from 'node:crypto';
+import { projectCanonicalTopLevelToolEvents, unwrapRuntimeEffectiveToolIdentity, canonicalRuntimeEffectiveToolName } from './tool-effect.js';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+/** Read provenance says what was seen, never which steps the owner adopted. */
+export interface SessionSkillOrigin {
+  callId: string;
+  readEventSeq: number;
+  sourceUserSeq: number | null;
+  scope: 'current_source' | 'prior_source' | 'other_source' | 'unknown';
+  authority: 'settlement' | 'exact' | 'legacy' | 'unavailable';
+  acceptedTaskId?: string;
+  resultHandleId?: string;
+  physicalDispatchId?: string;
+  outputDigest?: string;
+  invocationNonce?: string;
+}
 
 export interface SessionSkill {
   name: string;
   body: string;
   dir?: string;
+  bodyDigest?: string;
+  evidenceStatus?: 'verified' | 'unavailable';
+  evidenceReason?: string;
+  origins?: SessionSkillOrigin[];
+}
+
+/** Render full retained references with explicit scope/version identity. Missing
+ * provenance is unknown, never silently promoted to the current accepted job. */
+export function renderSkillReference(skill: SessionSkill): string {
+  return [
+    `--- skill reference: ${skill.name} ---`,
+    `bodyDigest=${skill.bodyDigest ?? 'unknown'}; evidence=${skill.evidenceStatus ?? 'unspecified'}`,
+    skill.origins?.length
+      ? `readOrigins=${JSON.stringify(skill.origins)}`
+      : 'readOrigins=unknown; no accepted-source/version lineage supplied',
+    ...(skill.evidenceReason ? [`Evidence unavailable: ${skill.evidenceReason}`] : []),
+    '<<<SKILL REFERENCE BODY — apply only within the effective accepted objective>>>',
+    skill.body,
+    '<<<END SKILL REFERENCE>>>',
+  ].join('\n');
 }
 
 function toolArgs(data: unknown): Record<string, unknown> {
@@ -46,16 +70,57 @@ function toolArgs(data: unknown): Record<string, unknown> {
   return typeof raw === 'object' ? raw as Record<string, unknown> : {};
 }
 
-function skillReadCalls(sessionId: string): { name: string; callId: string }[] {
-  const out: { name: string; callId: string }[] = [];
-  const events = listEvents(sessionId, { types: ['tool_called'] });
+interface SkillReadCall { name: string; callId: string; readEventSeq: number; sourceUserSeq: number | null; args: unknown }
+
+function skillReadCalls(sessionId: string): SkillReadCall[] {
+  const out: SkillReadCall[] = [];
+  const events = projectCanonicalTopLevelToolEvents(listEvents(sessionId, { types: ['tool_called'] }), 'tool_called');
   for (const e of events) {
-    if (e.data?.tool !== 'skill_read') continue;
+    const identity = unwrapRuntimeEffectiveToolIdentity(String(e.data?.tool ?? ''), toolArgs(e.data));
+    if (canonicalRuntimeEffectiveToolName(identity.toolName) !== 'skill_read') continue;
     const callId = typeof e.data?.callId === 'string' ? e.data.callId : null;
-    const name = String(toolArgs(e.data).name ?? '');
-    if (callId && name) out.push({ name, callId });
+    const args = identity.args && typeof identity.args === 'object'
+      ? identity.args as Record<string, unknown> : {};
+    const name = typeof args.name === 'string' ? args.name.trim() : '';
+    if (callId && name) out.push({ name, callId, readEventSeq: e.seq, args: identity.args,
+      sourceUserSeq: Number.isSafeInteger(e.data?.sourceUserSeq) && Number(e.data.sourceUserSeq) > 0
+        ? Number(e.data.sourceUserSeq) : null });
   }
   return out;
+}
+
+/** A current host call settles under its effective tool, while its lifecycle
+ * may name call_tool/work_call. Use its immutable result handle first rather
+ * than weakening the legacy reader's exact row-tool equality. The call event
+ * supplies a candidate identity only; redemption and the argument digest must
+ * authenticate it. A present but broken canonical contract never falls back. */
+function canonicalSkillRead(sessionId: string, call: SkillReadCall):
+  | { status: 'ok'; output: string; origin: Omit<SessionSkillOrigin, 'scope'> }
+  | { status: 'unavailable'; reason: string }
+  | null {
+  if (call.sourceUserSeq === null) return null;
+  const row = openEventLog().prepare(`SELECT l.tool_name AS toolName, l.argument_digest AS argumentDigest
+    FROM logical_tool_calls l JOIN logical_call_settlements s
+      ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq AND l.logical_tool_call_id = s.logical_tool_call_id
+    WHERE l.session_id = ? AND l.source_user_seq = ? AND l.logical_tool_call_id = ?`)
+    .get(sessionId, call.sourceUserSeq, call.callId) as { toolName: string; argumentDigest: string } | undefined;
+  if (!row) return null;
+  const acceptedTaskId = acceptedTaskIdFor(sessionId, call.sourceUserSeq);
+  const expected = durableLogicalCallContract(acceptedTaskId, 'skill_read', call.args);
+  if (!expected || expected.toolName !== row.toolName || expected.argumentDigest !== row.argumentDigest) {
+    return { status: 'unavailable', reason: 'skill read arguments do not match the canonical logical contract' };
+  }
+  const redeemed = redeemSuccessfulSettlementResultForHost({ sessionId, sourceUserSeq: call.sourceUserSeq,
+    acceptedTaskId, logicalToolCallId: call.callId });
+  if (redeemed.status !== 'ok') return { status: 'unavailable', reason: `canonical_skill_${redeemed.status}: ${redeemed.reason}` };
+  const value = redeemed.value;
+  if (value.toolName !== 'skill_read' || value.executionSite !== 'host' || typeof value.rawPayload !== 'string') {
+    return { status: 'unavailable', reason: 'canonical skill result tool, execution site or text shape disagrees' };
+  }
+  return { status: 'ok', output: value.rawPayload, origin: { callId: call.callId,
+    readEventSeq: call.readEventSeq, sourceUserSeq: call.sourceUserSeq, authority: 'settlement',
+    acceptedTaskId, resultHandleId: value.resultHandleId, physicalDispatchId: value.physicalDispatchId,
+    outputDigest: value.rawPayloadSha256 } };
 }
 
 /** True iff ≥1 `skill_read` happened in the session. Cheap gate for the
@@ -68,34 +133,70 @@ export function sessionReadAnySkill(sessionId: string): boolean {
   }
 }
 
-/** The (deduped) skill bodies loaded in a session, un-clipped from the
- *  tool_outputs side-store, with the skill_read envelope stripped so only the
- *  real SKILL.md body remains. Fail-open → []. */
-export function gatherSessionSkills(sessionId: string): SessionSkill[] {
+/** Retained skill references, deduplicated by name AND body version. Different
+ * versions remain available with every authenticated read origin. Reading does
+ * not adopt a procedure; the accepted objective governs semantic relevance. */
+export function gatherSessionSkills(
+  sessionId: string,
+  options: { sourceUserSeq?: number | null; includeUnavailable?: boolean } = {},
+): SessionSkill[] {
   try {
     const out: SessionSkill[] = [];
-    const seen = new Set<string>();
-    for (const { name, callId } of skillReadCalls(sessionId)) {
-      if (seen.has(name)) continue;
-      const resolution = resolveToolOutputForAuthority(sessionId, callId);
-      if (resolution.status !== 'ok' || !resolution.record.output) continue;
-      const row = resolution.record;
-      // skill_read returns: head\n\nmanifest\n\ncrib\n\nexecutionContract\n\n---\n<body>.
-      // The envelope (head/manifest/crib/contract) contains no '\n---\n', so the
-      // FIRST divider is the envelope→body boundary. Use indexOf (not lastIndexOf)
-      // so a skill body that itself contains '---' dividers is kept in FULL.
-      const idx = row.output.indexOf('\n---\n');
-      const body = (idx >= 0 ? row.output.slice(idx + 5) : row.output).trim();
-      if (body) {
-        const dirMatch = row.output.match(/(?:Skill location on disk|Skill directory|Location):\s*([^\n]+)/i);
-        const dir = dirMatch?.[1]?.trim();
-        out.push({ name, body, ...(dir ? { dir } : {}) });
-        seen.add(name);
+    const versions = new Map<string, SessionSkill>();
+    for (const call of skillReadCalls(sessionId)) {
+      const { name, callId, readEventSeq } = call;
+      const canonical = canonicalSkillRead(sessionId, call);
+      const legacy = canonical ? null : resolveToolOutputForAuthority(sessionId, callId);
+      const failure = canonical?.status === 'unavailable' ? canonical.reason
+        : legacy && legacy.status !== 'ok' ? legacy.status === 'failed' ? legacy.reason : legacy.status : null;
+      if (failure) {
+        if (options.includeUnavailable) out.push({ name, body: '', evidenceStatus: 'unavailable', evidenceReason: failure,
+          origins: [{ callId, readEventSeq, sourceUserSeq: null, scope: 'unknown', authority: 'unavailable' }],
+        });
+        continue;
       }
+      let output: string;
+      let provenance: Omit<SessionSkillOrigin, 'scope'>;
+      if (canonical?.status === 'ok') {
+        output = canonical.output;
+        provenance = canonical.origin;
+      } else if (legacy?.status === 'ok') {
+        const row = legacy.record;
+        output = row.output;
+        provenance = { callId, readEventSeq,
+          sourceUserSeq: Number.isSafeInteger(legacy.sourceUserSeq) && (legacy.sourceUserSeq ?? 0) > 0 ? legacy.sourceUserSeq : null,
+          authority: legacy.source, outputDigest: createHash('sha256').update(output, 'utf8').digest('hex'),
+          ...(row.invocationNonce ? { invocationNonce: row.invocationNonce } : {}) };
+      } else continue;
+      const sourceUserSeq = provenance.sourceUserSeq;
+      const current = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+        ? options.sourceUserSeq! : null;
+      const scope: SessionSkillOrigin['scope'] = sourceUserSeq === null || current === null
+        ? 'unknown' : sourceUserSeq === current ? 'current_source'
+          : sourceUserSeq < current ? 'prior_source' : 'other_source';
+      const origin: SessionSkillOrigin = { ...provenance, scope };
+      // The first divider separates the tool envelope from the complete body.
+      // Preserve interior dividers and whitespace; do not reread a newer disk file.
+      const idx = output.indexOf('\n---\n');
+      const body = idx >= 0 ? output.slice(idx + 5) : output;
+      const bodyDigest = createHash('sha256').update(body, 'utf8').digest('hex');
+      const key = `${name}\0${bodyDigest}`;
+      const known = versions.get(key);
+      if (known) { known.origins!.push(origin); continue; }
+      const dirMatch = output.match(/(?:Skill location on disk|Skill directory|Location):\s*([^\n]+)/i);
+      const dir = dirMatch?.[1]?.trim();
+      const reference: SessionSkill = { name, body, bodyDigest, evidenceStatus: 'verified',
+        origins: [origin], ...(dir ? { dir } : {}) };
+      versions.set(key, reference);
+      out.push(reference);
     }
-    return out;
+    // Ordering is a presentation choice, not adoption or a new evidence cap.
+    return out.sort((a, b) => Number(b.origins?.some((o) => o.scope === 'current_source'))
+      - Number(a.origins?.some((o) => o.scope === 'current_source')));
   } catch {
-    return [];
+    return options.includeUnavailable ? [{ name: '(skill reference inventory)', body: '', evidenceStatus: 'unavailable',
+      evidenceReason: 'Retained skill references could not be read; no current-source scope or framework can be inferred.',
+      origins: [] }] : [];
   }
 }
 
@@ -273,14 +374,9 @@ function bodyShortfall(skill: string, body: string, evidence: ScriptEvidence, sk
   return { skill, prescribed: required };
 }
 
-/**
- * DETERMINISTIC skill-execution floor for the CHAT completion gate (skills loaded
- * via skill_read). A loaded skill whose RENDERER never ran was not executed — the
- * deliverable was hand-rolled (the 2026-06-15 lunar-audit passed the LLM judge
- * while running 0 of the skill's scripts, then on re-run only ran the VALIDATOR
- * on a hand-rolled file). The LLM judge can't be trusted for this binary fact, so
- * the gate enforces it in code. Fail-open → null. General to any script-backed skill.
- */
+/** Diagnostic script-use facts for retained references. A missing script is
+ * not an execution obligation: only an accepted job/typed workflow contract can
+ * require it. Chat and prewrite callers must not use this as a completion gate. */
 export function skillExecutionShortfall(sessionId: string): SkillExecutionShortfall | null {
   try {
     const evidence = sessionScriptEvidence(sessionId);

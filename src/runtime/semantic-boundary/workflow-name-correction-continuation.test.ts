@@ -32,7 +32,6 @@ const { typedClassificationFromLastInterpretation } = await import('./interpret-
 const { snapshotFromAcceptedSource } = await import('./prepare-accepted-source.js');
 const { primePrimaryModelPlanningCatalog } = await import('./admit-and-compile-accepted-source.js');
 const { writeWorkflow } = await import('../../memory/workflow-store.js');
-const { uniqueWorkflowRunRequest } = await import('../../tools/named-workflow-match.js');
 const { tryHostDispatchNamedWorkflow } = await import('../harness/named-workflow-host-dispatch.js');
 const {
   finalizePreparedWorkflowDispatchForSource,
@@ -202,11 +201,6 @@ test('ordinary clarification shortcuts accept a bounded correction without grant
     assert.equal(consumed.resolution.selectedOption, undefined);
   }
   assert.deepEqual(taskContinuity.peekTaskContinuityPacket({ sessionId: session.id }), { status: 'none' });
-
-  const match = uniqueWorkflowRunRequest(enriched.semanticTaskInput);
-  assert.ok(match, 'the checked A/Q/B semantic surface must retain enough identity to select the workflow');
-  assert.equal(match?.slug, 'platform-49-slack-channel-review');
-  assert.equal(match?.name, 'Platform 49 Slack Channel Review');
 
   const beforeModelRoutes = eventlog.listEvents(session.id, { types: ['turn_model_routed'] }).length;
   const dispatched = tryHostDispatchNamedWorkflow({

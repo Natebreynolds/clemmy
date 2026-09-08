@@ -1,3 +1,5 @@
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { discoveryRequestDigest } from './discovery-request-identity.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { isHostStructuralPlanningControlLookup } from '../../tools/structural-control-lookup.js';
 import { appendEvent } from './eventlog.js';
@@ -109,7 +111,8 @@ function explicitRoleKey(args: Record<string, unknown>): string {
   return value?.trim().slice(0, 128) ?? '';
 }
 
-/** Anthropic's built-in ToolSearch schema cannot be widened with role_key.
+/** Legacy prefix compatibility only. New model instructions use plain queries.
+ * Anthropic's built-in ToolSearch schema cannot be widened with role_key.
  * Its query therefore carries the same opaque key as a prefix. The prefix is
  * removed for exact-vs-broad classification; it never becomes query identity. */
 function queryAndRole(args: Record<string, unknown>): { query: string; roleKey: string } {
@@ -431,6 +434,22 @@ function terminalizeDiscoveryDenial(
   }
 }
 
+/** Host computes the exact request key; role annotations are legacy display
+ * metadata and cannot buy another in-flight owner. No semantic equivalence is
+ * inferred between differently worded queries. */
+export function exactDiscoveryRequestDigest(toolName: string, input: unknown): string {
+  const args = JSON.parse(closedCanonicalJson(objectInput(input))) as Record<string, unknown>;
+  const name = canonicalDiscoveryToolName(toolName);
+  if (name === 'tool_search' || name === 'toolsearch') {
+    const scoped = queryAndRole(args);
+    if (typeof args.query === 'string') args.query = scoped.query;
+    delete args.role_key;
+    delete args.roleKey;
+    delete args.requirement_role;
+  }
+  return discoveryRequestDigest(name === 'toolsearch' ? 'tool_search' : name, args);
+}
+
 /**
  * Admit one physical discovery call for an accepted task. Legacy/out-of-band
  * callers without an exact positive task identity retain their prior behavior.
@@ -451,6 +470,7 @@ export function admitDiscoveryBoundary(
       sourceUserSeq: input.sourceUserSeq as number,
       category: classification.category,
       subject: classification.subject,
+      requestDigest: exactDiscoveryRequestDigest(input.toolName, input.input),
       callId: input.callId,
       ...(input.freshPlanCatalogDisclosure && classification.category === 'broad_discovery'
         ? { authorityClass: 'fresh_plan_catalog_disclosure' as const }

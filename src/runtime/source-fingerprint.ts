@@ -7,6 +7,7 @@ import path from 'node:path';
 export const RUNTIME_SOURCE_PATHS = [
   'src',
   'apps',
+  'packages',
   'scripts',
   'docs',
   'package.json',

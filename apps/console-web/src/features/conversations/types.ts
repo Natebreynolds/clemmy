@@ -1,3 +1,5 @@
+import type { RunStep, RunSourceCoverage } from '@/lib/run-presentation';
+import type { TaskMode, PlanRevisionRef } from '../../lib/task-mode';
 /** Mirrors the backend UnifiedSessionSummary (src/types.ts). */
 export type SessionOrigin = 'desktop' | 'cli' | 'discord' | 'workflow' | 'agent';
 
@@ -16,9 +18,14 @@ export interface Session {
   archived: boolean;
   continuable: boolean;
   turnCount: number;
+  /** Exact step sessions supplied by the backend for a collapsed run. */
+  runSteps?: RunStep[];
+  runCoverage?: RunSourceCoverage;
 }
 
 export interface Turn {
+  taskMode?: TaskMode;
+  planArtifactRef?: PlanRevisionRef;
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
@@ -57,4 +64,5 @@ export interface SessionFilters {
   tag?: string;
   source?: string;
   includeArchived?: boolean;
+  limit?: number;
 }

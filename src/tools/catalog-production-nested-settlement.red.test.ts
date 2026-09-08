@@ -33,6 +33,7 @@ const { buildWorkCall } = await import('./work-call.js');
 const innerDispatch = await import('./inner-dispatch.js');
 const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
 const {
   withHarnessRunContext,
@@ -61,6 +62,7 @@ type ToolLike = { invoke?: (ctx: unknown, input: string, details: unknown) => Pr
 
 test.after(() => {
   capabilityCatalogs.installHostCapabilityCatalogFactory(null);
+  manifestStores.installCapabilityManifestStore(null);
   ports.clearProductionCapabilityPorts();
   closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -68,8 +70,11 @@ test.after(() => {
 
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
 
-async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void> {
+async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeOnly = false): Promise<void> {
   const previousFactory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const previousStore = manifestStores.peekCapabilityManifestStore();
+  const store = manifestStores.createCapabilityManifestStore([], { durable: true });
+  manifestStores.installCapabilityManifestStore(store);
   const operationId = remappedCarrier
     ? 'GOOGLESHEETS_VALUES_GET'
     : 'reviewed_cli_nested_settlement_read';
@@ -115,6 +120,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
     },
     lifecycle: { state: 'current' },
   });
+  assert.equal(store.install(manifest).ok, true, 'the selected catalog manifest is installed in the real trusted store');
   factory.register({
     capabilityId: manifest.manifestId,
     toolName: manifest.operationId,
@@ -163,6 +169,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
       },
       lifecycle: { state: 'current' },
     });
+    assert.equal(store.install(shadowManifest).ok, true);
     factory.register({
       capabilityId: shadowManifest.manifestId,
       toolName: shadowManifest.operationId,
@@ -232,7 +239,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
   const session = createSession({
     id: remappedCarrier
       ? 'sess-catalog-nested-settlement-remapped'
-      : 'sess-catalog-nested-settlement-direct',
+      : localEnvelopeOnly ? 'sess-catalog-nested-settlement-wrapper-only' : 'sess-catalog-nested-settlement-direct',
     kind: 'chat',
   });
   const source = appendEvent({
@@ -348,7 +355,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
     toolName: contract.toolName,
     argumentDigest: contract.argumentDigest,
     effect: 'read' as const,
-    ...(remappedCarrier
+    ...(!localEnvelopeOnly
       ? {
           bindingKind: 'catalog_manifest' as const,
           capabilityId: manifest.manifestId,
@@ -358,7 +365,8 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
           operationId: manifest.operationId,
           manifestId: manifest.manifestId,
           manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
-          providerInputSchemaDigest: manifest.externalDefinition!.providerInputSchemaDigest,
+          ...(manifest.externalDefinition
+            ? { providerInputSchemaDigest: manifest.externalDefinition.providerInputSchemaDigest } : {}),
         }
       : {
           bindingKind: 'local_envelope' as const,
@@ -450,6 +458,23 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
       })),
     );
 
+    if (localEnvelopeOnly) {
+      // Preserve the former positive setup as an explicit denial control:
+      // the wrapper's local envelope cannot borrow a catalog operation by name.
+      assert.match(String(invoked.value), /not_reachable/);
+      assert.deepEqual(preparationOrder, [], 'a wrapper-only binding never reaches catalog preparation or its business body');
+      const physical = openEventLog().prepare(`SELECT COUNT(*) AS count FROM physical_dispatches
+        WHERE session_id = ? AND source_user_seq = ?`).get(session.id, source.seq) as { count: number };
+      assert.equal(physical.count, 0, 'the refused catalog identity makes no provider crossing');
+      return;
+    }
+    const durableBinding = hostBindings.loadHostCallCapabilityBinding({ db: openEventLog(),
+      sessionId: session.id, sourceUserSeq: source.seq, logicalToolCallId: callId });
+    assert.equal(durableBinding.status, 'ok', JSON.stringify(durableBinding));
+    if (durableBinding.status !== 'ok') throw new Error('exact host binding is missing');
+    assert.equal(durableBinding.binding.bindingKind, 'catalog_manifest');
+    assert.equal(durableBinding.binding.manifestId, manifest.manifestId);
+    assert.equal(durableBinding.binding.accountId, manifest.accountId);
     assert.doesNotMatch(String(invoked.value), /not_reachable/, String(invoked.value));
     assert.match(String(invoked.value), /alex\.rivera@acme\.example/);
     if (remappedCarrier) {
@@ -533,6 +558,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean): Promise<void>
     dispatchLeases.revokeDispatchLease(parentLease);
     ports.clearProductionCapabilityPorts();
     capabilityCatalogs.installHostCapabilityCatalogFactory(previousFactory);
+    manifestStores.installCapabilityManifestStore(previousStore);
   }
 }
 
@@ -542,4 +568,8 @@ test('nested host catalog live-read settles a record the host can adopt', () => 
 
 test('cold emitted transport is prepared once on the real work_call normalized gateway path', () => (
   runNestedCatalogLiveRead(true)
+));
+
+test('a local wrapper envelope cannot borrow the unique current catalog read or enter its port', () => (
+  runNestedCatalogLiveRead(false, true)
 ));

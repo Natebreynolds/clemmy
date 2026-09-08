@@ -15,6 +15,8 @@ import {
   publicReplyText,
   publicUserInputText,
   validTypedCompletionPresentation,
+  publicPlanArtifactRef,
+  publicTaskMode,
 } from './public-presentation.js';
 
 /**
@@ -65,6 +67,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       // Her mid-task words replay too: the point of a check-in is that
       // someone who walked away can reopen the session and read it.
       'conversation_check_in',
+      'plan_revision_published',
     ],
     limit,
   });
@@ -90,7 +93,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef'] };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -114,6 +117,22 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       event,
       userText: event.data.synthetic === true ? '' : publicUserInputText(event.data),
     });
+  }
+
+  // Publication is already durable while the final Plan reply may still be
+  // running. Reopen keeps its exact review card without inventing a terminal.
+  const publishedPlans = new Map<string, { ref: NonNullable<UnifiedSessionTurn['planArtifactRef']>; createdAt: string; text: string }>();
+  for (const event of events) {
+    if (event.type !== 'plan_revision_published' || event.role !== 'host') continue;
+    const seq = positiveSeq(event.data.sourceUserSeq);
+    const ref = publicPlanArtifactRef(event.data.planArtifactRef);
+    if (!seq || !ref) continue;
+    const key = sourceKey(event.sessionId, seq);
+    const owner = sources.get(key);
+    if (!owner || owner.event.id !== event.parentEventId || event.seq <= owner.event.seq
+      || publicTaskMode(owner.event.data.taskMode)?.kind !== 'plan') continue;
+    publishedPlans.set(key, { ref, createdAt: event.createdAt,
+      text: event.data.readiness === 'ready' ? 'Plan ready for review.' : 'Plan draft available for review.' });
   }
 
   // Her check-ins, grouped by the source turn they belong to. The writer binds
@@ -148,6 +167,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         text: presentation.text,
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
+        planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
       });
     }
   }
@@ -213,8 +233,10 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   const unpaired: Unit[] = [];
   for (const source of sources.values()) {
     const assistant = assistantBySource.get(source.key);
+    const publishedPlan = publishedPlans.get(source.key);
     const userTurns: UnifiedSessionTurn[] = source.userText
-      ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt }]
+      ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt,
+        ...(publicTaskMode(source.event.data.taskMode) ? { taskMode: publicTaskMode(source.event.data.taskMode) } : {}) }]
       : [];
     if (assistant) {
       // A DAEMON-DRIVEN turn (synthetic source — an outcome relay the user
@@ -234,6 +256,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
             text: assistant.text,
             createdAt: assistant.createdAt,
             planProposalId: assistant.planProposalId,
+            ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
           },
         ],
       });
@@ -243,7 +266,9 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       // far, not an empty wait.
       unpaired.push({
         order: source.event.seq,
-        turns: [...userTurns, ...(checkInsBySource.get(source.key) ?? [])],
+        turns: [...userTurns, ...(checkInsBySource.get(source.key) ?? []),
+          ...(publishedPlan ? [{ role: 'assistant' as const, text: publishedPlan.text,
+            createdAt: publishedPlan.createdAt, planArtifactRef: publishedPlan.ref }] : [])],
       });
     }
   }

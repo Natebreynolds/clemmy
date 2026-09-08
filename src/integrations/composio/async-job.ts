@@ -1,34 +1,15 @@
 /**
- * Composio async/queued-job awareness — FAMILY RECIPE REGISTRY.
+ * Composio queued-job receipt recognition and explicit poll recipes.
  *
- * Some Composio actions SUCCEED but only return a QUEUED RECEIPT, not the result:
- *  - DataForSEO `*_TASK_POST`  → `{ tasks: [{ id, result: null, status_code: 20100,
- *                                 status_message: "Task Created." }] }`
- *  - Apify `*_RUN_ACTOR`       → `{ id, status: "READY"|"RUNNING", finishedAt: null,
- *                                 defaultDatasetId }`  (output NOT inline)
- *  - Firecrawl async crawl     → `{ id, status: "scraping" }`
+ * A queued receipt is evidence that work started, not the requested result.
+ * The current foreground path returns its exact identifiers and guidance.
+ * Every status/result request must enter as a separately admitted logical
+ * call with normal account, authority, cancellation and settlement checks.
+ * It does not automatically poll or park a new job in the legacy watcher.
  *
- * A model that gets one of these can mistake the receipt for the answer and stop —
- * so the user never gets the data, and never got asked. This module DETECTS the
- * receipt shape (verified against real 2026-06-30 envelopes), produces a precise
- * corrective naming the exact job id + the poll action, and (where it can) polls
- * the job to its REAL terminal result so the model never has to know it was async.
- * Detection is SHAPE-based (+ a toolkit-prefix guard), never a blind slug map — so
- * it's inert on a normal result and can't misfire on the common case.
- *
- * ── The registry ────────────────────────────────────────────────────────────────
- * Each job family is one `JobFamilyRecipe` in JOB_FAMILIES: a `detect` (receipt
- * classifier) plus an optional `poll` recipe ({ resolveGetter, checkOnce }). ONE
- * shared budget/backoff loop (`pollJobToResolution`, 240s, 2s→10s) drives every
- * family that has a poll recipe; the background job-watcher reuses the same
- * `resolveJobGetter` + `checkJobOnce` for its deterministic per-tick polling.
- *
- * ADDING FAMILY #4 = one registry entry (a `JobFamilyRecipe`) + one fixture test.
- * Nothing else changes: detection, inline auto-resolve, and background parking all
- * dispatch through the registry.
- *
- * Kill-switches: CLEMMY_COMPOSIO_ASYNC_RESOLVE (detect+banner, default on) and
- * CLEMMY_COMPOSIO_AUTO_POLL (inline harness poll, default on).
+ * The recipe/poll helpers below remain reusable explicit orchestration
+ * helpers. Their presence and feature flags do not authorize background I/O;
+ * job-watcher.ts contains only migration of legacy unowned jobs.
  */
 import { getRuntimeEnv } from '../../config.js';
 import type { ComposioToolkitTool } from './client.js';
@@ -858,7 +839,9 @@ export function detectJobReceipt(slug: string, result: unknown): JobReceipt | nu
 /** The banner prepended to a receipt result so the model treats it as a queued job,
  *  not the answer. The raw receipt is kept BELOW it so the ids remain available. */
 export function asyncReceiptBanner(receipt: JobReceipt): string {
-  return `⏳ QUEUED JOB — this is a receipt, not the final result. ${receipt.pollGuidance}`;
+  return `⏳ QUEUED JOB — this is a receipt, not the final result. ${receipt.pollGuidance}`
+    + ' Keep the exact returned handle. Make status and result reads as separately admitted tool calls; '
+    + 'the foreground path does not automatically poll or background this job. Do not start a replacement.';
 }
 
 // ── Poll driver ────────────────────────────────────────────────────────────────────

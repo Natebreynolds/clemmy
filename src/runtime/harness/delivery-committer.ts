@@ -1,3 +1,4 @@
+import { redactSensitiveText } from '../security.js';
 /**
  * The single durable foreground-delivery boundary.
  *
@@ -7,11 +8,18 @@
  * arbitrary event data, so internal summaries and raw model output have no path
  * into the user-facing terminal payload.
  */
+import { acceptedTaskMode } from './accepted-task-mode.js';
+import { finishRunAttempt } from './eventlog.js';
 import { createHash } from 'node:crypto';
+import { readCommittedArtifactContent } from './host-local-write-commit.js';
+import { completionReviewEnabled } from './respond-bridge.js';
+import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
+import { sourceRefusedAttempts } from './source-refused-attempts.js';
 import {
   AcceptedTaskTerminalPublicationError,
   appendTerminalEventOnce,
   listEvents,
+  getSession,
   openEventLog,
   type EventRow,
 } from './eventlog.js';
@@ -48,6 +56,7 @@ import { constrainNeedsInputPresentationForRecovery } from './recovery-presentat
 import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
+import { getPlanRevisionForSource } from './plan-artifacts.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -890,6 +899,7 @@ function acceptedSourceHasZeroExternalEffectSurface(
   }
 }
 
+
 function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
   switch (outcome.status) {
     case 'needs_input': {
@@ -951,6 +961,20 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
     }
     default:
       return outcome;
+  }
+}
+
+
+/** Did this accepted source publish an inspectable plan revision? */
+function acceptedSourcePublishedPlanRevision(identity: {
+  sessionId: string; sourceUserSeq: number;
+}): boolean {
+  try {
+    return listEvents(identity.sessionId, { types: ['plan_revision_published'] })
+      .some((row) => row.data.sourceUserSeq === identity.sourceUserSeq);
+  } catch {
+    // Unreadable history must not turn a good plan into a question.
+    return true;
   }
 }
 
@@ -1061,6 +1085,46 @@ export function commitTurnOutcome(
       },
     };
   }
+  // A PLAN TURN'S DELIVERABLE IS A PLAN.
+  //
+  // Nothing asserted this, so an explicit Plan request could end `done` with a
+  // conversational answer and no published revision — leaving exact Execute
+  // with nothing to run and the mode silently degraded to chat. Live
+  // 2026-09-07 source 149138: a genuinely good Platform 49 analysis, zero
+  // mutations, terminal `done`, and no plan_revision_published anywhere in the
+  // session.
+  //
+  // The analysis is kept and the turn stays resumable — this is not a failure
+  // and nothing is discarded. It simply stops calling itself finished when the
+  // thing the owner asked for was not produced.
+  if (effectiveOutcome.status === 'done') {
+    try {
+      const mode = acceptedTaskMode(
+        effectiveOutcome.identity.sessionId,
+        effectiveOutcome.identity.sourceUserSeq,
+      );
+      if (mode?.kind === 'plan' && !acceptedSourcePublishedPlanRevision(effectiveOutcome.identity)) {
+        effectiveOutcome = {
+          ...effectiveOutcome,
+          status: 'needs_input',
+          resumable: true,
+          needs: { kind: 'input' },
+          presentation: {
+            kind: 'question',
+            text: `${effectiveOutcome.presentation.text}\n\n`
+              + '_I have not published this as an inspectable plan yet, so there is '
+              + 'nothing to Execute. Say the word and I will publish it as a plan '
+              + 'revision you can review and run._',
+          },
+        };
+      }
+    } catch { /* mode is advisory here; never fail a terminal on it */ }
+  }
+  // Completion depends on the accepted objective and its evidence. A carrier
+  // call with no business settlement may be a valid retained-data answer or an
+  // adopted cancellation; one unrelated (or failed) business call proves no
+  // objective complete. The host completion reviewer owns semantic gaps, while
+  // the typed delivery assessment above retains concrete unfinished-work floors.
   effectiveOutcome = withRetainedWorkTerminal(effectiveOutcome);
   const proposed = presentationEventForOutcome(effectiveOutcome);
   // A prepared/held workflow admission is durable accepted work, not an error
@@ -1071,7 +1135,326 @@ export function commitTurnOutcome(
     sessionId: proposed.identity.sessionId,
     sourceUserSeq: proposed.identity.sourceUserSeq,
   });
-  let data = completionDataForTurnOutcome(effectiveOutcome, effectiveOptions);
+  // This ref comes only from the complete immutable artifact published by this
+  // exact accepted source. It is deliberately absent from the caller-metadata
+  // allowlist, so a model reply cannot nominate a different plan for Execute.
+  const planSession = getSession(proposed.identity.sessionId);
+  const publishedPlan = planSession ? getPlanRevisionForSource({
+    sessionId: proposed.identity.sessionId, sourceUserSeq: proposed.identity.sourceUserSeq,
+    principalId: planSession.userId ?? planSession.id,
+  }) : null;
+  const planMetadata = publishedPlan ? { planArtifactRef: {
+    planId: publishedPlan.planId, revision: publishedPlan.revision, digest: publishedPlan.digest,
+  } } : {};
+  // The completion verdict for this exact accepted source, derived HERE from the
+  // durable event rather than accepted from caller metadata — the same reasoning
+  // as planArtifactRef above, so a model reply cannot nominate its own verdict.
+  // Read at publish time, so a terminal committed after a crash/reopen in
+  // another process binds the same verdict the first attempt would have.
+  const publishedVerdict = completionVerdictForAcceptedSource({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  // VALIDATE before attaching. Copying a same-source verdict without checking it
+  // against the bytes actually being published let a mismatched reply, a stale
+  // objective, a vanished artifact and a NEGATIVE verdict all publish as
+  // completion. `proposed.text` is the exact published presentation — every
+  // rewrite happens above this line.
+  // The policy this run ACTUALLY ran under, stamped at accept time. Re-reading
+  // the live setting here let a switch flipped between the work and the terminal
+  // relabel the run in either direction. The live value is used only when no
+  // stamp exists (a source accepted by an older build).
+  const capturedRead = readCapturedCompletionPolicy({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  // 'absent' is a legacy source with no stamp — today's setting is the honest
+  // best answer. 'unreadable' is a STORE FAILURE and must never be quietly
+  // replaced by today's setting, which would be a policy claim we cannot back.
+  const reviewWasEnabled = capturedRead.status === 'captured'
+    ? capturedRead.policy.enabled
+    : capturedRead.status === 'absent' && completionReviewEnabled();
+  const policyEvidence = capturedRead.status;
+  const reviewDisposition = ((): 'disabled_by_owner' | 'reviewed' | 'enabled_unavailable' => {
+    // A policy we could not read cannot certify anything about this run.
+    if (capturedRead.status === 'unreadable') return 'enabled_unavailable';
+    if (!reviewWasEnabled) return 'disabled_by_owner';
+    if (!publishedVerdict) return 'enabled_unavailable';
+    // A review that ran but did not stand — negative, failed open, or with
+    // unreadable evidence — is NOT 'reviewed'. Calling it reviewed is what let a
+    // failed-open publish look like a successful evaluation.
+    if (publishedVerdict.failedOpen === true) return 'enabled_unavailable';
+    if (publishedVerdict.settledEvidenceAvailable === false) return 'enabled_unavailable';
+    if (!publishedVerdict.fulfills) return 'enabled_unavailable';
+    return 'reviewed';
+  })();
+  // OBJECTIVE VALIDATION against the same authority-aware expression the judge
+  // used. A verdict whose objectiveDigest names a different objective was still
+  // accepted as verified after reopen; comparing to raw user text instead would
+  // fail Plan and Execute, whose accepted expressions legitimately differ.
+  const acceptedObjective = acceptedObjectiveForSource({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  const objectiveMatches = publishedVerdict?.objectiveDigest
+    ? (acceptedObjective !== null
+      && publishedVerdict.objectiveDigest
+        === createHash('sha256').update(acceptedObjective, 'utf8').digest('hex'))
+    : false;
+  const replyMatches = publishedVerdict?.replyDigest
+    ? publishedVerdict.replyDigest === createHash('sha256').update(proposed.text, 'utf8').digest('hex')
+    : false;
+  // RE-VERIFY the artifacts NOW, against the files as they stand at publication.
+  // Trusting the `digestMatches` flags recorded during judging misses every
+  // change made between the verdict and the terminal — the artifact could have
+  // been altered, truncated or deleted in that window and still publish as
+  // verified. `readCommittedArtifactContent` re-opens each handle through the
+  // same safe reader and re-hashes the raw bytes.
+  // History is not required coverage. A superseded generation, and any effect
+  // with no file contract, are excluded from the current-bytes recheck —
+  // publication was requiring every historical receipt to match current bytes,
+  // which no valid edit can satisfy.
+  const artifactCoverage = (publishedVerdict?.artifacts ?? [])
+    .filter((entry) => entry.superseded !== true && entry.evidenceContract !== 'none')
+    .map((entry) => {
+    const recheck = readCommittedArtifactContent({
+      createdId: entry.createdId,
+      handle: entry.handle,
+      contentDigest: entry.contentDigest,
+      receipt: '',
+    });
+    return {
+      createdId: entry.createdId,
+      handle: entry.handle,
+      contentDigest: entry.contentDigest,
+      judgedMatch: entry.digestMatches === true,
+      currentMatch: recheck.verified,
+    };
+  });
+  // Coverage is REQUIRED: a verdict with no artifacts cannot vouch for a turn
+  // that settled work, and one whose artifacts no longer verify cannot either.
+  // Coverage is required only when this source actually settled work. An
+  // ordinary artifact-free answer must not be made to look unverified for
+  // having produced no artifact.
+  // THE REQUIREMENT COMES FROM CANONICAL SETTLED WORK, not from the verdict.
+  // Reading `settledEffectCount` off the verdict let a missing or omitted field
+  // self-exempt: no verdict, or a verdict with the field absent and no
+  // artifacts, published as done/verified. The settled ledger is the authority
+  // on whether this request performed work; the verdict is only evidence about
+  // that work.
+  const settledNow = settledSourceArtifacts({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  // Required only when this request produced FILE-contract work. A turn whose
+  // only effects were deletions or non-file writes requires no artifact.
+  const artifactsRequired = settledNow.artifacts.some((entry) => (
+    !entry.superseded && (entry.evidenceContract === 'file' || entry.evidenceContract === 'unknown')
+  ));
+  // REQUIRED vs JUDGED vs CURRENT. Every settled identity must have been judged
+  // and must still verify now; a judged list that omits settled work is not
+  // coverage. Unresolved settled evidence fails coverage rather than vanishing.
+  // TYPED REVISION IDENTITY, not names. A workflow and a Space can share a
+  // createdId while differing in handle and digest, so a name join let judging
+  // only one of them pass. Coverage compares the exact revision.
+  const revisionKey = (entry: { createdId: string; handle: string; contentDigest: string }) =>
+    `${entry.createdId}\u0000${entry.handle}\u0000${entry.contentDigest}`;
+  const judgedRevisions = new Set(artifactCoverage.map(revisionKey));
+  // Only FINAL generations of FILE-contract effects can be required. Earlier
+  // generations are history, and an operation that never promised a file
+  // (deletion, write_file) has its settlement as its evidence.
+  // `unknown` is work we know happened but could not resolve. Excluding it from
+  // required coverage let an earlier positive omit unresolved work entirely.
+  const requiredFinal = settledNow.artifacts.filter((entry) => (
+    !entry.superseded && (entry.evidenceContract === 'file' || entry.evidenceContract === 'unknown')
+  ));
+  const coverageComplete = requiredFinal.every((entry) => judgedRevisions.has(revisionKey(entry)))
+    && requiredFinal.every((entry) => !entry.unresolvedReason);
+  const artifactsMatch = artifactsRequired
+    ? (artifactCoverage.length > 0
+      && coverageComplete
+      && artifactCoverage.every((entry) => entry.judgedMatch && entry.currentMatch))
+    : artifactCoverage.every((entry) => entry.judgedMatch && entry.currentMatch);
+  const verdictTrustworthy = Boolean(
+    publishedVerdict
+    && reviewDisposition === 'reviewed'
+    && publishedVerdict.fulfills
+    && publishedVerdict.failedOpen !== true
+    && publishedVerdict.settledEvidenceAvailable !== false
+    // CURRENT inventory must be readable too. A retained positive verdict from
+    // an earlier read cannot certify work whose evidence we cannot see now.
+    && settledNow.evidenceAvailable
+    && replyMatches
+    && objectiveMatches
+    && artifactsMatch,
+  );
+  // VERIFICATION GOVERNS THE PUBLIC RESULT.
+  //
+  // A wrong objective, content changed after judgment, or missing coverage for
+  // work that actually settled previously left the owner with the ordinary
+  // "done" reply and disposition `reviewed`, with only metadata dissenting.
+  // When review was REQUIRED for this run and its verification does not stand,
+  // the turn publishes as a truthful unverified result instead.
+  //
+  // `unverifiedCompletionOutcome` keeps the model's own account of the work and
+  // marks the turn blocked/resumable, so committed effects are retained and the
+  // owner can direct a targeted repair — no duplicate create, no compulsory
+  // Plan, no extra approval. An owner-disabled run and an ordinary artifact-free
+  // answer are untouched: both leave `verificationRequired` false.
+  // Review is REQUIRED when the owner had it on and this request actually
+  // settled work. A MISSING verdict then fails verification rather than
+  // exempting itself — previously `Boolean(publishedVerdict)` meant no verdict
+  // meant no requirement.
+  // An unreadable evidence spine cannot certify anything either — previously
+  // `evidenceAvailable:false` / count 0 was simply ignored at publication, so a
+  // missing review or a prior artifact-free verdict could self-exempt.
+  const verificationRequired = reviewWasEnabled
+    && (Boolean(publishedVerdict) || artifactsRequired || !settledNow.evidenceAvailable);
+  const verificationFailed = verificationRequired && !verdictTrustworthy;
+  if (verificationFailed && effectiveOutcome.status === 'done') {
+    // TYPED INDEPENDENT CAUSES, tested in order of what is actually knowable.
+    // Previously a MISSING verdict fell through to "reply mismatch" (there was
+    // no reply digest to compare) and a valid current file merely OMITTED from
+    // coverage was reported as "file drift" (nothing had drifted). Each cause is
+    // now distinguished from the others before any wording is chosen.
+    const coverageGap = artifactsRequired
+      && artifactCoverage.every((entry) => entry.currentMatch)
+      && !coverageComplete;
+    const detail = !publishedVerdict
+      ? 'completion_review_absent'
+      : publishedVerdict.failedOpen === true
+        ? 'completion_review_failed_open'
+        : !publishedVerdict.fulfills
+          ? 'completion_review_negative'
+          : !settledNow.evidenceAvailable
+            ? 'completion_review_evidence_unreadable'
+            : coverageGap
+              ? 'completion_review_coverage_incomplete'
+              : !objectiveMatches
+                ? 'completion_review_objective_mismatch'
+                : !replyMatches
+                  ? 'completion_review_reply_mismatch'
+                  : !artifactsMatch
+                    ? 'completion_review_artifact_drift'
+                    : 'completion_review_did_not_stand';
+    // The model's own account of the work STAYS — the work happened, and there
+    // is no safe generic substitute for a real account. What was missing is the
+    // HOST's finding: the reply alone read as plain success while verification
+    // had failed. This appends one factual sentence saying what was checked and
+    // what would settle it. It never repeats or undoes a committed effect.
+    const NOTES: Record<string, string> = {
+      completion_review_absent:
+        'Verification note: no completion review was recorded for this request, so nothing '
+        + 'has confirmed the result. Ask me to check it.',
+      completion_review_failed_open:
+        'Verification note: no completion verdict was obtained. This result remains unreviewed.',
+      completion_review_negative:
+        'Verification note: the completion review found this did not meet the request. Ask '
+        + 'me what is missing before relying on it.',
+      completion_review_evidence_unreadable:
+        'Verification note: I could not read the record of what this request wrote, so I '
+        + 'cannot confirm the result. Ask me to re-check it.',
+      completion_review_coverage_incomplete:
+        'Verification note: the review did not cover everything this request wrote. The '
+        + 'files themselves still match their receipts. Ask me to review the remaining work.',
+      completion_review_objective_mismatch:
+        'Verification note: the completion review was recorded against a different request, '
+        + 'so it does not vouch for this one. Ask me to re-check this result.',
+      completion_review_reply_mismatch:
+        'Verification note: the completion review was recorded against different reply text, '
+        + 'so it does not vouch for what you are reading. Ask me to re-check this result.',
+      completion_review_artifact_drift:
+        'Verification note: the saved file no longer matches the receipt for this write, so '
+        + 'I could not confirm the result. Ask me to re-read it and report what it now '
+        + 'contains before relying on this.',
+      completion_review_did_not_stand:
+        'Verification note: the completion review did not stand for this result, so it is '
+        + 'unconfirmed. Ask me to re-check it.',
+    };
+    const reviewReason = detail === 'completion_review_failed_open' && publishedVerdict?.reviewUnavailableReason
+      // Older durable verdicts used this internal fail-open label. It never
+      // meant a review accepted the result, including when reopened today.
+      ? redactSensitiveText(publishedVerdict.reviewUnavailableReason)
+        .replace(' — accepting completion', '; no review was completed').trim().slice(0, 800) : '';
+    const note = reviewReason ? `Verification note: ${reviewReason} This result remains unreviewed.`
+      : NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
+    const authored = effectiveOutcome.presentation.text.trim();
+    effectiveOutcome = unverifiedCompletionOutcome({
+      ...effectiveOutcome,
+      presentation: {
+        ...effectiveOutcome.presentation,
+        text: authored ? `${authored}\n\n${note}` : note,
+      },
+    }, true);
+    effectiveOptions = {
+      ...effectiveOptions,
+      metadata: { ...(effectiveOptions.metadata ?? {}), verificationDetail: detail },
+    };
+  }
+  const verdictMetadata = publishedVerdict ? { completionVerdictRef: {
+    version: 1 as const,
+    eventId: publishedVerdict.eventId,
+    seq: publishedVerdict.seq,
+    fulfills: publishedVerdict.fulfills,
+    // The single field a consumer may read as "this result was reviewed and the
+    // review stands against what we actually published". Never `fulfills` alone.
+    verified: verdictTrustworthy,
+    // An OFF policy with a retained verdict from an earlier state is still
+    // owner-disabled; calling it enabled_unavailable misreports the owner's
+    // choice as a review problem.
+    // A VALID captured-off with a retained verdict is genuinely owner-disabled.
+    // An UNREADABLE policy is not: we do not know what the owner chose, so it
+    // must not be presented as their decision.
+    disposition: capturedRead.status === 'unreadable'
+      ? 'enabled_unavailable'
+      : !reviewWasEnabled
+        ? 'disabled_by_owner'
+        : verdictTrustworthy ? reviewDisposition : 'enabled_unavailable',
+    policyEvidence,
+    replyMatches,
+    // The digest above describes the AUTHORED text the review saw. When a host
+    // verification note is appended the delivered bytes differ from it, so the
+    // published text is not what was judged and must not read as though it were.
+    deliveredTextIsJudgedText: !verificationFailed,
+    objectiveMatches,
+    artifactsMatch,
+    // Judged-vs-now per artifact, so a post-judgment change is visible rather
+    // than collapsed into one boolean.
+    artifactCoverage,
+    // Truthful qualifiers, previously dropped entirely.
+    ...(publishedVerdict.failedOpen ? { failedOpen: true } : {}),
+    ...(publishedVerdict.selfJudge ? { selfJudge: true } : {}),
+    ...(publishedVerdict.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
+    ...(publishedVerdict.substituteForExactPin ? { substituteForExactPin: true } : {}),
+    ...(publishedVerdict.requestedJudgeModelId
+      ? { requestedJudgeModelId: publishedVerdict.requestedJudgeModelId } : {}),
+    ...(publishedVerdict.substituteReason ? { substituteReason: publishedVerdict.substituteReason } : {}),
+    ...(publishedVerdict.settledEvidenceAvailable === false ? { settledEvidenceAvailable: false } : {}),
+    ...(publishedVerdict.judgeModelId ? { judgeModelId: publishedVerdict.judgeModelId } : {}),
+    ...(publishedVerdict.judgeProvider ? { judgeProvider: publishedVerdict.judgeProvider } : {}),
+    ...(publishedVerdict.judgeProviderId ? { judgeProviderId: publishedVerdict.judgeProviderId } : {}),
+    ...(publishedVerdict.objectiveDigest ? { objectiveDigest: publishedVerdict.objectiveDigest } : {}),
+    ...(publishedVerdict.replyDigest ? { replyDigest: publishedVerdict.replyDigest } : {}),
+    artifacts: publishedVerdict.artifacts.slice(0, 16),
+  } } : {
+    // Disabled is a legitimate policy, NOT a failed verification. An absent
+    // verdict must be readable as which of the two it was.
+    completionReview: { version: 1 as const, disposition: reviewDisposition, policyEvidence },
+  };
+  // Clean-attempt measurement, from the canonical ledgers. Metadata only — it
+  // must never become a gate.
+  const refused = sourceRefusedAttempts({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  const refusalMetadata = refused.count > 0 ? {
+    refusedAttempts: refused.count,
+    refusedLogicalCallIds: refused.attempts.map((entry) => entry.logicalToolCallId).slice(0, 16),
+  } : {};
+  let data = {
+    ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
+    ...planMetadata, ...verdictMetadata, ...refusalMetadata,
+  };
   let terminal;
   try {
     terminal = appendTerminalEventOnce({
@@ -1107,7 +1490,18 @@ export function commitTurnOutcome(
       },
     };
     const heldPresentation = presentationEventForOutcome(effectiveOutcome);
-    data = completionDataForTurnOutcome(effectiveOutcome, effectiveOptions);
+    // The hold fallback previously dropped every derived field, so a held
+    // terminal lost its review disposition and refusal measurement entirely.
+    // The verdict reference is deliberately NOT carried here: it was validated
+    // against a presentation this branch just replaced, so only the disposition
+    // and the measurement — neither of which is a claim about this text —
+    // survive.
+    data = {
+      ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
+      ...planMetadata,
+      completionReview: { version: 1 as const, disposition: reviewDisposition, policyEvidence },
+      ...refusalMetadata,
+    };
     terminal = appendTerminalEventOnce({
       sessionId: heldPresentation.identity.sessionId,
       turn: heldPresentation.identity.turn,
@@ -1158,6 +1552,9 @@ export function commitTurnOutcome(
       sourceUserSeq: persisted.identity.sourceUserSeq,
     }).catch(() => {});
   }
+  // NOTE: the run attempt is closed by the terminal publication itself, in the
+  // same transaction (eventlog `terminalOwner` branch). A best-effort finish
+  // here would be a second, weaker copy of that guarantee.
   return {
     event: terminal.event,
     inserted: terminal.inserted,

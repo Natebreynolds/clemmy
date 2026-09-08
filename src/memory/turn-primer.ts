@@ -123,6 +123,7 @@ export async function buildUnifiedTurnPrimer(input: {
 
   const timeoutMs = Math.max(25, Math.min(15_000, input.timeoutMs ?? 1_500));
   const recalled = await recallWithin(query, {
+    purpose: 'ambient',
     limit: Math.max(1, Math.min(20, input.limit ?? 8)),
     graphDepth: 1,
     now: input.now,
@@ -178,7 +179,8 @@ export async function buildUnifiedTurnPrimer(input: {
     partial: 'Recall is PARTIAL for this ask: the hits below are leads, not complete answers. If the answer should live in memory, call memory_recall_all (one call) before answering from assumption.',
     insufficient: 'Recall found little for this ask. If this depends on remembered context, call memory_recall_all (one call) rather than guessing; otherwise proceed.',
   } as const;
-  const RULE_RESERVE = Math.max(...Object.values(USE_RULES).map((rule) => rule.length));
+  const AMBIENT_USE_RULE = 'These are contextual candidates for this task, not a claim that memory answers every part. Use complete, applicable facts directly and preserve their dates and sources. A dated record does not establish facts for another date. Reopen a cited source or make a targeted memory query when a requested fact is missing or its scope is uncertain.';
+  const RULE_RESERVE = Math.max(AMBIENT_USE_RULE.length, ...Object.values(USE_RULES).map((rule) => rule.length));
   // The [USAGE] mark-used trailer was subtracted 2026-07-16 — usage credit is
   // now attributed in code post-turn (recall-auto-credit.ts). Its budget share
   // goes to the hits themselves.
@@ -187,7 +189,9 @@ export async function buildUnifiedTurnPrimer(input: {
   const retrievedHitCount = result.hits.length;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget);
   result.answerability = projectedRecallAnswerability(result, result.hits);
-  const useRule = USE_RULES[result.answerability ?? 'partial'] ?? USE_RULES.partial;
+  const useRule = result.purpose === 'ambient'
+    ? AMBIENT_USE_RULE
+    : USE_RULES[result.answerability ?? 'partial'] ?? USE_RULES.partial;
   if (result.hits.length === 0) {
     recordPrimerExposure(result, query, input.surface, { retrieved: retrievedHitCount, included: 0 }, input.sessionId);
     return {

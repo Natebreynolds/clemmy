@@ -226,13 +226,16 @@ test('judgeObjectiveComplete fails OPEN when the objective is empty', async () =
   assert.equal(v.done, true);
 });
 
-test('buildObjectiveJudgePrompt injects the skill-execution rubric when skills were loaded', async () => {
+test('buildObjectiveJudgePrompt frames retained skills as references applicable to the accepted objective', async () => {
   const { buildObjectiveJudgePrompt } = await import('./objective-judge.js');
   const p = buildObjectiveJudgePrompt('clone and improve the site', 'I built and deployed it.', {
     skills: [{ name: 'redesign-skill', body: 'Step 1: generate hero imagery. Step 2: build. Step 3: deploy.' }],
     toolCallSummary: 'run_shell_command×13, skill_read×4',
   });
-  assert.match(p, /verify they were EXECUTED/i);
+  assert.match(p, /Reading a skill supplies reference material/i);
+  assert.match(p, /Plan|inspection|comparison/i);
+  assert.match(p, /readOrigins=unknown/);
+  assert.doesNotMatch(p, /verify they were EXECUTED/i);
   assert.match(p, /redesign-skill/);
   assert.match(p, /generate hero imagery/);
   assert.match(p, /run_shell_command×13/);

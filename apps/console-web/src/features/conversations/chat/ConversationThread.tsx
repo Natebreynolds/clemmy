@@ -1,3 +1,6 @@
+import { isRunKind } from '@/lib/run-presentation';
+import { RunThread } from './RunThread';
+import type { TaskMode } from '@/lib/task-mode';
 import { useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -77,7 +80,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     bottomRef.current?.scrollIntoView({ behavior: chat.busy ? 'auto' : 'smooth', block: 'end' });
   }, [chat.messages, chat.busy]);
 
-  const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => {
+  const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => {
     await chat.send(input);
     // Re-sort + re-title the list now that this conversation has a new turn.
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
@@ -109,6 +112,10 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             <ChatBubble
               key={m.id}
               message={m}
+              sessionId={chat.sessionId.current ?? undefined}
+              executionBusy={chat.busy}
+              onExecutePlan={chat.executePlan}
+              onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
@@ -120,7 +127,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       <div className="border-t border-border bg-canvas/80 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-6 py-4">
           <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-          <Composer inputRef={composerRef} busy={chat.busy} onSend={send} onStop={chat.stop} />
+          <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} />
         </div>
       </div>
     </div>
@@ -138,7 +145,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (
-            messages.map((m) => <ChatBubble key={m.id} message={m} onApprove={() => {}} onReject={() => {}} />)
+            messages.map((m) => <ChatBubble key={m.id} message={m} sessionId={rawId(session.id)} onApprove={() => {}} onReject={() => {}} />)
           )}
         </div>
       </div>
@@ -169,6 +176,7 @@ export function ConversationThread() {
   }
 
   const { session, turns } = detail.data;
+  if (isRunKind(session.kind)) return <RunThread key={session.id} session={session} />;
   // Their chat loop is harness-native, so only harness chat sessions can be
   // continued in the new console. Workflow/agent runs and legacy desktop
   // (sessions.json) chats are read-only here.

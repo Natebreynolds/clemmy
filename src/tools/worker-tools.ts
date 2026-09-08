@@ -31,6 +31,7 @@ import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureL
 import { faultInjectWorkerModel, injectedWorkerRateLimitText } from '../runtime/harness/fault-inject.js';
 import { maybeHeavyPerItemToolAdvisory } from '../agents/fanout-alignment-gate.js';
 import { textResult } from './shared.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { buildWorkerReturn } from '../runtime/harness/fanout-reduce.js';
 import { assertNotKilled, harnessRunContextStorage, KillRequested } from '../runtime/harness/brackets.js';
 import {
@@ -388,11 +389,19 @@ export function registerWorkerTools(server: McpServer): void {
       );
       if (!allRequestedItemsReused || !manifestBinding) return singleResult;
       const singleText = String(singleResult.content?.[0]?.text ?? '');
-      return textResult([
-        `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
-        singleText,
-        durableReuseGuidance,
-      ].filter(Boolean).join('\n\n'));
+      // The inner result may already be an authenticated compact projection.
+      // Keep these host facts in the formatter's annotation channel: prepending
+      // them to that projection and formatting again redeems the original bytes
+      // and loses the wrapper prose. The raw worker output remains unchanged.
+      return {
+        ...singleResult,
+        content: [{ type: 'text' as const, text: formatRecallableToolText(singleText, {
+          hostAnnotations: [
+            `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+            ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+          ],
+        }) }],
+      };
     },
   );
 

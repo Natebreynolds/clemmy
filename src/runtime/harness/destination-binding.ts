@@ -142,9 +142,14 @@ export function evidenceFloorFromManifest(
   proposed: { handleRequired: boolean; evidenceRequirements: readonly string[] },
 ): DestinationEvidenceFloorV1 {
   const write = WRITE_EFFECTS.has(manifest.effect);
+  const acknowledgementOnly = manifest.effect === 'external_write'
+    && manifest.evidenceContract.kinds.length === 1
+    && manifest.evidenceContract.kinds[0] === 'tool_result'
+    && !manifest.evidenceContract.readbackRequired && !manifest.readbackContract?.required
+    && !manifest.externalDefinition?.verification && !manifest.operationSemantics?.atomicInputContent;
   const handleRequired = Boolean(
     proposed.handleRequired
-    || write
+    || (write && !acknowledgementOnly)
     || manifest.evidenceContract.readbackRequired
     || manifest.readbackContract?.required,
   );

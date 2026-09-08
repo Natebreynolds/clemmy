@@ -1,12 +1,7 @@
-/**
- * Host dispatch for a uniquely identified existing workflow run.
- *
- * A catalog name match is not enough — delete/edit/inspect never collapse
- * into RUN. uniqueWorkflowRunRequest is execution text plus unique catalog
- * identity. That request is queued through admitNamedWorkflowRunFromAcceptedSource
- * (the same queueWorkflowRun path as MCP workflow_run). Live 2026-08-29
- * seq 97371 uniquely named the workflow, then the model asked instead of
- * dispatching; the host owns this dispatch.
+/** Host dispatch for a checked existing-workflow clarification.
+ * Ordinary prose stays with the foreground model. Resource-name similarity
+ * cannot manufacture a workflow action; explicit workflow_run uses the same
+ * accepted-source admission and queue path directly.
  */
 import type { TurnGraphRoute } from '../graph/turn-graph-ir.js';
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
@@ -18,7 +13,6 @@ import { getSession, listEvents } from './eventlog.js';
 import {
   requestsWorkflowExecution,
   uniqueEnabledWorkflowMatch,
-  uniqueWorkflowRunRequest,
   type UniqueEnabledWorkflowMatch,
 } from '../../tools/named-workflow-match.js';
 import { admitNamedWorkflowRunFromAcceptedSource } from '../../tools/admit-named-workflow-run.js';
@@ -34,20 +28,7 @@ export type NamedWorkflowHostDispatchResult =
   | { status: 'blocked'; reason: string; workflowName: string; message: string }
   | { status: 'not_applicable'; reason: string };
 
-function priorAcceptedSourceTexts(sessionId: string, sourceUserSeq: number): string[] {
-  try {
-    return listEvents(sessionId, { types: ['user_input_received'] })
-      .filter((event) => event.seq < sourceUserSeq)
-      .map((event) => {
-        const display = typeof event.data.displayText === 'string' ? event.data.displayText.trim() : '';
-        const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
-        return display || text;
-      })
-      .filter((text) => text.length > 0);
-  } catch {
-    return [];
-  }
-}
+
 
 const WORKFLOW_CORRECTION_FILLER = new Set([
   'actually', 'correction', 'flow', 'i', 'is', 'it', 'meant', 'mean', 'my',
@@ -184,15 +165,12 @@ export function tryHostDispatchNamedWorkflow(input: {
   if (input.route === 'retrieve' || input.route === 'direct_reply') {
     return { status: 'not_applicable', reason: 'compiled_route_is_not_act' };
   }
-  // Decided before any lexical match or clarification correction: a step's
+  // Decided before clarification correction: a step's
   // own text can never manufacture RUN authority over its own workflow.
   if (acceptedSourceIsWorkflowInternal(input.sessionId, input.sourceUserSeq)) {
     return { status: 'not_applicable', reason: 'accepted_source_is_workflow_internal' };
   }
-  const unique = uniqueWorkflowRunRequest(
-    input.userText,
-    priorAcceptedSourceTexts(input.sessionId, input.sourceUserSeq),
-  ) ?? consumedWorkflowNameCorrection(input);
+  const unique = consumedWorkflowNameCorrection(input);
   if (unique) {
     const admitted = admitNamedWorkflowRunFromAcceptedSource({
       workflowName: unique.name,

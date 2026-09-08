@@ -44,9 +44,18 @@ function writeClaudeToken(): void {
   );
 }
 
+let fixtureCommand: string;
 test.beforeEach(() => {
   writeClaudeToken();
   resetClaudeHeadlessModelCache();
+  // These tests stub process execution; the matching CLI capability probe
+  // must also be deterministic instead of depending on the owner's CLI.
+  fixtureCommand = resolveClaudeCliPath() ?? 'claude';
+  _setHeadlessFlagSupportForTests(fixtureCommand, new Set(['--tools']));
+});
+
+test.afterEach(() => {
+  _setHeadlessFlagSupportForTests(fixtureCommand, null);
 });
 
 test.after(() => {
@@ -208,8 +217,11 @@ test('normalizeClaudeHeadlessOutputText strips markdown fences for structured ou
   );
 });
 
-function installSpawnMock(lines: unknown[], captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv }): void {
+function installSpawnMock(lines: unknown[], captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv; spawnCount?: number }, exitCode = 0, stderr = ''): void {
   setClaudeHeadlessSpawnForTest(((cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    assert.ok(args.includes('--tools'), 'every executed fixture CLI is tool-isolated');
+    assert.equal(args[args.indexOf('--tools') + 1], '', 'no model tools cross the text-only process boundary');
+    captured.spawnCount = (captured.spawnCount ?? 0) + 1;
     captured.cmd = cmd;
     captured.args = args;
     captured.env = options.env;
@@ -228,8 +240,8 @@ function installSpawnMock(lines: unknown[], captured: { cmd?: string; args?: str
       queueMicrotask(() => {
         for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`);
         child.stdout.end();
-        child.stderr.end();
-        child.emit('close', 0, null);
+        child.stderr.end(stderr);
+        child.emit('close', exitCode, null);
       });
     });
     return child;
@@ -505,4 +517,55 @@ test('a successful result is untouched by the failure projection', async () => {
   assert.equal((response.output ?? []).length, 1, 'a good answer still presents');
   assert.equal(response.providerData?.status, undefined);
   assert.equal(response.providerData?.finish_reason, undefined);
+});
+
+
+test('live quota failure survives empty stderr and success subtype without another request or tools', async () => {
+  const { classifyModelError } = await import('./resilient-model.js');
+  _setHeadlessFlagSupportForTests(fixtureCommand, new Set(['--tools', '--safe-mode', '--no-session-persistence']));
+  const captured: { args?: string[]; spawnCount?: number } = {};
+  installSpawnMock([
+    { type: 'system', subtype: 'init', tools: [], mcp_servers: [] },
+    { type: 'result', subtype: 'success', is_error: true, api_error_status: 429,
+      terminal_reason: 'api_error', result: "You've hit your session limit · resets 12:30am (America/Los_Angeles)" },
+  ], captured, 1);
+  await assert.rejects(new ClaudeHeadlessModel('claude-opus-5').getResponse({
+    input: 'Judge the supplied answer.', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false,
+  } as any), (error: any) => {
+    assert.equal(error.status, 429);
+    assert.match(error.message, /HTTP 429.*session limit.*12:30am/);
+    assert.match(error.bodyText, /api_error/);
+    assert.equal(classifyModelError(error).kind, 'model.rate_limited');
+    assert.equal(classifyModelError(error).isAuth, false);
+    return true;
+  });
+  assert.equal(captured.spawnCount, 1, 'quota failure is not an optional-flag retry');
+  assert.ok(captured.args?.includes('--safe-mode'));
+  assert.equal(captured.args?.[captured.args.indexOf('--tools') + 1], '');
+  assert.equal(captured.args?.[captured.args.indexOf('--model') + 1], 'claude-opus-5');
+});
+
+test('explicit API failure cannot publish an answer even with exit zero and a success subtype', async () => {
+  const response = await runHeadlessAndAdmit([
+    { type: 'result', subtype: 'success', is_error: false, api_error_status: 429, result: 'synthetic limit message' },
+  ]);
+  assert.deepEqual(response.output, []);
+  assert.equal(response.providerData?.status, 'failed');
+});
+
+test('nonzero exit retains bounded redacted error detail but never trusts ordinary result text', async () => {
+  for (const isError of [true, false]) {
+    installSpawnMock([{ type: 'result', subtype: 'success', is_error: isError,
+      result: `provider detail sk-ant-oat01-secret-value ${'x'.repeat(4000)}` }], {}, 1, 'Authorization: Bearer top-secret-token-value');
+    await assert.rejects(new ClaudeHeadlessModel('claude-opus-5').getResponse({
+      input: 'Judge.', modelSettings: {}, tools: [], outputType: 'text', handoffs: [], tracing: false,
+    } as any), (error: any) => {
+      assert.doesNotMatch(error.message, /secret-value|top-secret-token-value/);
+      assert.ok(error.message.length < 4200);
+      assert.equal(error.status, undefined);
+      assert.equal(Boolean(error.bodyText), isError, 'only explicit CLI error results become diagnostic body text');
+      assert.equal(error.message.includes('provider detail'), isError);
+      return true;
+    });
+  }
 });

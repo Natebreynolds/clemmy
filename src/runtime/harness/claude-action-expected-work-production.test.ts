@@ -262,9 +262,23 @@ test('connected Claude brain accepts the work_call action surface without requir
     sessionId,
     sourceUserSeq: source.seq,
   });
-  assert.equal(state?.policy.roleScoped, true, 'the connected Claude action freezes discovery roles');
-  assert.equal(state?.roles.length, 2, 'the compound request retains one role per semantic clause');
-  assert.ok(state?.roles.every((role) => !role.resolved));
+  // Discovery is no longer role-FROZEN. The packet used to publish a list of
+  // `role_key`s the model had to copy verbatim into tool_search, and a search
+  // that did not match one was refused — a grammar hoop in front of a plain
+  // description of what was needed. The governor still meters discovery and
+  // still tracks the task; it just no longer requires the model to name a
+  // slot it was never shown to spend one.
+  assert.equal(state?.policy.roleScoped, false,
+    'discovery is metered, not role-frozen');
+  assert.ok(state, 'the connected Claude action still registers a governed task');
+  // …and the clauses are no longer a durable inventory either. Splitting the
+  // request's English into two "roles" made an advisory reading of prose into
+  // membership authority: a capability that did not map onto one of the two
+  // parsed clauses read as out of scope. The task is still governed and still
+  // metered — it is simply not pre-partitioned by a guess at sentence
+  // structure.
+  assert.equal(state?.roles.length, 0,
+    'advisory clauses do not become a durable discovery inventory');
 });
 
 test('an action carrier registration failure aborts the MCP surface instead of exposing call_tool', () => {
@@ -357,7 +371,7 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
     brokerCoverage: string;
   };
   assert.equal(searchBody.results[0]?.carrier, 'work_call');
-  assert.match(searchBody.hint, /through work_call by copying its literal example/);
+  assert.match(searchBody.hint, /through work_call, copy the selected result carrier example/);
   assert.equal(searchBody.brokerCoverage, 'builtins_only',
     'an explicitly denied external scope cannot arm provider-backed role discovery');
 

@@ -12,6 +12,7 @@
  *
  * Mirrors the inline auth + path-safety idioms in console-routes.ts.
  */
+import { withWorkspaceSnapshotRead } from '../spaces/workspace-snapshot.js';
 import type { Express, Request, Response } from 'express';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -359,6 +360,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (!isLoopback(req)) { res.status(403).send('Workspaces are loopback-only'); return; }
     const slug = String(req.params.id ?? '');
     if (!isValidSpaceSlug(slug)) { res.status(400).send('invalid workspace id'); return; }
+    return withWorkspaceSnapshotRead(slug, () => {
     const rec = spaceStore.get(slug);
     if (!rec || rec.status === 'archived') { res.status(404).send('workspace not found'); return; }
     const csp = workspaceViewCsp(req, slug);
@@ -402,6 +404,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       return;
     }
     res.send(readFileSync(target));
+    });
   };
   app.get('/console/spaces/:id/view', (req, res) => {
     // Express is non-strict about trailing slashes, so this handler sees both

@@ -33,22 +33,24 @@ const store = createLiveStore<WorkingNowState>(EMPTY);
 let subscribers = 0;
 let timer: number | null = null;
 let inFlight: Promise<void> | null = null;
+let generation = 0;
 
 export function refreshWorkingNow(): Promise<void> {
+  if (subscribers === 0) return Promise.resolve();
   if (inFlight) return inFlight;
-  inFlight = listWorkingNow()
+  const startedGeneration = generation;
+  const attempt: Promise<void> = Promise.resolve().then(listWorkingNow)
     .then((snapshot) => {
+      if (generation !== startedGeneration || subscribers === 0) return;
       store.set((s) => ({ ...s, data: snapshot, known: true, error: null, offline: false }));
     }, (err: unknown) => {
-      // Keep the last good snapshot on screen; report the miss beside it.
-      store.set((s) => ({
-        ...s,
-        offline: isOfflineError(err),
-        error: err instanceof Error ? err.message : 'Could not read current work',
-      }));
+      if (generation !== startedGeneration || subscribers === 0) return;
+      store.set((s) => ({ ...s, offline: isOfflineError(err),
+        error: err instanceof Error ? err.message : 'Could not read current work' }));
     })
-    .finally(() => { inFlight = null; });
-  return inFlight;
+    .finally(() => { if (inFlight === attempt) inFlight = null; });
+  inFlight = attempt;
+  return attempt;
 }
 
 const onWake = (): void => { void refreshWorkingNow(); };
@@ -68,6 +70,8 @@ function start(): void {
 }
 
 function stop(): void {
+  generation += 1;
+  inFlight = null;
   document.removeEventListener('visibilitychange', onVisible);
   window.removeEventListener('pageshow', onWake);
   window.removeEventListener('online', onWake);
@@ -94,5 +98,11 @@ export function useWorkingNow(enabled = true): WorkingNowState & { refresh: () =
       if (subscribers === 0) stop();
     };
   }, [enabled]);
-  return { ...state, refresh: refreshWorkingNow };
+  // A retained snapshot remains readable after failure, but its old liveness
+  // certificate no longer describes this instant. Do not turn network failure
+  // into a false claim that the executor itself died.
+  const data = state.data && (state.error || state.offline)
+    ? { ...state.data, entries: state.data.entries.map(entry => ({ ...entry, liveness: 'unknown' as const })) }
+    : state.data;
+  return { ...state, data, refresh: refreshWorkingNow };
 }

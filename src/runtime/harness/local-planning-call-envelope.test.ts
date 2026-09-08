@@ -24,6 +24,7 @@ const authority = await import('./accepted-turn-call-authority.js');
 const bindings = await import('./host-call-capability-binding.js');
 const contracts = await import('./logical-call-contract.js');
 const identities = await import('./attempt-identity.js');
+const dispatch = await import('./dispatch-ledger.js');
 const consent = await import('./host-interactive-consent.js');
 const consentPolicy = await import('./interactive-consent-policy.js');
 const local = await import('./local-planning-capability.js');
@@ -63,12 +64,22 @@ async function evaluateLocalEnvelope(
   assert.equal(armed.status, 'armed', JSON.stringify(armed));
   if (armed.status !== 'armed') throw new Error(JSON.stringify(armed));
 
-  const observed = await local.observeCurrentLocalPlanningDefinition({
+  const observed = await local.observeCurrentLocalPlanningDefinitions({
     name: toolName,
     carrier: 'work_call',
   });
   assert.equal(observed.ok, true, observed.ok ? '' : observed.reason);
   if (!observed.ok) throw new Error(observed.reason);
+  const matching = observed.definitions.filter((definition) => local.localPlanningArgumentsMatch(definition, args));
+  assert.equal(matching.length, 1, 'the call must select one current argument-specific local definition');
+  const definition = matching[0]!;
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'capability_discovered', data: {
+    sourceUserSeq: source.seq, capabilities: [{ kind: local.AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+      providerKind: local.AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, identifier: definition.name,
+      capabilityRef: definition.capabilityRef, schemaFingerprint: definition.schemaFingerprint,
+      manifestDigest: definition.descriptor.manifestDigest,
+      accountIdentity: definition.accountIdentity, localAuthority: definition }],
+  } });
   const acceptedTaskId = identities.acceptedTaskIdFor(session.id, source.seq);
   const logicalToolCallId = `${toolName}-${label}`;
   const contract = contracts.durableLogicalCallContract(acceptedTaskId, toolName, args);
@@ -86,10 +97,10 @@ async function evaluateLocalEnvelope(
     argumentDigest: contract.argumentDigest,
     effect: 'local_write' as const,
     bindingKind: 'local_envelope' as const,
-    capabilityId: observed.definition.capabilityRef,
-    schemaFingerprint: observed.definition.schemaFingerprint,
+    capabilityId: definition.capabilityRef,
+    schemaFingerprint: definition.schemaFingerprint,
     accountId: '',
-    invokePortId: `configured-wrapper:${observed.definition.schemaFingerprint}`,
+    invokePortId: `configured-wrapper:${definition.schemaFingerprint}`,
     operationId: toolName,
     manifestId: '',
     manifestDigest: '',
@@ -105,9 +116,21 @@ async function evaluateLocalEnvelope(
     ...base,
     bindingDigest: bindings.hostCallAttestationBindingDigest(base),
   });
-  return authority.withHostCallAttestation(attestation, () => (
-    consent.evaluateUncoveredHostMutationConsent({ attestation, args })
-  ));
+  return authority.withHostCallAttestation(attestation, async () => {
+    const admitted = dispatch.admitLogicalCall({ identity: { sessionId: session.id, sourceUserSeq: source.seq,
+      acceptedTaskId, logicalToolCallId }, tool: toolName, args });
+    assert.equal(admitted.status, 'inserted', JSON.stringify(admitted));
+    const persisted = bindings.persistHostCallCapabilityBinding({ db: eventlog.openEventLog(), attestation,
+      sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId, logicalToolCallId,
+      toolName: contract.toolName, argumentDigest: contract.argumentDigest, effect: 'local_write' });
+    assert.equal(persisted.status, 'bound', JSON.stringify(persisted));
+    const result = await consent.evaluateUncoveredHostMutationConsent({ attestation, args, inputSchema: observed.schema });
+    assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null,
+      'an exact local call does not manufacture a work graph');
+    assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+      .get(session.id) as { n: number }).n, 0, 'consent projection never dispatches the mutation');
+    return result;
+  });
 }
 
 function evaluateWriteEnvelope(
@@ -235,5 +258,13 @@ test('inline Workspace creation remains one exact reversible local mutation enve
     consequence: 'create',
     destructive: false,
   });
-  assert.equal(result.coverage, null, 'the graph-neutral envelope must not manufacture extra work');
+  assert.ok(result.coverage, 'the exact disclosed local call supplies coverage without a work graph');
+  assert.deepEqual(result.coverage.source, result.call.source);
+  assert.equal(result.coverage.acceptedTaskId, result.call.acceptedTaskId);
+  assert.equal(result.coverage.requirementId, result.call.logicalToolCallId);
+  assert.deepEqual(result.coverage.callBinding, {
+    logicalToolCallId: result.call.logicalToolCallId,
+    argumentDigest: result.call.argumentDigest,
+    bindingDigest: result.call.bindingDigest,
+  });
 });

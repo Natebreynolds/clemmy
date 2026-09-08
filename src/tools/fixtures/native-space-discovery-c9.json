@@ -1,0 +1,199 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "query": "[role:clause-0:write] create a simple static Space with slug and display content",
+      "sourceUserSeq": 134567,
+      "originalVisible": [
+        "ZOOM_CREATE_WHITEBOARD",
+        "SLACK_CREATE_CANVAS",
+        "SALESFORCE_CREATE_NOTE",
+        "SLACK_CREATE_SLACK_LIST",
+        "GMAIL_CREATE_PROMPT_POST",
+        "GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN",
+        "create_agent",
+        "write_file"
+      ],
+      "providerCandidates": [
+        {
+          "name": "ZOOM_CREATE_WHITEBOARD",
+          "summary": "Creates a new whiteboard for the authenticated user. Use when you need to create a blank whiteboard that can be shared and collaborated on with others. The whiteboard will be associated with the user making the API call. **Required scope:** whiteboard:write or whiteboard:write:whiteboard **Notes:** - If no name is provided, the whiteboard will be named \"Untitled\" - After creation, the whiteboard can be shared with collaborators using share settings"
+        },
+        {
+          "name": "SLACK_CREATE_CANVAS",
+          "summary": "Creates a new Slack Canvas with the specified title and optional content."
+        },
+        {
+          "name": "SALESFORCE_CREATE_NOTE",
+          "summary": "Creates a new note attached to a Salesforce record with the specified title and content. Does not deduplicate \u2014 identical calls create duplicate notes. High-volume creation can trigger REQUEST_LIMIT_EXCEEDED; apply exponential backoff on retries."
+        },
+        {
+          "name": "SLACK_CREATE_SLACK_LIST",
+          "summary": "Creates a new Slack List via `slackLists.create`. Provide a `name` and, optionally, a `description_blocks` description and a `schema` of typed columns. You can instead copy an existing List's structure with `copy_from_list_id` (and its rows via `include_copied_list_records`), or enable task-tracking columns with `todo_mode`. Returns the new List's `list_id`. Requires a user token with the `lists:write` scope."
+        },
+        {
+          "name": "GMAIL_CREATE_PROMPT_POST",
+          "summary": "Send a one-shot prompt to the Sanity Content Agent. Stateless one-shot prompt endpoint. No thread management or message persistence. Ideal for simple, single-turn interactions. Use when you need to send a single prompt and receive a response without maintaining conversation context."
+        },
+        {
+          "name": "GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN",
+          "summary": "Creates a new Google Docs document, optionally initializing it with a title and content provided as Markdown text."
+        },
+        {
+          "name": "AIRTABLE_CREATE_BASE",
+          "summary": "Creates a new Airtable base with specified tables and fields within a workspace."
+        },
+        {
+          "name": "ZOOM_UPDATE_A_MEETING",
+          "summary": "To update a meeting via api, ensure `start time` is future-dated; `recurrence` is needed. limit: 100 requests/day, 100 updates/meeting in 24 hrs. requires `meeting:write` and `meeting:write:admin` scopes, with a `light` rate limit."
+        },
+        {
+          "name": "GREENHOUSE_CREATE_USER_JOB_PERMISSION",
+          "summary": "Grant a Greenhouse user a Job Admin role on a single job via the Harvest v3 API. Use when you need to give a recruiter, hiring manager, coordinator, or interviewer scoped access to manage one specific job at a defined permission level. Requires user_id, job_id, and role_id; retrieve valid role ids from the Greenhouse user roles endpoint."
+        },
+        {
+          "name": "AIRTABLE_CREATE_RECORD_FROM_NATURAL_LANGUAGE",
+          "summary": "Creates a new record in an Airtable table from a natural language description. Fetches the table schema, uses an LLM to generate the correct field payload, and creates the record with typecast enabled for automatic type conversion."
+        },
+        {
+          "name": "DATAFORSEO_CREATE_ON_PAGE_TASK_POST",
+          "summary": "Tool to create an On Page crawl task for analyzing websites. Use when you need to audit a website for SEO, check on-page parameters, find optimization opportunities, or analyze site structure. The crawl checks 60+ parameters including meta tags, duplicate content, images, response codes, and more."
+        },
+        {
+          "name": "ASANA_INSTANTIATE_PROJECT_TEMPLATE",
+          "summary": "Instantiate (create) a real Asana project from a project template, returning the async job record. Use when you need to create a new project from a template with specific date and role assignments."
+        },
+        {
+          "name": "AIRTABLE_CREATE_TABLE",
+          "summary": "Creates a new table within a specified existing Airtable base, allowing definition of its name, description, and field structure."
+        },
+        {
+          "name": "AIRTABLE_CREATE_RECORDS",
+          "summary": "Tool to create multiple records (up to 10) in a specified Airtable table. Use when you need to add new rows to a table with field values. Rate limit: 5 requests per second per base."
+        }
+      ]
+    },
+    {
+      "query": "[role:clause-0:write] create new Workspace Space with slug and static view",
+      "sourceUserSeq": 134567,
+      "originalVisible": [
+        "ASANA_CREATE_A_TAG_IN_A_WORKSPACE",
+        "AIRTABLE_CREATE_BASE",
+        "ZOOM_CREATE_WHITEBOARD",
+        "SLACK_CREATE_SLACK_LIST",
+        "space_edit_view",
+        "space_get_view",
+        "ASANA_CREATE_PROJECT_FOR_WORKSPACE",
+        "automation_read_pilot_workspace_create_request"
+      ],
+      "providerCandidates": [
+        {
+          "name": "ASANA_CREATE_A_TAG_IN_A_WORKSPACE",
+          "summary": "Creates a new tag, with properties like name and color defined in the request body, within a specific Asana workspace (using `workspace_gid`); this tag helps categorize tasks, is confined to the workspace, and is not automatically applied to tasks."
+        },
+        {
+          "name": "AIRTABLE_CREATE_BASE",
+          "summary": "Creates a new Airtable base with specified tables and fields within a workspace."
+        },
+        {
+          "name": "ZOOM_CREATE_WHITEBOARD",
+          "summary": "Creates a new whiteboard for the authenticated user. Use when you need to create a blank whiteboard that can be shared and collaborated on with others. The whiteboard will be associated with the user making the API call. **Required scope:** whiteboard:write or whiteboard:write:whiteboard **Notes:** - If no name is provided, the whiteboard will be named \"Untitled\" - After creation, the whiteboard can be shared with collaborators using share settings"
+        },
+        {
+          "name": "SLACK_CREATE_SLACK_LIST",
+          "summary": "Creates a new Slack List via `slackLists.create`. Provide a `name` and, optionally, a `description_blocks` description and a `schema` of typed columns. You can instead copy an existing List's structure with `copy_from_list_id` (and its rows via `include_copied_list_records`), or enable task-tracking columns with `todo_mode`. Returns the new List's `list_id`. Requires a user token with the `lists:write` scope."
+        },
+        {
+          "name": "ASANA_CREATE_PROJECT_FOR_WORKSPACE",
+          "summary": "Tool to create a project in a workspace. Use when you need to create a new project within a specific Asana workspace. Note: The team field is required when creating projects in workspaces."
+        },
+        {
+          "name": "MONDAY_CREATE_DASHBOARD",
+          "summary": "Tool to create a Monday.com dashboard with associated boards. Use when you need to establish a new dashboard in a workspace with specific board visibility settings."
+        },
+        {
+          "name": "SLACK_CREATE_ENTERPRISE_TEAM",
+          "summary": "Tool to create an Enterprise team in Slack. Use when you need to create a new team (workspace) within an Enterprise Grid organization. Requires admin.teams:write scope."
+        },
+        {
+          "name": "ASANA_CREATE_A_TASK",
+          "summary": "Creates a new asana task; requires 'workspace', 'parent', or 'projects' for association, and 'followers', 'projects', 'tags' are set only at creation."
+        },
+        {
+          "name": "SLACK_CREATE_SLACK_LIST_ITEM",
+          "summary": "Creates a new item (row) in a Slack List via `slackLists.items.create`. Set initial cell values with `initial_fields`; text columns require Block Kit `rich_text` (a plain string is wrapped automatically). Optionally duplicate an existing row with `duplicated_item_id` or create a subtask with `parent_item_id`. Requires a user token with the `lists:write` scope."
+        },
+        {
+          "name": "ASANA_CREATE_A_PROJECT",
+          "summary": "Creates a new asana project, requiring either a `workspace` or `team` gid for association, and returns the full project details."
+        },
+        {
+          "name": "AIRTABLE_CREATE_RECORD_FROM_NATURAL_LANGUAGE",
+          "summary": "Creates a new record in an Airtable table from a natural language description. Fetches the table schema, uses an LLM to generate the correct field payload, and creates the record with typecast enabled for automatic type conversion."
+        },
+        {
+          "name": "MONDAY_CREATE_WORKSPACE",
+          "summary": "Tool to create a Monday.com workspace. Use when you need to programmatically add a workspace after planning your project structure."
+        },
+        {
+          "name": "ASANA_INSTANTIATE_PROJECT_TEMPLATE",
+          "summary": "Instantiate (create) a real Asana project from a project template, returning the async job record. Use when you need to create a new project from a template with specific date and role assignments."
+        }
+      ]
+    },
+    {
+      "query": "create Space workspace slug title static view content no data sources",
+      "sourceUserSeq": 134567,
+      "originalVisible": [
+        "space_get",
+        "space_edit_view",
+        "space_get_view",
+        "space_set_data",
+        "space_refresh",
+        "MONDAY_CREATE_WORKSPACE",
+        "ASANA_CREATE_PROJECT_FOR_WORKSPACE",
+        "space_diff",
+        "space_publish",
+        "space_save"
+      ],
+      "providerCandidates": [
+        {
+          "name": "MONDAY_CREATE_WORKSPACE",
+          "summary": "Tool to create a Monday.com workspace. Use when you need to programmatically add a workspace after planning your project structure."
+        },
+        {
+          "name": "ASANA_CREATE_PROJECT_FOR_WORKSPACE",
+          "summary": "Tool to create a project in a workspace. Use when you need to create a new project within a specific Asana workspace. Note: The team field is required when creating projects in workspaces."
+        },
+        {
+          "name": "ASANA_CREATE_A_TAG_IN_A_WORKSPACE",
+          "summary": "Creates a new tag, with properties like name and color defined in the request body, within a specific asana workspace (using `workspace gid`); this tag helps categorize tasks, is confined to the workspace, and is not automatically applied to tasks."
+        },
+        {
+          "name": "SALESFORCE_CREATE_NOTE",
+          "summary": "Creates a new note attached to a salesforce record with the specified title and content."
+        },
+        {
+          "name": "SLACK_CREATE_CANVAS",
+          "summary": "Creates a new Slack Canvas with the specified title and optional content."
+        },
+        {
+          "name": "GOOGLEDOCS_CREATE_DOCUMENT",
+          "summary": "Creates a new google docs document using the provided title as filename and inserts the initial text at the beginning if non-empty, returning the document's id and metadata (excluding body content)."
+        },
+        {
+          "name": "GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN",
+          "summary": "Creates a new google docs document, optionally initializing it with a title and content provided as markdown text."
+        },
+        {
+          "name": "SALESFORCE_CREATE_NOTE_RECORD_WITH_CONTENT_TYPE_HEADER",
+          "summary": "Deprecated: creates a new note record in salesforce, associated with an existing salesforce object via `parentid`, automatically including a `content-type: application/json` header."
+        },
+        {
+          "name": "MONDAY_ARCHIVE_WORKSPACE",
+          "summary": "Tool to archive a Monday.com workspace. Use when you want to soft-remove a workspace from view."
+        }
+      ]
+    }
+  ]
+}

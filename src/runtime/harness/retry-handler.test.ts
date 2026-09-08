@@ -122,7 +122,10 @@ import { shouldRetryToolCall, formatRetryMessage } from './retry-handler.js';
   if (long.shouldRetry) throw new Error('a long timeout must not be repeated identically');
   if (long.remoteMayStillBeRunning !== true) throw new Error('the decision must say the remote work may still be running');
   if (!/may still be running/i.test(long.reason)) throw new Error('the reason must name the unresolved remote work');
-  if (!/status|poll/i.test(long.reason)) throw new Error('the reason must name the honest next step');
+  if (!/existing run.*exact returned handle/i.test(long.reason)) throw new Error('the reason must preserve the exact existing run');
+  if (!/reconcile the original attempt.*report the unresolved state/i.test(long.reason)) throw new Error('a missing handle must not imply an available poll');
+  if (!/do not repeat.*or start a replacement/i.test(long.reason)) throw new Error('an unknown start must not create a replacement');
+  if (/async.start|automatically|background/i.test(long.reason)) throw new Error('the reason must not promise unowned background work');
 
   // A FAST timeout is still an ordinary transient blip and keeps its retry.
   if (!shouldRetryToolCall(timeout, 1, [], 900).shouldRetry) {

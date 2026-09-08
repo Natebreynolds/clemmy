@@ -30,7 +30,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { listEvents, openEventLog } from './eventlog.js';
+import { afterEventPublicationCommit, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
 import {
@@ -1497,10 +1497,11 @@ function finalizeResolvedRow(publicRow: PendingApprovalRow): void {
   emitResolved(publicRow);
 }
 
-export function resolve(
+function resolveStored(
   approvalId: string,
   resolution: ApprovalResolution,
   resolver: string,
+  onTransition: (row: PendingApprovalRow) => void,
 ): ResolveResult {
   const db = openEventLog();
   const existing = db
@@ -1547,10 +1548,36 @@ export function resolve(
     .prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
     .get(approvalId) as ApprovalSqlRow;
   const publicRow = rowToPublic(row);
-  finalizeResolvedRow(publicRow);
+  onTransition(publicRow);
   return lateDecision
     ? { ok: false, reason: 'expired', row: publicRow }
     : { ok: true, row: publicRow };
+}
+
+export function resolve(
+  approvalId: string,
+  resolution: ApprovalResolution,
+  resolver: string,
+): ResolveResult {
+  return resolveStored(approvalId, resolution, resolver, finalizeResolvedRow);
+}
+
+/** Commit an approval control and its acknowledgement before waking an executor.
+ * A control response needs durable idempotency, not a competing execution lease.
+ * The callback is synchronous; a failed commit must never release a waiting call.
+ */
+export function withApprovalControlCommit<T>(
+  commit: (resolveDecision: typeof resolve) => T,
+): T {
+  return withEventPublicationTransaction(() => {
+    const value = commit((id, decision, actor) => resolveStored(
+      id, decision, actor, (row) => afterEventPublicationCommit(() => finalizeResolvedRow(row)),
+    ));
+    if (value && typeof (value as { then?: unknown }).then === 'function') {
+      throw new Error('Approval control commit must be synchronous');
+    }
+    return value;
+  });
 }
 
 /**

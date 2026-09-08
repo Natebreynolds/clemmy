@@ -1,3 +1,11 @@
+import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
+import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
+import { updateEnvKey } from '../tools/shared.js';
+import { claimPlanExecutionIngress, inspectPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
+import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 /**
  * Mobile PWA auth router — mounted at `/m` on the webhook server.
  *
@@ -105,6 +113,7 @@ import {
   createBridgePredicate,
   isCanonicalBridgedActivity,
 } from '../runtime/harness/bridged-activity.js';
+import { readPublicHarnessEventPage } from '../runtime/harness/public-event-page.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
@@ -134,6 +143,8 @@ import {
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
+import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
+import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
   approveTrustProposal,
   declineTrustProposal,
@@ -144,6 +155,7 @@ import {
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
   processBackgroundTasks,
+  getBackgroundTaskByApprovalId,
   queueBackgroundTaskApprovalResolution,
 } from '../execution/background-tasks.js';
 import {
@@ -222,9 +234,10 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
     .digest('hex');
 }
 
-function mobileChatPayloadHash(message: string, requestedSessionId: string | null): string {
+function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode): string {
+  if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
   return createHash('sha256')
-    .update(JSON.stringify({ message, requestedSessionId }))
+    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode) }))
     .digest('hex');
 }
 
@@ -1710,6 +1723,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * still gate everything behind it. Served anonymously so the native shell
    * can learn/refresh it on any LAN visit without a web session.
    */
+
   router.get('/relay-info', async (_req, res) => {
     const { getMobileRelayRuntime } = await import('../runtime/mobile-relay.js');
     res.json({ origin: getMobileRelayRuntime()?.origin ?? null });
@@ -2253,6 +2267,54 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   /** Smoke endpoint — confirms the cookie middleware works end-to-end.
    *  Also carries the profile name so the phone can greet the way the desktop
    *  console does: resolved at runtime, never hardcoded, empty when unknown. */
+  /**
+   * Completion review on/off — the authenticated MOBILE half of the shared
+   * control. Desktop already has GET/PATCH under /api/console/settings; without
+   * this the UI owner could ship one surface only.
+   *
+   * MOUNTED INSIDE the /m router as `/api/settings/completion-review`, i.e.
+   * `/m/api/settings/completion-review`, matching every other authenticated
+   * mobile endpoint here. An earlier revision registered `/settings/...`, which
+   * resolved to `/m/settings/...`; the `/api/mobile/...` path advertised in
+   * HANDOVER-15 was never mounted at all and 404s at both direct and relay
+   * ingress. Ingress is not widened and no admin credential is shared: the
+   * paired mobile session alone authorizes both verbs.
+   *
+   * `requireMobileSession` keeps it behind the same authenticated session as the
+   * rest of this router. The toggle grants no execution authority and removes
+   * none: native tool/source/account/schema/effect permissions, approval and
+   * Execute boundaries and deterministic write receipts are identical in both
+   * states.
+   */
+  router.get('/api/settings/completion-review', requireMobileSession, (_req, res) => {
+    const judge = resolveRoleModel('judge');
+    res.json({
+      completionReview: {
+        enabled: completionReviewEnabled(),
+        judge: judge.modelId,
+        judgeSource: judge.source,
+      },
+    });
+  });
+
+  router.patch('/api/settings/completion-review', requireMobileSession, (req, res) => {
+    const body = (req.body ?? {}) as { enabled?: unknown };
+    if (typeof body.enabled !== 'boolean') {
+      res.status(400).json({ error: 'enabled must be a boolean' });
+      return;
+    }
+    updateEnvKey('CLEMMY_COMPLETION_REVIEW', body.enabled ? 'on' : 'off');
+    resetHarnessRuntimeConfig();
+    const judge = resolveRoleModel('judge');
+    res.json({
+      completionReview: {
+        enabled: completionReviewEnabled(),
+        judge: judge.modelId,
+        judgeSource: judge.source,
+      },
+    });
+  });
+
   router.get('/api/whoami', requireMobileSession, async (req, res) => {
     const ctx = req.mobileSession!;
     let name = '';
@@ -2577,6 +2639,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // tool interrupts. Mobile needs first-class actions here; otherwise
   // the plan text renders but the user has no button to continue.
 
+  router.get('/api/plan-artifacts/:planId', requireMobileSession, (req, res) => {
+    const result = planArtifactResponse({ planId: req.params.planId, sessionId: req.query.sessionId,
+      revision: req.query.revision, digest: req.query.digest,
+      principal: { kind: 'authenticated_owner', actor: { surface: 'mobile', id: req.mobileSession!.record.deviceId } } });
+    res.status(result.status).json(result.body);
+  });
+
   router.get('/api/plan-proposals', requireMobileSession, (_req, res) => {
     try {
       const proposals = listPlanProposals({ status: 'pending', limit: 20 })
@@ -2703,9 +2772,70 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     res: express.Response,
     id: string,
     decision: 'approve' | 'reject',
-    options: { acceptedRunId?: string } = {},
+    options: { request?: { requestId: string; runId: string; inputHash: string } } = {},
   ): Promise<void> {
+    const acceptedRunId = options.request?.runId;
+    const request = options.request ?? {
+      requestId: mobileApprovalRunId(id, decision),
+      runId: mobileApprovalRunId(id, decision),
+      inputHash: createHash('sha256').update(JSON.stringify({ approvalId: id, decision })).digest('hex'),
+    };
     const existing = approvalRegistry.get(id);
+    const priorReceipt = getHarnessChatRequestReceipt(request.requestId);
+    const controlSessionId = priorReceipt?.sessionId ?? existing?.sessionId;
+    if (controlSessionId) {
+      try {
+        if (priorReceipt) claimHarnessChatRequest({ ...request, sessionId: priorReceipt.sessionId, sinceSeq: priorReceipt.sinceSeq });
+        const control = commitLiveApprovalControl({
+          ...request, sessionId: controlSessionId,
+          text: `${decision === 'approve' ? 'Approve' : 'Reject'} ${id}.`,
+          prepare: () => {
+            const row = approvalRegistry.get(id);
+            if (!row || row.sessionId !== controlSessionId || !approvalRegistry.isFormalApprovalSurface(row)
+              || !approvalRegistry.isActionable(row)) return null;
+            // Parked/background work still owns its existing resume path. This
+            // branch releases only a call waiting inside its live executor.
+            const session = HarnessSession.load(controlSessionId);
+            if (!session || session.loadInterruptState()
+              || exactPendingActionApprovalPreflight(row, decision).kind !== 'none'
+              || getBackgroundTaskByApprovalId(id)?.status === 'awaiting_approval'
+              || harnessListEvents(controlSessionId, { types: ['approval_parked'] })
+                .some((event) => event.data.approvalId === id)) return null;
+            return {
+              sourceData: { source: 'mobile_approval', approvalId: id, decision },
+              commit: (source, resolveDecision) => {
+                const resolved = resolveDecision(id, decision === 'approve' ? 'approved' : 'rejected', 'mobile-inbox');
+                if (!resolved.ok) throw new Error(`Approval control could not resolve its exact card: ${resolved.reason}`);
+                commitMobileApprovalTerminal({
+                  source, text: `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}.`,
+                  status: 'done', reason: 'mobile_approval_resolved',
+                  metadata: { approvalId: id, decision, status: 'resolved-live', liveApprovalControl: source.data.liveApprovalControl },
+                });
+              },
+            };
+          },
+        });
+        if (control) {
+          if (control.replayed) res.setHeader('Idempotent-Replay', '1');
+          if (acceptedRunId) {
+            res.json({ sessionId: control.receipt.sessionId, runId: control.receipt.runId, reply: control.presentation.text });
+          } else {
+            const row = approvalRegistry.get(id);
+            res.json({ ok: true, approvalId: id, sessionId: control.receipt.sessionId,
+              ...(row ? { approval: serializeApprovalForMobile(row) } : {}),
+              status: control.replayed ? 'replayed' : 'resolved-live', message: control.presentation.text });
+          }
+          return;
+        }
+      } catch (error) {
+        const conflict = error instanceof Error && error.message.startsWith('client request id ');
+        console.error('mobile approval control could not commit:', error);
+        res.status(conflict ? 409 : 500).json({
+          error: conflict ? 'IDEMPOTENCY_KEY_CONFLICT' : 'APPROVAL_ACCEPT_FAILED', message: PUBLIC_RUN_FAILURE_TEXT,
+        });
+        return;
+      }
+    }
     if (!existing) {
       res.status(404).json({ error: 'approval not found' });
       return;
@@ -2716,7 +2846,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       });
       return;
     }
-    const runId = options.acceptedRunId ?? mobileApprovalRunId(id, decision);
+    const runId = acceptedRunId ?? mobileApprovalRunId(id, decision);
     const typedChatPayload = (message: string): ChatSendResponse => ({
       sessionId: existing.sessionId,
       runId,
@@ -2737,7 +2867,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           if (replayTerminal.presentation.status === 'failed') {
             res.status(500).json({ error: 'APPROVAL_RESUME_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
           } else {
-            if (options.acceptedRunId) {
+            if (acceptedRunId) {
               res.json(typedChatPayload(replayTerminal.presentation.text));
               return;
             }
@@ -2777,6 +2907,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       && sessionRowForKind.kind !== 'workflow'
       && !!harnessSession.loadInterruptState();
 
+    if (options.request) {
+      try {
+        const claim = claimHarnessChatRequest({ ...options.request, sessionId: existing.sessionId,
+          sinceSeq: harnessLatestEventSeq(existing.sessionId) });
+        if (!claim.inserted) res.setHeader('Idempotent-Replay', '1');
+      } catch (error) {
+        console.warn('mobile typed approval idempotency conflict:', error);
+        res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
+        return;
+      }
+    }
+
     const executionClaim = claimRunAttemptLease({
       sessionId: existing.sessionId,
       runId,
@@ -2796,7 +2938,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           const terminalMessage = terminal.presentation.status === 'failed'
             ? PUBLIC_RUN_FAILURE_TEXT
             : terminal.presentation.text;
-          if (options.acceptedRunId && terminal.presentation.status !== 'failed') {
+          if (acceptedRunId && terminal.presentation.status !== 'failed') {
             res.json(typedChatPayload(terminalMessage));
             return;
           }
@@ -2817,7 +2959,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         approvalId: id,
         sessionId: existing.sessionId,
         status: 'already-processing',
-        ...(options.acceptedRunId ? typedChatPayload(`Approval ${id} is already processing.`) : {}),
+        ...(acceptedRunId ? typedChatPayload(`Approval ${id} is already processing.`) : {}),
       });
       return;
     }
@@ -2897,7 +3039,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         metadata: { approvalId: id, decision, queuedTaskId: queued.id },
       });
       settleMobileApprovalAttempt(approvalAttempt);
-      if (options.acceptedRunId) {
+      if (acceptedRunId) {
         res.json(typedChatPayload(text));
         return;
       }
@@ -2944,7 +3086,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         metadata: { approvalId: id, decision, status },
       });
       settleMobileApprovalAttempt(approvalAttempt);
-      if (options.acceptedRunId) {
+      if (acceptedRunId) {
         res.json(typedChatPayload(message));
         return;
       }
@@ -2982,7 +3124,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     const resumingMessage = `${decision === 'approve' ? 'Approved' : 'Rejected'} ${id}; resuming the exact request.`;
-    if (options.acceptedRunId) {
+    if (acceptedRunId) {
       res.status(202).json(typedChatPayload(resumingMessage));
     } else res.status(202).json({
       ok: true,
@@ -3301,12 +3443,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     const session = harnessGetSession(sessionId);
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
-    const events = projectHarnessEventsForPublic(harnessListEvents(session.id, { limit: 500 }));
-    res.json({
-      session: serializeSessionForMobile(session),
-      events: events.map(serializeEventForMobile),
-      latestSeq: harnessLatestEventSeq(session.id),
-    });
+    try {
+      const ownPage = readPublicHarnessEventPage(session.id, {
+        sinceSeq: req.query.sinceSeq, throughSeq: req.query.throughSeq, limit: req.query.limit ?? 500,
+      });
+      res.json({ session: serializeSessionForMobile(session), events: ownPage.events.map(serializeEventForMobile),
+        latestSeq: ownPage.latestSeq, page: ownPage.page });
+    } catch (error) {
+      res.status(error instanceof RangeError ? 400 : 500).json({ error: error instanceof RangeError ? 'INVALID_EVENT_CURSOR' : 'CATCH_UP_FAILED' });
+    }
   });
 
   /**
@@ -3326,13 +3471,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // the `Last-Event-ID` header carrying the last `id:` we emitted
     // (which is the harness event seq). Explicit ?sinceSeq= wins so
     // clients can also override.
-    const queryRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : NaN;
-    const headerRaw = typeof req.headers['last-event-id'] === 'string'
-      ? Number(req.headers['last-event-id'])
-      : NaN;
-    const sinceSeq = Number.isFinite(queryRaw) && queryRaw > 0
-      ? queryRaw
-      : (Number.isFinite(headerRaw) && headerRaw > 0 ? headerRaw : 0);
+    const sinceSeq = req.query.sinceSeq ?? req.headers['last-event-id'] ?? 0;
+    let ownPage: ReturnType<typeof readPublicHarnessEventPage>;
+    try {
+      ownPage = readPublicHarnessEventPage(session.id, { sinceSeq, throughSeq: req.query.throughSeq, limit: req.query.limit ?? 500 });
+    } catch (error) {
+      res.status(error instanceof RangeError ? 400 : 500).json({ error: error instanceof RangeError ? 'INVALID_EVENT_CURSOR' : 'CATCH_UP_FAILED' });
+      return;
+    }
 
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream');
@@ -3366,26 +3512,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // Merge host-dispatched workflow activity into the replay so a
       // reconnect mid-run seeds the live activity strip instead of waiting
       // for the next tool frame — same rule as the desktop console stream.
-      const ownEvents = harnessListEvents(session.id, { sinceSeq, limit: 500 });
-      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents)
-        .filter((ev) => ev.seq > sinceSeq);
-      const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
-      const replay = projectHarnessEventsForPublic(merged.slice(-500));
-      const shaped = replay.map(serializeEventForMobile);
-      // The resume cursor must come from the session's OWN ledger — bridged
-      // frames carry foreign seq numbers that would corrupt it.
-      const ownShaped = shaped.filter((ev) => ev.sessionId === session.id);
-      const lastSeq = ownShaped.length > 0 ? ownShaped[ownShaped.length - 1].seq : sinceSeq;
-      writeEvent(
-        'replay',
-        {
-          sessionId: session.id,
-          sessionStatus: session.status,
-          events: shaped,
-          latestSeq: lastSeq,
-        },
-        lastSeq > 0 ? lastSeq : undefined,
-      );
+      const bridged = collectBridgedWorkflowReplay(session.id, ownPage.events);
+      // Child activity is incidental context. It never consumes the origin's
+      // raw page or supplies a traversal cursor, and this is not child history.
+      const shaped = [...ownPage.events, ...projectHarnessEventsForPublic(bridged)]
+        .sort((a, b) => a.seq - b.seq).map(serializeEventForMobile);
+      writeEvent('replay', {
+        sessionId: session.id, sessionStatus: session.status,
+        events: shaped, latestSeq: ownPage.latestSeq, page: ownPage.page,
+      }, ownPage.page.scannedThroughSeq > 0 ? ownPage.page.scannedThroughSeq : undefined);
     } catch (err) {
       console.error('mobile chat replay failed:', err);
       writeEvent('replay', { sessionId: session.id, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
@@ -3405,7 +3540,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const shaped = serializeEventForMobile(event.event as HarnessEventRow);
       // Only the session's own frames advance the browser's Last-Event-ID —
       // a bridged frame's foreign seq must never become the resume cursor.
-      writeEvent('event', shaped, shaped.sessionId === session.id ? shaped.seq : undefined);
+      writeEvent('event', shaped, shaped.sessionId === session.id && !ownPage.page.hasMore ? shaped.seq : undefined);
     });
 
     // Phone-in-hand is the same "in the room" signal the desktop dock provides:
@@ -3440,23 +3575,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     const session = harnessGetSession(sessionId);
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
-    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
-    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
-    const limit = clampInt(req.query.limit, 200, 1, 500);
     try {
-      const ownEvents = harnessListEvents(session.id, { sinceSeq, limit });
-      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents)
-        .filter((ev) => ev.seq > sinceSeq);
-      const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
-      const shaped = projectHarnessEventsForPublic(merged.slice(-limit)).map(serializeEventForMobile);
-      const ownShaped = shaped.filter((ev) => ev.sessionId === session.id);
-      res.json({
-        sessionId: session.id,
-        sessionStatus: session.status,
-        events: shaped,
-        latestSeq: ownShaped.length > 0 ? ownShaped[ownShaped.length - 1].seq : sinceSeq,
+      const ownPage = readPublicHarnessEventPage(session.id, {
+        sinceSeq: req.query.sinceSeq, throughSeq: req.query.throughSeq, limit: req.query.limit ?? 200,
       });
+      const bridged = collectBridgedWorkflowReplay(session.id, ownPage.events);
+      const shaped = [...ownPage.events, ...projectHarnessEventsForPublic(bridged)]
+        .sort((a, b) => a.seq - b.seq).map(serializeEventForMobile);
+      res.json({ sessionId: session.id, sessionStatus: session.status,
+        events: shaped, latestSeq: ownPage.latestSeq, page: ownPage.page });
     } catch (err) {
+      if (err instanceof RangeError) { res.status(400).json({ error: 'INVALID_EVENT_CURSOR' }); return; }
       console.error('mobile chat catch-up failed:', err);
       res.status(500).json({ error: 'CATCH_UP_FAILED' });
     }
@@ -3485,6 +3614,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(503).json({ error: 'CHAT_SEND_UNAVAILABLE' });
       return;
     }
+    let taskMode: TaskMode | undefined;
+    try { taskMode = parseTaskMode(req.body?.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
+    if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
     const ctx = req.mobileSession!;
     const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
     if (!message) {
@@ -3514,7 +3646,48 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       ? req.body.sessionId.trim()
       : null;
     const proposedSessionId = requestedSessionId ?? `sess-mob-${digest.slice(0, 32)}`;
-    const inputHash = mobileChatPayloadHash(message, requestedSessionId);
+    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode);
+    if (taskMode?.kind === 'execute' && !requestedSessionId) {
+      res.status(400).json({ error: 'PLAN_CONVERSATION_REQUIRED' });
+      return;
+    }
+    let reviewedPlanOwnerControl: ReviewedPlanOwnerControlV1 | undefined;
+    let executeIngress: Parameters<typeof inspectPlanExecutionIngress>[0] | null = null;
+    if (taskMode?.kind === 'execute') {
+      try {
+        const control = resolveReviewedPlanOwnerControl({ sessionId: requestedSessionId!, ref: taskMode.executeRef,
+          actor: { surface: 'mobile', id: ctx.record.deviceId } });
+        reviewedPlanOwnerControl = control.ownerControl;
+        executeIngress = { sessionId: control.sessionId, principalId: control.principalId,
+          ref: taskMode.executeRef, requestId, inputHash };
+      } catch (error) {
+        res.status(409).json({ error: 'PLAN_EXECUTE_CONFLICT', message: error instanceof Error ? error.message : 'Selected plan cannot execute.' });
+        return;
+      }
+    }
+    const rejoinPlanExecution = (receipt: ReturnType<typeof claimHarnessChatRequest>['receipt']): boolean => {
+      const attempt = getLatestRunAttemptByRunId(receipt.sessionId, receipt.runId);
+      if (!attempt?.sourceUserSeq) return false;
+      res.setHeader('Idempotent-Replay', '1');
+      res.status(202).json({
+        accepted: true, sessionId: receipt.sessionId, runId: receipt.runId,
+        sinceSeq: receipt.sinceSeq, sourceUserSeq: attempt.sourceUserSeq, replayed: true,
+      });
+      return true;
+    };
+    if (executeIngress) {
+      try {
+        const priorExecution = inspectPlanExecutionIngress(executeIngress);
+        if (priorExecution) {
+          const alias = claimPlanExecutionIngress(executeIngress, () => { throw new Error('Execute reservation disappeared'); });
+          if (rejoinPlanExecution(alias.receipt)) return;
+        }
+        assertReviewedPlanExecuteSessionIdle(requestedSessionId!, priorExecution?.runId);
+      } catch (error) {
+        res.status(409).json({ error: 'PLAN_EXECUTE_CONFLICT', message: error instanceof Error ? error.message : 'Selected plan cannot execute.' });
+        return;
+      }
+    }
 
     // Workspace-scoped chat is a SESSION-ID CONVENTION (space-<slug>), not a
     // payload field — same rule as the desktop dock. Recognizing it here is
@@ -3528,30 +3701,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
       const priorReceipt = getHarnessChatRequestReceipt(requestId);
-      const typedControl = classifyMobileTypedChatControl(message);
+      const typedControl = !taskMode || taskMode.kind === 'normal' ? classifyMobileTypedChatControl(message) : null;
       if (typedControl?.kind === 'formal_approval') {
-        const approval = approvalRegistry.get(typedControl.approvalId);
-        if (!approval || !approvalRegistry.isFormalApprovalSurface(approval)) {
-          await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision);
-          return;
-        }
-        let approvalClaim: ReturnType<typeof claimHarnessChatRequest>;
-        try {
-          approvalClaim = claimHarnessChatRequest({
-            requestId,
-            sessionId: approval.sessionId,
-            runId,
-            inputHash,
-            sinceSeq: harnessLatestEventSeq(approval.sessionId),
-          });
-        } catch (err) {
-          console.warn('mobile typed approval idempotency conflict:', err);
-          res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
-          return;
-        }
-        if (!approvalClaim.inserted) res.setHeader('Idempotent-Replay', '1');
         await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision, {
-          acceptedRunId: approvalClaim.receipt.runId,
+          request: { requestId, runId, inputHash },
         });
         return;
       }
@@ -3600,6 +3753,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
           );
           if (leaseLive) {
+            if (taskMode && taskMode.kind !== 'normal') {
+              res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
+              return;
+            }
             const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
             const note = appendSteerNote(proposedSessionId, message);
             res.json({
@@ -3646,51 +3803,63 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       let requestClaim: ReturnType<typeof claimSessionForAcceptedSource> | ReturnType<typeof claimHarnessChatRequest>;
       let selectedSessionId: string | null = null;
       try {
-        // requestId is a SHA-256 binding of the authenticated device id and
-        // provider key. A pre-v60 receipt therefore already proves this mobile
-        // audience even when its old session metadata lacks channelId. Reclaim
-        // it before preview/classification; new receipts use the atomic selector.
-        if (typedControl?.kind === 'session_control') {
-          const selectedClaim = claimSessionForAcceptedSource({
-            kind: 'bound_control',
-            targetSessionId: proposedSessionId,
-            entrySessionId: proposedSessionId,
-            durableSourceId: runId,
-            continuity: {
-              provider: 'mobile',
-              scopeId: null,
-              conversationId,
-              audienceId: ctx.record.deviceId,
-            },
-            receipt: { requestId, runId, inputHash },
-          });
-          requestClaim = selectedClaim;
-          selectedSessionId = selectedClaim.selection.sessionId;
-        } else if (priorReceipt) {
-          requestClaim = claimHarnessChatRequest({
-            requestId,
-            sessionId: priorReceipt.sessionId,
-            runId: priorReceipt.runId,
-            inputHash,
-            sinceSeq: priorReceipt.sinceSeq,
-          });
-        } else {
-          const selectedClaim = claimSessionForAcceptedSource({
-            kind: 'ordinary',
-            entrySessionId: proposedSessionId,
-            durableSourceId: runId,
-            continuity: {
-              provider: 'mobile',
-              scopeId: null,
-              conversationId,
-              audienceId: ctx.record.deviceId,
-            },
-            ...(validatedMount ? { validatedMount } : {}),
-            receipt: { requestId, runId, inputHash },
-          });
-          requestClaim = selectedClaim;
-          selectedSessionId = selectedClaim.selection.sessionId;
-        }
+        const claimOrdinaryRequest = () => {
+          // requestId is a SHA-256 binding of the authenticated device id and
+          // provider key. A pre-v60 receipt therefore already proves this mobile
+          // audience even when its old session metadata lacks channelId. Reclaim
+          // it before preview/classification; new receipts use the atomic selector.
+          if (executeIngress && !priorReceipt) {
+            assertReviewedPlanExecuteSessionIdle(executeIngress.sessionId);
+            requestClaim = claimHarnessChatRequest({ requestId, sessionId: executeIngress.sessionId,
+              runId, inputHash, sinceSeq: harnessLatestEventSeq(executeIngress.sessionId) });
+            selectedSessionId = executeIngress.sessionId;
+          } else if (typedControl?.kind === 'session_control') {
+            const selectedClaim = claimSessionForAcceptedSource({
+              kind: 'bound_control',
+              targetSessionId: proposedSessionId,
+              entrySessionId: proposedSessionId,
+              durableSourceId: runId,
+              continuity: {
+                provider: 'mobile',
+                scopeId: null,
+                conversationId,
+                audienceId: ctx.record.deviceId,
+              },
+              receipt: { requestId, runId, inputHash },
+            });
+            requestClaim = selectedClaim;
+            selectedSessionId = selectedClaim.selection.sessionId;
+          } else if (priorReceipt) {
+            requestClaim = claimHarnessChatRequest({
+              requestId,
+              sessionId: priorReceipt.sessionId,
+              runId: priorReceipt.runId,
+              inputHash,
+              sinceSeq: priorReceipt.sinceSeq,
+            });
+          } else {
+            const selectedClaim = claimSessionForAcceptedSource({
+              kind: 'ordinary',
+              entrySessionId: proposedSessionId,
+              durableSourceId: runId,
+              continuity: {
+                provider: 'mobile',
+                scopeId: null,
+                conversationId,
+                audienceId: ctx.record.deviceId,
+              },
+              ...(validatedMount ? { validatedMount } : {}),
+              receipt: { requestId, runId, inputHash },
+            });
+            requestClaim = selectedClaim;
+            selectedSessionId = selectedClaim.selection.sessionId;
+          }
+          return requestClaim;
+        };
+        requestClaim = executeIngress
+          ? claimPlanExecutionIngress(executeIngress, claimOrdinaryRequest)
+          : claimOrdinaryRequest();
+        if (executeIngress && rejoinPlanExecution(requestClaim.receipt)) return;
       } catch (err) {
         console.warn('mobile idempotency key conflict:', err);
         res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' });
@@ -3723,13 +3892,6 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         return;
       }
 
-      // Session composition seeds identity primers onto the Codex snapshot so
-      // a phone dock and a desktop dock mount the same live workspace.
-      try {
-        const { applySessionMountPrimers, composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
-        applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
-      } catch { /* best-effort primer */ }
-
       let executionMessage = message;
       if (typedControl?.kind === 'session_control' && typedControl.command === 'continue') {
         const lastCompletion = harnessListEvents(sessionId, {
@@ -3746,26 +3908,44 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         }
       }
 
-      let execution = mobileChatInFlight.get(requestId);
+      const executionKey = executeIngress ? requestClaim.receipt.runId : requestId;
+      let execution = mobileChatInFlight.get(executionKey);
       if (!execution) {
-        const started = new ClementineGateway(deps.assistant).handleMessage({
-          message: executionMessage,
-          sessionId,
-          userId: ctx.record.deviceId,
-          channel: 'mobile',
-          source: 'mobile',
-          runId: requestClaim.receipt.runId,
-          // A process may die after the logical turn is durably accepted but
-          // before its public terminal is committed. A client retry must not
-          // turn that uncertainty into a second tool/write dispatch. The
-          // gateway replays an existing terminal when present and otherwise
-          // closes the accepted source with one stable failed terminal.
-          failClosedOnUnsettledReplay: !requestClaim.inserted,
+        const started = prepareAndDispatchMobileChat({
+          requestId: requestClaim.receipt.requestId,
+          prepare: async () => {
+            // Session composition seeds identity primers onto the Codex snapshot so
+            // a phone dock and a desktop dock mount the same live workspace.
+            try {
+              const { applySessionMountPrimers, composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
+              applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
+            } catch { /* best-effort primer */ }
+
+          },
+          dispatch: () => {
+            if (executeIngress) assertReviewedPlanExecuteSessionIdle(sessionId, requestClaim.receipt.runId);
+            return new ClementineGateway(deps.assistant!).handleMessage({
+            ...taskModeFields(taskMode),
+            message: executionMessage,
+            sessionId,
+            userId: reviewedPlanOwnerControl?.conversationPrincipalId ?? ctx.record.deviceId,
+            channel: 'mobile',
+            ...(reviewedPlanOwnerControl ? { reviewedPlanOwnerControl } : {}),
+            source: 'mobile',
+            runId: requestClaim.receipt.runId,
+            // A process may die after the logical turn is durably accepted but
+            // before its public terminal is committed. A client retry must not
+            // turn that uncertainty into a second tool/write dispatch. The
+            // gateway replays an existing terminal when present and otherwise
+            // closes the accepted source with one stable failed terminal.
+            failClosedOnUnsettledReplay: !requestClaim.inserted,
+            });
+          },
         });
         execution = started.finally(() => {
-          if (mobileChatInFlight.get(requestId) === execution) mobileChatInFlight.delete(requestId);
+          if (mobileChatInFlight.get(executionKey) === execution) mobileChatInFlight.delete(executionKey);
         });
-        mobileChatInFlight.set(requestId, execution);
+        mobileChatInFlight.set(executionKey, execution);
       }
       // Async mode: acknowledge the durable claim and let the reply ride the
       // event stream. A phone must never hold a fetch open across a whole

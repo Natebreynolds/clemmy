@@ -1,3 +1,5 @@
+import { parseTaskMode, taskModeDigest, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
+import { withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
@@ -59,7 +61,7 @@ import {
   evaluateTerminalDelivery,
   type TerminalDeliveryJudgePort,
 } from '../runtime/harness/terminal-delivery-judge.js';
-import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from '../runtime/harness/restart-recovery.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
   publicUserInputText,
@@ -82,6 +84,9 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 const logger = pino({ name: 'clementine-next.gateway' });
 
 export interface GatewayRequest {
+  taskMode?: TaskMode;
+  /** Server-only attribution after authenticated owner Plan control. */
+  reviewedPlanOwnerControl?: ReviewedPlanOwnerControlV1;
   message: string;
   sessionId: string;
   userId?: string;
@@ -318,7 +323,8 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
     const source = listHarnessEvents(request.sessionId, { types: ['user_input_received'] })
       .find((event) => event.seq === previous.sourceUserSeq);
     if (!source) throw new Error(`accepted gateway source ${previous.sourceUserSeq} is missing`);
-    if (publicUserInputText(source.data) !== request.message.trim()) {
+    if (publicUserInputText(source.data) !== request.message.trim()
+      || taskModeDigest(parseTaskMode(source.data.taskMode)) !== taskModeDigest(request.taskMode)) {
       throw new Error(`gateway run ${runId} is already bound to different input`);
     }
     if (!previous.finishedAt) {
@@ -336,19 +342,26 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
     return { source, attempt: null, replayedSource: true };
   }
 
-  const attempt = beginRunAttempt(request.sessionId, { runId });
-  const source = recordRunAttemptUserInput(attempt, {
-    turn: 1,
-    role: 'user',
-    data: {
-      text: request.message,
-      displayText: request.message,
-      runId,
-      attemptId: attempt.attemptId,
-      source: `gateway:${request.source ?? 'gateway'}`,
-    },
-  }, { armRunInFlight: true });
-  return { source, attempt, replayedSource: false };
+  const admit = (): AcceptedGatewayTurn => {
+    const attempt = beginRunAttempt(request.sessionId, { runId });
+    const source = recordRunAttemptUserInput(attempt, {
+      turn: 1,
+      role: 'user',
+      data: {
+        text: request.message,
+        displayText: request.message,
+        ...taskModeFields(request.taskMode),
+        runId,
+        ...(request.reviewedPlanOwnerControl ? { reviewedPlanOwnerControl: request.reviewedPlanOwnerControl,
+          userId: request.reviewedPlanOwnerControl.conversationPrincipalId } : {}),
+        attemptId: attempt.attemptId,
+        source: `gateway:${request.source ?? 'gateway'}`,
+      },
+    }, { armRunInFlight: true });
+    return { source, attempt, replayedSource: false };
+  };
+  return request.reviewedPlanOwnerControl
+    ? withReviewedPlanExecuteAdmission(request.sessionId, runId, admit) : admit();
 }
 
 function bindGatewayRetryAttempt(source: EventRow, runId: string): RunAttemptRef {
@@ -1090,6 +1103,7 @@ export class ClementineGateway {
   }
 
   async handleMessage(request: GatewayRequest): Promise<GatewayResponse> {
+    request = { ...request, taskMode: parseTaskMode(request.taskMode) };
     const run = startRun({
       id: request.runId,
       sessionId: request.sessionId,
@@ -1112,7 +1126,9 @@ export class ClementineGateway {
     const replay = acceptedSourceOutcome(accepted.source);
     if (replay) {
       request.onAcceptedTurn?.({ source: accepted.source, attempt: accepted.attempt });
-      if (accepted.attempt) {
+      if (replay.kind === 'dispatched') {
+        releaseRunInFlightAfterWorkflowTransfer(accepted.source.sessionId, accepted.attempt?.attemptId, accepted.source.seq);
+      } else if (accepted.attempt) {
         try { settleGatewayAttempt(accepted.attempt, 'completed'); } catch { /* replay stays authoritative */ }
       } else {
         clearGatewayRunMarkerIfIdle(request.sessionId);
@@ -1174,7 +1190,7 @@ export class ClementineGateway {
     }
 
     try {
-      const command = parseCommand(request.message);
+      const command = !request.taskMode || request.taskMode.kind === 'normal' ? parseCommand(request.message) : null;
       if (command) {
         const response = this.handleCommand(command, request);
         const committed = commitGatewayTerminal({
@@ -1192,7 +1208,7 @@ export class ClementineGateway {
         return { ...response, text: committed.presentation.text, runId: run.id };
       }
 
-      const parkedBackground = routeParkedBackgroundReply(request);
+      const parkedBackground = !request.taskMode || request.taskMode.kind === 'normal' ? routeParkedBackgroundReply(request) : null;
       if (parkedBackground) {
         const { response } = parkedBackground;
         addRunEvent(run.id, {
@@ -1219,9 +1235,10 @@ export class ClementineGateway {
         return { ...response, text: committed.presentation.text, runId: run.id };
       }
 
-      const effectiveMessage = rewriteBareContinueForHarness(request.sessionId, request.message);
+      const effectiveMessage = !request.taskMode || request.taskMode.kind === 'normal'
+        ? rewriteBareContinueForHarness(request.sessionId, request.message) : request.message;
 
-      if (shouldPromoteToDurable(request.message)) {
+      if ((!request.taskMode || request.taskMode.kind === 'normal') && shouldPromoteToDurable(request.message)) {
         addRunEvent(run.id, {
           type: 'queued_background',
           status: 'queued',
@@ -1267,6 +1284,7 @@ export class ClementineGateway {
       // confirm-first / guardrail / approvals) with the legacy synchronous
       // contract preserved; kill-switch CLEMMY_HARNESS_WEBHOOK=off.
       const response = await respondPreferHarness('webhook', {
+        ...taskModeFields(request.taskMode),
         message: effectiveMessage,
         displayMessage: request.message,
         sourceUserSeq: accepted.source.seq,
@@ -1282,11 +1300,10 @@ export class ClementineGateway {
       const route = recordGatewayRoute(run.id, response, request.model);
       const sourceOutcomeAfterResponse = acceptedSourceOutcome(accepted.source);
       if (sourceOutcomeAfterResponse?.kind === 'dispatched') {
-        // The foreground bridge has handed this accepted source to the durable
-        // workflow graph. Its acknowledgement closes only this physical HTTP /
-        // mobile request; the workflow reducer still owns the one later public
-        // conversation terminal for the logical turn.
-        try { settleGatewayAttempt(activeAttempt, 'completed'); } catch { /* bridge may already have settled it */ }
+        // The exact verified group owns the unfinished logical attempt. Release
+        // only the foreground lease/marker; final report-back closes the parent
+        // atomically with its one public terminal, after all child evidence.
+        releaseRunInFlightAfterWorkflowTransfer(accepted.source.sessionId, activeAttempt.attemptId, accepted.source.seq);
         finishRun(run.id, {
           status: 'queued',
           message: 'Workflow dispatch accepted; awaiting its durable terminal.',
@@ -1491,7 +1508,9 @@ export class ClementineGateway {
       logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'accepted gateway turn failed');
       const durable = acceptedSourceOutcome(accepted.source);
       if (durable) {
-        try {
+        if (durable.kind === 'dispatched') {
+          releaseRunInFlightAfterWorkflowTransfer(accepted.source.sessionId, activeAttempt.attemptId, accepted.source.seq);
+        } else try {
           settleGatewayAttempt(
             activeAttempt,
             durable.kind === 'terminal'

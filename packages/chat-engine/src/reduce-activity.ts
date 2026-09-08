@@ -1,5 +1,7 @@
+import { readLiveApprovalControl } from './live-approval-control.js';
 import type { ActivityItem, HarnessEvent } from './types.js';
-import { describeExternalWrite, humanToolLabel, salientArgDetail } from './tool-labels.js';
+import { humanToolLabel, salientArgDetail } from './tool-labels.js';
+import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone } from './write-ledger.js';
 import { workPlanActivityItem } from './work-plan-presentation.js';
 
 // Contract-grammar negotiation: the harness teaching the model its call
@@ -90,6 +92,7 @@ function upsertModelPhase(
  *  older events; agents (run_worker) are keyed by item; run_batch renders as ONE
  *  live meter row driven by authoritative batch_progress counts. */
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () => number = Date.now): ActivityItem[] {
+  if (readLiveApprovalControl(ev)) return prev;
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
   const callId = typeof d.callId === 'string' ? d.callId : typeof d.call_id === 'string' ? d.call_id : '';
@@ -396,28 +399,27 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     // describeExternalWrite (work-report.ts) so every surface speaks ONE
     // vocabulary. A failed/orphaned write is the same line with an honest tail.
     case 'external_write':
+    case 'external_write_succeeded':
     case 'external_write_failed':
     case 'external_write_orphaned': {
-      const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : '';
-      const writeTool = typeof d.toolName === 'string' ? d.toolName : tool;
-      const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
-      // The recorded irreversibility bit rides through so a reversible write
-      // (draft/update) can never render as delivery in the live feed either.
-      const base = describeExternalWrite(shapeKey, writeTool, targets, {
-        ...(typeof d.irreversible === 'boolean' ? { irreversible: d.irreversible } : {}),
-        ...(typeof d.actionKey === 'string' ? { actionKey: d.actionKey } : {}),
-      });
-      const failed = ev.type === 'external_write_failed';
-      const orphaned = ev.type === 'external_write_orphaned';
-      const key = callId || shapeKey || writeTool || `${prev.length}`;
-      return [...prev, {
-        id: `x-${ev.type}-${key}`,
+      const key = writeRowKey(d, ev.seq);
+      const id = `x-write-${key}`;
+      const at = prev.findIndex((item) => item.id === id);
+      const row = applyWriteEvent(at >= 0 ? prev[at]!.write : undefined, ev);
+      const item: ActivityItem = {
+        id,
         kind: 'event',
         variant: 'write',
-        label: failed ? `${base} — failed` : orphaned ? `${base} — timed out, may have landed` : base,
-        status: failed ? 'failed' : 'done',
-        tone: failed ? 'danger' : orphaned ? 'warning' : 'success',
-      }];
+        effect: 'external_write',
+        label: writeRowLabel(row),
+        status: writeRowStatus(row),
+        tone: writeRowTone(row),
+        write: row,
+      };
+      if (at < 0) return [...prev, item];
+      const next = [...prev];
+      next[at] = item;
+      return next;
     }
     case 'conversation_completed':
       return prev.map((it) => (

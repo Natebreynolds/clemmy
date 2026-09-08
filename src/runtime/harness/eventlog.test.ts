@@ -2299,8 +2299,18 @@ test('authority resolution requires effective identity parity across a lifecycle
   addOccurrence('one-sided-effective', 'workflow_run', undefined);
 
   assert.equal(resolveToolOutputForAuthority(sess.id, 'matching-effective').status, 'ok');
-  assert.equal(resolveToolOutputForAuthority(sess.id, 'mismatched-effective').status, 'ambiguous');
-  assert.equal(resolveToolOutputForAuthority(sess.id, 'one-sided-effective').status, 'ambiguous');
+  // Both still REFUSE — the security property is unchanged. Only the label
+  // moved: a SINGLE invocation whose call/return identity disagrees is stale or
+  // unverifiable authority, not a reused call id. Calling it `ambiguous` made
+  // file_query tell the model "reused by 1 invocations; pass a fresh unique
+  // call id" — false, and impossible to act on for a result the host stored
+  // (live 2026-09-07 sources 146537/147032, where that message looped and the
+  // owner's Plan was never written). `failed` carries the real reason.
+  for (const callId of ['mismatched-effective', 'one-sided-effective']) {
+    const resolution = resolveToolOutputForAuthority(sess.id, callId);
+    assert.notEqual(resolution.status, 'ok', `${callId} must not serve authority`);
+    assert.equal(resolution.status, 'failed', `${callId} is unverifiable, not a reuse`);
+  }
 });
 
 test('authority resolution keeps tool-output readers presentation-only without shadowing original reads', () => {
@@ -2719,7 +2729,13 @@ test('authority fallback never promotes legacy external-write output', () => {
     parentEventId: called.id,
   });
 
-  assert.equal(resolveToolOutputForAuthority(sess.id, 'legacy-write').status, 'ambiguous');
+  // The property is NEVER PROMOTED, and it holds: a legacy external-write
+  // output still refuses authority. Only the label moved — one invocation is
+  // not a reuse, so it reports the honest `failed` reason instead of telling
+  // the model to "pass a fresh unique call id" for a result the host stored.
+  const legacyWrite = resolveToolOutputForAuthority(sess.id, 'legacy-write');
+  assert.notEqual(legacyWrite.status, 'ok', 'legacy external-write output is never promoted');
+  assert.equal(legacyWrite.status, 'failed', 'one invocation is unverifiable, not ambiguous');
 });
 
 test('writeToolOutput stores a 300KB result in FULL (was tail-dropped under the old 200KB cap)', () => {

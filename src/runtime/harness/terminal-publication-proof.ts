@@ -52,6 +52,12 @@ import {
 import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { parseCapabilityManifestOperationSemantics } from './capability-manifest.js';
+import { parseProviderAcknowledgementMode } from './provider-acknowledgement-contract.js';
+import {
+  loadProviderAcknowledgementReceipt,
+  proveProviderAcknowledgement,
+  providerAcknowledgementReceiptsEqual,
+} from './provider-acknowledgement-proof.js';
 import {
   sealedNodeBindingDigestOf,
   type SealedNodeBindingDigestInput,
@@ -393,6 +399,8 @@ function sealedBindingDigest(binding: Record<string, unknown>): string | null {
       && !parseCapabilityManifestOperationSemantics(binding.operationSemantics))
     || (binding.verification !== undefined
       && !parseMutationVerificationRecipe(binding.verification))
+    || (binding.writeEvidenceMode !== undefined
+      && !parseProviderAcknowledgementMode(binding.writeEvidenceMode))
   ) return null;
   return sealedNodeBindingDigestOf(binding as unknown as SealedNodeBindingDigestInput);
 }
@@ -1411,6 +1419,33 @@ function verifyHostSealedWriteReceipt(input: {
   obligation: string;
   transition: TransitionRow;
 }): TerminalPublicationProofResult {
+  if (input.node.writeEvidenceMode === 'provider_acknowledgement_v1') {
+    const receipt = loadProviderAcknowledgementReceipt(input.db, input.transition.receipt_id);
+    if (!receipt || input.obligation !== 'commit_effect' || receipt.obligation !== input.obligation
+      || receipt.sessionId !== input.sessionId || receipt.sourceUserSeq !== input.sourceUserSeq
+      || receipt.acceptedTaskId !== input.acceptedTaskId || receipt.manifestId !== input.manifest.manifestId
+      || receipt.nodeId !== input.node.nodeId || receipt.physicalDispatchId !== input.transition.physical_attempt_id
+      || (input.transition.logical_tool_call_id !== null && input.transition.logical_tool_call_id !== receipt.logicalToolCallId)
+      || (input.transition.physical_dispatch_id !== null && input.transition.physical_dispatch_id !== receipt.physicalDispatchId)
+      || !exactManifestOperationMapping({ ...input, operationId: input.node.operationId,
+        logicalToolCallId: receipt.logicalToolCallId, resolvedTool: input.node.resolvedTool, effectKind: input.node.effectKind })) {
+      return { ok: false, status: 'conflict', reason: 'provider acknowledgement transition does not match its exact receipt' };
+    }
+    const result = exactSuccessfulResult({ ...input, logicalToolCallId: receipt.logicalToolCallId });
+    if (!result.ok) return { ok: false, status: 'conflict', reason: result.reason };
+    const proved = proveProviderAcknowledgement({ ...input, logicalToolCallId: receipt.logicalToolCallId,
+      result: {
+        toolName: result.row.logical_tool_name,
+        executionSite: result.row.dispatch_execution_site === 'host' ? 'host' : 'provider',
+        physicalDispatchId: result.row.handle_physical_dispatch_id!,
+        resultHandleId: result.row.handle_id, rawPayloadSha256: result.row.raw_payload_sha256!,
+        rawByteCount: result.row.raw_byte_count!,
+      },
+    });
+    return proved.ok && providerAcknowledgementReceiptsEqual(proved.receipt, receipt)
+      ? { ok: true }
+      : { ok: false, status: 'conflict', reason: proved.ok ? 'provider acknowledgement no longer matches its evidence' : proved.reason };
+  }
   const receipt = input.db.prepare(`
     SELECT w.receipt_id, w.kind,
            w.session_id AS receipt_session_id,

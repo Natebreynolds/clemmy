@@ -4,11 +4,22 @@ import { Search, Plus, Archive, X, PanelLeftClose } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
+import {
+  CONVERSATION_KIND_FILTERS,
+  conversationEmptyStateText,
+  parseConversationKindFilter,
+  type ConversationKindFilter,
+} from '@/lib/run-presentation';
 import { useSessions } from '../hooks/useSessions';
 import { useSessionMutations } from '../hooks/useSessionMutations';
 import { groupSessions, collectTags } from '../lib/groupSessions';
 import { ConversationListItem } from './ConversationListItem';
 import type { SessionFilters } from '../types';
+
+const KIND_PREF_KEY = 'clem.chat.kind';
+/** Runs and chats now share one page, so ask for more than the route's default
+ *  100 — otherwise a morning of workflow runs buries yesterday's chats. */
+const SESSION_PAGE_SIZE = 200;
 
 export function ConversationSidebar({
   onCollapse,
@@ -37,14 +48,29 @@ export function ConversationSidebar({
     return () => clearTimeout(t);
   }, [search, setSearchParams]);
 
+  // Which kinds the rail is showing. A view preference, not a query — it
+  // persists per-machine the way the rail's own collapsed state does.
+  const [kind, setKindState] = useState<ConversationKindFilter>(() => {
+    try { return parseConversationKindFilter(localStorage.getItem(KIND_PREF_KEY)); } catch { return 'all'; }
+  });
+  const setKind = (next: ConversationKindFilter) => {
+    setKindState(next);
+    try { localStorage.setItem(KIND_PREF_KEY, next); } catch { /* preference only */ }
+  };
+
   const tag = searchParams.get('tag') ?? '';
   const includeArchived = searchParams.get('archived') === '1';
   const filters: SessionFilters = useMemo(
-    () => ({ q: searchParams.get('q') ?? undefined, tag: tag || undefined, includeArchived }),
+    () => ({
+      q: searchParams.get('q') ?? undefined,
+      tag: tag || undefined,
+      includeArchived,
+      limit: SESSION_PAGE_SIZE,
+    }),
     [searchParams, tag, includeArchived],
   );
 
-  const { data, isLoading } = useSessions(filters);
+  const { data, isLoading } = useSessions(filters, kind);
   // Hide empty desktop shells ("t" · "No messages yet") unless it's the one
   // currently open (a just-created chat must stay visible while you type).
   // Harness rows always report turnCount 0 — never filter those.
@@ -102,7 +128,7 @@ export function ConversationSidebar({
             autoFocus={autoFocusSearch}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search conversations"
+            placeholder="Search chats and runs"
             className="h-9 flex-1 bg-transparent text-small text-fg outline-none placeholder:text-faint"
           />
           {search && (
@@ -110,6 +136,24 @@ export function ConversationSidebar({
               <X className="h-3.5 w-3.5" />
             </button>
           )}
+        </div>
+        <div role="group" aria-label="Show chats or runs" className="flex gap-0.5 rounded-md bg-subtle p-0.5">
+          {CONVERSATION_KIND_FILTERS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              aria-pressed={kind === option.id}
+              onClick={() => setKind(option.id)}
+              className={cn(
+                'flex-1 rounded-sm px-2 py-1 text-caption font-semibold transition-colors cursor-pointer',
+                kind === option.id
+                  ? 'bg-surface text-fg ring-1 ring-border'
+                  : 'text-muted hover:text-fg',
+              )}
+            >
+              {option.label}
+            </button>
+          ))}
         </div>
         {(tags.length > 0 || tag) && (
           <div className="flex flex-wrap gap-1">
@@ -153,7 +197,14 @@ export function ConversationSidebar({
           </div>
         ) : groups.length === 0 ? (
           <p className="px-3 py-10 text-center text-small text-faint">
-            {filters.q ? `No conversations match “${filters.q}”.` : 'No conversations yet.'}
+            {conversationEmptyStateText({
+              filter: kind,
+              query: filters.q ?? '',
+              // `total` is the server's page BEFORE the kind segment sliced
+              // it — the number the emptiness claim has to be honest about.
+              fetched: data?.total ?? 0,
+              pageSize: SESSION_PAGE_SIZE,
+            })}
           </p>
         ) : (
           groups.map((group) => (

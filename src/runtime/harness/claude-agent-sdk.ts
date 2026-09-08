@@ -2154,6 +2154,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   ) {
     try {
       discoveryGovernor.initializeTask({
+        claimKeyVersion: 'exact_request_v1',
         sessionId: options.sessionId,
         sourceUserSeq: options.sourceUserSeq as number,
         knownCapability: false,

@@ -31,14 +31,17 @@ import {
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { purgeWorkspaceObservationMemory } from '../memory/workspace-observation-bridge.js';
-import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import {
   HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
   hostLocalWriteCommitResultIsProven,
   withHostLocalWriteCommitFromFile,
+  withHostLocalWorkspaceCommitFromCurrentFiles,
   writeHostLocalWorkspaceCommitDocument,
+  serializeHostLocalWorkspaceCommitDocument,
 } from '../runtime/harness/host-local-write-commit.js';
-import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
+import { bootstrapWorkspaceObservationHistory, commitWorkspaceObservationBatch, deleteWorkspaceIndex, getCurrentWorkspaceDatasetObservation, indexWorkspaceRecord, openWorkspaceDb, reindexWorkspaceRecords, serializeWorkspaceProjection } from './workspace-db.js';
+import { canonicalWorkspaceJson, workspaceDataContentDigest } from './workspace-set-data-contract.js';
+import { assertWorkspaceUpdateJournalFits, clearWorkspaceUpdateJournal, persistWorkspaceUpdateJournal, recoverWorkspaceSnapshotUnderOwner, withWorkspaceSnapshotMutation, withWorkspaceSnapshotRead, workspaceSnapshotRevision, writeWorkspaceSnapshotFile } from './workspace-snapshot.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
 /** Hidden, invalid-as-a-slug directory used as the durable hard-delete marker. */
@@ -903,8 +906,138 @@ export type RepairStaticSnapshotCommitReceiptResult =
   | { ok: true; record: SpaceRecord; receiptPath: string; repaired: boolean }
   | { ok: false; reason: string };
 
-function workspaceMutationLockPath(slug: string): string {
-  return path.join(SPACES_DIR, `.workspace-${slug}`);
+export interface SpaceSnapshot {
+  record: SpaceRecord;
+  manifest: string;
+  view: string;
+  data: string;
+  revision: string;
+}
+
+function readSpaceSnapshotUnlocked(slug: string): SpaceSnapshot | undefined {
+  const record = readManifest(slug);
+  if (!record) return undefined;
+  const manifest = readFileSync(manifestPath(slug), 'utf8');
+  const view = readFileSync(resolveInSpace(slug, record.viewEntry), 'utf8');
+  const dataFile = resolveInSpace(slug, 'data.json');
+  const data = existsSync(dataFile) ? readFileSync(dataFile, 'utf8') : '{}';
+  return { record, manifest, view, data, revision: workspaceSnapshotRevision({ manifest, view, data }) };
+}
+
+export class WorkspaceStaticUpdateError extends Error {
+  constructor(readonly code: 'stale_revision' | 'not_static' | 'invalid_document', message: string) {
+    super(message); this.name = 'WorkspaceStaticUpdateError';
+  }
+}
+
+export interface ReplaceStaticSpaceDocumentInput extends SaveSpaceInput {
+  replacementData: Record<string, unknown>;
+  expectedRevision: string;
+  /** Synchronous failure/crash seam; never exposed through a tool. */
+  onPhase?: (phase: 'journal_written' | 'projection_written' | 'files_prepared' | 'before_sqlite_commit' | 'after_sqlite_commit') => void;
+}
+
+/** One owner extends the existing view revision and observation commit. The
+ * outer SQLite commit decides recovery; shared readers recover the journal
+ * under this same lock before observing manifest/view/data as a snapshot. */
+export interface StaticSpaceDocumentUpdateResult { record: SpaceRecord; commitResult: string }
+
+function replaceStaticSpaceDocumentUnlocked(input: ReplaceStaticSpaceDocumentInput): StaticSpaceDocumentUpdateResult {
+  const before = readSpaceSnapshotUnlocked(input.id);
+  if (!before || before.record.status !== 'active' || before.record.contentMode !== 'static_snapshot'
+    || !existsSync(resolveInSpace(input.id, 'data.json'))
+    || before.record.dataSources.length !== 0 || (input.dataSources?.length ?? 0) !== 0
+    || input.initialData !== undefined || (input.viewEntry !== undefined && input.viewEntry !== before.record.viewEntry)) {
+    throw new WorkspaceStaticUpdateError('not_static', 'A document replacement requires an existing active static Workspace with the same view target and no data sources.');
+  }
+  if (input.expectedRevision !== before.revision) {
+    throw new WorkspaceStaticUpdateError('stale_revision', 'The Workspace changed since it was read. Read its current snapshot and apply the intended edit to that revision. Nothing was changed.');
+  }
+  if (!input.replacementData || typeof input.replacementData !== 'object' || Array.isArray(input.replacementData)) {
+    throw new WorkspaceStaticUpdateError('invalid_document', 'The replacement dataset must be a complete JSON object.');
+  }
+  // Use the projection owner's actual on-disk serialization. Canonical
+  // dataset blobs sort keys lexically; JSON.stringify reorders integer keys.
+  // Both the intermediate projection and journal must name the same bytes.
+  const nextData = serializeWorkspaceProjection(JSON.parse(canonicalWorkspaceJson(input.replacementData))).text;
+  if (Buffer.byteLength(nextData, 'utf8') > SPACE_INITIAL_DATA_MAX_BYTES) {
+    throw new WorkspaceStaticUpdateError('invalid_document', 'The replacement static dataset exceeds the existing static document limit.');
+  }
+  const nextView = input.viewContent ?? before.view;
+  const now = new Date().toISOString();
+  const snapshotRel = path.posix.join('view-history', `${now.replace(/[:.]/g, '-')}-v${before.record.version}.html`);
+  const record: SpaceRecord = {
+    ...before.record,
+    title: input.title.trim().slice(0, 200) || input.id,
+    contract: input.contract ?? before.record.contract,
+    actions: input.actions ?? before.record.actions,
+    reengage: input.reengage ?? before.record.reengage,
+    originSessionId: input.originSessionId ?? before.record.originSessionId,
+    version: before.record.version + 1,
+    revisions: [...before.record.revisions, { version: before.record.version, ts: now, bytes: Buffer.byteLength(before.view, 'utf8'), file: snapshotRel }].slice(-50),
+    updatedAt: now,
+  };
+  delete record.manifestErrors;
+  const manifest = JSON.stringify(persistableRecord(record), null, 2);
+  const viewPath = resolveInSpace(input.id, record.viewEntry);
+  const dataPath = resolveInSpace(input.id, 'data.json');
+  const receiptPath = resolveInSpace(input.id, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME);
+  const receipt = serializeHostLocalWorkspaceCommitDocument({
+    createdId: input.id, receiptPath,
+    manifest: { path: manifestPath(input.id), bytes: manifest },
+    view: { path: viewPath, bytes: nextView }, data: { path: dataPath, bytes: nextData },
+  });
+  const refreshId = `static-update:${randomUUID()}`;
+  const components = [
+    { path: record.viewEntry, before: before.view, after: nextView },
+    { path: 'data.json', before: before.data, after: nextData },
+    { path: HOST_LOCAL_WORKSPACE_COMMIT_BASENAME, before: existsSync(receiptPath) ? readFileSync(receiptPath, 'utf8') : null, after: receipt },
+    { path: 'space.json', before: before.manifest, after: manifest },
+  ];
+  const journal = { version: 1 as const, slug: input.id, refreshId, dataDigest: workspaceDataContentDigest(input.replacementData), components };
+  assertWorkspaceUpdateJournalFits(journal);
+  const db = openWorkspaceDb();
+  if (db.inTransaction) throw new Error('Static Workspace updates require their own outer transaction');
+  indexWorkspaceRecord(before.record, { db, strict: true, emitOperational: false, appendStateEvent: false });
+  if (!getCurrentWorkspaceDatasetObservation(input.id, '$document', db)) {
+    const baseline = bootstrapWorkspaceObservationHistory(input.id, { db });
+    if (!baseline.ok) throw new Error(`Could not retain the prior Workspace document: ${baseline.error}`);
+  }
+  persistWorkspaceUpdateJournal(journal);
+  try {
+    input.onPhase?.('journal_written');
+    // The prior view remains ordinary history. It is not the commit decision.
+    atomicWrite(resolveInSpace(input.id, snapshotRel), before.view);
+    db.transaction(() => {
+      commitWorkspaceObservationBatch({ db, workspaceId: input.id, observations: [{
+        sourceKey: '$document', refreshId, cause: 'static_document_update', projectionMode: 'document', status: 'ok', data: input.replacementData,
+      }] });
+      input.onPhase?.('projection_written');
+      for (const component of components) writeWorkspaceSnapshotFile(resolveInSpace(input.id, component.path), component.after);
+      input.onPhase?.('files_prepared');
+      indexWorkspaceRecord(record, { db, strict: true, emitOperational: false });
+      const proof = withHostLocalWriteCommitFromFile({ createdId: input.id, committedPath: receiptPath, result: 'Static Workspace update generation check.' });
+      if (!hostLocalWriteCommitResultIsProven(proof)) throw new Error('Static Workspace update components changed before commit');
+      input.onPhase?.('before_sqlite_commit');
+    }).immediate();
+    input.onPhase?.('after_sqlite_commit');
+    const commitResult = withHostLocalWriteCommitFromFile({ createdId: input.id, committedPath: receiptPath, result: `Updated Workspace \"${record.title}\" (${input.id}), v${record.version}. The root dataset, phone content, and saved view share this committed revision.` });
+    if (!hostLocalWriteCommitResultIsProven(commitResult)) throw new Error('Static Workspace update components changed after commit');
+    clearWorkspaceUpdateJournal(input.id);
+    return { record, commitResult };
+  } catch (error) {
+    // Reconcile the actual SQLite decision before returning. If projection
+    // repair also fails, intent remains durable and readers fail closed until
+    // recovery can finish; an uncertain generation is never reported saved.
+    const recovery = recoverWorkspaceSnapshotUnderOwner(input.id);
+    if (recovery?.committed) {
+      const commitResult = withHostLocalWriteCommitFromFile({ createdId: input.id, committedPath: receiptPath, result: `Updated Workspace \"${record.title}\" (${input.id}), v${record.version}. Its committed root document and view were recovered.` });
+      if (!hostLocalWriteCommitResultIsProven(commitResult)) throw new Error('Recovered Workspace update failed its current generation proof');
+      return { record, commitResult };
+    }
+    try { rmSync(resolveInSpace(input.id, snapshotRel), { force: true }); } catch { /* unreferenced history is harmless */ }
+    throw error;
+  }
 }
 
 function sameStoredJson(left: unknown, right: unknown): boolean {
@@ -1228,7 +1361,8 @@ export class SpaceStore {
       let isDir = false;
       try { isDir = statSync(path.join(SPACES_DIR, name)).isDirectory(); } catch { continue; }
       if (!isDir) continue;
-      const rec = readManifest(name);
+      let rec: SpaceRecord | undefined;
+      try { rec = this.get(name); } catch { continue; } // one unrecoverable snapshot cannot hide unrelated Spaces
       if (!rec) continue;
       if (!includeArchived && rec.status === 'archived') continue;
       out.push(rec);
@@ -1238,7 +1372,16 @@ export class SpaceStore {
 
   get(slug: string): SpaceRecord | undefined {
     if (!isValidSpaceSlug(slug)) return undefined;
-    return readManifest(slug);
+    return withWorkspaceSnapshotRead(slug, () => readManifest(slug));
+  }
+
+  snapshot(slug: string): SpaceSnapshot | undefined {
+    if (!isValidSpaceSlug(slug)) return undefined;
+    return withWorkspaceSnapshotRead(slug, () => readSpaceSnapshotUnlocked(slug));
+  }
+
+  replaceStaticDocument(input: ReplaceStaticSpaceDocumentInput): StaticSpaceDocumentUpdateResult {
+    return withWorkspaceSnapshotMutation(input.id, () => replaceStaticSpaceDocumentUnlocked(input));
   }
 
   /** Create or update a Space manifest (idempotent by slug). */
@@ -1247,7 +1390,41 @@ export class SpaceStore {
       throw new Error(`invalid space slug "${input.id}" — use lowercase kebab-case (2-63 chars).`);
     }
     ensureDir(SPACES_DIR);
-    return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => saveSpaceUnlocked(input));
+    return withWorkspaceSnapshotMutation(input.id, () => saveSpaceUnlocked(input));
+  }
+
+  /** Certify the final ordinary-save snapshot without rebinding another
+   * author's edit. Smoke/visits may advance operational timestamps; every
+   * authoring field, including status/version/contract, remains exact. */
+  commitSaveResult(input: { expectedRecord: SpaceRecord; expectedView?: string; result: string }): string {
+    const expected = input.expectedRecord;
+    if (!isValidSpaceSlug(expected.id)) throw new Error('Invalid Workspace save identity');
+    const authoringFields = (value: Record<string, unknown>): string => {
+      const { updatedAt: _updatedAt, lastRefreshedAt: _lastRefreshedAt, lastOpenedAt: _lastOpenedAt, ...authoring } = value;
+      return canonicalWorkspaceJson(authoring);
+    };
+    // JSON encoding removes optional undefined properties exactly as persistence does.
+    const expectedManifest = JSON.parse(JSON.stringify(persistableRecord(expected))) as Record<string, unknown>;
+    return withWorkspaceSnapshotMutation(expected.id, () => withHostLocalWorkspaceCommitFromCurrentFiles({
+      createdId: expected.id, viewEntry: expected.viewEntry, result: input.result,
+      validate: ({ manifest, view, data }) => {
+        const current = JSON.parse(manifest.toString('utf8')) as Record<string, unknown>;
+        for (const key of ['updatedAt', 'lastRefreshedAt', 'lastOpenedAt']) {
+          if (current[key] !== undefined && (typeof current[key] !== 'string' || !Number.isFinite(Date.parse(current[key] as string)))) {
+            throw new Error('Workspace operational timestamp is invalid before delivery proof');
+          }
+        }
+        if (authoringFields(current) !== authoringFields(expectedManifest)) {
+          throw new Error('Workspace saved authoring fields changed before delivery proof');
+        }
+        if (input.expectedView !== undefined && !view.equals(Buffer.from(input.expectedView, 'utf8'))) {
+          throw new Error('Workspace saved view changed before delivery proof');
+        }
+        if (expected.contentMode === 'static_snapshot' && data === null) {
+          throw new Error('Workspace static data is missing before delivery proof');
+        }
+      },
+    }));
   }
 
   /** Reconstruct only the content-addressed proof carrier for an otherwise
@@ -1260,8 +1437,8 @@ export class SpaceStore {
       return { ok: false, reason: 'invalid Workspace slug' };
     }
     ensureDir(SPACES_DIR);
-    return withFileLockSyncStrict(
-      workspaceMutationLockPath(input.id),
+    return withWorkspaceSnapshotMutation(
+      input.id,
       () => repairStaticSnapshotCommitReceiptUnlocked(input),
     );
   }
@@ -1270,8 +1447,8 @@ export class SpaceStore {
   commitViewRevision(slug: string, nextView: string): SpaceRecord {
     if (!isValidSpaceSlug(slug)) throw new Error(`invalid workspace slug: ${slug}`);
     ensureDir(SPACES_DIR);
-    return withFileLockSyncStrict(
-      workspaceMutationLockPath(slug),
+    return withWorkspaceSnapshotMutation(
+      slug,
       () => commitSpaceViewRevisionUnlocked(slug, nextView),
     );
   }
@@ -1285,7 +1462,7 @@ export class SpaceStore {
       throw new Error(`invalid space slug "${input.id}" — use lowercase kebab-case (2-63 chars).`);
     }
     ensureDir(SPACES_DIR);
-    return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => {
+    return withWorkspaceSnapshotMutation(input.id, () => {
       recoverWorkspaceDeletionQuarantine(input.id);
       const dir = resolveSpaceDir(input.id);
       if (existsSync(dir)) {
@@ -1297,6 +1474,11 @@ export class SpaceStore {
 
   /** Patch a subset of fields on an existing Space. */
   update(slug: string, patch: Partial<Omit<SpaceRecord, 'id' | 'createdAt'>>): SpaceRecord | undefined {
+    if (!isValidSpaceSlug(slug)) return undefined;
+    return withWorkspaceSnapshotMutation(slug, () => this.updateUnlocked(slug, patch));
+  }
+
+  private updateUnlocked(slug: string, patch: Partial<Omit<SpaceRecord, 'id' | 'createdAt'>>): SpaceRecord | undefined {
     const existing = readManifest(slug);
     if (!existing) return undefined;
     const missingFixes = missingManifestFixes(
@@ -1336,6 +1518,11 @@ export class SpaceStore {
    * No-op if there's no current view yet.
    */
   recordRevision(slug: string): SpaceRecord | undefined {
+    if (!isValidSpaceSlug(slug)) return undefined;
+    return withWorkspaceSnapshotMutation(slug, () => this.recordRevisionUnlocked(slug));
+  }
+
+  private recordRevisionUnlocked(slug: string): SpaceRecord | undefined {
     const existing = readManifest(slug);
     if (!existing) return undefined;
     const viewFile = resolveInSpace(slug, existing.viewEntry);
@@ -1373,7 +1560,7 @@ export class SpaceStore {
         return existing;
       }
     }
-    return this.update(slug, {
+    return this.updateUnlocked(slug, {
       version: existing.version + 1,
       revisions: [...existing.revisions, revision].slice(-50),
     });
@@ -1381,6 +1568,11 @@ export class SpaceStore {
 
   /** Archive (soft) — keeps files for restore. */
   archive(slug: string): SpaceRecord | undefined {
+    if (!isValidSpaceSlug(slug)) return undefined;
+    return withWorkspaceSnapshotMutation(slug, () => this.archiveUnlocked(slug));
+  }
+
+  private archiveUnlocked(slug: string): SpaceRecord | undefined {
     const existing = readManifest(slug);
     if (existing?.manifestErrors && existing.manifestErrors.length > 0) {
       try {
@@ -1404,7 +1596,7 @@ export class SpaceStore {
         return undefined;
       }
     }
-    return this.update(slug, { status: 'archived' });
+    return this.updateUnlocked(slug, { status: 'archived' });
   }
 
   /**
@@ -1417,6 +1609,11 @@ export class SpaceStore {
    * marker in place so restart recovery finishes before slug reuse.
    */
   remove(slug: string): boolean {
+    if (!isValidSpaceSlug(slug)) return false;
+    return withWorkspaceSnapshotMutation(slug, () => this.removeUnlocked(slug));
+  }
+
+  private removeUnlocked(slug: string): boolean {
     if (!isValidSpaceSlug(slug)) return false;
     const dir = resolveSpaceDir(slug);
     let recovered = 0;

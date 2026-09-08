@@ -284,6 +284,7 @@ export interface FormatComposioToolOutputOptions {
   toolSlug?: string;
   /** Immutable provider args when effect semantics require more authority than
    * the slug alone (kept out of user-facing formatting). */
+  hostAnnotations?: readonly string[];
 }
 
 /**
@@ -682,6 +683,7 @@ export function formatComposioToolOutput(
     toolName: options.toolName ?? 'composio tool',
     sessionId: sessionIdFromRunContext(options.context),
     callId: callIdFromToolDetails(options.details),
+    hostAnnotations: options.hostAnnotations,
   });
 }
 
@@ -4125,11 +4127,12 @@ async function runComposioExecuteInner(
         },
       );
       let output = formatComposioExecuteOutput(result, { ...options, toolSlug });
+      const outputAnnotations: string[] = [];
       if (gate.routeConnectedAccountId) {
-        output += `\n\n[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`;
+        outputAnnotations.push(`[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`);
       }
-      if (accountRouteNote) output += `\n\n${accountRouteNote}`;
-      if (constraintBanner) output += `\n${constraintBanner}`;
+      if (accountRouteNote) outputAnnotations.push(accountRouteNote);
+      if (constraintBanner) outputAnnotations.push(constraintBanner);
       const sid = runSid;
       // Capture the intent BEFORE auto-remember consumes (deletes) the session's
       // search entry — the fresh search query is the honest intent behind this execute.
@@ -4150,7 +4153,8 @@ async function runComposioExecuteInner(
       } else {
         // F2: a genuine success proves the toolkit is reachable again → reset.
         clearReconnectBreaker(sid, toolSlug);
-        output += emptyStreakAdvisory(sid, toolSlug, result);
+        const emptyAdvisory = emptyStreakAdvisory(sid, toolSlug, result);
+        if (emptyAdvisory) outputAnnotations.push(emptyAdvisory);
       }
       try {
         recordExecution({
@@ -4175,7 +4179,7 @@ async function runComposioExecuteInner(
         const receipt = detectJobReceipt(toolSlug, result);
         if (receipt) {
           settledForLearning = null;
-          output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+          outputAnnotations.push(asyncReceiptBanner(receipt));
           if (receipt.generic) {
             recordOperationalEvent({
               source: 'tool',
@@ -4257,6 +4261,17 @@ async function runComposioExecuteInner(
         effectiveConnectionId,
       );
 
+      // A successful JSON result and host routing/continuation commentary
+      // share one bounded formatter. Appending prose after that formatter
+      // used to push valid JSON back over its cap and sever its own receipt.
+      const renderWithAnnotations = (additional?: string): string => {
+        const hostAnnotations = additional ? [...outputAnnotations, additional] : outputAnnotations;
+        if (failure.failed) return hostAnnotations.length ? `${output}\n\n${hostAnnotations.join('\n')}` : output;
+        return hostAnnotations.length
+          ? formatComposioExecuteOutput(result, { ...options, toolSlug, hostAnnotations })
+          : output;
+      };
+
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
       //
       // A nested carrier already owns its result shape. Appending
@@ -4276,7 +4291,7 @@ async function runComposioExecuteInner(
             signature: describeSignature(toolSlug, args),
             sessionId: runScopeIdFromRunContext(options.context) ?? sid,
           });
-          return advisory ? output + advisory : output;
+          return renderWithAnnotations(advisory || undefined);
         }
         const advisory = maybeFanoutAdvisory(
           toolSlug,
@@ -4284,9 +4299,9 @@ async function runComposioExecuteInner(
           runScopeIdFromRunContext(options.context) ?? sid,
           output,
         );
-        if (advisory) return output + advisory;
+        if (advisory) return renderWithAnnotations(advisory);
       }
-      return output;
+      return renderWithAnnotations();
     } catch (err) {
       if (err instanceof ToolAttemptSettlementAuthorityError) throw err;
 
@@ -4847,8 +4862,7 @@ export async function searchComposioBrokerCandidates(
       || right.score - left.score
       || left.slug.localeCompare(right.slug)
     ))
-    .slice(0, maxResults)
-    .map(({ providerRecommendedSuccessor: _providerRecommendedSuccessor, ...candidate }) => candidate);
+    .slice(0, maxResults);
 }
 
 export async function getDynamicComposioRuntimeTools(options: {

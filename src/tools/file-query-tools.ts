@@ -5,6 +5,7 @@
  * Deterministic retrieval (file-query-core.ts): no model call, no network.
  */
 
+import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -69,7 +70,18 @@ export function registerFileQueryTools(server: McpServer): void {
           const resolution = resolveToolOutputForAuthority(sessionId, callIdSource!);
           if (resolution.status === 'ambiguous') return invalidArgumentsTextResult(`ERROR: call id "${callIdSource}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
           if (resolution.status === 'missing') return invalidArgumentsTextResult(`ERROR: no stored output for call id "${callIdSource}" in this session.`);
-          if (resolution.status === 'failed') return invalidArgumentsTextResult(`ERROR: stored output for call id "${callIdSource}" cannot be used because ${resolution.reason}. Re-run the source read.`);
+          if (resolution.status === 'failed') {
+            // "Re-run the source read" is not actionable for a derived,
+            // presentation-only reader, and it throws away outputs the host is
+            // still holding. Live 2026-09-07 source 148101 looped here. Name
+            // the authentic retained evidence instead.
+            const wayThrough = retainedResultWayThrough({
+              sessionId, callId: callIdSource!, exclude: ['file_query'],
+            });
+            return invalidArgumentsTextResult(
+              `ERROR: stored output for call id "${callIdSource}" cannot be used because ${resolution.reason}. ${wayThrough}`,
+            );
+          }
           if (resolution.record.truncatedAtWrite) {
             return invalidArgumentsTextResult(
               `ERROR: stored output for call id "${callIdSource}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `

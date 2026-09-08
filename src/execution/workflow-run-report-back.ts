@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -679,6 +680,48 @@ function resolveWorkflowOriginGroupReport(
       reprojectRetainedWorkFromOrigin,
     },
   };
+}
+
+/** Reopen the SAME authoritative all-member join used by report-back, then
+ * retain complete stable child execution records for optional completion
+ * review. Model-authored run ids, result text and observer objects cannot
+ * supply or widen this evidence. Delivery bookkeeping is not execution data. */
+export function readWorkflowOriginCompletionEvidence(input: WorkflowOriginTerminalInput): {
+  digest: string;
+  summary: string;
+  sourceGroupId: string;
+  sourceGroupDigest: string;
+} | null {
+  try {
+    const file = workflowRunRecordFile(input.runId);
+    const current = file ? readRunRecordUnlocked(file) : null;
+    if (!current || current.id !== input.runId || !validEnvelope(current.reportBack)) return null;
+    const joined = resolveWorkflowOriginGroupReport(current, current.reportBack, input.observer);
+    if (joined.status !== 'ready') return null;
+    const projection = joined.projection;
+    const requestedMembers = input.evidenceRunIds ?? [input.runId];
+    if (projection.primaryRunId !== input.runId
+      || projection.identityRunId !== (input.identityRunId ?? input.runId)
+      || projection.outcome !== input.outcome || projection.detail !== input.detail
+      || requestedMembers.length !== projection.memberRunIds.length
+      || requestedMembers.some((id, index) => id !== projection.memberRunIds[index])) return null;
+    const members = projection.memberRunIds.map((runId) => {
+      const record = readRunRecordUnlocked(workflowRunRecordFile(runId)!);
+      if (!record || record.id !== runId || !validEnvelope(record.reportBack)
+        || !outcomeMatchesCanonicalStatus(record, record.reportBack.outcome)) throw new Error('child evidence changed');
+      const expected = projection.memberReportBackDigests.find((row) => row.runId === runId);
+      const reportBack = { workflowName: record.reportBack.workflowName,
+        outcome: record.reportBack.outcome, detail: record.reportBack.detail };
+      if (workflowRunReportBackContentDigest(reportBack) !== expected?.reportBackDigest) throw new Error('child report changed');
+      const { notifiedAt: _notified, reportBackAcknowledgedAt: _ack,
+        reportBackRetry: _retry, reportBack: _report, ...execution } = record;
+      return { ...execution, reportBack };
+    });
+    const summary = JSON.stringify({ sourceGroupId: projection.sourceGroupId,
+      sourceGroupDigest: projection.sourceGroupDigest, members });
+    return { digest: createHash('sha256').update(summary).digest('hex'), summary,
+      sourceGroupId: projection.sourceGroupId, sourceGroupDigest: projection.sourceGroupDigest };
+  } catch { return null; }
 }
 
 const CORRUPT_EVIDENCE_MAX_ATTEMPTS = 3;

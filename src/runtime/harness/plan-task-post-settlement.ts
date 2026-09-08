@@ -40,6 +40,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { hostDurableConversationPreambleDelivery } from './durable-conversation-preamble.js';
 import { effectiveTurnObjective } from './turn-control.js';
+import { acceptedPlanExecutionObjective } from './accepted-plan-execution.js';
 import {
   PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
   PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
@@ -188,6 +189,8 @@ function canonicalOperationIds(graph: NonNullable<ReturnType<typeof turnGraphFro
 }
 
 function durableObjectiveForSource(input: { sessionId: string; sourceUserSeq: number }): string | null {
+  const reviewed = acceptedPlanExecutionObjective(input.sessionId, input.sourceUserSeq);
+  if (reviewed) return reviewed;
   const source = listEvents(input.sessionId, {
     sinceSeq: input.sourceUserSeq - 1,
     types: ['user_input_received'],

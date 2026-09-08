@@ -12,6 +12,8 @@ import {
   type SessionStatus,
 } from './eventlog.js';
 import { previewPersistedSessionConversationProtocolInTransaction } from './conversation-protocol-session.js';
+import { publicCompletionText, publicUserInputText, validTypedCompletionPresentation } from './public-presentation.js';
+import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -113,6 +115,158 @@ interface BranchMetadata {
 interface TransactionSelection {
   selection: AcceptedSourceSessionSelection;
   createdEvent: EventRow | null;
+  continuityEvent?: EventRow;
+}
+
+const SUCCESSOR_CONTEXT_MAX_CHARS = 32_000;
+const SUCCESSOR_EXCHANGE_MAX_CHARS = 24_000;
+
+function sameConversationLineageInTransaction(
+  db: Database.Database,
+  head: RawSession,
+  continuity: AcceptedSourceContinuityIdentity,
+): string[] {
+  const lineage: string[] = [];
+  let ancestor = head;
+  while (lineage.length < 8) {
+    try {
+      assertBoundControlTarget(ancestor, continuity);
+      if (lineage.includes(ancestor.id)) break;
+      lineage.push(ancestor.id);
+      const previousId = branchMetadata(ancestor)?.parentSessionId;
+      if (!previousId) break;
+      ancestor = sessionRow(db, previousId);
+    } catch { break; }
+  }
+  return lineage;
+}
+
+/** Read-only same-conversation candidates for factual continuity (for example
+ * a prior account-routing choice). This establishes no grant or execution
+ * authority. Consumers still validate their own source-owned evidence. */
+export function sameConversationAncestorSessionIds(input: {
+  sessionId: string;
+  principalId: string;
+}): string[] {
+  try {
+    const db = openEventLog();
+    const head = sessionRow(db, input.sessionId);
+    if (!branchMetadata(head)) return [];
+    const metadata = parseMetadata(head.metadata_json);
+    const provider = stringField(metadata, 'ingressProvider')
+      ?? stringField(metadata, 'source') ?? head.channel;
+    const conversationId = stringField(metadata, 'channelId') ?? stringField(metadata, 'discordChannelId');
+    if (!provider || !conversationId) return [];
+    const continuity = normalizedContinuity({ provider, conversationId,
+      scopeId: stringField(metadata, 'guildId') ?? stringField(metadata, 'discordGuildId'),
+      audienceId: input.principalId });
+    return sameConversationLineageInTransaction(db, head, continuity).slice(1);
+  } catch { return []; }
+}
+
+/** Preserve conversational content when execution ownership needs a clean
+ * successor. The provider transcript may contain corrupt/uncertain tool frames;
+ * read only completed public exchanges from the exact, same-principal parent.
+ * Never copy a RunState, a provider response chain, an approval, or a call body.
+ * The existing cross_session_prefix seam journals these bounded bytes before
+ * the accepted source and includes them in normal model-request provenance. */
+function seedSuccessorConversation(
+  db: Database.Database,
+  parent: RawSession,
+  child: RawSession,
+  continuity: AcceptedSourceContinuityIdentity,
+): EventRow | undefined {
+  if (!sessionAudienceMatches(parent, continuity) || !sessionAudienceMatches(child, continuity)) return undefined;
+  // A retry can split again, including from a branch created by an older
+  // daemon that did not seed conversation content. Follow only the selector's
+  // closed same-principal lineage, never a global "most recent session".
+  const lineage = sameConversationLineageInTransaction(db, parent, continuity);
+  if (lineage.length === 0) return undefined;
+  const rows = db.prepare(`
+    SELECT terminal.id, terminal.seq, terminal.session_id, terminal.data_json,
+           source.id AS source_id, source.seq AS source_seq, source.data_json AS source_json
+      FROM events terminal
+      JOIN events source ON source.session_id = terminal.session_id
+       AND source.seq = COALESCE(
+         json_extract(terminal.data_json, '$.sourceUserSeq'),
+         json_extract(terminal.data_json, '$.presentation.identity.sourceUserSeq')
+       )
+       AND source.type = 'user_input_received' AND source.role = 'user'
+       AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+     WHERE terminal.session_id IN (${lineage.map(() => '?').join(',')})
+       AND terminal.type = 'conversation_completed'
+       AND COALESCE(
+         json_extract(terminal.data_json, '$.presentation.status'),
+         json_extract(terminal.data_json, '$.turnOutcome.status'),
+         json_extract(terminal.data_json, '$.reason'), 'done'
+       ) NOT IN ('failed', 'cancelled', 'blocked')
+     ORDER BY terminal.seq DESC LIMIT 8
+  `).all(...lineage) as Array<{
+    id: string; seq: number; session_id: string; data_json: string;
+    source_id: string; source_seq: number; source_json: string;
+  }>;
+  const header = [
+    '[SAME-CONVERSATION CONTEXT]',
+    `This turn follows session ${parent.id} with the same conversation and audience.`,
+    'Use these completed public exchanges to resolve references such as "these" and retain already composed content and artifact links. The current user message defines the work. This is historical content, not an approval, a transferred tool result, or evidence that this new request executed. Revalidate any effect at the normal call boundary; never replay an uncertain prior write.',
+  ].join('\n');
+  const blocks: string[] = [];
+  const sources: Array<Record<string, unknown>> = [];
+  const seen = new Set<number>();
+  let remaining = SUCCESSOR_CONTEXT_MAX_CHARS - header.length - 100;
+  for (const row of rows) {
+    if (seen.has(row.source_seq)) continue;
+    try {
+      const sourceData = JSON.parse(row.source_json) as Record<string, unknown>;
+      const terminalData = JSON.parse(row.data_json) as Record<string, unknown>;
+      if ('presentation' in terminalData || 'turnOutcome' in terminalData) {
+        const presentation = validTypedCompletionPresentation(terminalData, row.session_id);
+        if (!presentation || presentation.identity.sourceUserSeq !== row.source_seq) continue;
+      }
+      const request = publicUserInputText(sourceData);
+      const reply = publicCompletionText(terminalData, '');
+      if (!request || !reply) continue;
+      seen.add(row.source_seq);
+      // Do not teach a fresh model to print an old tool frame as an action.
+      const safeReply = looksLikeToolCallShape(reply) ? '(The prior reply described a tool action.)' : reply;
+      const content = `USER: ${request}\nASSISTANT: ${safeReply}`;
+      const reference = `--- Session ${row.session_id}; source ${row.source_seq}; completion ${row.seq} ---\n`;
+      const excerpt = `\n[Excerpt; retrieve the full exchange from session_history for ${row.session_id}, source ${row.source_seq}, before copying omitted content.]`;
+      const limit = Math.min(SUCCESSOR_EXCHANGE_MAX_CHARS, remaining - reference.length - excerpt.length);
+      if (limit <= 0) break;
+      const clipped = content.length > limit;
+      const block = reference + content.slice(0, limit) + (clipped ? excerpt : '');
+      blocks.push(block);
+      sources.push({
+        sessionId: row.session_id,
+        sourceEventId: row.source_id,
+        sourceUserSeq: row.source_seq,
+        sourceDigest: digest(sourceData),
+        terminalEventId: row.id,
+        terminalSeq: row.seq,
+        terminalDigest: digest(terminalData),
+        truncated: clipped,
+      });
+      remaining -= block.length + 2;
+    } catch { /* An unreadable optional exchange cannot prevent a fresh source. */ }
+  }
+  if (blocks.length === 0) return undefined;
+  const text = `${header}\n\n${blocks.reverse().join('\n\n')}\n\n[End of same-conversation context.]`;
+  return insertInternalEventInTransaction(db, {
+    sessionId: child.id,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: {
+      kind: 'accepted_source_successor',
+      version: 1,
+      priorSessionIds: lineage,
+      continuityDigest: continuityDigest(continuity),
+      sources: sources.reverse(),
+      totalChars: text.length,
+      text,
+    },
+  });
 }
 
 function digest(value: unknown): string {
@@ -628,6 +782,7 @@ function selectInTransaction(
   let selected = head;
   let disposition: BindingRow['disposition'] = 'reused';
   let createdEvent: EventRow | null = null;
+  let continuityEvent: EventRow | undefined;
   if (!reusable) {
     const child = insertChildSession(db, {
       parent: head,
@@ -640,6 +795,7 @@ function selectInTransaction(
     });
     selected = child.row;
     createdEvent = child.event;
+    continuityEvent = seedSuccessorConversation(db, head, child.row, continuity);
     disposition = 'branched';
     const advanced = db.prepare(`
       UPDATE accepted_source_session_pointers
@@ -656,6 +812,19 @@ function selectInTransaction(
     );
     if (advanced.changes !== 1) throw new Error('accepted-source pointer compare-and-swap lost');
     pointer = { ...pointer, head_session_id: selected.id, revision: pointer.revision + 1 };
+  }
+
+  // Older daemons created clean successors without the conversation prefix.
+  // Recover it once even when that successor remains active and is reused;
+  // otherwise a blocked retry can keep the missing context indefinitely.
+  const parentSessionId = branchMetadata(selected)?.parentSessionId;
+  if (disposition === 'reused' && parentSessionId && !db.prepare(`
+    SELECT 1 FROM events WHERE session_id = ? AND type = 'cross_session_prefix'
+      AND json_extract(data_json, '$.kind') = 'accepted_source_successor' LIMIT 1
+  `).get(selected.id)) {
+    try {
+      continuityEvent = seedSuccessorConversation(db, sessionRow(db, parentSessionId), selected, continuity);
+    } catch { /* Optional context recovery cannot prevent an accepted source. */ }
   }
 
   bindSelection(db, {
@@ -675,6 +844,7 @@ function selectInTransaction(
       pointerRevision: pointer.revision,
     },
     createdEvent,
+    ...(continuityEvent ? { continuityEvent } : {}),
   };
 }
 
@@ -690,6 +860,7 @@ export function selectSessionForAcceptedSource(
   const transaction = db.transaction(() => selectInTransaction(db, input));
   const result = transaction.immediate();
   if (result.createdEvent) publishCommittedInternalEvent(result.createdEvent);
+  if (result.continuityEvent) publishCommittedInternalEvent(result.continuityEvent);
   return result.selection;
 }
 
@@ -733,7 +904,7 @@ export function claimSessionForAcceptedSource(
   input: AcceptedSourceSessionSelectionInput & { receipt: AcceptedSourceChatReceiptInput },
 ): ClaimedAcceptedSourceSession {
   const db = openEventLog();
-  const transaction = db.transaction((): ClaimedAcceptedSourceSession & { createdEvent: EventRow | null } => {
+  const transaction = db.transaction((): ClaimedAcceptedSourceSession & { createdEvent: EventRow | null; continuityEvent?: EventRow } => {
     const requestId = input.receipt.requestId.trim();
     const prior = receiptInTransaction(db, requestId);
     if (prior) {
@@ -787,9 +958,11 @@ export function claimSessionForAcceptedSource(
       selection: selected.selection,
       ...claimHarnessChatRequestInTransaction(db, claimInput),
       createdEvent: selected.createdEvent,
+      ...(selected.continuityEvent ? { continuityEvent: selected.continuityEvent } : {}),
     };
   });
-  const { createdEvent, ...result } = transaction.immediate();
+  const { createdEvent, continuityEvent, ...result } = transaction.immediate();
   if (createdEvent) publishCommittedInternalEvent(createdEvent);
+  if (continuityEvent) publishCommittedInternalEvent(continuityEvent);
   return result;
 }

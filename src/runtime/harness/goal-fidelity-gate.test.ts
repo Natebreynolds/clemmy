@@ -185,7 +185,7 @@ test('buildGoalFidelityPrompt: includes goal, skill, evidence, payload, and the 
   assert.match(p, /acme-outbound/);
   assert.match(p, /BYTE-IDENTICAL/);
   assert.match(p, /FAIL OPEN/);
-  assert.match(p, /DEFINING requirement/);
+  assert.match(p, /applicable framework requirement adopted by that goal/);
   assert.match(p, /exactly one verdict line/);
   assert.doesNotMatch(p, /structured verdict/);
 });
@@ -257,17 +257,16 @@ test('summarizeGoalFidelityState: exposes loaded skills and batch-uniformity evi
   assert.match(summary.evidence?.text ?? '', /BYTE-IDENTICAL/);
 });
 
-test('summarizeGoalFidelityState: renderer shortfall is inspectable before the gate blocks', () => {
+test('summarizeGoalFidelityState: a read reference does not create a deterministic producer obligation', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   seedGoal(sess.id, 'Run the lunar local audit and publish the report.');
   seedSkill(sess.id, 'lunar-local-audit', 'After gathering data, run scripts/generate-html.js to produce the report.');
 
   const summary = summarizeGoalFidelityState(sess.id, 'composio_execute_tool', sendArgs('NETLIFY_DEPLOY_SITE_PUBLISH', 'ignored@site.example', 'publish'));
-  assert.equal(summary.mode, 'renderer_block_risk');
-  assert.equal(summary.skills[0].rendererShortfall?.skill, 'lunar-local-audit');
-  assert.deepEqual(summary.skills[0].rendererShortfall?.prescribed, ['generate-html.js']);
-  assert.ok(summary.issues.some((issue) => /generate-html\.js/.test(issue)));
+  assert.equal(summary.mode, 'skill_judge_ready');
+  assert.equal(summary.skills[0].rendererShortfall, null);
+  assert.deepEqual(summary.issues, []);
 });
 
 // ─── §7.1 emails class: batch-identical opening blocks; researched allows ──
@@ -385,28 +384,58 @@ test('GoalFidelityCheckFailedError: present_for_approval message says present-an
   assert.doesNotMatch(other.message, /Good to send\?/i);
 });
 
-// ─── §7.2 renderer class: deterministic block, judge never called ──────────
-
-test('evaluateGoalFidelity: a loaded skill whose producer script never ran blocks deterministically (judge not consulted)', async () => {
+// Scope is interpreted by the existing semantic reviewer, not a bare-read floor.
+// Injected verdicts prove the real control path and complete reference inputs;
+// live model relevance is a separate qualification.
+test('evaluateGoalFidelity: unrelated rendering reference does not preempt the action reviewer', async () => {
   resetEventLog();
   _resetGoalFidelityStateForTests();
   const sess = createSession({ kind: 'chat' });
-  seedGoal(sess.id, 'Run the lunar local audit for Example Legal and publish the report.');
-  seedSkill(sess.id, 'lunar-local-audit', '## Render\nAfter gathering the data, run scripts/generate-html.js to produce the report, then publish dist/index.html.');
-  // NOTE: no run_shell_command invoked generate-html.js this session.
-
+  seedSkill(sess.id, 'lunar-local-audit', 'Run scripts/generate-html.js to produce a report.');
+  seedGoal(sess.id, 'Send Casey the status update: all three invoices have been reconciled.');
   let judged = false;
-  _setGoalFidelityJudgeForTests(async () => { judged = true; return { fulfills: true, gap: 'x' }; });
+  _setGoalFidelityJudgeForTests(async (input) => {
+    judged = true;
+    assert.match(input.goal, /three invoices/);
+    assert.match(input.skills[0].body, /generate-html/);
+    assert.equal(input.skills[0].origins?.[0].scope, 'unknown', 'unattributed reads do not adopt current scope');
+    const prompt = buildGoalFidelityPrompt(input);
+    assert.match(prompt, /reading a skill does not commit/i);
+    assert.match(prompt, /readOrigins=/);
+    return { fulfills: true, gap: 'The outgoing invoice status is exactly the accepted action; no report was requested.' };
+  });
   try {
-    const blocked = await evaluateGoalFidelity(sess.id, 'composio_execute_tool', sendArgs('NETLIFY_DEPLOY_SITE_PUBLISH', 'ignored@site.example', 'publish'));
-    assert.equal(blocked.action, 'block');
-    assert.equal(blocked.mode, 'renderer');
-    assert.equal(blocked.skill, 'lunar-local-audit');
-    assert.match(blocked.reason, /generate-html\.js/);
-    assert.equal(judged, false, 'renderer floor is deterministic — the judge is never called');
-  } finally {
-    _setGoalFidelityJudgeForTests(null);
-  }
+    const result = await evaluateGoalFidelity(sess.id, 'composio_execute_tool',
+      sendArgs(SEND, 'casey@example.test', 'All three invoices have been reconciled.'));
+    assert.equal(judged, true, 'a reference read must not block before the existing reviewer');
+    assert.equal(result.action, 'allow');
+  } finally { _setGoalFidelityJudgeForTests(null); }
+});
+
+test('evaluateGoalFidelity: an adopted framework requirement remains enforceable by the action reviewer', async () => {
+  resetEventLog();
+  _resetGoalFidelityStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  seedGoal(sess.id, 'Run the lunar local audit framework and publish its generated report for Example Legal.');
+  const body = '## Render\nRun scripts/generate-html.js to produce the report.\n'
+    + 'Full framework context.\n'.repeat(600) + 'Required final deliverable: the generated report with per-account evidence.';
+  seedSkill(sess.id, 'lunar-local-audit', body);
+  let judged = false;
+  _setGoalFidelityJudgeForTests(async (input) => {
+    judged = true;
+    assert.equal(input.skills[0].body, body);
+    assert.ok(buildGoalFidelityPrompt(input).includes(body), 'the final required step is not clipped');
+    assert.match(input.goal, /lunar local audit framework/);
+    return { fulfills: false, gap: 'The accepted framework requires the generated report; the proposed publish contains only the placeholder.' };
+  });
+  try {
+    const result = await evaluateGoalFidelity(sess.id, 'composio_execute_tool',
+      sendArgs('NETLIFY_DEPLOY_SITE_PUBLISH', 'ignored@site.example', 'publish placeholder'));
+    assert.equal(judged, true);
+    assert.equal(result.action, 'block');
+    assert.equal(result.mode, 'judge');
+    assert.match(result.reason, /requires the generated report/);
+  } finally { _setGoalFidelityJudgeForTests(null); }
 });
 
 // ─── §7.3 goal-scope class: payload exceeds the goal → judge blocks ────────

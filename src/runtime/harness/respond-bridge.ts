@@ -1,3 +1,7 @@
+import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
+import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
+import { parseTaskMode, taskModeDigest, taskModeFields } from './task-mode.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
 /**
  * respondViaHarness — the CANON-ONE-LOOP convergence bridge.
  *
@@ -124,7 +128,7 @@ import {
   exactTerminalForAcceptedSource,
   type AcceptedSourceTerminalOutcome,
 } from './accepted-source-terminal.js';
-import { clearRunInFlightAfterTerminal } from './restart-recovery.js';
+import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from './restart-recovery.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import {
   InvalidFreshTurnEngineError,
@@ -312,6 +316,26 @@ function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
  *  desktop/Discord). Unattended lanes leave it off: their callers already own
  *  report-back honesty via verifyDelivered, and an in-loop judge with no
  *  human present only burns budget arguing with itself. */
+/**
+ * Owner control: is completion review switched ON?
+ *
+ * The owner requires a feature users can turn on and off that also works with a
+ * single provider. Nothing persisted previously fed the completion judge — every
+ * `judgeCompletion` value was a compile-time literal, so the only way to be
+ * unjudged was to be on a surface that never opted in. The existing "Second
+ * opinion" switch does NOT turn completion review off; its own copy says
+ * completion judges still run.
+ *
+ * Persisted in the same .env-backed store as the judge model selection
+ * (CLEMMY_MODEL_ROLES), so on/off and which-model travel together and survive
+ * restart. Default ON preserves today's behaviour for everyone who never touches
+ * it. Disabled-by-owner is a legitimate policy, NOT a failed verification: it
+ * must never force Plan, a retry, or an unfinished result.
+ */
+export function completionReviewEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_COMPLETION_REVIEW', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
 const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judgeCompletion: boolean; honorModel?: boolean }> = {
   webhook: { kind: 'chat', judgeCompletion: true },
   cli: { kind: 'chat', judgeCompletion: true },
@@ -404,6 +428,7 @@ async function blockedPreRunResponse(
       role: 'user',
       data: {
         text: request.displayMessage ?? request.message,
+        ...taskModeFields(request.taskMode),
         ...(request.runId ? { runId: request.runId } : {}),
         ...(request.hostDirective === true ? { hostDirective: true } : {}),
         attemptId: preflightAttempt.attemptId,
@@ -795,6 +820,7 @@ async function ensureAcceptedRecoveryTurn(
     role: 'user',
     data: {
       text: displayMessage,
+      ...taskModeFields(request.taskMode),
       ...(request.runId ? { runId: request.runId } : {}),
       ...(request.hostDirective === true ? { hostDirective: true } : {}),
       attemptId: attempt.attemptId,
@@ -1090,6 +1116,8 @@ async function tryServeCompletedAnswerReplay(
   // The strict assessor repeats this check, but reaching its first await for a
   // cron/background prompt would otherwise add a microtask to unrelated work.
   const acceptedText = request.displayMessage ?? request.message;
+  if ((request.taskMode ?? acceptedTaskMode(request.sessionId, request.sourceUserSeq))?.kind === 'plan'
+    || request.taskMode?.kind === 'execute') return null;
   if (!isExplicitCompletedAnswerReplay(acceptedText)) return null;
   const authority = currentAcceptedReadAuthority(
     request.sessionId,
@@ -1395,18 +1423,39 @@ export async function respondViaHarness(
   // this). Outer desktop/Discord callers pass the same run id, so begin is
   // idempotent; background/workflow/cron callers gain exact cancellation rather
   // than a session-global poll that can jump to a newer turn.
-  const requestAttempt = beginRunAttempt(sessionId, { runId: request.runId });
-  const sourceUserEvent = recordRunAttemptUserInput(requestAttempt, {
+  const providedMode = parseTaskMode(request.taskMode);
+  const sourceMode = acceptedTaskMode(sessionId, acceptedSourceUserSeq);
+  if (acceptedSourceUserSeq !== undefined && providedMode && taskModeDigest(providedMode) !== taskModeDigest(sourceMode)) throw new Error('accepted task mode mismatch');
+  const requestedMode = providedMode ?? sourceMode;
+  const reviewedAdmission = requestedMode?.kind === 'execute' ? admitPlanExecutionBridgeSource({
+    sessionId, sourceUserSeq: acceptedSourceUserSeq, runId: request.runId, mode: requestedMode,
+    displayText: displayMessage, modelDirectiveApplied: displayMessage !== request.message, surface,
+  }) : null;
+  if (reviewedAdmission?.kind === 'joined') {
+    return { sessionId, text: 'This reviewed revision already has an execution. The existing run remains its owner; no duplicate work was started.', stoppedReason: 'awaiting-input',
+      raw: { reviewedPlanExecutionJoined: true, planExecutionRunId: reviewedAdmission.claim.executionRunId, planExecutionSessionId: reviewedAdmission.claim.sessionId, planExecutionSourceUserSeq: reviewedAdmission.claim.sourceUserSeq } };
+  }
+  const requestAttempt = reviewedAdmission?.attempt ?? beginRunAttempt(sessionId, { runId: request.runId });
+  const sourceUserEvent = reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
     turn: 1,
     role: 'user',
     data: {
       text: displayMessage,
+      ...taskModeFields(request.taskMode),
       ...(displayMessage !== request.message ? { modelDirectiveApplied: true } : {}),
       ...(request.runId ? { runId: request.runId } : {}),
       attemptId: requestAttempt.attemptId,
       source: `bridge:${surface}`,
     },
   }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
+  const durableTaskMode = parseTaskMode(sourceUserEvent.data.taskMode);
+  if (request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(durableTaskMode)) throw new Error('accepted task mode mismatch');
+  request = { ...request, taskMode: durableTaskMode };
+  if (durableTaskMode?.kind === 'execute') {
+    request = { ...request, runId: requestAttempt.runId!, message: acceptedPlanExecutionText(sessionId, sourceUserEvent.seq)!, displayMessage,
+      maxWallClockMs: request.maxWallClockMs ?? 30 * 60_000 };
+  }
+
   // Rehydrate private continuation state only from the exact durable source
   // BEFORE its first graph is persisted. A clarification answer is semantically
   // the durable A/Q/B capsule, not the bare B bytes: persisting B first and then
@@ -1768,7 +1817,7 @@ export async function respondViaHarness(
       maxWallClockMs: request.maxWallClockMs,
       maxRunTokens: request.maxRunTokens,
       runTokenBaseline: request.runTokenBaseline,
-      judgeCompletion: config.judgeCompletion,
+      judgeCompletion: config.judgeCompletion && completionReviewEnabled(),
       // A structured zero-tool result is meaningful only on an explicitly
       // decision-only surface. Never let a caller combine this opt-in with
       // undefined or non-empty tool authority and suppress effect evidence.
@@ -1843,6 +1892,8 @@ export async function respondViaHarness(
         if (!dispatch) {
           throw new Error('Harness returned dispatched without exact durable dispatch authority.');
         }
+        preserveRequestAttemptOwnership = true;
+        releaseRunInFlightAfterWorkflowTransfer(sessionId, requestAttempt.attemptId, sourceUserEvent.seq);
         return withRouteDiagnostics({
           text: composeDispatchedReplyText(sourceUserEvent, dispatch.text),
           sessionId,
@@ -2430,6 +2481,9 @@ async function respondPreferHarnessWithinRuntimeConfig(
   let key: string | null = null;
   try {
     const source = acceptedSourceIdentityForReplay(request);
+    if (source && request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(parseTaskMode(source.data.taskMode))) {
+      return responseForAcceptedSourceIdentityMismatch(surface, request);
+    }
     // source.seq is the immutable logical-turn identity. The ordinary harness
     // may rotate its physical run attempt while this promise is in flight;
     // that must not split ownership and admit a warm sibling.

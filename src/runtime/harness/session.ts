@@ -5,6 +5,7 @@ import {
   createSession,
   getSession,
   insertInternalEventInTransaction,
+  listEvents,
   openEventLog,
   publishCommittedInternalEvent,
   updateSession,
@@ -17,6 +18,7 @@ import {
   preparePersistedSessionConversationProtocol,
   type PreparedProviderConversation,
 } from './conversation-protocol-session.js';
+import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
 
 /**
  * HarnessSession — Clementine-owned conversation memory.
@@ -56,6 +58,48 @@ const META_INTERRUPT_MCP_SCOPE = '__interrupt_mcp_scope';
 // user decision while still surviving daemon restart.
 const META_RECOVERY = '__host_recovery_state';
 const META_RECOVERY_MCP_SCOPE = '__host_recovery_mcp_scope';
+/** Exact activation that owns the installed recovery blob. */
+const META_RECOVERY_OWNER = '__host_recovery_owner';
+/**
+ * The activation still RESPONSIBLE for an accepted source, independent of any
+ * checkpoint blob.
+ *
+ * The recovery blob was the wrong evidence: adoption deliberately removes it
+ * while the work continues, so sampling it told the desktop bridge that a live
+ * turn had stopped. Live 2026-09-07 source 141915 — checkpoint recovery ran
+ * 4ms before the attempt was marked completed, and the next protected child
+ * call was refused against a finished owner.
+ *
+ * Cleared in the SAME transaction as the terminal that closes the owner, so it
+ * can never outlive the work it describes.
+ */
+const META_CONTINUATION_OWNER = '__continuation_owner';
+
+/** The exact activation a recovery checkpoint belongs to. */
+export interface RecoveryOwner {
+  sourceUserSeq: number;
+  /** Distinguishes competing activations of the SAME accepted source. */
+  attemptId?: string | undefined;
+}
+
+export type RecoverySaveOutcome =
+  | { installed: true }
+  | {
+      installed: false;
+      reason:
+        /** Another activation owns the installed recovery. */
+        | 'owner_conflict'
+        /** The source already published a typed terminal. */
+        | 'source_terminalized'
+        | 'storage_failure';
+    };
+
+function recoveryOwnerToken(owner: RecoveryOwner): string {
+  return JSON.stringify({
+    sourceUserSeq: owner.sourceUserSeq,
+    attemptId: owner.attemptId ?? null,
+  });
+}
 // Restart-recovery marker: set while a runConversation is in flight, cleared in
 // a finally when it returns/throws — so ONLY a hard process death (daemon crash
 // /restart mid-run) leaves it set. The boot scan uses it to surface an
@@ -400,18 +444,234 @@ export class HarnessSession {
     });
   }
 
+  /**
+   * Install this turn's recovery checkpoint.
+   *
+   * `owner` FENCES the write to one exact activation. A source number alone
+   * does not identify an activation: two activations of the SAME source
+   * compete, and the older one was able to replace the newer one's checkpoint.
+   * The predicate is therefore exact ownership, not a numeric comparison —
+   * either nothing is installed, or the installed owner is precisely us.
+   *
+   * The write touches ONLY the recovery keys. It previously replaced the whole
+   * metadata document from a CACHED copy, so any unrelated field written after
+   * this instance loaded was silently erased.
+   *
+   * A source that already published a typed terminal owns nothing further: a
+   * late response must never revive finished work.
+   */
   saveRecoveryState(
     serialized: string,
-    options: { mcpToolScope?: McpToolScope | null } = {},
-  ): void {
-    const meta = { ...this.row.metadata };
-    meta[META_RECOVERY] = serialized;
-    if (options.mcpToolScope && typeof options.mcpToolScope.reason === 'string') {
-      meta[META_RECOVERY_MCP_SCOPE] = JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope;
-    } else {
-      delete meta[META_RECOVERY_MCP_SCOPE];
+    options: {
+      mcpToolScope?: McpToolScope | null;
+      owner?: RecoveryOwner;
+    } = {},
+  ): RecoverySaveOutcome {
+    const scope = options.mcpToolScope && typeof options.mcpToolScope.reason === 'string'
+      ? JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope
+      : null;
+    const owner = options.owner;
+    const ownerToken = owner ? recoveryOwnerToken(owner) : null;
+
+    if (owner && this.acceptedSourceHasTypedTerminal(owner.sourceUserSeq)) {
+      return { installed: false, reason: 'source_terminalized' };
     }
-    this.row = updateSession(this.row.id, { metadata: meta });
+
+    // ONE nested expression touching only our own keys. `json_set` leaves every
+    // unrelated field alone, so a concurrent writer's metadata survives. Built
+    // outward, so the textual order of the placeholders matches `bound`.
+    let expr = `json_set(metadata_json, '$.${META_RECOVERY}', ?)`;
+    const bound: unknown[] = [serialized];
+    if (ownerToken !== null) {
+      expr = `json_set(${expr}, '$.${META_RECOVERY_OWNER}', json(?))`;
+      bound.push(ownerToken);
+    }
+    if (scope) {
+      expr = `json_set(${expr}, '$.${META_RECOVERY_MCP_SCOPE}', json(?))`;
+      bound.push(JSON.stringify(scope));
+    } else {
+      expr = `json_remove(${expr}, '$.${META_RECOVERY_MCP_SCOPE}')`;
+    }
+
+    // Ownership predicate, in the SAME statement as the write.
+    //
+    // Three ways to hold the blob, and only three:
+    //   1. nothing is installed;
+    //   2. the installed owner is exactly us — an ordinary re-hold;
+    //   3. we are the session's NEWEST activation, so nothing that could still
+    //      be running has a better claim.
+    //
+    // (3) is judged by `run_attempts.started_at`, the canonical per-session
+    // activation ordering this codebase already fences run ownership with. A
+    // source number alone cannot do it: two activations of the SAME source
+    // compete. Liveness alone cannot either — a SIGKILLed attempt never
+    // records finished_at, so requiring the previous owner to be finished
+    // would deadlock every restart out of its own recovery, which is the very
+    // failure this fence exists to prevent.
+    //
+    // Taking over is therefore a claim only the newest activation can make.
+    // That covers a blob whose owner sidecar is missing or unreadable — legacy
+    // bytes, or a corrupt read — WITHOUT wedging the session: unknown ownership
+    // does not block the one activation that provably supersedes it, and it
+    // does block every stale one.
+    const ownership = ownerToken === null
+      ? ''
+      : ` AND (
+            json_extract(metadata_json, '$.${META_RECOVERY}') IS NULL
+            OR (json_extract(metadata_json, '$.${META_RECOVERY_OWNER}.sourceUserSeq') = ?
+                AND json_extract(metadata_json, '$.${META_RECOVERY_OWNER}.attemptId') IS ?)
+            OR EXISTS (
+                 SELECT 1 FROM run_attempts AS mine
+                  WHERE mine.session_id = sessions.id
+                    AND mine.attempt_id = ?
+                    AND NOT EXISTS (
+                          SELECT 1 FROM run_attempts AS newer
+                           WHERE newer.session_id = sessions.id
+                             AND newer.started_at > mine.started_at
+                        )
+               )
+          )`;
+
+    bound.push(new Date().toISOString(), this.row.id);
+    if (owner && ownerToken !== null) {
+      bound.push(owner.sourceUserSeq, owner.attemptId ?? null, owner.attemptId ?? null);
+    }
+
+    try {
+      const result = openEventLog().prepare(`
+        UPDATE sessions SET metadata_json = ${expr}, updated_at = ?
+         WHERE id = ?${ownership}
+      `).run(...bound as never[]);
+      this.refresh();
+      return result.changes === 1
+        ? { installed: true }
+        : { installed: false, reason: 'owner_conflict' };
+    } catch {
+      return { installed: false, reason: 'storage_failure' };
+    }
+  }
+
+  /**
+   * Whether one accepted source already published a TYPED terminal.
+   *
+   * Deliberately typed-only: the compatibility projection turns a legacy or
+   * corrupt row into a conservative blocked terminal so it never returns null,
+   * which would let an unreadable row fence a live activation out of its own
+   * recovery.
+   */
+  private acceptedSourceHasTypedTerminal(sourceUserSeq: number): boolean {
+    if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return false;
+    try {
+      const source = listEvents(this.row.id, { types: ['user_input_received'] })
+        .find((candidate) => candidate.seq === sourceUserSeq);
+      if (!source) return false;
+      return resolveExactTerminalForAcceptedSource(source).kind === 'terminal';
+    } catch {
+      // An unreadable eventlog is not proof of a terminal. Refusing here would
+      // deny a live activation its own checkpoint on a transient read failure.
+      return false;
+    }
+  }
+
+  /**
+   * Does the DURABLY installed recovery belong to this exact activation?
+   *
+   * The desktop bridge asks before finishing its run attempt. A held turn whose
+   * recovery owner is armed must keep its attempt live: every later child lease
+   * names that attempt, and `isDispatchLeaseCurrent` correctly refuses any
+   * lineage whose bound attempt has finished. Live 2026-09-07 source 140867 —
+   * the attempt was finished at 02:41:24.777 while its own scheduled recovery
+   * ran on, and fifteen consecutive calls were refused
+   * `child_lease_activation_failed` before the owner was asked to retype the
+   * request. The board never changed.
+   *
+   * Positive evidence only: no sidecar, unreadable metadata, or a different
+   * owner all answer false, so a turn can never claim "held with recovery
+   * armed" without an actual owner and checkpoint behind it.
+   */
+  recoveryOwnedByActivation(owner: { sourceUserSeq: number; attemptId?: string | undefined }): boolean {
+    try {
+      const row = openEventLog().prepare(
+        `SELECT json_extract(metadata_json, '$.${META_RECOVERY}') AS blob,
+                json_extract(metadata_json, '$.${META_RECOVERY_OWNER}.sourceUserSeq') AS src,
+                json_extract(metadata_json, '$.${META_RECOVERY_OWNER}.attemptId') AS att
+           FROM sessions WHERE id = ?`,
+      ).get(this.row.id) as { blob?: unknown; src?: unknown; att?: unknown } | undefined;
+      if (!row || typeof row.blob !== 'string' || !row.blob) return false;
+      if (row.src !== owner.sourceUserSeq) return false;
+      return (row.att ?? null) === (owner.attemptId ?? null);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Claim continuation responsibility for one exact activation. Idempotent;
+   * a newer source's claim replaces an older one's.
+   */
+  claimContinuationOwner(owner: { sourceUserSeq: number; attemptId?: string | undefined }): boolean {
+    try {
+      const result = openEventLog().prepare(`
+        UPDATE sessions
+           SET metadata_json = json_set(metadata_json, '$.${META_CONTINUATION_OWNER}', json(?)),
+               updated_at = ?
+         WHERE id = ?
+           AND COALESCE(json_extract(metadata_json, '$.${META_CONTINUATION_OWNER}.sourceUserSeq'), 0) <= ?
+      `).run(
+        JSON.stringify({ sourceUserSeq: owner.sourceUserSeq, attemptId: owner.attemptId ?? null }),
+        new Date().toISOString(),
+        this.row.id,
+        owner.sourceUserSeq,
+      );
+      this.refresh();
+      return result.changes === 1;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Is this activation still responsible for the turn?
+   *
+   * `unreadable` is deliberately distinct from `absent`: a metadata read
+   * failure is not evidence that execution stopped, and the caller must not
+   * treat it as permission to finish the owner.
+   */
+  continuationOwnerState(
+    owner: { sourceUserSeq: number; attemptId?: string | undefined },
+  ): 'ours' | 'other' | 'absent' | 'unreadable' {
+    let row: { src?: unknown; att?: unknown } | undefined;
+    try {
+      row = openEventLog().prepare(
+        `SELECT json_extract(metadata_json, '$.${META_CONTINUATION_OWNER}.sourceUserSeq') AS src,
+                json_extract(metadata_json, '$.${META_CONTINUATION_OWNER}.attemptId') AS att
+           FROM sessions WHERE id = ?`,
+      ).get(this.row.id) as { src?: unknown; att?: unknown } | undefined;
+    } catch {
+      return 'unreadable';
+    }
+    if (!row) return 'unreadable';
+    if (row.src === null || row.src === undefined) return 'absent';
+    if (row.src !== owner.sourceUserSeq) return 'other';
+    return (row.att ?? null) === (owner.attemptId ?? null) ? 'ours' : 'other';
+  }
+
+  /** Release continuation responsibility held by this exact activation. */
+  releaseContinuationOwner(owner: { sourceUserSeq: number; attemptId?: string | undefined }): boolean {
+    try {
+      const result = openEventLog().prepare(`
+        UPDATE sessions
+           SET metadata_json = json_remove(metadata_json, '$.${META_CONTINUATION_OWNER}'),
+               updated_at = ?
+         WHERE id = ?
+           AND json_extract(metadata_json, '$.${META_CONTINUATION_OWNER}.sourceUserSeq') = ?
+           AND json_extract(metadata_json, '$.${META_CONTINUATION_OWNER}.attemptId') IS ?
+      `).run(new Date().toISOString(), this.row.id, owner.sourceUserSeq, owner.attemptId ?? null);
+      this.refresh();
+      return result.changes === 1;
+    } catch {
+      return false;
+    }
   }
 
   loadRecoveryState(): string | null {
@@ -431,12 +691,45 @@ export class HarnessSession {
     }
   }
 
-  clearRecoveryState(): void {
-    if (!(META_RECOVERY in this.row.metadata) && !(META_RECOVERY_MCP_SCOPE in this.row.metadata)) return;
-    const meta = { ...this.row.metadata };
-    delete meta[META_RECOVERY];
-    delete meta[META_RECOVERY_MCP_SCOPE];
-    this.row = updateSession(this.row.id, { metadata: meta });
+  /**
+   * Clear the recovery blob.
+   *
+   * `expectedSerialized` retires EXACTLY those bytes: retiring a superseded
+   * owner must never erase a blob another source installed in the interim. An
+   * unconditional clear is still available for the in-flight paths that own the
+   * turn they are clearing.
+   */
+  clearRecoveryState(expectedSerialized?: string): boolean {
+    const updatedAt = new Date().toISOString();
+    const removal = `metadata_json = json_remove(metadata_json, '$.${META_RECOVERY}', '$.${META_RECOVERY_MCP_SCOPE}', '$.${META_RECOVERY_OWNER}')`;
+    let changes = 0;
+    try {
+      const db = openEventLog();
+      // The condition lives in the STATEMENT, so the compare and the swap are
+      // one durable step. Comparing cached metadata first and updating after
+      // left a window in which a concurrent install was silently erased, and
+      // reported success either way.
+      const result = expectedSerialized === undefined
+        ? db.prepare(`
+            UPDATE sessions SET ${removal}, updated_at = ?
+             WHERE id = ?
+               AND (json_extract(metadata_json, '$.${META_RECOVERY}') IS NOT NULL
+                 OR json_extract(metadata_json, '$.${META_RECOVERY_MCP_SCOPE}') IS NOT NULL)
+          `).run(updatedAt, this.row.id)
+        : db.prepare(`
+            UPDATE sessions SET ${removal}, updated_at = ?
+             WHERE id = ?
+               AND json_extract(metadata_json, '$.${META_RECOVERY}') = ?
+          `).run(updatedAt, this.row.id, expectedSerialized);
+      changes = result.changes;
+    } catch {
+      // A storage failure retires nothing. Reporting false keeps the caller on
+      // the ownership-preserving branch instead of announcing a retirement
+      // that never reached the database.
+      return false;
+    }
+    this.refresh();
+    return changes === 1;
   }
 
   /**

@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { Pin, MoreVertical, Pencil, Tag, Archive, ArchiveRestore, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { StatusPill } from '@/components/ui/StatusPill';
 import { originMeta } from '../lib/origin';
 import { stripInlineMarkdown } from '@/lib/markdown-text';
+import { deleteConfirmText, isRunKind, runRowTiming, runStatusMeta } from '@/lib/run-presentation';
 import type { Session } from '../types';
 
 /** One-line preview hygiene: previews are raw (server-truncated) message text.
@@ -40,6 +42,12 @@ export function ConversationListItem({ session, actions }: { session: Session; a
   const [draft, setDraft] = useState(session.title);
   const menuRef = useRef<HTMLDivElement>(null);
   const meta = originMeta(session.origin);
+  // A run row answers a different question than a chat row: not "what was said
+  // last" but "how did it go, and when did it stop". Same rail, same origin
+  // vocabulary, different second line.
+  const isRun = isRunKind(session.kind);
+  const status = runStatusMeta(session.status);
+  const timing = runRowTiming(session, Date.now());
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -93,15 +101,24 @@ export function ConversationListItem({ session, actions }: { session: Session; a
             />
           ) : (
             <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">
-              {session.title || 'New chat'}
+              {session.title || (isRun ? 'Run' : 'New chat')}
             </span>
           )}
-          <span className="shrink-0 text-caption text-faint">{relativeTime(session.updatedAt)}</span>
-        </div>
-        <div className="mt-0.5 flex items-center gap-2 pr-6">
-          <span className="min-w-0 flex-1 truncate text-caption text-muted">
-            {stripMarkdown(session.preview) || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
+          <span className="shrink-0 text-caption text-faint">
+            {isRun ? timing.text : relativeTime(session.updatedAt)}
           </span>
+        </div>
+        <div className="mt-1 flex items-center gap-1.5 pr-6">
+          {isRun ? (
+            <>
+              <StatusPill tone={status.tone} className="shrink-0">{status.label}</StatusPill>
+              <span className="min-w-0 truncate text-caption text-muted">{meta.label}</span>
+            </>
+          ) : (
+            <span className="min-w-0 flex-1 truncate text-caption text-muted">
+              {stripMarkdown(session.preview) || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
+            </span>
+          )}
         </div>
         {session.tags.length > 0 && (
           <div className="mt-1 flex flex-wrap gap-1">
@@ -116,7 +133,7 @@ export function ConversationListItem({ session, actions }: { session: Session; a
       <div ref={menuRef} className="absolute right-1.5 top-1.5">
         <button
           type="button"
-          aria-label="Conversation actions"
+          aria-label={`${isRun ? 'Run' : 'Conversation'} actions`}
           onClick={(e) => { e.preventDefault(); setMenuOpen((v) => !v); }}
           className="rounded-sm p-1 text-faint opacity-0 transition-opacity hover:bg-hover hover:text-fg group-hover:opacity-100 focus:opacity-100"
         >
@@ -142,7 +159,7 @@ export function ConversationListItem({ session, actions }: { session: Session; a
               danger
               onClick={() => {
                 setMenuOpen(false);
-                if (window.confirm('Delete this conversation? This cannot be undone.')) actions.onDelete(session.id);
+                if (window.confirm(deleteConfirmText(session))) actions.onDelete(session.id);
               }}
             />
           </div>

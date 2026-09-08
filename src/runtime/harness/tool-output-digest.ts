@@ -106,12 +106,14 @@ export function resolveDominantArray(value: unknown): { rows: unknown[]; path: s
 const STRUCTURED_PROJECTION_META_KEY = '__clementine';
 const MAX_STRUCTURED_PROJECTION_KEYS = 64;
 const MAX_STRUCTURED_PROJECTION_ITEMS = 64;
-const MIN_JSON_VALUE_CHARS = 4; // `null`
+const MIN_JSON_VALUE_CHARS = 4; // minimum allocation unit, never a substitute value
+const OMITTED_JSON_VALUE = Symbol('omitted_json_value');
 
 interface StructuredProjectionStats {
   clippedStrings: number;
   omittedArrayItems: number;
   omittedObjectKeys: number;
+  omittedValues: number;
 }
 
 export interface StructuredJsonToolOutputOptions extends DigestOptions {
@@ -119,6 +121,7 @@ export interface StructuredJsonToolOutputOptions extends DigestOptions {
    * than appended as prose so the projection remains parseable. */
   exactOutputReceipt: string;
   resourceIndex?: string;
+  hostAnnotations?: readonly string[];
 }
 
 function jsonChars(value: unknown): number {
@@ -165,7 +168,7 @@ function allocateJsonBudgets(sizes: number[], available: number): number[] {
 function compactJsonString(value: string, budget: number, stats: StructuredProjectionStats): unknown {
   const serialized = JSON.stringify(value);
   if (serialized.length <= budget) return value;
-  if (budget < MIN_JSON_VALUE_CHARS) return null;
+  if (budget < MIN_JSON_VALUE_CHARS) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
 
   const marker = `…[${value.length} chars total]`;
   let low = 0;
@@ -182,7 +185,8 @@ function compactJsonString(value: string, budget: number, stats: StructuredProje
     }
   }
   stats.clippedStrings += 1;
-  return best ?? null;
+  if (best === null) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
+  return best;
 }
 
 function compactJsonValue(
@@ -191,11 +195,20 @@ function compactJsonValue(
   stats: StructuredProjectionStats,
   depth = 0,
 ): unknown {
-  if (budget < MIN_JSON_VALUE_CHARS || depth > 12) return null;
   const fullSize = jsonChars(value);
+  // The allocator gives already-fitting scalar values their exact size. A
+  // one-digit number or empty string needs fewer bytes than the `null`
+  // placeholder: admit the real value before considering that placeholder.
   if (fullSize <= budget) return value;
+  if (budget < MIN_JSON_VALUE_CHARS || depth > 12) {
+    stats.omittedValues += 1;
+    return OMITTED_JSON_VALUE;
+  }
   if (typeof value === 'string') return compactJsonString(value, budget, stats);
-  if (value === null || typeof value !== 'object') return null;
+  if (value === null || typeof value !== 'object') {
+    stats.omittedValues += 1;
+    return OMITTED_JSON_VALUE;
+  }
 
   if (Array.isArray(value)) {
     const maximum = Math.min(value.length, MAX_STRUCTURED_PROJECTION_ITEMS);
@@ -206,13 +219,23 @@ function compactJsonValue(
       shown -= 1;
     }
     stats.omittedArrayItems += value.length - shown;
-    if (shown === 0) return [];
+    if (shown === 0) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
     const overhead = 2 + Math.max(0, shown - 1);
     const sizes = value.slice(0, shown).map(jsonChars);
     const budgets = allocateJsonBudgets(sizes, budget - overhead);
-    return value.slice(0, shown).map((entry, index) => (
-      compactJsonValue(entry, budgets[index]!, stats, depth + 1)
-    ));
+    const compact: unknown[] = [];
+    for (let index = 0; index < shown; index += 1) {
+      const entry = compactJsonValue(value[index], budgets[index]!, stats, depth + 1);
+      // JSON arrays cannot express a hole without inventing null or shifting
+      // source indices. Retain a contiguous prefix and report the suffix as
+      // omitted; callers can query the original at its unchanged offsets.
+      if (entry === OMITTED_JSON_VALUE) {
+        stats.omittedArrayItems += shown - index;
+        break;
+      }
+      compact.push(entry);
+    }
+    return compact.length > 0 ? compact : OMITTED_JSON_VALUE;
   }
 
   const record = value as Record<string, unknown>;
@@ -230,7 +253,7 @@ function compactJsonValue(
     keys = keys.slice(0, -1);
   }
   stats.omittedObjectKeys += originalKeys.length - keys.length;
-  if (keys.length === 0) return {};
+  if (keys.length === 0) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
   const overhead = 2
     + Math.max(0, keys.length - 1)
     + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
@@ -239,9 +262,11 @@ function compactJsonValue(
   const compact: Record<string, unknown> = {};
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
-    compact[key] = compactJsonValue(record[key], budgets[index]!, stats, depth + 1);
+    const entry = compactJsonValue(record[key], budgets[index]!, stats, depth + 1);
+    if (entry === OMITTED_JSON_VALUE) stats.omittedObjectKeys += 1;
+    else compact[key] = entry;
   }
-  return compact;
+  return Object.keys(compact).length > 0 ? compact : OMITTED_JSON_VALUE;
 }
 
 /**
@@ -261,21 +286,26 @@ export function compactStructuredJsonToolOutput(
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
+  const projectionSemantics = 'Omitted fields and array suffixes are unavailable in this view, not null or empty source values. Arrays retain original prefix order.';
   const fullMetadata = {
     kind: 'structured_projection_v1',
     truncated: true,
+    projectionSemantics,
     rawChars: text.length,
     recovery: callId ? {
       tool_output_query: { call_id: callId, limit: 50 },
       recall_tool_result: { call_id: callId },
     } : undefined,
     resourceIndex: options.resourceIndex || undefined,
+    ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}),
     receipt: options.exactOutputReceipt,
   };
   const metadataCandidates: Array<Record<string, unknown>> = [
     fullMetadata,
-    { kind: 'structured_projection_v1', receipt: options.exactOutputReceipt },
-    { receipt: options.exactOutputReceipt },
+    { kind: 'structured_projection_v1', truncated: true, projectionSemantics, receipt: options.exactOutputReceipt,
+      ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) },
+    { truncated: true, projectionSemantics, receipt: options.exactOutputReceipt,
+      ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) },
   ];
 
   for (const metadataBase of metadataCandidates) {
@@ -289,11 +319,13 @@ export function compactStructuredJsonToolOutput(
         clippedStrings: 0,
         omittedArrayItems: 0,
         omittedObjectKeys: 0,
+        omittedValues: 0,
       };
-      const projected = compactJsonValue(parsed, payloadBudget, stats);
+      const value = compactJsonValue(parsed, payloadBudget, stats);
+      const projected = value === OMITTED_JSON_VALUE ? {} : value;
       if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
       const metadata = metadataBase === fullMetadata
-        ? { ...metadataBase, projection: stats }
+        ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats }
         : metadataBase;
       const output = JSON.stringify({
         ...(projected as Record<string, unknown>),

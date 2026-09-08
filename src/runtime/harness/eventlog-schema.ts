@@ -1,6 +1,8 @@
+import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.js';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
+import { SESSION_HISTORY_SEARCH_SCHEMA_V1 } from './session-history-search-schema.js';
 import {
   PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
   PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
@@ -11174,6 +11176,28 @@ const MIGRATIONS: EventLogMigration[] = [
         WHERE type IN ('external_write_succeeded', 'external_write_failed')
           AND json_extract(data_json, '$.decisiveProjectionKey') IS NOT NULL;
     `,
+  },
+  {
+    // v78: global recovery/learning cursors filter by event type before seq.
+    // Session-leading indexes cannot serve that prefix; the 15s workflow
+    // recovery timer otherwise scans every large event payload even when it
+    // has no pending batches. Preserve the exact queries and recovery scope.
+    version: 78,
+    sql: `CREATE INDEX IF NOT EXISTS idx_events_type_seq ON events(type, seq);`,
+  },
+  { version: 79, sql: SESSION_HISTORY_SEARCH_SCHEMA_V1 },
+  {
+    version: 80,
+    sql: '',
+    backfill: (db) => {
+      const columns = db.prepare('PRAGMA table_info(discovery_governor_tasks)').all() as Array<{ name: string }>;
+      if (columns.length === 0) return; // Sparse historical upgrade rehearsal.
+      if (!columns.some((column) => column.name === 'claim_key_version')) {
+        db.exec('ALTER TABLE discovery_governor_tasks ADD COLUMN claim_key_version INTEGER NOT NULL DEFAULT 0 CHECK (claim_key_version IN (0, 1))');
+      }
+      // Existing sources remain version 0. Only new runtime admission selects v1.
+      db.exec(DISCOVERY_REQUEST_CALLS_SCHEMA_V1);
+    },
   },
 ];
 

@@ -86,7 +86,7 @@ function utf8(value: string): number {
   return Buffer.byteLength(value, 'utf8');
 }
 
-function canonicalWorkspaceJson(value: unknown): string {
+export function canonicalWorkspaceJson(value: unknown): string {
   let nodes = 0;
   const visit = (input: unknown, depth: number): string => {
     nodes += 1;
@@ -127,6 +127,19 @@ function canonicalWorkspaceJson(value: unknown): string {
 /** Exact digest used by the Workspace observation blob store. */
 export function workspaceDataContentDigest(value: unknown): string {
   return sha256(canonicalWorkspaceJson(value));
+}
+
+/** Extract only the declared dataset carrier field. The caller must first
+ * authenticate the successful host settlement and workspace_observation
+ * contract, then validate this string with the canonical host receipt parser. */
+export function workspaceDatasetHostFileCommit(result: unknown): string | undefined {
+  let value = result;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const commit = (value as Record<string, unknown>).hostFileCommit;
+  return typeof commit === 'string' ? commit : undefined;
 }
 
 function exactArguments(value: unknown): WorkspaceSetDataArguments {

@@ -200,14 +200,20 @@ export function resolveActiveTaskContext(
   if (!suppressPriorTask) {
     try {
       const snapshot = getFocusSnapshot(PARKED_FOCUS_LIMIT);
-      parked = snapshot.parked.slice(0, PARKED_FOCUS_LIMIT).map(projectParkedFocus);
+      parked = snapshot.parked
+        .filter((row) => !focusSummaryIsHistoricalForRequest(row, opts.input, sessionId))
+        .slice(0, PARKED_FOCUS_LIMIT).map(projectParkedFocus);
       if (snapshot.active) {
-        const disposition: ActiveTaskFocusDisposition = snapshot.needsConfirm
+        const historical = focusSummaryIsHistoricalForRequest(snapshot.active, opts.input, sessionId);
+        const disposition: ActiveTaskFocusDisposition = historical
+          ? 'historical'
+          : snapshot.needsConfirm
           ? 'stale'
-          : focusSummaryIsHistoricalForRequest(snapshot.active, opts.input, sessionId)
-            ? 'historical'
-            : 'active';
-        focus = projectFocus(snapshot.active, disposition);
+          : 'active';
+        // A stale focus from another conversation cannot resolve "these" in
+        // this one. Even its title can substitute the wrong task (five old
+        // drafts replaced three current drafts after a mobile session split).
+        if (!(historical && snapshot.needsConfirm)) focus = projectFocus(snapshot.active, disposition);
       }
     } catch {
       // Focus corruption must not hide an independently valid session goal.

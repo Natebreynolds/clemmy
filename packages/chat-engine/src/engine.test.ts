@@ -1,3 +1,5 @@
+import { createPendingMessageStore } from './pending-request.js';
+import { readTaskMode, checkedPlanArtifactResponse, canExecuteReviewedPlan, type TaskMode } from './task-mode.js';
 /**
  * Run: npx tsx --test packages/chat-engine/src/engine.test.ts
  *
@@ -468,7 +470,9 @@ test('reduceActivity: batch meter, deliverables roll-up, external write phrasing
   activity = reduceActivity(activity, ev(3, 'deliverable_saved', { name: 'brief.md' }));
   activity = reduceActivity(activity, ev(4, 'deliverable_saved', { name: 'notes.md' }));
   assert.ok(activity.some((a) => a.label === 'Saved 2 files · latest notes.md'));
-  activity = reduceActivity(activity, ev(5, 'external_write', { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], irreversible: true }));
+  activity = reduceActivity(activity, ev(5, 'external_write', { callId: 'mail-write', shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], irreversible: true }));
+  assert.ok(activity.some((a) => a.label === 'Sending a message to a@b.co' && a.status === 'running'));
+  activity = reduceActivity(activity, ev(6, 'external_write_succeeded', { callId: 'mail-write', targets: ['a@b.co'] }));
   assert.ok(activity.some((a) => a.label === 'Sent a message to a@b.co'));
 });
 
@@ -497,4 +501,106 @@ test('renderMarkdown activates only the exact validated mobile Workspace handoff
   ]) {
     assert.doesNotMatch(renderMarkdown(unsafe), /<a /);
   }
+});
+
+
+test('typed Plan and Execute modes preserve exact request bytes, reject mode-changing steering, and survive replay', async () => {
+  const transport = new FakeTransport();
+  const sent: unknown[] = [];
+  const mode: TaskMode = { version: 1, kind: 'plan' };
+  const ref = { planId: 'plan-review', revision: 2, digest: 'a'.repeat(64) };
+  const engine = new ChatEngine({ transport, newIdempotencyKey: () => 'same-plan-key', api: {
+    send: async input => { sent.push(structuredClone(input)); return { sessionId: 'plan-session', accepted: true }; },
+    loadSession: async () => ({ events: [], latestSeq: 0 }),
+  } });
+  try {
+    await engine.send('Investigate the workflow and workspace edits.', mode);
+    await wait(10);
+    assert.deepEqual(engine.snapshot().activeTaskMode, mode);
+    await assert.rejects(engine.send('Execute', { version: 1, kind: 'execute', executeRef: ref }), /current turn/);
+    await assert.rejects(engine.send('Change mode', { version: 1, kind: 'normal' }), /current turn/);
+    assert.equal(sent.length, 1, 'Execute cannot become steering or a second active request');
+    transport.live!.onEvent(ev(10, 'user_input_received', { text: 'Investigate the workflow and workspace edits.', taskMode: mode }));
+    transport.live!.onEvent(ev(11, 'plan_revision_published', { artifact: { ...ref, sourceUserSeq: 10 } }));
+    assert.deepEqual(engine.snapshot().messages.find(message => message.role === 'assistant')?.planArtifactRef, ref);
+    transport.live!.onEvent(ev(12, 'conversation_completed', { sourceUserSeq: 10, reply: 'Review the full plan before Execute.', planArtifactRef: ref }));
+    assert.equal(engine.snapshot().busy, false);
+    await engine.send('Execute reviewed revision 2', { version: 1, kind: 'execute', executeRef: ref });
+    ref.revision = 99;
+    assert.equal((sent[1] as { taskMode: { executeRef: { revision: number } } }).taskMode.executeRef.revision, 2, 'request owns a copied exact revision');
+    assert.equal(engine.snapshot().activeTaskMode?.kind, 'execute');
+  } finally { engine.dispose(); }
+  const exact = { ...ref, revision: 2 };
+  const reopened = foldTranscript([
+    ev(10, 'user_input_received', { text: 'Investigate.', taskMode: mode }),
+    ev(11, 'plan_revision_published', { artifact: { ...exact, sourceUserSeq: 10 } }),
+    ev(12, 'conversation_completed', { sourceUserSeq: 10, reply: 'Full plan ready to review.' }),
+  ]);
+  assert.deepEqual(reopened.at(-1)?.planArtifactRef, exact);
+  assert.deepEqual(reopened.at(-1)?.taskMode, mode);
+});
+
+test('offline Execute survives storage and reopen with original session, key, and revision', async () => {
+  const values = new Map<string, string>();
+  const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
+  const store = createPendingMessageStore(storage, 'pending');
+  const mode: TaskMode = { version: 1, kind: 'execute', executeRef: { planId: 'plan-1', revision: 4, digest: 'b'.repeat(64) } };
+  store.save([{ id: 'pending-exact', role: 'user', text: 'Execute this reviewed revision', taskMode: mode,
+    pending: 'sending', idempotencyKey: 'uncertain-202', requestSessionId: null }]);
+  const sent: unknown[] = [];
+  const engine = new ChatEngine({ transport: new FakeTransport(), pendingStore: store, sessionId: 'reopened-conversation', api: {
+    send: async input => { sent.push(input); return { sessionId: 'accepted-branch', accepted: true }; },
+    loadSession: async () => ({ events: [ev(1, 'user_input_received', { text: 'Earlier turn' }), ev(2, 'conversation_completed', { reply: 'Earlier answer' })], latestSeq: 2 }),
+  } });
+  try {
+    await engine.open();
+    assert.equal(engine.snapshot().messages.find(message => message.id === 'pending-exact')?.pending, 'failed');
+    await engine.retry('pending-exact');
+    assert.deepEqual(sent, [{ message: 'Execute this reviewed revision', sessionId: null, idempotencyKey: 'uncertain-202', taskMode: mode }]);
+    assert.equal(values.has('pending'), false, 'observed acceptance removes the outbox identity');
+  } finally { engine.dispose(); }
+});
+
+test('a reopened active Plan retains its mode and failed steering never creates another turn', async () => {
+  const transport = new FakeTransport();
+  const sent: unknown[] = [];
+  const engine = new ChatEngine({ transport, sessionId: 'plan-running', pendingStore: {
+    load: () => [{ id: 'steer', role: 'user', text: 'Add the dependency check', pending: 'failed', steer: 'failed', requestSessionId: 'plan-running', idempotencyKey: 'steer-key' }], save: () => {},
+  }, api: {
+    send: async input => { sent.push(input); return { sessionId: 'plan-running', accepted: false, steered: true }; },
+    loadSession: async () => ({ events: [ev(3, 'user_input_received', { text: 'Investigate', taskMode: { version: 1, kind: 'plan' } })], latestSeq: 3 }),
+  } });
+  try {
+    await engine.open();
+    assert.equal(engine.snapshot().activeTaskMode?.kind, 'plan');
+    const before = engine.snapshot().messages.filter(message => message.role === 'assistant').length;
+    await engine.retry('steer');
+    assert.equal((sent[0] as { steerOnly: boolean }).steerOnly, true);
+    assert.equal('taskMode' in (sent[0] as object), false, 'steering inherits accepted mode without sending another mode declaration');
+    assert.equal(engine.snapshot().messages.filter(message => message.role === 'assistant').length, before);
+    assert.equal(engine.snapshot().busy, true);
+    await engine.send('Keep the workspace edits in scope', { version: 1, kind: 'plan' });
+    assert.equal('taskMode' in (sent[1] as object), false);
+    assert.equal(engine.snapshot().activeTaskMode?.kind, 'plan');
+  } finally { engine.dispose(); }
+});
+
+test('review requires complete exact artifact; stale revision stays explicit and malformed modes fail closed', () => {
+  const ref = { planId: 'plan-full', revision: 1, digest: 'c'.repeat(64) };
+  const fullText = 'Step and dependency detail. '.repeat(1000) + 'EXACT END';
+  const artifact = { ...ref, version: 1, sessionId: 's', fullText, readiness: 'ready', missingPrerequisites: [], createdAt: 'now' };
+  const checked = checkedPlanArtifactResponse({ artifact, latest: { ...ref, revision: 2, digest: 'd'.repeat(64) } }, ref);
+  assert.equal(checked.artifact.fullText, fullText, 'no preview truncation');
+  assert.equal(checked.latest.revision, 2, 'newer revision is disclosed, never substituted for reviewed content');
+  assert.equal(canExecuteReviewedPlan(checked, ref), false, 'stale reviewed revision cannot execute');
+  assert.equal(canExecuteReviewedPlan(checked, checked.latest), false, 'new selection cannot borrow the previously loaded full text');
+  const current = { ...checked, latest: ref };
+  assert.equal(canExecuteReviewedPlan(current, ref), true);
+  assert.equal(canExecuteReviewedPlan({ ...current, artifact: { ...current.artifact, readiness: 'needs_input' } }, ref), false);
+  assert.equal(canExecuteReviewedPlan({ ...current, execution: { executionRunId: 'already-claimed' } }, ref), false);
+  assert.throws(() => checkedPlanArtifactResponse({ artifact: { ...artifact, revision: 2 }, latest: ref }, ref), /could not be verified/);
+  assert.throws(() => checkedPlanArtifactResponse({ artifact: { ...artifact, fullText: '' }, latest: ref }, ref));
+  assert.equal(readTaskMode({ version: 1, kind: 'execute', executeRef: { ...ref, grant: 'all' } }), undefined);
+  assert.equal(readTaskMode({ version: 1, kind: 'plan', approved: true }), undefined);
+  assert.equal(readTaskMode('plan'), undefined);
 });

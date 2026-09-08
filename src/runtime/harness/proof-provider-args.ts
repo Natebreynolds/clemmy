@@ -34,6 +34,50 @@ function propertyType(property: Record<string, unknown> | undefined): string {
   return typeof property?.type === 'string' ? property.type : '';
 }
 
+/** The proof path remains closed unless the selected schema explicitly owns
+ * an extension shape. Such a shape is provider DATA, not permission to choose
+ * an operation/account/effect. Named and patterned constraints both apply. */
+function providerPropertySchemas(
+  schema: Record<string, unknown>,
+  key: string,
+): Array<Record<string, unknown> | true> | null {
+  const constraints: Array<Record<string, unknown> | true> = [];
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  const add = (child: unknown): boolean => {
+    if (child === true) constraints.push(true);
+    else if (isRecord(child)) constraints.push(child);
+    else return false;
+    return true;
+  };
+  if (Object.prototype.hasOwnProperty.call(properties, key) && !add(properties[key])) return null;
+  if (isRecord(schema.patternProperties)) {
+    for (const [pattern, child] of Object.entries(schema.patternProperties)) {
+      try {
+        if (new RegExp(pattern).test(key) && !add(child)) return null;
+      } catch { return null; }
+    }
+  }
+  if (constraints.length > 0) return constraints;
+  if (schema.additionalProperties === true) return [true];
+  if (isRecord(schema.additionalProperties)) return [schema.additionalProperties];
+  return null;
+}
+
+function isProviderJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isProviderJsonValue);
+  return isRecord(value) && Object.values(value).every(isProviderJsonValue);
+}
+
+function matchesProviderProperty(value: unknown, schemas: Array<Record<string, unknown> | true>): boolean {
+  return schemas.every((schema) => schema === true
+    ? isProviderJsonValue(value)
+    : Object.keys(schema).length === 0
+      ? isProviderJsonValue(value)
+      : providerReadyValueMatchesSchema(value, schema));
+}
+
 function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, unknown> | undefined): boolean {
   if (!schema) return false;
   if (value === null && schema.nullable === true) return true;
@@ -62,15 +106,12 @@ function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, 
     }
     case 'object': {
       if (!isRecord(value)) return false;
-      const { required, properties } = schemaShape(schema);
+      const { required } = schemaShape(schema);
       if (required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return false;
-      // Exact passthrough is deliberately stricter than ordinary provider
-      // validation: every key, including nested keys, must be named by the
-      // selected schema. Open/extension shapes take the semantic fallback.
-      return Object.entries(value).every(([key, child]) => (
-        Object.prototype.hasOwnProperty.call(properties, key)
-        && providerReadyValueMatchesSchema(child, properties[key])
-      ));
+      return Object.entries(value).every(([key, child]) => {
+        const constraints = providerPropertySchemas(schema, key);
+        return constraints !== null && matchesProviderProperty(child, constraints);
+      });
     }
     case '':
       // A declared but untyped scalar can cross; an unresolved object/array
@@ -373,11 +414,18 @@ export function collectProviderSchemaFailures(
         }
       }
       for (const [key, child] of Object.entries(value)) {
-        if (!hasOwn(properties, key)) {
+        const constraints = providerPropertySchemas(schema, key);
+        if (constraints === null) {
           push({ path: childPointer(pointer, key), code: 'unknown_field' });
           continue;
         }
-        collectProviderSchemaFailures(child, properties[key], childPointer(pointer, key), out, budget);
+        for (const constraint of constraints) {
+          if (constraint === true || Object.keys(constraint).length === 0) {
+            if (!isProviderJsonValue(child)) push({ path: childPointer(pointer, key), code: 'type_mismatch', expected: 'JSON value' });
+          } else {
+            collectProviderSchemaFailures(child, constraint, childPointer(pointer, key), out, budget);
+          }
+        }
       }
       return;
     }
@@ -471,14 +519,12 @@ export function validateProofProviderArguments(input: {
   const missingRequiredFields = required.filter((key) => (
     !Object.prototype.hasOwnProperty.call(payload, key)
   ));
-  const unknownFields = Object.keys(payload).filter((key) => (
-    !Object.prototype.hasOwnProperty.call(properties, key)
-  ));
+  const unknownFields = Object.keys(payload).filter((key) => providerPropertySchemas(input.schema, key) === null);
   const invalidFields = Object.entries(payload)
-    .filter(([key, value]) => (
-      Object.prototype.hasOwnProperty.call(properties, key)
-      && !providerReadyValueMatchesSchema(value, properties[key])
-    ))
+    .filter(([key, value]) => {
+      const constraints = providerPropertySchemas(input.schema, key);
+      return constraints !== null && !matchesProviderProperty(value, constraints);
+    })
     .map(([key]) => key);
   const fieldsTruncated = [required, allAllowed, missingRequiredFields, unknownFields, invalidFields]
     .some((fields) => fields.length > MAX_REPAIR_FIELDS);

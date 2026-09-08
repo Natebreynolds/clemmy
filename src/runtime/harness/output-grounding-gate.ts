@@ -406,7 +406,16 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
     if (!verdict) throw new InvalidVerdict(`output-grounding judge returned no GROUNDED/CONTRADICTED/UNVERIFIABLE verdict (got: ${raw.slice(0, 120)})`);
     return verdict;
   };
-  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  // An honoured EXACT judge pin must be given a deadline it can meet. Without
+  // this the routing carried timeoutMs and nothing consumed it, so a deliberately
+  // chosen flagship judge still raced the 25s cheap-checker default and timed out
+  // into fail-open — the 2026-07-07/07-08 shape, and indistinguishable to the
+  // owner from "the flagship judged and agreed".
+  const raced = await withJudgeHedge(
+    attempt(routing),
+    hedgeRouting ? attempt(hedgeRouting) : null,
+    routing.timeoutMs ? { timeoutMs: routing.timeoutMs } : {},
+  );
   if (raced.value) {
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
     record(raced.value.verdict === 'grounded' ? 'passed' : (raced.value.verdict === 'unverifiable' ? 'advisory' : 'blocked'), winner);

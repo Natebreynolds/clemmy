@@ -23,6 +23,7 @@ function install(name: string, description: string): void {
     '---',
     `name: ${name}`,
     `description: ${description}`,
+    'version: 1.1.0',
     '---',
     '',
     `Full ${name} procedure stays behind skill_read.`,
@@ -93,7 +94,8 @@ test('an action-shaped request reaches its artifact skill even when neighbors sh
   assert.deepEqual(findRelevantSkills('whats on my calendar today'), [], 'an unrelated read stays quiet');
 });
 
-test('a fully specified compound data flow does not inject a one-substep skill', () => {
+test('compound data flow admits a useful Sheet reference while excluding unrelated whole recipes', () => {
+  install('google-firm-sheet', 'Pull firm data into a Google Sheet for account tracking.');
   install(
     'workspace-email-recipe',
     'Build an interactive Workspace report with scheduled data pulls and one-click email actions.',
@@ -103,10 +105,42 @@ test('a fully specified compound data flow does not inject a one-substep skill',
     'Review Slack requests and append a daily digest to a Google Sheet workspace.',
   );
   const request = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
-  assert.deepEqual(
-    findRelevantSkills(request),
-    [],
-    'artifact/action overlap alone is not an applicability anchor for a compound flow',
-  );
-  assert.equal(renderRelevantSkillsForPrompt(request), '');
+  const names = findRelevantSkills(request).map(match => match.skill.name);
+  assert.ok(names.includes('google-firm-sheet'), 'the data-to-Sheet helper is useful to this requested subtask');
+  assert.ok(!names.includes('workspace-email-recipe'), 'an incidental email feature does not adopt a Workspace recipe');
+  assert.ok(!names.includes('slack-sheet-review'), 'a Sheet destination does not adopt an unrelated Slack source procedure');
+  const prompt = renderRelevantSkillsForPrompt(request);
+  assert.match(prompt, /google-firm-sheet/);
+  assert.doesNotMatch(prompt, /workspace-email-recipe|slack-sheet-review/);
+});
+
+
+test('an owner writing standard can anchor to its useful subtask without describing the whole compound job', () => {
+  install('scorpion-outbound', 'Scorpion brand-enforced outbound email. Shapes a template or draft into an on-brand cold or follow-up prospect email.');
+  const query = "Find me 30 of Brett's market leader accounts that he hasn't touched in the last 15 days. Pull account data and then website SEO data. Create me a 3 email plan that we can start kicking off today and then email every 2 days after as long as they don't respond. These emails need to add value around scorpion and have a clear CTA on why they would want to book a meeting with him.";
+  const matches = findRelevantSkills(query);
+  const reference = matches.find(match => match.skill.name === 'scorpion-outbound');
+  assert.ok(reference, `the email writing subtask can use its brand standard, got ${matches.map(match => match.skill.name).join(', ')}`);
+  assert.equal(reference.skill.frontmatter.version, '1.1.0');
+  assert.equal(reference.skill.frontmatter.applicability, undefined, 'fixture does not bypass purpose matching with owner metadata edits');
+  const prompt = renderRelevantSkillsForPrompt(query);
+  assert.match(prompt, /scorpion-outbound/);
+  assert.doesNotMatch(prompt, /Full scorpion-outbound procedure/, 'candidate discovery does not execute or inject the whole framework');
+});
+
+test('an incidental email delivery and a brand account lookup do not import a prospect writing standard', () => {
+  install('scorpion-outbound', 'Scorpion brand-enforced outbound email. Shapes a template or draft into an on-brand cold or follow-up prospect email.');
+  for (const query of [
+    'Find the Scorpion market leader accounts assigned to Brett and report their website SEO data.',
+    'Create a Scorpion website report, then email me the link.',
+    'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.',
+  ]) assert.ok(!findRelevantSkills(query).some(match => match.skill.name === 'scorpion-outbound'), query);
+  assert.ok(findRelevantSkills('Inspect scorpion-outbound').some(match => match.skill.name === 'scorpion-outbound'), 'explicit reference discovery remains available without execution');
+});
+
+test('writing standards remain subtask candidates in a multi-artifact outreach request', () => {
+  install('scorpion-outbound', 'Scorpion brand-enforced outbound email. Shapes a template or draft into an on-brand cold or follow-up prospect email.');
+  const matches = findRelevantSkills('Read the account spreadsheet, draft Scorpion prospect emails, then create a website report for the meeting.');
+  assert.ok(matches.some(match => match.skill.name === 'scorpion-outbound'));
+  assert.ok(!matches.some(match => match.skill.name === 'workspace-email-recipe'), 'incidental email features do not make a Workspace recipe the writing standard');
 });

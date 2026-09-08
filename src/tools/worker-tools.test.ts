@@ -108,12 +108,14 @@ const { runClaudeAgentSdkWorker, setClaudeAgentSdkWorkerRunForTest } = await imp
 );
 const { registerWorkerTools } = await import('./worker-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { exactToolOutputForInvocation, formatRecallableToolText, DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('../runtime/harness/tool-output-format.js');
 const {
   appendEvent,
   beginRunAttempt,
   createSession,
   finishRunAttempt,
   getToolOutput,
+  getToolOutputForInvocation,
   listEvents,
 } = await import('../runtime/harness/eventlog.js');
 const { reviseWorkContract, summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
@@ -361,15 +363,34 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
           workManifest: { ...initial.workManifest, mode: 'reconcile' },
         };
         const resumeCallId = 'call_sdk_manifest_resume';
-        const second = await withToolOutputContext({
-          sessionId, callId: resumeCallId, toolName: 'run_worker', settlementNonce: randomUUID(),
-        }, () => handler(resumed));
+        const resumeContext = { sessionId, callId: resumeCallId, toolName: 'run_worker', settlementNonce: randomUUID() };
+        const second = await withToolOutputContext(resumeContext, () => handler(resumed));
         assert.match(second.content[0].text, /Durable receipt: this item was already complete/);
         assert.match(second.content[0].text, /No worker ran and no action was repeated/);
         assert.match(second.content[0].text, /Do not call run_worker again for this phase; synthesize the user-facing result now/);
         const exactResume = getToolOutput(sessionId, resumeCallId)?.output ?? '';
         assert.match(exactResume, new RegExp(resumeTail), 'the 65,537-byte result is reused through its load-bearing tail');
         assert.doesNotMatch(exactResume, /…\(truncated\)/, 'resume never records the legacy successful prefix marker');
+        assert.ok(exactResume === largeResult, 'reuse preserves every original worker byte, including its load-bearing tail');
+        assert.ok(getToolOutputForInvocation(sessionId, resumeCallId, resumeContext.settlementNonce)?.output === largeResult,
+          'the exact resumed invocation retains raw work without host annotations');
+        const visible = second.content[0].text;
+        assert.ok(visible.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, 'reuse guidance stays inside the existing model-output ceiling');
+        assert.ok(exactToolOutputForInvocation({ ...resumeContext, compactResult: visible }) === largeResult,
+          'the annotated model return redeems the original bytes for this invocation');
+        const wrappedAgain = withToolOutputContext(resumeContext, () => formatRecallableToolText(visible));
+        assert.equal(wrappedAgain, visible, 'the next default-sized adapter preserves host guidance and exact receipt');
+        for (const wrongIdentity of [
+          { ...resumeContext, settlementNonce: randomUUID() },
+          { ...resumeContext, callId: 'unrelated-worker-call' },
+          { ...resumeContext, toolName: 'unrelated_tool' },
+        ]) {
+          assert.equal(exactToolOutputForInvocation({ ...wrongIdentity, compactResult: visible }), visible,
+            'copied annotation and receipt cannot borrow another invocation or tool');
+        }
+        const inventedReceipt = 'Durable receipt: this item was already complete. No worker ran and no action was repeated.';
+        assert.equal(exactToolOutputForInvocation({ ...resumeContext, compactResult: inventedReceipt }), inventedReceipt,
+          'host-looking prose without the exact nonce/digest cannot vouch for the retained raw worker result');
 
         const batch = {
           ...packet('unused batch placeholder'),

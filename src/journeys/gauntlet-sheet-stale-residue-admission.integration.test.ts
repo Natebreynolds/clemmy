@@ -56,6 +56,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gauntlet-sheet-stale-residue-'));
@@ -427,6 +428,12 @@ test('S1-residue: stale process-wide catalog residue must not sink a same-turn-d
     async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
     async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
     async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: 'conn-googlesheets-residue',
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
   });
 
   const gateway = composioTools.getComposioRuntimeTools()
@@ -743,6 +750,12 @@ test('S2-residue-survives: registering the selected write must not evict unrelat
     async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
     async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
     async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: 'conn-googlesheets-residue-survives',
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
   });
 
   const gateway = composioTools.getComposioRuntimeTools()
@@ -1036,6 +1049,12 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
     async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
     async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: 'conn-googlesheets-live-published',
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }),
   });
 
   const gateway = composioTools.getComposioRuntimeTools()

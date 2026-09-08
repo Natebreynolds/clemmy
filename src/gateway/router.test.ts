@@ -29,11 +29,17 @@ const {
   beginRunAttempt,
   createSession,
   getActiveRunAttempt,
+  getRunAttemptBySourceUserSeq,
+  closeEventLog,
+  interruptForeignRunAttemptLeases,
+  interruptOrphanedRunAttemptsAtBoot,
+  openEventLog,
   getSession,
   listEvents,
   recordRunAttemptUserInput,
   resetEventLog,
 } = await import('../runtime/harness/eventlog.js');
+const { workflowOwnedUnfinishedAttemptIds } = await import('../runtime/harness/accepted-source-outcome.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const {
   presentationEventFromCompletionData,
@@ -1265,9 +1271,21 @@ test('gateway keeps verified workflow dispatch nonterminal across replay until t
   assert.equal(getRun(runId)?.status, 'queued');
 
   const [source] = listEvents(session.id, { types: ['user_input_received'] });
+  const attempt = getRunAttemptBySourceUserSeq(session.id, source.seq);
+  assert.equal(attempt?.status, 'active', 'dispatch replay must retain the exact parent owner');
+  assert.equal(attempt?.finishedAt, null);
+  assert.equal(HarnessSession.load(session.id)?.runInFlightSince(), null, 'durable transfer releases only the foreground marker');
+  closeEventLog();
+  assert.equal(interruptForeignRunAttemptLeases('new-process', { preserveAttemptIds: workflowOwnedUnfinishedAttemptIds() }), 0);
+  assert.equal(interruptOrphanedRunAttemptsAtBoot(Date.now(), { preserveAttemptIds: workflowOwnedUnfinishedAttemptIds() }), 0);
+  assert.equal(getRunAttemptBySourceUserSeq(session.id, source.seq)?.attemptId, attempt?.attemptId);
+  assert.equal(getRunAttemptBySourceUserSeq(session.id, source.seq)?.finishedAt, null);
   commitAnswerForSource(source, 'The background report is ready.');
+  const finishedAt = getRunAttemptBySourceUserSeq(session.id, source.seq)?.finishedAt;
+  assert.ok(finishedAt, 'only the exact final terminal closes the parent');
   const completedReplay = await gateway.handleMessage(request);
   assert.equal(completedReplay.text, 'The background report is ready.');
+  assert.equal(getRunAttemptBySourceUserSeq(session.id, source.seq)?.finishedAt, finishedAt);
   assert.equal(hostCalls, 1);
   assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
   assert.equal(getRun(runId)?.status, 'completed');
@@ -1342,3 +1360,24 @@ test('a verbal approval settles a sole approval-parked task deterministically (n
   assert.equal(settled?.status, 'pending', 'the parked task was not queued for continuation');
   assert.equal(settled?.approvalResolution?.approved, true);
 });
+
+for (const damage of ['ordinary', 'wrong-source', 'missing-group', 'corrupt-group'] as const) {
+  test(`workflow boot preservation refuses ${damage} ownership`, () => {
+    const session = createSession({ kind: 'chat', channel: 'mobile' });
+    const attempt = beginRunAttempt(session.id, { runId: `desktop:bad-owner-${damage}` });
+    const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Run my saved workflow.' } });
+    if (damage !== 'ordinary') {
+      const dispatchedSource = damage === 'wrong-source'
+        ? appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: source.data })
+        : source;
+      const event = appendActiveWorkflowDispatch(dispatchedSource, `child-bad-owner-${damage}`);
+      const group = path.join(WORKFLOW_RUNS_DIR, '.origin-groups', createHash('sha256').update(String(event.data.sourceGroupId)).digest('hex'));
+      if (damage === 'missing-group') rmSync(group, { recursive: true, force: true });
+      if (damage === 'corrupt-group') writeFileSync(path.join(group, 'sealed.json'), '{}');
+    }
+    const preserved = workflowOwnedUnfinishedAttemptIds();
+    assert.equal(preserved.includes(attempt.attemptId), false);
+    assert.equal(interruptOrphanedRunAttemptsAtBoot(Date.now(), { preserveAttemptIds: preserved }), 1);
+    assert.equal(getRunAttemptBySourceUserSeq(session.id, source.seq)?.status, 'interrupted');
+  });
+}

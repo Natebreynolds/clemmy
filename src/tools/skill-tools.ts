@@ -106,7 +106,7 @@ export function registerSkillTools(server: McpServer): void {
     'skill_read',
     [
       'Load the full body of an installed SKILL.md skill into context.',
-      'Use after `skill_list()` once you have picked the skill that fits the task. The returned body is the skill\'s actual instructions/persona/rules — treat it as authoritative for the current task.',
+      'Use after `skill_list()` to inspect or apply an installed skill. The full body is reference material; apply the requirements relevant to the accepted task and the user\'s selected framework. Reading it does not authorize extra work.',
     ].join('\n'),
     {
       name: z.string().min(1).max(80).describe('Skill directory name as shown by skill_list (e.g. "taste-skill", "brutalist-skill").'),
@@ -184,22 +184,15 @@ export function registerSkillTools(server: McpServer): void {
 
       const crib = renderToolNameCrib(skill);
 
-      // Execution contract (global, generic — reads no skill-specific code).
-      // An installed skill is an authoritative PROCEDURE to run, not reference
-      // material to skim and cherry-pick. Without this framing the model treats
-      // skill_read as "study material" and skips prescribed steps (observed:
-      // read a redesign skill, then shipped without generating the imagery the
-      // skill calls for). The body below stays authoritative; this only frames
-      // intent. Applies in chat, workers, AND workflow steps because they all
-      // call this one tool.
+      // Loading a reference is not a separate execution contract. The owner
+      // may be planning, inspecting, comparing, or applying only a scoped part.
       const executionContract = [
-        '=== HOW TO RUN THIS SKILL ===',
-        'This skill is a PROCEDURE to EXECUTE, not reference material to summarize or cherry-pick.',
-        'Carry out every step in the body below, in order, using your tools:',
-        '- Do all steps and phases; do not condense or skip any. If the skill names a step (generate images, run a script, fetch a reference), actually do it.',
-        '- Produce every deliverable the body specifies (the file, image, URL, message, or record) — not a description of it.',
-        '- You are done with this skill only when each deliverable it prescribes actually exists.',
-        '- If you deliberately skip a prescribed step, say so explicitly and why — do not silently drop it.',
+        '=== APPLYING THIS SKILL REFERENCE ===',
+        'Use the full body below within the effective accepted task and the user’s instructions.',
+        'Reading this skill does not itself commit you to every step or authorize its deliverables.',
+        'For planning, inspection or comparison, investigate the relevant procedure without executing business changes.',
+        'When the accepted task adopts this framework, carry out its applicable requirements and verify the requested deliverables. Do not silently skip a required step.',
+        'Prior or unrelated references do not add work; explain a material conflict or ambiguity through the ordinary conversation.',
       ].join('\n');
 
       return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}`);

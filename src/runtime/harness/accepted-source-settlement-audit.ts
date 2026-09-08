@@ -1,3 +1,4 @@
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 /**
  * Read-only terminal audit for one exact accepted source.
  *
@@ -140,7 +141,7 @@ function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number): 
   const events = listEvents(sessionId, { sinceSeq: sourceUserSeq - 1 });
   const source = events.find((event) => event.seq === sourceUserSeq && event.type === 'user_input_received');
   if (!source) throw new Error('accepted source event is missing');
-  const nextSource = events.find((event) => event.seq > sourceUserSeq && event.type === 'user_input_received');
+  const nextSource = events.find((event) => event.seq > sourceUserSeq && event.type === 'user_input_received' && !isLiveApprovalAcknowledgement(event));
   const acceptedTaskId = `task:${sessionId}#${sourceUserSeq}`;
   const chronologicalSourceWindow = events.filter(
     (event) => event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq),

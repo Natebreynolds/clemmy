@@ -117,8 +117,9 @@ test('cross-session work keeps only a non-authoritative focus pointer and never 
     sessionId: 'active-task-new-session',
     input: 'Review the status of the previous release sheet run.',
   });
-  assert.equal(review.focus?.disposition, 'active');
-  assert.match(renderResolvedActiveTaskContext(review), /secret-old-receipt/);
+  assert.equal(review.focus?.disposition, 'historical');
+  assert.match(renderResolvedActiveTaskContext(review), /RELATED HISTORICAL focus|sheet:release-fixture/);
+  assert.doesNotMatch(renderResolvedActiveTaskContext(review), /secret-old-receipt|secret-old-decision|secret-old-action/);
   assert.equal(review.goal, null, 'reviewing focus history must not import the prior session goal');
 });
 

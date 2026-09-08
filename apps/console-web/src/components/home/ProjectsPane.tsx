@@ -33,7 +33,7 @@ export function ProjectsPane({
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
         id={headingId}
-        label="Projects"
+        label="Spaces"
         aside={
           <Link to="/workspaces" className="rounded-sm font-semibold text-primary hover:underline">
             All projects

@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel } from './codex-model.js';
-import { INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel, CodexModelProvider } from './codex-model.js';
+import { INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { BoundaryError } from '../boundary-error.js';
 import { buildTransportTimeoutError, detectCodexTransportFailure } from '../codex-dispatcher.js';
@@ -586,4 +586,32 @@ test('convertCodexItemToSdkOutputItem output validates against the installed SDK
       status: 'completed',
     });
   });
+});
+
+
+test('Codex provider construction and production request serialization preserve registry-known selected IDs', () => {
+  const request = modelRequest([{ role: 'user', content: 'Check the exact selected model.' }]);
+  for (const id of ['gpt-5.6-terra', 'gpt-6', 'gpt-7-review-fixture', 'codex-review-fixture', 'o3']) {
+    assert.equal(resolveProvider(id), 'codex', 'the production registry owns the wire classification');
+    const model = new CodexModelProvider().getModel(id);
+    assert.ok(model instanceof CodexResponsesModel);
+    assert.equal(model.modelId, id, 'construction must not silently substitute a default');
+    const wire = JSON.parse(JSON.stringify(buildCodexRequestBody(model.modelId, request)));
+    assert.equal(wire.model, id, 'the same production serializer used by fetch must retain the selected ID');
+    assert.equal(buildCodexRequestBody(id, request).model, id, 'direct serialization must not remap either');
+    assert.equal(wire.store, false);
+    assert.equal(wire.stream, true);
+  }
+});
+
+test('Codex construction and serialization retain the documented fallback for unknown or other-provider IDs', () => {
+  const request = modelRequest([{ role: 'user', content: 'No arbitrary model passthrough.' }]);
+  for (const id of ['', 'not-a-registered-model', 'claude-sonnet-5', 'grok-4.6']) {
+    assert.notEqual(resolveProvider(id), 'codex');
+    const model = new CodexModelProvider().getModel(id);
+    assert.ok(model instanceof CodexResponsesModel);
+    assert.equal(model.modelId, 'gpt-5.4');
+    assert.equal(buildCodexRequestBody(model.modelId, request).model, 'gpt-5.4');
+    assert.equal(buildCodexRequestBody(id, request).model, 'gpt-5.4');
+  }
 });

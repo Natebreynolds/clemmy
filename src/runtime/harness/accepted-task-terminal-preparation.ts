@@ -1,3 +1,4 @@
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 /**
  * Production orchestration for the staged expected-work protocol.
  *
@@ -289,7 +290,7 @@ function sourceHasWorkEvidence(input: {
 function turnEventsForWorkEvidence(sessionId: string, sourceUserSeq: number) {
   const events = listEvents(sessionId, { sinceSeq: sourceUserSeq - 1 });
   const nextSource = events.find((event) =>
-    event.seq > sourceUserSeq && event.type === 'user_input_received');
+    event.seq > sourceUserSeq && event.type === 'user_input_received' && !isLiveApprovalAcknowledgement(event));
   return events.filter((event) =>
     event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq));
 }

@@ -1,3 +1,5 @@
+import type { WriteLedgerRow } from './write-ledger.js';
+import type { TaskMode, PlanRevisionRef } from './task-mode.js';
 /**
  * Shared chat-engine types. These mirror the desktop console's contracts
  * (apps/console-web/src/lib/useChat.ts) so both UIs speak one vocabulary;
@@ -24,6 +26,8 @@ export interface ReplayPayload {
   events: HarnessEvent[];
   latestSeq?: number;
   error?: string;
+  /** Own-session raw traversal only; bridged child events do not extend it. */
+  page?: { version: 1; scannedThroughSeq: number; snapshotSeq: number; hasMore: boolean };
 }
 
 export type MessageStatus =
@@ -60,6 +64,26 @@ export interface ActivityItem {
   count?: number;
   /** Bounded runtime-verified content peek (the opening of a file just written). */
   excerpt?: string;
+  /** Actual event effect; presentation only, never execution authority. */
+  effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
+  /** A reservation becomes confirmed only through its own write terminal. */
+  write?: WriteLedgerRow;
+}
+
+/**
+ * The backend's TYPED terminal, carried onto the message so renderers can key on
+ * it instead of re-deriving state from prose or reason strings. `status` is the
+ * harness terminal status; `kind` is the presentation kind; `needs` is what the
+ * turn is waiting on; `resumable` is the harness's own claim. Absent on legacy
+ * events, in which case renderers fall back to `MessageStatus`.
+ */
+export interface TerminalFacts {
+  status: 'done' | 'needs_input' | 'blocked' | 'cancelled' | 'failed' | 'transferred' | 'uncertain';
+  kind?: 'answer' | 'question' | 'approval' | 'continue';
+  needs?: 'input' | 'approval' | 'continue';
+  resumable?: boolean;
+  /** Which model actually produced this turn (from turn_model_routed). */
+  modelIdentity?: string;
 }
 
 export interface ChatMessage {
@@ -68,6 +92,8 @@ export interface ChatMessage {
   text: string;
   status?: MessageStatus;
   progress?: string;
+  /** See TerminalFacts. */
+  terminal?: TerminalFacts;
   /** Live, accumulated tool calls + spawned agents for THIS turn. */
   activity?: ActivityItem[];
   approval?: {
@@ -81,6 +107,10 @@ export interface ChatMessage {
       risk: { reversibility: string; consequence: string; destructive: boolean };
     };
   };
+  taskMode?: TaskMode;
+  planArtifactRef?: PlanRevisionRef;
+  /** Original target retained verbatim across a failed POST and a later retry. */
+  requestSessionId?: string | null;
   planProposalId?: string;
   planProposalStatus?: 'pending' | 'approved' | 'rejected';
   planProposalNeedsUserInput?: boolean;
@@ -121,6 +151,7 @@ export interface EngineSnapshot {
    * Stop to work there too falls back to the run attempt's own identity.
    */
   cancelKey: string | null;
+  activeTaskMode?: TaskMode;
 }
 
 export function isTerminalEvent(type: string): boolean {

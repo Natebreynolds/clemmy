@@ -16,6 +16,7 @@ import { recordOperationalEvent, type WorkspaceOperationalEventType } from '../r
 import { redactSensitiveText } from '../runtime/security.js';
 import { ensureWorkspaceSchema } from './workspace-db-schema.js';
 import type { SpaceAction, SpaceDataSource, SpaceRecord, SpaceRevision } from './store.js';
+import { withWorkspaceProjectionOwner } from './workspace-snapshot.js';
 
 export const WORKSPACE_STATE_DIR = path.join(BASE_DIR, 'state');
 export const WORKSPACE_DB_PATH = path.join(WORKSPACE_STATE_DIR, 'workspaces.db');
@@ -396,10 +397,11 @@ export function listIndexedWorkspaces(db: Database.Database = openWorkspaceDb())
 export function commitWorkspaceObservationBatch(
   input: CommitWorkspaceObservationBatchInput,
 ): CommitWorkspaceObservationBatchResult {
-  return commitWorkspaceObservationBatchInternal(input, {
+  const root = input.rootDir ?? workspaceRootFromDb(input.db ?? openWorkspaceDb(), input.workspaceId);
+  return withWorkspaceProjectionOwner(input.workspaceId, root, () => commitWorkspaceObservationBatchInternal(input, {
     project: true,
     baselineOnly: false,
-  });
+  }));
 }
 
 export function listWorkspaceDatasetObservations(
@@ -570,11 +572,13 @@ export function healWorkspaceDataProjection(
 ): HealWorkspaceProjectionResult {
   const db = options.db ?? openWorkspaceDb();
   const rootDir = options.rootDir ?? workspaceRootFromDb(db, workspaceId);
+  return withWorkspaceProjectionOwner(workspaceId, rootDir, () => {
   const existing = readWorkspaceProjection(rootDir);
   const projection = buildWorkspaceProjection(db, workspaceId, existing);
   const serialized = serializeWorkspaceProjection(projection.document);
   const changed = atomicWriteWorkspaceProjectionIfChanged(rootDir, serialized.text);
   return { bytes: serialized.bytes, sources: projection.sources, changed };
+  });
 }
 
 /**
@@ -1535,7 +1539,7 @@ function readWorkspaceProjection(rootDir: string): unknown {
   }
 }
 
-function serializeWorkspaceProjection(document: unknown): {
+export function serializeWorkspaceProjection(document: unknown): {
   text: string;
   bytes: number;
 } {

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import {
   exactProviderDataEnvelopeAcknowledged,
   exactProviderDataPayload,
@@ -683,13 +684,16 @@ export function resolveArtifactRunScopeId(
       desc: false,
     });
     const users = events.filter((event) => event.type === 'user_input_received');
+    const controlSources = new Set(users.filter(isLiveApprovalAcknowledgement).map((event) => event.seq));
+    const executionSources = users.filter((event) => !controlSources.has(event.seq));
     const latestUser = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? users.find((event) => event.seq === sourceUserSeq)
-      : users.at(-1);
+      : executionSources.at(-1);
     latestUserSeq = latestUser?.seq ?? 0;
     latestUserText = String((latestUser?.data as { text?: unknown } | undefined)?.text ?? '');
     const priorCompletionEvent = events
-      .filter((event) => event.type === 'conversation_completed' && event.seq < latestUserSeq)
+      .filter((event) => event.type === 'conversation_completed' && event.seq < latestUserSeq
+        && !controlSources.has(Number(event.data.sourceUserSeq)))
       .at(-1);
     priorCompletionSeq = priorCompletionEvent?.seq ?? 0;
     priorCompletion = priorCompletionEvent?.data as {
@@ -699,7 +703,7 @@ export function resolveArtifactRunScopeId(
     } | undefined;
     immediateAwaitingInputReply = priorCompletion?.reason === 'awaiting_user_input'
       && priorCompletionSeq > 0
-      && !users.some((event) => event.seq > priorCompletionSeq && event.seq < latestUserSeq);
+      && !executionSources.some((event) => event.seq > priorCompletionSeq && event.seq < latestUserSeq);
   } catch { /* a missing event trail starts a conservative new root */ }
 
   const sameTurn = latestUserSeq > 0

@@ -1,3 +1,4 @@
+import { CompletionReviewControl } from './CompletionReviewControl';
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
@@ -314,6 +315,7 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
           )}
         </RoleRow>
         <JudgeMetrics metrics={judgeMetrics} />
+        <CompletionReviewControl />
 
         {/* Second opinion — whether the one judge above checks the brain's draft. */}
         <div className="rounded-lg border border-border bg-canvas p-3">
@@ -333,7 +335,7 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
           <p className="mt-1.5 text-caption text-muted">
             {secondOpinionOn
               ? 'The brain stays the author. A different model checks a compact evidence packet, accepts the draft unchanged by default, and may return one bounded factual correction. It cannot run tools or decide task completion.'
-              : 'The brain answers directly. Write-boundary and completion judges still run when the harness needs them.'}
+              : 'Second opinion is off. Completion review uses its separate setting above; write-boundary checks remain in place.'}
             {' '}{fusion?.active
               ? <span className="text-success">Active now.</span>
               : (secondOpinionOn && <span className="text-warning">Configured but inactive — the judge is not available yet.</span>)}

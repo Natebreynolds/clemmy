@@ -172,16 +172,43 @@ export function recordCodexUsageExhausted(retryAfterMs?: number): void {
  * reset still in the future. Missing/stale/expired data → false (fail-open:
  * availability must never be denied on guesswork).
  */
+/** How long a captured usedPercent sample remains evidence of CURRENT
+ *  unavailability. Beyond this the 429 latch (exhaustedUntil) is the only
+ *  authority and a probe may re-establish truth. Tunable for operators who want
+ *  a longer hold; it can never override an active latch. */
+export const CODEX_QUOTA_SAMPLE_FRESH_MS = (() => {
+  const raw = Number.parseInt(process.env.CLEMMY_CODEX_QUOTA_SAMPLE_FRESH_MS ?? '900000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 900_000;
+})();
+
 export function codexQuotaExhausted(now: number = Date.now()): boolean {
   try {
     loadOnce();
     const codex = snapshot.codex;
     if (!codex) return false;
+    // The 429 LATCH is the authoritative backoff and stays absolute.
     if (typeof codex.exhaustedUntil === 'number' && codex.exhaustedUntil > now) return true;
-    for (const window of [codex.primary, codex.secondary]) {
-      if (!window) continue;
-      if (window.windowMinutes === 0) continue; // placeholder, not a real limit
-      if (window.usedPercent >= 100 && typeof window.resetAt === 'number' && window.resetAt > now) return true;
+    // A captured usedPercent is EVIDENCE, and evidence goes stale. Treating a
+    // single 100% sample as authoritative until resetAt turned one reading into
+    // a lockout for the whole window — observed 2026-09-05: capturedAt 17:36
+    // with a weekly resetAt of 09-11 disabled the Codex lane for six days while
+    // the owner reported having quota. It is also self-sustaining: the ONLY
+    // writer is recordCodexRateLimit(res.headers) from an actual Codex response
+    // (codex-model.ts), and codexAvailable() gates that call — so the one thing
+    // that could refresh the reading is the thing the reading prevents.
+    //
+    // Past the freshness bound the cached percentage no longer proves current
+    // unavailability, so a probe may proceed. If the account really is out, that
+    // probe 429s and re-arms exhaustedUntil, which is the mechanism designed for
+    // it. Nothing here edits an auth/quota file to manufacture availability.
+    const capturedAt = typeof codex.capturedAt === 'number' ? codex.capturedAt : 0;
+    const captureIsFresh = capturedAt > 0 && (now - capturedAt) <= CODEX_QUOTA_SAMPLE_FRESH_MS;
+    if (captureIsFresh) {
+      for (const window of [codex.primary, codex.secondary]) {
+        if (!window) continue;
+        if (window.windowMinutes === 0) continue; // placeholder, not a real limit
+        if (window.usedPercent >= 100 && typeof window.resetAt === 'number' && window.resetAt > now) return true;
+      }
     }
     return false;
   } catch {

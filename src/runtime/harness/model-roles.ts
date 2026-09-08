@@ -84,6 +84,10 @@ export interface ResolvedRoleModel {
   /** The binding's free-form intent slug that matched this resolution (set only
    *  when an intent-scoped binding won) — drives the routing trace + hit/miss. */
   matchedIntent?: string;
+  /** Set when downshiftForBoundary honoured an EXPLICIT heavyweight judge pin
+   *  instead of substituting the cheap boundary model. Callers must pay the
+   *  extended deadline and report a miss visibly rather than failing open. */
+  exactHeavyweightPin?: boolean;
   /** Set when the learned route policy won: the evidence behind the pick. */
   policy?: { score: number; defaultScore: number; sampleCount: number; policyVersion: number };
 }

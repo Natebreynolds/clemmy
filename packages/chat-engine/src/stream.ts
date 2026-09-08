@@ -1,3 +1,4 @@
+import { readLiveApprovalControl } from './live-approval-control.js';
 /**
  * The chat stream manager — the part of the engine that makes a phone's
  * connection survive reality.
@@ -38,12 +39,13 @@ export interface StreamTransport {
   connect(opts: {
     sessionId: string;
     sinceSeq: number;
+    throughSeq?: number;
     onReplay(payload: ReplayPayload): void;
     onEvent(event: HarnessEvent): void;
     onError(): void;
   }): Promise<StreamConnection>;
   /** Cursor catch-up over plain fetch auth (no ticket). */
-  fetchRecent(sessionId: string, sinceSeq: number): Promise<ReplayPayload>;
+  fetchRecent(sessionId: string, sinceSeq: number, throughSeq?: number): Promise<ReplayPayload>;
 }
 
 export interface ChatStreamOptions {
@@ -98,6 +100,13 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
   const t = { ...DEFAULTS, ...options };
   const now = options.now ?? Date.now;
   let cursor = options.sinceSeq ?? 0;
+  // A live event proves delivery of that event, not coverage of earlier raw
+  // pages. Reconnect and catch-up use this separate contiguous scan cursor.
+  let scanCursor = cursor;
+  let snapshotSeq: number | undefined;
+  let dedupedThrough = cursor;
+  let pollFlight: Promise<boolean> | null = null;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   let connection: StreamConnection | null = null;
   let connecting = false;
@@ -115,6 +124,7 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
   };
 
   const clearTimers = (): void => {
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     if (approvalTimer) { clearTimeout(approvalTimer); approvalTimer = null; }
@@ -151,17 +161,19 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
     // dedupe by seq so an overlap between poll catch-up and stream replay is
     // inert. Bridged (foreign-session) frames never advance the cursor.
     if (ownSession && event.seq > 0) {
-      if (seen.has(event.seq)) return false;
+      if (event.seq <= dedupedThrough || seen.has(event.seq)) return false;
       seen.add(event.seq);
       if (seen.size > 4096) {
-        // Bounded memory: everything at/below the cursor is already deduped
-        // by the seq check on arrival order.
-        for (const s of seen) { if (s <= cursor - 512) seen.delete(s); }
+        // Only a completed raw scan establishes a dedupe lower bound. A
+        // later live event must not erase unread history from a prior page.
+        dedupedThrough = Math.max(dedupedThrough, scanCursor);
+        for (const s of seen) { if (s <= dedupedThrough) seen.delete(s); }
       }
       if (event.seq > cursor) cursor = event.seq;
     }
     const stopsStream = ownSession
       && isTerminalEvent(event.type)
+      && !readLiveApprovalControl(event)
       && (options.shouldStopOnTerminal?.(event) ?? true);
     options.onEvent(event);
     if (stopsStream) {
@@ -170,9 +182,16 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
         // synchronously on the first one used to discard the rest. Debounce,
         // take one catch-up poll, then settle.
         if (approvalTimer) clearTimeout(approvalTimer);
-        approvalTimer = setTimeout(() => {
-          void pollOnce().finally(finishTerminal);
-        }, t.approvalSettleMs);
+        const settleApproval = async (): Promise<void> => {
+          await pollOnce();
+          if (stopped) return;
+          if (snapshotSeq !== undefined) {
+            approvalTimer = setTimeout(() => { void settleApproval(); }, t.approvalSettleMs);
+            return;
+          }
+          finishTerminal();
+        };
+        approvalTimer = setTimeout(() => { void settleApproval(); }, t.approvalSettleMs);
         return true;
       }
       finishTerminal();
@@ -182,23 +201,57 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
   };
 
   const deliverPayload = (payload: ReplayPayload): boolean => {
+    if (payload.sessionId && payload.sessionId !== options.sessionId) throw new Error('Replay session does not match the requested origin.');
+    const page = payload.page;
+    if (page && !(page.version === 1 && Number.isSafeInteger(page.scannedThroughSeq)
+      && Number.isSafeInteger(page.snapshotSeq) && page.scannedThroughSeq >= scanCursor
+      && page.snapshotSeq >= page.scannedThroughSeq && typeof page.hasMore === 'boolean'
+      && (snapshotSeq === undefined || page.snapshotSeq === snapshotSeq)
+      && (page.hasMore ? page.scannedThroughSeq > scanCursor && page.scannedThroughSeq < page.snapshotSeq
+        : page.scannedThroughSeq === page.snapshotSeq))) {
+      throw new Error('Replay page does not prove progress through the requested snapshot.');
+    }
+    if (!page && snapshotSeq !== undefined) throw new Error('Replay continuation is missing its raw coverage.');
     let terminal = false;
+    let ownDelivered = scanCursor;
     for (const event of payload.events ?? []) {
       const own = !event.sessionId || event.sessionId === options.sessionId;
       if (deliver(event, own)) terminal = true;
+      if (own && event.seq > ownDelivered) ownDelivered = event.seq;
       if (stopped) break;
+    }
+    if (page) {
+      scanCursor = page.scannedThroughSeq;
+      snapshotSeq = page.hasMore ? page.snapshotSeq : undefined;
+    } else if (!page) {
+      // Older transports have no raw coverage contract. Keep their former
+      // event cursor semantics without treating latestSeq as scanned proof.
+      scanCursor = Math.max(scanCursor, ownDelivered);
     }
     return terminal;
   };
 
-  const pollOnce = async (): Promise<boolean> => {
-    try {
-      const payload = await options.transport.fetchRecent(options.sessionId, cursor);
-      if (stopped) return false;
-      return deliverPayload(payload);
-    } catch {
-      return false;
-    }
+  const pollOnce = (): Promise<boolean> => {
+    if (pollFlight) return pollFlight;
+    pollFlight = (async () => {
+      try {
+        // Bound work per radio turn, not total history. Keep the frontier and
+        // schedule another turn until the exact origin snapshot is drained.
+        for (let pageCount = 0; pageCount < 8; pageCount++) {
+          const before = scanCursor;
+          const payload = await options.transport.fetchRecent(options.sessionId, scanCursor, snapshotSeq);
+          if (stopped) return false;
+          if (deliverPayload(payload) && stopped) return true;
+          if (snapshotSeq === undefined || scanCursor <= before) return false;
+        }
+        if (!stopped && snapshotSeq !== undefined && !drainTimer) {
+          drainTimer = setTimeout(() => { drainTimer = null; void pollOnce(); }, 0);
+        }
+        return false;
+      } catch { return false; }
+      finally { pollFlight = null; }
+    })();
+    return pollFlight;
   };
 
   const handleFailure = (): void => {
@@ -250,14 +303,22 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
     try {
       const attempt = await options.transport.connect({
         sessionId: options.sessionId,
-        sinceSeq: cursor,
+        sinceSeq: scanCursor,
+        ...(snapshotSeq === undefined ? {} : { throughSeq: snapshotSeq }),
         onReplay: (payload) => {
           if (stopped) return;
           outageStartedAt = null;
           reconnectDelay = t.reconnectBaseDelayMs;
           setState('live');
           resetIdle();
-          deliverPayload(payload);
+          try {
+            deliverPayload(payload);
+            if (!stopped && snapshotSeq !== undefined) void pollOnce();
+          } catch {
+            connection?.close();
+            connection = null;
+            handleFailure();
+          }
         },
         onEvent: (event) => {
           if (stopped) return;
@@ -308,6 +369,6 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
   return {
     resume,
     stop,
-    cursor: () => cursor,
+    cursor: () => Math.max(cursor, scanCursor),
   };
 }

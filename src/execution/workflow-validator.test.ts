@@ -409,7 +409,7 @@ test('missing usesSkill reference → warning', () => {
   );
 });
 
-test('multi-item step without forEach → parallelism warning', () => {
+test('multi-item prose does not invent a required forEach rewrite', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',
     description: 'Workflow that should fan out',
@@ -419,8 +419,8 @@ test('multi-item step without forEach → parallelism warning', () => {
   });
 
   assert.ok(
-    result.warnings.some((warning) => warning.includes('has no forEach')),
-    `expected forEach warning, got: ${JSON.stringify(result.warnings)}`,
+    !result.warnings.some((warning) => warning.includes('has no forEach')),
+    `unexpected inferred forEach warning, got: ${JSON.stringify(result.warnings)}`,
   );
 });
 
@@ -495,37 +495,19 @@ test('parallelism hint: shared tracker batch writes with aggregate outputs are n
   );
 });
 
-test('parallelism hint gives the mechanical forEach rewrite + steers away from run_worker (Gap D)', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow that should fan out',
-    steps: [
-      { id: 'enrich', prompt: 'For each of the 20 sites, scrape and audit the SEO signals.' },
-    ],
-  });
-  const hint = result.warnings.find((w) => w.includes('has no forEach'));
-  assert.ok(hint, 'parallelism hint present');
-  assert.match(hint!, /forEach: <upstreamStepId>/, 'names the concrete forEach rewrite');
-  assert.match(hint!, /array/i, 'tells the author to emit an array upstream');
-  assert.match(hint!, /run_worker is not the path/i, 'clarifies run_worker is not the workflow fan-out primitive');
-});
-
-test('deliverable-producing step without an output contract → advisory warning (Gap C)', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow that builds a report',
-    steps: [
-      { id: 'build', prompt: 'Generate the competitive SEO brief and save it to an HTML file.' },
-    ],
-  });
-  assert.ok(
-    result.warnings.some((w) => /output contract/i.test(w)),
-    `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`,
-  );
-  assert.ok(
-    result.warnings.some((w) => /path_exists/.test(w)),
-    `expected file/path contract suggestion, got: ${JSON.stringify(result.warnings)}`,
-  );
+test('routine validation does not prescribe topology or output contracts from prose', () => {
+  for (const prompt of [
+    'For each of the 20 sites, scrape and audit the SEO signals.',
+    'Generate the competitive SEO brief and save it to an HTML file.',
+    'Draft a short status summary. Do not send, publish, or take any other action.',
+  ]) {
+    const definition: WorkflowFrontmatter = { name: 'authored-job', steps: [{ id: 'work', prompt, sideEffect: 'read' }] };
+    const before = JSON.stringify(definition);
+    const result = validateWorkflowDefinition(definition);
+    assert.equal(result.ok, true, result.errors.join('\n'));
+    assert.doesNotMatch(result.warnings.join('\n'), /forEach rewrite|has no forEach|run_worker is not|output contract|path_exists|url_present|no pinned `goal`/);
+    assert.equal(JSON.stringify(definition), before);
+  }
 });
 
 test('deliverable step WITH an output contract → no advisory', () => {
@@ -580,62 +562,16 @@ test('forEach + deterministic steps are exempt from the output-contract advisory
   assert.ok(!det.warnings.some((w) => /output contract/i.test(w)), 'deterministic step exempt');
 });
 
-test('deploy deliverable without output contract suggests URL and file verification', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow that deploys an audit page',
-    steps: [
-      { id: 'deploy', prompt: 'Build the audit HTML file, deploy it to Netlify, and return the live URL and saved preview path.' },
-    ],
-  });
-  const warning = result.warnings.find((w) => /output contract/i.test(w));
-  assert.ok(warning, `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`);
-  assert.match(warning!, /url_present/);
-  assert.match(warning!, /path_exists/);
-  assert.equal((warning!.match(/\bverify:/g) ?? []).length, 1, 'suggestion should merge URL and path checks into one verify block');
-});
-
-test('list-producing deliverable without output contract suggests non-empty data contract', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow that gathers meetings',
-    steps: [
-      { id: 'pull', prompt: 'Generate the list of overdue Salesforce meetings and output the rows.' },
-    ],
-  });
-  const warning = result.warnings.find((w) => /output contract/i.test(w));
-  assert.ok(warning, `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`);
-  assert.match(warning!, /non_empty/);
-  assert.match(warning!, /min_items/);
-});
-
-test('deliverable workflow without a pinned goal gets a goal-loop advisory', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow that builds a report',
-    steps: [
-      { id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' },
-    ],
-  });
-  assert.ok(
-    result.warnings.some((w) => /no pinned `goal`/.test(w)),
-    `expected pinned goal advisory, got: ${JSON.stringify(result.warnings)}`,
-  );
-});
-
-test('synthesis-only deliverable workflow without a pinned goal still gets a goal-loop advisory', () => {
-  const result = validateWorkflowDefinition({
-    name: 'wf',
-    description: 'Workflow with a synthesis deliverable',
-    synthesis: { prompt: 'Return the final report URL and saved HTML path.' },
-    steps: [
-      { id: 'prepare', prompt: 'Analyze the source material.' },
-    ],
-  });
-  assert.ok(
-    result.warnings.some((w) => /no pinned `goal`/.test(w)),
-    `expected pinned goal advisory from synthesis deliverable, got: ${JSON.stringify(result.warnings)}`,
-  );
+test('routine validation leaves output cardinality and goal selection with the author', () => {
+  for (const prompt of [
+    'Build an HTML file, deploy it, and return the live URL and saved path.',
+    'Generate the list of overdue meetings and output the rows.',
+    'Return the final report URL and saved HTML path.',
+  ]) {
+    const result = validateWorkflowDefinition({ name: 'optional-contracts',
+      synthesis: { prompt }, steps: [{ id: 'work', prompt }] });
+    assert.doesNotMatch(result.warnings.join('\n'), /url_present|path_exists|non_empty|min_items|no pinned `goal`/);
+  }
 });
 
 test('deliverable workflow with a pinned goal suppresses goal-loop advisory', () => {
@@ -910,7 +846,7 @@ function sfCliChoice(): ToolChoiceRecord {
   };
 }
 
-test('binding warning: a generic salesforce step exposed to composio gets a WARNING (never an error)', () => {
+test('validation cannot upgrade remembered capability overlap into required binding', () => {
   const wf: WorkflowFrontmatter = {
     name: 'sf-flow',
     description: 'Query Salesforce and add prospects to Airtable.',
@@ -921,7 +857,7 @@ test('binding warning: a generic salesforce step exposed to composio gets a WARN
   };
   const result = validateWorkflowDefinition(wf, { rememberedToolChoices: [sfCliChoice()] });
   assert.equal(result.ok, true, 'binding mismatch is advisory — never blocks the write');
-  assert.ok(result.warnings.some((w) => /proven .*sf data query/.test(w)), 'warns to bake the proven command');
+  assert.equal(result.warnings.some((w) => /proven .*sf data query|Bake|set allowedTools/.test(w)), false, 'memory overlap is not a validation requirement');
 });
 
 test('binding warning: a step already bound (or locked off composio) does NOT warn', () => {

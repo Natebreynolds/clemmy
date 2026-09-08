@@ -1,0 +1,147 @@
+[
+  {
+    "slug": "aurora-weather-digest",
+    "name": "Aurora Weather Digest",
+    "enabled": false
+  },
+  {
+    "slug": "cedar-inventory-snapshot",
+    "name": "Cedar Inventory Snapshot",
+    "enabled": false
+  },
+  {
+    "slug": "meadow-calendar-reminder",
+    "name": "Meadow Calendar Reminder",
+    "enabled": true
+  },
+  {
+    "slug": "orchard-support-triage",
+    "name": "Orchard Support Triage",
+    "enabled": false
+  },
+  {
+    "slug": "summit-product-notes",
+    "name": "Summit Product Notes",
+    "enabled": false
+  },
+  {
+    "slug": "harbor-website-health",
+    "name": "Harbor Website Health",
+    "enabled": true
+  },
+  {
+    "slug": "willow-release-tracker",
+    "name": "Willow Release Tracker",
+    "enabled": true
+  },
+  {
+    "slug": "maplestreet-asset-audit",
+    "name": "Maplestreet Asset Audit",
+    "enabled": true
+  },
+  {
+    "slug": "sampleteam-web-metrics",
+    "name": "Sampleteam Web Metrics",
+    "enabled": true
+  },
+  {
+    "slug": "birch-expense-review",
+    "name": "Birch Expense Review",
+    "enabled": false
+  },
+  {
+    "slug": "granite-equipment-check",
+    "name": "Granite Equipment Check",
+    "enabled": true
+  },
+  {
+    "slug": "juniper-knowledge-index",
+    "name": "Juniper Knowledge Index",
+    "enabled": false
+  },
+  {
+    "slug": "papertrail-meeting-digest",
+    "name": "Papertrail Meeting Digest",
+    "enabled": false
+  },
+  {
+    "slug": "starlight-feedback-summary",
+    "name": "Starlight Feedback Summary",
+    "enabled": false
+  },
+  {
+    "slug": "bramble-task-review",
+    "name": "Bramble Task Review",
+    "enabled": true
+  },
+  {
+    "slug": "westfield-usage-snapshot",
+    "name": "Westfield Usage Snapshot",
+    "enabled": false
+  },
+  {
+    "slug": "pinecone-research-digest",
+    "name": "Pinecone Research Digest",
+    "enabled": true
+  },
+  {
+    "slug": "outlook-sampleteam-inbox-read-canary",
+    "name": "Outlook Sampleteam Inbox Read Canary",
+    "enabled": false
+  },
+  {
+    "slug": "larch-status-monitor",
+    "name": "Larch Status Monitor",
+    "enabled": false
+  },
+  {
+    "slug": "brookside-issue-triage",
+    "name": "Brookside Issue Triage",
+    "enabled": false
+  },
+  {
+    "slug": "alder-message-archive",
+    "name": "Alder Message Archive",
+    "enabled": true
+  },
+  {
+    "slug": "cobalt-repository-review",
+    "name": "Cobalt Repository Review",
+    "enabled": true
+  },
+  {
+    "slug": "indigo-deployment-check",
+    "name": "Indigo Deployment Check",
+    "enabled": false
+  },
+  {
+    "slug": "copper-billing-summary",
+    "name": "Copper Billing Summary",
+    "enabled": false
+  },
+  {
+    "slug": "linden-team-calendar",
+    "name": "Linden Team Calendar",
+    "enabled": false
+  },
+  {
+    "slug": "quartz-customer-notes",
+    "name": "Quartz Customer Notes",
+    "enabled": true
+  },
+  {
+    "slug": "ember-security-digest",
+    "name": "Ember Security Digest",
+    "enabled": true
+  },
+  {
+    "slug": "atlas-changelog-tracker",
+    "name": "Atlas Changelog Tracker",
+    "enabled": true
+  },
+  {
+    "slug": "sequoia-system-health",
+    "name": "Sequoia System Health",
+    "enabled": true
+  }
+]

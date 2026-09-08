@@ -219,65 +219,103 @@ export class ClaudeAuthError extends Error {
   }
 }
 
-// The Keychain read MUST NEVER run synchronously on a request path: `security
-// find-generic-password` can block on a TCC Allow prompt that a headless
-// daemon can never answer, and because the old call was execFileSync it froze
-// the ENTIRE event loop while it waited — live 2026-08-26, every brain went
-// "silent before first content" at once whenever a fresh daemon pid needed
-// keychain authorization, and the fallback ladder benched Claude AND Codex in
-// the same breath. The read is now cache-first: request paths only ever see
-// the cache (or the fast credentials-file fallback); the keychain itself is
-// probed by a BOUNDED async refresh kicked at module load and re-kicked when
-// the cache ages out. A pending prompt costs one 3-second child process, not
-// a frozen daemon.
+// Sync readers use cache/files only. The explicit async auth gate owns the
+// bounded Keychain read; import-time prewarming could time out while synchronous
+// boot work held the event loop, then poison readiness with a fresh negative.
 const KEYCHAIN_REFRESH_TTL_MS = 5 * 60_000;
 const KEYCHAIN_PROBE_TIMEOUT_MS = 3_000;
+const KEYCHAIN_EXPIRED_RETRY_MS = 30_000;
+type KeychainProbeOutcome = { raw: string | null; errorCode?: string };
+type KeychainProbe = (signal: AbortSignal) => Promise<KeychainProbeOutcome>;
 let keychainCache: { raw: string | null; at: number } | null = null;
-let keychainProbeInFlight = false;
+let keychainProbeInFlight: Promise<void> | null = null;
+let keychainGeneration = 0;
+let keychainProbeOverride: KeychainProbe | null = null;
+let keychainProbeOverrideEnabled = true;
+let keychainNow = Date.now;
+let keychainProbeTimeoutMs = KEYCHAIN_PROBE_TIMEOUT_MS;
 
-function refreshKeychainCacheAsync(): void {
-  if (keychainProbeInFlight) return;
-  if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return;
-  if (process.platform !== 'darwin') return;
-  keychainProbeInFlight = true;
-  try {
-    const child = execFile(
-      'security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
-      { encoding: 'utf-8', timeout: KEYCHAIN_PROBE_TIMEOUT_MS },
-      (err, stdout) => {
-        keychainProbeInFlight = false;
-        const raw = !err && stdout && stdout.trim() ? stdout.trim() : null;
-        // Negative results are cached too — a denied prompt must not storm.
-        keychainCache = { raw, at: Date.now() };
-      },
-    );
-    child.on('error', () => { keychainProbeInFlight = false; });
-  } catch { keychainProbeInFlight = false; }
+function keychainProbeAllowed(): boolean {
+  // An injected probe can exercise timing without ever touching the real
+  // Keychain. The production isolation guard always wins for the system probe.
+  if (keychainProbeOverride) return keychainProbeOverrideEnabled;
+  return process.env.CLEMMY_TEST_ISOLATED_HOME !== '1' && process.platform === 'darwin';
+}
+
+const probeSystemKeychain: KeychainProbe = (signal) => new Promise(resolve => {
+  execFile('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
+    { encoding: 'utf-8', timeout: KEYCHAIN_PROBE_TIMEOUT_MS, signal },
+    (error, stdout) => resolve({
+      raw: !error && stdout?.trim() ? stdout.trim() : null,
+      ...(error ? { errorCode: String(error.code ?? 'PROBE_FAILED') } : {}),
+    }));
+});
+
+function refreshKeychainCacheAsync(): Promise<void> {
+  if (keychainProbeInFlight) return keychainProbeInFlight;
+  if (!keychainProbeAllowed()) return Promise.resolve();
+  const generation = ++keychainGeneration;
+  const started = Date.now();
+  const controller = new AbortController();
+  const pending = new Promise<KeychainProbeOutcome>(resolve => {
+    let settled = false;
+    const finish = (outcome: KeychainProbeOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => {
+      finish({ raw: null, errorCode: 'ETIMEDOUT' });
+      controller.abort();
+    }, keychainProbeTimeoutMs);
+    Promise.resolve().then(() => (keychainProbeOverride ?? probeSystemKeychain)(controller.signal))
+      .then(finish, () => finish({ raw: null, errorCode: 'PROBE_FAILED' }));
+  }).then(outcome => {
+    if (generation !== keychainGeneration) return;
+    // Negative results and unchanged expired positives are timestamped at
+    // completion. Late results after timeout cannot overwrite this generation.
+    keychainCache = { raw: outcome.raw, at: keychainNow() };
+    logger.info({
+      outcome: outcome.raw ? 'credential_present' : outcome.errorCode === 'ETIMEDOUT' ? 'timed_out' : 'unavailable',
+      durationMs: Date.now() - started,
+      ...(outcome.errorCode ? { errorCode: outcome.errorCode.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) } : {}),
+    }, 'Claude Code keychain readiness probe completed');
+  }).finally(() => {
+    if (keychainProbeInFlight === pending) keychainProbeInFlight = null;
+  });
+  keychainProbeInFlight = pending;
+  return pending;
+}
+
+async function ensureClaudeCodeReadiness(): Promise<void> {
+  if (rawCredentialReader !== readRawCredentialJsonFromSystem || !keychainProbeAllowed()) return;
+  if (keychainProbeInFlight) return keychainProbeInFlight;
+  const age = keychainCache ? keychainNow() - keychainCache.at : Infinity;
+  let expiredPositive = false;
+  if (keychainCache?.raw) {
+    try {
+      const token = parseClaudeCredential(keychainCache.raw);
+      expiredPositive = Boolean(token.expiresAt && token.expiresAt <= keychainNow() + EXPIRY_SKEW_MS);
+    } catch { /* invalid payloads retain the ordinary cache TTL */ }
+  }
+  if (!keychainCache || age >= KEYCHAIN_REFRESH_TTL_MS
+    || (expiredPositive && age >= KEYCHAIN_EXPIRED_RETRY_MS)) await refreshKeychainCacheAsync();
 }
 
 function readRawCredentialJsonFromSystem(): string | null {
-  // The repository suite owns a disposable filesystem home, but the macOS
-  // Keychain is global to the logged-in user. Never let an isolated test probe
-  // the developer's real Claude Code credential; tests inject rawCredentialReader
-  // when they need to exercise this fallback.
+  if (!keychainProbeOverride && process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return null;
+  if (keychainProbeAllowed() && keychainCache?.raw) return keychainCache.raw;
+  // A fake cache may be exercised in isolation, but a fake negative must never
+  // fall through to the user's real Claude Code credentials file.
   if (process.env.CLEMMY_TEST_ISOLATED_HOME === '1') return null;
-  if (process.platform === 'darwin') {
-    if (!keychainCache || Date.now() - keychainCache.at > KEYCHAIN_REFRESH_TTL_MS) {
-      refreshKeychainCacheAsync();
-    }
-    if (keychainCache?.raw) return keychainCache.raw;
-    // Cache cold or negative: fall through to the file path without blocking.
-  }
-  // Linux / fallback: Claude Code's credentials file.
+  // This sync path never initiates a prompt or waits for the Keychain.
   const credFile = path.join(os.homedir(), '.claude', '.credentials.json');
   if (existsSync(credFile)) {
     try { return readFileSync(credFile, 'utf-8'); } catch { /* ignore */ }
   }
   return null;
 }
-
-// Pre-warm at module load so the first model call finds a settled cache.
-refreshKeychainCacheAsync();
 
 let rawCredentialReader = readRawCredentialJsonFromSystem;
 function readRawCredentialJson(): string | null {
@@ -373,7 +411,8 @@ export interface ClaudeAuthSnapshot {
 const REFRESH_BEFORE_MS = 5 * 60_000;
 let refreshClaudeTokensImpl = refreshClaudeTokens;
 
-function tryClaudeCodeFallback(reason: string): string | null {
+async function tryClaudeCodeFallback(reason: string): Promise<string | null> {
+  await ensureClaudeCodeReadiness();
   const cli = getClaudeCodeTokens();
   if (!cli) return null;
   try {
@@ -411,6 +450,19 @@ export function claudeVaultRefreshDead(): boolean {
  *  the request path. */
 export async function loadFreshClaudeAccessToken(): Promise<string> {
   let tokens = getStoredClaudeTokens();
+  if (!tokens || tokens.source === 'claude-code') {
+    try {
+      assertSubscriptionToken(tokens);
+      // Valid CLI access still observes the ordinary positive-cache TTL.
+      await ensureClaudeCodeReadiness();
+      tokens = getStoredClaudeTokens();
+    } catch (error) {
+      if (error instanceof ClaudeAuthError && (error.kind === 'missing' || error.kind === 'expired')) {
+        await ensureClaudeCodeReadiness();
+        tokens = getStoredClaudeTokens();
+      }
+    }
+  }
   if (
     tokens?.source === 'vault' &&
     tokens.refreshToken &&
@@ -422,7 +474,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
       // Grant already rejected as invalid_grant — skip the doomed network refresh
       // and go straight to fallback. Recovers automatically once a re-auth writes
       // a new token (saveClaudeTokens clears the dead marker).
-      const fallback = tryClaudeCodeFallback('vault_refresh_dead');
+      const fallback = await tryClaudeCodeFallback('vault_refresh_dead');
       if (fallback) return fallback;
     } else {
       try {
@@ -449,7 +501,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
           // Transient (timeout / 5xx / network) — keep retrying on the next call.
           logger.warn({ err: msg }, 'Claude token refresh failed (transient) — will retry');
         }
-        const fallback = tryClaudeCodeFallback('vault_refresh_failed');
+        const fallback = await tryClaudeCodeFallback('vault_refresh_failed');
         if (fallback) return fallback;
       }
     }
@@ -460,7 +512,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     const fallbackAllowed =
       err instanceof ClaudeAuthError && (err.kind === 'expired' || err.kind === 'missing');
     if (tokens?.source === 'vault' && fallbackAllowed) {
-      const fallback = tryClaudeCodeFallback(err.kind);
+      const fallback = await tryClaudeCodeFallback(err.kind);
       if (fallback) return fallback;
     }
     throw err;
@@ -554,6 +606,17 @@ export function getClaudeAuthSnapshot(): ClaudeAuthSnapshot {
 }
 
 export const __test__ = {
+  setKeychainProbeForTests(probe: KeychainProbe | null, options: {
+    now?: () => number; timeoutMs?: number; enabled?: boolean;
+  } = {}): void {
+    keychainGeneration += 1;
+    keychainProbeOverride = probe;
+    keychainProbeOverrideEnabled = options.enabled ?? true;
+    keychainNow = options.now ?? Date.now;
+    keychainProbeTimeoutMs = options.timeoutMs ?? KEYCHAIN_PROBE_TIMEOUT_MS;
+    keychainCache = null;
+    keychainProbeInFlight = null;
+  },
   parseClaudeCredential,
   assertSubscriptionToken,
   OAT_PREFIX,

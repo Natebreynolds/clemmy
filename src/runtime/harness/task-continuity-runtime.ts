@@ -2174,6 +2174,7 @@ export async function enrichAcceptedRequestWithTaskContinuity(
   if (proven) {
     try {
       discoveryGovernor.initializeTask({
+        claimKeyVersion: 'exact_request_v1',
         sessionId: request.sessionId,
         sourceUserSeq,
         knownCapability: true,

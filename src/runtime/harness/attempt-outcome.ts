@@ -242,6 +242,16 @@ export interface AttemptSignals {
    * only by the settlement seam, and only when no crossing left the machine.
    */
   hostExecuted?: boolean;
+  /**
+   * The local result carried an EXPLICIT typed negative — `ok: false` — rather
+   * than merely lacking a success flag. The two are not the same fact, and
+   * conflating them is what let a "already exists" refusal settle as a
+   * succeeded mutation.
+   */
+  hostReportedFailure?: boolean;
+  /** Host-authored, value-free status token from that typed negative
+   *  (e.g. `duplicate`, `empty`). Prose never reaches the durable row. */
+  hostFailureStatus?: string;
   /** Free text, consulted last and only able to yield `unknown`. */
   text?: string;
 }
@@ -286,6 +296,22 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       ? signals.repairKey.slice(0, 32)
       : null;
     return outcome('invalid_arguments', 'nominal', repairKey ? `validation:${repairKey}` : 'validation');
+  }
+  // A LOCAL tool's own typed non-write outcome. Nominal: the tool that ran
+  // in-process said it changed nothing, in a field, and that outranks the
+  // generic MCP error flag below — which would only ever reach `unknown` and
+  // lose the repair route. Ordered here with the other nominal facts because
+  // `hostExecuted` (further down) would otherwise call it a succeeded mutation.
+  if (signals.hostReportedFailure === true) {
+    const token = typeof signals.hostFailureStatus === 'string'
+      && /^[a-z0-9_]{1,32}$/.test(signals.hostFailureStatus)
+      ? signals.hostFailureStatus
+      : null;
+    return outcome(
+      'invalid_arguments',
+      'structured',
+      token ? `host_reported:${token}` : 'host_reported_failure',
+    );
   }
   if (signals.capabilityDefinitionUnavailable) {
     return outcome('unsupported_capability', 'nominal', 'current_definition_unavailable');
@@ -386,6 +412,9 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   // local work: a contracted local read could never discharge a dependency or
   // seal a universe, so the whole per-item lane behind it was unreachable.
   if (signals.hostExecuted === true) {
+    // `hostExecuted` proves the CALL completed, not that the OPERATION did. A
+    // typed non-write is already handled in the nominal section above, before
+    // the generic MCP error flag could flatten it to `unknown`.
     return signals.emptyResult
       ? outcome('empty_result', 'nominal', 'host_execution')
       : outcome('succeeded', 'nominal', 'host_execution');

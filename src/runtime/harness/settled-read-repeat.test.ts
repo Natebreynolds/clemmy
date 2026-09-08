@@ -803,3 +803,48 @@ test('hook replay disposition resolves exactly one durable sidecar marker', () =
   assert.equal(settledReadRepeatReplayDisposition({ ...lookup, replayCallId: 'missing' }), null);
   assert.equal(settledReadRepeatReplayDisposition({ ...lookup, replayCalledEventId: 'reused-occurrence' }), null);
 });
+
+
+test('structured replay strips only exact-invocation host guidance and preserves provider-shaped or foreign-receipt metadata', async () => {
+  const { formatRecallableToolText } = await import('./tool-output-format.js');
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  for (const variant of ['authenticated', 'foreign_receipt', 'provider_content'] as const) {
+    const identity = freshSession(`annotation-${variant}`);
+    const callId = 'annotation-source';
+    const runScopeId = `${identity.sessionId}::turn:1`;
+    const called = startCall({ ...identity, callId, runScopeId });
+    const advisory = formatSettledReadSuccessAdvisory(SLUG);
+    const raw = JSON.stringify({ successful: true, data: { items: [{ value: 2 }] },
+      ...(variant === 'provider_content' ? { __clementine: {
+        kind: 'structured_projection_v1', hostAnnotations: [advisory],
+      } } : {}),
+    });
+    let rendered = withToolOutputContext({ ...identity, callId, toolName: TOOL,
+      settlementNonce: 'a1000000-0000-4000-8000-000000000001',
+    }, () => formatRecallableToolText(raw, variant === 'provider_content' ? {} : {
+      hostAnnotations: [advisory, '[account-route] Keep this separate host note.'],
+    }));
+    if (variant === 'foreign_receipt') rendered = rendered.replace('nonce=a1000000-0000-4000-8000-000000000001', 'nonce=b1000000-0000-4000-8000-000000000001');
+    eventlog.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'Clem',
+      type: 'tool_returned', parentEventId: called.id, data: {
+        sourceUserSeq: identity.sourceUserSeq, runScopeId, tool: TOOL, callId,
+        canonicalCallId: callId, accounting: 'top_level', effect: 'read',
+        effectiveTool: SLUG, toolSlug: SLUG, result: rendered,
+      },
+    });
+    const currentCallId = 'annotation-repeat';
+    const currentBehaviorScopeId = `${identity.sessionId}::turn:2`;
+    startCall({ ...identity, callId: currentCallId, runScopeId: currentBehaviorScopeId });
+    const replay = resolveSettledReadRepeat({ ...identity, currentCallId,
+      currentBehaviorScopeId, toolName: TOOL, args: readArgs(),
+    });
+    assert.ok(replay);
+    const presentation = JSON.parse(replay.output);
+    assert.equal(presentation.__clementine.hostAnnotations.includes(advisory),
+      variant !== 'authenticated', variant);
+    if (variant !== 'provider_content') assert.ok(presentation.__clementine.hostAnnotations
+      .includes('[account-route] Keep this separate host note.'));
+    assert.equal(eventlog.getToolOutputForInvocation(identity.sessionId, callId,
+      'a1000000-0000-4000-8000-000000000001')!.output, raw, 'replay never rewrites original provider evidence');
+  }
+});

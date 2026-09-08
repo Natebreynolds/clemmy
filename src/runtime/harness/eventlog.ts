@@ -88,6 +88,8 @@ export const EVENT_TYPES = [
   'plan_approved',
   'plan_revised',
   'plan_rejected',
+  'plan_revision_published',
+  'plan_execution_claimed',
   'step_started',
   // Private Claude local-MCP handoff: canUseTool has the provider's outer
   // toolUseID before the in-process handler sees its transport request. This
@@ -611,6 +613,13 @@ export const EVENT_TYPES = [
   'dependency_request',
   'connection_request',
   'connection_request_satisfied',
+  'session_history_search_recorded',
+  // Effective completion-review policy, stamped once at accept time so a later
+  // settings change cannot relabel an already-running task.
+  'completion_policy_captured',
+  // The scope one accepted source froze for its mutations. Read back by the
+  // consent boundary so a later call cannot widen the job by proposing more.
+  'accepted_mutation_scope',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -738,6 +747,8 @@ export interface CreateSessionInput {
 
 export interface ListEventsOptions {
   sinceSeq?: number;
+  /** Inclusive raw sequence frontier for a stable replay page. */
+  throughSeq?: number;
   /** Inclusive ISO timestamp boundary. Useful for old run-attempt rows that
    * predate an explicit sequence watermark. Prefer sinceSeq when available. */
   sinceAt?: string;
@@ -1306,7 +1317,61 @@ export function getSessionTokensUsed(sessionId: string): number {
   }
 }
 
+interface EventPublicationFrame {
+  db: Database.Database;
+  publications: Array<() => void>;
+  afterPublication: Array<() => void>;
+}
+
+let eventPublicationFrame: EventPublicationFrame | null = null;
+
+/** A synchronous, explicitly owned transaction for decisions that publish
+ * several related events. Nested managed calls use savepoints and join the
+ * outer publication queue; a rolled-back savepoint contributes nothing.
+ * This does not make arbitrary SQLite transactions or other append side
+ * effects transactional. An unmanaged outer transaction has no commit hook.
+ */
+export function withEventPublicationTransaction<T>(commit: () => T): T {
+  const db = openEventLog();
+  const parent = eventPublicationFrame;
+  if ((!parent && db.inTransaction) || (parent && parent.db !== db)) {
+    throw new Error('Event publication requires ownership of the outer transaction');
+  }
+  const frame: EventPublicationFrame = { db, publications: [], afterPublication: [] };
+  eventPublicationFrame = frame;
+  let result: T;
+  try {
+    result = db.transaction(() => {
+      const value = commit();
+      if (value && typeof (value as { then?: unknown }).then === 'function') {
+        throw new Error('Event publication transaction must be synchronous');
+      }
+      return value;
+    }).immediate();
+  } finally {
+    eventPublicationFrame = parent;
+  }
+  if (parent) {
+    parent.publications.push(...frame.publications);
+    parent.afterPublication.push(...frame.afterPublication);
+  } else {
+    for (const publish of frame.publications) publish();
+    for (const effect of frame.afterPublication) effect();
+  }
+  return result;
+}
+
+/** Release a waiting owner only after the managed commit's events publish. */
+export function afterEventPublicationCommit(effect: () => void): void {
+  if (!eventPublicationFrame) throw new Error('No managed event publication transaction is active');
+  eventPublicationFrame.afterPublication.push(effect);
+}
+
 function publishPersistedEvent(event: EventRow): EventRow {
+  if (eventPublicationFrame) {
+    eventPublicationFrame.publications.push(() => { publishPersistedEvent(event); });
+    return event;
+  }
   const session = getSession(event.sessionId);
   const sessionSignal = session ? summarizeSessionForSignal(session) : undefined;
   // Fan out for live SSE subscribers. Best-effort — emit errors are
@@ -3112,6 +3177,18 @@ export function appendEvent(input: AppendEventInput): EventRow {
           presentation: lifecyclePresentation,
           now,
         });
+        // Continuation responsibility ends with the typed terminal, in the same
+        // transaction that publishes it. Deliberately OUTSIDE the
+        // `terminalOwner` branch below: when the attempt has already been
+        // closed there is no owner row to match, and keying on one left the
+        // record behind after its work had finished (measured 2026-09-07,
+        // source 142450 — terminal published, responsibility still installed).
+        db.prepare(
+          `UPDATE sessions
+              SET metadata_json = json_remove(metadata_json, '$.__continuation_owner')
+            WHERE id = ?
+              AND json_extract(metadata_json, '$.__continuation_owner.sourceUserSeq') = ?`,
+        ).run(input.sessionId, terminalSourceUserSeq);
         if (terminalOwner && terminalOwner.source_user_seq === terminalSourceUserSeq) {
           finishRunAttemptInTransaction(
             db,
@@ -3125,6 +3202,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
             sourceUserSeq: terminalSourceUserSeq,
             now,
           });
+
         }
         // Direct callers without a physical run-attempt row still own an exact
         // source-scoped marker. Settle it in this same terminal transaction so
@@ -4331,6 +4409,10 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
     clauses.push('seq > ?');
     params.push(options.sinceSeq);
   }
+  if (options.throughSeq !== undefined) {
+    clauses.push('seq <= ?');
+    params.push(options.throughSeq);
+  }
   if (options.sinceAt !== undefined) {
     clauses.push('created_at >= ?');
     params.push(options.sinceAt);
@@ -5270,13 +5352,14 @@ export function renewRunAttemptLease(
 }
 
 /**
- * Startup recovery for process-owned attempts. A lease belonging to another
+ * Startup recovery for process-owned attempts. The optional exclusions must
+ * come from the exact cross-store workflow-owner reader, never a lease heuristic. A lease belonging to another
  * process (or a pre-lease row) cannot still have a live executor in this
  * daemon, so close it immediately rather than waiting for its wall-clock TTL.
  */
 export function interruptForeignRunAttemptLeases(
   ownerId: string,
-  options: { runIdPrefix?: string; nowMs?: number } = {},
+  options: { runIdPrefix?: string; nowMs?: number; preserveAttemptIds?: readonly string[] } = {},
 ): number {
   const owner = ownerId.trim();
   if (!owner) throw new Error('ownerId is required');
@@ -5292,8 +5375,9 @@ export function interruptForeignRunAttemptLeases(
       WHERE finished_at IS NULL
         AND status = 'active'
         AND (run_id LIKE ? OR (? = '' AND run_id IS NULL))
-        AND (lease_owner IS NULL OR lease_owner != ?)`,
-  ).run(now, `${prefix}%`, prefix, owner);
+        AND (lease_owner IS NULL OR lease_owner != ?)
+        AND attempt_id NOT IN (SELECT value FROM json_each(?))`,
+  ).run(now, `${prefix}%`, prefix, owner, JSON.stringify(options.preserveAttemptIds ?? []));
   return result.changes;
 }
 
@@ -5303,14 +5387,18 @@ export function interruptForeignRunAttemptLeases(
  * foreign-lease sweep never reached them and they showed as phantom running
  * sessions forever. Call ONLY from daemon startup (a CLI process opening the
  * same DB must never sweep the live daemon's rows). */
-export function interruptOrphanedRunAttemptsAtBoot(nowMs: number = Date.now()): number {
+export function interruptOrphanedRunAttemptsAtBoot(
+  nowMs: number = Date.now(),
+  options: { preserveAttemptIds?: readonly string[] } = {},
+): number {
   const now = new Date(nowMs).toISOString();
   return openEventLog().prepare(
     `UPDATE run_attempts
         SET finished_at = ?, status = 'interrupted', lease_expires_at = NULL
       WHERE finished_at IS NULL
-        AND status = 'active'`,
-  ).run(now).changes;
+        AND status = 'active'
+        AND attempt_id NOT IN (SELECT value FROM json_each(?))`,
+  ).run(now, JSON.stringify(options.preserveAttemptIds ?? [])).changes;
 }
 
 function rowToHarnessChatRequestReceipt(row: {
@@ -5343,7 +5431,15 @@ export function getHarnessChatRequestReceipt(requestId: string): HarnessChatRequ
     since_seq: number;
     created_at: string;
   } | undefined;
-  return row ? rowToHarnessChatRequestReceipt(row) : null;
+  if (row) return rowToHarnessChatRequestReceipt(row);
+  const db = openEventLog();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reviewed_plan_ingress_aliases_v1'").get()) return null;
+  const alias = db.prepare(`SELECT aliases.request_id, owner.session_id, owner.run_id,
+      aliases.input_hash, owner.since_seq, aliases.created_at
+    FROM reviewed_plan_ingress_aliases_v1 aliases
+    JOIN harness_chat_requests owner ON owner.request_id = aliases.owner_request_id
+    WHERE aliases.request_id = ?`).get(requestId) as typeof row;
+  return alias ? rowToHarnessChatRequestReceipt(alias) : null;
 }
 
 function rowToHarnessChatRequestCancellation(row: {
@@ -5398,7 +5494,17 @@ export function getHarnessChatCancellation(requestIdInput: string): HarnessChatR
     requested_at: string;
     reason: string | null;
   } | undefined;
-  return row ? rowToHarnessChatRequestCancellation(row) : null;
+  if (row) return rowToHarnessChatRequestCancellation(row);
+  const db = openEventLog();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reviewed_plan_ingress_aliases_v1'").get()) return null;
+  const owner = db.prepare('SELECT owner_request_id FROM reviewed_plan_ingress_aliases_v1 WHERE request_id = ?')
+    .get(requestId) as { owner_request_id: string } | undefined;
+  const ownerId = owner?.owner_request_id ?? requestId;
+  const related = db.prepare(`SELECT request_id, requested_at, reason
+    FROM harness_chat_request_cancellations WHERE request_id = ? OR request_id IN (
+      SELECT request_id FROM reviewed_plan_ingress_aliases_v1 WHERE owner_request_id = ?
+    ) ORDER BY requested_at LIMIT 1`).get(ownerId, ownerId) as typeof row;
+  return related ? { ...rowToHarnessChatRequestCancellation(related), requestId } : null;
 }
 
 /** Atomically claim or replay a desktop chat request. A request id is bound to
@@ -5419,10 +5525,16 @@ export function claimHarnessChatRequestInTransaction(
 ): { receipt: HarnessChatRequestReceipt; inserted: boolean } {
   const requestId = input.requestId.trim();
   if (!requestId) throw new Error('requestId is required');
-  const cancelled = db.prepare(
-    'SELECT 1 FROM harness_chat_request_cancellations WHERE request_id = ?',
-  ).get(requestId);
+  const cancelled = getHarnessChatCancellation(requestId);
   if (cancelled) throw new Error(`client request id ${requestId} was cancelled before acceptance`);
+
+  const prior = getHarnessChatRequestReceipt(requestId);
+  if (prior) {
+    if (prior.sessionId !== input.sessionId || prior.runId !== input.runId || prior.inputHash !== input.inputHash) {
+      throw new Error(`client request id ${requestId} is already bound to a different chat request`);
+    }
+    return { receipt: prior, inserted: false };
+  }
 
   const createdAt = nowIso();
   const result = db.prepare(
@@ -7024,7 +7136,7 @@ interface DurableToolOutputOccurrence {
 
 function authorityEventString(
   event: EventRow,
-  field: 'callId' | 'tool' | 'effect' | 'effectiveTool',
+  field: 'callId' | 'tool' | 'effect' | 'effectiveTool' | 'accounting',
 ): string {
   const value = event.data[field];
   return typeof value === 'string' ? value.trim() : '';
@@ -7186,14 +7298,44 @@ function durableToolOutputOccurrence(
       && isSettledReadReplayReturnData(event.data)
       && typeof event.parentEventId === 'string')
     .map((event) => event.parentEventId as string));
-  const calls = events.filter((event) =>
+  // ONE INVOCATION OBSERVED TWICE IS STILL ONE INVOCATION.
+  //
+  // A carrier-wrapped call writes a `top_level` pair (work_call) AND a
+  // `transport_mirror` pair (the inner provider tool) for the SAME logical
+  // invocation, each correctly parented. Counting both made an authentic result
+  // look like a reused call id.
+  //
+  // Live 2026-09-07 source 146537 (the Platform 49 Plan): call
+  // toolu_01UYMgkwaEPRxRSFwo3QQqUS has one nonce, one dispatch (146623), one
+  // settlement (146641) and a complete 2,308-byte output — and its lifecycle
+  // holds work_call 146611/146643 plus transport_mirror 146617/146642. Every
+  // file_query on it was rejected as "reused by 2 invocations", eleven times,
+  // asking the model for a fresh call id it cannot legitimately manufacture.
+  // The turn died at recovery_surface_mismatch with the plan never written.
+  //
+  // `accounting` is host-authored and names the mirror explicitly. When a
+  // top-level observation exists it is the authority; the mirror is a second
+  // view of it, not a second call. Calls with no top-level pair (an unwrapped
+  // direct invocation) keep their existing treatment, and two genuine
+  // top-level invocations sharing an id still fail ambiguous below.
+  const accountingOf = (event: EventRow): string =>
+    authorityEventString(event, 'accounting') ?? '';
+  const candidateCalls = events.filter((event) =>
     event.type === 'tool_called' && authorityEventString(event, 'callId') === callId
       && !replayParentIds.has(event.id)
   );
-  const returns = events.filter((event) =>
+  const candidateReturns = events.filter((event) =>
     event.type === 'tool_returned' && authorityEventString(event, 'callId') === callId
       && !isSettledReadReplayReturnData(event.data)
   );
+  const hasTopLevel = candidateCalls.some((event) => accountingOf(event) === 'top_level')
+    && candidateReturns.some((event) => accountingOf(event) === 'top_level');
+  const calls = hasTopLevel
+    ? candidateCalls.filter((event) => accountingOf(event) === 'top_level')
+    : candidateCalls;
+  const returns = hasTopLevel
+    ? candidateReturns.filter((event) => accountingOf(event) === 'top_level')
+    : candidateReturns;
   if (calls.length !== 1 || returns.length !== 1) {
     return {
       occurrence: null,
@@ -7788,6 +7930,32 @@ export function resolveToolOutputTermMatchesForAuthority(
 /** Resolve bytes for a value that may authorize a later action. Reporting and
  * recall may intentionally use the canonical longest row; authority consumers
  * must use this function so a reused call id can never select stale bytes. */
+
+/**
+ * Ambiguous means SEVERAL durable invocations compete for one call id. A single
+ * invocation whose stored bytes do not line up with its occurrence is a
+ * different condition — stale or unverifiable authority — and saying "reused by
+ * 1 invocations; pass a fresh unique call id" is both false and impossible to
+ * act on for a result the host itself stored.
+ *
+ * This lived in TWO places (the nonce branch and the legacy branch) with the
+ * same `Math.max(1, …)`. Fixing one and shipping the other is how the live
+ * 2026-09-07 file_query loop survived its first correction. One decision now.
+ */
+function unusableAuthorityResolution(
+  lifecycle: { callCount: number; returnCount: number; reason?: string },
+  fallbackReason: string,
+): AuthorityToolOutputResolution {
+  if (lifecycle.callCount > 1 || lifecycle.returnCount > 1) {
+    return {
+      status: 'ambiguous',
+      invocationCount: Math.max(lifecycle.callCount, lifecycle.returnCount),
+      reason: lifecycle.reason ?? fallbackReason,
+    };
+  }
+  return { status: 'failed', reason: lifecycle.reason ?? fallbackReason };
+}
+
 export function resolveToolOutputForAuthority(
   sessionId: string,
   callId: string,
@@ -7835,11 +8003,21 @@ export function resolveToolOutputForAuthority(
           sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
         };
       }
-      return {
-        status: 'ambiguous',
-        invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
-        reason: lifecycle.reason ?? 'exact output does not match the sole durable invocation',
-      };
+      // ONE invocation is not a reuse. Reporting this as `ambiguous` produced
+      // the literal message "call id … was reused by 1 invocations; pass a
+      // fresh unique call id" — an incoherent diagnosis and an instruction the
+      // model cannot act on, because it cannot manufacture a call id for a
+      // result the host already stored. Live 2026-09-07 sources 146537/147032:
+      // file_query looped on exactly this and the Plan never got written.
+      //
+      // Ambiguity means SEVERAL invocations compete for one id. A single
+      // invocation whose stored bytes do not line up with its durable
+      // occurrence is a different condition — stale or unverifiable authority —
+      // and it already has an honest status.
+      return unusableAuthorityResolution(
+        lifecycle,
+        'its stored bytes do not match the one durable invocation of this call id',
+      );
     }
     const legacy = readCanonicalOutput(db, sessionId, callId);
     if (!legacy) return { status: 'missing' };
@@ -7862,11 +8040,10 @@ export function resolveToolOutputForAuthority(
         sourceUserSeq: lifecycle.occurrence.sourceUserSeq,
       };
     }
-    return {
-      status: 'ambiguous',
-      invocationCount: Math.max(1, lifecycle.callCount, lifecycle.returnCount),
-      reason: lifecycle.reason ?? 'legacy output lacks one matching read/compute lifecycle occurrence',
-    };
+    return unusableAuthorityResolution(
+      lifecycle,
+      'legacy output lacks one matching read/compute lifecycle occurrence',
+    );
   })();
 }
 

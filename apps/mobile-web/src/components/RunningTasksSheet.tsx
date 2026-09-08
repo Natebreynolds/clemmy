@@ -5,8 +5,8 @@ import { haptic } from '../lib/native-bridge';
 import {
   hasExpandableTaskFacts,
   kindLabel,
-  lifecycleLabel,
   mobileRunControl,
+  runStatusLabel,
   workerCountLabel,
 } from '../lib/running-tasks';
 import { presentWorkingNow } from '@clem/chat-engine';
@@ -20,11 +20,15 @@ const MAX_VISIBLE_TASKS = 12;
  * chat with a dashboard or manufactures a task from assistant text. */
 export function RunningTasksSheet({
   composerRef,
+  onOpenRun,
 }: {
   /** Optional: only the Chat screen has a composer to return focus to. The
    *  sheet is mounted in the app shell so running work is visible on EVERY
    *  tab, and on non-chat tabs focus falls back to the document body. */
   composerRef?: { current: HTMLTextAreaElement | null };
+  /** Open the run's own screen. Expanding a row in place shows the three facts
+   *  this DTO carries; the run itself is where what it CHANGED lives. */
+  onOpenRun?: (sessionId: string) => void;
 }) {
   // ONE snapshot for the whole app: the shell keeps the poll alive and Home
   // renders from this same store, so the chip and the page cannot disagree.
@@ -95,7 +99,10 @@ export function RunningTasksSheet({
   // the accessible name and lives inside the sheet; right-aligned overflow
   // in the header escapes LEFT, straight over the screen title — a compact
   // chip makes that geometry impossible.
-  const compact = [view.running, view.needsYou].filter((n) => n > 0).join('·');
+  // Every group the sheet LISTS gets a digit, stalled included: the sheet
+  // shows all three, so a chip that counted two of them under-reported the
+  // list it opens.
+  const compact = [view.running, view.needsYou, view.stalled].filter((n) => n > 0).join('·');
 
   return (
     <div class="running-tasks-affordance">
@@ -150,10 +157,14 @@ export function RunningTasksSheet({
                       />
                       <div class="running-task-identity">
                         <h3>{entry.headline}</h3>
+                        {/* The same words the chip above uses. The lifecycle
+                            word alone described the moment a row stopped, so a
+                            run blocked on Tuesday sat here reading "Needs
+                            review" under a chip that said "21 stalled". */}
                         <div class="running-task-meta">
                           <span>{kindLabel(entry.kind)}</span>
-                          <span>{lifecycleLabel(entry.lifecycle)}</span>
-                          {elapsed ? <span>{elapsed}</span> : null}
+                          <span>{runStatusLabel(p)}</span>
+                          {elapsed && !p.stalled ? <span>{elapsed}</span> : null}
                         </div>
                       </div>
                     </div>
@@ -171,7 +182,22 @@ export function RunningTasksSheet({
                             setSelected(expanded ? null : entry.runKey);
                           }}
                         >
-                          {expanded ? 'Close' : entry.needsAttention ? 'Review' : 'Open'}
+                          {expanded ? 'Close' : entry.needsAttention ? 'Review' : 'Details'}
+                        </button>
+                      ) : null}
+                      {/* The sheet is a glance; the run is the work. Only a
+                          harness session has a run screen, so a row without
+                          one shows no dead affordance. */}
+                      {onOpenRun && entry.sessionId ? (
+                        <button
+                          type="button"
+                          class="running-task-open"
+                          onClick={() => {
+                            close();
+                            onOpenRun(entry.sessionId as string);
+                          }}
+                        >
+                          Open run
                         </button>
                       ) : null}
                       {control ? (

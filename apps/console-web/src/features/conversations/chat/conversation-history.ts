@@ -1,3 +1,4 @@
+import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -13,6 +14,8 @@ export function historyToMessages(turns: Turn[]): ChatMessage[] {
         id: `h${++seedSeq}`,
         role: turn.role,
         text: turn.text,
+        taskMode: readTaskMode(turn.taskMode),
+        planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
         status: 'awaiting-plan' as const,
         planProposalId: turn.planProposalId,
       };
@@ -22,6 +25,8 @@ export function historyToMessages(turns: Turn[]): ChatMessage[] {
         id: `h${++seedSeq}`,
         role: turn.role,
         text: turn.text,
+        taskMode: readTaskMode(turn.taskMode),
+        planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
         status: 'awaiting-approval' as const,
         approval: {
           subject: turn.approval.subject,
@@ -35,6 +40,8 @@ export function historyToMessages(turns: Turn[]): ChatMessage[] {
       id: `h${++seedSeq}`,
       role: turn.role,
       text: turn.text,
+        taskMode: readTaskMode(turn.taskMode),
+        planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
       status: turn.role === 'assistant' ? ('complete' as const) : undefined,
     };
   });

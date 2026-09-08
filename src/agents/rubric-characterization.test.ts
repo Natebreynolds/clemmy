@@ -34,6 +34,14 @@ const TOK = (chars: number): number => Math.round(chars / 4);
 // --- GOLDEN SNAPSHOT (captured 2026-06-19 @ main 0758e46) ------------------
 // Update these — and only these — when a rubric edit is intentional.
 const GOLDEN = {
+  // 2026-09-07 discovery subtraction: the rubric no longer tells the model to
+  // spend a role slot ("use the runtime broker ONCE for that unresolved role",
+  // "distinct roles may resolve in parallel and synonymous searches share the
+  // same attempt"). It now says: describe the missing capability plainly to
+  // `tool_search`, run independent searches in parallel, treat results as
+  // advisory, and refine when they do not fit. The role_key grammar was a hoop
+  // in front of a plain description, and the governor still meters discovery
+  // without it.
   // 2026-06-28 (Inc A): OFFER BACKGROUND line now routes via the structured
   // `offer_background` tool → background / hold_task_for_later / now (both lanes:
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
@@ -161,10 +169,10 @@ const GOLDEN = {
   // need no plan; call a disclosed read through work_call directly (byte-neutral).
   // 2026-09-02: PARALLELIZE READS — read a source whole in one call and recall
   // the retained set instead of walking a cursor one page per turn (net -39 B).
-  instructions: { len: 31842, sha16: '9ef8088e2e8ab6e1' },
-  native: { len: 30949, sha16: '57b6b23f8e1d890f' },
-  claudeBrain: { len: 8931, sha16: 'd628958eafd680ef' },
-  lean: { len: 10936, sha16: '312178d94f766567' },
+  instructions: { len: 31886, sha16: '5cbcc32e2cdc807c' },
+  native: { len: 30993, sha16: '993e81186d1b02f8' },
+  claudeBrain: { len: 8949, sha16: '50404a7bf34c980a' },
+  lean: { len: 10954, sha16: '59b00aeb63a13b82' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -323,14 +331,20 @@ test('provider parity: focus context is injected, never a mandatory per-turn too
   }
 });
 
-test('provider parity: resolved capabilities execute directly and discovery is one role-scoped repair path', () => {
+test('provider parity: resolved capabilities execute directly and discovery is described, not role-keyed', () => {
   for (const [lane, rubric] of [
     ['standard', ORCHESTRATOR_INSTRUCTIONS],
     ['claude', CLAUDE_BRAIN_RUBRIC],
   ] as const) {
     assert.match(rubric, /bounded retrieval result, not a checklist/i, lane);
     assert.match(rubric, /(?:resolved exact capability and schema|injected packet resolves an exact capability and schema)[^.]*invoke it directly/i, lane);
-    assert.match(rubric, /(?:single runtime discovery broker once[^.]*semantic role|unresolved semantic role[^.]*single runtime discovery broker once)/i, lane);
+    // Both lanes must ASK PLAINLY rather than spend a named role slot. The
+    // old wording ('the single runtime discovery broker once for that
+    // unresolved semantic role') made the model match a grammar before it
+    // could describe what it needed.
+    assert.match(rubric, /`tool_search` with a plain description of a missing capability/i, lane);
+    assert.match(rubric, /[Ii]ndependent searches may run in parallel/, lane);
+    assert.doesNotMatch(rubric, /discovery broker once for that unresolved (?:semantic )?role/i, lane);
     assert.match(rubric, /exact call fails schema validation[^.]*exact subject once/i, lane);
     assert.match(rubric, /skill candidates? (?:is|are) advisory/i, lane);
     assert.doesNotMatch(

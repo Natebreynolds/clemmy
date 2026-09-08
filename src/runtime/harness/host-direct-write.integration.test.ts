@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -34,7 +34,7 @@ const adapters = await import('./production-capability-adapter.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
 const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const { buildWorkCall } = await import('../../tools/work-call.js');
-const { hostRunRunner, HostInterruptState } = await import('./host-turn-runner.js');
+const { hostRunRunner, HostInterruptState, HostRecoveryState } = await import('./host-turn-runner.js');
 const approvals = await import('./approval-registry.js');
 const completion = await import('./carrier-completion-registry.js');
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -70,14 +70,18 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json') {
-  const operationId = { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY' }[kind];
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias' }) {
+  const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
+  const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
+    ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
+  const args = payloadForWrite(1);
+  const operationId = providerFixture?.operationId ?? { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY' }[kind];
   if (outerShape === 'args') FIXTURE_ALIAS_OPERATIONS.add(operationId);
   const capabilityId = `cap:resolved:${operationId.toLowerCase()}`;
   const accountId = 'account:direct:owner';
-  const providerInputSchemaDigest = digestSchema(INPUT_SCHEMA);
+  const providerInputSchemaDigest = digestSchema(inputSchema);
   const definitionFingerprint = sha(`${operationId}:${providerInputSchemaDigest}`);
-  schemas.rememberToolSchema(operationId, INPUT_SCHEMA, Date.now(), '1', { type: 'object' });
+  schemas.rememberToolSchema(operationId, inputSchema, Date.now(), '1', { type: 'object' });
   const manifest = manifests.attachSemanticContract({
     version: 1, manifestId: capabilityId, providerKind: 'native_mcp', operationId,
     providerIdentity: 'native:direct-write-fixture', providerVersion: 'catalog-v1', operationVersion: '1', definitionFingerprint,
@@ -102,25 +106,29 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   let preparationCalls = 0;
   const invoke = async (request: any) => {
     providerCalls += 1;
-    assert.equal(modelCalls, 1, 'consent must dispatch before another model step');
-    assert.deepEqual(request.payload, ARGS);
+    assert.equal(modelCalls, providerFixture?.singleFrame ? 1 : providerCalls, 'each call dispatches in the model step that nominated it');
+    assert.deepEqual(request.payload, payloadForWrite(providerCalls));
     assert.equal(request.binding.account, accountId);
     assert.ok(request.authority, 'the existing adapter receives the exact consent grant');
     if (uncertain) throw new Error('fixture transport outcome unknown after possible write');
-    return { successful: true, data: { id: `draft-${carrierName}`, body: ARGS.body } };
+    return { successful: true, data: { id: `draft-${carrierName}-${providerCalls}`, ...payloadForWrite(providerCalls) } };
   };
   ports.clearProductionCapabilityPorts();
   assert.equal(ports.registerFixtureCapabilityPort(ports.productionPortIdentityFromManifest(manifest), {
     invoke: invoke as never,
     admitPreparation: () => undefined,
-    prepareInvocation: async () => { preparationCalls += 1; return { fixture: true }; },
+    prepareInvocation: async () => {
+      preparationCalls += 1;
+      if (providerFixture?.preparationFailure) throw new Error('fixture packaged provider client is unavailable before dispatch');
+      return { fixture: true };
+    },
     invokeWithPreparation: async (_proof: unknown, work: () => Promise<unknown>) => work(),
   }).ok, true);
   const entry = adapters.registeredCapabilityFromManifest({ manifest, observation, invoke: invoke as never });
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
   const prompt = kind === 'draft'
-    ? 'Create one reversible draft on my connected owner account from this validated content. Do not send anything.'
+    ? `Create ${writeCount} independent reversible drafts on my connected owner account from this validated content. Do not send anything.`
     : `Perform the exact ${kind} operation on my connected owner account from this validated content.`;
   const session = eventlog.createSession({ id: `p3-direct-write-${carrierName}-${kind}-${suffix}`, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
@@ -136,14 +144,32 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
         invoke: async () => { carrierBodies += 1; throw new Error('must use the already resolved exact port'); } } as never);
   const outerArgs = carrierName === 'work_call'
     ? { requirement_id: 'create_draft', universe_item_id: null, universe_selector: null, seal_amendment: null,
-        source_call_ids: null, source_record_ids: null, name: operationId, args_json: JSON.stringify(ARGS) }
-    : { name: operationId, args_json: JSON.stringify(ARGS) };
+        source_call_ids: null, source_record_ids: null, name: operationId, args_json: JSON.stringify(args) }
+    : { name: operationId, args_json: JSON.stringify(args) };
   // The bytes the MODEL emits. With the `args` shape the host completes them
   // (args → args_json) before admission, so the pause persists bytes that never
   // appeared in the checkpointed model history.
   const modelArgs: Record<string, unknown> = outerShape === 'args'
-    ? (({ args_json: _dropped, ...rest }) => ({ ...rest, args: ARGS }))(outerArgs)
+    ? (({ args_json: _dropped, ...rest }) => ({ ...rest, args }))(outerArgs)
     : outerArgs;
+  const modelArgumentsForOrdinal = (ordinal: number): Record<string, unknown> => {
+    const representation = providerFixture?.carrierRepresentation;
+    if (representation) {
+      // Actual candidate2 shape: the outer args_json is a string, but the
+      // nested Composio arguments value is an object. The real host completer
+      // serializes it once while accepted model history retains these bytes.
+      const inner = { tool_slug: operationId, arguments: representation === 'gateway_string'
+        ? JSON.stringify(payloadForWrite(ordinal)) : payloadForWrite(ordinal) };
+      const outer = { ...outerArgs, name: 'composio_execute_tool', args_json: JSON.stringify(inner) };
+      if (representation !== 'gateway_alias') return outer;
+      const { args_json: _omitted, ...hostFields } = outer;
+      return { ...hostFields, args: inner };
+    }
+    return writeCount === 1 ? modelArgs
+      : { ...modelArgs, ...(outerShape === 'args'
+        ? { args: payloadForWrite(ordinal) }
+        : { args_json: JSON.stringify(payloadForWrite(ordinal)) }) };
+  };
   const model = {
     async getResponse(request: { tools?: Array<{ name?: string }> }) {
       modelCalls += 1;
@@ -153,16 +179,19 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
         // after the model request froze its empty catalog. Never make a plan.
         factory.register(entry);
       }
+      const ordinals = providerFixture?.singleFrame
+        ? (modelCalls === 1 ? Array.from({ length: writeCount }, (_, index) => index + 1) : [])
+        : (modelCalls <= writeCount ? [modelCalls] : []);
       return { responseId: `direct-write-${carrierName}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        output: modelCalls === 1
-          ? [{ type: 'function_call', callId: 'exact-draft', name: carrierName, arguments: JSON.stringify(modelArgs) }]
-          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The draft was created.' }] }],
+        output: ordinals.length > 0
+          ? ordinals.map(ordinal => ({ type: 'function_call', callId: writeCount === 1 ? 'exact-draft' : `exact-draft-${ordinal}`, name: carrierName, arguments: JSON.stringify(modelArgumentsForOrdinal(ordinal)) }))
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: providerFixture?.preparationFailure ? 'The provider could not be prepared; no drafts were created.' : 'The draft was created.' }] }],
       };
     }, getStreamedResponse: modelStream,
   };
   const agent = { model, tools: [carrier] };
   const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [carrier], activeToolNames: [carrierName],
-    policyHash: 'p3-direct-write', budget: { maxUncachedTokens: 10_000, maxModelCalls: 3, maxToolCalls: 3, maxElapsedMs: 60_000 } });
+    policyHash: 'p3-direct-write', budget: { maxUncachedTokens: 10_000, maxModelCalls: writeCount + 2, maxToolCalls: writeCount + 2, maxElapsedMs: 60_000 } });
   assert.ok(sealed.ok);
   if (!sealed.ok) return;
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
@@ -170,9 +199,9 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('legacy Runner must remain unreachable'); } });
   const run = (input: any = [{ type: 'message', role: 'user', content: prompt }], extra: Record<string, unknown> = {}) => brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
-    counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1` },
+    counter: new brackets.ToolCallsCounter(writeCount + 2), behaviorScopeId: `${session.id}::turn:1` },
   () => hostRunRunner(runner as never, agent as never, input,
-    { maxTurns: 3, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
+    { maxTurns: writeCount + 2, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
   return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt,
     counts: () => ({ providerCalls, modelCalls, preparationCalls, carrierBodies }) };
 }
@@ -192,6 +221,181 @@ for (const carrierName of ['call_tool', 'work_call'] as const) test(`one exact $
   const db = eventlog.openEventLog();
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(session.id) as { n: number }).n, 1);
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?').get(session.id) as { n: number }).n, 0);
+});
+
+test('three independent exact reversible writes settle through per-call consent without plan_task', async () => {
+  const fixture = await directWriteFixture('work_call', 'draft', 'three-independent', false, 'args_json', 3);
+  assert.ok(fixture);
+  const outcome = await fixture.run();
+  assert.equal(fixture.counts().providerCalls, 3, JSON.stringify(outcome.history));
+  assert.equal(fixture.counts().preparationCalls, 3);
+  assert.equal(Boolean(outcome.hasInterruptions), false);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['turn_graph_compiled', 'awaiting_user_input'] }).length, 0);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 3);
+  const returned = outcome.history.filter((item: any) => item.type === 'function_call_result');
+  assert.equal(returned.length, 3);
+  assert.equal(new Set(returned.map((item: any) => item.callId)).size, 3);
+});
+
+test('three exact drafts dispatch from the real SDK schema after undefined optional metadata is closed at ingestion', async () => {
+  const schema = JSON.parse(readFileSync(new URL('../../tools/fixtures/outlook-create-draft-input-schema.json', import.meta.url), 'utf8'));
+  // The exact SDK shape found by a metadata-only live reproduction. It is
+  // absent from the provider JSON wire, but present as undefined in memory.
+  schema.properties.attachment.anyOf[0].description = undefined;
+  const payloads = [
+    { subject: 'schema-proof-A', body: 'Redwood appointment follow-up.', is_html: false },
+    { subject: 'schema-proof-B', body: 'Juniper proposal follow-up.', is_html: false },
+    { subject: 'schema-proof-C', body: 'Willow formatting check.', is_html: false },
+  ];
+  const fixture = await directWriteFixture('work_call', 'draft', 'sdk-schema-three', false, 'args_json', 3,
+    { operationId: 'OUTLOOK_CREATE_DRAFT', schema, payloads, singleFrame: true });
+  assert.ok(fixture);
+  assert.equal(fixture.manifest.externalDefinition?.providerInputSchemaDigest, 'e76f11e4b4d7b4ee8f075b8f43a7d6a329e09d6b3dcabfceab8685f9817dd418');
+  const outcome = await fixture.run();
+  assert.equal(fixture.counts().providerCalls, 3, JSON.stringify(outcome.history));
+  assert.equal(fixture.counts().preparationCalls, 3);
+  assert.equal(Boolean(outcome.hasInterruptions), false);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['turn_graph_compiled', 'awaiting_user_input'] }).length, 0);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 3);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).filter(row => row.data.kind === 'prepared_external_call_mismatch').length, 0);
+});
+
+function refusedProviderFixture(representation: 'direct' | 'gateway_object' | 'gateway_string' | 'gateway_alias') {
+  const schema = representation === 'direct' ? INPUT_SCHEMA
+    : JSON.parse(readFileSync(new URL('../../tools/fixtures/outlook-create-draft-input-schema.json', import.meta.url), 'utf8'));
+  if (representation !== 'direct') schema.properties.attachment.anyOf[0].description = undefined;
+  return {
+    operationId: representation === 'direct' ? 'EXAMPLE_CREATE_DRAFT' : 'OUTLOOK_CREATE_DRAFT', schema,
+    payloads: [1, 2, 3].map(ordinal => representation === 'direct'
+      ? { body: `Exact refused draft ${ordinal}.` }
+      : { subject: `raw-carrier-proof-${ordinal}`, body: `Exact refused draft ${ordinal}.`, is_html: false,
+          to_recipients: [], cc_recipients: [], bcc_recipients: [] }),
+    singleFrame: true, preparationFailure: true,
+    ...(representation === 'direct' ? {} : { carrierRepresentation: representation }),
+  };
+}
+
+for (const representation of ['direct', 'gateway_object', 'gateway_string', 'gateway_alias'] as const) test(`a preparation refusal settles all three ${representation} work calls without dispatch or checkpoint recovery`, async () => {
+  const fixture = await directWriteFixture('work_call', 'draft', `three-preparation-refused-${representation}`, false, 'args_json', 3,
+    refusedProviderFixture(representation));
+  assert.ok(fixture);
+  const outcome = await fixture.run();
+  assert.equal(fixture.counts().preparationCalls, 1);
+  assert.equal(fixture.counts().providerCalls, 0);
+  assert.equal(outcome.hold, undefined, JSON.stringify(outcome));
+  assert.equal(outcome.serializedRecoveryState, undefined);
+  const rawCall = outcome.history.find((item: any) => item.type === 'function_call') as any;
+  const rawOuter = JSON.parse(rawCall.arguments);
+  if (representation === 'gateway_object') {
+    assert.equal(typeof JSON.parse(rawOuter.args_json).arguments, 'object', 'accepted model history keeps the raw nested object');
+  } else if (representation === 'gateway_alias') {
+    assert.ok(rawOuter.args, 'accepted history retains the raw args alias');
+    assert.equal(Object.hasOwn(rawOuter, 'args_json'), false);
+  }
+  const returned = outcome.history.filter((item: any) => item.type === 'function_call_result') as any[];
+  assert.deepEqual(returned.map(item => [item.callId, item.name, JSON.parse(item.output.text).disposition]), [
+    ['exact-draft-1', 'work_call', 'refused_pre_dispatch'],
+    ['exact-draft-2', 'work_call', 'not_started'],
+    ['exact-draft-3', 'work_call', 'not_started'],
+  ]);
+  // Reopen storage to prove settlement and projection survive process-local
+  // state loss; the provider cannot be entered by receipt/checkpoint recovery.
+  eventlog.closeEventLog();
+  const db = eventlog.openEventLog();
+  const calls = db.prepare('SELECT logical_tool_call_id, tool_name, state FROM logical_tool_calls WHERE session_id = ? ORDER BY logical_tool_call_id').all(fixture.session.id);
+  assert.deepEqual(calls, [1, 2, 3].map(ordinal => ({ logical_tool_call_id: `exact-draft-${ordinal}`, tool_name: fixture.operationId.toLowerCase(), state: 'settled' })));
+  const settlements = db.prepare('SELECT execution_kind, host_crossing_count, physical_crossing_count FROM logical_call_settlements WHERE session_id = ?').all(fixture.session.id);
+  assert.deepEqual(settlements, [1, 2, 3].map(() => ({ execution_kind: 'refused_pre_dispatch', host_crossing_count: 0, physical_crossing_count: 0 })));
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?').get(fixture.session.id) as { n: number }).n, 0);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM logical_model_result_projection_receipts WHERE session_id = ?').get(fixture.session.id) as { n: number }).n, 3);
+  assert.deepEqual(db.prepare('SELECT disposition FROM accepted_model_batch_checkpoints WHERE session_id = ?').all(fixture.session.id), [{ disposition: 'ready' }]);
+});
+
+for (const representation of ['direct', 'gateway_object'] as const) test(`finalize recovery closes exact ${representation} unstarted siblings after storage reopens without replaying preparation`, async () => {
+  const fixture = await directWriteFixture('work_call', 'draft', `three-refused-recovery-${representation}`, false, 'args_json', 3,
+    refusedProviderFixture(representation));
+  assert.ok(fixture);
+  eventlog.openEventLog().exec(`CREATE TEMP TRIGGER fixture_refuse_sibling_settlement
+    BEFORE INSERT ON logical_call_settlements
+    WHEN NEW.logical_tool_call_id = 'exact-draft-2'
+    BEGIN SELECT RAISE(ABORT, 'fixture settlement storage unavailable'); END`);
+  const held = await fixture.run();
+  assert.ok(held.serializedRecoveryState);
+  assert.equal(HostRecoveryState.fromString(held.serializedRecoveryState).phase, 'finalize');
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const identity = { sessionId: fixture.session.id, turn: fixture.source.turn, sourceUserSeq: fixture.source.seq };
+  const blockedTerminal = {
+    version: 2 as const, id: turnOutcomeId(identity), identity,
+    status: 'blocked' as const, resumable: true,
+    presentation: { kind: 'blocked' as const, text: 'The provider could not be prepared; no drafts were created.' },
+  };
+  // Exact live failure: exhausting checkpoint retries returned a blocked
+  // outcome, but the unchanged terminal guard correctly rejected its two
+  // OPEN siblings. Merely delivering different prose cannot repair this.
+  assert.throws(() => commitTurnOutcome(blockedTerminal), /host call authority still owns unsettled work/);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
+  assert.deepEqual(fixture.counts(), { providerCalls: 0, modelCalls: 1, preparationCalls: 1, carrierBodies: 0 });
+  eventlog.closeEventLog(); // drops the injected failure as a fresh process would
+  const recovered = await fixture.run(HostRecoveryState.fromString(held.serializedRecoveryState));
+  assert.ok(recovered.serializedRecoveryState);
+  assert.equal(HostRecoveryState.fromString(recovered.serializedRecoveryState).phase, 'continue');
+  assert.deepEqual(fixture.counts(), { providerCalls: 0, modelCalls: 1, preparationCalls: 1, carrierBodies: 0 });
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM logical_tool_calls WHERE session_id = ? AND state = 'settled' AND tool_name = ?").get(fixture.session.id, fixture.operationId.toLowerCase()) as { n: number }).n, 3);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM logical_model_result_projection_receipts WHERE session_id = ?').get(fixture.session.id) as { n: number }).n, 3);
+  assert.deepEqual(db.prepare('SELECT disposition FROM accepted_model_batch_checkpoints WHERE session_id = ?').all(fixture.session.id), [{ disposition: 'ready' }]);
+  const completed = await fixture.run(HostRecoveryState.fromString(recovered.serializedRecoveryState));
+  assert.equal(completed.hold, undefined);
+  assert.equal(fixture.counts().preparationCalls, 1);
+  assert.equal(fixture.counts().providerCalls, 0);
+  const terminal = commitTurnOutcome(blockedTerminal);
+  assert.equal(terminal.presentation.status, 'blocked');
+  assert.equal(terminal.presentation.identity.sourceUserSeq, fixture.source.seq);
+  assert.equal(commitTurnOutcome(blockedTerminal).event.id, terminal.event.id);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+});
+
+for (const change of ['call_name', 'arguments', 'active_call_lease'] as const) test(`unstarted sibling recovery refuses ${change} without inventing a zero-effect settlement`, async () => {
+  const fixture = await directWriteFixture('work_call', 'draft', `refusal-tamper-${change}`, false, 'args_json', 3, {
+    operationId: 'EXAMPLE_CREATE_DRAFT', schema: INPUT_SCHEMA,
+    payloads: [1, 2, 3].map(ordinal => ({ body: `Exact protected draft ${ordinal}.` })),
+    singleFrame: true, preparationFailure: true,
+  });
+  assert.ok(fixture);
+  eventlog.openEventLog().exec(`CREATE TEMP TRIGGER fixture_refuse_sibling_settlement
+    BEFORE INSERT ON logical_call_settlements
+    WHEN NEW.logical_tool_call_id = 'exact-draft-2'
+    BEGIN SELECT RAISE(ABORT, 'fixture settlement storage unavailable'); END`);
+  const held = await fixture.run();
+  assert.ok(held.serializedRecoveryState);
+  eventlog.closeEventLog();
+  const state = HostRecoveryState.fromString(held.serializedRecoveryState);
+  const call = state.frameHistory[1] as any;
+  if (change === 'call_name') {
+    call.name = 'call_tool';
+    (state.resultItems[1] as any).name = 'call_tool';
+  } else if (change === 'arguments') {
+    const outer = JSON.parse(call.arguments);
+    outer.args_json = JSON.stringify({ body: 'Changed body after admission.' });
+    call.arguments = JSON.stringify(outer);
+  } else {
+    const { activateDispatchLease } = await import('./dispatch-lease.js');
+    const { durableLogicalCallRecoveryMaterial } = await import('./logical-call-contract.js');
+    const acceptedTaskId = state.acceptedModelBatchRef!.acceptedTaskId;
+    const material = durableLogicalCallRecoveryMaterial(acceptedTaskId, call.name, JSON.parse(call.arguments));
+    assert.ok(material);
+    activateDispatchLease({ sessionId: fixture.session.id, scopeId: `fixture-active-sibling:${fixture.session.id}`,
+      sourceUserSeq: fixture.source.seq, acceptedTaskId, logicalToolCallId: call.callId,
+      recovery: { effect: 'external_write', businessCall: true, material } });
+  }
+  const outcome = await fixture.run(state);
+  assert.ok(outcome.hold, JSON.stringify(outcome));
+  assert.deepEqual(fixture.counts(), { providerCalls: 0, modelCalls: 1, preparationCalls: 1, carrierBodies: 0 });
+  assert.equal((eventlog.openEventLog().prepare('SELECT state FROM logical_tool_calls WHERE session_id = ? AND logical_tool_call_id = ?')
+    .get(fixture.session.id, 'exact-draft-2') as { state: string }).state, 'open');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM accepted_model_batch_checkpoints WHERE session_id = ?')
+    .get(fixture.session.id) as { n: number }).n, 0);
 });
 
 for (const change of ['rejected', 'edited-args', 'wrong-approval', 'expired'] as const) test(`direct approval resume ${change} cannot execute a provider call`, async () => {

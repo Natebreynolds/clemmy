@@ -913,9 +913,21 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
     responses += 1;
     assert.notEqual(res.stoppedReason, 'error', `the warm host turn failed: ${JSON.stringify(res)}`);
     assert.match(res.text, /^Your calendar is ready\./, JSON.stringify(eventlog.listEvents(sessionId)));
-    assert.match(res.text, /Retained work \(durable checkpoint\):/);
-    assert.match(res.text, /Source\/tool schedulerco_list_events: 1 record \(unknown\) retained as rh_[a-f0-9]+\./);
-    assert.match(res.text, /External write state: no settled external-write attempt is recorded\./);
+    const completion = eventlog.listEvents(sessionId).find(event => event.type === 'conversation_completed');
+    const completionRef = completion?.data.completionVerdictRef as Record<string, unknown> | undefined;
+    const unavailableReview = eventlog.listEvents(sessionId).find(event => event.id === completionRef?.eventId);
+    assert.equal(unavailableReview?.type, 'goal_alignment_judged');
+    assert.equal(unavailableReview?.data.failedOpen, true);
+    const unavailableReason = unavailableReview?.data.reason;
+    assert.equal(typeof unavailableReason, 'string');
+    assert.ok(typeof unavailableReason === 'string' && unavailableReason.trim().length > 0,
+      'an unavailable completion review retains its actionable cause');
+    assert.ok(res.text.includes(`Verification note: ${unavailableReason}`),
+      'the owner sees the reason from the exact retained failed-open review');
+    assert.match(res.text, /This result remains unreviewed\./,
+      'the authored read result is preserved without presenting unavailable review as verification');
+    assert.doesNotMatch(res.text, /accepting completion/,
+      'the historical internal fail-open label is not a claim of successful completion');
   } finally {
     _setBridgeImplsForTests({});
     productionPorts.clearProductionCapabilityPorts();
@@ -952,9 +964,16 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
   assert.equal(events.filter((event) => event.type === 'conversation_completed').length, 1,
     'the host turn published more than one terminal');
   const terminal = events.find((event) => event.type === 'conversation_completed');
-  assert.equal(terminal?.data.reason, 'verification_required');
+  const verdict = terminal?.data.completionVerdictRef as Record<string, unknown> | undefined;
+  assert.equal(verdict?.verified, false);
+  assert.equal(verdict?.failedOpen, true);
+  assert.equal(verdict?.disposition, 'enabled_unavailable');
+  const judgment = events.find(event => event.id === verdict?.eventId);
+  assert.equal(judgment?.type, 'goal_alignment_judged');
+  assert.equal(judgment?.data.failedOpen, true, 'the public qualifier redeems the actual unavailable review');
+  assert.equal(terminal?.data.reason, 'blocked');
   assert.equal(terminal?.data.delivered, false);
-  assert.deepEqual(terminal?.data.verificationMissing, ['coverage_unproven']);
+  assert.equal(terminal?.data.verificationDetail, 'completion_review_failed_open');
   assert.equal(events.filter((event) => event.type === 'turn_graph_shadow').length, 0,
     'the host fixture manufactured legacy graph authority');
   const db = eventlog.openEventLog();

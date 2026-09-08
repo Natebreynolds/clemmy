@@ -508,6 +508,12 @@ test('one bounded repair admits after a destination posture mismatch', async () 
   });
   assert.equal(result.status, 'admitted');
   assert.equal(interprets, 2);
+  // TWO judge calls, as originally specified. C14 briefly saw one here because
+  // its destination check compared each operation against the UNION of every
+  // declared destination and so fired on this fixture. The check is now scoped
+  // to an operation's own deliverable family and dependency lineage, which does
+  // not match this case, so the source/effect judge handles it exactly as before
+  // and the original token totals hold.
   assert.equal(judges, 2);
   assert.equal(result.record.repairAttempted, true);
   assert.equal(result.record.inputTokens, 222);

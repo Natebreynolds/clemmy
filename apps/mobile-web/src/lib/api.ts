@@ -1,3 +1,4 @@
+import { readCompletionReviewResponse, type TaskMode, type ReplayPayload } from '@clem/chat-engine';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
  * served by the Clementine daemon at /m/), so the session cookie is sent
@@ -13,6 +14,7 @@
  */
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
 import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
+import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -105,14 +107,32 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     err.offline = true;
     throw err;
   }
-  // Any answer at all means the door is open again.
-  if (connectionDoor() === 'offline') setConnectionDoor('direct');
+  // A REMEMBERED answer is not an answer from the Mac. The service worker
+  // serves a stamped last-good copy when the network fails (lib/last-good.ts),
+  // and it arrives here as an ordinary 200 — so the stamp, not the status, is
+  // what decides whether the door is open. Without this the app would report
+  // "Direct" while showing yesterday's data.
+  const lastGoodStamp = res.headers.get(LAST_GOOD_HEADER);
+  noteLastGood(path, lastGoodStamp);
+  if (lastGoodStamp) {
+    setConnectionDoor('offline');
+    reportConnectionLost();
+  } else if (connectionDoor() === 'offline') {
+    // Any live answer at all means the door is open again.
+    setConnectionDoor('direct');
+  }
   // Session tokens rotate every ~12h and the proof signs over a fingerprint
   // derived from the token. The rotation sets a new HttpOnly cookie the page
   // can't read, so the daemon also announces the new fingerprint in a
   // response header — fold it in or every later proof 401s (live: a paired
   // phone bounced to the login screen every 12 hours).
-  const rotatedFp = res.headers.get('x-clem-session-fp');
+  //
+  // A REMEMBERED copy must never do that. Its fingerprint is whatever the
+  // daemon announced when the copy was taken, and adopting it would sign every
+  // later proof over a fingerprint that has since rotated — the exact 401 loop
+  // this header exists to prevent. (The worker also strips it when storing;
+  // this is the second lock on the same door.)
+  const rotatedFp = lastGoodStamp ? null : res.headers.get('x-clem-session-fp');
   if (rotatedFp) sessionFingerprint = rotatedFp;
   const text = await res.text();
   let body: unknown = null;
@@ -125,12 +145,17 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     // self-heals invisibly. Pre-auth paths keep the immediate signal (their
     // 401 IS the status).
     if (isPreAuthPath(path)) {
+      clearLastGood();
       window.dispatchEvent(new Event('clem:needs-login'));
     } else {
       void fetch('/m/auth/status', { credentials: 'include' })
         .then((probe) => (probe.ok ? probe.json() : { authenticated: false }))
         .then((status: { authenticated?: boolean }) => {
-          if (!status?.authenticated) window.dispatchEvent(new Event('clem:needs-login'));
+          if (status?.authenticated) return;
+          // A CONFIRMED dead session, not a rotation race: drop the remembered
+          // reads with it. A transient 401 keeps them, which is the point.
+          clearLastGood();
+          window.dispatchEvent(new Event('clem:needs-login'));
         })
         .catch(() => { /* unreachable daemon reads as offline, not sign-out */ });
     }
@@ -310,8 +335,20 @@ export async function upgradeToDeviceKey(): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
-  await api('/m/auth/logout', { method: 'POST' });
-  setSessionFingerprint(null);
+  // Signing out is a LOCAL act first; telling the daemon is the courtesy.
+  // Offline that POST throws, and letting the throw skip what follows left a
+  // signed-out phone holding the service worker's remembered reads and its
+  // badge — a cached read outliving the credential that earned it. The clear
+  // is therefore unconditional, and the caller still learns the daemon was
+  // never told.
+  try {
+    await api('/m/auth/logout', { method: 'POST' });
+  } finally {
+    setSessionFingerprint(null);
+    // Nothing this session could read may survive it — including the service
+    // worker's remembered copies of the run list and the inbox summary.
+    clearLastGood();
+  }
 }
 
 // ─── inbox shape (shape mirrors src/runtime/harness/approval-registry.ts) ─
@@ -375,7 +412,10 @@ export interface InboxNotification {
     trustProposalId: string | null;
     relatedApprovalIds?: string[];
     questionId: string | null;
+    /** The originating CONVERSATION — where a reply belongs. */
     sessionId: string | null;
+    /** The session the run itself used, when the work had one of its own. */
+    runSessionId?: string | null;
     runId: string | null;
     stepId: string | null;
     workflow: string | null;
@@ -478,8 +518,11 @@ export async function markInboxNotificationRead(id: string): Promise<{
   return api(`/m/api/inbox/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' });
 }
 
+/** The ONE spelling of the summary path — the stamp registry is keyed by it. */
+export const INBOX_SUMMARY_PATH = '/m/api/inbox/summary';
+
 export async function getInboxSummary(): Promise<InboxSummary> {
-  return api('/m/api/inbox/summary');
+  return api(INBOX_SUMMARY_PATH);
 }
 
 export async function listInboxQuestions(): Promise<{ questions: InboxQuestion[]; count: number }> {
@@ -639,6 +682,17 @@ export interface RunSummary {
   status: 'received' | 'running' | 'queued' | 'awaiting_approval' | 'awaiting_input' | 'completed' | 'failed' | 'cancelled';
   createdAt: string;
   updatedAt: string;
+  // The route already enriches every row through the same formatter the
+  // desktop reads (src/runtime/activity-format.ts): a human state label and a
+  // one-line preview of what the run produced, is doing, or failed on. The
+  // phone printed the raw status token for months because these were simply
+  // not declared here. Optional because an older daemon's row has neither.
+  /** e.g. "Done", "Waiting for your approval" — never a snake_case token. */
+  statusLabel?: string;
+  /** The run's output preview, error, or live line. */
+  preview?: string;
+  /** True when the daemon says this row still wants a person. */
+  needsAttention?: boolean;
 }
 
 /** One run as a readable object: what it did, what it touched, what it left. */
@@ -665,8 +719,21 @@ export interface RunDetail {
   deliverables: Array<{ at: number; name: string; dir: string | null; excerpt: string | null }>;
 }
 
+/**
+ * The ONE spelling of a run's detail path.
+ *
+ * The last-good stamp registry is keyed by the path api() was called with, so
+ * a screen asking "is what I'm showing remembered?" has to ask with the exact
+ * same string. Spelling it twice cost us that: `background:task-1` was stored
+ * encoded and looked up raw, the lookup missed, and a stamped copy of exactly
+ * the runs a push addresses rendered with no age disclosure at all.
+ */
+export function runDetailPath(sessionId: string): string {
+  return `/m/api/runs/${encodeURIComponent(sessionId)}`;
+}
+
 export async function getRun(sessionId: string): Promise<RunDetail> {
-  return api(`/m/api/runs/${encodeURIComponent(sessionId)}`);
+  return api(runDetailPath(sessionId));
 }
 
 // ─── server-owned running work ─────────────────────────────────────────────
@@ -796,7 +863,24 @@ export async function listChatSessions(): Promise<{ sessions: ChatSession[] }> {
 }
 
 export async function getChatSession(id: string): Promise<{ session: ChatSession; events: ChatEvent[]; latestSeq: number }> {
-  return api<{ session: ChatSession; events: ChatEvent[]; latestSeq: number }>(`/m/api/chat/sessions/${encodeURIComponent(id)}`);
+  const initial = await api<{ session: ChatSession; events: ChatEvent[]; latestSeq: number; page?: ReplayPayload['page'] }>(`/m/api/chat/sessions/${encodeURIComponent(id)}`);
+  const events = [...initial.events];
+  let page = initial.page;
+  let latestSeq = page?.scannedThroughSeq ?? initial.latestSeq;
+  while (page?.hasMore) {
+    const next = await fetchRecentChatEvents(id, page.scannedThroughSeq, page.snapshotSeq);
+    if (next.sessionId !== id || next.page?.version !== 1
+      || next.page.snapshotSeq !== page.snapshotSeq
+      || next.page.scannedThroughSeq <= page.scannedThroughSeq
+      || next.page.scannedThroughSeq > page.snapshotSeq
+      || (!next.page.hasMore && next.page.scannedThroughSeq !== page.snapshotSeq)) {
+      throw new Error('Chat history traversal did not advance within its origin snapshot.');
+    }
+    events.push(...next.events.filter(event => event.sessionId === id) as ChatEvent[]);
+    page = next.page;
+    latestSeq = page.scannedThroughSeq;
+  }
+  return { session: initial.session, events, latestSeq };
 }
 
 export interface ChatSendResult {
@@ -825,13 +909,14 @@ export function freshIdempotencyKey(): string {
 }
 
 export async function sendChatMessage(
-  input: { message: string; sessionId?: string; idempotencyKey: string },
+  input: { message: string; sessionId?: string; idempotencyKey: string; taskMode?: TaskMode },
 ): Promise<ChatSendResult> {
   return api<ChatSendResult>('/m/api/chat/send', {
     method: 'POST',
     headers: { 'idempotency-key': input.idempotencyKey },
     body: JSON.stringify({
       message: input.message,
+      ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       sessionId: input.sessionId,
     }),
   });
@@ -844,13 +929,14 @@ export async function sendChatMessage(
  * the accepted run keeps going.
  */
 export async function sendChatMessageAsync(
-  input: { message: string; sessionId?: string | null; idempotencyKey: string; steerOnly?: boolean },
+  input: { message: string; sessionId?: string | null; idempotencyKey: string; steerOnly?: boolean; taskMode?: TaskMode },
 ): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean }> {
   return api('/m/api/chat/send', {
     method: 'POST',
     headers: { 'idempotency-key': input.idempotencyKey },
     body: JSON.stringify({
       message: input.message,
+      ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       async: true,
       ...(input.steerOnly ? { steerOnly: true } : {}),
@@ -862,9 +948,11 @@ export async function sendChatMessageAsync(
 export async function fetchRecentChatEvents(
   sessionId: string,
   sinceSeq: number,
-): Promise<{ sessionId: string; sessionStatus: string; events: ChatEvent[]; latestSeq: number }> {
-  const params = sinceSeq > 0 ? `?sinceSeq=${sinceSeq}` : '';
-  return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/events/recent${params}`);
+  throughSeq?: number,
+): Promise<ReplayPayload> {
+  const params = new URLSearchParams({ sinceSeq: String(sinceSeq) });
+  if (throughSeq !== undefined) params.set('throughSeq', String(throughSeq));
+  return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/events/recent?${params}`);
 }
 
 /**
@@ -899,18 +987,20 @@ export function createChatStreamTransport(): {
   connect(opts: {
     sessionId: string;
     sinceSeq: number;
-    onReplay(payload: { events: ChatEvent[]; latestSeq?: number }): void;
+    throughSeq?: number;
+    onReplay(payload: ReplayPayload): void;
     onEvent(event: ChatEvent): void;
     onError(): void;
   }): Promise<{ close(): void }>;
-  fetchRecent(sessionId: string, sinceSeq: number): Promise<{ events: ChatEvent[]; latestSeq?: number }>;
+  fetchRecent(sessionId: string, sinceSeq: number, throughSeq?: number): Promise<ReplayPayload>;
 } {
   return {
     async connect(opts) {
       const streamPath = `/m/api/chat/sessions/${encodeURIComponent(opts.sessionId)}/stream`;
       const ticket = await mintStreamTicket(streamPath);
       const params = new URLSearchParams();
-      if (opts.sinceSeq > 0) params.set('sinceSeq', String(opts.sinceSeq));
+      params.set('sinceSeq', String(opts.sinceSeq));
+      if (opts.throughSeq !== undefined) params.set('throughSeq', String(opts.throughSeq));
       if (ticket) params.set('ticket', ticket);
       const query = params.toString();
       const source = new EventSource(`${streamPath}${query ? `?${query}` : ''}`, { withCredentials: true });
@@ -936,7 +1026,7 @@ export function createChatStreamTransport(): {
         },
       };
     },
-    fetchRecent: (sessionId, sinceSeq) => fetchRecentChatEvents(sessionId, sinceSeq),
+    fetchRecent: (sessionId, sinceSeq, throughSeq) => fetchRecentChatEvents(sessionId, sinceSeq, throughSeq),
   };
 }
 
@@ -1484,6 +1574,17 @@ export interface ModelSettings {
   activeBrain: string;
   /** Optional for cached PWAs talking briefly to an older daemon. */
   codexRescue?: CodexRescueSettings;
+}
+
+/** Paired mobile endpoint; independent of model choice and Second opinion. */
+export async function getCompletionReview() {
+  return readCompletionReviewResponse(await api<unknown>('/m/api/settings/completion-review'));
+}
+
+export async function setCompletionReview(enabled: boolean) {
+  return readCompletionReviewResponse(await api<unknown>('/m/api/settings/completion-review', {
+    method: 'PATCH', body: JSON.stringify({ enabled }),
+  }));
 }
 
 export async function getModelSettings(): Promise<ModelSettings> {

@@ -513,6 +513,10 @@ function WorkspaceViewForId({ id }: { id: string }) {
                   <ChatBubble
                     key={m.id}
                     message={m}
+                    sessionId={chat.sessionId.current ?? undefined}
+                    executionBusy={chat.busy}
+                    onExecutePlan={chat.executePlan}
+                    onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
                     onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
                     onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
                   />
@@ -521,7 +525,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
             </div>
             <div className="border-t border-border p-2">
               <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-              <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} placeholder="Ask about this workspace…" />
+              <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask about this workspace…" />
             </div>
           </div>
         ) : (

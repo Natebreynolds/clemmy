@@ -68,7 +68,11 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
     more: ['/chat', '/memory', '/meetings', '/goals', '/agents'],
   },
   quickActions: [],
-  phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
+  // Work is a DESTINATION, not only a tap-through. The run screen — the best
+  // surface in the product — used to be reachable one way: Activity, which was
+  // not itself offered here, so it lived behind "More". No tenth section was
+  // added for it; the section that already exists was promoted.
+  phoneSwitcher: ['home', 'inbox', 'activity', 'chats', 'spaces', 'more'],
 };
 
 /** Pane ids in render order, honoring the user's order and hidden set. */
@@ -88,7 +92,10 @@ export function visiblePanes(prefs: HomePreferences): HomePaneId[] {
 export const PHONE_PANES: ReadonlyArray<{ id: HomePaneId; label: string }> = [
   { id: 'quick_actions', label: 'Quick actions' },
   { id: 'needs_you', label: 'Needs you' },
-  { id: 'running', label: 'Running' },
+  // The pane's own heading is derived from what is in it — "Running" only when
+  // the server certified something live, "Still open" when it did not — so the
+  // switch that turns it on names the pane, not one of its states.
+  { id: 'running', label: 'Current work' },
   { id: 'while_away', label: 'While you were away' },
   { id: 'projects', label: 'Coming up · Projects' },
 ];

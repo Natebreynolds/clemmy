@@ -1,3 +1,4 @@
+import { acceptedPlanExecutionText } from '../harness/accepted-plan-execution.js';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import pino from 'pino';
@@ -235,6 +236,8 @@ export function graphSemanticText(
   context?: TaskContinuationContext,
   source?: EventRow,
 ): string {
+  const reviewedExecution = acceptedPlanExecutionText(identity.sessionId, identity.sourceUserSeq);
+  if (reviewedExecution) return reviewedExecution;
   // A conversational Yes is not a fresh semantic task. Rehydrate the exact
   // frozen send only after the registry proves this accepted source is the
   // addressed response that resolved it. This makes the graph/expected-work

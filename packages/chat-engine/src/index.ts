@@ -7,3 +7,8 @@ export * from './terminal-presentation.js';
 export * from './stream.js';
 export * from './engine.js';
 export * from './markdown.js';
+export * from './task-mode.js';
+export * from './pending-request.js';
+export * from './write-ledger.js';
+export * from './completion-review.js';
+export * from './live-approval-control.js';

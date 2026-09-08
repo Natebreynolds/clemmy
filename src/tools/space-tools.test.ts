@@ -718,6 +718,8 @@ test('space_get surfaces hand-written manifest JSON errors and space_save requir
 test('space_list + space_get read back', async () => {
   assert.match(text(await tools.space_list({})), /CRM Board/);
   const got = text(await tools.space_get({ slug: 'crm' }));
+  assert.match(got, /space_get_view\(\{slug:"crm",grep:null,around:null\}\)/);
+  assert.match(got, /apply space_edit_view/);
   assert.match(got, /Workspace "CRM Board"/);
   assert.match(got, /v2/);
   assert.match(got, /Objective: Keep the sales team focused/);

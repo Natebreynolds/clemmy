@@ -53,6 +53,7 @@ import {
   WORKFLOW_RUNS_DIR,
   ensureDir,
   textResult,
+  nonWriteTextResult,
 } from './shared.js';
 import {
   getWorkflowImportJob,
@@ -94,7 +95,6 @@ import { uniqueEnabledWorkflowMatch } from './named-workflow-match.js';
 import { admitNamedWorkflowRunFromAcceptedSource } from './admit-named-workflow-run.js';
 import { addNotification } from '../runtime/notifications.js';
 import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
-import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
 import {
   applyWorkflowVisualContractFixes,
@@ -377,9 +377,9 @@ function appendDataSources(def: WorkflowDefinition): string {
 }
 
 export interface StepBindResult {
-  /** Confirmation lines for steps that were AUTO-bound (deterministic). */
+  /** Confirmation lines from explicit authoring bindings. */
   boundNotes: string[];
-  /** Advisory lines for steps that SHOULD bind but weren't auto-bound. */
+  /** Optional retrieval candidates; never binding or required work. */
   advisories: string[];
 }
 
@@ -443,77 +443,28 @@ function lockAllowedToolsTo(existing: string[] | undefined, family: string[]): s
   return [...new Set<string>([...kept, ...family])];
 }
 
-/** Auto-bind may NARROW the tool surface but must never WIDEN the auto-approval
- *  scope: if the author explicitly scoped the step (non-wildcard) and the proven
- *  family isn't already reachable, locking it in would silently auto-approve a
- *  tool they deliberately excluded. In that case we ADVISE instead of mutating. */
-function canLockWithoutEscalation(existing: string[] | undefined, family: string[]): boolean {
-  if (!existing || existing.length === 0 || existing.some((t) => t === '*')) return true; // wildcard → narrowing
-  return family.every((f) =>
-    existing.some((e) => e === f || (e.endsWith('*') && f.startsWith(e.slice(0, -1)))));
-}
-
-/**
- * Hybrid author-time binding (the centerpiece of tight authoring). For each
- * step, find the user's PROVEN tool-choice for what the step does:
- *   - HIGH-confidence cli/mcp match → AUTO-BIND: bake the exact command into the
- *     step prompt AND lock allowedTools to that family (dropping the composio
- *     drift gateway) so the run uses the path that works and can't re-decide.
- *   - MEDIUM match, or any composio match (identifier/connection rot-prone) →
- *     ADVISE only: name the exact command so the author can bind it; never mutate.
- *   - Already-bound or usesSkill steps are left untouched.
- * Mutates `steps` in place; returns notes for the tool result. Best-effort — a
- * matcher error never blocks the write (a clean store yields empty results).
- */
+/** Historical name retained for authoring callers. Remembered procedures are
+ * retrieval candidates only: the authored step owns its effect, prompt and tool
+ * scope. A prose overlap cannot create another operation or lock a tool family.
+ * Omitted effects stay unspecified; they are never defaulted to read here. */
 export function bindStepsToToolChoices(
-  steps: Array<{ id?: string; prompt: string; allowedTools?: string[]; usesSkill?: string }>,
+  steps: Array<Pick<WorkflowStepInput, 'id' | 'prompt' | 'allowedTools' | 'usesSkill' | 'sideEffect' | 'call'>>,
   opts: { choices?: ToolChoiceRecord[] } = {},
 ): StepBindResult {
-  const boundNotes: string[] = [];
   const advisories: string[] = [];
   for (const step of steps) {
-    if (step.usesSkill) continue; // a skill owns its own tool surface
-    if (step.prompt.includes(BIND_DIRECTIVE_MARKER)) continue; // already engine-bound
-    const requestedEffectScope = requestedCapabilityEffectScope(step.prompt);
+    if (step.usesSkill || step.call || step.prompt.includes(BIND_DIRECTIVE_MARKER)) continue;
+    if (!step.sideEffect) continue;
+    const effect = step.sideEffect === 'read' ? 'read' : 'write';
     let matches: StepToolChoiceMatch[];
     try { matches = matchToolChoicesForStep(step.prompt, { choices: opts.choices }); } catch { continue; }
-    const top = matches.find((m) => !m.alreadyBound);
+    const top = matches.find((m) => !m.alreadyBound && m.effectClass === effect);
     if (!top) continue;
-    // A compound read+write step needs more than one effect role. Procedural
-    // memory is useful ranking evidence for the operation it proved, but one
-    // recalled CLI/MCP must never lock the whole step's surface and strand the
-    // other role. Keep the step unchanged and make the missing discovery work
-    // explicit; a later authoring pass may split/bind the roles independently.
-    if (requestedEffectScope === 'mixed') {
-      advisories.push(
-        `Step \`${step.id ?? '?'}\` contains mixed read/write work. Remembered ${top.kind} \`${neutralizeTemplatePlaceholders(top.command)}\` may cover one operation, but it was not auto-bound or used to lock the step. Split the effects into separate steps or keep discovery available for every unresolved capability.`,
-      );
-      continue;
-    }
-    // AUTO-BIND only when it's a proven cli/mcp choice AND locking it in won't
-    // silently widen the auto-approval scope the author chose; otherwise advise.
-    const safeToLock = canLockWithoutEscalation(step.allowedTools, top.family);
-    if (top.autoBindable && top.tier === 'high' && safeToLock) {
-      const how = top.kind === 'cli' ? ' via run_shell_command' : '';
-      const noun = top.kind === 'cli' ? 'command' : 'tool';
-      const cmd = neutralizeTemplatePlaceholders(top.command);
-      step.prompt =
-        `${step.prompt}${BIND_DIRECTIVE_MARKER} use this exact, proven ${noun} (do not substitute another tool): \`${cmd}\`${how}.`;
-      step.allowedTools = lockAllowedToolsTo(step.allowedTools, top.family);
-      boundNotes.push(
-        `Bound step \`${step.id ?? '?'}\` to your proven ${top.kind} \`${cmd}\` and locked its tools so the run can't drift onto a stale path.`,
-      );
-    } else {
-      const cmd = neutralizeTemplatePlaceholders(top.command);
-      const what = top.kind === 'composio'
-        ? `could use your remembered \`${top.identifier}\``
-        : `should use your proven \`${cmd}\``;
-      advisories.push(
-        `Step \`${step.id ?? '?'}\` ${what} — embed that exact ${top.kind === 'cli' ? 'command (via run_shell_command)' : 'tool'} in the step prompt and set its allowedTools to that family, so the run uses the proven path instead of re-deciding.`,
-      );
-    }
+    advisories.push(
+      `Optional discovery candidate for step \`${step.id ?? '?'}\`: remembered ${top.kind} \`${neutralizeTemplatePlaceholders(top.command)}\`. Confirm that it serves the authored step and inspect its current argument and account contract before selecting it.`,
+    );
   }
-  return { boundNotes, advisories };
+  return { boundNotes: [], advisories };
 }
 
 // ── Chat-aware toolkit binding (correct-by-construction authoring) ──────────
@@ -1116,7 +1067,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Use this whenever the user says a local time so 8 AM means their 8 AM, not the server host time.'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
-      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
+      inputs: z.string().optional().describe('Workflow-level input schema as a JSON-encoded string, not a shorthand line and not the structured steps[].inputs binding object. Map input names to metadata {type?, default?, description?}. Example JSON text: {"text":{"type":"string","description":"Text supplied at runtime to summarize"}}. Pass that text as this string field inside args_json. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
       resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"lead_sheet":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<spreadsheet id>","name":"Leads"}} or {"content_calendar":{"kind":"workspace","id":"my-workspace-slug"}}. Use for fixed Workspaces, accounts, sheets, folders, campaigns, channels, repos, CLIs, and API endpoints that the workflow should remember between runs; do NOT put these in run inputs.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the authoring smoke test, e.g. {"url":"https://example.com"}. Use when an external read step needs inputs that are not defaulted in `inputs`; otherwise the workflow stays disabled until it can be verified.'),
       synthesis_prompt: z.string().optional(),
@@ -1133,42 +1084,57 @@ export function registerOrchestrationTools(server: McpServer): void {
       // missing graph even for direct/internal callers that bypass the tool
       // schema; keyword synthesis here would be a second, less-informed author.
       if (!steps || steps.length === 0) {
-        return textResult('Workflow was NOT created: provide at least one explicit model-authored semantic step. The host validates and compiles steps but does not infer a graph from description keywords.');
+        return nonWriteTextResult('invalid_graph', 'Workflow was NOT created: provide at least one explicit model-authored semantic step. The host validates and compiles steps but does not infer a graph from description keywords.');
       }
 
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
       } catch (error) {
-        return textResult(error instanceof Error ? error.message : String(error));
+        return nonWriteTextResult('invalid_inputs', error instanceof Error ? error.message : String(error));
       }
       let resourceBindings: Record<string, WorkflowResourceBinding>;
       try {
         resourceBindings = parseWorkflowResourcesJson(resources);
       } catch (error) {
-        return textResult(error instanceof Error ? error.message : String(error));
+        return nonWriteTextResult('invalid_resources', error instanceof Error ? error.message : String(error));
       }
       let providedSmokeInputs: Record<string, string>;
       try {
         providedSmokeInputs = parseWorkflowRunInputsJson(test_inputs);
       } catch (error) {
-        return textResult(error instanceof Error ? error.message : String(error));
+        return nonWriteTextResult('invalid_test_inputs', error instanceof Error ? error.message : String(error));
       }
       const stepGraphError = validateWorkflowStepGraph(steps);
-      if (stepGraphError) return textResult(stepGraphError);
+      if (stepGraphError) return nonWriteTextResult('invalid_graph', stepGraphError);
       const triggerResult = buildWorkflowTrigger({
         schedule: trigger_schedule,
         timezone: trigger_timezone,
         webhookPath: trigger_webhook_path,
         events: trigger_events,
       });
-      if (!triggerResult.ok) return textResult(triggerResult.error);
+      if (!triggerResult.ok) return nonWriteTextResult('invalid_trigger', triggerResult.error);
 
       if (!/[a-zA-Z0-9]/.test(name)) {
-        return textResult('Please give the workflow a name with at least one letter or number.');
+        return nonWriteTextResult('invalid_name', 'Please give the workflow a name with at least one letter or number.');
       }
       const dirName = workflowSlugFromName(name);
-      if (readWorkflow(dirName)) return textResult(`Workflow "${name}" already exists.`);
+      // Changed nothing. Reported as a typed non-write so the settlement cannot
+      // record it as a successful mutation (live 2026-09-07: it did, and the
+      // committer then told the owner their unchanged file had drifted).
+      if (readWorkflow(dirName)) {
+        return nonWriteTextResult(
+          'duplicate',
+          // Deliberately does NOT offer workflow_update. Live 2026-09-07: with that
+          // suggestion in the text, a create request whose name already existed was
+          // "repaired" by overwriting the existing workflow's description — an
+          // authorization the owner never gave. Creating and modifying someone's
+          // existing artifact are different acts; only the safe repair belongs in a
+          // repairable outcome.
+          `Workflow "${name}" already exists, so nothing was created and it is unchanged. `
+          + 'Create it under a different name, or stop and ask the user before changing the existing one.',
+        );
+      }
 
       const def: WorkflowDefinition = {
         name,
@@ -1211,7 +1177,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         modelPortability: portable_models ? 'portable' : 'preserve',
       });
       if (!created.ok) {
-        return textResult(
+        // The canonical core refused validation before its persistence call.
+        return nonWriteTextResult('invalid_workflow',
           `Workflow "${name}" was NOT created — fix these first:\n- ${created.errors.join('\n- ')}`,
         );
       }
@@ -1471,7 +1438,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_get',
-    'Read one workflow by name. For its frontmatter/metadata — schedule, timezone, enabled state, description, inputs/resources, or step IDs — use section="metadata"; that bounded view omits every step prompt. '
+    'Read one workflow by name or exact saved slug. For its frontmatter/metadata — schedule, timezone, enabled state, description, inputs/resources, or step IDs — use section="metadata"; that bounded view omits every step prompt. '
       + 'Omit section (or use section="full") only when you need the full definition, including every step\'s line-numbered prompt and derived DATA SOURCES. Read the full or one-step view BEFORE editing so you can copy a VERBATIM prompt snippet into workflow_edit_step.',
     {
       name: z.string().min(1),
@@ -1480,7 +1447,11 @@ export function registerOrchestrationTools(server: McpServer): void {
     },
     async ({ name, section, step }) => {
       const allGet = listWorkflowFiles();
-      let entry = allGet.find((w) => w.data.name === name);
+      const exactMatches = allGet.filter((w) => w.data.name === name || w.name === name);
+      if (exactMatches.length > 1) {
+        return textResult(`Workflow identity "${name}" is ambiguous. Use a unique exact saved name or slug.`, { isError: true });
+      }
+      let entry: WorkflowEntry | undefined = exactMatches[0];
       if (!entry) {
         // Match by name, not just the exact direct name — same resolver the
         // run path uses, so workflow_get("prospecting flow") still finds it.
@@ -1539,9 +1510,11 @@ export function registerOrchestrationTools(server: McpServer): void {
               ? { kind: 'script', runner: stp.deterministic.runner }
               : stp.call?.tool
                 ? { kind: 'tool', tool: stp.call.tool }
-                : stp.subgraph
-                  ? { kind: 'subgraph', mode: stp.subgraph.mode, specialist_ids: stp.subgraph.specialists.map((specialist) => specialist.id) }
-                  : { kind: 'model' },
+                : stp.transform
+                  ? { kind: 'transform', version: stp.transform.version }
+                  : stp.subgraph
+                    ? { kind: 'subgraph', mode: stp.subgraph.mode, specialist_ids: stp.subgraph.specialists.map((specialist) => specialist.id) }
+                    : { kind: 'model' },
           })),
           ...(w.inputs && Object.keys(w.inputs).length > 0 ? { inputs: w.inputs } : {}),
           ...(w.models ? { models: w.models } : {}),
@@ -1567,6 +1540,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           ? ` subgraph=${stp.subgraph.mode}[${stp.subgraph.specialists.map((specialist) => specialist.id).join(',')}]`
           : '';
         const det = stp.deterministic ? ` deterministic=${stp.deterministic.runner}` : '';
+        const transformLine = stp.transform ? `    transform: ${JSON.stringify(stp.transform)}` : '';
         const sources = deriveStepDataSources(stp);
         const sourcesLine = sources.length > 0 ? `    data: ${sources.join(' · ')}` : '';
         // For a deterministic step, READ the runner's source and surface WHAT it
@@ -1614,6 +1588,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           `  ${stp.id}${deps}${project}${model}${forEach}${subgraph}${det}`,
           sourcesLine,
           runnerLine,
+          transformLine,
           ...specialistLines,
           '    prompt:',
           numbered,
@@ -1762,7 +1737,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_update',
-    'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
+    'Modify an existing workflow by exact saved name or slug: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
       + 'IMPORTANT: when `steps` is present it REPLACES THE ENTIRE STEP GRAPH; never send one step as a patch. Read and resend every step for a graph change, or use workflow_edit_step for a targeted prompt edit. '
       + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. '
       + 'For a heavy read-only analysis, `subgraph: {mode:"read_parallel_v1", specialists:[...]}` compiles 2–6 concurrent result-only branches and uses the authored step as their reducer; keep fetch/effect nodes separate. '
@@ -1807,7 +1782,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       clear_trigger_webhook_path: z.boolean().optional().describe('Pass true to remove an existing webhook trigger path.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('Replace the workflow event subscriptions. Pass [] or clear_trigger_events=true to remove existing event triggers.'),
       clear_trigger_events: z.boolean().optional().describe('Pass true to remove existing internal event trigger subscriptions.'),
-      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
+      inputs: z.string().optional().describe('Workflow-level input schema as a JSON-encoded string, not a shorthand line and not the structured steps[].inputs binding object. Map input names to metadata {type?, default?, description?}. Example JSON text: {"text":{"type":"string","description":"Text supplied at runtime to summarize"}}. Pass that text as this string field inside args_json. Pass only to change the input schema; omit to preserve it.'),
       resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"ads_account":{"kind":"account","toolkit":"googleads","account":"123-456-7890"}} or {"content_calendar":{"kind":"workspace","id":"my-workspace-slug"}}. Pass only to replace resource bindings; omit to preserve them.'),
       clear_resources: z.boolean().optional().describe('Pass true to remove all workflow resource bindings.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the re-verification smoke test when this update changes an enabled workflow, e.g. {"url":"https://example.com"}.'),
@@ -1867,8 +1842,15 @@ export function registerOrchestrationTools(server: McpServer): void {
       }
       const inputsProvided = Object.keys(inputsSchema).length > 0;
       const resourcesProvided = resources !== undefined;
-      const entry = listWorkflowFiles().find((w) => w.data.name === name);
-      if (!entry) return textResult(`Workflow "${name}" not found.`);
+      // Updates select one durable identity. Read-only fuzzy retrieval does
+      // not authorize choosing a write target, and a name/slug collision must
+      // not make filesystem listing order decide which workflow is edited.
+      const exactMatches = listWorkflowFiles().filter((w) => w.data.name === name || w.name === name);
+      if (exactMatches.length > 1) {
+        return textResult(`Workflow identity "${name}" is ambiguous. Use a unique exact saved name or slug.`, { isError: true });
+      }
+      const entry = exactMatches[0];
+      if (!entry) return textResult(`Workflow "${name}" not found. Use its exact saved name or slug.`, { isError: true });
 
       if (steps) {
         const stepGraphError = validateWorkflowStepGraph(steps);

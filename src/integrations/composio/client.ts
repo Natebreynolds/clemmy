@@ -14,7 +14,7 @@ import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 import { getMachineId } from '../../runtime/machine-id.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
-import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
+import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } from './identity-cache.js';
 import { ExternalWritePreDispatchError } from '../../runtime/harness/external-write-admission.js';
 import {
@@ -3089,6 +3089,25 @@ export async function executePreparedComposioPresign(
   );
 }
 
+/** Request options inherit the invocation owner's remaining window. The SDK's
+ * default 60s HTTP timer must not preempt a longer admitted call. Read this at
+ * the actual dispatch edge, not preparation, so intervening work consumes the
+ * same deadline. With no owner deadline the existing SDK policy is unchanged.
+ * Neither a deadline nor cancellation proves that a remote operation stopped. */
+function preparedComposioRequestOptions(): { signal?: AbortSignal; timeout?: number } | undefined {
+  const signal = currentToolAbortSignal();
+  signal?.throwIfAborted();
+  const deadlineAt = currentToolAbortDeadlineAt();
+  if (deadlineAt === undefined) return signal ? { signal } : undefined;
+  const remainingMs = Math.ceil(deadlineAt - Date.now());
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    // The owner timer may be queued behind synchronous preparation. Never turn
+    // an expired window into an unlimited/zero timeout or a fresh HTTP call.
+    throw new DOMException('The tool invocation deadline elapsed before the Composio request.', 'TimeoutError');
+  }
+  return { ...(signal ? { signal } : {}), timeout: remainingMs };
+}
+
 /** The terminal body: one no-retry v3.1 POST.
  * It performs no schema lookup, account listing, reconnect, version fetch,
  * fallback, upload/download modifier, or retry. */
@@ -3117,12 +3136,12 @@ export async function executePreparedComposioTool(
       ? { connected_account_id: state.connectedAccountId }
       : {}),
   };
-  const signal = currentToolAbortSignal();
+  const requestOptions = preparedComposioRequestOptions();
   const raw = await execute.call(
     state.rawClient!.tools,
     state.toolSlug,
     body,
-    signal ? { signal } : undefined,
+    requestOptions,
   ) as Record<string, unknown>;
   return {
     data: raw?.data,

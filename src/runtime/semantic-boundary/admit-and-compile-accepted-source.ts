@@ -45,6 +45,7 @@ import {
   canonicalResolvedCapabilityId,
   canonicalCatalogIdentityOf,
   isCurrentCallableCatalogEntry,
+  persistedCatalogSnapshotManifestIdsForSource,
   type RegisteredHostCapability,
 } from '../harness/host-capability-catalog-factory.js';
 import { currentAcceptedSourceCatalogManifestScope } from '../harness/accepted-source-catalog-scope.js';
@@ -53,7 +54,7 @@ import {
   type TurnSemanticProposalV1,
 } from './turn-semantic-proposal.js';
 import { selectRelevantCapabilityDescriptors } from './capability-candidate-retrieval.js';
-import { registerProofProvisionedCapabilities } from '../harness/proof-provisioned-catalog.js';
+import { isLegacyGenericProviderWriteEvidencePolicy, registerProofProvisionedCapabilities } from '../harness/proof-provisioned-catalog.js';
 import { createProductionMcpReadCarrier } from '../harness/production-mcp-read-carrier.js';
 import { parseNamespacedTool } from '../mcp-namespace-shim.js';
 import {
@@ -111,6 +112,7 @@ import {
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidates,
+  observeCurrentLocalPlanningDefinition,
   revalidateLocalPlanningDefinition,
   type AuthorizedLocalPlanningDefinitionV1,
 } from '../harness/local-planning-capability.js';
@@ -120,6 +122,7 @@ import {
   inspectAuthorizedLiveReadPlanningAuthority,
   type AuthorizedLiveReadPlanningAuthorityV1,
 } from '../harness/live-read-planning-authority.js';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { explicitCapabilityNamespaceConflict } from './capability-namespace-alignment.js';
 import { requestedCapabilityEffectScope } from '../../memory/capability-effect-scope.js';
 
@@ -1225,6 +1228,13 @@ function replayedPlanningDescriptor(value: unknown): HostCapabilityDescriptorV1 
     || stringArrays.some((key) => !Array.isArray(row[key]) || !(row[key] as unknown[]).every((entry) => typeof entry === 'string'))
     || (row.advisoryRoles !== undefined
       && (!Array.isArray(row.advisoryRoles) || !row.advisoryRoles.every((entry) => typeof entry === 'string')))
+    // An upsert capability declares every posture it supports. The key is
+    // OPTIONAL, so descriptors persisted before it existed still parse; when it
+    // is present every member must be one of the two real postures.
+    || (row.destinationPostures !== undefined
+      && (!Array.isArray(row.destinationPostures)
+        || row.destinationPostures.length === 0
+        || !row.destinationPostures.every((entry) => entry === 'create_new' || entry === 'named_existing')))
   ) return null;
   return {
     id: row.id,
@@ -1244,6 +1254,13 @@ function replayedPlanningDescriptor(value: unknown): HostCapabilityDescriptorV1 
     accountScope: row.accountScope,
     manifestDigest: row.manifestDigest,
     ...(Array.isArray(row.advisoryRoles) ? { advisoryRoles: [...row.advisoryRoles as string[]] } : {}),
+    // DROPPING this silently is what broke Space priming: space_save's upsert
+    // fact vanished on replay, so the reopened card no longer matched the
+    // published definition and the production loop blocked before its first
+    // model call.
+    ...(Array.isArray(row.destinationPostures)
+      ? { destinationPostures: [...row.destinationPostures as ('create_new' | 'named_existing')[]] }
+      : {}),
   };
 }
 
@@ -1529,9 +1546,14 @@ function exactPlanningDescriptorSnapshot(value: unknown): HostCapabilityDescript
   if (!parsed || !value || typeof value !== 'object' || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
   const keys = Object.keys(row).sort();
-  const allowed = row.advisoryRoles === undefined
-    ? [...PLANNING_DESCRIPTOR_REQUIRED_KEYS]
-    : [...PLANNING_DESCRIPTOR_REQUIRED_KEYS, 'advisoryRoles'];
+  // Optional keys are admitted exactly when present. This is a CLOSED key-set
+  // check, so an unlisted optional key rejects the whole descriptor — which is
+  // how `destinationPostures` silently disqualified every Space card.
+  const allowed = [
+    ...PLANNING_DESCRIPTOR_REQUIRED_KEYS,
+    ...(row.advisoryRoles === undefined ? [] : ['advisoryRoles']),
+    ...(row.destinationPostures === undefined ? [] : ['destinationPostures']),
+  ];
   if (keys.join('\0') !== allowed.sort().join('\0')) return null;
   // Preserve the exact serialized property order that contributed to the
   // original model-surface digest. The closed parser above proves every value;
@@ -1542,6 +1564,7 @@ function exactPlanningDescriptorSnapshot(value: unknown): HostCapabilityDescript
     'applicableDeliverableKinds',
     'evidenceKinds',
     'advisoryRoles',
+    'destinationPostures',
   ]) {
     if (Array.isArray(row[key])) Object.freeze(row[key]);
   }
@@ -1782,6 +1805,9 @@ export async function primePrimaryModelPlanningCatalog(input: {
       reason: `durable initial planning card is unavailable: ${durableInitialCard.reason}`,
     };
   }
+  const frozenSource = persistedCatalogSnapshotManifestIdsForSource(input);
+  const withholdLegacyEvidencePolicy = durableInitialCard.status === 'missing'
+    && !frozenSource.ok && frozenSource.reason === 'missing_snapshot';
   let indexedDescriptors: HostCapabilityDescriptorV1[] = [];
   let indexedRegisteredIds = new Set<string>();
   let indexedLocalDefinitions: AuthorizedLocalPlanningDefinitionV1[] = [];
@@ -1799,6 +1825,106 @@ export async function primePrimaryModelPlanningCatalog(input: {
     indexedDescriptors = hostDescriptorsFromCapabilityIndex(objective);
     indexedLocalDefinitions = [];
   }
+  // The index supplies HISTORICAL local definitions. Priming may only offer an
+  // operation whose CURRENT configured shape still matches, so reobserve every
+  // one here and carry the reobservation — not the indexed bytes — forward to
+  // both the card and the durable publication below. A definition whose
+  // ref/schema/effect/account has moved is dropped rather than offered; that is
+  // the changed-schema/effect/principal negative case, and it keeps stale index
+  // bytes from ever becoming execution permission.
+  indexedLocalDefinitions = (await Promise.all(
+    indexedLocalDefinitions.map(async (definition) => {
+      const revalidated = await revalidateLocalPlanningDefinition(definition);
+      return revalidated.ok && revalidated.definition.capabilityRef === definition.capabilityRef
+        ? revalidated.definition
+        : null;
+    }),
+  )).flatMap((definition) => (definition ? [definition] : []));
+
+  // THIS SESSION's own successful native writes are the most relevant memory
+  // there is, and they were not consulted at all. Nomination came only from the
+  // global index, whose learned writes are dominated by whatever the home has
+  // done most often. Live C16: a turn created a Space via `space_save`, and the
+  // very next turn's card offered workflow_create/update/edit_step — the wrong
+  // family entirely — so the edit planned, searched, and died with
+  // `no observed operation is bound to this expected requirement`.
+  //
+  // Seed from the operations this session already used successfully, so the
+  // artifact the user is plainly still working on is represented. Each is
+  // reobserved against the current registry below like every other seed; this
+  // only decides what gets OFFERED, never what is authorized.
+  try {
+    const priorNames = new Set<string>();
+    for (const event of listEvents(input.sessionId, { types: ['capability_discovered'] })) {
+      if (typeof event.data.sourceUserSeq !== 'number') continue;
+      if (event.data.sourceUserSeq >= input.sourceUserSeq) continue;
+      for (const row of Array.isArray(event.data.capabilities) ? event.data.capabilities : []) {
+        if (!row || typeof row !== 'object') continue;
+        const entry = row as { providerKind?: unknown; identifier?: unknown };
+        if (entry.providerKind !== AUTHORIZED_LOCAL_REGISTRY_PROVENANCE) continue;
+        if (typeof entry.identifier === 'string') priorNames.add(entry.identifier);
+      }
+    }
+    const known = new Set(indexedLocalDefinitions.map((definition) => definition.name));
+    for (const name of priorNames) {
+      if (known.has(name)) continue;
+      const observed = await observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
+      if (!observed.ok) continue;
+      if (indexedLocalDefinitions.some((d) => d.capabilityRef === observed.definition.capabilityRef)) continue;
+      indexedLocalDefinitions.push(observed.definition);
+    }
+  } catch {
+    // Additive only: session history that cannot be read leaves nomination as-is.
+  }
+
+  // A remembered operation is a CANDIDATE HINT for this turn, not the answer.
+  // Priming used to publish only what was remembered, so a warm turn asking to
+  // edit an existing artifact saw a card offering `workflow_create` alone. The
+  // model planned with it, the typed destination contract correctly refused the
+  // contradiction, and only then did a search find `workflow_update` — a wasted
+  // plan and search on an ordinary edit (live C14 source 136255).
+  //
+  // Surface the remembered operation's siblings in the same AUTHORING family so
+  // the first selection can be right. The family is `deliverableKind` + the
+  // host's own `purpose` slug, which is the accurate axis: `author_workflow`
+  // covers create/update/edit_step, while `dispatch_named_workflow` (run) and
+  // `delete_workflow` are different jobs and stay out on their own terms.
+  //
+  // An earlier revision keyed on "postures this seed does not already cover".
+  // That proxy failed the reviewer's seed matrix in both directions: a
+  // create+edit_step seed omitted `workflow_update` because both postures looked
+  // covered, and an update-only seed nominated `workflow_run` because create_new
+  // looked uncovered — surfacing an operation that DISPATCHES work for a request
+  // that only wanted an edit. Purpose is the honest relation; posture is not.
+  // Reversible and non-destructive still gate everything, which is the
+  // independent reason `workflow_delete` can never appear.
+  if (indexedLocalDefinitions.length > 0) {
+    const primedRefs = new Set(indexedLocalDefinitions.map((definition) => definition.capabilityRef));
+    const families = new Set(indexedLocalDefinitions.flatMap((definition) => {
+      const kind = definition.descriptor.deliverableKind;
+      const purpose = definition.descriptor.purpose;
+      return kind && purpose ? [`${kind}::${purpose}`] : [];
+    }));
+    const siblingNames = new Set<string>();
+    for (const entry of TOOL_REGISTRY) {
+      const planning = entry.localPlanning;
+      if (!planning) continue;
+      if (planning.reversibility !== 'reversible' || planning.destructive) continue;
+      if (!families.has(`${planning.deliverableKind}::${planning.purpose}`)) continue;
+      siblingNames.add(entry.name);
+    }
+    for (const name of siblingNames) {
+      try {
+        const observed = await observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
+        if (!observed.ok || primedRefs.has(observed.definition.capabilityRef)) continue;
+        primedRefs.add(observed.definition.capabilityRef);
+        indexedLocalDefinitions.push(observed.definition);
+      } catch {
+        // Additive only: a sibling that cannot be observed is simply not offered.
+      }
+    }
+  }
+
   const catalogEntries = (peekHostCapabilityCatalogFactory()?.snapshot() ?? []).filter((entry) => (
     !catalogManifestScope
     || (entry.providerKind ?? entry.manifest?.providerKind) !== 'composio'
@@ -1806,7 +1932,13 @@ export async function primePrimaryModelPlanningCatalog(input: {
     || catalogManifestScope.operationIds.has(
       (entry.manifest?.operationId ?? entry.toolName).toUpperCase(),
     )
-  ));
+  )).filter((entry) => {
+    if (!withholdLegacyEvidencePolicy || !isLegacyGenericProviderWriteEvidencePolicy(entry.manifest)) return true;
+    // A fresh card must not advertise the retired receipt/readback default.
+    // Exact discovery performs the normal account/definition checks and can
+    // publish its successor; this filter cannot mutate shared/frozen entries.
+    return false;
+  });
   const catalogDescriptors = catalogEntries.flatMap((entry) => {
     const descriptor = hostDescriptorFromRegistered(entry);
     if (!descriptor) return [];
@@ -1875,13 +2007,63 @@ export async function primePrimaryModelPlanningCatalog(input: {
     sourceUserSeq: input.sourceUserSeq,
     byName: disclosureByName,
   });
+  // Staging alone is not enough to make a primed operation CALLABLE. The direct
+  // work_call path resolves execution authority from this source's durable
+  // `capability_discovered` row (readDurableAuthorizedLocalPlanningDefinition in
+  // local-planning-capability.ts), never from this in-memory map — while the
+  // Plan path revalidates `staged.localDefinition` and so worked either way.
+  // Priming therefore advertised a native operation on the warm card that the
+  // model could not actually call, and the turn fell back to plan_task; that
+  // plan then cannot open a graph resolution over the chat turn's already-armed
+  // non-graph host authority, so an ordinary reversible edit dead-ended. Live
+  // C12 source 135730 blocked exactly this way ("graph resolution cannot replace
+  // non-graph call authority") while the same edit succeeded cold at 135997.
+  //
+  // Publish the reobserved definition so an ordinary Normal-mode edit needs no
+  // same-source discovery step and no plan. A ref that already has a durable row
+  // for this source is not republished, preserving duplicate prevention.
+  const primedLocalAuthority: Array<{
+    kind: string;
+    identifier: string;
+    effectClass: 'read' | 'write';
+    schemaFingerprint: string;
+    capabilityRef: string;
+    manifestDigest: string;
+    accountIdentity?: string;
+    providerKind: string;
+    descriptor: HostCapabilityDescriptorV1;
+    localAuthority: AuthorizedLocalPlanningDefinitionV1;
+  }> = [];
   for (const definition of indexedLocalDefinitions) {
+    const alreadyDurable = replayed.stagedById.has(definition.capabilityRef);
     replayed.stagedById.set(definition.capabilityRef, {
       descriptor: definition.descriptor,
       identifier: definition.name,
       providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
       accountIdentity: definition.accountIdentity,
       localDefinition: definition,
+    });
+    if (alreadyDurable) continue;
+    primedLocalAuthority.push({
+      kind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+      identifier: definition.name,
+      effectClass: definition.descriptor.effect === 'read' ? 'read' : 'write',
+      schemaFingerprint: definition.schemaFingerprint,
+      capabilityRef: definition.capabilityRef,
+      manifestDigest: definition.descriptor.manifestDigest,
+      accountIdentity: definition.accountIdentity,
+      providerKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+      descriptor: definition.descriptor,
+      localAuthority: definition,
+    });
+  }
+  if (primedLocalAuthority.length > 0) {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: accepted.turn,
+      role: 'system',
+      type: 'capability_discovered',
+      data: { sourceUserSeq: input.sourceUserSeq, capabilities: primedLocalAuthority },
     });
   }
   const allowedById = new Map<string, HostCapabilityDescriptorV1>();
@@ -2020,6 +2202,11 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
     providerDefinition?: StagedProviderDefinitionV1;
   }> = [];
   const allowed = new Map(catalog.capabilities.map((descriptor) => [descriptor.id, descriptor]));
+  // Planning-card membership and execution-authority publication are DIFFERENT
+  // concerns; `allowed` above is seeded from capabilities an EARLIER turn already
+  // disclosed. This set keeps the authority record emitted exactly once per ref
+  // per turn without letting card dedup suppress it entirely.
+  const publishedLocalAuthorityRefs = new Set<string>();
   const proofById = new Map(
     hostDescriptorsFromResolutionProof(catalog.sessionId, catalog.sourceUserSeq)
       .map((descriptor) => [descriptor.id, descriptor]),
@@ -2074,8 +2261,24 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
           localDefinition: definition,
         };
         catalog.stagedById.set(definition.capabilityRef, staged);
-        if (allowed.has(definition.capabilityRef)) continue;
-        allowed.set(definition.capabilityRef, definition.descriptor);
+        // A capability the card already lists still needs THIS source's durable
+        // localAuthority published: consent preparation and sealing read that
+        // record, and without it an ordinary native write cannot be offered, so
+        // the host falls back to a planning detour. Skipping publication because
+        // the descriptor was already on the card is what broke native writes
+        // once a tool had been learned — C11 workflow edit 135472 and Space
+        // create 135561 both took this branch and landed nothing, while the cold
+        // create 135386 published and succeeded.
+        //
+        // `definition` is this pass's current reobservation, so this persists the
+        // CURRENT schema/effect/source/account rather than reusing an earlier
+        // turn's execution permission. Ownership and duplicate checks downstream
+        // are unchanged; only the publication suppression is removed.
+        if (!allowed.has(definition.capabilityRef)) {
+          allowed.set(definition.capabilityRef, definition.descriptor);
+        }
+        if (publishedLocalAuthorityRefs.has(definition.capabilityRef)) continue;
+        publishedLocalAuthorityRefs.add(definition.capabilityRef);
         newlyDisclosed.push({
           kind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
           identifier: definition.name,
@@ -2262,11 +2465,11 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       proof?.accountIdentity?.trim() || null,
       'composio',
     );
-    const descriptor = proofById.get(capabilityRef);
-    if (!descriptor || !proof) continue;
+    const proofDescriptor = proofById.get(capabilityRef);
+    if (!proofDescriptor || !proof) continue;
     const providerInputSchemaDigest = digestSchema(candidate.schema);
     const accountIdentity = proof.accountIdentity?.trim() || 'runtime';
-    if (descriptor.accountScope !== accountIdentity) continue;
+    if (proofDescriptor.accountScope !== accountIdentity) continue;
     const providerDefinition = currentComposioProviderDefinition({
       identifier: name,
       schema: candidate.schema as Record<string, unknown>,
@@ -2276,6 +2479,22 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       !providerDefinition
       || providerDefinition.providerInputSchemaDigest !== providerInputSchemaDigest
     ) continue;
+    // Discovery may just have published a current manifest after this card
+    // was primed. Its exact checked contract outranks the advisory proof's
+    // generic shape; otherwise an acknowledgement-only write regains an
+    // invented readback requirement at the disclosure boundary.
+    const publishedEntry = peekHostCapabilityCatalogFactory()?.get(capabilityRef);
+    const publishedDescriptor = publishedEntry ? hostDescriptorFromRegistered(publishedEntry) : null;
+    const publishedDefinition = publishedEntry ? stagedProviderDefinitionFromRegistered(publishedEntry) : null;
+    const descriptor = publishedDescriptor
+      && publishedEntry?.manifest?.providerKind === 'composio'
+      && publishedEntry.manifest.operationId.toLowerCase() === name.toLowerCase()
+      && publishedEntry.manifest.accountId === accountIdentity
+      && publishedDescriptor.accountScope === accountIdentity
+      && publishedDescriptor.effect === proofDescriptor.effect
+      && stagedProviderDefinitionsEqual(publishedDefinition, providerDefinition)
+      ? publishedDescriptor
+      : proofDescriptor;
     const prior = catalog.stagedById.get(capabilityRef);
     if (prior && (
       prior.identifier.toLowerCase() !== name.toLowerCase()

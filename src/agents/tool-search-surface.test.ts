@@ -237,7 +237,12 @@ test('explicit local-memory-only turns load a bounded read surface and honor no-
     assert.equal(names.has(forbidden), false, `${forbidden} is outside a read-only local-memory turn`);
   }
   const scope = listEvents(sess.id, { types: ['tool_search_scope'] })[0]?.data as { firstClassCount?: number } | undefined;
-  assert.ok((scope?.firstClassCount ?? 999) <= 12, 'the model-facing schema surface stays bounded');
+  // 13, not 12: `session_search` joined the always-loaded recall set. Prior
+  // CONVERSATIONS are local memory — on this very scenario ("using only
+  // Clementine local memory, list the 8 people…") it is the instrument, not
+  // bloat. Live C11 sources 135212/135311 show the turn failing precisely
+  // because it was invisible. The guard still holds the surface bounded.
+  assert.ok((scope?.firstClassCount ?? 999) <= 13, 'the model-facing schema surface stays bounded');
   const catalog = (await renderInstructions(agent)).split('[tool-catalog]')[1] ?? '';
   assert.doesNotMatch(catalog, /workflow_run|focus_clear|memory_remember/);
 });

@@ -1,3 +1,7 @@
+import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
+import type { TerminalFacts } from '@clem/chat-engine';
+import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
+import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   createChatClientRequestId,
@@ -15,7 +19,8 @@ import {
 import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
-import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
+import { humanToolLabel, salientArgDetail } from './toolLabels';
+import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone, type WriteLedgerRow } from '../../../../packages/chat-engine/src/write-ledger';
 import { isWorkPlanRow, workPlanActivityItem, workPlanStepLabel } from './work-plan-presentation';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
@@ -55,6 +60,9 @@ export interface ActivityItem {
    *  written). Rendered as an expandable pane under the row — the
    *  visibility window into what's actually being produced. */
   excerpt?: string;
+  effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
+  /** Settlement belongs to this exact write, not the chat terminal. */
+  write?: WriteLedgerRow;
 }
 
 export interface ChatMessage {
@@ -62,6 +70,8 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   text: string;
   status?: MessageStatus;
+  /** The backend's typed terminal; see chat-engine TerminalFacts. */
+  terminal?: TerminalFacts;
   progress?: string;
   /** Live, accumulated tool calls + spawned agents for THIS turn — the premium
    *  "watch the team work" strip (vs. a single rolling label). */
@@ -89,6 +99,8 @@ export interface ChatMessage {
     pendingActionId?: string;
     pendingAction?: PendingActionApprovalView;
   };
+  taskMode?: TaskMode;
+  planArtifactRef?: PlanRevisionRef;
   planProposalId?: string;
   attachmentNames?: string[];
   /** The durable work item behind a report-back message (background task /
@@ -251,75 +263,8 @@ function providerFor(d: Record<string, unknown>, model: string): ActivityItem['p
 }
 
 const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
-const EMPTY_COMPLETION_ERROR = 'The run ended without a usable answer, so I haven’t marked it complete. Check the activity above or try again.';
 
-function meaningfulCompletionText(value: unknown): string {
-  const text = humanHarnessText(value, '');
-  // A bare terminal placeholder is not work-product. Treating it as evidence
-  // made an empty/reasoning-only provider turn look successfully completed.
-  return /^(?:\(?done[.!]?\)?|complete[.!]?)$/i.test(text) ? '' : text;
-}
 
-/** Project a terminal event into user-visible truth. A completion event proves
- * that the stream ended; it does not, by itself, prove that the user received
- * an answer. Only explicit/streamed human output earns the success state. */
-export function terminalCompletionPresentation(
-  data: Record<string, unknown>,
-  currentText: string,
-  currentStatus?: MessageStatus,
-): Pick<ChatMessage, 'text' | 'status' | 'progress'> {
-  const reason = typeof data.reason === 'string' ? data.reason : '';
-  const reasonKey = reason
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .replace(/[\s-]+/g, '_')
-    .toLowerCase();
-  const eventText = meaningfulCompletionText(data);
-  const streamedText = meaningfulCompletionText(currentText);
-  const text = eventText || streamedText;
-  const awaitingContinue = reasonKey === 'awaiting_continue' || reasonKey === 'limit_exceeded';
-  const awaitingUser = currentStatus === 'awaiting-reply'
-    || /awaiting_(?:user(?:_(?:input|reply))?|input|reply)|needs_user_(?:input|reply)/.test(reasonKey);
-  const stopped = awaitingContinue || /cancelled|canceled|aborted|stopped/.test(reasonKey);
-  // `delivered: true` is the server's authoritative success flag. A rescue
-  // path like reason 'stall_judge_delivered' is a SUCCESS with provenance —
-  // the substring 'stall' branded a judged-good reply with a red "Didn't
-  // finish" (live 2026-07-30, first turn on v3.2.0).
-  const judgedDelivered = data.delivered === true || /delivered/.test(reasonKey);
-  const failed = !judgedDelivered
-    && /fail|error|abandon|stall|exhaust|invalid|blocked|unavailable|timed?_?out|no_structured/.test(reasonKey);
-
-  if (text) {
-    const status: MessageStatus = awaitingUser ? 'awaiting-reply' : stopped ? 'stopped' : failed ? 'failed' : 'complete';
-    return { text, status, progress: undefined };
-  }
-  if (awaitingUser) {
-    return {
-      text: 'I need your input before I can continue.',
-      status: 'awaiting-reply',
-      progress: undefined,
-    };
-  }
-  if (reasonKey === 'no_structured_output') {
-    return {
-      text: 'That step finished but my reply didn’t come through — say “continue” and I’ll pick it right back up.',
-      status: 'failed',
-      progress: undefined,
-    };
-  }
-  if (awaitingContinue) {
-    return {
-      text: 'I reached this run’s current limit before I had a usable answer. Say “continue” and I’ll keep working.',
-      status: 'stopped',
-      progress: undefined,
-    };
-  }
-  // Delivered-but-unrenderable (e.g. a placeholder-only reply): the server
-  // vouched for the delivery — never contradict it with a failure banner.
-  if (judgedDelivered && !stopped) {
-    return { text: 'Done — the full reply is in the activity above.', status: 'complete', progress: undefined };
-  }
-  return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined };
-}
 
 export interface PendingChatPost {
   fingerprint: string;
@@ -327,6 +272,7 @@ export interface PendingChatPost {
   input: string;
   sessionId: string | null;
   attachments: string[];
+  taskMode?: TaskMode;
 }
 
 export class ChatPostCancelledError extends Error {
@@ -351,10 +297,11 @@ function throwIfChatPostCancelled(signal?: AbortSignal): void {
  * second model/tool run. */
 export function retainPendingChatPost(
   previous: PendingChatPost | null,
-  payload: { input: string; sessionId: string | null; attachments: string[] },
+  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode },
   createId: () => string = createChatClientRequestId,
 ): PendingChatPost {
-  const fingerprint = JSON.stringify([payload.sessionId ?? '', payload.input, payload.attachments]);
+  const taskMode = snapshotTaskMode(payload.taskMode);
+  const fingerprint = JSON.stringify([payload.sessionId ?? '', payload.input, payload.attachments, ...(taskMode ? [taskMode] : [])]);
   if (previous?.fingerprint === fingerprint) return previous;
   return {
     fingerprint,
@@ -362,7 +309,27 @@ export function retainPendingChatPost(
     input: payload.input,
     sessionId: payload.sessionId,
     attachments: [...payload.attachments],
+    ...(taskMode ? { taskMode } : {}),
   };
+}
+
+export function loadPendingChatPost(storage: Pick<Storage, 'getItem'>, key: string): PendingChatPost | null {
+  try {
+    const row = JSON.parse(storage.getItem(key) ?? 'null') as PendingChatPost | null;
+    if (!row || typeof row.clientRequestId !== 'string' || !row.clientRequestId
+      || typeof row.input !== 'string' || (row.sessionId !== null && typeof row.sessionId !== 'string')
+      || !Array.isArray(row.attachments) || !row.attachments.every(id => typeof id === 'string')
+      || (row.taskMode !== undefined && !readTaskMode(row.taskMode))) return null;
+    const checked = retainPendingChatPost(null, row, () => row.clientRequestId);
+    return checked.fingerprint === row.fingerprint ? checked : null;
+  } catch { return null; }
+}
+
+export function savePendingChatPost(storage: Pick<Storage, 'setItem' | 'removeItem'>, key: string, value: PendingChatPost | null): void {
+  try {
+    if (value) storage.setItem(key, JSON.stringify(value));
+    else storage.removeItem(key);
+  } catch { /* The in-memory identity remains available if browser storage is unavailable. */ }
 }
 
 function isRetryableChatPostError(error: unknown): boolean {
@@ -417,6 +384,7 @@ export async function postPendingChatWithRetry(
         pending.sessionId,
         pending.attachments,
         pending.clientRequestId,
+        pending.taskMode,
       );
       if (options.signal?.aborted) {
         try {
@@ -450,6 +418,7 @@ const REUSED_RESULT_LABEL = 'Reused earlier result';
  *  older events; agents (run_worker) are keyed by item; run_batch renders as ONE
  *  live meter row driven by authoritative batch_progress counts. */
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
+  if (readLiveApprovalControl(ev)) return prev;
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
   const callId = typeof d.callId === 'string' ? d.callId : typeof d.call_id === 'string' ? d.call_id : '';
@@ -726,28 +695,27 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     // report-back message all speak in ONE vocabulary. A failed/orphaned write
     // is the same line with an honest tail.
     case 'external_write':
+    case 'external_write_succeeded':
     case 'external_write_failed':
     case 'external_write_orphaned': {
-      const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : '';
-      const writeTool = typeof d.toolName === 'string' ? d.toolName : tool;
-      const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
-      // The recorded irreversibility bit rides through so a reversible write
-      // (draft/update) can never render as delivery in the live feed either.
-      const base = describeExternalWrite(shapeKey, writeTool, targets, {
-        ...(typeof d.irreversible === 'boolean' ? { irreversible: d.irreversible } : {}),
-        ...(typeof d.actionKey === 'string' ? { actionKey: d.actionKey } : {}),
-      });
-      const failed = ev.type === 'external_write_failed';
-      const orphaned = ev.type === 'external_write_orphaned';
-      const key = callId || shapeKey || writeTool || `${prev.length}`;
-      return [...prev, {
-        id: `x-${ev.type}-${key}`,
+      const key = writeRowKey(d, ev.seq);
+      const id = `x-write-${key}`;
+      const at = prev.findIndex((item) => item.id === id);
+      const row = applyWriteEvent(at >= 0 ? prev[at]!.write : undefined, ev);
+      const item: ActivityItem = {
+        id,
         kind: 'event',
         variant: 'write',
-        label: failed ? `${base} — failed` : orphaned ? `${base} — timed out, may have landed` : base,
-        status: failed ? 'failed' : 'done',
-        tone: failed ? 'danger' : orphaned ? 'warning' : 'success',
-      }];
+        effect: 'external_write',
+        label: writeRowLabel(row),
+        status: writeRowStatus(row),
+        tone: writeRowTone(row),
+        write: row,
+      };
+      if (at < 0) return [...prev, item];
+      const next = [...prev];
+      next[at] = item;
+      return next;
     }
     // ONE row per code-mode program: "Ran a batch program (N tool calls)". The
     // per-call plumbing stays inside the sandbox — the user sees the outcome, not
@@ -1024,22 +992,41 @@ export function inFlightTurnSince(
 ): number | null {
   let lastUserSeq = -1;
   for (const ev of events) {
+    if (readLiveApprovalControl(ev)) continue;
     if (ev.type === 'user_input_received' && !(ev.data as { synthetic?: boolean } | undefined)?.synthetic) {
       lastUserSeq = ev.seq;
     }
   }
   if (lastUserSeq < 0) return null;
-  return events.some((ev) => ev.seq > lastUserSeq && isTerminalEvent(ev.type)) ? null : lastUserSeq;
+  return events.some((ev) => ev.seq > lastUserSeq && isTerminalEvent(ev.type) && !readLiveApprovalControl(ev)) ? null : lastUserSeq;
+}
+
+/** Restore presentation from the exact accepted source, never a later event. */
+export function activeTurnTaskMode(
+  events: ReadonlyArray<{ seq: number; type: string; data?: Record<string, unknown> }>,
+  sourceUserSeq: number,
+): TaskMode | undefined {
+  return readTaskMode(events.find(event => event.type === 'user_input_received' && event.seq === sourceUserSeq)?.data?.taskMode);
 }
 
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
   const [busy, setBusy] = useState(false);
+  const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const sessionIdRef = useRef<string | null>(options?.initialSessionId ?? null);
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
   const lateWatchRef = useRef<{ cancel: () => void } | null>(null);
-  const pendingPostRef = useRef<PendingChatPost | null>(null);
+  const pendingStorageKey = `clem.pending.console:${options?.initialSessionId ?? 'new'}`;
+  const [pendingPost, setPendingPost] = useState<PendingChatPost | null>(() => {
+    try { return loadPendingChatPost(localStorage, pendingStorageKey); } catch { return null; }
+  });
+  const pendingPostRef = useRef<PendingChatPost | null>(pendingPost);
+  const retainPending = useCallback((value: PendingChatPost | null) => {
+    pendingPostRef.current = value;
+    setPendingPost(value);
+    try { savePendingChatPost(localStorage, pendingStorageKey, value); } catch { /* private browser */ }
+  }, [pendingStorageKey]);
   const postAbortRef = useRef<AbortController | null>(null);
   const activeRunRef = useRef<ChatPostResult | null>(null);
   const pendingBackgroundRef = useRef<{ assistantId: string } | null>(null);
@@ -1106,23 +1093,19 @@ export function useChat(options?: UseChatOptions) {
   useEffect(() => {
     if (busy) return;
     let stopped = false;
+    let polling = false;
     const tick = async () => {
+      if (polling) return;
       const sid = sessionIdRef.current;
       if (!sid || stopped) return;
       const cursor = inboxOutcomeCursorForSession(inboxOutcomeCursorRef.current, sid);
       if (cursor !== inboxOutcomeCursorRef.current) inboxOutcomeCursorRef.current = cursor;
+      polling = true;
       try {
-        const out = await apiGet<{ latestSeq: number; events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }> }>(
-          `/api/sessions/${encodeURIComponent(sid)}/events/recent?sinceSeq=${cursor.seq}&limit=200`,
-        );
-        if (stopped) return;
-        // The request may finish after Reset/new-session changed the cursor.
-        // Never let an old session response arm the new session's watermark.
-        if (inboxOutcomeCursorRef.current !== cursor) return;
-        if (cursor.seq === 0) { cursor.seq = out.latestSeq || 1; return; }
-        if (!out.events.length) return;
-        const additions = inboxAdditionsFromEvents(out.events, cursor.deliveries);
-        cursor.seq = Math.max(cursor.seq, out.latestSeq);
+        const additions = await pollInboxOutcomeEvents(cursor, {
+          active: () => !stopped && inboxOutcomeCursorRef.current === cursor,
+          fetchPage: (url) => apiGet<RecentEventsPage>(url),
+        });
         if (additions.length) {
           setMessages((prev) => {
             const seenIds = new Set(prev.map((m) => m.id));
@@ -1136,6 +1119,7 @@ export function useChat(options?: UseChatOptions) {
           });
         }
       } catch { /* transient poll failure — next tick retries; reopen remains the floor */ }
+      finally { polling = false; }
     };
     void tick();
     const timer = window.setInterval(() => { void tick(); }, 5000);
@@ -1189,6 +1173,7 @@ export function useChat(options?: UseChatOptions) {
           text: '',
           status: 'thinking' as const,
           progress: 'Reconnecting to the run…',
+          taskMode: activeTurnTaskMode(out.events, lastUserSeq),
         }]);
         const handle = runHarnessStream(sid, { sinceSeq: lastUserSeq, onEvent: (ev) => applyEvent(assistantId, ev) });
         streamRef.current = handle;
@@ -1197,7 +1182,7 @@ export function useChat(options?: UseChatOptions) {
         if (!result.ok) {
           // Stream gave up but the run may still finish — same late-recovery
           // net send() uses.
-          lateWatchRef.current = watchForLateCompletion(sid, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
+          lateWatchRef.current = watchForLateCompletion(sid, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev), { replayCursor: handle.getReplayCursor() });
         }
         setBusy(false);
       } catch {
@@ -1289,6 +1274,16 @@ export function useChat(options?: UseChatOptions) {
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
     const d = (ev.data ?? {}) as Record<string, unknown>;
+    if (readLiveApprovalControl(ev)) {
+      if (ev.sessionId && ev.sessionId !== sessionIdRef.current) return;
+      if (ev.type === 'conversation_completed') setMessages(previous => {
+        const id = `control-ack-${ev.seq}`;
+        return previous.some(message => message.id === id) ? previous : [...previous, {
+          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        }];
+      });
+      return;
+    }
     if (ev.type === 'stream_token') {
       // Token-level streaming: append delta to current assistant text
       const delta = typeof d.delta === 'string' ? d.delta : '';
@@ -1311,6 +1306,9 @@ export function useChat(options?: UseChatOptions) {
           ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
         };
       }));
+    } else if (ev.type === 'plan_revision_published') {
+      const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
+      if (ref) patch(assistantId, { planArtifactRef: ref });
     } else if (ev.type === 'conversation_completed') {
       awaitingWorkflowReportRef.current = false;
       const text = humanHarnessText((d.reply ?? d.summary), '');
@@ -1328,6 +1326,7 @@ export function useChat(options?: UseChatOptions) {
           return {
             ...m,
             ...terminalCompletionPresentation(d, m.text, m.status),
+            ...(readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ? { planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) } : {}),
             workflowLive: undefined,
             ...(activity !== (m.activity ?? EMPTY_ACTIVITY) ? { activity } : {}),
           };
@@ -1409,10 +1408,19 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[] }) => {
+  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }, retryRequest?: PendingChatPost) => {
+    const taskMode = snapshotTaskMode(input.taskMode);
+    const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
+    if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
+      throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
+    }
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
     if (!text && attachmentIds.length === 0) return;
+    if (!busy && pendingPostRef.current && !retryRequest) {
+      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode });
+      if (candidate !== pendingPostRef.current) throw new Error('Retry or cancel the unconfirmed request before sending a different one.');
+    }
     if (busy) {
       // MID-RUN STEERING: the message reaches the RUNNING turn at its next
       // tool-result boundary — it must not claim a new attempt (that would
@@ -1421,7 +1429,7 @@ export function useChat(options?: UseChatOptions) {
       // wait for the turn to finish.
       if (attachmentIds.length > 0) return;
       const steerId = nextId();
-      setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending' }]);
+      setMessages((prev) => [...prev, { id: steerId, role: 'user', text, steer: 'pending', taskMode }]);
       try {
         const res = await apiPost<{ steered?: boolean }>('/api/harness/chat', {
           input: text,
@@ -1452,8 +1460,8 @@ export function useChat(options?: UseChatOptions) {
     activeAssistantId.current = assistantId;
     setMessages((prev) => [
       ...prev,
-      { id: userId, role: 'user', text, attachmentNames: input.attachmentNames },
-      { id: assistantId, role: 'assistant', text: '', status: 'thinking', progress: 'Starting up…' },
+      { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode },
+      { id: assistantId, role: 'assistant', text: '', status: 'thinking', taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
     ]);
     setBusy(true);
 
@@ -1461,12 +1469,13 @@ export function useChat(options?: UseChatOptions) {
     postAbortRef.current = postAbort;
 
     try {
-      const pending = retainPendingChatPost(pendingPostRef.current, {
+      const pending = retryRequest ?? retainPendingChatPost(pendingPostRef.current, {
         input: text,
         sessionId: sessionIdRef.current,
         attachments: attachmentIds,
+        ...(taskMode ? { taskMode } : {}),
       });
-      pendingPostRef.current = pending;
+      retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {
         signal: postAbort.signal,
         onLateAccepted: async (accepted) => {
@@ -1475,12 +1484,12 @@ export function useChat(options?: UseChatOptions) {
           // but never attach its stream or revive the stopped chat bubble.
           if (postAbortRef.current === postAbort) sessionIdRef.current = accepted.sessionId;
           const confirmed = await cancelSession(accepted);
-          if (confirmed && pendingPostRef.current === pending) pendingPostRef.current = null;
+          if (confirmed && pendingPostRef.current === pending) retainPending(null);
         },
       });
       // Only observing the server's 202 proves this turn identity is safely
       // bound. Until then it remains reusable for an explicit resend.
-      if (pendingPostRef.current === pending) pendingPostRef.current = null;
+      if (pendingPostRef.current === pending) retainPending(null);
       sessionIdRef.current = body.sessionId;
       if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(body.sessionId));
       activeRunRef.current = body;
@@ -1510,7 +1519,7 @@ export function useChat(options?: UseChatOptions) {
         // auto-resume) — keep a slow watch on the session and deliver the real
         // result over the "stopped" note instead of stranding a completed run.
         // (Any prior watch was cancelled at the top of this send.)
-        lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
+        lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev), { replayCursor: handle.getReplayCursor() });
       } else if (awaitingWorkflowReportRef.current) {
         lateWatchRef.current = watchForLateCompletion(
           body.sessionId,
@@ -1524,7 +1533,7 @@ export function useChat(options?: UseChatOptions) {
       const e = err as ApiError;
       // Validation/conflict errors prove the server did not accept this exact
       // request. Transport/restart failures retain it for a safe replay.
-      if (!isRetryableChatPostError(e) && postAbortRef.current === postAbort) pendingPostRef.current = null;
+      if (!isRetryableChatPostError(e) && postAbortRef.current === postAbort) retainPending(null);
       if (e.status === 404) {
         sessionIdRef.current = null;
         // The session is gone server-side — a stale pointer would bounce the
@@ -1546,7 +1555,7 @@ export function useChat(options?: UseChatOptions) {
       const pendingBackground = pendingBackgroundRef.current as { assistantId: string } | null;
       if (pendingBackground?.assistantId === assistantId) pendingBackgroundRef.current = null;
     }
-  }, [busy, applyEvent, handoffAcceptedRun, patch]);
+  }, [busy, messages, applyEvent, handoffAcceptedRun, patch, retainPending]);
 
   const stop = useCallback(() => {
     const aid = activeAssistantId.current;
@@ -1577,7 +1586,7 @@ export function useChat(options?: UseChatOptions) {
       // receipt under the client request id; do not discard that identity until
       // the server confirms it can never execute later.
       void cancelPendingChatRequest(pending.clientRequestId).then((confirmed) => {
-        if (confirmed && pendingPostRef.current === pending) pendingPostRef.current = null;
+        if (confirmed && pendingPostRef.current === pending) retainPending(null);
         if (confirmed || !aid) return;
         setMessages((prev) => prev.map((m) => (m.id === aid
           ? {
@@ -1619,7 +1628,6 @@ export function useChat(options?: UseChatOptions) {
     streamRef.current = null;
     activeAssistantId.current = null;
     sessionIdRef.current = null;
-    pendingPostRef.current = null;
     pendingBackgroundRef.current = null;
     activeRunRef.current = null;
     inboxOutcomeCursorRef.current = createInboxOutcomeCursor(null);
@@ -1627,7 +1635,21 @@ export function useChat(options?: UseChatOptions) {
     setBusy(false);
   }, []);
 
-  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef };
+  const retryPending = () => {
+    const pending = pendingPostRef.current;
+    if (!pending || busy) return Promise.resolve();
+    return send({ text: pending.input, attachmentIds: pending.attachments, taskMode: pending.taskMode }, pending);
+  };
+  const cancelPending = async () => {
+    const pending = pendingPostRef.current;
+    if (!pending || busy) return;
+    if (await cancelPendingChatRequest(pending.clientRequestId)) {
+      if (pendingPostRef.current === pending) retainPending(null);
+    } else throw new Error('Cancellation was not confirmed. The exact request remains available to retry.');
+  };
+  const activeTaskMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
+  const executePlan = (ref: PlanRevisionRef) => send({ text: `Execute the reviewed plan, revision ${ref.revision}.`, taskMode: { version: 1, kind: 'execute', executeRef: ref } });
+  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, pendingPost, retryPending, cancelPending };
 }
 
 
@@ -1654,6 +1676,7 @@ export function createInboxOutcomeDeliveryState(): InboxOutcomeDeliveryState {
 export interface InboxOutcomeCursor {
   sessionId: string | null;
   seq: number;
+  snapshotSeq?: number;
   deliveries: InboxOutcomeDeliveryState;
 }
 
@@ -1663,6 +1686,55 @@ export function createInboxOutcomeCursor(sessionId: string | null = null): Inbox
     seq: 0,
     deliveries: createInboxOutcomeDeliveryState(),
   };
+}
+
+/** Actual idle inbox polling owner, extracted so private-page continuation and
+ * first-open watermark behavior are qualified through the real producer. */
+export async function pollInboxOutcomeEvents(cursor: InboxOutcomeCursor, input: {
+  fetchPage(url: string): Promise<RecentEventsPage>;
+  active(): boolean;
+  maxPages?: number;
+}): Promise<ChatMessage[]> {
+  if (!cursor.sessionId) return [];
+  // A reset/busy transition during a later fetch cannot consume earlier pages
+  // without presenting their messages. Commit this bounded turn together.
+  const draft = { ...cursor, deliveries: cursor.deliveries.map(delivery => ({ ...delivery })) };
+  const additions: ChatMessage[] = [];
+  const maxPages = Number.isSafeInteger(input.maxPages) && Number(input.maxPages) > 0 ? Math.min(4, Number(input.maxPages)) : 4;
+  const finish = (): ChatMessage[] => {
+    if (!input.active()) return [];
+    cursor.seq = draft.seq;
+    cursor.snapshotSeq = draft.snapshotSeq;
+    cursor.deliveries = draft.deliveries;
+    return additions;
+  };
+  try {
+    for (let index = 0; index < maxPages && input.active(); index += 1) {
+      const scan = { scanSeq: draft.seq, snapshotSeq: draft.snapshotSeq };
+      const out = await input.fetchPage(recentEventsUrl(cursor.sessionId, scan, 200));
+      if (!input.active()) return [];
+      if (draft.seq === 0) {
+        // First idle poll intentionally ignores existing history. Only here
+        // does latestSeq set a watermark rather than claim read coverage.
+        if (!Number.isSafeInteger(out.latestSeq) || Number(out.latestSeq) < 0) throw new Error('Invalid inbox watermark.');
+        draft.seq = Number(out.latestSeq) || 1;
+        draft.snapshotSeq = undefined;
+        return finish();
+      }
+      const next = { ...scan };
+      const continuation = advanceRunEventPage(next, out, 200);
+      const events = (out.events ?? []).filter(event => !event.sessionId || event.sessionId === cursor.sessionId);
+      additions.push(...inboxAdditionsFromEvents(events.map(event => ({ ...event, data: event.data ?? {} })), draft.deliveries));
+      draft.seq = next.scanSeq;
+      draft.snapshotSeq = next.snapshotSeq;
+      if (!continuation.more) break;
+    }
+  } catch (error) {
+    // Earlier pages were usable even when a later fetch failed. Their paired
+    // inbox messages and exact cursor commit together; the rest stays due.
+    if (draft.seq === cursor.seq && draft.snapshotSeq === cursor.snapshotSeq) throw error;
+  }
+  return finish();
 }
 
 /**
@@ -1759,6 +1831,7 @@ export function inboxAdditionsFromEvents(
   };
 
   for (const ev of orderedEvents) {
+    if (readLiveApprovalControl(ev)) continue;
     const d = ev.data ?? {};
     if (ev.type === 'user_input_received' && d.synthetic === true && d.source === 'outcome') {
       registerDelivery(ev);
@@ -1814,3 +1887,6 @@ export function inboxAdditionsFromEvents(
   }
   return additions;
 }
+
+/** The shared mapper is the only terminal projection; re-exported for callers and pins. */
+export { terminalCompletionPresentation };

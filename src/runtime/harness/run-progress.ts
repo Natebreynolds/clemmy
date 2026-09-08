@@ -9,17 +9,23 @@
  * and "may proceed" can never disagree. Pure DATA — no model call, no
  * vocabulary detection, shared by every brain lane.
  */
-import { getTurnGraphEventForSource, openEventLog } from './eventlog.js';
+import { getEvent, getTurnGraphEventForSource, openEventLog } from './eventlog.js';
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import { expectedWorkPlanLines, type ExpectedWorkPlanLine } from './expected-work-admission.js';
 
 function latestUserSeq(sessionId: string): number | null {
   try {
-    const row = openEventLog().prepare(`
-      SELECT MAX(seq) AS seq FROM events
+    const rows = openEventLog().prepare(`
+      SELECT id FROM events
        WHERE session_id = ? AND type = 'user_input_received'
-    `).get(sessionId) as { seq: number | null } | undefined;
-    return row?.seq ?? null;
+       ORDER BY seq DESC
+    `).iterate(sessionId) as Iterable<{ id: string }>;
+    for (const row of rows) {
+      const event = getEvent(row.id);
+      if (event && !isLiveApprovalAcknowledgement(event)) return event.seq;
+    }
+    return null;
   } catch {
     return null;
   }

@@ -1,3 +1,8 @@
+import {
+  workingNowLifecycleLabel,
+  workingNowStatusLabel,
+  type PresentedWorkingNowEntry,
+} from '@clem/chat-engine';
 import type { ActivityEntry } from './api';
 
 export type MobileRunControlTarget =
@@ -21,29 +26,26 @@ const STOPPABLE_LIFECYCLES = new Set([
   'completing',
 ]);
 
-/** Human vocabulary for a server-owned lifecycle. Unknown values fail closed
- * instead of turning an internal spelling into user-facing state. */
-export function lifecycleLabel(lifecycle: string): string {
-  const labels: Record<string, string> = {
-    accepted: 'Accepted',
-    queued: 'Queued',
-    reasoning: 'Running',
-    retrieving: 'Reading',
-    using_tool: 'Running',
-    fanout: 'Running',
-    reducing: 'Combining',
-    verifying: 'Verifying',
-    awaiting_input: 'Waiting for input',
-    awaiting_approval: 'Waiting for approval',
-    paused_budget: 'Stopped',
-    retrying: 'Retrying',
-    completing: 'Finishing',
-    blocked: 'Needs review',
-    completed: 'Done',
-    failed: 'Failed',
-    cancelled: 'Stopped',
-  };
-  return labels[lifecycle] ?? 'Status unavailable';
+/** Human vocabulary for a server-owned lifecycle — the SHARED one, so the phone
+ * cannot word a lifecycle differently from the pill above it or the desktop
+ * beside it. Unknown values fail closed instead of turning an internal spelling
+ * into user-facing state. */
+export const lifecycleLabel = workingNowLifecycleLabel;
+
+/**
+ * The one line under a run row's title — and the place the phone stops
+ * rendering a past fact as a present one. The words come from the shared
+ * presenter (workingNowStatusLabel), so the row and the chip above it cannot
+ * disagree; this is only the phone's adapter from its DTO to that call.
+ */
+export function runStatusLabel(presented: PresentedWorkingNowEntry<ActivityEntry>): string {
+  return workingNowStatusLabel({
+    membership: presented.membership,
+    silence: presented.silence,
+    quiet: presented.quiet,
+    lifecycle: presented.entry.lifecycle,
+    ...(presented.entry.activity?.text ? { phase: presented.entry.activity.text } : {}),
+  });
 }
 
 export function kindLabel(kind: ActivityEntry['kind']): string {
@@ -120,4 +122,33 @@ export function mobileRunControl(entry: ActivityEntry): {
     };
   }
   return null;
+}
+
+/**
+ * The workflow run ids this phone can actually END right now.
+ *
+ * A CONTROL MAY NOT BE OFFERED FOR SOMETHING IT CANNOT DO. An Inbox
+ * notification carries the runId it was written about and nothing else — no
+ * status crosses the mobile boundary — so a button gated on "this row names a
+ * run" is really gated on a fact stamped days ago. Measured on the owner's
+ * store 2026-09-06: 54 unread notifications carry a runId, and the
+ * cancellation authority's own TERMINAL_STATUSES
+ * (src/execution/workflow-run-cancellation.ts:61 — completed, blocked, error,
+ * failed, cancelled, dry_run, creation_test) already covers 48 of them. Those
+ * 48 taps could only ever return 409 ALREADY_FINISHED.
+ *
+ * So liveness is read from the one place that owns it: the server's Working
+ * Now projection, which drops every terminal run before the phone sees it
+ * (shouldSurfaceInWorkingNow), narrowed by the SAME mobileRunControl decision
+ * the running-tasks sheet and Activity already use — no second opinion about
+ * what is stoppable. On that same store this set is exactly the 6 runs the
+ * cancel route accepts: 0 false offers, 0 real ones lost.
+ */
+export function stoppableWorkflowRunIds(entries: readonly ActivityEntry[]): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    const control = mobileRunControl(entry);
+    if (control?.target.kind === 'workflow') ids.add(control.target.runId);
+  }
+  return ids;
 }

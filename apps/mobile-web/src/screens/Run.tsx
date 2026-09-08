@@ -19,14 +19,21 @@
  */
 import { useMemo } from 'preact/hooks';
 import {
+  foldWriteLedger,
+  readLiveApprovalControl,
   narrateActivity,
   reduceActivity,
+  writeReversibilityLabel,
+  writeRowLabel,
   type ActivityItem,
   type HarnessEvent,
 } from '@clem/chat-engine';
-import { getRun, isActiveRunStatus } from '../lib/api';
+import { getRun, runDetailPath } from '../lib/api';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
+import { lastGoodAt, lastGoodNotice } from '../lib/last-good';
+import { runElapsedLabel, runIsLive, runCanBeControlled } from '../lib/run-liveness';
+import { runStateLabel } from '../lib/run-rows';
 import { useScreenData } from '../lib/use-screen-data';
 
 interface Props {
@@ -35,13 +42,35 @@ interface Props {
 }
 
 export function Run({ sessionId, onBack }: Props) {
-  const { data, loading, error, offline, refresh } = useScreenData(
+  const { data, loading, error, offline, stale, refresh } = useScreenData(
     () => getRun(sessionId),
     // Live runs are worth polling; a settled one is not.
-    { intervalMs: 5_000 },
+    { intervalMs: 5_000, resourceKey: sessionId },
   );
   const run = data ?? null;
-  const live = run ? isActiveRunStatus(run.status) : false;
+  /**
+   * The SAME path api() fetched with, so the stamp lookup cannot miss. Spelling
+   * it a second time is how `background:task-1` lost its age disclosure.
+   */
+  const stampedAt = lastGoodAt(runDetailPath(sessionId));
+  // Status alone never certifies liveness: a remembered copy of a running run
+  // still says "running". See lib/run-liveness.ts.
+  const live = runIsLive({ status: run?.status, stampedAt, stale: stale || offline || Boolean(error) });
+  const controllable = runCanBeControlled({ status: run?.status, stampedAt, stale: stale || offline || Boolean(error) });
+  const elapsedLabel = run
+    ? runElapsedLabel({ startedAt: run.startedAt, lastEventAt: run.lastEventAt, live, nowMs: Date.now() })
+    : null;
+  /**
+   * What changed out there, folded from the events rather than the route's
+   * precomputed `receipts`. Two reasons: the events carry `callId`, so a
+   * reservation pairs to its own terminal instead of listing the same draft
+   * twice; and this is the SAME fold the chat transcript runs, so the run view
+   * and the conversation can no longer disagree about what settled.
+   */
+  const writes = useMemo(
+    () => [...foldWriteLedger(run?.events ?? []).values()],
+    [run?.events],
+  );
 
   const activity = useMemo(() => {
     if (!run) return [] as ActivityItem[];
@@ -56,7 +85,7 @@ export function Run({ sessionId, onBack }: Props) {
     if (!run) return '';
     for (let i = run.events.length - 1; i >= 0; i -= 1) {
       const event = run.events[i];
-      if (event.type === 'conversation_completed') {
+      if (event.type === 'conversation_completed' && !readLiveApprovalControl(event)) {
         const text = (event.data as { reply?: unknown } | undefined)?.reply;
         if (typeof text === 'string' && text.trim()) return text.trim();
       }
@@ -72,7 +101,13 @@ export function Run({ sessionId, onBack }: Props) {
       </div>
       <div class="workflow-detail-body">
         {loading && !run ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
-        <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={Boolean(run)} />
+        <ScreenNotice
+          error={error}
+          offline={offline}
+          onRetry={() => void refresh()}
+          hasData={Boolean(run)}
+          lastGood={lastGoodNotice(stampedAt, Date.now())}
+        />
 
         {run ? (
           <>
@@ -81,28 +116,29 @@ export function Run({ sessionId, onBack }: Props) {
                 {/* Status is not a liveness certificate: active reads active,
                     but only the server's liveness may animate a pulse. */}
                 {live ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
-                {run.status.replace(/_/g, ' ')}
-                {run.startedAt ? ` · ${elapsed(run.startedAt, run.lastEventAt, live)}` : ''}
+                {runStateLabel({ status: run.status })}
+                {/* No end point, no number: a remembered copy of an active run
+                    must not tick a clock up from a start time days old. */}
+                {elapsedLabel ? ` · ${elapsedLabel}` : ''}
               </span>
-              {live ? <RunControl target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
+              {/* Waiting work retains its exact Stop control, but a failed or cached read cannot claim a current target. */}
+              {controllable ? <RunControl key={run.id} target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
             </div>
 
             {/* What it changed in the world. First, because it is the thing a
                 person most needs to know and the hardest to take back. */}
-            {run.receipts.length > 0 ? (
+            {writes.length > 0 ? (
               <section class="home-section">
                 <h2 class="section-head">What changed</h2>
-                {run.receipts.map((receipt, i) => (
-                  <div key={i} class="run-receipt">
-                    <div class="run-receipt-what">{receiptLabel(receipt)}</div>
-                    <div class="card-when">
-                      {receipt.kind === 'external_write_failed' ? 'failed · '
-                        : receipt.kind === 'external_write_orphaned' ? 'timed out, may have landed · '
-                          : ''}
-                      {receipt.irreversible === false ? 'reversible' : 'not reversible'}
+                {writes.map((row) => {
+                  const reversibility = writeReversibilityLabel(row);
+                  return (
+                    <div key={row.callId} class="run-receipt">
+                      <div class="run-receipt-what">{writeRowLabel(row)}</div>
+                      {reversibility ? <div class="card-when">{reversibility}</div> : null}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </section>
             ) : null}
 
@@ -153,22 +189,4 @@ export function Run({ sessionId, onBack }: Props) {
       </div>
     </div>
   );
-}
-
-/** Plain language for one external write. */
-function receiptLabel(receipt: { shapeKey: string | null; tool: string | null; targets: string[] }): string {
-  const key = (receipt.shapeKey || receipt.tool || 'action').toLowerCase().replace(/[_:]/g, ' ');
-  const to = receipt.targets.length
-    ? ` → ${receipt.targets.slice(0, 2).join(', ')}${receipt.targets.length > 2 ? ` +${receipt.targets.length - 2}` : ''}`
-    : '';
-  return `${key}${to}`;
-}
-
-function elapsed(startedAt: number, lastEventAt: number | null, live: boolean): string {
-  const end = live ? Date.now() : (lastEventAt ?? Date.now());
-  const seconds = Math.max(0, Math.round((end - startedAt) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

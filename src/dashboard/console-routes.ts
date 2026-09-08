@@ -1,3 +1,8 @@
+import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
+import { claimPlanExecutionIngress, inspectPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
+import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
+import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
+import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 import type { Express, Request, Response } from 'express';
 import express from 'express';
 import * as fs from 'node:fs';
@@ -5,7 +10,8 @@ import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
 import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
@@ -389,6 +395,7 @@ import {
   PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
   PUBLIC_RUN_FAILURE_TEXT,
 } from '../runtime/harness/public-presentation.js';
+import { readPublicHarnessEventPage } from '../runtime/harness/public-event-page.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
 import {
   presentationEventFromCompletionData,
@@ -404,12 +411,13 @@ import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
-import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
+import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from '../runtime/harness/restart-recovery.js';
+import { acceptedSourceOutcome, workflowOwnedUnfinishedAttemptIds } from '../runtime/harness/accepted-source-outcome.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
@@ -430,6 +438,16 @@ import {
   resolveEffectiveProviderForModel,
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
+
+// Process identity is captured once, outside route registration. Recomputing
+// Date.now() - uptime on every request drifted by one millisecond and made a
+// completed live proof appear to have crossed a daemon restart. timeOrigin is
+// the process boot clock; later wall-clock corrections cannot change it.
+const CONSOLE_PROCESS_IDENTITY = Object.freeze({
+  daemonInstanceId: randomUUID(),
+  daemonProcessId: process.pid,
+  startedAt: new Date(performance.timeOrigin).toISOString(),
+});
 
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
@@ -3114,9 +3132,10 @@ function harnessChatStableDigest(requestId: string): string {
   return createHash('sha256').update(requestId).digest('hex');
 }
 
-function harnessChatPayloadHash(input: string, attachmentIds: string[]): string {
+function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode): string {
+  if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: input, attachmentIds, taskMode });
   return createHash('sha256')
-    .update(JSON.stringify({ input, attachmentIds }))
+    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode) }))
     .digest('hex');
 }
 
@@ -3393,6 +3412,82 @@ function clearConsoleRunMarkerIfIdle(sessionId: string, ownerAttemptId?: string)
 }
 
 /** Record a route-owned accepted turn and bind its terminal to that exact row. */
+function tryCommitLiveApprovalControl(input: {
+  sessionId: string;
+  requestId: string;
+  inputHash: string;
+  text: string;
+  eligible: boolean;
+  intent: ReturnType<typeof parseApprovalIntent>;
+}): Record<string, unknown> | null {
+  const result = commitLiveApprovalControl({
+    sessionId: input.sessionId, requestId: input.requestId,
+    runId: `desktop:${harnessChatStableDigest(input.requestId).slice(0, 40)}`,
+    inputHash: input.inputHash, text: input.text,
+    prepare: () => {
+      if (!input.eligible || !input.intent) return null;
+      const intent = input.intent;
+      if (intent.approvalId && getBackgroundTaskByApprovalId(intent.approvalId)?.status === 'awaiting_approval') {
+        return null;
+      }
+      const actionable = approvalRegistry.listPending({ sessionId: input.sessionId, status: 'pending' })
+        .filter((entry) => approvalRegistry.isActionable(entry)).filter(approvalRegistry.isFormalApprovalSurface);
+      const selection = selectAddressedApproval(actionable, intent.approvalId);
+      if (selection.kind === 'none') return null;
+      const row = selection.kind === 'selected' ? selection.row : null;
+      const standalone = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+        || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
+      if (row && !standalone) {
+        const linked = pendingActionApprovalViewFromArgs(row.args);
+        const parked = listHarnessEvents(input.sessionId, { types: ['approval_parked'] })
+          .some((event) => event.data.approvalId === row.approvalId);
+        // Parked work resumes through its existing execution owner. An in-place
+        // wait only needs a registry decision; it must not acquire another lease.
+        if (parked || (linked?.id && linked.approvalId === row.approvalId)) return null;
+      }
+      return {
+        sourceData: row ? { approvalId: row.approvalId, decision: intent.decision } : {},
+        commit: (source, resolveDecision) => {
+          const choices = actionable.map((entry) => `${intent.decision} ${entry.approvalId} — ${entry.subject}`);
+          let text: string;
+          let status: ConsoleTerminalStatus = 'done';
+          let reason = 'sdk_approval_resolved';
+          if (selection.kind === 'ambiguous' || selection.kind === 'missing') {
+            text = selection.kind === 'ambiguous'
+              ? [`You have ${selection.rows.length} pending approvals. Choose the exact card; I did not approve or reject any of them.`, ...choices].join('\n')
+              : [`Approval ${selection.approvalId} is no longer pending. I did not apply your decision to another card.`, ...choices].join('\n');
+            status = 'needs_input';
+            reason = 'awaiting_user_input';
+            appendHarnessEvent({ sessionId: input.sessionId, turn: 0, role: 'Clem', type: 'awaiting_user_input',
+              data: { sourceUserSeq: source.seq, reason: selection.kind === 'ambiguous' ? 'approval_choice_required' : 'approval_not_pending',
+                question: text, options: choices } });
+          } else {
+            const result = resolveDecision(selection.row.approvalId,
+              intent.decision === 'approve' ? 'approved' : 'rejected', 'chat-dock-user');
+            const approvedRunner = result.ok && intent.decision === 'approve'
+              && (row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
+            text = !result.ok
+              ? 'That approval was no longer pending. Nothing else was approved or rejected.'
+              : approvedRunner
+                ? `Approved ${row!.approvalId}. Refreshing the blocked Workspace data source now; I’ll report its real outcome here.`
+                : `${intent.decision === 'approve' ? 'Approved' : 'Rejected'} ${row!.approvalId} — continuing.`;
+            if (standalone) reason = approvedRunner ? 'workspace_runner_approval_refresh_started' : 'workspace_approval_resolved';
+          }
+          commitConsoleTerminal({ identity: { sessionId: input.sessionId, turn: source.turn, sourceUserSeq: source.seq },
+            text, status, legacyReason: reason, metadata: { steps: 0, liveApprovalControl: source.data.liveApprovalControl } });
+        },
+      };
+    },
+  });
+  if (!result) return null;
+  const { receipt, source, replayed } = result;
+  return {
+    sessionId: receipt.sessionId, streamUrl: `/api/sessions/${receipt.sessionId}/events`,
+    status: 'completed', mode: 'approval-control', sinceSeq: receipt.sinceSeq, sourceUserSeq: source.seq,
+    clientRequestId: receipt.requestId, runId: receipt.runId, replayed,
+  };
+}
+
 function recordAndCommitConsoleTerminal(input: {
   sessionId: string;
   userText: string;
@@ -3577,7 +3672,9 @@ export function registerConsoleRoutes(
   // owned by a prior process is necessarily orphaned, so make it resumable now
   // instead of forcing the first browser replay to wait out the full TTL.
   try {
-    interruptForeignRunAttemptLeases(HARNESS_CHAT_LEASE_OWNER, { runIdPrefix: 'desktop:' });
+    interruptForeignRunAttemptLeases(HARNESS_CHAT_LEASE_OWNER, {
+      runIdPrefix: 'desktop:', preserveAttemptIds: workflowOwnedUnfinishedAttemptIds(),
+    });
   } catch { /* eventlog startup recovery is best-effort; request-time TTL still applies */ }
   initApprovalFocusReconciliation();
 
@@ -8231,7 +8328,7 @@ export function registerConsoleRoutes(
         // Preserve the legacy package walk as a compatibility fallback while
         // exposing the exact runtime identity used by launch/proof checks.
         version: buildInfo.version === 'unknown' ? version ?? 'unknown' : buildInfo.version,
-        startedAt: new Date(process.uptime() * 1000 * -1 + Date.now()).toISOString(),
+        ...CONSOLE_PROCESS_IDENTITY,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -10155,6 +10252,14 @@ export function registerConsoleRoutes(
   });
 
   // ─── Plan proposals (Planner sub-agent → user review) ──────────
+
+  app.get('/api/console/plan-artifacts/:planId', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const { planArtifactResponse } = await import('./plan-artifacts-api.js');
+    const result = planArtifactResponse({ planId: req.params.planId, sessionId: req.query.sessionId,
+      revision: req.query.revision, digest: req.query.digest, principal: { kind: 'local_owner' } });
+    res.status(result.status).json(result.body);
+  });
 
   app.get('/api/console/plan-proposals', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -14593,21 +14698,15 @@ export function registerConsoleRoutes(
     const sessionId = req.params.sessionId;
     const session = getHarnessSession(sessionId);
     if (!session) { res.status(404).json({ error: 'session not found' }); return; }
-    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
-    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
-    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 500;
-    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.trunc(limitRaw))) : 500;
     try {
-      const events = projectHarnessEventsForPublic(
-        listHarnessEvents(sessionId, { sinceSeq, limit }),
-      );
+      const page = readPublicHarnessEventPage(sessionId, req.query);
       res.json({
         sessionId,
         sessionStatus: session.status,
-        latestSeq: getLatestHarnessEventSeq(sessionId),
-        events,
+        ...page,
       });
     } catch (err) {
+      if (err instanceof RangeError) { res.status(400).json({ error: err.message }); return; }
       console.error('desktop harness recent-event replay failed:', err);
       res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
     }
@@ -15107,6 +15206,47 @@ export function registerConsoleRoutes(
   // or clear:true) reverts the role to its provider-derived default. The judge
   // also keeps the claude-vs-codex branch (CLEMMY_DEBATE_JUDGE) in sync with the
   // chosen model's provider so resolveDebateBrains actually routes there.
+  /**
+   * Completion review on/off — the owner's optional-review control.
+   *
+   * The persisted half of the shared contract: desktop and mobile own the
+   * controls, this owns storage and the typed shape. Deliberately separate from
+   * the Judge/checker selector (which model reviews) and from Second opinion
+   * (which does NOT disable completion review) — all three keep distinct
+   * meanings. Stored beside the role bindings in the same .env-backed store so
+   * on/off and which-model travel together and survive restart.
+   *
+   * Turning review off grants no execution authority and removes none: native
+   * tool/source/account/schema/effect permissions, approval and Execute
+   * boundaries and deterministic write receipts are untouched either way.
+   */
+  app.get('/api/console/settings/completion-review', (_req, res) => {
+    res.json({
+      completionReview: {
+        enabled: completionReviewEnabled(),
+        judge: resolveRoleModel('judge').modelId,
+        judgeSource: resolveRoleModel('judge').source,
+      },
+    });
+  });
+
+  app.patch('/api/console/settings/completion-review', (req, res) => {
+    const body = (req.body ?? {}) as { enabled?: unknown };
+    if (typeof body.enabled !== 'boolean') {
+      res.status(400).json({ error: 'enabled must be a boolean' });
+      return;
+    }
+    updateEnvKey('CLEMMY_COMPLETION_REVIEW', body.enabled ? 'on' : 'off');
+    resetHarnessRuntimeConfig();
+    res.json({
+      completionReview: {
+        enabled: completionReviewEnabled(),
+        judge: resolveRoleModel('judge').modelId,
+        judgeSource: resolveRoleModel('judge').source,
+      },
+    });
+  });
+
   app.patch('/api/console/settings/models/roles', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -15436,6 +15576,10 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
 
     const body = req.body ?? {};
+    let taskMode: TaskMode | undefined;
+    try { taskMode = parseTaskMode(body.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
+    if (taskMode && body.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
+    const explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
     const input = typeof body.input === 'string' ? body.input.trim() : '';
     const attachmentIds: string[] = Array.isArray(body.attachments)
       ? body.attachments.filter((a: unknown): a is string => typeof a === 'string').slice(0, 10)
@@ -15453,7 +15597,7 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const payloadHash = harnessChatPayloadHash(input, attachmentIds);
+    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode);
     const priorReceipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
     if (priorReceipt && priorReceipt.inputHash !== payloadHash) {
       res.status(409).json({ error: 'client request id is already bound to different input' });
@@ -15461,7 +15605,7 @@ export function registerConsoleRoutes(
     }
 
     const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
-    const parsedHarnessCommand = parseHarnessCommand(input);
+    const parsedHarnessCommand = explicitTaskMode ? null : parseHarnessCommand(input);
     if (
       (parsedHarnessCommand === 'cancel' || parsedHarnessCommand === 'new')
       && !requestedSessionId
@@ -15487,7 +15631,6 @@ export function registerConsoleRoutes(
       : deterministicSessionId
         ? getHarnessSession(deterministicSessionId)
         : null;
-    const freshSession = !session;
     // A Workspace's floating dock binds a STABLE per-workspace session id
     // (space-<slug>) so the dock + re-engage share one continuous thread — but
     // that session may not exist until the first message. Create it with the
@@ -15534,6 +15677,48 @@ export function registerConsoleRoutes(
     let sessionId = session.id;
     let streamUrl = `/api/sessions/${sessionId}/events`;
 
+    let reviewedPlanOwnerControl: ReviewedPlanOwnerControlV1 | undefined;
+    let executeIngress: Parameters<typeof inspectPlanExecutionIngress>[0] | null = null;
+    if (taskMode?.kind === 'execute') {
+      try {
+        const control = resolveReviewedPlanOwnerControl({ sessionId, ref: taskMode.executeRef,
+          actor: { surface: 'desktop', id: 'desktop' } });
+        reviewedPlanOwnerControl = control.ownerControl;
+        executeIngress = { sessionId, principalId: control.principalId, ref: taskMode.executeRef,
+          requestId: requestIdentity.requestId, inputHash: payloadHash };
+      } catch (error) {
+        res.status(409).json({ error: error instanceof Error ? error.message : 'Selected plan cannot execute.', code: 'PLAN_EXECUTE_CONFLICT' });
+        return;
+      }
+    }
+    const rejoinPlanExecution = (receipt: ReturnType<typeof claimHarnessChatRequest>['receipt']): boolean => {
+      const attempt = getLatestHarnessRunAttemptByRunId(receipt.sessionId, receipt.runId);
+      if (!attempt?.sourceUserSeq) return false;
+      res.status(202).json({
+        sessionId: receipt.sessionId, streamUrl: `/api/sessions/${receipt.sessionId}/events`,
+        status: 'started', mode: 'execute', sinceSeq: receipt.sinceSeq,
+        clientRequestId: requestIdentity.requestId, runId: receipt.runId, replayed: true,
+        sourceUserSeq: attempt.sourceUserSeq, attemptId: attempt.attemptId,
+        runScopeId: harnessAttemptRunScopeId(receipt.sessionId, attempt),
+        cancelEndpoint: harnessAttemptCancelEndpoint(receipt.sessionId, attempt),
+        backgroundEndpoint: harnessAttemptBackgroundEndpoint(receipt.sessionId, attempt),
+      });
+      return true;
+    };
+    if (executeIngress) {
+      try {
+        const priorExecution = inspectPlanExecutionIngress(executeIngress);
+        if (priorExecution) {
+          const alias = claimPlanExecutionIngress(executeIngress, () => { throw new Error('Execute reservation disappeared'); });
+          if (rejoinPlanExecution(alias.receipt)) return;
+        }
+        assertReviewedPlanExecuteSessionIdle(sessionId, priorExecution?.runId);
+      } catch (error) {
+        res.status(409).json({ error: error instanceof Error ? error.message : 'Selected plan cannot execute.', code: 'PLAN_EXECUTE_CONFLICT' });
+        return;
+      }
+    }
+
     // Resolve deterministic route intent before acceptance, but do not mutate
     // anything yet. The selected target is copied onto the accepted user edge
     // below, making it the recovery authority after a lost response or crash.
@@ -15551,7 +15736,7 @@ export function registerConsoleRoutes(
     } else if (command === 'new') {
       proposedEarlyRoute = { kind: 'new' };
     }
-    if (!proposedEarlyRoute && requestedSessionId && input && command !== 'sessions') {
+    if (!explicitTaskMode && !proposedEarlyRoute && requestedSessionId && input && command !== 'sessions') {
       const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
       if (parkedTask?.pendingQuestionId) {
         const replyDecision = classifyBackgroundInputReply({
@@ -15580,6 +15765,45 @@ export function registerConsoleRoutes(
       }
     }
 
+    // If this session is paused on an SDK approval interrupt and the
+    // user's message is an approve/reject intent, take the RESUME path
+    // instead of starting a new turn. Mirrors the Discord-side
+    // tryHandleHarnessApprovalReply pattern — without this, the chat
+    // dock had no way to resume a paused session, the SEND button sat
+    // in THINKING forever, and the user couldn't continue the workflow.
+    const harnessSession = HarnessSession.load(sessionId);
+    const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
+    // Registry-owned approvals have no RunState interrupt. Most belong to a
+    // still-alive Agent SDK query; Workspace buttons are standalone continuations
+    // owned by their deterministic runtime.
+    const registryApprovalPending = !isPausedOnApproval
+      && approvalRegistry.listPending({ sessionId, status: 'pending' })
+        .some(approvalRegistry.isFormalApprovalSurface);
+    // Approvals parked in a background task THIS chat spawned live in the
+    // task's OWN run session, so the session-scoped registry check above never
+    // sees them. Live 2026-08-04 (desktop): the user typed "Approved" six
+    // times while the saved task sat awaiting_approval — every reply was a
+    // fresh model turn improvising about approvals it could not reach. The
+    // origin link is the routing authority: a verbal decision here must queue
+    // the task's durable continuation, exactly like the Tasks-board button.
+    const originTaskApprovals = listBackgroundTasks({ status: 'awaiting_approval' })
+      .filter((task) => task.originSessionId === sessionId && !!task.pendingApprovalId);
+    const intent = !explicitTaskMode && (isPausedOnApproval || registryApprovalPending || originTaskApprovals.length > 0)
+      ? parseApprovalIntent(input)
+      : null;
+
+    try {
+      const control = tryCommitLiveApprovalControl({ sessionId, requestId: requestIdentity.requestId,
+        inputHash: payloadHash, text: input, intent,
+        eligible: !explicitTaskMode && !proposedEarlyRoute && !isPausedOnApproval
+          && registryApprovalPending && attachmentIds.length === 0 });
+      if (control) { res.status(202).json(control); return; }
+    } catch (error) {
+      console.error('live approval control could not commit:', error);
+      res.status(500).json({ error: PUBLIC_RUN_FAILURE_TEXT });
+      return;
+    }
+
     // MID-RUN STEERING (2026-08-07): a message for a session whose attempt is
     // STILL RUNNING becomes a durable steer note delivered to the model at its
     // next tool-result boundary — it must NOT claim a new attempt, because
@@ -15589,23 +15813,39 @@ export function registerConsoleRoutes(
     // attachments keep the normal turn path so files are never silently
     // dropped into a note. A dead-leased attempt is NOT running — the normal
     // supersede path is the correct recovery there.
-    if (!priorReceipt && !proposedEarlyRoute && input && requestedSessionId && attachmentIds.length === 0 && !command) {
+    if (!priorReceipt && !proposedEarlyRoute && !intent && input && requestedSessionId && attachmentIds.length === 0 && !command) {
       try {
         const latestAttempt = getLatestHarnessRunAttempt(sessionId);
-        const leaseLive = Boolean(
-          latestAttempt
-          && !latestAttempt.finishedAt
-          && latestAttempt.leaseExpiresAt
-          && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
-        );
-        if (leaseLive) {
+        const { steerReasonForRunningWork } = await import('../runtime/harness/steer-notes.js');
+        let steerReason: 'lease_live' | 'recovering_in_flight' | null = null;
+        try {
+          steerReason = steerReasonForRunningWork({
+            runInFlightSince: HarnessSession.load(sessionId)?.runInFlightSince() ?? null,
+            leaseExpiresAt: latestAttempt?.leaseExpiresAt ?? null,
+            attemptFinishedAt: latestAttempt?.finishedAt ?? null,
+            hasUnfinishedAttempt: Boolean(latestAttempt && !latestAttempt.finishedAt),
+            nowMs: Date.now(),
+          });
+        } catch { steerReason = null; }
+        const leaseLive = steerReason === 'lease_live';
+        if (steerReason) {
+          if (explicitTaskMode) {
+            res.status(409).json({ error: 'Finish or stop the active turn before changing its mode.', code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
+            return;
+          }
           const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
-          const note = appendSteerNote(sessionId, input);
+          const note = appendSteerNote(sessionId, input, {
+            clientRequestId: requestIdentity.requestId,
+          });
           res.json({
             ok: true,
             steered: true,
             sessionId,
             noteSeq: note.seq,
+            // Which fact made this a steer. A recovering turn has no live
+            // lease, so a client (or a later reader) must not read `steered`
+            // as proof that a lease was held.
+            steerReason,
             streamUrl,
             clientRequestId: requestIdentity.requestId,
           });
@@ -15669,32 +15909,6 @@ export function registerConsoleRoutes(
       }
     }
 
-    // If this session is paused on an SDK approval interrupt and the
-    // user's message is an approve/reject intent, take the RESUME path
-    // instead of starting a new turn. Mirrors the Discord-side
-    // tryHandleHarnessApprovalReply pattern — without this, the chat
-    // dock had no way to resume a paused session, the SEND button sat
-    // in THINKING forever, and the user couldn't continue the workflow.
-    const harnessSession = HarnessSession.load(sessionId);
-    const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
-    // Registry-owned approvals have no RunState interrupt. Most belong to a
-    // still-alive Agent SDK query; Workspace buttons are standalone continuations
-    // owned by their deterministic runtime.
-    const registryApprovalPending = !isPausedOnApproval
-      && approvalRegistry.listPending({ sessionId, status: 'pending' })
-        .some(approvalRegistry.isFormalApprovalSurface);
-    // Approvals parked in a background task THIS chat spawned live in the
-    // task's OWN run session, so the session-scoped registry check above never
-    // sees them. Live 2026-08-04 (desktop): the user typed "Approved" six
-    // times while the saved task sat awaiting_approval — every reply was a
-    // fresh model turn improvising about approvals it could not reach. The
-    // origin link is the routing authority: a verbal decision here must queue
-    // the task's durable continuation, exactly like the Tasks-board button.
-    const originTaskApprovals = listBackgroundTasks({ status: 'awaiting_approval' })
-      .filter((task) => task.originSessionId === sessionId && !!task.pendingApprovalId);
-    const intent = (isPausedOnApproval || registryApprovalPending || originTaskApprovals.length > 0)
-      ? parseApprovalIntent(input)
-      : null;
     // The task settlement target: an explicit apr-id naming a spawned task's
     // approval always wins; a bare approve/reject reaches the task only when
     // NOTHING in this session competes for it and exactly one task waits —
@@ -15769,74 +15983,86 @@ export function registerConsoleRoutes(
       || acceptedApprovalProtectsExistingLiveOwner;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
     const autonomy = loadProactivityPolicy().autoApproveScope;
-    const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
 
     const proposedRunId = priorReceipt?.runId
       ?? `desktop:${harnessChatStableDigest(requestIdentity.requestId).slice(0, 40)}`;
     let requestClaim: ReturnType<typeof claimHarnessChatRequest> | ReturnType<typeof claimSessionForAcceptedSource>;
     try {
-      // A durable receipt is already the immutable desktop-principal binding.
-      // Reclaim it before reclassifying against mutable parked/approval state;
-      // otherwise a lost-response retry can change lanes after the first turn
-      // already consumed that state. Desktop has one authenticated audience,
-      // and `existingId` above intentionally ignores a conflicting body id.
-      if (priorReceipt) {
-        requestClaim = claimHarnessChatRequest({
-          requestId: requestIdentity.requestId,
-          sessionId: priorReceipt.sessionId,
-          runId: priorReceipt.runId,
-          inputHash: payloadHash,
-          sinceSeq: priorReceipt.sinceSeq,
-        });
-      } else if (!proposedEarlyRoute && !intent) {
-        const lineage = resolveAcceptedSourceIngressLineage({
-          sessionId,
-          provider: 'desktop',
-          scopeId: null,
-          audienceId: 'desktop',
-        });
-        const workspaceSlug = /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)
-          ? sessionId.slice('space-'.length)
-          : null;
-        const validatedMount = lineage?.validatedMount ?? (workspaceSlug ? {
-          version: 1 as const,
-          kind: 'workspace' as const,
-          rootSessionId: sessionId,
-          workspaceSlug,
-        } : undefined);
-        const claimed = claimSessionForAcceptedSource({
-          kind: 'ordinary',
-          entrySessionId: sessionId,
-          durableSourceId: proposedRunId,
-          continuity: {
+      const claimOrdinaryRequest = () => {
+        // A durable receipt is already the immutable desktop-principal binding.
+        // Reclaim it before reclassifying against mutable parked/approval state;
+        // otherwise a lost-response retry can change lanes after the first turn
+        // already consumed that state. Desktop has one authenticated audience,
+        // and `existingId` above intentionally ignores a conflicting body id.
+        if (executeIngress && !priorReceipt) {
+          assertReviewedPlanExecuteSessionIdle(sessionId);
+          requestClaim = claimHarnessChatRequest({ requestId: requestIdentity.requestId,
+            sessionId, runId: proposedRunId, inputHash: payloadHash, sinceSeq });
+        } else if (priorReceipt) {
+          requestClaim = claimHarnessChatRequest({
+            requestId: requestIdentity.requestId,
+            sessionId: priorReceipt.sessionId,
+            runId: priorReceipt.runId,
+            inputHash: payloadHash,
+            sinceSeq: priorReceipt.sinceSeq,
+          });
+        } else if (!proposedEarlyRoute && !intent) {
+          const lineage = resolveAcceptedSourceIngressLineage({
+            sessionId,
             provider: 'desktop',
             scopeId: null,
-            conversationId: lineage?.conversationId ?? sessionId,
             audienceId: 'desktop',
-          },
-          ...(validatedMount ? { validatedMount } : {}),
-          receipt: {
+          });
+          const workspaceSlug = /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)
+            ? sessionId.slice('space-'.length)
+            : null;
+          const validatedMount = lineage?.validatedMount ?? (workspaceSlug ? {
+            version: 1 as const,
+            kind: 'workspace' as const,
+            rootSessionId: sessionId,
+            workspaceSlug,
+          } : undefined);
+          const claimed = claimSessionForAcceptedSource({
+            kind: 'ordinary',
+            entrySessionId: sessionId,
+            durableSourceId: proposedRunId,
+            continuity: {
+              provider: 'desktop',
+              scopeId: null,
+              conversationId: lineage?.conversationId ?? sessionId,
+              audienceId: 'desktop',
+            },
+            ...(validatedMount ? { validatedMount } : {}),
+            receipt: {
+              requestId: requestIdentity.requestId,
+              runId: proposedRunId,
+              inputHash: payloadHash,
+              sinceSeq,
+            },
+          });
+          if (claimed.selection.sessionId !== claimed.receipt.sessionId) {
+            throw new Error('desktop receipt was not claimed on the pre-accepted session');
+          }
+          requestClaim = claimed;
+          sessionId = claimed.selection.sessionId;
+          streamUrl = `/api/sessions/${sessionId}/events`;
+        } else {
+          requestClaim = claimHarnessChatRequest({
             requestId: requestIdentity.requestId,
+            sessionId,
             runId: proposedRunId,
             inputHash: payloadHash,
             sinceSeq,
-          },
-        });
-        if (claimed.selection.sessionId !== claimed.receipt.sessionId) {
-          throw new Error('desktop receipt was not claimed on the pre-accepted session');
+          });
         }
-        requestClaim = claimed;
-        sessionId = claimed.selection.sessionId;
-        streamUrl = `/api/sessions/${sessionId}/events`;
-      } else {
-        requestClaim = claimHarnessChatRequest({
-          requestId: requestIdentity.requestId,
-          sessionId,
-          runId: proposedRunId,
-          inputHash: payloadHash,
-          sinceSeq,
-        });
-      }
+        return requestClaim;
+      };
+      requestClaim = executeIngress
+        ? claimPlanExecutionIngress(executeIngress, claimOrdinaryRequest)
+        : claimOrdinaryRequest();
+      sessionId = requestClaim.receipt.sessionId;
+      streamUrl = `/api/sessions/${sessionId}/events`;
+      if (executeIngress && rejoinPlanExecution(requestClaim.receipt)) return;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const cancelledBeforeAcceptance = message.includes('cancelled before acceptance');
@@ -15853,12 +16079,35 @@ export function registerConsoleRoutes(
       applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
     } catch { /* best-effort primer */ }
     const requestRunId = requestClaim.receipt.runId;
-    const executionClaim = claimRunAttemptLease({
-      sessionId,
-      runId: requestRunId,
-      ownerId: HARNESS_CHAT_LEASE_OWNER,
-      leaseMs: HARNESS_CHAT_LEASE_MS,
-    });
+    const claimAttempt = (): ReturnType<typeof claimRunAttemptLease> => {
+      const previous = getLatestHarnessRunAttemptByRunId(sessionId, requestRunId);
+      if (previous?.sourceUserSeq) {
+        const source = listHarnessEvents(sessionId, { types: ['user_input_received'] })
+          .find((event) => event.seq === previous.sourceUserSeq);
+        if (!source) throw new Error('The original accepted source is unavailable.');
+        const outcome = acceptedSourceOutcome(source);
+        if (outcome?.kind === 'dispatched') {
+          // An expired HTTP lease cannot reclaim an exact source already owned
+          // by its activated workflow group. Rejoin without model/tool replay.
+          releaseRunInFlightAfterWorkflowTransfer(sessionId, previous.attemptId, source.seq);
+          return { attempt: previous, claimed: false, reason: 'active', interruptedAttemptId: null };
+        }
+        if (!outcome && listHarnessEvents(sessionId, { types: ['async_work_dispatched'] })
+          .some((event) => event.data.sourceUserSeq === source.seq)) {
+          throw new Error('The original workflow dispatch cannot be verified; it was not restarted.');
+        }
+      }
+      return claimRunAttemptLease({ sessionId, runId: requestRunId,
+        ownerId: HARNESS_CHAT_LEASE_OWNER, leaseMs: HARNESS_CHAT_LEASE_MS });
+    };
+    let executionClaim: ReturnType<typeof claimRunAttemptLease>;
+    try {
+      executionClaim = executeIngress
+        ? withReviewedPlanExecuteAdmission(sessionId, requestRunId, claimAttempt) : claimAttempt();
+    } catch (error) {
+      res.status(409).json({ error: error instanceof Error ? error.message : 'Plan execution could not acquire the conversation.', code: 'PLAN_EXECUTE_CONFLICT' });
+      return;
+    }
     const shouldSchedule = executionClaim.claimed;
     const requestAttempt: RunAttemptRef | null = executionClaim.attempt;
 
@@ -15912,7 +16161,9 @@ export function registerConsoleRoutes(
           role: 'user',
           data: {
             text: turnInput,
+            ...taskModeFields(taskMode),
             displayText: input || (attachmentIds.length ? 'Attached file' : ''),
+            ...(reviewedPlanOwnerControl ? { reviewedPlanOwnerControl, userId: reviewedPlanOwnerControl.conversationPrincipalId } : {}),
             requestId: requestClaim.receipt.requestId,
             clientRequestId: requestClaim.receipt.requestId,
             runId: requestRunId,
@@ -16128,8 +16379,8 @@ export function registerConsoleRoutes(
     res.status(202).json({
       sessionId,
       streamUrl,
-      status: intent ? 'resuming' : planFirst ? 'planning' : 'started',
-      mode: intent ? `approval-${intent.decision}` : planFirst ? 'plan-first' : 'fresh',
+      status: intent ? 'resuming' : 'started',
+      mode: intent ? `approval-${intent.decision}` : explicitTaskMode ? taskMode!.kind : 'fresh',
       sinceSeq: requestClaim.receipt.sinceSeq,
       clientRequestId: requestClaim.receipt.requestId,
       runId: requestRunId,
@@ -16164,6 +16415,11 @@ export function registerConsoleRoutes(
 
     setImmediate(async () => {
       let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
+      // HELD WORK KEEPS ITS OWNER. Set only when runConversation returned a
+      // hold AND the durable recovery sidecar names this exact attempt, so the
+      // attempt stays live for the owner that is still running on it.
+      let heldByArmedRecoveryOwner = false;
+      let heldOwnerEvidence: 'ours' | 'other' | 'absent' | 'unreadable' | null = null;
       const leaseHeartbeat = setInterval(() => {
         try {
           renewRunAttemptLease(requestAttempt, HARNESS_CHAT_LEASE_OWNER, HARNESS_CHAT_LEASE_MS);
@@ -16327,7 +16583,7 @@ export function registerConsoleRoutes(
         // /goal slash command (goal-contract P3): pin/inspect/cancel the
         // session's parked goal. status/cancel are reply-only; start/resume
         // swap the run input so work begins immediately on the normal loop.
-        const goalCmd = !intent ? parseGoalCommand(turnInput) : null;
+        const goalCmd = !explicitTaskMode && !intent ? parseGoalCommand(turnInput) : null;
         let goalRunInput: string | null = null;
         if (goalCmd) {
           const outcome = handleGoalContractCommand({ command: goalCmd, sessionId, channel: 'desktop' });
@@ -16343,7 +16599,7 @@ export function registerConsoleRoutes(
           }
           goalRunInput = outcome.runInput;
         }
-        if (!intent) {
+        if (!explicitTaskMode && !intent) {
           const continuityNotes: string[] = [];
           const continuity = await routeOpenQuestionPlan({
             channel: 'desktop',
@@ -16399,7 +16655,7 @@ export function registerConsoleRoutes(
         // Skips approval-resume, a session paused on approval, and /goal runs.
         // Space sessions stay foreground unless the background lane is named
         // explicitly — the user is watching the workspace being edited.
-        const promoteToDurable = !intent
+        const promoteToDurable = !explicitTaskMode && !intent
           && !isPausedOnApproval
           && !goalRunInput
           && shouldPromoteToDurable(input, { sessionId });
@@ -16419,20 +16675,6 @@ export function registerConsoleRoutes(
             metadata: { steps: 0, queuedTaskId: task.id },
           });
           return;
-        }
-        // A /goal start already pinned its goal — skip plan-first and run
-        // the objective directly on the normal loop.
-        if (planFirst && !goalRunInput) {
-          const preflight = await runPlanFirstPreflight({
-            input: turnInput,
-            sessionId,
-            channel: 'desktop',
-            freshSession,
-            autonomy,
-            reuseRecordedUserInput: true,
-            sourceUserSeq: requestSourceUserSeq!,
-          });
-          if (preflight.surfaced) return;
         }
         const effectiveInput = goalRunInput ?? turnInput;
         if (intent && harnessSession && session?.kind === 'workflow') {
@@ -16574,12 +16816,13 @@ export function registerConsoleRoutes(
           'home',
           {
             message: effectiveInput,
+            ...taskModeFields(taskMode),
             displayMessage: input,
             sourceUserSeq: requestSourceUserSeq,
             sessionId,
             runId: requestRunId,
             channel: 'desktop',
-            userId: 'desktop',
+            userId: reviewedPlanOwnerControl?.conversationPrincipalId ?? 'desktop',
           },
           async (req) => {
             const result = await runConversation({
@@ -16594,9 +16837,30 @@ export function registerConsoleRoutes(
               input: req.message,
               sourceUserSeq: requestSourceUserSeq,
               runAttemptId: requestAttempt.attemptId,
-              judgeCompletion: true,
+              judgeCompletion: completionReviewEnabled(),
               reuseRecordedUserInput: true,
             });
+            // The held/recovery status was being discarded here: only text and
+            // session travelled out, so the `finally` below finished a turn
+            // that had not stopped working.
+            if (result.hold) {
+              // Continuation RESPONSIBILITY, not the checkpoint blob. Adoption
+              // deliberately removes the blob while the work continues, so
+              // sampling it reported that a live turn had stopped. An
+              // unreadable read is not evidence of stopping either, so it also
+              // retains the owner.
+              try {
+                const state = HarnessSession.load(sessionId)?.continuationOwnerState({
+                  sourceUserSeq: requestSourceUserSeq,
+                  attemptId: requestAttempt.attemptId,
+                });
+                heldByArmedRecoveryOwner = state === 'ours' || state === 'unreadable';
+                heldOwnerEvidence = state ?? 'unreadable';
+              } catch {
+                heldByArmedRecoveryOwner = true;
+                heldOwnerEvidence = 'unreadable';
+              }
+            }
             const replyText = (result.lastDecision?.reply && result.lastDecision.reply.trim())
               ? result.lastDecision.reply
               : (result.lastDecision?.summary ?? '');
@@ -16633,7 +16897,43 @@ export function registerConsoleRoutes(
         }
       } finally {
         clearInterval(leaseHeartbeat);
-        try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* receipt telemetry is best-effort */ }
+        // Finish the attempt ONLY when nothing is still running on it. A
+        // finished attempt is correctly refused every future child lease
+        // (`isDispatchLeaseCurrent`), so finishing one whose recovery owner is
+        // armed makes its own continuation structurally impossible. The lease
+        // guard is right and stays; this is the premature finish it exposed.
+        let workflowOwnsAttempt = false;
+        try {
+          workflowOwnsAttempt = acceptedSourceOutcome(requestAcceptedUserEvent)?.kind === 'dispatched';
+          if (workflowOwnsAttempt) releaseRunInFlightAfterWorkflowTransfer(sessionId, requestAttempt.attemptId, requestSourceUserSeq);
+        } catch {
+          // Unreadable ownership is not proof that the accepted work ended.
+          heldByArmedRecoveryOwner = true;
+          heldOwnerEvidence = 'unreadable';
+        }
+        if (workflowOwnsAttempt) {
+          // Exact final report-back owns the terminal and attempt settlement.
+        } else if (heldByArmedRecoveryOwner && requestAttemptStatus === 'completed') {
+          try {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'restart_recovery_decision',
+              data: {
+                decision: 'attempt_retained_for_recovery_owner',
+                sourceUserSeq: requestSourceUserSeq,
+                attemptId: requestAttempt.attemptId,
+                evidence: heldOwnerEvidence,
+                reason: heldOwnerEvidence === 'unreadable'
+                  ? 'continuation ownership was unreadable; an unreadable read is not proof that work stopped'
+                  : 'this activation still holds continuation responsibility',
+              },
+            });
+          } catch { /* diagnostic only */ }
+        } else {
+          try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* receipt telemetry is best-effort */ }
+        }
         if (!acceptedApprovalDefersMarkerOwnership) {
           const terminal = listHarnessEvents(sessionId, { types: ['conversation_completed'], desc: true })
             .find((event) => event.data.sourceUserSeq === requestSourceUserSeq);

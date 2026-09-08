@@ -45,7 +45,11 @@ const {
   isKillRequested,
   listEvents,
   recordRunAttemptUserInput,
+  renewRunAttemptLease,
   resetEventLog,
+  openEventLog,
+  closeEventLog,
+  getRunAttemptBySourceUserSeq,
 } = await import('../runtime/harness/eventlog.js');
 const { getBackgroundTask, listBackgroundTasks } = await import('../execution/background-tasks.js');
 const { getRun, startRun } = await import('../runtime/run-events.js');
@@ -90,6 +94,81 @@ async function waitUntil(
   }
   assert.fail(message);
 }
+
+test('Execute taps with different request IDs rejoin the accepted revision before steering or attempt replacement', async () => {
+  resetEventLog();
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { publishPlanRevision } = await import('../runtime/harness/plan-artifacts.js');
+  const { claimPlanExecutionIngress } = await import('../runtime/harness/plan-execution-ingress.js');
+  const sessionId = 'desktop-reviewed-plan';
+  createSession({ id: sessionId, kind: 'chat', userId: 'desktop' });
+  const planning = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Plan a native Space.', taskMode: { version: 1, kind: 'plan' } } });
+  const plan = publishPlanRevision({ sessionId, principalId: 'desktop', sourceUserSeq: planning.seq,
+    fullText: 'Create the reviewed native Space once.', readiness: 'ready' });
+  const ref = { planId: plan.planId, revision: plan.revision, digest: plan.digest };
+  const taskMode = { version: 1 as const, kind: 'execute' as const, executeRef: ref };
+  const input = 'Execute the reviewed plan.';
+  const inputHash = createHash('sha256').update(JSON.stringify({ input, attachmentIds: [], taskMode })).digest('hex');
+  const reserved = claimPlanExecutionIngress({ sessionId, principalId: 'desktop', ref,
+    requestId: 'desktop-plan-owner', inputHash }, () => claimHarnessChatRequest({
+    requestId: 'desktop-plan-owner', sessionId, runId: 'desktop-plan-run', inputHash, sinceSeq: planning.seq,
+  }));
+  const lease = claimRunAttemptLease({ sessionId, runId: reserved.receipt.runId, ownerId: 'fixture-owner', leaseMs: 60_000 });
+  assert.ok(lease.attempt);
+  recordRunAttemptUserInput(lease.attempt, { turn: 2, role: 'user', data: { text: input, taskMode, runId: reserved.receipt.runId } });
+  let brainCalls = 0;
+  _setBridgeImplsForTests({ runConversation: (async () => { brainCalls++; throw new Error('duplicate dispatched'); }) as never });
+  const harness = await boot();
+  try {
+    const replies = await Promise.all(['desktop-plan-tap-2', 'desktop-plan-tap-3'].map(clientRequestId => fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input, sessionId, clientRequestId, taskMode }),
+    })));
+    for (const reply of replies) {
+      assert.equal(reply.status, 202);
+      const body = await reply.json() as { runId: string; attemptId: string; steered?: boolean; replayed: boolean };
+      assert.equal(body.runId, reserved.receipt.runId);
+      assert.equal(body.attemptId, lease.attempt.attemptId);
+      assert.equal(body.replayed, true);
+      assert.notEqual(body.steered, true);
+    }
+    assert.equal(brainCalls, 0);
+    assert.equal(getActiveRunAttempt(sessionId)?.attemptId, lease.attempt.attemptId);
+    assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 2);
+    assert.equal(getHarnessChatRequestReceipt('desktop-plan-tap-3')?.runId, reserved.receipt.runId);
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
+test('planning words do not switch absent or Normal mode to the legacy preflight planner', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  let calls = 0;
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId: string }) => {
+      calls++;
+      return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'Here is the requested plan.', done: true, nextAction: 'completed' } };
+    }) as never,
+  });
+  const harness = await boot();
+  try {
+    for (const [index, taskMode] of [undefined, { version: 1, kind: 'normal' }].entries()) {
+      const response = await fetch(`${harness.url}/api/harness/chat`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: 'Draft me a plan for the requested work.', clientRequestId: `normal-plan-words-${index}`, taskMode }),
+      });
+      assert.equal(response.status, 202);
+      const accepted = await response.json() as { sessionId: string; runId: string; mode: string; status: string };
+      assert.equal(accepted.status, 'started');
+      assert.equal(accepted.mode, 'fresh');
+      await waitUntil(() => calls === index + 1, 'normal configured brain was not dispatched');
+      const source = listEvents(accepted.sessionId, { types: ['user_input_received'] })[0]!;
+      assert.deepEqual(source.data.taskMode, taskMode);
+      await waitUntil(() => Boolean(getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt), 'normal test attempt did not settle');
+    }
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
 
 test('Stop before chat acceptance persists a tombstone and the request can never execute later', async () => {
   resetEventLog();
@@ -1115,8 +1194,9 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       tool: 'google_calendar_update_event',
       args: { eventId: 'event-2', title: 'Launch review' },
     });
-    const originalLiveAttempt = beginRunAttempt(session.id, { runId: 'desktop:live-sdk-owner' });
-    recordRunAttemptUserInput(originalLiveAttempt, {
+    const originalLiveAttempt = claimRunAttemptLease({ sessionId: session.id, runId: 'desktop:live-sdk-owner',
+      ownerId: 'original-sdk-owner', leaseMs: 60_000 }).attempt!;
+    const originalSource = recordRunAttemptUserInput(originalLiveAttempt, {
       turn: 0,
       role: 'user',
       data: { text: 'Run the live SDK task.', displayText: 'Run the live SDK task.' },
@@ -1129,6 +1209,15 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       });
       assert.equal(response.status, 202);
     };
+
+    const wokenAfterCommit: boolean[] = [];
+    approvalRegistry.onApprovalResolved((row) => {
+      if (row.approvalId !== first.approvalId && row.approvalId !== second.approvalId) return;
+      const controlSource = listEvents(session.id, { types: ['user_input_received'] })
+        .find((event) => event.data.approvalId === row.approvalId);
+      wokenAfterCommit.push(!!controlSource && listEvents(session.id, { types: ['conversation_completed'] })
+        .some((event) => event.data.sourceUserSeq === controlSource.seq));
+    });
 
     await postDecision('approve', 'approval-bare-must-pick');
     await waitFor(() => listEvents(session.id, { types: ['awaiting_user_input'] })
@@ -1151,6 +1240,12 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       'an ambiguous approval acknowledgement never clears the original live SDK marker',
     );
 
+    assert.equal(
+      getLatestRunAttemptByRunId(session.id, originalLiveAttempt.runId!)?.finishedAt,
+      null,
+      'an approval acknowledgement preserves the actual original executor, not only its metadata marker',
+    );
+
     await postDecision(`approve ${first.approvalId}`, 'approval-exact-first');
     await waitFor(() => approvalRegistry.get(first.approvalId)?.status === 'resolved');
     assert.equal(approvalRegistry.get(first.approvalId)?.resolution, 'approved');
@@ -1164,6 +1259,16 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     await waitFor(() => approvalRegistry.get(second.approvalId)?.status === 'resolved');
     assert.equal(approvalRegistry.get(second.approvalId)?.resolution, 'rejected');
     assert.ok(getSession(session.id)?.metadata.__run_in_flight);
+
+    // Lost responses preserve their original control, even though the pending
+    // card set changed. Neither replay may turn into steering or a model job.
+    await postDecision('approve', 'approval-bare-must-pick');
+    await postDecision(`approve ${first.approvalId}`, 'approval-exact-first');
+    assert.deepEqual(wokenAfterCommit, [true, true], 'the waiting calls wake only after their exact acknowledgement commits');
+    assert.equal(listEvents(session.id, { types: ['user_input_received'] })
+      .filter((event) => event.data.clientRequestId === 'approval-exact-first').length, 1);
+    assert.equal(renewRunAttemptLease(originalLiveAttempt, 'original-sdk-owner', 60_000), true,
+      'the original executor can continue renewing its exact lease after approval');
 
     const workspaceRunner = approvalRegistry.register({
       sessionId: session.id,
@@ -1182,8 +1287,154 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     assert.ok(workspaceSource && workspaceAck, 'Workspace approval is one source-bound typed terminal');
     assert.match(workspaceText, /refreshing.*now/i);
     assert.doesNotMatch(workspaceText, /continuing/i);
+    const { steerBlockForToolBoundary, adoptedSteerNotesForSource } = await import('../runtime/harness/steer-notes.js');
+    const steer = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'Also include the regional total.', sessionId: session.id,
+        clientRequestId: 'steer-after-approval', steerOnly: true }) });
+    assert.equal(steer.status, 200);
+    assert.equal((await steer.json() as { steered?: boolean }).steered, true);
+    assert.match(steerBlockForToolBoundary(session.id), /Also include the regional total/);
+    assert.deepEqual(adoptedSteerNotesForSource({ sessionId: session.id, sourceUserSeq: originalSource.seq })
+      .map((note) => note.text), ['Also include the regional total.'],
+      'control acknowledgements do not replace the objective receiving later steering');
+    assert.equal(getLatestRunAttemptByRunId(session.id, originalLiveAttempt.runId!)?.finishedAt, null);
+    for (const event of listEvents(session.id, { types: ['user_input_received'] })) {
+      if (!event.data.liveApprovalControl) continue;
+      assert.equal(getLatestRunAttemptByRunId(session.id, String(event.data.runId)), null,
+        'a live approval acknowledgement has no competing execution attempt');
+    }
     assert.equal(brainCalls, 0);
   } finally {
     await harness.close();
   }
 });
+
+async function appendDesktopWorkflowDispatch(
+  source: import('../runtime/harness/eventlog.js').EventRow,
+  runId: string,
+) {
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const { createWorkflowChatDispatchPreparationAuthority, createWorkflowChatDispatchPreparedReceipt,
+    createWorkflowOriginGroupCloseAuthority, createWorkflowOriginGroupClosedBatchReceipt,
+    finalizeWorkflowOriginGroupClosedBatch, recordWorkflowChatDispatchPreparation,
+    recordWorkflowOriginGroupClosedBatch } = await import('../execution/workflow-origin-group.js');
+  const replyTarget = source.data.originReplyTarget as import('../runtime/exact-origin-delivery.js').ExactOriginDeliveryTarget;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'gateway-dispatch-test',
+    status: 'awaiting_chat_dispatch_seal',
+  }), 'utf-8');
+  const authority = createWorkflowChatDispatchPreparationAuthority({
+    runId,
+    observer: { sessionId: source.sessionId, sourceUserSeq: source.seq, replyTarget },
+    queueRequestDigest: createHash('sha256').update(`gateway-dispatch:${runId}`).digest('hex'),
+  });
+  const prepared = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_prepared',
+    parentEventId: source.id,
+    data: { ...authority },
+  });
+  const receipt = recordWorkflowChatDispatchPreparation(createWorkflowChatDispatchPreparedReceipt(authority, {
+    eventId: prepared.id,
+    eventSeq: prepared.seq,
+    preparedAt: prepared.createdAt,
+  }));
+  const closeAuthority = createWorkflowOriginGroupCloseAuthority([receipt]);
+  const closed = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatch_batch_closed',
+    parentEventId: source.id,
+    data: { ...closeAuthority },
+  });
+  recordWorkflowOriginGroupClosedBatch({
+    receipt: createWorkflowOriginGroupClosedBatchReceipt(closeAuthority, {
+      eventId: closed.id,
+      eventSeq: closed.seq,
+      closedAt: closed.createdAt,
+    }),
+    preparedReceipts: [receipt],
+  });
+  const active = finalizeWorkflowOriginGroupClosedBatch(receipt.sourceGroupId, {
+    beforeMemberRelease: () => {},
+  });
+  return appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'async_work_dispatched',
+    parentEventId: source.id,
+    data: { ...active.publicDispatch, replyTarget: active.sealed.replyTarget },
+  });
+}
+
+for (const variant of ['verified', 'naked-status', 'fast-terminal'] as const) {
+  test(`desktop workflow handoff retains only exact ownership: ${variant}`, async () => {
+    resetEventLog(); resetHarnessRuntimeConfig();
+    const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+    const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+    let calls = 0;
+    const commit = (source: import('../runtime/harness/eventlog.js').EventRow) => {
+      const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+      return commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done',
+        resumable: false, presentation: { kind: 'answer', text: 'The exact workflow result.' } });
+    };
+    _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+      runConversation: (async (request: { sessionId: string; sourceUserSeq: number }) => {
+        calls++;
+        const source = listEvents(request.sessionId, { types: ['user_input_received'] })
+          .find((event) => event.seq === request.sourceUserSeq)!;
+        if (variant !== 'naked-status') await appendDesktopWorkflowDispatch(source, `desktop-child-${variant}`);
+        if (variant === 'fast-terminal') commit(source);
+        return { sessionId: request.sessionId, status: 'dispatched', steps: 1, lastTurn: source.turn,
+          lastDecision: { reply: 'Queued, awaiting actual result.' } };
+      }) as never,
+    });
+    const harness = await boot();
+    try {
+      const body = { input: 'Run the saved workflow and return its result.', clientRequestId: `desktop-workflow-${variant}` };
+      const submit = () => fetch(`${harness.url}/api/harness/chat`, { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const response = await submit();
+      assert.equal(response.status, 202);
+      const accepted = await response.json() as { sessionId: string; runId: string; attemptId: string };
+      await waitUntil(() => calls === 1, 'desktop host did not enter');
+      if (variant !== 'verified') {
+        await waitUntil(() => !!getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt,
+          'an unowned status or fast terminal did not settle the physical attempt');
+        return;
+      }
+      await waitUntil(() => {
+        const attempt = getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId);
+        return !!attempt && attempt.leaseOwner === null;
+      }, 'verified handoff did not release the HTTP lease');
+      const source = listEvents(accepted.sessionId, { types: ['user_input_received'] })[0]!;
+      assert.equal(getRunAttemptBySourceUserSeq(accepted.sessionId, source.seq)?.finishedAt, null);
+      // Expired/detached request lease must not replace the durable workflow owner.
+      openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?')
+        .run('2000-01-01T00:00:00.000Z', accepted.attemptId);
+      closeEventLog();
+      const replayResponse = await submit();
+      const replay = await replayResponse.json() as { attemptId: string; replayed: boolean };
+      assert.equal(replay.attemptId, accepted.attemptId);
+      assert.equal(replay.replayed, true);
+      assert.equal(calls, 1);
+      assert.equal(getRunAttemptBySourceUserSeq(accepted.sessionId, source.seq)?.finishedAt, null);
+      assert.equal(listEvents(accepted.sessionId, { types: ['user_input_received'] }).length, 1);
+      commit(source);
+      const finishedAt = getRunAttemptBySourceUserSeq(accepted.sessionId, source.seq)?.finishedAt;
+      assert.ok(finishedAt);
+      await submit();
+      assert.equal(calls, 1);
+      assert.equal(getRunAttemptBySourceUserSeq(accepted.sessionId, source.seq)?.finishedAt, finishedAt);
+      assert.equal(listEvents(accepted.sessionId, { types: ['conversation_completed'] }).length, 1);
+    } finally { _setBridgeImplsForTests({}); await harness.close(); }
+  });
+}

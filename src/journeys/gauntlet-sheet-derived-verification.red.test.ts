@@ -32,6 +32,7 @@ import { appendFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'n
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 import { after, test } from 'node:test';
 
 const PROCESS_RESTART_FIXTURE = process.env.CLEM_DERIVED_RESTART_FIXTURE === '1';
@@ -198,6 +199,8 @@ type ProviderBody = {
 };
 
 export type TurnOptions = {
+  /** Negative control: omit only the typed source-account semantic reviewer. */
+  omitAccountReviewer?: boolean;
   sessionId: string;
   /** Omit the verifier capability to prove the pre-mutation refusal. */
   discloseVerifier: boolean;
@@ -374,6 +377,12 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
     async interpret() { throw new Error('hidden pre-loop semantic model pass'); },
     async judgeSourceEffect() { throw new Error('hidden pre-loop semantic effect judge'); },
     async judgePlanGrounding() { throw new Error('hidden pre-loop semantic grounding judge'); },
+    ...(options.omitAccountReviewer ? {} : { judgeAccountSelection: currentSourceAccountReviewer({
+      sessionId: () => session.id, acceptedText: PROMPT, toolkit: 'googlesheets',
+      accountIdentity: ACCOUNT,
+      acceptedSource: (id, seq) => eventlog.listEvents(id, { sinceSeq: seq - 1,
+        types: ['user_input_received'], limit: 1 }).find(event => event.seq === seq),
+    }) }),
   });
 
   const gateway = composioTools.getComposioRuntimeTools()
@@ -591,6 +600,30 @@ function settledVerifierCalls(sessionId: string): string[] {
     .filter((data) => data.businessCall === false && String(data.logicalToolCallId ?? '').startsWith('verify:'))
     .map((data) => String(data.logicalToolCallId));
 }
+
+if (!PROCESS_RESTART_FIXTURE) test('missing account reviewer publishes no provider capability and performs no write', { timeout: 180_000 }, async () => {
+  const result = await runTurn({ sessionId: 'derived-missing-account-reviewer',
+    discloseVerifier: true, updateTargetId: SHEET_ID, omitAccountReviewer: true });
+  assert.deepEqual(result.bodies, [], 'an unavailable reviewer grants no provider crossing');
+  const events = eventlog.listEvents(result.sessionId);
+  const returnedRows = events.filter(event => event.type === 'tool_returned'
+    && event.data.sourceUserSeq === result.sourceUserSeq && event.data.tool === 'tool_search')
+    .flatMap(event => {
+      const raw = event.data.result;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return Array.isArray(parsed?.results) ? parsed.results : [];
+    });
+  const sheetRows = returnedRows.filter(row => [CREATE_OPERATION, UPDATE_OPERATION, READ_OPERATION].includes(row.name));
+  assert.ok(sheetRows.length > 0, 'metadata must still be exposed, not hidden to make the negative pass');
+  assert.ok(sheetRows.every(row => row.planningRefStatus === 'account_selection_required'
+    && row.accountSelectionReason === 'review_unavailable' && !row.capabilityRef));
+  assert.equal(events.filter(event => event.type === 'capability_resolution'
+    && event.data.sourceUserSeq === result.sourceUserSeq)
+    .flatMap(event => Array.isArray(event.data.entries) ? event.data.entries : [])
+    .some(entry => entry.kind === 'composio' && entry.status === 'proven'), false);
+  assert.equal((capabilityCatalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [])
+    .some(entry => [CREATE_REF, UPDATE_REF].includes(entry.capabilityId)), false);
+});
 
 // ------------------------------------------------------------------ case 1 --
 if (!PROCESS_RESTART_FIXTURE) test('the two-operation business request produces exactly four verified provider phases', { timeout: 180_000 }, async () => {

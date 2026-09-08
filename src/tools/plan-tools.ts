@@ -1,3 +1,4 @@
+import { acceptedPlanExecution, acceptedPlanExecutionObjective, acceptedPlanExecutionText } from '../runtime/harness/accepted-plan-execution.js';
 import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -43,6 +44,7 @@ import {
   recordPlanTaskPreparationCheckpoint,
 } from '../runtime/harness/plan-task-post-settlement.js';
 import { bindAdmittedNodeCapability } from '../runtime/harness/graph-node-capability.js';
+import { selectProviderAcknowledgementMode } from '../runtime/harness/provider-acknowledgement-contract.js';
 import {
   freezeCatalogSnapshotForSource,
   canonicalCatalogIdentityOf,
@@ -74,8 +76,6 @@ import {
   loadDurableAuthorizedLocalPlanningDefinition,
 } from '../runtime/harness/local-planning-capability.js';
 import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
-import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
-import { acceptedSourceIsWorkflowInternal } from '../runtime/harness/named-workflow-host-dispatch.js';
 import {
   accountSelectionForCitedWrite,
   citedLegsUnblockedByAccount,
@@ -370,6 +370,21 @@ function planCompletenessCapabilities(
   ))];
 }
 
+function planCapabilityEffectIssues(input: {
+  draft: Pick<PlanTaskInput['draft'], 'topology' | 'bindings'>;
+  capabilities: readonly HostCapabilityDescriptorV1[];
+}): string[] {
+  const effects = new Map(input.capabilities.map((capability) => [capability.id, capability.effect]));
+  const refs = new Map(input.draft.bindings.map((binding) => [binding.operationId, binding.capabilityRef]));
+  return input.draft.topology.operations.flatMap((operation, index) => {
+    const ref = refs.get(operation.id);
+    const expected = ref ? effects.get(ref) : undefined;
+    return expected && expected !== operation.effect
+      ? [`draft.topology.operations.${index}.effect: ${operation.id} binds the already-disclosed capability ${ref}; expected ${expected}, received ${operation.effect}. Match the selected operation and effect to the intended work. If this capability does the wrong operation, discover and bind the correct capability before submitting the plan; do not change a read into a write just to satisfy this check`]
+      : [];
+  });
+}
+
 /** Invalid siblings cannot conceal repairs whose own inputs pass the same
  * strict field schemas. This reads only the current source/catalog; it never
  * compiles, persists, invokes a model, or treats partial input as authority. */
@@ -381,6 +396,9 @@ function independentPlanInputIssues(raw: unknown, planning: HostFreshPlanningCon
   const boundInput = z.object({ topology: fields.topology, bindings: fields.bindings }).safeParse(draft);
   const context = harnessRunContextStorage.getStore();
   if (boundInput.success && planning && context?.sessionId && context.sourceUserSeq) {
+    const capabilities = planCompletenessCapabilities(planning, boundInput.data.bindings);
+    const effectIssues = planCapabilityEffectIssues({ draft: boundInput.data, capabilities });
+    issues.push(...effectIssues);
     const source = listEvents(context.sessionId, { sinceSeq: context.sourceUserSeq - 1, types: ['user_input_received'], limit: 1 })
       .find((event) => event.seq === context.sourceUserSeq);
     const continuation = context.taskContinuation;
@@ -389,9 +407,9 @@ function independentPlanInputIssues(raw: unknown, planning: HostFreshPlanningCon
       ? continuation.parentInput.trim()
       : String(source?.data.displayText || source?.data.text || '').trim();
     const scope = requestedCapabilityEffectScope(objective);
-    if ((scope === 'write' || scope === 'mixed')
+    if (effectIssues.length === 0 && (scope === 'write' || scope === 'mixed')
       && boundInput.data.topology.operations.some((operation) => PLAN_WRITE_EFFECTS.has(operation.effect))
-      && !planDraftHasHostAttestedWrite({ draft: boundInput.data, capabilities: planCompletenessCapabilities(planning, boundInput.data.bindings) })) {
+      && !planDraftHasHostAttestedWrite({ draft: boundInput.data, capabilities })) {
       issues.push(`draft.bindings: ${PLAN_MISSING_WRITE_DETAIL}`);
     }
   }
@@ -411,7 +429,7 @@ function settledPreamble(raw: string): string {
 
 function planningCatalogText(capabilities: readonly HostCapabilityDescriptorV1[]): string {
   if (capabilities.length === 0) {
-    return '(The initial planning card had no exact capability descriptors. Use foreground tool_search; cite only exact capabilityRef values it returns.)';
+    return '(No capability descriptors are listed on this card. Cite exact executable capabilityRef values from the latest disclosure for this request; use tool_search if needed.)';
   }
   return JSON.stringify(capabilities.map((capability) => ({
     capabilityRef: capability.id,
@@ -706,6 +724,10 @@ async function sealFreshPlanCapabilityBindings(input: {
     const sealedBinding = sealBoundCapability({
       nodeId: node.id,
       binding: bound.binding,
+      ...(bound.binding.manifest ? { writeEvidenceMode: selectProviderAcknowledgementMode({
+        graph: input.graph, operationId: node.id, workContractId: input.workContractId,
+        manifest: bound.binding.manifest,
+      }) ?? undefined } : {}),
       // This is a capability-selection seal, not invocation identity. The
       // same host-owned projection is used by the admitted graph executor.
       argumentDigest: createHash('sha256').update(JSON.stringify({
@@ -879,7 +901,7 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     acceptedTaskId: intent.identity.acceptedTaskId,
-    acceptedText: intent.objective,
+    acceptedText: acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq) ?? intent.objective,
     graph: intent.graph,
     operationIds: intent.operationIds,
     workContractId: intent.contractId,
@@ -1191,6 +1213,59 @@ function undisclosedRefRepairInstruction(
  * business calls. The refusal now names both kind lists (see
  * turn-semantic-proposal), so this instruction can point at them.
  */
+/**
+ * A destination-posture refusal is not a "pick another ref from the list"
+ * problem when the list contains nothing that can act on the target.
+ *
+ * Live C14 source 136275 refused a create-only capability for an edit, then
+ * handed back a repair naming only `workflow_create` and telling the model to
+ * use ONLY that list — the very capability just refused.
+ *
+ * Derived from the SAME typed facts the validator used: the draft's declared
+ * destination (family + posture), the cited capability's descriptor, and the
+ * postures each shown capability supports. An earlier revision parsed both
+ * postures out of the English error prose, which could recommend the rejected
+ * ref, name the wrong family, or disagree with recoveryTool.
+ */
+function destinationMismatchRepair(input: {
+  reason: string;
+  draft: Pick<z.infer<typeof FreshActionPlanDraftSchema>, 'destination' | 'bindings'>;
+  capabilities: readonly HostCapabilityDescriptorV1[];
+}): string | null {
+  if (!input.reason.includes('capability_ref_destination_mismatch')) return null;
+  const sink = input.draft.destination;
+  if (!sink) return null;
+  const byId = new Map(input.capabilities.map((entry) => [entry.id, entry]));
+  const posturesOf = (entry: HostCapabilityDescriptorV1): ReadonlySet<string> => new Set<string>([
+    ...(entry.destinationPosture ? [entry.destinationPosture] : []),
+    ...(entry.destinationPostures ?? []),
+  ]);
+  // The refs this draft actually cited for the sink's family — those are the
+  // ones that failed, and must never be recommended back.
+  const citedForFamily = new Set(
+    input.draft.bindings
+      .map((binding) => binding.capabilityRef)
+      .filter((ref) => byId.get(ref)?.deliverableKind === sink.family),
+  );
+  const compatible = input.capabilities.filter((entry) => (
+    entry.deliverableKind === sink.family
+    && !citedForFamily.has(entry.id)
+    && posturesOf(entry).has(sink.posture)
+  ));
+  const target = sink.posture === 'named_existing'
+    ? `an existing ${sink.family}`
+    : `a new ${sink.family}`;
+  if (compatible.length > 0) {
+    return `The cited capability cannot act on ${target}. Re-cite one of these, which can: `
+      + `${compatible.map((entry) => `${entry.id} (${entry.purpose})`).join(', ')}. `
+      + 'Then call plan_task again. Do not restate the same selection.';
+  }
+  return `The cited capability cannot act on ${target}, and no capability shown on this card can `
+    + 'either — so re-citing from that list cannot fix it. Call tool_search once for the '
+    + `operation that acts on ${target}, then call plan_task again with the exact capabilityRef `
+    + 'it returns. Do not rewrite the request as a creation to fit the capability you already have.';
+}
+
 function dagKindMismatchRepairInstruction(reason: string): string | null {
   if (!reason.includes('dag_kind_mismatch')) return null;
   const edges = [...reason.matchAll(/dag_kind_mismatch:([^\s(]+)\s*\(([^)]*)\)/g)]
@@ -1252,21 +1327,6 @@ function planAdmissionRecoveryTool(
       : admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search');
 }
 
-function priorAcceptedSourceTexts(sessionId: string, sourceUserSeq: number): string[] {
-  try {
-    return listEvents(sessionId, { types: ['user_input_received'] })
-      .filter((event) => event.seq < sourceUserSeq)
-      .map((event) => {
-        const display = typeof event.data.displayText === 'string' ? event.data.displayText.trim() : '';
-        const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
-        return display || text;
-      })
-      .filter((text) => text.length > 0);
-  } catch {
-    return [];
-  }
-}
-
 async function executePlanTask(
   input: PlanTaskInput,
   planning?: HostFreshPlanningContextV1,
@@ -1306,7 +1366,7 @@ async function executePlanTask(
   const turn = source.turn;
   const display = typeof source.data.displayText === 'string' ? source.data.displayText.trim() : '';
   const eventText = typeof source.data.text === 'string' ? source.data.text.trim() : '';
-  const consumingObjective = display || eventText;
+  const consumingObjective = acceptedPlanExecutionText(sessionId, sourceUserSeq) ?? (display || eventText);
   const continuation = context.taskContinuation;
   const objective = continuation
     && continuation.consumingSourceUserSeq === sourceUserSeq
@@ -1315,27 +1375,9 @@ async function executePlanTask(
       ? continuation.parentInput.trim()
       : consumingObjective;
   if (!objective) throw new Error('plan_task accepted source text is missing');
-  // A workflow step's own accepted text names its workflow and says "run";
-  // the step surface denies workflow_run, so the class guard decides first
-  // (lane parity with tryHostDispatchNamedWorkflow).
-  const uniqueWorkflow = acceptedSourceIsWorkflowInternal(sessionId, sourceUserSeq) ? null : uniqueWorkflowRunRequest(
-    objective,
-    priorAcceptedSourceTexts(sessionId, sourceUserSeq),
-  );
-  if (uniqueWorkflow) {
-    // OPEN-THE-GATES C2/C: a uniquely named workflow is invoked with
-    // workflow_run. plan_task here sent GLM into admission, then she
-    // workflow_get'd three times and invented a host-gate refusal
-    // (sess-desktop-ca4779, zero workflow_run calls).
-    return JSON.stringify({
-      ok: false,
-      code: 'plan_not_required',
-      detail: 'this accepted request uniquely names an existing workflow; call workflow_run with that exact name',
-      workflowName: uniqueWorkflow.name,
-      repair: `Call workflow_run with name "${uniqueWorkflow.name}". Do not plan_task. Do not workflow_get unless the user asked to inspect the definition.`,
-      recoveryTool: 'workflow_run',
-    });
-  }
+  // A submitted plan is optional user/model structure. Catalog similarity to
+  // a saved workflow cannot veto it or replace its accepted objective. The
+  // normal source, capability, topology and effect admission below decides.
   // Change 2: a check may refuse only if the missing fact is outside the
   // host. Two connected Outlook mailboxes is that fact. tool_search already
   // returned the matching write with account_selection_required; admitting
@@ -1398,6 +1440,10 @@ async function executePlanTask(
   const accountBlockedWriteInDraft = accountSelection !== null;
   const lineage = collectConstructLineageCompleteness(input.draft);
   const lineageIssues = planLineageIssues(lineage);
+  // The ref is present but the model copied the wrong effect. This is an
+  // argument repair, not missing authority; rediscovery cannot change it.
+  const effectIssues = planCapabilityEffectIssues({ draft: input.draft, capabilities: completenessCapabilities });
+  if (effectIssues.length > 0) return planInputRefusal([...effectIssues, ...lineageIssues]);
   if (
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
     && draftHasWriteOperation
@@ -1528,7 +1574,7 @@ async function executePlanTask(
         db,
         identity: requirePlanIdentity('graph persistence'),
         graphEvent,
-        objective,
+        objective: acceptedPlanExecutionObjective(sessionId, sourceUserSeq) ?? objective,
         operationIds,
         preamble,
         deliveryOwner,
@@ -1567,6 +1613,7 @@ async function executePlanTask(
       : recoveryTool === 'stop_factual'
         ? 'State factually that the current policy does not admit the requested effect. Do not retry planning or discovery.'
         : (verifierRepairInstruction(planned.reason)
+          ?? destinationMismatchRepair({ reason: planned.reason, draft: input.draft, capabilities: repairPlanning.capabilities })
           ?? undisclosedRefRepairInstruction(planned.reason, admissibleCapabilities.length)
           ?? dagKindMismatchRepairInstruction(planned.reason)
           ?? (admissibleCapabilities.length > 0
@@ -1691,10 +1738,17 @@ async function executePlanTask(
       cardinality: operation.cardinality,
     })),
     next: writeDeferredForValidation
-      ? 'This is a read/gather stage for a request that will also write. Invoke each plan-selected read through work_call with proposal:null and its exact requirement_id, then present what you found and ask the user to validate before the write. The write is a SEPARATE step you plan after they say go — do NOT claim the task is done.'
+      ? 'This is a read/gather stage for a request that will also write. Invoke each plan-selected read through work_call with its exact requirement_id (this call has no proposal field), then present what you found and ask the user to validate before the write. The write is a SEPARATE step you plan after they say go — do NOT claim the task is done.'
       : bindingSeal.unverifiedMutations.length > 0
-      ? 'Invoke each plan-selected operation through work_call with proposal:null and its exact requirement_id. After a write, if the host could not read it back, tell the user you wrote and could not confirm — never claim done.'
-      : 'Use tool_search as needed, then invoke each plan-selected local read or business operation through work_call with proposal:null and its exact requirement_id.',
+      ? 'Invoke each plan-selected operation through work_call with its exact requirement_id; this call has no proposal field. After a write, if the host could not read it back, tell the user you wrote and could not confirm — never claim done.'
+      // Operation SELECTION is frozen by the graph that just persisted; only
+      // arguments and schemas remain open. The old wording ("Use tool_search as
+      // needed, then invoke…") read as an invitation to keep shopping for a
+      // better operation. Live C13 source 136121 did exactly that: after the
+      // plan froze workflow_create, two later searches ranked workflow_update
+      // first, every attempt to use it returned unsupported_unmaterialized, and
+      // the turn spent its remaining calls there instead of reporting the problem.
+      : 'Operation selection is now FROZEN by this plan. Invoke each plan-selected local read or business operation through work_call with its exact requirement_id; this call has no proposal field. Use tool_search only to fill in arguments or schemas for those exact operations — a different capabilityRef cannot be substituted into this plan, and searching for one will not materialize it. If a plan-selected operation cannot do what the request needs, say so plainly instead of searching for a replacement.',
     ...(writeDeferredForValidation ? { writeDeferred: true } : {}),
     ...(bindingSeal.unverifiedMutations.length > 0
       ? { unverifiedMutations: bindingSeal.unverifiedMutations }
@@ -1705,20 +1759,24 @@ async function executePlanTask(
 export function buildPlanTaskTool(input: {
   planning: HostFreshPlanningContextV1;
 }): Tool<RuntimeContextValue> {
+  const reviewedExecution = acceptedPlanExecution(input.planning.identity.sessionId, input.planning.identity.sourceUserSeq);
   // The description below re-renders the planning card, which grows with
   // same-source disclosures across re-primes (including a crash-resume). It
   // is turn state the model reads, not the callable contract, so the shipped
   // schema fingerprint covers name + parameters only (capability-envelope.ts).
   return Object.assign(tool({
     name: 'plan_task',
-    description: [
+    description: reviewedExecution
+      ? 'Activate the exact reviewed revision selected by the user. Call with {} once before its business operations. The host loads its frozen draft unchanged, validates current capabilities, and starts durable tracking. This grants no tool or send approval; each call keeps its existing consent checks.'
+      : [
       'Admit and freeze one action plan or exact reviewed Clementine-local read plan for the current accepted request inside this foreground model loop.',
-      'Reads never need a plan: run any disclosed read through work_call first and look at the data. Call this tool for the write, or for a multi-operation action, once the data is in hand. Resolve any missing exact capability refs with tool_search first. Then call this tool first in its tool-call frame. It may stand alone, or it may be followed by exactly one proposal-free work_call for a dependency-root read/compute operation declared in this draft. No write, admin, unknown, dependent, or additional sibling is allowed. Include the brief user-facing preamble in this call.',
-      'This is a host-only control: it performs no provider/business I/O and grants no approval. After success, every work_call must pass proposal:null.',
+      'Use this tool for an explicitly requested execution graph or coordinated business operations that need dependency or per-member tracking. In Normal mode, contextual reads, one authorized reversible write, and ordinary readback can run directly: their order alone does not require a plan. Follow each disclosed carrier example; a direct work_call uses its exact currently disclosed executable capabilityRef. Each call still passes the existing tool-edge consent and effect checks. Resolve missing exact capability refs with tool_search.',
+      'When using plan_task, call it first in its tool-call frame. It may stand alone, or it may be followed by exactly one proposal-free work_call for a dependency-root read/compute operation declared in this draft. That frame cannot include a write, admin, unknown, dependent, or additional sibling call. Include the brief user-facing preamble in this call.',
+      'This is a host-only control: it performs no provider/business I/O and grants no approval. After success, every work_call binds its exact requirement_id; that call has no proposal field.',
       'Use topology as the sole operation DAG. Put capabilityRef/role/evidence annotations in bindings; do not copy effects or dependencies into bindings. coverage is required for reads and null for non-reads. dependsOn means ORDER only. When a later operation consumes prior result bytes, also name its exact immediate source in dataFrom; for example read_source once with dataFrom:[], then write_once with dependsOn:["read_source"] and dataFrom:["read_source"]. Use cardinality each only for genuine per-member work; a counted collection written once stays once.',
-      `Exact host planning catalog: ${planningCatalogText(input.planning.capabilities)}`,
+      `Planning capabilities disclosed for this request: ${planningCatalogText(input.planning.capabilities)}`,
     ].join(' '),
-    parameters: PlanTaskSdkSchema,
+    parameters: reviewedExecution ? { type: 'object', properties: {}, required: [], additionalProperties: false } : PlanTaskSdkSchema,
     // A plan can only be admitted against a capability the host DISCLOSED, so
     // an actually empty live catalog keeps this door absent. Foreground
     // tool_search may disclose an exact ref later in the same agent run. The
@@ -1734,7 +1792,8 @@ export function buildPlanTaskTool(input: {
       );
     },
     execute: async (args) => {
-      const parsed = PlanTaskInputSchema.safeParse(args);
+      const selected = acceptedPlanExecution(input.planning.identity.sessionId, input.planning.identity.sourceUserSeq);
+      const parsed = PlanTaskInputSchema.safeParse(selected ? { preamble: 'I am executing the reviewed plan with durable progress tracking.', draft: selected.artifact.structuredPlan?.executionDraft } : args);
       const planning = snapshotPrimaryModelPlanningContext(input.planning.authority);
       if (!parsed.success) return planInputRefusal([
         ...planSchemaIssues(parsed.error.issues),

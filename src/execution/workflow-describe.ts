@@ -103,7 +103,7 @@ export function describeInputs(def: WorkflowDefinition): string {
     .map(([key, meta]) => {
       const dflt = meta?.default?.trim();
       if (dflt) return `${key} (defaults to "${dflt}")`;
-      return `${key} (required)`;
+      return `${key} (${meta?.required === false ? 'optional' : 'required'})`;
     })
     .join(', ');
 }

@@ -213,7 +213,12 @@ export interface DeliveryVerdict {
   /** The KIND of blocker, for routing/triage (only set when delivered:false). */
   blockerType?: BlockerType;
   /** Present when a completion was accepted through degraded verification. */
-  verification?: { failedOpen?: boolean; selfJudge?: boolean };
+  verification?: {
+    failedOpen?: boolean; selfJudge?: boolean;
+    /** Selection provenance travels with the tag: a deliberately chosen
+     *  same-provider review must not read as an unselected fallback. */
+    ownerSelectedJudge?: boolean;
+  };
 }
 
 export interface VerifyDeliveredOpts {
@@ -316,7 +321,10 @@ export async function verifyDelivered(
   }
   if (verdict.done) {
     const accepted = verdict.failedOpen || verdict.selfJudge
-      ? { ...DELIVERED, verification: { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge } }
+      ? { ...DELIVERED, verification: {
+          failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge,
+          ...(verdict.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
+        } }
       : DELIVERED;
     return maybeRefute(objective, text, opts, accepted);
   }

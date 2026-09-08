@@ -73,6 +73,18 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
   // for a second search).
   'file_query',
   'tool_output_query',
+  // Prior CONVERSATIONS are the same recall class as a landed tool result, and
+  // were the one member of it that still cost a discovery round. Live C11
+  // sources 135212/135311: asked to find an earlier conversation by topic, Clem
+  // worked through the recall tools she could actually see — memory_recall_all
+  // 5x then 7x, recall_tool_result, file_query — and never reached
+  // session_search, because it was not on this surface. Read-only review of all
+  // 23 model requests across those sources found no first-class session_search
+  // schema. She was not choosing badly; the instrument was invisible.
+  // Registry tier promotion does NOT reach this set — host_v1 assembly consumes
+  // this list directly (tool-catalog.ts:189), which is why the earlier
+  // tier:'core' change was inert.
+  'session_search',
   'tool_search',
 ]);
 
@@ -223,16 +235,40 @@ function entryText(e: CatalogEntry): string {
 /** Deterministic lexical fallback when embeddings are off/unhealthy: token overlap
  *  between the query and the tool's name+one-liner. Keeps tool_search useful (and
  *  its tests hermetic) without a live embedding endpoint. */
-function lexicalScore(queryTokens: string[], e: CatalogEntry): number {
-  if (queryTokens.length === 0) return 0;
-  const hay = entryText(e).toLowerCase();
+function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: ReadonlyMap<string, number>): {
+  score: number;
+  fullLexicalCoverage: boolean;
+  completeCompoundNameMatch: boolean;
+} {
+  if (queryTokens.length === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  const descriptionTokens = new Set(e.oneLiner.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
   const nameTokens = new Set(e.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
-  let hits = 0;
+  let covered = 0;
+  let nameHits = 0;
+  let queryWeight = 0;
   for (const q of queryTokens) {
-    if (nameTokens.has(q)) hits += 2; // a name-token match is worth more
-    else if (hay.includes(q)) hits += 1;
+    const weight = weights.get(q) ?? 0;
+    queryWeight += weight;
+    if (nameTokens.has(q)) nameHits += weight;
+    if (nameTokens.has(q) || descriptionTokens.has(q)) covered += weight;
   }
-  return hits / (queryTokens.length * 2);
+  if (queryWeight === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  // Coverage rewards the requested concepts; Dice similarity also accounts
+  // for unrequested operation qualifiers. Merely adding more name tokens must
+  // not make every reply/forward variant beat the matching base operation.
+  const nameWeight = [...nameTokens].reduce((total, token) => total + (weights.get(token) ?? 0), 0);
+  const nameSimilarity = 2 * nameHits / (queryWeight + nameWeight);
+  return {
+    score: (covered / queryWeight + nameSimilarity) / 2,
+    // A compound operation identifier explicitly present in ordinary word
+    // order is stronger lexical evidence than incidental description words.
+    // A single generic token (including a repeated-token name) is insufficient.
+    completeCompoundNameMatch: nameTokens.size > 1
+      && [...nameTokens].every((token) => queryTokens.includes(token)),
+    // Within each name-match class, prefer full coverage over a partial-name bonus.
+    // Neither key is execution authority or proof of semantic suitability.
+    fullLexicalCoverage: covered === queryWeight,
+  };
 }
 
 /**
@@ -269,13 +305,35 @@ export function rankCatalogLexically(
   query: string,
   opts: { allowedNames?: ReadonlySet<string> } = {},
 ): RankedCatalogEntry[] {
-  const entries = catalogEntries(opts);
+  return rankCatalogEntriesLexically(query, catalogEntries(opts));
+}
+
+/** One relevance scale for native and discovered catalog metadata. Source-local
+ * rank positions are not comparable scores: the best unrelated provider hit
+ * must not beat a matching native operation merely by heading its own list. */
+export function rankCatalogEntriesLexically<T extends CatalogEntry>(
+  query: string,
+  entries: readonly T[],
+): Array<T & { score: number; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean }> {
   const q = (query ?? '').trim();
-  if (!q) return entries.map((entry) => ({ ...entry, score: 0 }));
-  const queryTokens = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false }));
+  const queryTokens = [...new Set(q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))];
+  // Learn informativeness from this same candidate corpus. Common connecting
+  // words and generic verbs cannot outweigh a rare requested object/property;
+  // no curated stop-word list, provider boost, or product-name alias is needed.
+  const documents = new Map<string, number>();
+  for (const entry of entries) {
+    const tokens = new Set(`${entry.name} ${entry.oneLiner}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    for (const token of tokens) documents.set(token, (documents.get(token) ?? 0) + 1);
+  }
+  const weights = new Map([...documents].map(([token, count]) => [
+    token, Math.log(1 + (entries.length - count + 0.5) / (count + 0.5)),
+  ]));
   return entries
-    .map((entry) => ({ ...entry, score: lexicalScore(queryTokens, entry) }))
-    .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
+    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, entry, weights) }))
+    .sort((left, right) => Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+      || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
+      || right.score - left.score || left.name.localeCompare(right.name));
 }
 
 async function semanticScores(query: string, entries: CatalogEntry[]): Promise<Map<string, number> | null> {

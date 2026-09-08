@@ -261,7 +261,13 @@ test('JIT core surface: mandated members present, JIT-able tools absent', () => 
   // always-loaded CORE must keep the tools whose JIT-pruning caused a live incident,
   // and must NOT swallow the intent-evident JIT-able tools (which retrieval brings back).
   const core = asSet(TOOL_JIT_MANDATED);
-  for (const n of ['focus_get', 'focus_set', 'focus_update', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
+  // session_search joined CORE after live C10 source 135118: asked to find a prior
+  // conversation by marker, Clem made ZERO tool calls and replied that looking up
+  // another session "would mean a provider call". The native local search existed,
+  // was indexed and warm, but sat at tier 'discoverable' — reachable only through a
+  // tool_search she had no reason to run, because she believed the capability was
+  // remote. Finding earlier sessions is a North Star faculty, not a niche intent.
+  for (const n of ['focus_get', 'focus_set', 'focus_update', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'session_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
     assert.ok(core.has(n), `JIT core must include mandated ${n}`);
   }
   // These are intent-evident / discoverable — they must stay JIT-able, not core.
@@ -309,6 +315,7 @@ test('workerBlockedToolNames (F1 + collision/commit vectors) == deriveWorkerBloc
     // A check-in speaks into the conversation; a worker has none, so its note
     // would land in the parent's thread without the parent's judgement.
     'check_in',
+    'publish_plan',
     'run_batch',
     'request_approval',
     'pending_action_queue',

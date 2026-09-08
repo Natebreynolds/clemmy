@@ -18,6 +18,7 @@
  *   wins regardless of how many events fired during the debounce.
  */
 import type { Message } from 'discord.js';
+import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { actionBus } from '../runtime/action-bus.js';
@@ -4620,7 +4621,7 @@ export async function runDiscordHarnessConversation(opts: {
           input: effectiveInput,
           sourceUserSeq: acceptedUserInput.seq,
           runAttemptId: activeRun.attemptId,
-          judgeCompletion: true,
+          judgeCompletion: completionReviewEnabled(),
           onConversationPreamble,
           onChunk,
           reuseRecordedUserInput: true,

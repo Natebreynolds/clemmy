@@ -6,7 +6,10 @@
  */
 export function stripInlineMarkdown(text: string): string {
   if (!text) return '';
-  let out = text;
+  // This exact transport prefix can survive in older focus summaries. It is
+  // presentation framing, not part of the owner's question. Leave quoted or
+  // mid-sentence occurrences intact and do not interpret it as task state.
+  let out = text.replace(/^\[clementine:awaiting-user-input:final\](?:\s+|$)/, '');
   // Fenced/inline code: keep the content, drop the ticks.
   out = out.replace(/```[a-z]*\n?/gi, '').replace(/`([^`]*)`/g, '$1');
   // Links/images: keep the human label, drop the URL.

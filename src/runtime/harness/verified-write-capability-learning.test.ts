@@ -169,10 +169,14 @@ test('local proof is revoked by current schema, envelope, effect, or account dri
 });
 
 test('current local identity enters the primary planning card with zero invocation, approval, or source replay', async () => {
+  const { observeCurrentLocalPlanningDefinition } = await import('./local-planning-capability.js');
+  const observed = await observeCurrentLocalPlanningDefinition({ name: 'space_save', carrier: 'work_call' });
+  assert.equal(observed.ok, true, observed.ok ? '' : observed.reason);
+  if (!observed.ok) throw new Error('the current Space registry definition could not be observed');
   indexed._setVerifiedWriteResolverForTests(async () => [{
-    record: localRecord,
+    record: { ...localRecord, localEnvelopeFingerprint: observed.definition.envelopeFingerprint },
     hostBinding: {} as CanonicalVerifiedWriteCapability['hostBinding'],
-    currentLocalDefinition: localDefinition,
+    currentLocalDefinition: observed.definition,
   }]);
   try {
     const session = eventlog.createSession({ id: 'verified-write-current-planning', kind: 'chat' });

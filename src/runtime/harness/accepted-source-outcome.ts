@@ -1,5 +1,6 @@
 import {
   listEvents,
+  openEventLog,
   type EventRow,
 } from './eventlog.js';
 import { verifiedWorkflowRunDispatchReceipts } from './loop.js';
@@ -67,4 +68,26 @@ export function acceptedSourceOutcome(source: EventRow): AcceptedSourceOutcome |
   // blocked. Only a proven absence reaches the dispatch lookup below.
   return exactTerminalForAcceptedSource(source)
     ?? exactDispatchForAcceptedSource(source);
+}
+
+/** The boot sweeper must distinguish dead foreground executors from logical
+ * sources already handed to a durable workflow owner. Only complete existing
+ * cross-store dispatch authority preserves an unfinished row; neither a NULL
+ * lease nor an event's unverified claim is sufficient. This grants no new call. */
+export function workflowOwnedUnfinishedAttemptIds(): string[] {
+  const candidates = openEventLog().prepare(`SELECT session_id, attempt_id, source_user_seq
+    FROM run_attempts WHERE finished_at IS NULL AND status = 'active'
+      AND source_user_seq IS NOT NULL`).all() as Array<{
+        session_id: string; attempt_id: string; source_user_seq: number;
+      }>;
+  const preserved: string[] = [];
+  for (const candidate of candidates) {
+    const source = listEvents(candidate.session_id, {
+      types: ['user_input_received'], sinceSeq: candidate.source_user_seq - 1, limit: 1,
+    })[0];
+    if (source?.seq === candidate.source_user_seq && acceptedSourceOutcome(source)?.kind === 'dispatched') {
+      preserved.push(candidate.attempt_id);
+    }
+  }
+  return preserved;
 }

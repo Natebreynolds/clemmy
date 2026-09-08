@@ -1,3 +1,6 @@
+import { readLiveApprovalControl } from './live-approval-control.js';
+import type { PendingMessageStore } from './pending-request.js';
+import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode } from './task-mode.js';
 /**
  * ChatEngine — the framework-agnostic chat state machine.
  *
@@ -31,6 +34,7 @@ export interface ChatApi {
     sessionId: string | null;
     idempotencyKey: string;
     steerOnly?: boolean;
+    taskMode?: TaskMode;
   }): Promise<SendResult>;
   /** Full transcript load for opening an existing session. */
   loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string }>;
@@ -40,6 +44,7 @@ export interface ChatEngineOptions {
   transport: StreamTransport;
   api: ChatApi;
   sessionId?: string | null;
+  pendingStore?: PendingMessageStore;
   newIdempotencyKey?: () => string;
   now?: () => number;
   /** Stream timing overrides ride through to runChatStream (tests). */
@@ -67,7 +72,8 @@ function delegatedSourceSeqFromMessageId(id: string): number | null {
 }
 
 function sourceUserSeqOf(event: HarnessEvent): number | null {
-  const direct = event.data?.sourceUserSeq;
+  const artifact = event.data?.artifact;
+  const direct = event.data?.sourceUserSeq ?? (artifact && typeof artifact === 'object' ? (artifact as Record<string, unknown>).sourceUserSeq : undefined);
   if (typeof direct === 'number' && Number.isSafeInteger(direct) && direct > 0) return direct;
   const presentation = event.data?.presentation;
   if (!presentation || typeof presentation !== 'object' || Array.isArray(presentation)) return null;
@@ -99,6 +105,7 @@ function exactRunIds(value: unknown): string[] {
 export class ChatEngine {
   private readonly transport: StreamTransport;
   private readonly api: ChatApi;
+  private readonly pendingStore?: PendingMessageStore;
   private readonly newKey: () => string;
   private readonly now: () => number;
   private readonly streamTimings: Partial<Parameters<typeof runChatStream>[0]>;
@@ -124,6 +131,8 @@ export class ChatEngine {
   constructor(options: ChatEngineOptions) {
     this.transport = options.transport;
     this.api = options.api;
+    this.pendingStore = options.pendingStore;
+    this.messages = options.pendingStore?.load() ?? [];
     this.newKey = options.newIdempotencyKey ?? defaultIdempotencyKey;
     this.now = options.now ?? Date.now;
     this.streamTimings = options.streamTimings ?? {};
@@ -145,6 +154,7 @@ export class ChatEngine {
       // Derived rather than cleared at each of the several places busy drops,
       // so a stale key can never outlive the turn it belonged to.
       cancelKey: this.busy ? this.inFlightKey : null,
+      activeTaskMode: this.busy ? this.messages.find(message => message.id === this.activeAssistantId)?.taskMode : undefined,
     };
   }
 
@@ -195,7 +205,8 @@ export class ChatEngine {
     if (!this.sessionId) return;
     const { events, latestSeq } = await this.api.loadSession(this.sessionId);
     if (this.disposed) return;
-    this.messages = foldTranscript(events);
+    const unacknowledged = this.messages.filter(message => message.role === 'user' && message.pending);
+    this.messages = [...foldTranscript(events), ...unacknowledged];
     this.cursor = latestSeq;
     // A turn may still be in flight (user sent from another surface, or the
     // app was reopened mid-run): if the last user input has no terminal after
@@ -206,6 +217,8 @@ export class ChatEngine {
       this.activeSourceFloorSeq = inFlightSince;
       this.activeSourceUserSeq = inFlightSince + 1;
       this.ensureActiveAssistant();
+      const source = events.find(event => event.type === 'user_input_received' && event.seq === inFlightSince + 1);
+      this.updateActive(message => ({ ...message, taskMode: readTaskMode(source?.data?.taskMode) }));
       this.attachStream(inFlightSince);
     } else if (events.length > 0 || latestSeq > 0) {
       // Delegated work releases the composer, but its durable running card is
@@ -230,7 +243,11 @@ export class ChatEngine {
     this.emit();
   }
 
-  async send(text: string): Promise<void> {
+  async send(text: string, selectedMode?: TaskMode): Promise<void> {
+    const taskMode = snapshotTaskMode(selectedMode);
+    if (this.busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, this.snapshot().activeTaskMode))) {
+      throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
+    }
     const message = text.trim();
     if (!message) return;
     if (this.busy) {
@@ -243,6 +260,7 @@ export class ChatEngine {
         role: 'user',
         text: message,
         pending: 'sending',
+        requestSessionId: this.sessionId,
         steer: 'pending',
         idempotencyKey: this.newKey(),
       };
@@ -278,6 +296,8 @@ export class ChatEngine {
       role: 'user',
       text: message,
       pending: 'sending',
+      ...(taskMode ? { taskMode } : {}),
+      requestSessionId: this.sessionId,
       idempotencyKey,
     };
     const assistant: ChatMessage = {
@@ -285,6 +305,7 @@ export class ChatEngine {
       role: 'assistant',
       text: '',
       status: 'thinking',
+      ...(taskMode ? { taskMode, ...(taskMode.kind === 'plan' ? { progress: 'Investigating with read-only tools…' } : {}) } : {}),
       activity: [],
     };
     this.messages = [...this.messages, userMessage, assistant];
@@ -299,13 +320,29 @@ export class ChatEngine {
 
   async retry(messageId: string): Promise<void> {
     const failed = this.messages.find((m) => m.id === messageId && m.pending === 'failed');
-    if (!failed || !failed.idempotencyKey || this.busy) return;
+    if (!failed || !failed.idempotencyKey || (this.busy && !failed.steer)) return;
+    if (failed.steer) {
+      this.messages = this.messages.map(message => message.id === messageId ? { ...message, pending: 'sending' } : message);
+      this.emit();
+      try {
+        const result = await this.api.send({ message: failed.text, sessionId: failed.requestSessionId ?? this.sessionId,
+          idempotencyKey: failed.idempotencyKey, steerOnly: true, ...(failed.taskMode ? { taskMode: failed.taskMode } : {}) });
+        this.messages = this.messages.map(message => message.id === messageId
+          ? { ...message, pending: result.steered ? undefined : 'failed', steer: result.steered ? 'delivered' : 'failed' } : message);
+      } catch (error) {
+        this.messages = this.messages.map(message => message.id === messageId
+          ? { ...message, pending: 'failed', pendingError: error instanceof Error ? error.message : 'Steering was not confirmed.' } : message);
+      }
+      this.emit();
+      return;
+    }
     this.messages = this.messages.map((m) => (m.id === messageId ? { ...m, pending: 'sending', pendingError: undefined } : m));
     this.busy = true;
     this.inFlightKey = failed.idempotencyKey;
     this.activeSourceFloorSeq = this.cursor;
     this.activeSourceUserSeq = null;
     this.ensureActiveAssistant();
+    this.updateActive(message => ({ ...message, taskMode: failed.taskMode }));
     this.emit();
     await this.postWithRetry(failed, failed.text, failed.idempotencyKey);
   }
@@ -321,7 +358,10 @@ export class ChatEngine {
     const delays = [500, 1500, 3500];
     for (let attempt = 0; ; attempt += 1) {
       try {
-        const result = await this.api.send({ message, sessionId: this.sessionId, idempotencyKey });
+        const result = await this.api.send({ message, sessionId: userMessage.requestSessionId !== undefined ? userMessage.requestSessionId : this.sessionId, idempotencyKey,
+          ...(userMessage.taskMode ? { taskMode: userMessage.taskMode } : {}),
+          ...(userMessage.steer ? { steerOnly: true } : {}),
+        });
         if (this.disposed) return;
         this.messages = this.messages.map((m) => (m.id === userMessage.id
           ? { ...m, pending: undefined, pendingError: undefined }
@@ -507,6 +547,18 @@ export class ChatEngine {
     if (event.seq > this.cursor && (!event.sessionId || event.sessionId === this.sessionId)) {
       this.cursor = event.seq;
     }
+    if (readLiveApprovalControl(event)) {
+      if (event.sessionId && event.sessionId !== this.sessionId) return;
+      if (event.type === 'conversation_completed') {
+        const id = `control-ack-${event.seq}`;
+        if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
+          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        }];
+        this.emit();
+      }
+      // Keep the current work bubble, mode, busy state and Stop request intact.
+      return;
+    }
     switch (event.type) {
       case 'stream_token': {
         const delta = typeof d.delta === 'string' ? d.delta : '';
@@ -535,11 +587,11 @@ export class ChatEngine {
           this.activeSourceUserSeq = event.seq;
         }
         // Confirm the local echo; a foreign-surface send appends as its own row.
-        const pendingIndex = this.messages.findIndex((m) => m.role === 'user' && m.pending === 'sending' && m.text === text);
+        const pendingIndex = this.messages.findIndex((m) => m.role === 'user' && m.pending === 'sending' && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)));
         if (pendingIndex >= 0) {
           this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined } : m));
-        } else if (!this.messages.some((m) => m.role === 'user' && m.text === text && m.pending === undefined)) {
-          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text }];
+        } else if (!this.messages.some((m) => m.role === 'user' && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined)) {
+          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode) }];
         }
         break;
       }
@@ -568,6 +620,11 @@ export class ChatEngine {
         this.busy = false;
         break;
       }
+      case 'plan_revision_published': {
+        const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
+        if (ref && this.terminalOwnsActiveTurn(event)) this.updateActive(message => ({ ...message, planArtifactRef: ref }));
+        break;
+      }
       case 'conversation_completed': {
         const delegatedTargetId = sourceUserSeqOf(event) === null
           ? null
@@ -592,6 +649,7 @@ export class ChatEngine {
         this.updateActive((m) => ({
           ...m,
           ...presentation,
+          ...(readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ? { planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) } : {}),
           ...(planProposalId ? {
             planProposalId,
             planProposalStatus: statusRaw === 'approved' || statusRaw === 'rejected' ? statusRaw : 'pending',
@@ -721,6 +779,7 @@ export class ChatEngine {
   }
 
   private emit(): void {
+    this.pendingStore?.save(this.messages);
     if (this.disposed) return;
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
@@ -733,6 +792,7 @@ export class ChatEngine {
 export function inFlightTurnSince(events: readonly HarnessEvent[]): number | null {
   let lastUserSeq: number | null = null;
   for (const event of events) {
+    if (readLiveApprovalControl(event)) continue;
     if (event.type === 'user_input_received') {
       lastUserSeq = event.seq;
     } else if (lastUserSeq !== null && event.seq > lastUserSeq
@@ -767,13 +827,23 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
   const awaitingMessageIndexBySource = new Map<number, number>();
   const delegatedMessageIndexBySource = new Map<number, number>();
   let currentSourceUserSeq: number | null = null;
+  const taskModesBySource = new Map<number, TaskMode>();
+  const planRefsBySource = new Map<number, NonNullable<ChatMessage['planArtifactRef']>>();
   for (const event of events) {
     const d = (event.data ?? {}) as Record<string, unknown>;
+    if (readLiveApprovalControl(event)) {
+      if (event.type === 'conversation_completed' && !messages.some(message => message.id === `control-ack-${event.seq}`)) messages.push({
+        id: `control-ack-${event.seq}`, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+      });
+      continue;
+    }
     switch (event.type) {
       case 'user_input_received': {
         const text = typeof d.text === 'string' ? d.text.trim() : '';
-        if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text });
+        if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode) });
         currentSourceUserSeq = event.seq;
+        const mode = readTaskMode(d.taskMode);
+        if (mode) taskModesBySource.set(event.seq, mode);
         activity = [];
         opening = '';
         pendingAwaitingMessageIndex = null;
@@ -782,6 +852,12 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
       case 'conversation_preamble': {
         const text = typeof d.text === 'string' ? d.text.trim() : '';
         if (text) opening = text;
+        break;
+      }
+      case 'plan_revision_published': {
+        const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
+        const source = sourceUserSeqOf(event) ?? currentSourceUserSeq;
+        if (ref && source !== null) planRefsBySource.set(source, ref);
         break;
       }
       case 'conversation_completed': {
@@ -806,6 +882,8 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
           role: 'assistant',
           text: presentation.text,
           status: presentation.status,
+          taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
+          planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),
           ...(planProposalId ? {
             planProposalId,
             planProposalStatus: statusRaw === 'approved' || statusRaw === 'rejected' ? statusRaw : 'pending',

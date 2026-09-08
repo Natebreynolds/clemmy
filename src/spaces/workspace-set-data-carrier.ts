@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+import { withWorkspaceSnapshotMutation } from './workspace-snapshot.js';
 
 import { appendAudit } from './data-store.js';
 import {
   bootstrapWorkspaceObservationHistory,
   commitWorkspaceObservationBatch,
   getWorkspaceDatasetObservationByRefreshId,
+  getCurrentWorkspaceDatasetObservation,
   getWorkspaceObservationDocument,
   indexWorkspaceRecord,
   openWorkspaceDb,
@@ -28,6 +32,12 @@ import {
 } from './workspace-set-data-executor.js';
 
 const observationBootstrapChecks = new WeakMap<object, Set<string>>();
+
+export interface HostWorkspaceSetDataExecutionResult extends WorkspaceSetDataExecutionResult {
+  /** Whole-file proof captured at this commit edge; source identity/digest
+   * above remain unchanged and are never replaced by this file digest. */
+  hostFileCommit?: string;
+}
 
 function prepareObservationStore(rec: SpaceRecord): ReturnType<typeof openWorkspaceDb> {
   const db = openWorkspaceDb();
@@ -155,8 +165,10 @@ function createStoragePort(): {
 async function executeWithHostStorage(
   args: WorkspaceSetDataArguments | Record<string, unknown>,
   mode: 'manual' | 'content_addressed',
-): Promise<WorkspaceSetDataExecutionResult> {
+): Promise<HostWorkspaceSetDataExecutionResult> {
   const carrier = createStoragePort();
+  const prepared = prepareWorkspaceSetData(args);
+  const result = withWorkspaceSnapshotMutation(prepared.slug, () => {
   const result = executeWorkspaceSetDataWithStorage(args, carrier.storage, mode === 'manual'
     ? {
         mode,
@@ -169,6 +181,20 @@ async function executeWithHostStorage(
         cause: 'reviewed_local',
         provenance: { adapter: 'reviewed_local', initiatedBy: 'workflow_v3' },
       });
+  const current = getCurrentWorkspaceDatasetObservation(result.workspaceId, result.sourceId);
+  const document = JSON.parse(readFileSync(resolveInSpace(result.slug, 'data.json'), 'utf8')) as Record<string, unknown>;
+  // Replaying an old content-addressed observation must not mint a fresh file
+  // proof for some newer source generation. Its historical artifact remains
+  // available to reconciliation, but current delivery coverage is unresolved.
+  const sourceStillCurrent = current?.id === result.observationId
+    && Object.hasOwn(document, result.sourceId)
+    && workspaceDataContentDigest(document[result.sourceId]) === result.contentDigest;
+  const n = result.rows;
+  return { ...result, ...(sourceStillCurrent ? { hostFileCommit: withHostLocalWriteCommitFromFile({
+    createdId: result.slug, committedPath: resolveInSpace(result.slug, 'data.json'),
+    result: `Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${result.sourceId}" (${result.bytes} bytes, marked ${mode === 'manual' ? 'manual' : 'reviewed local'}). Observation ${result.observationId}; source digest ${result.contentDigest}. The open Workspace auto-refreshes.`,
+  }) } : {}) };
+  });
   const committed = carrier.committed();
   if (result.created && committed) {
     try {
@@ -188,13 +214,13 @@ async function executeWithHostStorage(
 
 export function executeManualWorkspaceSetData(
   args: WorkspaceSetDataArguments | Record<string, unknown>,
-): Promise<WorkspaceSetDataExecutionResult> {
+): Promise<HostWorkspaceSetDataExecutionResult> {
   return executeWithHostStorage(args, 'manual');
 }
 
 export function executeReviewedWorkspaceSetData(
   args: WorkspaceSetDataArguments | Record<string, unknown>,
-): Promise<WorkspaceSetDataExecutionResult> {
+): Promise<HostWorkspaceSetDataExecutionResult> {
   return executeWithHostStorage(args, 'content_addressed');
 }
 

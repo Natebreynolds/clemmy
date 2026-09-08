@@ -132,17 +132,29 @@ if ! (cd "$ROOT" && NODE_OPTIONS= node scripts/emit-implementation-artifacts.mjs
   echo "✗ implementation artifact emission failed; refusing to launch"
   exit 1
 fi
+# The sealed transport deliberately imports packaged dist modules. A source
+# daemon with no backend dist fails only on the first real write; stale dist can
+# silently mix releases. Use the normal clean, stable-source candidate build.
+echo "→ building packaged backend dependencies from current source"
+if ! (cd "$ROOT" && NODE_OPTIONS= npm run build); then
+  echo "✗ backend candidate build failed; refusing to launch"
+  exit 1
+fi
 EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
 if [[ ! "$EXPECTED_GIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
   echo "✗ could not resolve the candidate's full git SHA"; exit 2
 fi
 EXPECTED_GIT_DIRTY=false
 [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all 2>/dev/null)" ] && EXPECTED_GIT_DIRTY=true
-EXPECTED_RUNTIME_JSON="$(cd "$ROOT" && NODE_OPTIONS= node --import tsx --input-type=module --eval '
+EXPECTED_RUNTIME_JSON="$(cd "$ROOT" && EXPECTED_CLEMENTINE_BUILD_SHA="$EXPECTED_GIT_SHA" NODE_OPTIONS= node --import tsx --input-type=module --eval '
   import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
   import { HARNESS_SCHEMA_VERSION } from "./src/runtime/harness/schema-version.ts";
+  import { assertBuiltBackendReady } from "./scripts/lib/dev-backend-readiness.mjs";
+  const sourceFingerprint = fingerprintRuntimeSourceFromGit({ repoRoot: process.cwd() });
+  assertBuiltBackendReady({ repoRoot: process.cwd(), sourceFingerprint,
+    gitHead: process.env.EXPECTED_CLEMENTINE_BUILD_SHA, schemaVersion: HARNESS_SCHEMA_VERSION });
   console.log(JSON.stringify({
-    sourceFingerprint: fingerprintRuntimeSourceFromGit({ repoRoot: process.cwd() }),
+    sourceFingerprint,
     schemaVersion: HARNESS_SCHEMA_VERSION,
   }));
 ')"
@@ -158,7 +170,7 @@ if ! (cd "$ROOT" && NODE_OPTIONS= node scripts/emit-implementation-artifacts.mjs
   echo "✗ implementation artifacts changed or source moved during emission; refusing to launch"
   exit 1
 fi
-echo "✓ implementation artifacts match current source"
+echo "✓ backend dependencies load and implementation artifacts match current source"
 
 # The source daemon serves apps/mobile-web/dist verbatim. A source-only patch
 # otherwise leaves the phone on yesterday's ignored bundle, even though the
@@ -301,6 +313,7 @@ if ! (
   NODE_OPTIONS= node --import tsx --input-type=module --eval '
     import { WEBHOOK_HOST, WEBHOOK_PORT, WEBHOOK_SECRET } from "./src/config.ts";
     import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
+    import { assertBuiltBackendReady } from "./scripts/lib/dev-backend-readiness.mjs";
     void (async () => {
       if (!WEBHOOK_SECRET) throw new Error("WEBHOOK_SECRET unavailable");
       const expectedCutoverHold = process.env.EXPECTED_CUTOVER_HOLD === "on";
@@ -324,6 +337,9 @@ if ! (
       const expectedFingerprint = process.env.EXPECTED_CLEMENTINE_SOURCE_FINGERPRINT;
       const expectedSchema = Number(process.env.EXPECTED_CLEMENTINE_SCHEMA_VERSION);
       const currentFingerprint = fingerprintRuntimeSourceFromGit({ repoRoot: process.env.EXPECTED_CLEMENTINE_ROOT });
+      assertBuiltBackendReady({ repoRoot: process.env.EXPECTED_CLEMENTINE_ROOT,
+        sourceFingerprint: expectedFingerprint, gitHead: process.env.EXPECTED_CLEMENTINE_SHA,
+        schemaVersion: expectedSchema, probeImports: false });
       const errors = [
         response.status === 200 ? null : `HTTP ${response.status}`,
         build?.entry === expectedEntry ? null : `entry=${String(build?.entry)}`,

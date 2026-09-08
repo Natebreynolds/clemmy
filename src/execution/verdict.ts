@@ -39,6 +39,13 @@ export interface RecordedVerdict {
   failedOpen?: boolean | undefined;
   /** Verdict came from the brain's own model family (tagged lower-confidence). */
   selfJudge?: boolean | undefined;
+  /** Which model ACTUALLY ruled, and — when a stand-in ran instead of the judge
+   *  the owner pinned — what was requested and why. Recorded so a substitute
+   *  verdict can never be read afterwards as the pinned model's qualification. */
+  judgeModelId?: string | undefined;
+  substituteForExactPin?: boolean | undefined;
+  requestedJudgeModelId?: string | undefined;
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | undefined;
   /** Per-criterion scorecard where the door has one (goal validation). */
   criteriaMet?: number | undefined;
   criteriaTotal?: number | undefined;
@@ -67,6 +74,14 @@ export function recordVerdictEvent(
         ...(verdict.reason ? { reason: verdict.reason.slice(0, 400) } : {}),
         ...(verdict.failedOpen !== undefined ? { failedOpen: verdict.failedOpen } : {}),
         ...(verdict.selfJudge !== undefined ? { selfJudge: verdict.selfJudge } : {}),
+        // Who ACTUALLY ruled, and what was asked for. A durable row that omits
+        // this cannot distinguish the owner's pinned judge from a cheaper
+        // stand-in after the fact, which is how a substitute verdict gets read
+        // as qualification of a model that never ran.
+        ...(verdict.judgeModelId ? { judgeModelId: verdict.judgeModelId } : {}),
+        ...(verdict.substituteForExactPin ? { substituteForExactPin: true } : {}),
+        ...(verdict.requestedJudgeModelId ? { requestedJudgeModelId: verdict.requestedJudgeModelId } : {}),
+        ...(verdict.substituteReason ? { substituteReason: verdict.substituteReason } : {}),
         ...(verdict.criteriaMet !== undefined ? { criteriaMet: verdict.criteriaMet } : {}),
         ...(verdict.criteriaTotal !== undefined ? { criteriaTotal: verdict.criteriaTotal } : {}),
         ...(verdict.detail ? { detail: verdict.detail } : {}),

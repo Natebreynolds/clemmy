@@ -137,20 +137,30 @@ test('held parent and migration child have exact minimal runtime import closures
       // Pure leaf (only a `type` import of better-sqlite3): the v72 async-read
       // refinement schema module rides along with eventlog-schema's migration list.
       'src/runtime/harness/async-read-refinement-schema.ts',
+      'src/runtime/harness/discovery-request-identity.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',
+      'src/runtime/harness/session-history-search-schema.ts',
       'src/runtime/security.ts',
       'src/runtime/source-fingerprint.ts',
+      'src/shared/closed-canonical-json.ts',
     ],
     packages: ['better-sqlite3'],
   });
   assert.deepEqual(runtimeImportClosure('src/runtime/harness/eventlog-schema.ts'), {
     modules: [
       'src/runtime/harness/async-read-refinement-schema.ts',
+      // Pure, IO-free leaves the v79/v80 migrations need: the session-history
+      // search DDL, the discovery-request digest, and the shared canonical
+      // encoder underneath it. They ride along with eventlog-schema's migration
+      // list exactly as the v72 module above does.
+      'src/runtime/harness/discovery-request-identity.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',
+      'src/runtime/harness/session-history-search-schema.ts',
+      'src/shared/closed-canonical-json.ts',
     ],
     packages: ['better-sqlite3'],
   });

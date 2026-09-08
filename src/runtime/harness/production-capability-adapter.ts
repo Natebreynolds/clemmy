@@ -118,6 +118,7 @@ export function liveLocalRegistryIdentity(operationId: string): LiveCapabilityOb
       description: decl.description ?? '',
       sideEffect: decl.sideEffect,
       projectEffect: 'projectEffect' in decl ? decl.projectEffect : null,
+      ...(decl.localPlanningRead === true ? { localPlanningRead: true } : {}),
       inputSchema: 'inputSchema' in decl ? decl.inputSchema ?? null : null,
       outputSchema: 'outputSchema' in decl ? decl.outputSchema ?? null : null,
     })),

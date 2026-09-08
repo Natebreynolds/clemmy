@@ -192,7 +192,7 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   );
   const searchOutput = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'space_save', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'space_save', role_key: null, limit: 8, account_selection: null }),
   );
   const searchBody = JSON.parse(String(searchOutput)) as {
     results: Array<{ name: string; capabilityRef?: string }>;
@@ -652,7 +652,7 @@ test('accepted space_edit_view snapshots V1, commits and indexes V2 once, and te
   );
   const searchOutput = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'space_edit_view', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'space_edit_view', role_key: null, limit: 8, account_selection: null }),
   );
   const searchBody = JSON.parse(String(searchOutput)) as {
     results: Array<{ name: string; capabilityRef?: string }>;
@@ -919,7 +919,7 @@ test('accepted space_edit_runner commits exact runner bytes once and terminal re
   );
   const searchOutput = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'space_edit_runner', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'space_edit_runner', role_key: null, limit: 8, account_selection: null }),
   );
   const searchBody = JSON.parse(String(searchOutput)) as {
     results: Array<{ name: string; capabilityRef?: string }>;
@@ -1168,7 +1168,7 @@ test('search -> plan -> work_call reaches workflow_create once with provider-nat
   );
   const searchOutput = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'workflow_create', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'workflow_create', role_key: null, limit: 8, account_selection: null }),
   );
   const searchBody = JSON.parse(String(searchOutput)) as {
     results: Array<{ name: string; capabilityRef?: string; schema?: Record<string, unknown> }>;
@@ -1421,7 +1421,7 @@ test('accepted workflow_update commits reopened bytes once and frozen-work repla
   );
   const searchOutput = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'workflow_update', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'workflow_update', role_key: null, limit: 8, account_selection: null }),
   );
   const searchBody = JSON.parse(String(searchOutput)) as {
     results: Array<{ name: string; capabilityRef?: string }>;

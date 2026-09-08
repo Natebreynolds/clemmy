@@ -20,7 +20,6 @@ import { readFileSync } from 'node:fs';
 
 const CONTRACT = new URL('./plan-task-result-contract.ts', import.meta.url);
 const HOST = new URL('./host-turn-runner.ts', import.meta.url);
-const PLAN = new URL('../../tools/plan-tools.ts', import.meta.url);
 
 test('NEGATIVE: unique-run plan_not_required is a closed settled refusal', () => {
   const src = readFileSync(CONTRACT, 'utf8');
@@ -119,10 +118,25 @@ test('NEGATIVE: a completed step after unique-run nomination continues into work
   );
 });
 
-test('re-break (i): unique-run payload still carries workflowName + repair', () => {
-  const src = readFileSync(PLAN, 'utf8');
-  assert.match(src, /workflowName: uniqueWorkflow\.name/);
-  assert.match(src, /Call workflow_run with name "\$\{uniqueWorkflow\.name\}"/);
+test('retained unique-run payload preserves its exact name and repair without minting new routing authority', async () => {
+  // Current planning no longer nominates a workflow from prose similarity.
+  // Previously settled results must still reopen through the closed contract.
+  const { parseExactPlanTaskRefusal } = await import('./plan-task-result-contract.js');
+  const payload = {
+    ok: false, code: 'plan_not_required',
+    detail: 'The retained request named an existing workflow.',
+    workflowName: 'retained-review-workflow',
+    repair: 'Call workflow_run with name "retained-review-workflow".',
+  };
+  const retained = parseExactPlanTaskRefusal(JSON.parse(JSON.stringify(payload)));
+  assert.ok(retained);
+  assert.deepEqual(retained.payload, payload);
+  assert.equal(retained.disposition, 'settled_refusal');
+  assert.equal(retained.recoveryTool, null, 'a legacy payload grants no new structural routing authority');
+  assert.equal(retained.structural, false);
+  assert.equal(parseExactPlanTaskRefusal({ ...payload, extraAuthority: true }), null);
+  assert.equal(parseExactPlanTaskRefusal({ ...payload, workflowName: '' }), null);
+  assert.equal(parseExactPlanTaskRefusal({ ...payload, repair: '' }), null);
 });
 
 test('re-break (ii): host-turn-runner continues instead of completing', () => {

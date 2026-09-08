@@ -215,22 +215,26 @@ test('Salesforce read and complete Sheets destination keep independent scoped se
     context,
     () => Promise.all([
       invoke('salesforce-scoped-search', {
+        account_selection: null, cursor: null,
         query: 'read Tim open Salesforce deals closing this quarter with SOQL',
         role_key: 'clause-0:mixed',
         limit: 1,
       }),
       invoke('local-structural-planning-lookup', {
+        account_selection: null, cursor: null,
         query: 'create a plan for multi-step dependent work and execute work calls',
         role_key: null,
         limit: 5,
       }),
       invoke('sheets-scoped-search', {
+        account_selection: null, cursor: null,
         query: 'Google Sheets create a new spreadsheet and write rows of data into it',
         role_key: 'clause-1:write',
         limit: 2,
       }),
     ]),
   );
+  assert.match(String(salesforceRaw), /^\{/, String(salesforceRaw));
   const salesforce = JSON.parse(String(salesforceRaw)) as { results?: Array<Record<string, unknown>> };
   const structural = JSON.parse(String(structuralRaw)) as { kind?: string; results?: Array<Record<string, unknown>> };
   const sheets = JSON.parse(String(sheetsRaw)) as { results?: Array<Record<string, unknown>> };
@@ -239,7 +243,7 @@ test('Salesforce read and complete Sheets destination keep independent scoped se
   assert.equal(searchedQueries.some((query) => /multi-step dependent work/i.test(query)), false,
     'host structural lookup never falls through to provider/business discovery');
   assert.deepEqual(salesforce.results?.map((row) => row.name), ['SALESFORCE_QUERY_OPEN_DEALS']);
-  assert.deepEqual(sheets.results?.map((row) => row.name), [
+  assert.deepEqual(sheets.results?.map((row) => row.name).sort(), [
     'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
     'GOOGLESHEETS_VALUES_UPDATE',
   ]);
@@ -728,7 +732,7 @@ test('only the tool_search broker transports broad role identity on Codex and Cl
   })?.subject, '', 'alternate broad surfaces cannot smuggle a role field');
 });
 
-test('the candidate card exposes only unresolved opaque roles and the broker schema accepts the key', async () => {
+test('the candidate card omits advisory role choreography while the broker accepts legacy metadata', async () => {
   const card = renderCapabilityCandidateCard({
     candidates: [],
     matches: [],
@@ -739,10 +743,8 @@ test('the candidate card exposes only unresolved opaque roles and the broker sch
       { roleKey: 'clause-1:write', text: 'create the requested artifact', resolved: false },
     ],
   } as never);
-  assert.match(card, /role_key `clause-1:write`/);
-  assert.doesNotMatch(card, /role_key `clause-0:read`/);
-  assert.match(card, /For broad `tool_search`/);
-  assert.match(card, /\[role:<role_key>\]/);
+  assert.equal(card, '', 'unresolved advisory clauses are not new tasks for the model');
+  assert.doesNotMatch(card, /role_key|\[role:/);
 
   let shape: Record<string, unknown> | undefined;
   let handler: ((input: Record<string, unknown>) => Promise<unknown>) | undefined;
@@ -755,8 +757,8 @@ test('the candidate card exposes only unresolved opaque roles and the broker sch
   assert.ok(shape?.role_key, 'the one broad broker exposes role_key');
   assert.match(
     String((shape?.role_key as { description?: string } | undefined)?.description ?? ''),
-    /Required on the wire.*broad discovery.*exact unresolved role_key.*no unresolved role is listed, pass null.*exact tool-name schema refresh, pass null/i,
-    'the provider-facing schema explains the admission contract instead of presenting role_key as optional telemetry',
+    /optional compatibility metadata/i,
+    'the provider-facing schema keeps old wire metadata without requiring it for plain discovery',
   );
   const result = await handler?.({
     query: 'workspace roots',

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
+import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.js';
 
 /**
  * Durable discovery admission for one accepted user task.
@@ -64,6 +65,7 @@ export interface DiscoveryTaskKey {
 
 export interface DiscoveryTaskPolicy extends DiscoveryTaskKey {
   knownCapability: boolean;
+  claimKeyVersion: 'legacy' | 'exact_request_v1';
   /** True only after the exact accepted request's requirement projection was
    * durably registered. Legacy/workflow callers without that projection retain
    * the task-wide compatibility budget. */
@@ -162,6 +164,7 @@ export type DiscoveryAdmissionReason =
   /** A prior epoch was closed by new evidence; this epoch has its own budget. */
   | 'new_evidence_admitted'
   | 'task_not_initialized'
+  | 'request_identity_required'
   | 'role_required'
   | 'role_not_unresolved'
   | 'role_resolved'
@@ -237,6 +240,7 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
   admitted: false;
   reason:
     | 'task_not_initialized'
+    | 'request_identity_required'
     | 'role_required'
     | 'role_not_unresolved'
     | 'role_resolved'
@@ -248,6 +252,8 @@ export interface DiscoveryDeniedDecision extends DiscoveryDecisionBase {
 export type DiscoveryDecision = DiscoveryAdmittedDecision | DiscoveryDeniedDecision;
 
 export interface InitializeDiscoveryTaskInput extends DiscoveryTaskKey {
+  /** Frozen only when the source is first initialized; existing sources retain their replay policy. */
+  claimKeyVersion?: 'exact_request_v1';
   /**
    * True when capability resolution already identified the exact carrier/tool.
    * This is monotonic: once any lane proves the task known, a later lane cannot
@@ -296,6 +302,8 @@ export interface DiscoveryRoleInitialization {
 }
 
 export interface AdmitDiscoveryInput extends DiscoveryTaskKey {
+  /** Computed by the host from the complete exact discovery request, never copied from model metadata. */
+  requestDigest?: string;
   category: DiscoveryCategory;
   /** Stable physical provider/tool invocation identity. */
   callId: string;
@@ -413,6 +421,7 @@ export interface DiscoverySettlement {
 }
 
 interface RawTaskRow {
+  claim_key_version?: number;
   session_id: string;
   source_user_seq: number;
   known_capability: number;
@@ -555,6 +564,10 @@ function ensureSchema(db: Database.Database): void {
         ADD COLUMN current_epoch INTEGER NOT NULL DEFAULT 0
     `);
   }
+  if (!tableColumns(db, 'discovery_governor_tasks').has('claim_key_version')) {
+    db.exec('ALTER TABLE discovery_governor_tasks ADD COLUMN claim_key_version INTEGER NOT NULL DEFAULT 0 CHECK (claim_key_version IN (0, 1))');
+  }
+  db.exec(DISCOVERY_REQUEST_CALLS_SCHEMA_V1);
   migrateClaimKey(db);
   if (!tableColumns(db, 'discovery_governor_claims').has('timeout_continuation_used')) {
     db.exec(`
@@ -701,6 +714,7 @@ function rowToPolicy(row: RawTaskRow, roleSet: RawRoleSetRow | null = null): Dis
     sessionId: row.session_id,
     sourceUserSeq: row.source_user_seq,
     knownCapability,
+    claimKeyVersion: row.claim_key_version === 1 ? 'exact_request_v1' : 'legacy',
     roleScoped,
     roleCount: roleSet?.role_count ?? 0,
     unresolvedRoleCount,
@@ -1016,9 +1030,9 @@ export class DiscoveryGovernor {
       if (!prior) {
         db.prepare(`
           INSERT INTO discovery_governor_tasks
-            (session_id, source_user_seq, known_capability, initialized_at, updated_at)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(key.sessionId, key.sourceUserSeq, input.knownCapability ? 1 : 0, now, now);
+            (session_id, source_user_seq, known_capability, initialized_at, updated_at, claim_key_version)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(key.sessionId, key.sourceUserSeq, input.knownCapability ? 1 : 0, now, now, input.claimKeyVersion === 'exact_request_v1' ? 1 : 0);
       } else if (input.knownCapability && prior.known_capability === 0) {
         // Knowledge only tightens policy. A fallover can never reopen broad
         // discovery after another brain proved the exact capability.
@@ -1052,6 +1066,15 @@ export class DiscoveryGovernor {
    */
   initializeRoles(input: InitializeDiscoveryRolesInput): DiscoveryRoleInitialization {
     const key = taskKey(input);
+    const initialDb = this.databaseProvider();
+    ensureSchema(initialDb);
+    const initialTask = initialDb.prepare('SELECT * FROM discovery_governor_tasks WHERE session_id = ? AND source_user_seq = ?')
+      .get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined;
+    // New sources have exact request ownership. Advisory English clauses never
+    // become a mandatory discovery inventory or durable membership authority.
+    if (initialTask?.claim_key_version === 1) {
+      return { status: 'existing', policy: rowToPolicy(initialTask), roles: [] };
+    }
     // Absence is not an all-resolved projection. If candidate resolution was
     // unavailable or a mixed-version caller omitted requirements, retain the
     // legacy path instead of freezing an empty set that strands novel work.
@@ -1189,6 +1212,10 @@ export class DiscoveryGovernor {
     let roleAdvisory: string | undefined;
     const db = this.databaseProvider();
     ensureSchema(db);
+    // Rides with an admitted search; see repeatedDiscoveryAdvisory.
+    const repeatAdvisory = input.category === 'broad_discovery'
+      ? repeatedDiscoveryAdvisory(db, key)
+      : undefined;
     const decide = db.transaction((): DiscoveryDecision => {
       const rawPolicy = db.prepare(`
         SELECT * FROM discovery_governor_tasks
@@ -1210,12 +1237,40 @@ export class DiscoveryGovernor {
         });
       }
 
+      const exactRequests = policy.claimKeyVersion === 'exact_request_v1';
+      if (exactRequests) {
+        if (!input.requestDigest || !/^[a-f0-9]{64}$/.test(input.requestDigest)) {
+          return buildDecision({ key, category: input.category, subject, callId,
+            admitted: false, reason: 'request_identity_required', replay: false,
+            consumedBudget: false, policy, claim: null });
+        }
+        if (input.category === 'broad_discovery') subject = `request:${input.requestDigest}`;
+        // Preserve every admitted invocation even after a settled subject slot
+        // transfers to a continuation. Replaying old or changed bytes cannot
+        // acquire a second physical owner, including across epochs/restarts.
+        const priorCall = db.prepare(`SELECT 1 FROM discovery_governor_request_calls
+          WHERE session_id = ? AND source_user_seq = ? AND call_id = ?`)
+          .get(key.sessionId, key.sourceUserSeq, callId);
+        if (priorCall) {
+          return buildDecision({ key, category: input.category, subject, callId,
+            admitted: false, reason: 'same_call_replay', replay: true,
+            consumedBudget: false, policy, claim: null });
+        }
+      }
+      const rememberCall = (): void => {
+        if (!exactRequests) return;
+        db.prepare(`INSERT INTO discovery_governor_request_calls
+          (session_id, source_user_seq, call_id, category, request_digest, admitted_at)
+          VALUES (?, ?, ?, ?, ?, ?)` )
+          .run(key.sessionId, key.sourceUserSeq, callId, input.category, input.requestDigest!, new Date().toISOString());
+      };
+
       // The opaque fresh-plan marker proves WHICH configured broker object
       // issued the call; it never replaces WHAT unresolved requirement the
       // model selected. A role-scoped task therefore always validates and keys
       // the exact host-frozen role. Only a compatibility task with no durable
       // role projection may fall back to the single host marker.
-      if (input.category === 'broad_discovery' && !policy.roleScoped) {
+      if (!exactRequests && input.category === 'broad_discovery' && !policy.roleScoped) {
         subject = freshPlanCatalogDisclosure ? 'host:fresh_plan_catalog' : '';
       }
 
@@ -1224,7 +1279,7 @@ export class DiscoveryGovernor {
       // 2026-08-24, 30 turns hit this gate, 26 completed anyway, and the 86
       // refused calls had already been paid for. The subject still collapses to
       // a HOST-OWNED key so the claim ledger can never be keyed on model text.
-      if (input.category === 'broad_discovery' && policy.roleScoped) {
+      if (!exactRequests && input.category === 'broad_discovery' && policy.roleScoped) {
         const role = subject
           ? db.prepare(`
               SELECT * FROM discovery_governor_roles
@@ -1285,6 +1340,18 @@ export class DiscoveryGovernor {
           policy,
           claim: null,
         });
+      }
+
+      if (exactRequests) {
+        const pending = db.prepare(`SELECT * FROM discovery_governor_claims
+          WHERE session_id = ? AND source_user_seq = ? AND category = ?
+            AND subject = ? AND outcome = 'pending' ORDER BY epoch DESC LIMIT 1`)
+          .get(key.sessionId, key.sourceUserSeq, input.category, subject) as RawClaimRow | undefined;
+        if (pending) {
+          return buildDecision({ key, category: input.category, subject, callId,
+            admitted: false, reason: 'new_call_requires_retry_epoch', replay: true,
+            consumedBudget: false, policy, claim: rowToClaim(pending) });
+        }
       }
 
       const rawExisting = db.prepare(`
@@ -1364,7 +1431,7 @@ export class DiscoveryGovernor {
             consumedBudget: false,
             policy,
             claim: existing,
-            ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+            ...((roleAdvisory ?? repeatAdvisory) ? { advisory: [roleAdvisory, repeatAdvisory].filter(Boolean).join(' ') } : {}),
           });
         }
         const continuationAdmittedAt = new Date().toISOString();
@@ -1403,9 +1470,10 @@ export class DiscoveryGovernor {
             consumedBudget: false,
             policy,
             claim: continuationClaim,
-            ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+            ...((roleAdvisory ?? repeatAdvisory) ? { advisory: [roleAdvisory, repeatAdvisory].filter(Boolean).join(' ') } : {}),
           });
         }
+        rememberCall();
         return buildDecision({
           key,
           category: input.category,
@@ -1418,7 +1486,7 @@ export class DiscoveryGovernor {
           policy,
           claim: continuationClaim,
           priorOutcome: existing.outcome,
-          ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+          ...((roleAdvisory ?? repeatAdvisory) ? { advisory: [roleAdvisory, repeatAdvisory].filter(Boolean).join(' ') } : {}),
         });
       }
 
@@ -1457,9 +1525,10 @@ export class DiscoveryGovernor {
           consumedBudget: false,
           policy,
           claim,
-          ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+          ...((roleAdvisory ?? repeatAdvisory) ? { advisory: [roleAdvisory, repeatAdvisory].filter(Boolean).join(' ') } : {}),
         });
       }
+      rememberCall();
       return buildDecision({
         key,
         category: input.category,
@@ -1477,7 +1546,7 @@ export class DiscoveryGovernor {
         consumedBudget: true,
         policy,
         claim,
-        ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
+        ...((roleAdvisory ?? repeatAdvisory) ? { advisory: [roleAdvisory, repeatAdvisory].filter(Boolean).join(' ') } : {}),
       });
     });
     return decide.immediate();
@@ -1509,6 +1578,8 @@ export class DiscoveryGovernor {
     ensureSchema(db);
     if (
       input.category === 'broad_discovery'
+      && (db.prepare('SELECT claim_key_version FROM discovery_governor_tasks WHERE session_id = ? AND source_user_seq = ?')
+        .get(key.sessionId, key.sourceUserSeq) as RawTaskRow | undefined)?.claim_key_version !== 1
       && !rawRoleSet(db, key)
       && subject !== 'host:fresh_plan_catalog'
     ) subject = '';
@@ -1727,6 +1798,62 @@ export const HOST_UNSCOPED_DISCOVERY_SUBJECT = 'host:unscoped_role';
  * High enough that no observed real turn reaches it: the busiest measured turn
  * on the production home issued 43 discovery attempts.
  */
+
+/**
+ * DIMINISHING RETURNS — the brake the exact-request digest cannot be.
+ *
+ * `discoveryRequestDigest` is a sha256 of the exact arguments, and says so:
+ * "Exact read-request identity, never semantic intent". It stops a byte-identical
+ * repeat and nothing else, so ten differently-worded searches for one need are
+ * ten admissions. `MAX_TURN_DISCOVERY_ADMISSIONS` (120) is a runaway backstop,
+ * not a brake.
+ *
+ * Measured live 2026-09-07, one report-refresh turn: search #1 disclosed the
+ * correct dataset-returning capability and nine more searches followed.
+ * Search #7 repeated an actor-run capability already shown at #4.
+ * Fourteen model round-trips, 36s of
+ * real provider work in ~960s elapsed: 3.8% of the turn spent on the task.
+ *
+ * So meter NEW INFORMATION, not queries. When the previous broad discovery for
+ * this source added no identifier the source had not already been shown, the
+ * next one is told so, WITH the accumulated set. It is an advisory that rides
+ * with an admitted search, never a refusal: a denial here terminalizes the turn,
+ * and "search again" must never become a dead end.
+ */
+function repeatedDiscoveryAdvisory(db: Database.Database, key: DiscoveryTaskKey): string | undefined {
+  try {
+    const rows = db.prepare(`
+      SELECT data_json FROM events
+       WHERE session_id = ?
+         AND type = 'capability_discovered'
+         AND json_extract(data_json, '$.sourceUserSeq') = ?
+       ORDER BY seq
+    `).all(key.sessionId, key.sourceUserSeq) as Array<{ data_json: string }>;
+    if (rows.length < 2) return undefined;
+    const idsOf = (row: { data_json: string }): string[] => {
+      try {
+        const parsed = JSON.parse(row.data_json) as { capabilities?: Array<{ identifier?: unknown }> };
+        return (parsed.capabilities ?? [])
+          .map((entry) => (typeof entry.identifier === 'string' ? entry.identifier : ''))
+          .filter(Boolean);
+      } catch { return []; }
+    };
+    const seenBefore = new Set<string>();
+    for (const row of rows.slice(0, -1)) for (const id of idsOf(row)) seenBefore.add(id);
+    const latest = idsOf(rows[rows.length - 1]!);
+    if (latest.length === 0 || latest.some((id) => !seenBefore.has(id))) return undefined;
+    const everything = [...seenBefore, ...latest];
+    const shown = [...new Set(everything)];
+    return 'Your last search returned only capabilities you have already been shown. '
+      + `This task has surfaced ${shown.length}: ${shown.slice(0, 12).join(', ')}`
+      + `${shown.length > 12 ? ', …' : ''}. Searching again for the same need will not add to that set — `
+      + 'pick the one that fits and call it, or tell the user what is genuinely missing.';
+  } catch {
+    // An advisory must never be the reason discovery fails.
+    return undefined;
+  }
+}
+
 export const MAX_TURN_DISCOVERY_ADMISSIONS = 120;
 
 export function unresolvedDiscoveryRoleKeys(key: DiscoveryTaskKey): string[] {

@@ -6,7 +6,7 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildWorkCall } from '../tools/work-call.js';
 import { actionExpectedWorkCarrierRequired } from '../runtime/harness/action-expected-work-boundary.js';
-import { actionTopologyRoleFor } from '../tools/tool-registry.js';
+import { actionTopologyRoleFor, deriveWorkerBlocked } from '../tools/tool-registry.js';
 import { buildCompactToolCatalog } from './tool-catalog.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -129,21 +129,11 @@ function workerBlockedToolNames(): Set<string> {
   if (!_workerBlockedToolNames) {
     _workerBlockedToolNames = new Set<string>([
       ...WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
-      'notify_user',
-      // A check-in speaks into the CONVERSATION, and a worker has none — its
-      // note would land in the parent's thread without the parent's judgement
-      // about whether it was worth saying. The conversational parent owns what
-      // the user hears, same rule as notify_user above.
-      'check_in',
-      // A worker composes one exact mutation payload; only the conversational
-      // parent may aggregate, freeze, approve, and commit it. Keeping commit
-      // primitives off this surface makes the capability envelope agree with
-      // the central Composio gateway's workerScope refusal.
-      'run_batch',
-      'request_approval',
-      'pending_action_queue',
-      'pending_action_execute',
-      'pending_action_record_result',
+      // Parent publication/commit and user-collision tools are declared in the
+      // registry. Derive them here so new host controls (such as publish_plan)
+      // cannot drift from their worker restriction. Keep legacy unregistered
+      // workflow exclusions above until those callers are retired.
+      ...deriveWorkerBlocked(),
     ]);
   }
   return _workerBlockedToolNames;

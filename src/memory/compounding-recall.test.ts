@@ -6,7 +6,8 @@
  *  - Thread anchors: a follow-up phrase retrieves against the session's own
  *    last reply tokens (deterministic, no model call).
  *  - Answerability is CONSUMED: the primer's use-rule changes when recall is
- *    partial/insufficient and names memory_recall_all as one call away.
+ *    ambient candidates preserve evidence/date/scope without forcing another
+ *    broad retrieval when the requested fact is already present.
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -59,18 +60,21 @@ test('anchor tokens exclude stopwords, short tokens, and query-covered tokens', 
   assert.ok(anchors.includes('operations') || anchors.includes('quarterly'), JSON.stringify(anchors));
 });
 
-test('answerability is consumed: a thin recall ships the PARTIAL/INSUFFICIENT rule naming memory_recall_all', async () => {
-  rememberFact({ kind: 'project', content: 'Umbrella retro cadence is biweekly on Thursdays.' });
+test('ambient recall preserves usable evidence and asks targeted retrieval only for missing facts', async () => {
+  const fact = rememberFact({ kind: 'project', content: 'As of 2026-07-14, Umbrella retro cadence is biweekly on Thursdays.' });
   const primer = await buildUnifiedTurnPrimer({
     query: 'umbrella retro cadence',
-    surface: 'turn_memory_primer',
+    surface: 'automatic_primer',
     limit: 4,
     maxChars: 1_800,
   });
   assert.equal(primer.status, 'ok');
-  if (primer.answerability === 'supported') {
-    assert.match(primer.text ?? '', /Answer local-memory questions from a complete evidence-backed FACT/);
-  } else {
-    assert.match(primer.text ?? '', /memory_recall_all/, 'a non-supported primer names the one-call escalation');
-  }
+  assert.equal(primer.answerability, 'partial', 'ambient context does not certify an entire business task');
+  assert.ok(primer.text?.includes(`[ref fact:${fact.id}]`), 'the usable fact retains its exact reference');
+  assert.match(primer.text ?? '', /2026-07-14.*biweekly on Thursdays/);
+  assert.match(primer.text ?? '', /Use complete, applicable facts directly/);
+  assert.match(primer.text ?? '', /dated record does not establish facts for another date/i);
+  assert.match(primer.text ?? '', /targeted memory query when a requested fact is missing or its scope is uncertain/);
+  assert.doesNotMatch(primer.text ?? '', /call memory_recall_all \(one call\)/,
+    'thin ambient context is not an unconditional command to search all memory again');
 });

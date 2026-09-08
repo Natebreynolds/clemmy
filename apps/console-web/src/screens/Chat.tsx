@@ -203,7 +203,7 @@ export function Chat() {
         <CollaborativeWorkstate snapshot={cc.data?.focus} compact className="mb-5" />
 
         <RunningTasksDrawer className="mb-2" composerRef={composerRef} />
-        <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+        <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
 
         <QuickActions
           className="mt-4 items-center [&>div]:justify-center"
@@ -227,6 +227,10 @@ export function Chat() {
             <ChatBubble
               key={m.id}
               message={m}
+              sessionId={chat.sessionId.current ?? undefined}
+              executionBusy={chat.busy}
+              onExecutePlan={chat.executePlan}
+              onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
@@ -239,7 +243,7 @@ export function Chat() {
       <div className={cn('border-t border-border bg-canvas/80 backdrop-blur')}>
         <div className="mx-auto w-full max-w-3xl px-8 py-4">
           <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-          <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+          <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
         </div>
       </div>
     </div>

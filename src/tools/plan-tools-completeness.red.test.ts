@@ -65,7 +65,7 @@ async function discloseLocal(
   );
   const raw = await search.invoke(
     new RunContext({ sessionId: planning.identity.sessionId }),
-    JSON.stringify({ query: name, role_key: null, limit: 8 }),
+    JSON.stringify({ query: name, role_key: null, limit: 8, account_selection: null }),
   );
   const body = JSON.parse(String(raw)) as {
     results: Array<{
@@ -320,7 +320,7 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
         return {
           responseId: 'plan-completeness-response-2',
           output: [toolCall('plan-missing-write-search', 'tool_search', {
-            query: 'workflow_create', role_key: null, limit: 8,
+            query: 'workflow_create', role_key: null, limit: 8, account_selection: null,
           })],
         };
       }
@@ -594,6 +594,52 @@ function readOnlyFileDraftForContinuation(capabilityRef: string) {
     evidenceRequirements: ['tool_result', 'local_commit_receipt'],
   };
 }
+
+test('a disclosed native effect mismatch permits correcting the mistaken binding without granting authority', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'native-effect-mismatch', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Read my profile and create a manual workflow from it.' } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true);
+  if (!primed.ok) return;
+  const readRef = await discloseLocal(primed.planning, 'user_profile_read');
+  const writeRef = await discloseLocal(primed.planning, 'workflow_create');
+  const draft = readOnlyFileDraftForContinuation(readRef);
+  draft.bindings[1]!.capabilityRef = writeRef;
+  draft.topology.operations[1]!.effect = 'external_write';
+  const planTask = buildPlanTaskTool({ planning: primed.planning }) as unknown as {
+    invoke: (context: unknown, args: string) => Promise<unknown>;
+  };
+  const invoke = async (args: unknown) => JSON.parse(String(await brackets.withHarnessRunContext({
+    ...identity, counter: new brackets.ToolCallsCounter(4),
+  }, () => planTask.invoke(null, JSON.stringify(args)))));
+  const refusal = await invoke({ preamble: 'I will create the manual workflow.', draft });
+  assert.equal(refusal.code, 'plan_invalid_input');
+  assert.equal(refusal.recoveryTool, 'plan_task');
+  assert.match(refusal.detail, /operations\.1\.effect.*expected local_write, received external_write/);
+  assert.ok(refusal.detail.includes(writeRef));
+  assert.match(refusal.detail, /discover and bind the correct capability/);
+  assert.match(refusal.detail, /do not change a read into a write/);
+  assert.doesNotMatch(refusal.detail, /Keep the exact capabilityRef and correct the effect/);
+  assert.doesNotMatch(refusal.detail, /has not attested/);
+  assert.match(refusal.repairKey, /^[a-f0-9]{32}$/);
+  const independent = await invoke({ preamble: 'I will create the manual workflow.', draft: { ...draft, criteria: null } });
+  assert.match(independent.detail, /criteria/);
+  assert.match(independent.detail, /expected local_write/);
+  assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
+  assert.equal(eventlog.listEvents(session.id, { types: ['accepted_task_authority_armed', 'conversation_preamble'] }).length, 0);
+
+  // A fabricated ref remains a discovery failure; this repair never invents
+  // an effect or substitutes another capability for an unknown binding.
+  draft.bindings[1]!.capabilityRef = 'cap:local:missing_native:create';
+  const missing = await invoke({ preamble: 'I will create the manual workflow.', draft });
+  assert.equal(missing.code, 'plan_incomplete_missing_write');
+  assert.equal(missing.recoveryTool, 'tool_search');
+});
 
 test('real semantic admission refusals carry stable full-issue repair keys without arming work', async () => {
   eventlog.resetEventLog();

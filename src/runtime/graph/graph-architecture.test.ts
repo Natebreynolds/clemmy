@@ -39,6 +39,11 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
   'turn-graph-shadow.ts': [
     '../harness/eventlog.js',
     '../harness/task-continuity-runtime.js',
+    // Executing a reviewed plan must run THAT plan's text, not a re-reading of
+    // the user's "go ahead". This is a pure durable read (event log + plan
+    // artifact) on the same observation seam as eventlog above: it reports what
+    // the accepted plan said and decides nothing.
+    '../harness/accepted-plan-execution.js',
     '../../agents/proactivity-policy.js',
     './turn-graph-compiler.js',
     'node:perf_hooks',

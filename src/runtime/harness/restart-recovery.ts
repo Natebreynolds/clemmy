@@ -484,7 +484,18 @@ export function releaseRunInFlightAfterWorkflowTransfer(
     const sourceGroupId = workflowOriginSourceGroupId({ sessionId, sourceUserSeq });
     const active = readActiveWorkflowOriginGroup(sourceGroupId);
     if (!active || active.sealed.sourceGroupId !== sourceGroupId) return false;
-    return clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
+    const db = openEventLog();
+    return db.transaction(() => {
+      const cleared = clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
+      if (ownerAttemptId) {
+        // The workflow group owns execution now. Keep the logical attempt
+        // unfinished, but never advertise the departed HTTP executor's lease.
+        db.prepare(`UPDATE run_attempts SET lease_owner = NULL, lease_expires_at = NULL
+          WHERE session_id = ? AND attempt_id = ? AND source_user_seq = ?
+            AND finished_at IS NULL`).run(sessionId, ownerAttemptId, sourceUserSeq);
+      }
+      return cleared;
+    }).immediate();
   } catch {
     return false;
   }

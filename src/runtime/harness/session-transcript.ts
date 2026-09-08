@@ -30,7 +30,11 @@ import {
   validTypedCompletionPresentation,
 } from './public-presentation.js';
 
-export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
+export interface PriorTurn {
+  who: 'user' | 'assistant'; text: string; at: string;
+  /** Present only for explicit history retrieval, never inferred from turn numbers. */
+  identity?: { sessionId: string; sourceUserSeq: number | null; eventSeq: number };
+}
 
 export type RelevantPriorWorkStatusSource = 'typed_terminal' | 'run_attempt';
 export type RelevantPriorWorkMatchKind = 'exact' | 'semantic' | 'lexical';
@@ -320,6 +324,7 @@ export function pullRecentTurnsForSessions(
   sessionIds: string[],
   maxTurns: number,
   throughSeq?: number,
+  includeIdentity = false,
 ): PriorTurn[] {
   const turnLimit = Math.max(1, Math.trunc(maxTurns));
   const rows = uniqueSessionIds(sessionIds)
@@ -434,7 +439,8 @@ export function pullRecentTurnsForSessions(
     } else {
       orphanAssistants.push({
         order: row.seq,
-        turns: [{ who: 'assistant', text: completion, at: row.created_at }],
+        turns: [{ who: 'assistant', text: completion, at: row.created_at,
+          ...(includeIdentity ? { identity: { sessionId: row.session_id, sourceUserSeq: null, eventSeq: row.seq } } : {}) }],
       });
     }
   }
@@ -477,7 +483,8 @@ export function pullRecentTurnsForSessions(
     }
     orphanAssistants.push({
       order: row.seq,
-      turns: [{ who: 'assistant', text: question, at: row.created_at }],
+      turns: [{ who: 'assistant', text: question, at: row.created_at,
+        ...(includeIdentity ? { identity: { sessionId: row.session_id, sourceUserSeq: exactSeq, eventSeq: row.seq } } : {}) }],
     });
   }
 
@@ -486,14 +493,16 @@ export function pullRecentTurnsForSessions(
   for (const source of sources.values()) {
     const assistant = assistantBySource.get(source.key);
     const userTurn = source.userText
-      ? [{ who: 'user' as const, text: source.userText, at: source.row.created_at }]
+      ? [{ who: 'user' as const, text: source.userText, at: source.row.created_at,
+          ...(includeIdentity ? { identity: { sessionId: source.row.session_id, sourceUserSeq: source.row.seq, eventSeq: source.row.seq } } : {}) }]
       : [];
     if (assistant) {
       settled.push({
         order: source.row.seq,
         turns: [
           ...userTurn,
-          { who: 'assistant', text: assistant.text, at: assistant.at },
+          { who: 'assistant', text: assistant.text, at: assistant.at,
+            ...(includeIdentity ? { identity: { sessionId: source.row.session_id, sourceUserSeq: source.row.seq, eventSeq: assistant.seq } } : {}) },
         ],
       });
     } else if (userTurn.length > 0) {
@@ -1046,14 +1055,13 @@ export async function renderRelevantPriorWorkForModel(
   };
 }
 
-const TURN_TRIM = 800;
 // Cross-session continuation prefixes ride into EVERY turn's context on the
 // Claude SDK lane — bound them (they were the last unbounded context input).
 const CROSS_SESSION_PREFIX_MAX_CHARS = 2000;
 const CROSS_SESSION_PREFIXES_TOTAL_MAX_CHARS = 6000;
 const ASYNC_OUTCOME_REPORT_BACK_RE = /^\[(?:background task|workflow run) [^\]\n]+ (?:completed|failed|blocked|needs input|needs attention)\]/i;
 
-/** Render prior turns as USER:/YOU: lines (per-turn 800-char trim). The caller
+/** Render prior turns as USER:/YOU: lines without silently shortening a turn. The caller
  *  adds any header. Used by both the cross-session prefix and the brain history. */
 export function renderTranscriptTurns(turns: Array<{ who: 'user' | 'assistant'; text: string }>): string {
   return turns
@@ -1067,8 +1075,7 @@ export function renderTranscriptTurns(turns: Array<{ who: 'user' | 'assistant'; 
       const safeText = t.who === 'assistant' && looksLikeToolCallShape(t.text)
         ? '(took a tool action)'
         : t.text;
-      const trimmed = safeText.length > TURN_TRIM ? `${safeText.slice(0, TURN_TRIM)}…` : safeText;
-      return `  ${label}: ${trimmed}`;
+      return `  ${label}: ${safeText}`;
     })
     .join('\n');
 }
@@ -1255,4 +1262,46 @@ export function renderSessionHistoryForModel(
   }
 
   return '';
+}
+
+
+/** Lossless explicit retrieval for ONE named session. Prompt-context renderers
+ * may summarize windows, but the history tool must retain the exact public
+ * source/completion bytes and event identities. The caller pages this text;
+ * the elected transcript and its snapshot boundary never vary between pages. */
+export function exactSessionHistoryForTool(input: {
+  sessionId: string; throughSeq?: number; maxTurns?: number;
+}): { text: string; throughSeq: number | null; turns: number; earlierBeforeSeq: number | null } {
+  const db = openEventLog();
+  const harness = getHarnessSession(input.sessionId);
+  if (!harness) {
+    if (input.throughSeq !== undefined) return { text: '', throughSeq: input.throughSeq, turns: 0, earlierBeforeSeq: null };
+    const legacy = new SessionStore().get(input.sessionId);
+    const turns = input.maxTurns === undefined ? legacy.turns : legacy.turns.slice(-input.maxTurns);
+    return { text: turns.length ? `Recent transcript for ${input.sessionId}:\n${turns.map(turn => `${turn.role === 'user' ? 'User' : 'Assistant'}: ${turn.text}`).join('\n')}` : '',
+      throughSeq: null, turns: turns.length, earlierBeforeSeq: null };
+  }
+  const boundary = normalizeThroughSeq(input.throughSeq)
+    ?? (db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?').get(input.sessionId) as { seq: number }).seq;
+  if (boundary === 0) return { text: '', throughSeq: 0, turns: 0, earlierBeforeSeq: null };
+  const count = (db.prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ? AND seq <= ?')
+    .get(input.sessionId, boundary) as { count: number }).count;
+  const turns = pullRecentTurnsForSessions(db, [input.sessionId], Math.max(1, Math.min(input.maxTurns ?? count, count)), boundary, true);
+  const prefixes = db.prepare("SELECT seq, data_json FROM events WHERE session_id = ? AND type = 'cross_session_prefix' AND seq <= ? ORDER BY seq")
+    .all(input.sessionId, boundary) as Array<{ seq: number; data_json: string }>;
+  const prefixText = prefixes.flatMap(row => {
+    try {
+      const data = JSON.parse(row.data_json) as { text?: unknown };
+      return typeof data.text === 'string' ? [`Historical continuation context [event_seq=${row.seq}]:\n${data.text}`] : [];
+    } catch { return []; }
+  }).join('\n\n');
+  const actions = renderRecentActionsForSessions(db, [input.sessionId], Math.max(1, count), 'THIS conversation', boundary);
+  const text = [prefixText, actions, turns.length ? `Recent transcript for ${input.sessionId}:\n${turns.map(turn => (
+    `[session_id=${turn.identity!.sessionId} source_seq=${turn.identity!.sourceUserSeq ?? 'unpaired'} event_seq=${turn.identity!.eventSeq} at=${turn.at}]\n${turn.who === 'user' ? 'USER' : 'YOU'}: ${turn.text}`
+  )).join('\n\n')}` : ''].filter(Boolean).join('\n\n');
+  const earliest = Math.min(...turns.map(turn => turn.identity?.sourceUserSeq ?? turn.identity?.eventSeq ?? boundary));
+  const earlier = input.maxTurns !== undefined && Number.isFinite(earliest) && db.prepare(
+    "SELECT 1 FROM events WHERE session_id = ? AND seq < ? AND type = 'user_input_received' LIMIT 1",
+  ).get(input.sessionId, earliest) ? earliest - 1 : null;
+  return { text, throughSeq: boundary, turns: turns.length, earlierBeforeSeq: earlier };
 }

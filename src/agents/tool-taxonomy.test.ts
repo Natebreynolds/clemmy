@@ -73,6 +73,16 @@ test.after(() => {
 
 // ---------- classifyTool ----------
 
+test('classifyTool: only the trusted local publish_plan control is a local artifact write', () => {
+  for (const name of ['publish_plan', 'clementine-local__publish_plan', 'mcp__clementine__publish_plan']) {
+    assert.equal(classifyTool(name), 'write', name);
+  }
+  for (const name of ['foreign__publish_plan', 'mcp__foreign__publish_plan', 'cx_publish_plan', 'mcp__clementine__foreign__publish_plan']) {
+    assert.equal(classifyTool(name), 'send', name);
+  }
+  assert.equal(classifyTool('composio_execute_tool', { args: { tool_slug: 'PUBLISH_PLAN' } }), 'send');
+});
+
 test('classifyTool: explicit admin list wins', () => {
   for (const name of ['create_tool', 'delete_agent', 'plugin_install']) {
     assert.equal(classifyTool(name), 'admin', name);

@@ -16,7 +16,8 @@
  * The returned rows deliberately keep the legacy EventRow wire shape so the
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
-import type { EventRow } from './eventlog.js';
+import { getRunAttemptSourceUserEvent, listEvents, type EventRow } from './eventlog.js';
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import {
   parseNarratedEnvelope,
   publicReplyFromNarratedEnvelope,
@@ -38,6 +39,15 @@ import {
   SETTLED_READ_REUSE_LABEL,
 } from './settled-read-replay-semantics.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
+import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMode } from './task-mode.js';
+
+export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {
+  try { return value === undefined ? undefined : parsePlanRevisionRef(value); } catch { return undefined; }
+}
+
+export function publicTaskMode(value: unknown): TaskMode | undefined {
+  try { return parseTaskMode(value); } catch { return undefined; }
+}
 
 const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'turn_ended',
@@ -572,6 +582,8 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
       'terminalKey', 'verification', 'artifactVerification', 'artifactRunScopeId',
       'transport', 'maxTurns',
     ]),
+    ...(typedPresentation && publicPlanArtifactRef(data.planArtifactRef)
+      ? { planArtifactRef: publicPlanArtifactRef(data.planArtifactRef) } : {}),
     reply,
     // Compatibility for consumers that historically read summary first.
     summary: reply,
@@ -671,6 +683,39 @@ function publicToolEffect(data: Record<string, unknown>): string {
     : '';
 }
 
+export interface PublicLiveApprovalControl {
+  version: 1;
+  ownerAttemptId: string;
+  ownerSourceUserSeq: number;
+}
+
+/** Controls have their own acknowledgements while the original executor stays
+ * live. Publish only a relationship backed by the original attempt and exact
+ * accepted source; a copied terminal metadata field cannot claim ownership.
+ */
+function publicLiveApprovalControl(event: EventRow): PublicLiveApprovalControl | null {
+  if (event.type !== 'conversation_completed' && !event.data.liveApprovalControl) return null;
+  try {
+    let source = event;
+    if (event.type === 'conversation_completed') {
+      const presentation = validTypedCompletionPresentation(event.data, event.sessionId);
+      if (!presentation) return null;
+      const seq = presentation.identity.sourceUserSeq;
+      const accepted = listEvents(event.sessionId, { types: ['user_input_received'], sinceSeq: seq - 1, limit: 1 })[0];
+      if (!accepted || accepted.seq !== seq || accepted.seq >= event.seq) return null;
+      source = accepted;
+    }
+    if (!isLiveApprovalAcknowledgement(source)) return null;
+    const control = source.data.liveApprovalControl as PublicLiveApprovalControl;
+    const ownerSource = getRunAttemptSourceUserEvent({ sessionId: source.sessionId, attemptId: control.ownerAttemptId });
+    if (!ownerSource || ownerSource.seq !== control.ownerSourceUserSeq || ownerSource.id !== source.parentEventId) return null;
+    const claimed = event.data.liveApprovalControl as Partial<PublicLiveApprovalControl> | undefined;
+    if (claimed && (claimed.version !== control.version || claimed.ownerAttemptId !== control.ownerAttemptId
+      || claimed.ownerSourceUserSeq !== control.ownerSourceUserSeq)) return null;
+    return { version: 1, ownerAttemptId: control.ownerAttemptId, ownerSourceUserSeq: control.ownerSourceUserSeq };
+  } catch { return null; }
+}
+
 function projectData(event: EventRow): Record<string, unknown> | null {
   const data = event.data ?? {};
   switch (event.type) {
@@ -682,12 +727,34 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       return delta ? { delta, public: true } : null;
     }
     case 'user_input_received': {
+      const liveApprovalControl = publicLiveApprovalControl(event);
+      if (liveApprovalControl) {
+        return { text: publicUserInputText(data), synthetic: true, liveApprovalControl };
+      }
       if (data.synthetic === true) {
         if (data.source !== 'outcome') return null;
         return selected(data, ['synthetic', 'source', 'sourceId', 'sourceLabel', 'deliveryPhase']);
       }
       const input = publicUserInputText(data);
-      return input ? { text: input } : null;
+      const taskMode = publicTaskMode(data.taskMode);
+      return input ? { text: input, ...(taskMode ? { taskMode } : {}) } : null;
+    }
+    case 'plan_revision_published': {
+      const ref = publicPlanArtifactRef(data.planArtifactRef);
+      if (!ref || event.role !== 'host' || !event.parentEventId
+        || !Number.isSafeInteger(data.sourceUserSeq) || Number(data.sourceUserSeq) <= 0
+        || (data.readiness !== 'ready' && data.readiness !== 'needs_input')) return null;
+      return { planArtifactRef: ref, sourceUserSeq: data.sourceUserSeq, readiness: data.readiness };
+    }
+    case 'plan_execution_claimed': {
+      const claim = data.claim as Record<string, unknown> | undefined;
+      const ref = publicPlanArtifactRef(claim?.ref);
+      if (!claim || !ref || event.role !== 'host' || event.parentEventId !== claim.sourceEventId
+        || event.sessionId !== claim.sessionId || !Number.isSafeInteger(claim.sourceUserSeq)
+        || Number(claim.sourceUserSeq) <= 0 || typeof claim.executionRunId !== 'string'
+        || !claim.executionRunId || typeof claim.claimId !== 'string' || !claim.claimId) return null;
+      return { planArtifactRef: ref, sourceUserSeq: claim.sourceUserSeq,
+        executionRunId: claim.executionRunId, claimId: claim.claimId, executionReserved: true };
     }
     // Mid-run steering: the user's own words, shown in their own transcript —
     // same trust class as user_input_received. Delivery markers stay internal.
@@ -722,8 +789,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       if (!route || nodeCount <= 0) return null;
       return { route, fastPath, nodeCount };
     }
-    case 'conversation_completed':
-      return terminalData(data, event.sessionId);
+    case 'conversation_completed': {
+      const liveApprovalControl = publicLiveApprovalControl(event);
+      return { ...terminalData(data, event.sessionId), ...(liveApprovalControl ? { liveApprovalControl } : {}) };
+    }
     case 'conversation_preamble':
       // The dedicated eventlog CAS writer binds this event to its exact real
       // user source. Retain a small event-level floor here as well so a

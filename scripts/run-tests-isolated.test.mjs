@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -198,6 +198,40 @@ test('concurrently executed test files never share a home', () => {
     const homes = readFileSync(reportPath, 'utf8').split('\n').filter(Boolean);
     assert.equal(homes.length, 2, 'both fixture files ran');
     assert.notEqual(homes[0], homes[1], 'each test file process minted its own home');
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test('isolated runner preserves the selected Node runtime even when PATH offers another node', {
+  skip: process.platform === 'win32' ? 'POSIX shebang regression fixture' : false,
+}, () => {
+  const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-runner-node-identity-'));
+  const marker = path.join(fixtureDir, 'wrong-node-used');
+  const report = path.join(fixtureDir, 'runtime.json');
+  const wrongNode = path.join(fixtureDir, 'node');
+  const fixturePath = path.join(fixtureDir, 'runtime.test.mjs');
+  writeFileSync(wrongNode, `#!/bin/sh\nprintf wrong > '${marker}'\nexit 86\n`);
+  chmodSync(wrongNode, 0o755);
+  writeFileSync(fixturePath, `
+    import { test } from 'node:test';
+    import { writeFileSync } from 'node:fs';
+    test('records the actual test process runtime', () => {
+      writeFileSync(${JSON.stringify(report)}, JSON.stringify({ executable: process.execPath, version: process.version }));
+    });
+  `);
+  try {
+    const result = spawnSync(process.execPath, [runnerPath, fixturePath], {
+      cwd: repoRoot,
+      env: { ...nestedRunnerEnv(), PATH: `${fixtureDir}${path.delimiter}${process.env.PATH ?? ''}` },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, `runner failed\n${result.stdout}\n${result.stderr}`);
+    assert.equal(existsSync(marker), false, 'PATH must not select the test runtime');
+    assert.deepEqual(JSON.parse(readFileSync(report, 'utf8')), {
+      executable: process.execPath,
+      version: process.version,
+    });
   } finally {
     rmSync(fixtureDir, { recursive: true, force: true });
   }

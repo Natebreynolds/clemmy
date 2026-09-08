@@ -64,6 +64,13 @@ import {
   proveHostLocalWorkspaceStructuredCollection,
 } from './host-local-write-commit.js';
 import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
+import {
+  ensureProviderAcknowledgementReceiptTable,
+  loadProviderAcknowledgementReceipt,
+  proveProviderAcknowledgement,
+  providerAcknowledgementReceiptsEqual,
+  type ProviderAcknowledgementReceipt,
+} from './provider-acknowledgement-proof.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -1108,6 +1115,31 @@ export function redeemEvidenceReceipt(
         ? { ok: true, receipt: { ...redeemed.receipt } as RedeemedReceipt['receipt'] }
         : redeemed;
     }
+    if (receiptId.startsWith('provider-acknowledgement:v1:')) {
+      const acknowledged = loadProviderAcknowledgementReceipt(db, receiptId);
+      if (!acknowledged || acknowledged.sessionId !== sessionId
+        || (expect.expectKind !== undefined && expect.expectKind !== 'commit')
+        || (expect.effect !== undefined && expect.effect !== 'external_write')
+        || (expect.sourceUserSeq !== undefined && acknowledged.sourceUserSeq !== expect.sourceUserSeq)
+        || (expect.physicalAttemptId !== undefined && acknowledged.physicalDispatchId !== expect.physicalAttemptId)) {
+        return { ok: false, reason: 'provider acknowledgement receipt scope is not exact' };
+      }
+      const authority = authorityManifest(db, acknowledged, { issuing: false });
+      if (!authority.ok) return { ok: false, reason: authority.reason };
+      const node = authority.manifest.nodes.find((entry) => entry.nodeId === acknowledged.nodeId);
+      const result = redeemSuccessfulSettlementResultForHost(acknowledged);
+      if (!node || result.status !== 'ok') return { ok: false, reason: 'provider acknowledgement result is not redeemable' };
+      const reproved = proveProviderAcknowledgement({
+        db, ...acknowledged, manifest: authority.manifest, node, result: result.value,
+      });
+      if (!reproved.ok || !providerAcknowledgementReceiptsEqual(reproved.receipt, acknowledged)) {
+        return { ok: false, reason: reproved.ok ? 'provider acknowledgement bytes changed' : reproved.reason };
+      }
+      return { ok: true, receipt: {
+        kind: 'commit', receiptId, obligation: 'commit_effect', sourceUserSeq: acknowledged.sourceUserSeq,
+        physicalAttemptId: acknowledged.physicalDispatchId,
+      } as RedeemedReceipt['receipt'] };
+    }
     const writeRow = loadHostWriteReceiptRow(db, receiptId);
     if (writeRow) {
       if (expect.expectKind && writeRow.kind !== expect.expectKind) {
@@ -1640,8 +1672,8 @@ function verifyManifestDerivationSources(input: {
 
 /**
  * Issue write-obligation receipts from durable construct facts only.
- * Requires an exact created id, an independent provider receipt, and a
- * content-digest-matched readback for reversible writes.
+ * A pre-dispatch acknowledgement mode proves the exact settled provider call.
+ * Artifact/content/readback modes retain their independently declared proofs.
  */
 export function issueHostWriteEvidenceForManifestNode(input: {
   sessionId: string;
@@ -1649,7 +1681,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
   manifestId: string;
   nodeId: string;
 }):
-  | { status: 'issued' | 'replayed'; receipts: HostWriteReceipt[] }
+  | { status: 'issued' | 'replayed'; receipts: Array<HostWriteReceipt | ProviderAcknowledgementReceipt> }
   | { status: 'missing' | 'refused' | 'conflict' | 'storage_error'; reason: string } {
   if (
     !input.sessionId.trim()
@@ -1664,7 +1696,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
   try {
     const db = openEventLog();
     const transaction = db.transaction(():
-      | { status: 'issued' | 'replayed'; receipts: HostWriteReceipt[] }
+      | { status: 'issued' | 'replayed'; receipts: Array<HostWriteReceipt | ProviderAcknowledgementReceipt> }
       | { status: 'missing' | 'refused' | 'conflict' | 'storage_error'; reason: string } => {
       ensureHostWriteReceiptTable(db);
       const manifestState = authorityManifest(db, input, { issuing: true });
@@ -1691,6 +1723,33 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           status: created.status === 'storage_error' ? 'storage_error' : 'refused',
           reason: `manifest write has no authoritative settled result: ${created.reason}`,
         };
+      }
+      if (node.writeEvidenceMode === 'provider_acknowledgement_v1') {
+        const proved = proveProviderAcknowledgement({
+          db, ...input, acceptedTaskId: manifestState.authority.accepted_task_id,
+          manifest: manifestState.manifest, node, logicalToolCallId, result: created.value,
+        });
+        if (!proved.ok) return { status: 'refused', reason: proved.reason };
+        ensureProviderAcknowledgementReceiptTable(db);
+        const prior = db.prepare(`SELECT receipt_id FROM host_provider_acknowledgement_receipts_v1
+          WHERE session_id = ? AND source_user_seq = ? AND manifest_id = ? AND node_id = ?`)
+          .get(input.sessionId, input.sourceUserSeq, input.manifestId, input.nodeId) as { receipt_id: string } | undefined;
+        if (prior) {
+          const receipt = loadProviderAcknowledgementReceipt(db, prior.receipt_id);
+          return receipt && providerAcknowledgementReceiptsEqual(receipt, proved.receipt)
+            ? { status: 'replayed', receipts: [receipt] }
+            : { status: 'conflict', reason: 'provider acknowledgement already owns different proof bytes' };
+        }
+        const mirror = insertInternalEventInTransaction(db, {
+          sessionId: input.sessionId, turn: manifestState.manifest.identity.turn,
+          role: 'system', type: EVIDENCE_RECEIPT_EVENT, data: { ...proved.receipt },
+        });
+        db.prepare(`INSERT INTO host_provider_acknowledgement_receipts_v1
+          (receipt_id, session_id, source_user_seq, manifest_id, node_id, receipt_json, receipt_event_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(proved.receipt.receiptId, input.sessionId,
+          input.sourceUserSeq, input.manifestId, input.nodeId, JSON.stringify(proved.receipt), mirror.id);
+        mirrors.push(mirror);
+        return { status: 'issued', receipts: [proved.receipt] };
       }
       const frozenVerification = proveFrozenMutationVerification({
         sessionId: input.sessionId,

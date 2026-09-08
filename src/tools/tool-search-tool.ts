@@ -17,17 +17,17 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { SourceAccountNominationSchema, type SourceAccountNomination } from './source-account-routing.js';
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
-import { catalogEntries, rankCatalogLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
-import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
-import { peekConnectedToolkits } from '../integrations/composio/client.js';
+import { catalogEntries, rankCatalogEntriesLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+  inspectAuthorizedLocalPlanningDisclosureCandidates,
   issueAuthorizedLocalPlanningDisclosureCandidate,
   type LocalPlanningRefusalReason,
 } from '../runtime/harness/local-planning-capability.js';
@@ -36,6 +36,7 @@ import {
   type AuthorizedLiveReadPlanningAuthorityV1,
 } from '../runtime/harness/live-read-planning-authority.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import type { ProofProvisionResult } from '../runtime/harness/proof-provisioned-catalog.js';
 import {
   readToolSearchContinuation,
   TOOL_SEARCH_CONTINUATION_MAX_ENTRIES as DURABLE_TOOL_SEARCH_CONTINUATION_MAX_ENTRIES,
@@ -68,61 +69,6 @@ export function normalizeToolSearchCursor(cursor: string | null | undefined): st
   return trimmed;
 }
 
-function connectedToolkitSlugs(): Set<string> {
-  try {
-    return new Set(
-      peekConnectedToolkits()
-        .filter((toolkit) => (toolkit.status ?? '').toUpperCase() !== 'FAILED')
-        .map((toolkit) => toolkit.slug.trim().toLowerCase())
-        .filter(Boolean),
-    );
-  } catch {
-    return new Set();
-  }
-}
-
-function candidateToolkitConnected(name: string, connected: Set<string>): boolean {
-  if (connected.size === 0) return false;
-  try {
-    return connected.has(registeredToolkitOfSlug(name).trim().toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-/** Exact live-read acquisition for this query is not a peer of fuzzy broker
- * membership. A 0.05 memory nudge on a connected Composio row previously
- * outranked an acquired reviewed CLI (live 2026-08-28: GOOGLESHEETS_QUERY_TABLE
- * ranked above salesforce_sf_soql_query on "query Salesforce ... sf CLI"). */
-const ACQUIRED_LIVE_READ_RANK_BOOST = 1;
-const PLANNING_PROVIDER_RANK_BOOST = 2;
-const CONNECTED_TOOLKIT_RANK_BOOST = 0.5;
-/**
- * Her own catalog ranks in the SAME band as a provider row, so relevance
- * decides between them.
- *
- * Both rankers bound their base score to [0,1]. While this was 1 and the
- * planning provider boost was 2, providers occupied [2,3] and built-ins [1,2]
- * — so no built-in could outrank any provider at any relevance, which is the
- * defect the tiering comment below says was fixed on 2026-08-19
- * (APIFY_SCHEDULE_PUT over her own workflow_schedule). It regressed.
- *
- * Measured live 2026-08-28: "I need this to update please and refresh" against
- * a workspace returned twenty SALESFORCE_/ASANA_/SLACK_/APIFY_ rows and ZERO
- * space_* tools. Her workspace tools were not mis-ranked; they never entered
- * the window to be ranked at all.
- *
- * The value is 1.5, not 2, and the half matters: at 2 a maximally relevant
- * built-in TIES an acquired live read, collapsing the tier above it. At 1.5 the
- * bands are built-in [1.5,2.5], connected provider [2,3], acquired [3,4] — they
- * overlap enough for relevance to decide, and the acquired tier stays strictly
- * on top.
- *
- * Equal footing, not precedence: a provider row that is genuinely more relevant to
- * the query still wins. What can no longer happen is losing by construction.
- */
-const OWN_CATALOG_RANK_BOOST = 1.5;
-
 function isAcquiredLiveReadCandidate(
   candidate: Pick<ToolSearchBrokerCandidate, 'planningAuthority'> & {
     sourceKind?: ToolSearchCandidateSourceKind;
@@ -132,24 +78,10 @@ function isAcquiredLiveReadCandidate(
     || candidate.planningAuthority != null;
 }
 
-function scoreDiscoveredSourceCandidate(
-  candidate: ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind },
-  index: number,
-  count: number,
-  input: { discloseForPlanning: boolean; connectedToolkitSlugs: Set<string> },
-): number {
-  const base = candidate.score ?? Math.max(0, 1 - (index / Math.max(1, count)));
-  const planningOrConnected = input.discloseForPlanning
-    ? PLANNING_PROVIDER_RANK_BOOST
-    : candidateToolkitConnected(candidate.name, input.connectedToolkitSlugs)
-      ? CONNECTED_TOOLKIT_RANK_BOOST
-      : 0;
-  const acquired = isAcquiredLiveReadCandidate(candidate) ? ACQUIRED_LIVE_READ_RANK_BOOST : 0;
-  return base + planningOrConnected + acquired;
-}
-
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
+const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
+const CAPABILITY_PUBLICATION_NEXT_STEP = 'The operation and account have not yet produced an executable capabilityRef. Search once for the exact operation you need, retaining the same account selection. Call it only after that search returns a capabilityRef. If publication remains unavailable, report its exact host blocker; do not invent a ref, broaden discovery, or ask the user to repeat the account.';
 /** One physical broker search retains at most the same window the public
  * surface can request. A smaller first page therefore never makes rank nine
  * unreachable, while provider/catalog scans remain strictly bounded. */
@@ -186,7 +118,7 @@ interface ToolSearchSchemaHandle {
   chars: number;
   bytes: number;
   cursor: string;
-  encoding: 'json_text_chunks';
+  encoding: 'json_object_or_text_chunks';
 }
 
 type StoredToolSearchContinuation =
@@ -275,7 +207,7 @@ class ToolSearchContinuationStore {
       chars: text.length,
       bytes,
       cursor: `${key}:0`,
-      encoding: 'json_text_chunks',
+      encoding: 'json_object_or_text_chunks',
     };
   }
 
@@ -338,7 +270,7 @@ class ToolSearchContinuationStore {
       return {
         text: JSON.stringify({
           error: 'invalid_or_expired_tool_search_cursor',
-          hint: 'Use only a result next_cursor or schema_handles[*].cursor returned by this tool_search instance.',
+          hint: 'Use only next_cursor or schema_handles[*].cursor returned in this session. A tool name is not a schema cursor; set cursor:null and query the exact tool name to obtain its schema.',
         }),
         isError: true,
       };
@@ -366,6 +298,30 @@ class ToolSearchContinuationStore {
       };
     }
     this.refreshMemoryEntry(key, sessionId, entry);
+    // Redemption has selected one exact schema. Keep it whole when the actual
+    // JSON object envelope fits the existing result budget: encoding schema
+    // JSON inside another JSON string needlessly escapes it a second time and
+    // used to force three model round trips for an 18.5K contract. The durable
+    // bytes/digest above remain the authority; larger documents retain the
+    // same lossless chunk protocol and offsets below.
+    if (offset === 0) {
+      try {
+        const complete = JSON.stringify({
+          kind: 'tool_search_schema',
+          schema_ref: `sha256:${digest}`,
+          sha256: digest,
+          encoding: 'json',
+          chars: entry.text.length,
+          bytes: entry.bytes,
+          schema: JSON.parse(entry.text),
+          complete: true,
+        });
+        if (complete.length <= DEFAULT_TOOL_RESULT_MAX_CHARS) return { text: complete };
+      } catch {
+        // A legacy non-JSON entry remains byte-addressable by the existing
+        // chunk path; parsing failure cannot substitute or discard its bytes.
+      }
+    }
     const end = Math.min(entry.text.length, offset + TOOL_SEARCH_SCHEMA_CHUNK_CHARS);
     const nextCursor = end < entry.text.length
       ? `${TOOL_SEARCH_SCHEMA_CURSOR_PREFIX}${digest}:${end}`
@@ -418,7 +374,7 @@ export type ToolSearchCandidateSourceKind =
  * which put the action arguments where tool_slug belongs. */
 export function renderCarrierInvocationExample(
   carrier: string,
-  invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string },
+  invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string | null },
   capabilityRef?: string,
 ): {
   tool: string;
@@ -431,7 +387,9 @@ export function renderCarrierInvocationExample(
   };
 } {
   const payloadField = invocation.payloadField ?? 'arguments';
-  const inner = { ...(invocation.fixedArgs ?? {}), [payloadField]: { '<argument>': '<value>' } };
+  const inner = invocation.payloadField === null
+    ? { ...(invocation.fixedArgs ?? {}), '<argument>': '<value>' }
+    : { ...(invocation.fixedArgs ?? {}), [payloadField]: { '<argument>': '<value>' } };
   const base = { name: invocation.name, args_json: JSON.stringify(inner) };
   // Direct tool-edge nomination is keyed by the opaque capability ref that
   // tool_search just disclosed. Keeping that ref beside the literal carrier
@@ -457,6 +415,13 @@ export function renderCarrierInvocationExample(
 export interface ToolSearchBrokerCandidate {
   name: string;
   summary: string;
+  /** Additional advisory catalog metadata for relevance only, never schema or authority. */
+  relevanceText?: string;
+  /** The provider hydrated this row only because a deprecated result named
+   *  it as the current replacement. That is LIFECYCLE AUTHORITY, not
+   *  relevance: the operation the request is about may read as a poor lexical
+   *  match precisely because the deprecated row held the matching prose. */
+  lifecycleSuccessor?: boolean;
   schema?: unknown;
   carrier: ToolSearchDispatchCarrier;
   score?: number;
@@ -464,7 +429,8 @@ export interface ToolSearchBrokerCandidate {
   invocation?: {
     name: string;
     fixedArgs?: Record<string, unknown>;
-    payloadField?: string;
+    /** null means the operation accepts its schema directly, without an adapter wrapper. */
+    payloadField?: string | null;
   };
   /** Process-only nomination issued by a live-read source. The broker carries
    * it to the planning callback but never serializes it into model-visible
@@ -472,16 +438,52 @@ export interface ToolSearchBrokerCandidate {
   planningAuthority?: AuthorizedLiveReadPlanningAuthorityV1;
 }
 
+// Source-account routing imports the broker indirectly. Construct its schema
+// only while handling a request, after that module has finished initializing.
+function deferredToolSearchPageSchema() { return z.object({
+  kind: z.literal('deferred_tool_search_page_v1'),
+  query: z.string().min(1).max(400),
+  roleKey: z.string().max(128).nullable(),
+  accountSelection: SourceAccountNominationSchema.nullable(),
+  limit: z.number().int().min(1).max(TOOL_SEARCH_WINDOW_RESULTS),
+  page: z.number().int().min(2).max(TOOL_SEARCH_WINDOW_RESULTS),
+  pageCount: z.number().int().min(2).max(TOOL_SEARCH_WINDOW_RESULTS),
+  totalResults: z.number().int().min(1).max(TOOL_SEARCH_WINDOW_RESULTS),
+  rows: z.array(z.object({
+    name: z.string().min(1), summary: z.string(),
+    sourceKind: z.enum(['authorized_external_mcp', 'authorized_composio',
+      AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, AUTHORIZED_LOCAL_REGISTRY_PROVENANCE]).optional(),
+    carrier: z.enum(['call_tool', 'work_call']).optional(),
+  })).min(1).max(TOOL_SEARCH_WINDOW_RESULTS),
+}); }
+type DeferredToolSearchPage = z.infer<ReturnType<typeof deferredToolSearchPageSchema>>;
+
 export interface ToolSearchCandidateSource {
   kind: ToolSearchCandidateSourceKind;
   search(input: {
     query: string;
     limit: number;
+    /** Advisory selection must cross the same accepted-source check before
+     * it can help an adapter acquire account-scoped candidates. */
+    accountSelection?: SourceAccountNomination | null;
+    /** Collect advisory metadata only; prepareCandidates owns exact live
+     * definition acquisition after the broker selects a visible page. */
+    deferPreparation?: boolean;
     signal?: AbortSignal;
     /** Absolute wall deadline owned by the broker. Adapters with multiple
      * internal reads should settle slightly before it so partial progress can
      * be returned instead of being discarded by the outer abort. */
     deadlineAt?: number;
+  }): Promise<ToolSearchBrokerCandidate[]>;
+  /** Optional two-stage source. Only these returned current definitions may
+   * enter planning disclosure; retained cursor metadata has no authority. */
+  prepareCandidates?(input: {
+    candidates: readonly ToolSearchBrokerCandidate[];
+    query: string;
+    /** False for durable cursor metadata, which always needs fresh observation. */
+    reuseSearchPreparation: boolean;
+    signal?: AbortSignal;
+    deadlineAt: number;
   }): Promise<ToolSearchBrokerCandidate[]>;
 }
 
@@ -688,17 +690,27 @@ export function attachToolSearchSelectedAccountEvidence(
 }
 
 export interface ToolSearchPlanningBlocker {
-  code: 'account_selection_required';
+  code: 'account_selection_required' | 'capability_publication_required';
   /** Stable current identities the user can name on the next accepted turn.
    * Emails are preferred; an opaque connection id is used only when the
    * provider exposes no mailbox identity. */
   choices: readonly string[];
+  /** Host-owned diagnostic; publication failures never imply an account question. */
+  reason?: 'review_unavailable' | 'proof_publication_expired' | 'proof_not_registered'
+    | 'exact_definition_unavailable'
+    | NonNullable<ProofProvisionResult['refusal']>['code'];
 }
 
 export interface ToolSearchPlanningDisclosureOutcome {
   version: 1;
   refs: Readonly<Record<string, string>>;
   blockers: Readonly<Record<string, ToolSearchPlanningBlocker>>;
+}
+
+export interface ToolSearchPlanningDisclosureControl {
+  signal: AbortSignal;
+  deadlineAt: number;
+  accountSelection?: SourceAccountNomination | null;
 }
 
 function isPlanningDisclosureOutcome(
@@ -735,7 +747,7 @@ export function toolSearchBrokerCoverage(
 
 function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
   return carrier === 'work_call'
-    ? 'Invoke the selected result through work_call by copying its literal example. For one fresh standalone write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
+    ? 'For execution through work_call, copy the selected result carrier example. For publish_plan, use its exact effect and put only the direct selected-tool input fields from its schema into staticArgumentsJson; carrier names, fixedArgs and payload wrappers belong to the work_call example. For each independent proposal-free write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
     : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
 }
 
@@ -798,6 +810,32 @@ function stripSchemaAnnotations(value: unknown): unknown {
   return out;
 }
 
+/** Structural compaction must retain the selected tool's direct argument
+ * contract. A string shape alone does not distinguish JSON text from a path,
+ * identifier or prose. Preserve these annotations from the same exact schema;
+ * the full original remains behind its existing lossless handle.
+ */
+function compactSelectedSchema(value: unknown): unknown {
+  const compact = stripSchemaAnnotations(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !compact || typeof compact !== 'object' || Array.isArray(compact)) return compact;
+  const originalProperties = (value as Record<string, unknown>).properties;
+  const compactProperties = (compact as Record<string, unknown>).properties;
+  if (!originalProperties || typeof originalProperties !== 'object' || Array.isArray(originalProperties)
+    || !compactProperties || typeof compactProperties !== 'object' || Array.isArray(compactProperties)) return compact;
+  for (const [name, original] of Object.entries(originalProperties)) {
+    const target = (compactProperties as Record<string, unknown>)[name];
+    if (!original || typeof original !== 'object' || Array.isArray(original)
+      || !target || typeof target !== 'object' || Array.isArray(target)) continue;
+    for (const annotation of ['description', 'examples'] as const) {
+      if (Object.prototype.hasOwnProperty.call(original, annotation)) {
+        (target as Record<string, unknown>)[annotation] = (original as Record<string, unknown>)[annotation];
+      }
+    }
+  }
+  return compact;
+}
+
 /** Lazily-built, memoized name → schema/instructions map. Dynamic-imported so
  * this module (which the runtime tool registry imports) never forms an
  * eval-time import cycle. */
@@ -847,7 +885,7 @@ export function registerToolSearchTool(
      * the current host catalog. Candidate prose itself grants nothing. */
     discloseForPlanning?: (
       candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-      control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+      control?: Readonly<ToolSearchPlanningDisclosureControl>,
     ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
       | Readonly<Record<string, string>>
       | ToolSearchPlanningDisclosureOutcome;
@@ -863,13 +901,15 @@ export function registerToolSearchTool(
         .min(1)
         .max(400)
         .describe('What you want to do, in plain language.'),
+      account_selection: SourceAccountNominationSchema.nullable().optional()
+        .describe('Source-account routing only, never approval. If the accepted user request already identifies the account to operate in/as, nominate its exact current connected email or connection ID, toolkit, and a verbatim source_quote from accepted user wording in this conversation. Do not treat recipients, attendees, third-party accounts, reported or quoted instructions, or skill names as operating-account selections. On account_selection_required, use the returned choices to resolve an account the user already named; ask the user only if their selection is genuinely missing or unclear. Pass null when no nomination is needed.'),
       role_key: z
         .string()
         .min(1)
         .max(128)
         .nullable()
         .optional()
-        .describe('Required on the wire. For broad discovery: one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null.'),
+        .describe('Optional compatibility metadata for callers retaining a prior role identifier; otherwise pass null. Describe the intent plainly in query, without a role label or prefix.'),
       limit: z
         .number()
         .int()
@@ -889,27 +929,44 @@ export function registerToolSearchTool(
         .default(null)
         .describe('next_cursor or schema_handles[*].cursor from a prior result in this session; null means the first page.'),
     },
-    async ({ query, role_key, limit, cursor }: {
+    async ({ query, role_key, limit, cursor, account_selection }: {
       query: string;
       role_key?: string | null;
       limit?: number | null;
       cursor?: string | null;
+      account_selection?: SourceAccountNomination | null;
     }) => {
       const continuationSessionId = getToolOutputContext()?.sessionId;
-      // A continuation is a read of bytes retained by an earlier admitted
-      // search, never another discovery attempt. Invalid/expired cursors fail
-      // locally and cannot fall through into a candidate source.
+      // Retained pages either contain completed public bytes or advisory
+      // metadata awaiting exact preparation. A cursor never repeats broad
+      // discovery and cannot import authority from its stored metadata.
+      let deferredPage: DeferredToolSearchPage | undefined;
       const continuation = normalizeToolSearchCursor(cursor);
       if (continuation) {
         const continued = continuations.read(continuation, continuationSessionId);
-        return textResult(continued.text, { isError: continued.isError });
+        if (continued.isError) return invalidArgumentsTextResult(continued.text);
+        let decoded: unknown;
+        try { decoded = JSON.parse(continued.text); } catch { /* legacy text below */ }
+        if ((decoded as { kind?: unknown } | null)?.kind !== 'deferred_tool_search_page_v1') {
+          return textResult(continued.text);
+        }
+        const parsed = deferredToolSearchPageSchema().safeParse(decoded);
+        if (!parsed.success) return invalidArgumentsTextResult(JSON.stringify({
+          error: 'invalid_or_expired_tool_search_cursor',
+          hint: 'Use an exact returned cursor from this session, or set cursor:null and search the exact operation again.',
+        }));
+        deferredPage = parsed.data;
+        query = deferredPage.query;
+        role_key = deferredPage.roleKey;
+        account_selection = account_selection ?? deferredPage.accountSelection;
+        limit = deferredPage.limit;
       }
       // plan_task/work_call are host-owned controls, not business/provider
       // capabilities. Answer their narrowly recognized structural lookup
       // locally before any candidate source, schema materializer, or planning
       // disclosure callback can run. The result grants no capabilityRef; the
       // ordinary orchestrator lifecycle owns when their real schemas appear.
-      const structuralControl = hostStructuralPlanningControlLookup(query);
+      const structuralControl = deferredPage ? null : hostStructuralPlanningControlLookup(query);
       if (structuralControl) return textResult(JSON.stringify(structuralControl));
       const brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
@@ -920,22 +977,28 @@ export function registerToolSearchTool(
       // capability and its schema. Natural-language discovery still ranks the
       // whole allowed catalog below.
       const requestedLimit = Math.min(limit ?? TOP_RESULTS, TOOL_SEARCH_WINDOW_RESULTS);
-      const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames });
-      const exactEntry = scopedCatalog
+      const metadataMap = await toolMetadataMap();
+      const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames }).map((entry) => {
+        const metadata = metadataMap.get(entry.name);
+        const properties = (metadata?.schema as { properties?: object } | undefined)?.properties;
+        return { ...entry,
+        // Registry one-liners are display summaries, sometimes clipped in the
+        // middle of a word. Retrieval needs the actual registered operation's
+        // meaning just as provider rows use their full discovery metadata.
+          oneLiner: [metadata?.description || entry.oneLiner,
+            ...Object.keys(properties ?? {})].join('\n'),
+        };
+      });
+      const exactEntry = deferredPage ? undefined : scopedCatalog
         .find((entry) => queryExplicitlyNamesTool(query, entry.name));
-      const exactKnownButDenied = !exactEntry && catalogEntries()
+      const exactKnownButDenied = !deferredPage && !exactEntry && catalogEntries()
         .some((entry) => queryExplicitlyNamesTool(query, entry.name));
-      // A uniquely named saved workflow plus execution text is an exact
-      // selection of workflow_run — not a fuzzy hunt across Composio actors
-      // (live 2026-08-29: "run my platform 49 workflow" ranked APIFY_RUN_ACTOR).
-      const uniqueWorkflowRun = !exactEntry && uniqueWorkflowRunRequest(query)
-        ? scopedCatalog.find((entry) => entry.name === 'workflow_run')
-        : undefined;
+      // Only a structured tool-name selection receives the exact-hit shortcut.
+      // Workflow-name similarity remains advisory ranking, never a substitute
+      // for the requested operation or a reason to skip provider discovery.
       const exactNamedHit: RankedCatalogEntry | undefined = exactEntry
         ? { ...exactEntry, score: 1 }
-        : uniqueWorkflowRun
-          ? { ...uniqueWorkflowRun, score: 1 }
-          : undefined;
+        : undefined;
       // Sources the provider itself could not answer, so the model is told
       // "could not reach X" and can retry — never silence that reads as "X
       // does not exist" (see CandidateSourceUnavailableError).
@@ -949,7 +1012,11 @@ export function registerToolSearchTool(
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
       // an exact capability selection.
-      const sourceCandidates = exactNamedHit || exactKnownButDenied
+      let sourceCandidates = deferredPage
+        ? deferredPage.rows.filter((row) => row.sourceKind && row.carrier).map((row) => ({
+            name: row.name, summary: row.summary, sourceKind: row.sourceKind!, carrier: row.carrier!,
+          } as ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind }))
+        : exactNamedHit || exactKnownButDenied
         ? []
         : (await Promise.all((opts.candidateSources ?? []).map(async (source) => {
             // A candidate source is advisory breadth, never load-bearing: the
@@ -980,6 +1047,8 @@ export function registerToolSearchTool(
                 // returns is paged locally and never fetched a second time.
                 source.search({
                   query,
+                  accountSelection: account_selection,
+                  deferPreparation: Boolean(opts.discloseForPlanning && source.prepareCandidates),
                   limit: requestedLimit,
                   signal: controller.signal,
                   deadlineAt: sourceDeadlineAt,
@@ -1007,10 +1076,9 @@ export function registerToolSearchTool(
                   `${source.kind} answered after the tool_search deadline.`,
                 );
               }
-              // Truncating BEFORE scoring let a source's own ordering decide
-              // what the ranker is ever allowed to see. The tier design above
-              // (acquired [3,4] strictly over connected provider [2,3]) then
-              // only ranks the survivors, so a broker answering a broad query
+              // Truncating BEFORE scoring lets a source's own ordering decide
+              // what the ranker can see. Query-bound acquired reads must reach
+              // the merged ranker, so a broker answering a broad query
               // with a full window of provider rows evicts the acquired live
               // read that the design says must win — it "never entered the
               // window to be ranked at all", the same shape as the 2026-08-28
@@ -1031,7 +1099,7 @@ export function registerToolSearchTool(
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
                 .map((candidate) => ({
                   ...candidate,
-                  summary: candidate.summary.trim().slice(0, 600),
+                  summary: candidate.summary.trim(),
                   sourceKind: source.kind,
                 }));
               return [
@@ -1066,59 +1134,128 @@ export function registerToolSearchTool(
               if (deadline) clearTimeout(deadline);
             }
           }))).flat();
-      const exactSourceMatches = sourceCandidates.filter((candidate) =>
+      const exactSourceMatches = (deferredPage ? [] : sourceCandidates).filter((candidate) =>
         queryExplicitlyNamesTool(query, candidate.name));
       const exactSourceHit = exactSourceMatches.length === 1
         ? exactSourceMatches[0]
         : undefined;
       const selectedExactly = exactSourceHit ?? exactNamedHit;
-      const rankedBuiltins = selectedExactly
-        ? []
-        // Provider membership/schema acquisition already owns this control
-        // call's bounded network budget. Embeddings are only an advisory
-        // ordering signal, so the execution-critical broker uses the same
-        // deterministic lexical fallback directly instead of stacking a cold
-        // 2x10s embedding retry behind provider search (live 2026-08-27: that
-        // stack turned the nominal 10s source bound into a 66s host timeout).
-        : rankCatalogLexically(query, { allowedNames: opts.allowedNames });
-      // TIERED RANKING (live 2026-08-19: APIFY_SCHEDULE_PUT outranked her own
-      // workflow_schedule; live 2026-08-28: GOOGLESHEETS_QUERY_TABLE outranked
-      // an acquired Salesforce CLI read). Exact live-read acquisition for this
-      // query outranks fuzzy broker membership, which outranks her own catalog,
-      // which outranks the rest — she cites the acquired how before the world's
-      // noise.
-      const connectedSlugs = connectedToolkitSlugs();
-      const combined = selectedExactly
-        ? [selectedExactly]
-        : [
+      // Merge all scoped metadata onto one query-relevance scale. A source's
+      // ordinal score is useful only as a tie-break, never as proof that its
+      // first result is more relevant than another catalog's matching tool.
+      // Exact live-read acquisition retains its query-bound precedence; neither
+      // being connected nor requesting planning disclosure earns a rank boost.
+      const combined = deferredPage
+        ? deferredPage.rows.filter((row) => row.sourceKind || scopedCatalog.some((entry) => entry.name === row.name))
+            .map((row) => ({ ...row, oneLiner: row.summary, score: 0 }))
+        : selectedExactly ? [selectedExactly]
+        : rankCatalogEntriesLexically(query, [
             ...sourceCandidates.map((candidate, index) => ({
               ...candidate,
-              score: scoreDiscoveredSourceCandidate(
-                candidate,
-                index,
-                sourceCandidates.length,
-                {
-                  discloseForPlanning: Boolean(opts.discloseForPlanning),
-                  connectedToolkitSlugs: connectedSlugs,
-                },
-              ),
+              oneLiner: [candidate.summary, candidate.relevanceText].filter(Boolean).join('\n'),
+              sourceRank: Number.isFinite(candidate.score)
+                ? candidate.score!
+                : Math.max(0, 1 - index / Math.max(1, sourceCandidates.length)),
+              acquiredLiveRead: isAcquiredLiveReadCandidate(candidate),
+              lifecycleSuccessor: candidate.lifecycleSuccessor === true,
             })),
-            ...rankedBuiltins.map((entry) => ({
-              name: entry.name,
+            ...scopedCatalog.map((entry) => ({
+              ...entry,
               summary: entry.oneLiner,
-              score: (entry.score ?? 0) + OWN_CATALOG_RANK_BOOST,
+              sourceRank: 0,
+              acquiredLiveRead: false,
+              lifecycleSuccessor: false,
             })),
-          ].sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
+          ]).sort((left, right) => (
+            Number(right.acquiredLiveRead) - Number(left.acquiredLiveRead)
+            // One relevance scale orders rows that compete on relevance. A row
+            // the provider hydrated as a deprecated result's named replacement
+            // is not competing on relevance: the deprecated row is exactly the
+            // one holding the query's prose, so scoring alone buries the
+            // operation the request is actually about.
+            || Number(right.lifecycleSuccessor) - Number(left.lifecycleSuccessor)
+            // An explicitly expressed compound operation name precedes
+            // descriptive coverage; acquisition/lifecycle priorities stay intact.
+            || Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+            || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
+            || right.score - left.score
+            || right.sourceRank - left.sourceRank
+            || left.name.localeCompare(right.name)
+          ));
       const seen = new Set<string>();
-      const rankedWindow = combined.filter((candidate) => {
+      let rankedWindow = combined.filter((candidate) => {
         const key = candidate.name.toLowerCase();
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
       }).slice(0, TOOL_SEARCH_WINDOW_RESULTS);
-      const metadataMap = await toolMetadataMap();
+      // Only sources with an exact selected-candidate contract may defer a
+      // durable page. Existing opaque live-read authority keeps its old path.
+      const canDeferPages = Boolean(!selectedExactly && opts.discloseForPlanning
+        && (opts.candidateSources ?? []).some((source) => source.prepareCandidates)
+        && sourceCandidates.every((candidate) => (opts.candidateSources ?? [])
+          .filter((source) => source.kind === candidate.sourceKind && source.prepareCandidates).length === 1));
+      if (deferredPage && !canDeferPages) {
+        return textResult(JSON.stringify({ error: 'tool_search_page_source_unavailable',
+          hint: 'This page needs its original source adapter. Search again on the current configured surface.' }), { isError: true });
+      }
+      const selectedRows = canDeferPages ? rankedWindow.slice(0, requestedLimit) : rankedWindow;
+      const selectedNames = new Set(selectedRows.map((row) => row.name));
+      const preparationBlockers: Record<string, ToolSearchPlanningBlocker> = {};
+      if (!selectedExactly && opts.discloseForPlanning) {
+        for (const source of opts.candidateSources ?? []) {
+          if (!source.prepareCandidates) continue;
+          const selected = sourceCandidates.filter((candidate) => candidate.sourceKind === source.kind && selectedNames.has(candidate.name));
+          if (selected.length === 0) continue;
+          const controller = new AbortController();
+          const deadlineAt = Math.min(brokerDeadlineAt, Date.now() + PLANNING_DISCLOSURE_DEADLINE_MS);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let prepared: ToolSearchBrokerCandidate[] = [];
+          try {
+            prepared = await Promise.race([
+              source.prepareCandidates({ candidates: selected, query, reuseSearchPreparation: !deferredPage, signal: controller.signal, deadlineAt }).catch(() => []),
+              new Promise<ToolSearchBrokerCandidate[]>((resolve) => {
+                timer = setTimeout(() => { controller.abort(); resolve([]); }, Math.max(0, deadlineAt - Date.now()));
+              }),
+            ]);
+            if (controller.signal.aborted || Date.now() >= deadlineAt) prepared = [];
+          } finally { if (timer) clearTimeout(timer); }
+          const preparedByName = new Map(prepared.filter((candidate) => selectedNames.has(candidate.name)).map((candidate) => [candidate.name, candidate]));
+          sourceCandidates = sourceCandidates.map((candidate) => {
+            if (candidate.sourceKind !== source.kind || !selectedNames.has(candidate.name)) return candidate;
+            const current = preparedByName.get(candidate.name);
+            // Preparation may WITHHOLD AUTHORITY (no capabilityRef when exact
+            // materialization fails) — it may not erase the schema the live
+            // provider already returned in this same pass. Dropping a shape we
+            // already hold makes the row unusable for no safety gain: the model
+            // can still see the arguments and reach it through call_tool, which
+            // is exactly what the plan-citation gate routes it to.
+            if (current) {
+              return {
+                ...current,
+                schema: current.schema ?? candidate.schema,
+                sourceKind: source.kind,
+              };
+            }
+            preparationBlockers[candidate.name] = { code: 'capability_publication_required', choices: [],
+              reason: controller.signal.aborted || Date.now() >= deadlineAt ? 'proof_publication_expired' : 'exact_definition_unavailable' };
+            // AUTHORITY is withheld; the SHAPE is not. planningAuthority is the
+            // safety-bearing field — without it the row fails the plan-citation
+            // gate and is routed to the call_tool dispatcher, which the page's
+            // own guidance below states explicitly ("no plan ref" is not "no
+            // door"). Erasing the schema too contradicted that: the model was
+            // handed a named capability it could neither cite nor inspect,
+            // holding a definition the live provider had already returned.
+            return { ...candidate, planningAuthority: undefined };
+          });
+          rankedWindow = rankedWindow.map((row) => {
+            const current = sourceCandidates.find((candidate) => candidate.name === row.name && candidate.sourceKind === source.kind);
+            return current && selectedNames.has(row.name) ? { ...row, ...current } : row;
+          });
+        }
+      }
       const planningOutcomes: (ToolSearchPlanningDisclosureCandidate | { name: string; refused: LocalPlanningRefusalReason } | null)[] = opts.discloseForPlanning
-        ? (await Promise.all(rankedWindow.map(async (candidate) => {
+        ? (await Promise.all(rankedWindow.filter((candidate) => selectedNames.has(candidate.name) && !preparationBlockers[candidate.name]).map(async (candidate) => {
             const sourcedMatches = sourceCandidates.filter((entry) => entry.name === candidate.name);
             const sourced = sourcedMatches.length === 1 ? sourcedMatches[0] : undefined;
             if (sourced) {
@@ -1227,6 +1364,17 @@ export function registerToolSearchTool(
               | null
             > = [];
             for (const group of groups) {
+              const expiredDisclosure = (reason: ToolSearchPlanningBlocker['reason'] = 'proof_publication_expired'): ToolSearchPlanningDisclosureOutcome => ({
+                version: 1,
+                refs: Object.freeze({}),
+                blockers: Object.freeze(Object.fromEntries(group
+                  .filter((candidate) => candidate.sourceKind === 'authorized_composio')
+                  .map((candidate) => [candidate.name, {
+                    code: 'capability_publication_required' as const,
+                    choices: Object.freeze([]),
+                    reason,
+                  }]))),
+              });
               let timer: ReturnType<typeof setTimeout> | undefined;
               const controller = new AbortController();
               const groupBudgetMs = Math.min(
@@ -1234,7 +1382,7 @@ export function registerToolSearchTool(
                 remainingBrokerMs(),
               );
               if (groupBudgetMs <= 0) {
-                outcomes.push(null);
+                outcomes.push(expiredDisclosure());
                 continue;
               }
               const groupDeadlineAt = Date.now() + groupBudgetMs;
@@ -1243,7 +1391,8 @@ export function registerToolSearchTool(
                   Promise.resolve(disclose(group, {
                     signal: controller.signal,
                     deadlineAt: groupDeadlineAt,
-                  })).catch(() => null),
+                    accountSelection: account_selection,
+                  })).catch(() => expiredDisclosure('proof_not_registered')),
                   new Promise<null>((resolve) => {
                     timer = setTimeout(() => {
                       controller.abort();
@@ -1255,8 +1404,8 @@ export function registerToolSearchTool(
                   controller.signal.aborted
                   || Date.now() >= groupDeadlineAt
                   || remainingBrokerMs() <= 0
-                  ? null
-                  : outcome,
+                  ? expiredDisclosure()
+                  : outcome ?? expiredDisclosure(),
                 );
               } finally {
                 if (timer) clearTimeout(timer);
@@ -1280,8 +1429,15 @@ export function registerToolSearchTool(
             });
           })()
         : Object.freeze({ version: 1, refs: Object.freeze({}), blockers: Object.freeze({}) });
-      const planningRefs: Readonly<Record<string, string>> = planningDisclosure.refs;
-      const planningBlockers: Readonly<Record<string, ToolSearchPlanningBlocker>> = planningDisclosure.blockers;
+      const planningBlockers: Readonly<Record<string, ToolSearchPlanningBlocker>> = { ...planningDisclosure.blockers, ...preparationBlockers };
+      // A previous catalog definition cannot override this page's current
+      // account or publication refusal. Never disclose both a blocker and an
+      // executable-looking ref for the same selected operation.
+      const planningRefs: Readonly<Record<string, string>> = Object.fromEntries(
+        Object.entries(planningDisclosure.refs).filter((entry): entry is [string, string] => (
+          !planningBlockers[entry[0]] && typeof entry[1] === 'string' && entry[1].trim().length > 0
+        )),
+      );
 
       const schemaForName = (name: string): unknown => {
         const localPlanning = planningCandidateByName.get(name);
@@ -1310,7 +1466,33 @@ export function registerToolSearchTool(
           ? opts.dispatchCarrierForName(exactNamedHit.name)
           : null
       );
-      const hint = (() => {
+      // A complete schema can be moved behind a content-addressed handle by the
+      // size loop further down, and only the FINAL no-carrier fallback below ever
+      // said so. Production returns through the exact- or mixed-carrier branch,
+      // so the model was told to fill `schemas.<tool>` for a schema that had just
+      // been evicted — C9 workflow_update event 134811 published schemas:{} beside
+      // an 18168-character handle, and the model re-ran discovery instead of
+      // reading the local chunks it already had. Handle presence is threaded in
+      // because `schemaHandles` lives in the deeper render scope; render()
+      // recomputes this hint on every pass, so by the final render it describes
+      // the payload that actually ships.
+      const handleReadingGuidance = (hasSchemaHandles: boolean): string => (hasSchemaHandles
+        ? ' One or more complete schemas are behind schema_handles: read the ordered local chunks using that handle cursor before calling. It is a local read and does not repeat provider discovery; do not expect those tools under `schemas`.'
+        : '');
+      const invocationHint = (hasSchemaHandles: boolean): string => {
+        if (exactCarrier) return dispatchHint(exactCarrier) + handleReadingGuidance(hasSchemaHandles);
+        if (opts.dispatchCarrierForName) {
+          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
+            + 'Copy each result\'s invocation example and fill its exact schema: native operations take their arguments directly, while provider adapters may require the wrapper shown in that row. args_json is one JSON string; do not serialize a nested arguments object a second time. For each independent proposal-free write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead. When planning, copy the disclosed effect exactly.' + handleReadingGuidance(hasSchemaHandles);
+        }
+        const fixedCarrier = opts.dispatchCarrier
+          ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
+        if (fixedCarrier) return dispatchHint(fixedCarrier) + handleReadingGuidance(hasSchemaHandles);
+        return opts.allowedNames
+          ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.' + handleReadingGuidance(hasSchemaHandles)
+          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
+      };
+      const hintForRows = (rows: readonly (typeof rankedWindow)[number][], hasSchemaHandles: boolean): string => {
         // A provider that did not answer must never read like a capability
         // that does not exist. Lead with this only when it plausibly explains
         // an otherwise-empty result — an exact/built-in hit already answered
@@ -1324,11 +1506,39 @@ export function registerToolSearchTool(
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
           return `Could not reach: ${causes}. This is a provider/connection problem, not evidence the capability is missing — do not conclude it does not exist or invent a reference for it. Retry this search once, or tell the user the connection could not be reached if it keeps failing.`;
         }
-        if (Object.keys(planningBlockers).length > 0) {
-          const choices = [...new Set(Object.values(planningBlockers).flatMap((blocker) => blocker.choices))];
-          return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
+        // Disclosure covers the retained window, while a model sees one page.
+        // An unresolved alternative must not override a ready visible choice
+        // or leak an off-page account into the page's recovery instruction.
+        const visibleBlockers = rows.flatMap((row) => planningBlockers[row.name]
+          ? [[row.name, planningBlockers[row.name]!] as const]
+          : []);
+        const visibleRefs = rows.filter((row) => Boolean(planningRefs[row.name]));
+        if (visibleBlockers.length > 0) {
+          const available = rows.some((row) => !planningBlockers[row.name] && (
+            Boolean(planningRefs[row.name])
+            || localPlanningRowStatus(row.name).planningRefStatus === 'dispatch_now'
+          ));
+          if (available) {
+            return 'Use a result with a capabilityRef or dispatch_now status if it satisfies the task, following its own carrier and invocation example (work_call for business results; call_tool for controls). Only if you select an unresolved result, follow that result\'s specific recovery step; another result\'s account or publication blocker does not block an available choice.';
+          }
+          const reviewUnavailable = visibleBlockers
+            .filter(([, blocker]) => blocker.code === 'account_selection_required'
+              && blocker.reason === 'review_unavailable')
+            .map(([name]) => name);
+          if (reviewUnavailable.length > 0) {
+            return `Account-routing review unavailable for ${reviewUnavailable.join(', ')}. ${ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP} Any other account blockers remain listed on their individual results.`;
+          }
+          const accountBlockers = visibleBlockers.map(([, blocker]) => blocker)
+            .filter((blocker) => blocker.code === 'account_selection_required');
+          if (accountBlockers.length > 0) {
+            const choices = [...new Set(accountBlockers.flatMap((blocker) => blocker.choices))];
+            return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
+          }
+          const publication = visibleBlockers
+            .map(([name, blocker]) => `${name}: ${blocker.reason ?? 'proof_not_registered'}`).join(', ');
+          return `Capability publication unavailable (${publication}). ${CAPABILITY_PUBLICATION_NEXT_STEP} Other results with a capabilityRef remain executable.`;
         }
-        if (opts.discloseForPlanning && Object.keys(planningRefs).length === 0) {
+        if (opts.discloseForPlanning && visibleRefs.length === 0) {
           // "No plan ref" is not "no door". The names below fail the plan-citation
           // gate, which is exactly what routes them to the call_tool dispatcher,
           // so they are invocable on this turn. Telling the model to refine
@@ -1336,7 +1546,7 @@ export function registerToolSearchTool(
           // holding the tool with a full schema (live 2026-08-27, seq 90427).
           // Destructive rows are deliberately never named here — a page that
           // cannot plan them must not nudge the model to fire them either.
-          const callableNow = rankedWindow
+          const callableNow = rows
             .map((row) => row.name)
             .filter((name) => {
               const status = localPlanningRowStatus(name);
@@ -1347,18 +1557,8 @@ export function registerToolSearchTool(
           }
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
-        if (exactCarrier) return dispatchHint(exactCarrier);
-        if (opts.dispatchCarrierForName) {
-          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
-            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the action arguments; do not serialize the arguments object a second time. For one fresh standalone write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead.';
-        }
-        const fixedCarrier = opts.dispatchCarrier
-          ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
-        if (fixedCarrier) return dispatchHint(fixedCarrier);
-        return opts.allowedNames
-          ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
-      })();
+        return invocationHint(hasSchemaHandles);
+      };
 
       type RankedWindowRow = (typeof rankedWindow)[number];
 
@@ -1367,9 +1567,37 @@ export function registerToolSearchTool(
         return candidate ? selectedAccountEvidenceByCandidate.get(candidate) : undefined;
       };
 
-      const publicResult = (r: RankedWindowRow) => ({
+      const { peekHostCapabilityCatalogFactory, isCurrentCallableCatalogEntry } = await import(
+        '../runtime/harness/host-capability-catalog-factory.js'
+      );
+      const publishedCatalog = peekHostCapabilityCatalogFactory();
+      const publishedEffect = (name: string, capabilityRef: string | undefined) => {
+        if (!capabilityRef || planningBlockers[name]) return undefined;
+        const entry = publishedCatalog?.get(capabilityRef);
+        return entry && entry.toolName === name && isCurrentCallableCatalogEntry(entry)
+          ? entry.effect : undefined;
+      };
+
+      const publicResult = (r: RankedWindowRow) => {
+        const candidate = planningCandidateByName.get(r.name);
+        // Only the host-issued seal can supply native execution semantics.
+        // A provider row claiming local provenance is not a local definition.
+        const localDefinitions = candidate && planningRefs[r.name] && !planningBlockers[r.name]
+          ? inspectAuthorizedLocalPlanningDisclosureCandidates(candidate)
+          : null;
+        const localEffects = new Set(localDefinitions?.map((definition) => definition.descriptor.effect));
+        const effect = ((candidate?.capabilityVariants?.length ?? 0) <= 1
+          ? publishedEffect(r.name, planningRefs[r.name]) : undefined)
+          ?? (localEffects.size === 1 ? [...localEffects][0] : undefined);
+        const invocation = 'invocation' in r && r.invocation
+          ? r.invocation
+          : localDefinitions?.length
+            ? { name: r.name, payloadField: null }
+            : undefined;
+        return ({
           name: r.name,
           summary: ('summary' in r ? r.summary : r.oneLiner).slice(0, 600),
+          ...(effect ? { effect } : {}),
           ...(planningRefs[r.name]
             && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
             ? { capabilityRef: planningRefs[r.name] }
@@ -1377,20 +1605,40 @@ export function registerToolSearchTool(
           ...(planningRefs[r.name]
             && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) > 1
             ? {
-                capabilityVariants: planningCandidateByName.get(r.name)!.capabilityVariants,
+                capabilityVariants: planningCandidateByName.get(r.name)!.capabilityVariants!.map((variant) => ({
+                  ...variant,
+                  ...(localDefinitions?.find((definition) => definition.capabilityRef === variant.capabilityRef)
+                    ? { effect: localDefinitions.find((definition) => definition.capabilityRef === variant.capabilityRef)!.descriptor.effect }
+                    : {}),
+                })),
                 capabilitySelection: 'Choose exactly one variant before plan_task; work_call arguments must match that frozen variant.',
               }
             : {}),
           ...(planningRefs[r.name] && planningCandidateByName.get(r.name)
             ? { planningProvenance: planningCandidateByName.get(r.name)!.sourceKind }
             : {}),
+          ...(localDefinitions?.length && localDefinitions.every((definition) => definition.descriptor.effect === 'read')
+            && candidate?.carrier === 'work_call'
+            && (('carrier' in r && r.carrier) || opts.dispatchCarrierForName?.(r.name) || opts.dispatchCarrier) === 'call_tool'
+            ? { planningCarrier: 'work_call', planningInvocation: 'After selecting this read in a plan, use work_call with that exact plan operation id as requirement_id. The call_tool example remains available for an ordinary contextual read.' }
+            : {}),
           ...(planningRefs[r.name] && selectedAccountForName(r.name)
             ? { selectedAccount: selectedAccountForName(r.name)! }
             : {}),
-          ...(planningBlockers[r.name]
+          ...(planningBlockers[r.name]?.code === 'capability_publication_required'
+            ? {
+                planningRefStatus: 'materialization_unavailable' as const,
+                materializationReason: planningBlockers[r.name]!.reason ?? 'proof_not_registered',
+                materializationNextStep: CAPABILITY_PUBLICATION_NEXT_STEP,
+              }
+            : planningBlockers[r.name]
             ? {
                 planningRefStatus: 'account_selection_required' as const,
                 accountChoices: planningBlockers[r.name]!.choices,
+                ...(planningBlockers[r.name]!.reason ? { accountSelectionReason: planningBlockers[r.name]!.reason } : {}),
+                accountSelectionNextStep: planningBlockers[r.name]!.reason === 'review_unavailable'
+                  ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP
+                  : 'If the accepted user request already names the operating account, repeat tool_search with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}. The host checks source-versus-recipient meaning. Ask the user only if no account was selected or the choice remains unclear.',
               }
             : opts.discloseForPlanning && !planningRefs[r.name]
               ? localPlanningRowStatus(r.name)
@@ -1402,20 +1650,25 @@ export function registerToolSearchTool(
               : opts.dispatchCarrier
                 ? { carrier: opts.dispatchCarrier }
                 : {}),
-          ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
-          ...('invocation' in r && r.invocation
+          ...(invocation ? { invocation } : {}),
+          ...(planningRefs[r.name] ? {
+            planArgumentsHint: `For publish_plan, staticArgumentsJson contains only the direct ${r.name} input fields matching schemas.${r.name}. The invocation/example wrapper is used only for execution, not inside staticArgumentsJson.`,
+          } : {}),
+          ...(invocation
+            && planningBlockers[r.name]?.code !== 'capability_publication_required'
             ? { example: renderCarrierInvocationExample(
                 'carrier' in r && r.carrier
                   ? r.carrier
                   : (opts.dispatchCarrierForName?.(r.name) ?? opts.dispatchCarrier ?? 'work_call'),
-                r.invocation,
+                invocation,
                 planningRefs[r.name]
                   && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
                   ? planningRefs[r.name]
                   : undefined,
               ) }
             : {}),
-      });
+        });
+      };
 
       const formatPage = (
         rows: readonly RankedWindowRow[],
@@ -1498,7 +1751,7 @@ export function registerToolSearchTool(
           ...(role_key ? { role_key } : {}),
           page,
           page_count: pageCount,
-          total_results: rankedWindow.length,
+          total_results: deferredPage?.totalResults ?? rankedWindow.length,
           results: rows.map(publicResult),
           schemas,
           ...(Object.keys(schemaHandles).length > 0 ? { schema_handles: schemaHandles } : {}),
@@ -1508,42 +1761,80 @@ export function registerToolSearchTool(
           // fact, distinct from and never implied by an empty `results`.
           ...(unavailable.length > 0 ? { unavailable } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
-          hint,
+          hint: hintForRows(rows, Object.keys(schemaHandles).length > 0),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,
-            continuation_hint: 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
+            continuation_hint: canDeferPages
+              ? 'Use this cursor for the next retained page. Only that page receives current account and exact definition checks; broad discovery is not repeated.'
+              : 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
           } : {}),
         });
 
         let text = render();
-        const shownSchemaNames = [...schemaNames];
-        if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
-          const exactName = selectedExactly.name;
-          if (schemas[exactName] !== undefined) {
-            // Keep a compact structural preview when annotations are the only
-            // reason it crossed the ceiling, but retain the original bytes
-            // behind the content-addressed handle either way.
-            ensureSchemaHandle(exactName);
-            schemas[exactName] = stripSchemaAnnotations(schemas[exactName]);
-            text = render();
-          }
-        }
+        // The leading available schema is the argument contract for the best
+        // current result. Exact selection takes precedence; broad discovery
+        // must not evict its leading native/provider contract merely to keep
+        // lower-ranked previews. Authority and the output ceiling are unchanged.
+        const primarySchemaName = selectedExactly?.name
+          ?? schemaNames.find((name) => schemas[name] !== undefined);
+        const shownSchemaNames = [...schemaNames]
+          .filter((name) => name !== primarySchemaName);
         while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
           const moved = shownSchemaNames.pop()!;
           ensureSchemaHandle(moved);
           delete schemas[moved];
           text = render();
         }
+        if (
+          text.length > DEFAULT_TOOL_RESULT_MAX_CHARS
+          && primarySchemaName
+          && schemas[primarySchemaName] !== undefined
+        ) {
+          // Preserve direct argument instructions/examples in the structural
+          // preview, and retain the complete original behind its exact handle.
+          ensureSchemaHandle(primarySchemaName);
+          schemas[primarySchemaName] = compactSelectedSchema(schemas[primarySchemaName]);
+          text = render();
+        }
         // Guidance is useful but is not an argument contract. If an unusually
         // large instruction block alone breaches the result ceiling, omit it;
-        // the exact schema remains inline or losslessly addressable.
+        // the primary schema remains inline or losslessly addressable.
         if (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && selectedExactly) {
           delete guidance[selectedExactly.name];
           text = render();
         }
+        // Last resort: lower-ranked previews and optional guidance have yielded,
+        // but the primary contract still cannot fit. Keep its authenticated
+        // handle instead of emitting an oversized or malformed schema.
+        if (
+          text.length > DEFAULT_TOOL_RESULT_MAX_CHARS
+          && primarySchemaName
+          && schemas[primarySchemaName] !== undefined
+        ) {
+          ensureSchemaHandle(primarySchemaName);
+          delete schemas[primarySchemaName];
+          text = render();
+        }
         return text;
       };
+
+      if (canDeferPages) {
+        const remaining = rankedWindow.slice(requestedLimit);
+        const page = deferredPage?.page ?? 1;
+        const pageCount = deferredPage?.pageCount ?? Math.max(1, Math.ceil(rankedWindow.length / requestedLimit));
+        const nextCursor = remaining.length > 0 ? continuations.storePage(JSON.stringify({
+          kind: 'deferred_tool_search_page_v1', query, roleKey: role_key ?? null,
+          accountSelection: account_selection ?? null, limit: requestedLimit,
+          page: page + 1, pageCount, totalResults: deferredPage?.totalResults ?? rankedWindow.length,
+          rows: remaining.map((row) => ({
+            name: row.name, summary: 'summary' in row ? row.summary : row.oneLiner,
+            ...('sourceKind' in row && row.sourceKind ? { sourceKind: row.sourceKind } : {}),
+            ...('carrier' in row && row.carrier ? { carrier: row.carrier } : {}),
+          })),
+        } satisfies DeferredToolSearchPage), continuationSessionId) : undefined;
+        return textResult(formatPage(rankedWindow.slice(0, requestedLimit), page, pageCount, nextCursor));
+      }
 
       const pages: Array<readonly RankedWindowRow[]> = [];
       if (rankedWindow.length === 0) pages.push([]);

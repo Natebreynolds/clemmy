@@ -1,3 +1,5 @@
+import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
@@ -74,10 +76,8 @@ import {
 } from './compaction.js';
 import { windowScaleForModel } from './model-window-observations.js';
 import {
-  pullRecentTurnsForHarnessHistory,
   renderRecentActionsForHarnessHistory,
   renderSessionHistoryForModel,
-  renderTranscriptTurns,
 } from './session-transcript.js';
 import {
   continuationClassifyEnabled,
@@ -125,7 +125,7 @@ import {
 } from './delivery-committer.js';
 import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
 import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
-import { exactTerminalForAcceptedSource } from './accepted-source-terminal.js';
+import { exactTerminalForAcceptedSource, resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
 import {
   repairActionTerminalBeforeCommit,
   repairTerminalPresentation,
@@ -161,7 +161,7 @@ import {
 } from '../../agents/plan-proposals.js';
 import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateGoalInput } from '../../execution/goal-validate.js';
 import { recordVerdictEvent } from '../../execution/verdict.js';
-import { gatherSessionSkills, summarizeToolCallsForJudge, skillExecutionShortfall } from './skill-execution.js';
+import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroundingChatRetry } from './output-grounding-gate.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import {
@@ -611,6 +611,107 @@ function standardTurnIdentity(input: {
   // on different physical turns; both must still propose the same nested
   // identity for appendTerminalEventOnce's durable winner.
   return { sessionId: input.sessionId, turn: accepted.turn, sourceUserSeq };
+}
+
+/**
+ * Fence a recovery WRITE to the source that owns it.
+ *
+ * A late response from an older source must not install its blob over a newer
+ * source's live recovery — that is how a superseded owner reappeared after the
+ * newer turn had already moved on. Callers with no usable source stay
+ * unconditional: an unfenced write is correct only where the caller provably
+ * owns the turn, and inventing a source here would fence against the wrong one.
+ */
+function recoveryOwnerFence(
+  sourceUserSeq: number | undefined,
+  attemptId: string | undefined,
+): { owner: { sourceUserSeq: number; attemptId?: string } } | Record<string, never> {
+  // A source number does not identify an ACTIVATION. Two activations of the
+  // same accepted source compete for one blob, and the older one was able to
+  // replace the newer one's checkpoint while reporting success.
+  return Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+    ? { owner: { sourceUserSeq: sourceUserSeq as number, ...(attemptId ? { attemptId } : {}) } }
+    : {};
+}
+
+/**
+ * A rejected save did NOT install this activation as the recovery owner.
+ * Re-entering on its bytes would run work whose checkpoint another activation
+ * (or a published terminal) now owns.
+ */
+function recoverySaveWasRejected(
+  outcome: { installed: boolean; reason?: string },
+): boolean {
+  return outcome.installed !== true;
+}
+
+/**
+ * Record every rejected recovery save.
+ *
+ * A rejected save installed nothing, so the turn is NOT "held with recovery
+ * armed" — there is no owner and no checkpoint behind that claim. The two
+ * immediate-re-entry sites additionally stop; these record the fact so a held
+ * turn with no durable recovery is visible rather than silent.
+ */
+function noteRecoverySaveOutcome(
+  outcome: { installed: boolean; reason?: string },
+  ctx: {
+    sessionId: string;
+    turn: number;
+    sourceUserSeq: number | undefined;
+    attemptId: string | undefined;
+    site: string;
+    session?: HarnessSession;
+  },
+): boolean {
+  if (outcome.installed === true) {
+    // WAITING TO RESUME IS OWNED WORK. The moment recovery is armed this source
+    // has a resumption owed to it, and that must be true BEFORE any later
+    // adoption consumes the checkpoint — the window between arming and adoption
+    // was previously unowned, so a bridge sampling it saw a turn that looked
+    // finished. Claimed here because an INSTALLED save is the exact durable
+    // proof that the work is waiting rather than done.
+    if (ctx.session && Number.isSafeInteger(ctx.sourceUserSeq)) {
+      const claimed = ctx.session.claimContinuationOwner({
+        sourceUserSeq: ctx.sourceUserSeq as number,
+        attemptId: ctx.attemptId,
+      });
+      if (!claimed) {
+        // A newer source already owns continuation for this session. Our
+        // recovery is armed but we are not the owner, and saying so is the
+        // difference between a held turn and a silently abandoned one.
+        safeAppend({
+          sessionId: ctx.sessionId,
+          turn: ctx.turn,
+          role: 'system',
+          type: 'restart_recovery_decision',
+          data: {
+            decision: 'continuation_ownership_refused',
+            site: ctx.site,
+            sourceUserSeq: ctx.sourceUserSeq ?? null,
+            ...(ctx.attemptId ? { attemptId: ctx.attemptId } : {}),
+            reason: 'a newer source holds continuation responsibility',
+          },
+        });
+        return false;
+      }
+    }
+    return true;
+  }
+  safeAppend({
+    sessionId: ctx.sessionId,
+    turn: ctx.turn,
+    role: 'system',
+    type: 'restart_recovery_decision',
+    data: {
+      decision: 'recovery_save_rejected',
+      reason: outcome.reason ?? 'owner_conflict',
+      site: ctx.site,
+      sourceUserSeq: ctx.sourceUserSeq ?? null,
+      ...(ctx.attemptId ? { attemptId: ctx.attemptId } : {}),
+    },
+  });
+  return false;
 }
 
 function acceptedUserEvent(
@@ -2041,61 +2142,6 @@ function itemText(value: unknown): string {
     }).filter(Boolean).join('\n');
   }
   return '';
-}
-
-function normalizeReplaySearchText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function snapshotSearchText(items: AgentInputItem[]): string {
-  return normalizeReplaySearchText(items.map((item) => {
-    const record = item as { content?: unknown };
-    const content = itemText(record.content);
-    if (content.trim()) return content;
-    try { return JSON.stringify(item); } catch { return ''; }
-  }).filter(Boolean).join('\n'));
-}
-
-function snapshotIncludesTurn(snapshotText: string, turnText: string): boolean {
-  const needle = normalizeReplaySearchText(turnText);
-  if (!needle) return true;
-  if (snapshotText.includes(needle)) return true;
-  // Long assistant replies may be represented inside structured JSON or compacted
-  // with suffixes stripped. A strong prefix match is enough to avoid duplicate
-  // replay while still recovering genuinely missing Claude SDK turns.
-  if (needle.length > 240 && snapshotText.includes(needle.slice(0, 240))) return true;
-  return false;
-}
-
-function clipReplayFallback(text: string, maxChars: number): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= maxChars) return trimmed;
-  return `${trimmed.slice(0, Math.max(0, maxChars - 30))}\n...[session history truncated]`;
-}
-
-function renderEventlogReplayFallback(sessionId: string, currentInput: string, snapshotItems: AgentInputItem[]): string {
-  try {
-    const db = openEventLog();
-    const snapshotText = snapshotSearchText(snapshotItems);
-    const actions = renderRecentActionsForHarnessHistory(db, sessionId);
-    const turns = pullRecentTurnsForHarnessHistory(sessionId, 8);
-    const current = currentInput.trim();
-    const priorTurns = turns.length > 0 &&
-      turns[turns.length - 1]?.who === 'user' &&
-      turns[turns.length - 1]?.text.trim() === current
-      ? turns.slice(0, -1)
-      : turns;
-    const missingTurns = priorTurns.filter((turn) => !snapshotIncludesTurn(snapshotText, turn.text));
-    const parts = [
-      actions,
-      missingTurns.length > 0
-        ? `Recent transcript missing from the persisted SDK snapshot for ${sessionId}:\n${renderTranscriptTurns(missingTurns)}`
-        : '',
-    ].filter(Boolean);
-    return parts.length > 0 ? clipReplayFallback(parts.join('\n\n'), 8_000) : '';
-  } catch {
-    return '';
-  }
 }
 
 /**
@@ -5100,6 +5146,10 @@ type ScheduledHostRecovery = {
 };
 
 const scheduledHostRecoveries = new Map<string, ScheduledHostRecovery>();
+// One process-local executor for an exact accepted source, including its ready
+// checkpoint hop. Durable leases/checkpoint proofs remain authoritative across
+// processes; this only joins competing timer/immediate wakes in this process.
+const activeHostConversations = new Map<string, Promise<RunConversationResult>>();
 
 /**
  * Wake one private same-source checkpoint owner. Timers are process-local and
@@ -5117,58 +5167,55 @@ function scheduleHostCheckpointRecovery(
   if (scheduledHostRecoveries.has(key)) return;
   const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
   const timer = setTimeout(() => {
-    scheduledHostRecoveries.delete(key);
+    // Retain the scheduled owner while its async activation runs. Removing it
+    // at entry let a recovered frame schedule a second timer while the immediate
+    // continuation was still awaiting its model response.
+    if (scheduledHostRecoveries.get(key) !== scheduled) return;
     void (async () => {
-      const session = HarnessSession.load(options.sessionId);
-      const recoveryBlob = session?.loadRecoveryState();
-      if (!session || !recoveryBlob) return;
-      let recovery: HostRecoveryState;
+      let retry = false;
       try {
-        recovery = HostRecoveryState.fromString(recoveryBlob);
-      } catch {
-        return;
-      }
-      if (
-        recovery.sessionId !== options.sessionId
-        || recovery.sourceUserSeq !== sourceUserSeq
-      ) return;
-      const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
-      const sourceText = typeof source.data.text === 'string'
-        ? source.data.text
-        : options.input;
-      const {
-        onChunk: _discardChunk,
-        onConversationPreamble: _discardPreambleDelivery,
-        ...stableOptions
-      } = options;
-      try {
+        const session = HarnessSession.load(options.sessionId);
+        const recoveryBlob = session?.loadRecoveryState();
+        if (!session || !recoveryBlob) return;
+        let recovery: HostRecoveryState;
+        try { recovery = HostRecoveryState.fromString(recoveryBlob); } catch { return; }
+        if (recovery.sessionId !== options.sessionId || recovery.sourceUserSeq !== sourceUserSeq) return;
+        const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
+        const sourceText = typeof source.data.text === 'string' ? source.data.text : options.input;
+        const {
+          onChunk: _discardChunk,
+          onConversationPreamble: _discardPreambleDelivery,
+          ...stableOptions
+        } = options;
         const result = await runConversation({
           ...stableOptions,
           input: sourceText,
           sourceUserSeq,
           reuseRecordedUserInput: true,
           suppressMemoryCapture: true,
-          mcpToolScope: session.loadRecoveryMcpToolScope()
-            ?? options.mcpToolScope,
+          mcpToolScope: session.loadRecoveryMcpToolScope() ?? options.mcpToolScope,
         });
-        if (
-          result.status === 'held'
-          && HarnessSession.load(options.sessionId)?.loadRecoveryState()
-        ) {
-          scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
-        }
+        retry = result.status === 'held';
       } catch {
-        // A thrown local/surface failure does not transfer ownership to the
-        // user. If the exact state is still present, retry it with bounded
-        // backoff; no model or body can run before its own ref is reopened.
-        if (HarnessSession.load(options.sessionId)?.loadRecoveryState()) {
-          scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+        // Retry only while this exact source still owns a readable checkpoint.
+        retry = true;
+      } finally {
+        if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
+        if (retry) {
+          try {
+            const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
+            const held = blob ? HostRecoveryState.fromString(blob) : undefined;
+            if (held?.sessionId === options.sessionId && held.sourceUserSeq === sourceUserSeq) {
+              scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+            }
+          } catch { /* unreadable private state is not wake authority */ }
         }
       }
     })();
   }, delayMs);
   timer.unref?.();
-  scheduledHostRecoveries.set(key, { timer, attempt });
+  const scheduled: ScheduledHostRecovery = { timer, attempt };
+  scheduledHostRecoveries.set(key, scheduled);
 }
 
 export async function runConversation(
@@ -5177,19 +5224,31 @@ export async function runConversation(
   return withRuntimeConfigSnapshot(() => withAcceptedSourceCatalogManifestScope(
     options.acceptedCatalogScope,
     async () => {
-      const outcome = await runConversationWithinRuntimeConfig(options);
-      // A 'continue' checkpoint is a READY ordinary same-source continuation:
-      // the host has already committed the recovered frame's exact results
-      // and only needs the next model step. It is consumed at the top of the
-      // next activation (checkpoint adoption below), which used to mean the
-      // caller got "still owned by recovery" and the work waited for the next
-      // periodic/restart tick. Take that next activation here, once: the
-      // frame is committed and the batch is claim-cursored, so re-entering
-      // cannot replay a model step or a tool body. Anything but a ready
-      // continuation returns unchanged; a second hold stays with the durable
-      // owner exactly as before.
-      if (!checkpointContinuationIsReady(outcome, options)) return outcome;
-      return runConversationWithinRuntimeConfig(options);
+      // Replay before accepting/rearming, as before. Join an in-flight source
+      // before a second caller can rearm its restart metadata.
+      const replaySource = existingFreshConversationSource(options);
+      if (replaySource) {
+        const inFlight = activeHostConversations.get(`${options.sessionId}:${replaySource.seq}`);
+        if (inFlight) return inFlight;
+        const replay = replayedRunConversationResult(replaySource);
+        if (replay) return replay;
+      }
+      const sourceUserSeq = acceptFreshConversationInput(options);
+      const acceptedOptions = { ...options, sourceUserSeq };
+      const key = `${options.sessionId}:${sourceUserSeq}`;
+      const prior = activeHostConversations.get(key);
+      if (prior) return prior;
+      // Install the promise before any async activation work can yield/re-enter.
+      const owned = Promise.resolve().then(async () => {
+        const outcome = await runConversationWithinRuntimeConfig(acceptedOptions);
+        if (!checkpointContinuationIsReady(outcome, acceptedOptions)) return outcome;
+        return runConversationWithinRuntimeConfig(acceptedOptions);
+      });
+      activeHostConversations.set(key, owned);
+      try { return await owned; }
+      finally {
+        if (activeHostConversations.get(key) === owned) activeHostConversations.delete(key);
+      }
     },
   ));
 }
@@ -5231,22 +5290,11 @@ export function checkpointContinuationIsReady(
 }
 
 async function runConversationWithinRuntimeConfig(
-  options: RunConversationOptions,
+  options: RunConversationOptions & { sourceUserSeq: number },
 ): Promise<RunConversationResult> {
-  // Provider/fallover retries explicitly identify an already-accepted source.
-  // If that source has a public winner, return it before acceptUserInputForRun
-  // can re-arm restart metadata and before graph/authority/model execution can
-  // replay an effect-capable turn.
-  const replaySource = existingFreshConversationSource(options);
-  if (replaySource) {
-    const replay = replayedRunConversationResult(replaySource);
-    if (replay) return replay;
-  }
-  // Accept first: a marker with no accepted source has no logical turn to
-  // recover. Once armed, clear it only after the typed terminal commits. A
-  // reducer/SQLite failure must stay recoverable, and a completedReason
-  // candidate remains armed while the bridge tries the next brain.
-  const sourceUserSeq = acceptFreshConversationInput(options);
+  // Acceptance/replay and the exact-source activation owner live in the public
+  // entry point, so a ready checkpoint hop keeps the same executor throughout.
+  const sourceUserSeq = options.sourceUserSeq;
   const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
   const acceptedText = typeof acceptedSource.data.text === 'string' ? acceptedSource.data.text : options.input;
   const sessionKind = getSession(options.sessionId)?.kind ?? '';
@@ -5328,7 +5376,8 @@ async function runConversationWithinRuntimeConfig(
       };
     }
   }
-  const hostPlainConversation = hostOwnsFreshTurn && freshHostConversationSurfaceOnly({
+  const hostPlainConversation = hostOwnsFreshTurn && !['plan', 'execute'].includes(acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind ?? 'normal')
+    && freshHostConversationSurfaceOnly({
     sessionId: options.sessionId,
     sourceUserSeq,
   });
@@ -5354,6 +5403,12 @@ async function runConversationWithinRuntimeConfig(
       lastTurn: acceptedSource.turn,
       error: 'I could not safely load the current capability catalog for this request. Please retry.',
     };
+  }
+  if (hostPlanningCatalog?.ok && acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute') {
+    try { await revalidateReviewedPlanPreparation(hostPlanningCatalog.planning); }
+    catch (error) {
+      return { sessionId: options.sessionId, status: 'blocked', steps: 0, lastTurn: acceptedSource.turn, error: error instanceof Error ? error.message : 'Reviewed plan preparation is unavailable.' };
+    }
   }
   const graphEvent = hostOwnsFreshTurn ? null : await recordAcceptedSourceGraph({
       identity: {
@@ -5618,6 +5673,7 @@ async function runConversationWithinRuntimeConfig(
             sourceUserSeq,
           );
       if (hostDispatch) {
+        foregroundRelease = 'transfer';
         return recordAsyncWorkflowDispatch({
           sessionId: options.sessionId,
           sourceUserSeq,
@@ -5898,7 +5954,9 @@ async function runConversationCore(
   // an evidence reconciler, not a new public-answer author; its durable
   // settlements decide whether this saved candidate may ship.
   let effectArtifactSelfReconciliation: EffectArtifactSelfReconciliation | null = null;
-  let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
+  let completionVerification: {
+    failedOpen?: boolean; selfJudge?: boolean; ownerSelectedJudge?: boolean;
+  } | null = null;
   let totalToolCalls = 0;
   let meaningfulToolEvidence = false;
   // WATCHER judge (trajectory co-pilot, watcher-judge.ts). Spans the run for
@@ -7662,17 +7720,8 @@ async function runConversationCore(
         ? decision.reply
         : decision.summary;
       const multiResultObjective = objectiveMayRequireMultipleResults(objective);
-      const skillExecutionGateEnabled = (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off';
-      let skillExecutionGapEvaluated = false;
-      let cachedSkillExecutionGap: ReturnType<typeof skillExecutionShortfall> = null;
-      const currentSkillExecutionGap = (): ReturnType<typeof skillExecutionShortfall> => {
-        if (!skillExecutionGateEnabled) return null;
-        if (!skillExecutionGapEvaluated) {
-          cachedSkillExecutionGap = skillExecutionShortfall(options.sessionId);
-          skillExecutionGapEvaluated = true;
-        }
-        return cachedSkillExecutionGap;
-      };
+      // Reading a skill does not create another completion obligation. The
+      // existing objective judge interprets applicable retained references.
       // A bare plural collection noun ("items", "records") used to force a
       // second model to re-judge one already-settled connected read. Replace
       // only that false multi-result signal with an exact-source certificate:
@@ -7695,16 +7744,7 @@ async function runConversationCore(
             openApprovalCard: hasOpenApprovalCard(options.sessionId),
           })
         : null;
-      // Only a read that already passed the exact certificate pays the
-      // deterministic skill scan here. Other turns evaluate it lazily inside
-      // the judge branch, preserving the skill floor without charging casual
-      // plural conversation or an active goal-validation path.
-      const verifiedReadSkillGap = verifiedReadCompletionCandidate
-        ? currentSkillExecutionGap()
-        : null;
-      const verifiedReadCompletion = verifiedReadSkillGap
-        ? null
-        : verifiedReadCompletionCandidate;
+      const verifiedReadCompletion = verifiedReadCompletionCandidate;
       if (activeGoal && goalGate && freshExternalWriteVerified) {
         const goalPlan = activeGoal.approvedPlan ?? activeGoal.plan;
         const evidenceText = (decision.reply?.trim() ? decision.reply : decision.summary) ?? '';
@@ -7924,11 +7964,9 @@ async function runConversationCore(
         && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
       ) {
         const responseText = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
-        // Skill-execution rubric: if any skill was loaded this session, give the
-        // judge the skill's own steps + tool-call evidence so it verifies the
-        // skill was EXECUTED (deliverables produced), not just read. Fail-open:
-        // gather helpers return [] on error, so the judge runs exactly as before.
-        const loadedSkills = gatherSessionSkills(options.sessionId);
+        // Full retained references carry source/version facts. The existing
+        // objective judge decides applicability; reading does not adopt work.
+        const loadedSkills = gatherSessionSkills(options.sessionId, { sourceUserSeq: activeSourceUserSeq, includeUnavailable: true });
         // Always hand the judge the tool-call evidence — NOT only when a skill
         // loaded. A plain build/deploy/CLI run that loads no skill still did
         // real, verifiable work; judging ONLY decision.reply starved the judge
@@ -7998,28 +8036,30 @@ async function runConversationCore(
           reason: verdict.reason,
           failedOpen: verdict.failedOpen,
           selfJudge: verdict.selfJudge,
+          // Carry WHO ruled onto the durable row. Dropping it here made a
+          // stand-in's verdict indistinguishable from the owner's pinned judge.
+          judgeModelId: verdict.judgeModelId,
+          substituteForExactPin: verdict.substituteForExactPin,
+          requestedJudgeModelId: verdict.requestedJudgeModelId,
+          substituteReason: verdict.substituteReason,
         });
         if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
-          completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
+          // The PRODUCTION loop must carry selection provenance too — my earlier
+          // threading only touched the standalone Claude SDK caller, which the
+          // supported path never uses.
+          completionVerification = {
+            failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge,
+            ownerSelectedJudge: verdict.ownerSelectedJudge === true,
+          };
         }
-        // DETERMINISTIC skill-execution FLOOR. The LLM judge above can't be
-        // trusted for the binary "did the skill's bundled script run" — on the
-        // 2026-06-15 lunar-audit it HAD the evidence (no generate-html.js in the
-        // tool-call summary) and still passed a hand-rolled HTML. So enforce it in
-        // code: a loaded skill that prescribes bundled scripts but ran NONE of them
-        // was not executed → NOT done, regardless of the judge. Kill-switch
-        // HARNESS_SKILL_EXEC_GATE=off; fail-open (null → no gate). Conservative
-        // zero-ran threshold never false-bounces a partial-but-real run.
-        const skillGap = currentSkillExecutionGap();
         // AWAITING verdict: the judge ruled the reply's question/pause IS the
         // deliverable (backstop for shapes the deterministic ask-first invariant
         // can't classify, e.g. an honest partial-progress report). Yield to the
-        // user — never continue past a question awaiting their call. Runs AFTER
-        // the deterministic skill floor (a skill shortfall still bounces), and
-        // synthesizes the awaiting_user_input event so ?-less pause replies are
+        // user — never continue past a question awaiting their call. Synthesize
+        // the awaiting_user_input event so ?-less pause replies are
         // DELIVERED verbatim on every surface instead of respond-bridge falling
         // back to a stale session-wide question (adversarial review 2026-07-09).
-        if (verdict.awaitingUser && !skillGap) {
+        if (verdict.awaitingUser) {
           const awaitingSummary = publicReplyText(decision.reply, '')
             || 'I need a little more information before I can continue safely. What would you like me to do next?';
           const artifactState = standardArtifactTerminalState(options.sessionId, activeSourceUserSeq);
@@ -8067,7 +8107,15 @@ async function runConversationCore(
         // two hard self-bounces is what drove the ask-first regression into unapproved
         // sends. The delivery gate below still applies its deterministic
         // honesty checks either way.
-        const selfJudgeAdvisory = !verdict.done && verdict.selfJudge === true && !skillGap
+        // An owner-SELECTED same-provider judge is the configured supported path,
+        // not the coherence-trap fallback this downgrade exists for. Discarding
+        // its second disagreement would silently drop a real negative review
+        // just because both models share a provider. The one-hard-bounce cap
+        // still applies to the UNSELECTED fallback lane — two hard self-bounces
+        // are what drove the ask-first regression into unapproved sends — and
+        // MAX_OBJECTIVE_JUDGE_CONTINUATIONS still bounds both.
+        const selfJudgeAdvisory = !verdict.done && verdict.selfJudge === true
+          && verdict.ownerSelectedJudge !== true
           && objectiveJudgeContinuations >= 1;
         if (selfJudgeAdvisory) {
           safeAppend({
@@ -8083,12 +8131,8 @@ async function runConversationCore(
             },
           });
         }
-        if ((!verdict.done && !selfJudgeAdvisory) || skillGap) {
-          // A deterministic skill-execution shortfall overrides the LLM verdict
-          // with a script-specific reason; otherwise use the judge's reason.
-          const judgeReason = skillGap
-            ? `the "${skillGap.skill}" skill was loaded but NONE of its prescribed scripts ran (${skillGap.prescribed.join(', ')}) — the deliverable was hand-rolled instead of built by the skill's own pipeline`
-            : verdict.reason;
+        if (!verdict.done && !selfJudgeAdvisory) {
+          const judgeReason = verdict.reason;
           // This is a corrective continuation, not a terminal skill failure.
           // Counting each "not done yet" bounce against a draft could quarantine
           // a sound procedure after two loop iterations even when the run later
@@ -8104,16 +8148,10 @@ async function runConversationCore(
               kind: 'progress_check_in',
               steps: stepIndex,
               message: 'Checked the objective — not done yet, continuing.',
-              objectiveJudge: { attempt: objectiveJudgeContinuations, reason: judgeReason, skillGap: skillGap ? skillGap.skill : undefined },
+              objectiveJudge: { attempt: objectiveJudgeContinuations, reason: judgeReason },
             },
           });
-          nextInput = skillGap
-            ? [
-                `You marked this objective complete, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
-                'Do NOT hand-roll the deliverable. Run the skill\'s actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill\'s template exactly, then re-verify and finish.',
-                'Only set nextAction=completed once the skill\'s own scripts have produced and validated the artifact.',
-              ].join(' ')
-            : freshnessGap
+          nextInput = freshnessGap
               ? currentExternalWriteStatus === 'ambiguous'
                 ? [
                     'The current request has an ambiguous external-write outcome. Do NOT repeat the write.',
@@ -8651,7 +8689,7 @@ async function runConversationCore(
         // terminal. Route that rare shape through the ordinary judge before
         // publishing instead of leaving a receiptless optimized completion.
         const lateVerdict = await objectiveJudge(objective, userVisibleSummary, {
-          skills: gatherSessionSkills(options.sessionId),
+          skills: gatherSessionSkills(options.sessionId, { sourceUserSeq: activeSourceUserSeq, includeUnavailable: true }),
           toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
         });
         recordVerdictEvent(options.sessionId, turnResult.turn, {
@@ -8691,6 +8729,7 @@ async function runConversationCore(
           completionVerification = {
             failedOpen: lateVerdict.failedOpen,
             selfJudge: lateVerdict.selfJudge,
+            ownerSelectedJudge: lateVerdict.ownerSelectedJudge === true,
           };
         }
         terminalVerifiedReadReceipt = null;
@@ -9394,6 +9433,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const turn = nextTurnNumber(row);
   let persistedRecoveryState: HostRecoveryState | undefined;
   let adoptedCheckpointContinuation = false;
+  let adoptedRecoveryState: HostRecoveryState | undefined;
   const recoveryBlob = session.loadRecoveryState();
   if (recoveryBlob) {
     try {
@@ -9413,6 +9453,74 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   let sourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
     ? options.sourceUserSeq
     : undefined;
+  if (persistedRecoveryState) {
+    // RECONCILE A SUPERSEDED BLOB BEFORE SURRENDERING TO IT.
+    //
+    // A late model response can save recovery for a source whose terminal was
+    // already published. Every later accepted source then returned `held` here —
+    // before turn_started, before prompt composition, before any model call — so
+    // one stale blob blocked the session permanently. Live L12: source 138564
+    // published terminal 138643, the late response saved recovery ~7s after,
+    // and the next source 138644 died with no turn_started and no terminal.
+    //
+    // A blob whose OWN source provably has a public terminal owns nothing. Retire
+    // exactly those bytes and continue as a fresh source. A blob whose source has
+    // no terminal is genuine in-flight work and still holds.
+    //
+    // Retirement demands a TYPED terminal. The compatibility projection turns a
+    // legacy or corrupt row into a conservative blocked terminal rather than
+    // null, so its truthiness proves only that some row claims this source —
+    // never that the source published a readable one. Retiring live recovery on
+    // that evidence would discard genuine in-flight work.
+    //
+    // Retirement is also a compare-and-swap on the EXACT bytes we read. Without
+    // them there is nothing to condition on, so the blob keeps its ownership.
+    if (
+      persistedRecoveryState.sessionId === options.sessionId
+      && sourceUserSeq !== undefined
+      && sourceUserSeq !== persistedRecoveryState.sourceUserSeq
+      && typeof recoveryBlob === 'string'
+      && recoveryBlob.length > 0
+    ) {
+      let ownerPublishedTypedTerminal = false;
+      try {
+        ownerPublishedTypedTerminal = resolveExactTerminalForAcceptedSource(
+          acceptedUserEvent(options.sessionId, persistedRecoveryState.sourceUserSeq),
+        ).kind === 'terminal';
+      } catch { /* unreadable ⇒ treat the blob as live and hold */ }
+      if (ownerPublishedTypedTerminal) {
+        let retired = false;
+        try {
+          retired = session.clearRecoveryState(recoveryBlob);
+        } catch { retired = false; }
+        safeAppend({
+          sessionId: options.sessionId,
+          turn,
+          role: 'system',
+          type: 'restart_recovery_decision',
+          data: retired
+            ? {
+                decision: 'retired_superseded_recovery',
+                supersededSourceUserSeq: persistedRecoveryState.sourceUserSeq,
+                acceptedSourceUserSeq: sourceUserSeq,
+                reason: 'the recovery owner already published a typed terminal',
+              }
+            : {
+                // A failed swap means the durable owner is no longer the blob we
+                // read — a newer source installed its own, or storage refused.
+                // Announcing retirement here is what would make the record lie.
+                decision: 'retained_recovery_after_failed_retirement',
+                supersededSourceUserSeq: persistedRecoveryState.sourceUserSeq,
+                acceptedSourceUserSeq: sourceUserSeq,
+                reason: 'recovery ownership changed or storage refused the retirement',
+              },
+        });
+        // Only a CONFIRMED durable retirement admits this turn. Otherwise the
+        // held path below keeps the surviving owner intact.
+        if (retired) persistedRecoveryState = undefined;
+      }
+    }
+  }
   if (persistedRecoveryState) {
     if (
       persistedRecoveryState.sessionId !== options.sessionId
@@ -9445,11 +9553,44 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           !== acceptedModelBatchHistoryDigest(persistedRecoveryState.history)
         || (checkpoint.lastResponseId ?? undefined)
           !== persistedRecoveryState.lastResponseId
-        || !session.adoptRecoveredConversation({
-          serializedState: recoveryBlob!,
-          history: persistedRecoveryState.history,
-          lastResponseId: persistedRecoveryState.lastResponseId,
-        })
+        || !(() => {
+          // Claim continuation responsibility BEFORE adoption removes the blob,
+          // and let a FAILED claim stop the adoption.
+          //
+          // Sampling the blob after adoption is what told the desktop bridge a
+          // live turn had stopped (live source 141915: recovery ran 4ms before
+          // the attempt was marked completed). And a claim that fails means a
+          // newer source owns continuation for this session — consuming the
+          // checkpoint anyway would destroy the resume state of work we do not
+          // own, which is precisely the outcome the blob is there to prevent.
+          let owned = false;
+          try {
+            owned = session.claimContinuationOwner({
+              sourceUserSeq: persistedRecoveryState!.sourceUserSeq,
+              attemptId: options.runAttemptId,
+            });
+          } catch { owned = false; }
+          if (!owned) {
+            safeAppend({
+              sessionId: options.sessionId,
+              turn,
+              role: 'system',
+              type: 'restart_recovery_decision',
+              data: {
+                decision: 'adoption_refused_without_ownership',
+                sourceUserSeq: persistedRecoveryState!.sourceUserSeq,
+                ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+                reason: 'continuation responsibility belongs to another source; the checkpoint is left intact',
+              },
+            });
+            return false;
+          }
+          return session.adoptRecoveredConversation({
+            serializedState: recoveryBlob!,
+            history: persistedRecoveryState!.history,
+            lastResponseId: persistedRecoveryState!.lastResponseId,
+          });
+        })()
       ) {
         return {
           sessionId: options.sessionId,
@@ -9462,6 +9603,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // here forward this is a fresh same-source continuation, so all normal
       // memory/context/tool-surface/model policy layers run in their usual
       // order; none were allowed to gate the prior bookkeeping adoption.
+      // Adoption changes the session snapshot owner, not the accepted source's
+      // consumed judge/no-progress budget or exact checkpoint history. Preserve
+      // the already-proved typed state for the ordinary host runner invocation.
+      adoptedRecoveryState = persistedRecoveryState;
       persistedRecoveryState = undefined;
       adoptedCheckpointContinuation = true;
     }
@@ -9542,6 +9687,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   ) {
     try {
       discoveryGovernor.initializeTask({
+        claimKeyVersion: 'exact_request_v1',
         sessionId: options.sessionId,
         sourceUserSeq: sourceUserSeq as number,
         knownCapability: false,
@@ -9890,45 +10036,37 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     });
   }
 
-  // Cross-brain replay fallback: the Claude SDK brain writes canonical
-  // user_input_received/conversation_completed rows, but it does not populate the
-  // OpenAI SDK conversation snapshot. If a later turn for the same session falls
-  // over to this standard harness lane, replay only the eventlog turns/actions
-  // missing from the snapshot. That covers both a fully empty snapshot and a mixed
-  // session with an older OpenAI snapshot plus newer Claude turns, without
-  // duplicating normal harness history.
-  const replay = renderEventlogReplayFallback(options.sessionId, options.input, compactedItems);
-  if (replay) {
-    compactedItems = [
-      {
-        role: 'system',
-        content: `[SESSION REPLAY]\n${replay}`,
-      } as AgentInputItem,
-      ...compactedItems,
-    ];
+  // Public terminals may land after the private tool checkpoint. Reopen them
+  // in their source-owned position before the new accepted request; never put
+  // a stopped assistant answer ahead of the request it answered as system text.
+  if (!adoptedCheckpointContinuation && sourceUserSeq) {
+    try {
+      const { replayMissingPublicTurns } = await import('./session-public-replay.js');
+      compactedItems = replayMissingPublicTurns({ sessionId: options.sessionId, sourceUserSeq, history: compactedItems });
+      const actions = renderRecentActionsForHarnessHistory(openEventLog(), options.sessionId, 20, sourceUserSeq);
+      if (actions) compactedItems = [{ role: 'system', content: `[SESSION ACTION EVIDENCE]\n${actions}` } as AgentInputItem, ...compactedItems];
+    } catch { /* retained private history remains available on replay failure */ }
   }
 
-  // Cross-session prefix injection. The seed function in discord-harness
-  // writes a cross_session_prefix event when a fresh session opens with
-  // prior same-channel context. Without injecting it into items here,
-  // the agent only sees it if it explicitly calls session_history —
-  // which it often skips. Prepending as a system message guarantees
-  // the agent reads the continuation context BEFORE deciding what tool
-  // to call. (Observed in the missing-focus regression: agent skipped
-  // session_history, called memory_recall, picked the wrong sheet.)
-  // Only on the FIRST turn — subsequent turns already have it in
-  // compactedItems via session history replay.
-  if (turn === 1 || compactedItems.length === 0) {
+  // Same-conversation context is also seeded when an older daemon's active
+  // successor first returns after upgrade. Inject every missing prefix before
+  // choosing a tool, even after turn one; an existing exact item prevents
+  // duplication. These public historical exchanges carry no execution grants.
+  {
     try {
       const prefixEvents = listEvents(options.sessionId, { types: ['cross_session_prefix'] });
       if (prefixEvents.length > 0) {
-        const prefixText = prefixEvents
+        const prefixTexts = prefixEvents
           .map((e) => {
             const text = (e.data as { text?: unknown })?.text;
             return typeof text === 'string' ? text : '';
           })
-          .filter(Boolean)
-          .join('\n\n');
+          .filter(Boolean);
+        const existingSystemTexts = compactedItems.flatMap((item) => {
+          const candidate = item as unknown as { role?: unknown; content?: unknown };
+          return candidate.role === 'system' ? [itemText(candidate.content)] : [];
+        });
+        const prefixText = prefixTexts.filter((text) => !existingSystemTexts.some((existing) => existing.includes(text))).join('\n\n');
         if (prefixText) {
           compactedItems.unshift({ role: 'system', content: prefixText } as AgentInputItem);
         }
@@ -10736,6 +10874,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         const recallBudget = new RecallBudget(
           recallBudgetMaxCalls(windowScaleForModel(routedModelIdForBudget)),
           recallBudgetMaxBytes(windowScaleForModel(routedModelIdForBudget)),
+          options.sessionId,
         );
         harnessCtx = {
           sessionId: options.sessionId,
@@ -10776,13 +10915,35 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             let outcome = await run(
               runner,
               options.agent,
-              (persistedRecoveryState ?? items) as unknown as AgentInputItem[],
+              (persistedRecoveryState ?? adoptedRecoveryState ?? items) as unknown as AgentInputItem[],
               opts,
             );
             if (outcome.hold && outcome.serializedRecoveryState) {
-              session.saveRecoveryState(outcome.serializedRecoveryState, {
+              const saved = session.saveRecoveryState(outcome.serializedRecoveryState, {
                 mcpToolScope: harnessCtx?.mcpToolScope,
+                ...(recoveryOwnerFence(sourceUserSeq, options.runAttemptId)),
               });
+              if (!noteRecoverySaveOutcome(saved, {
+                sessionId: options.sessionId, turn, sourceUserSeq,
+                attemptId: options.runAttemptId, site: 'fresh_hold', session,
+              })) {
+                // We are not the recovery owner: another activation installed
+                // its own checkpoint, or this source already terminalized.
+                // Re-entering would run work on bytes we do not own.
+                safeAppend({
+                  sessionId: options.sessionId,
+                  turn,
+                  role: 'system',
+                  type: 'restart_recovery_decision',
+                  data: {
+                    decision: 'recovery_save_rejected',
+                    reason: (saved as { reason?: string }).reason ?? 'owner_conflict',
+                    sourceUserSeq: sourceUserSeq ?? null,
+                    ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+                  },
+                });
+                return outcome;
+              }
               // One immediate exact re-entry closes ordinary transient local
               // store failures. The recovery state replays neither model nor
               // tool body; a second hold remains durable for the periodic/
@@ -10800,9 +10961,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
                   opts,
                 );
                 if (outcome.hold && outcome.serializedRecoveryState) {
-                  session.saveRecoveryState(outcome.serializedRecoveryState, {
-                    mcpToolScope: harnessCtx?.mcpToolScope,
-                  });
+                  noteRecoverySaveOutcome(
+                    session.saveRecoveryState(outcome.serializedRecoveryState, {
+                      mcpToolScope: harnessCtx?.mcpToolScope,
+                      ...(recoveryOwnerFence(sourceUserSeq, options.runAttemptId)),
+                    }),
+                    { sessionId: options.sessionId, turn, sourceUserSeq,
+                      attemptId: options.runAttemptId, site: 'fresh_reentry_hold', session },
+                  );
                 }
               }
             }
@@ -10835,9 +11001,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // The durable restart owner remains armed. Do not snapshot a carrier,
       // bump the logical conversation, or manufacture a public terminal.
       if (outcome.serializedRecoveryState) {
-        session.saveRecoveryState(outcome.serializedRecoveryState, {
-          mcpToolScope: harnessCtx?.mcpToolScope,
-        });
+        noteRecoverySaveOutcome(
+          session.saveRecoveryState(outcome.serializedRecoveryState, {
+            mcpToolScope: harnessCtx?.mcpToolScope,
+            ...(recoveryOwnerFence(sourceUserSeq, options.runAttemptId)),
+          }),
+          { sessionId: options.sessionId, turn, sourceUserSeq,
+            attemptId: options.runAttemptId, site: 'fresh_outer_hold', session },
+        );
       }
       if (outcome.serializedState) {
         // Reopen failure for an existing approval retains that exact approval
@@ -11564,11 +11735,30 @@ export async function resumePendingApproval(
               { ...opts, stream: true },
             );
             if (outcome.hold && outcome.serializedRecoveryState) {
-              session.saveRecoveryState(outcome.serializedRecoveryState, {
+              const saved = session.saveRecoveryState(outcome.serializedRecoveryState, {
                 mcpToolScope: resumeAgentScopeBinding.bound
                   ? resumeAgentScopeBinding.scope
                   : undefined,
+                ...(recoveryOwnerFence(resumeSourceUserSeq, options.runAttemptId)),
               });
+              if (!noteRecoverySaveOutcome(saved, {
+                sessionId: options.sessionId, turn, sourceUserSeq: resumeSourceUserSeq,
+                attemptId: options.runAttemptId, site: 'resume_hold', session,
+              })) {
+                safeAppend({
+                  sessionId: options.sessionId,
+                  turn,
+                  role: 'system',
+                  type: 'restart_recovery_decision',
+                  data: {
+                    decision: 'recovery_save_rejected',
+                    reason: (saved as { reason?: string }).reason ?? 'owner_conflict',
+                    sourceUserSeq: resumeSourceUserSeq ?? null,
+                    ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+                  },
+                });
+                return outcome;
+              }
               const recovery = HostRecoveryState.fromString(outcome.serializedRecoveryState);
               if (recovery.phase !== 'continue') {
                 outcome = await run(
@@ -11578,11 +11768,16 @@ export async function resumePendingApproval(
                   { ...opts, stream: true },
                 );
                 if (outcome.hold && outcome.serializedRecoveryState) {
-                  session.saveRecoveryState(outcome.serializedRecoveryState, {
-                    mcpToolScope: resumeAgentScopeBinding.bound
-                      ? resumeAgentScopeBinding.scope
-                      : undefined,
-                  });
+                  noteRecoverySaveOutcome(
+                    session.saveRecoveryState(outcome.serializedRecoveryState, {
+                      mcpToolScope: resumeAgentScopeBinding.bound
+                        ? resumeAgentScopeBinding.scope
+                        : undefined,
+                      ...(recoveryOwnerFence(resumeSourceUserSeq, options.runAttemptId)),
+                    }),
+                    { sessionId: options.sessionId, turn, sourceUserSeq: resumeSourceUserSeq,
+                      attemptId: options.runAttemptId, site: 'resume_reentry_hold', session },
+                  );
                 }
               }
             }
@@ -11610,11 +11805,16 @@ export async function resumePendingApproval(
 
     if (outcome.hold) {
       if (outcome.serializedRecoveryState) {
-        session.saveRecoveryState(outcome.serializedRecoveryState, {
-          mcpToolScope: resumeAgentScopeBinding.bound
-            ? resumeAgentScopeBinding.scope
-            : undefined,
-        });
+        noteRecoverySaveOutcome(
+          session.saveRecoveryState(outcome.serializedRecoveryState, {
+            mcpToolScope: resumeAgentScopeBinding.bound
+              ? resumeAgentScopeBinding.scope
+              : undefined,
+            ...(recoveryOwnerFence(resumeSourceUserSeq, options.runAttemptId)),
+          }),
+          { sessionId: options.sessionId, turn, sourceUserSeq: resumeSourceUserSeq,
+            attemptId: options.runAttemptId, site: 'resume_outer_hold', session },
+        );
       }
       if (outcome.serializedState) {
         session.saveInterruptState(outcome.serializedState, {
@@ -14972,8 +15172,30 @@ function truncate(s: string, n: number): string {
 /** Per-turn recall_tool_result budget — env-tunable so grown data sources
  *  (a daily-append tracker sheet) don't hit a hard cliff. Defaults sized to
  *  page a ~150KB payload in one turn while still bounding re-inflation. */
+/**
+ * METER THE COST, NOT THE COUNT.
+ *
+ * Recall's real resource is BYTES INTO CONTEXT, and `recallBudgetMaxBytes`
+ * already measures exactly that. The call count was a proxy for the same thing
+ * and it fired far earlier: live 2026-09-07 source 149138 — the owner's
+ * Platform 49 sheet review — consumed 94,776 of 150,000 permitted bytes (63%,
+ * with 55KB of headroom) across 19 returns, and was refused 11 times by a
+ * five-call cliff. Every one of those refusals then sent the model to another
+ * reader, so the proxy did not save context: it spent 11 extra calls.
+ *
+ * The count survives only as a RUNAWAY BACKSTOP, well clear of any real job, so
+ * a pathological loop still terminates while ordinary paging never touches it.
+ * The byte budget remains the honest bound and is unchanged.
+ *
+ * 50, not 200: a backstop is not free. It bounds how long a genuinely looping
+ * caller grinds before it stops, and an absurdly high one turns a stuck loop
+ * into a hang — measured here as recall-exercising test files sliding from
+ * seconds to past a ten-minute watchdog. 50 is ~2.5x the largest real run
+ * observed (19 returns, 94,776 bytes) and still far below anything that reads
+ * as productive work.
+ */
 function recallBudgetMaxCalls(windowScale = 1): number {
-  const fallback = Math.round(5 * windowScale);
+  const fallback = Math.round(50 * windowScale);
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_CALLS', String(fallback)) ?? String(fallback), 10);
   return Number.isFinite(raw) && raw >= 1 ? raw : fallback;
 }

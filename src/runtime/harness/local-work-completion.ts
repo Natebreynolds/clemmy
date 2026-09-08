@@ -1,3 +1,4 @@
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 /** Completion projection, not an execution gate: an accepted, typed item
  * declaration does not disappear because its coordinator never entered. */
 import type { AgentInputItem } from '@openai/agents';
@@ -64,7 +65,7 @@ export function pendingAcceptedLocalWork(input: {
   }>;
   if (admissions.length === 0) return null;
   const sourceEvents = listEvents(input.sessionId, { sinceSeq: input.sourceUserSeq - 1 });
-  const nextSource = sourceEvents.find((event) => event.seq > input.sourceUserSeq && event.type === 'user_input_received');
+  const nextSource = sourceEvents.find((event) => event.seq > input.sourceUserSeq && event.type === 'user_input_received' && !isLiveApprovalAcknowledgement(event));
   const ownedEvents = sourceEvents.filter((event) => event.seq > input.sourceUserSeq
     && (event.data.sourceUserSeq === input.sourceUserSeq
       || (event.data.sourceUserSeq === undefined && (!nextSource || event.seq < nextSource.seq))));

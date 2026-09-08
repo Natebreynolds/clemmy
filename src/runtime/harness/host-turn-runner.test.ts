@@ -101,8 +101,9 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   // Live 2026-09-05, from the phone: the model asked for OUTLOOK_CREATE_DRAFT,
   // which this turn had not proven. One unrelated Outlook READ was in the
   // proven set, so the reply was a menu headed "use one of those exactly" —
-  // reads offered in place of a write, with no mention of plan_task, the only
-  // door a write takes. It re-searched eighteen times and the turn died.
+  // reads offered in place of a write. It re-searched eighteen times and the
+  // turn died. Proven writes now share the read discovery path; planning is
+  // for work topology, not a second capability-acquisition door.
   const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
   const foreign = [
     'GREENHOUSE_CREATE_USER_EMAIL', 'OPENAI_CREATE_MESSAGE', 'AIRTABLE_CREATE_RECORD',
@@ -115,7 +116,11 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
   });
   assert.match(withStaleRead, /OUTLOOK_CREATE_DRAFT is not proven for this step/);
-  assert.match(withStaleRead, /plan_task/, 'the write door is named');
+  assert.match(withStaleRead, /published executable capabilityRef and work_call example/);
+  assert.match(withStaleRead, /existing tool edge still decides allow, deny, or ask/);
+  assert.match(withStaleRead, /unsupported_unmaterialized.*do not invent a requirement_id/);
+  assert.doesNotMatch(withStaleRead, /WRITE or SEND does not|plan_task first/,
+    'a write is not sent back through the retired staging-only rule');
   assert.ok(!/Use one of those exactly/.test(withStaleRead),
     'a menu of reads is never offered as the answer to a write');
 
@@ -127,14 +132,17 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   });
   assert.match(wrongProvider, /Nothing from OUTLOOK is proven/);
   assert.match(wrongProvider, /do not substitute another provider/);
-  assert.match(wrongProvider, /plan_task/);
+  assert.match(wrongProvider, /Discover that exact operation with tool_search/);
 
-  // A spelling slip on an operation that IS proven keeps the exact-list reply.
+  // A discovered operation still needs a published executable ref. The live
+  // readback failure recognized the account/operation but never materialized it.
   const spellingSlip = hostProvenOperationRepair({
     requestedOperation: 'OUTLOOK_GET_DRAFTS_MAIL_FOLDER',
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
   });
-  assert.match(spellingSlip, /The operations proven for this step are: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
+  assert.match(spellingSlip, /Operations found during discovery: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
+  assert.match(spellingSlip, /does not establish executable readiness/);
+  assert.match(spellingSlip, /do not guess a requirement_id or repeat unchanged discovery/);
 
   assert.match(
     hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),
@@ -151,13 +159,22 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
     accountChoices: ['first@example.test', 'second@example.test'],
   });
-  assert.match(needsAccount, /still needs you to say which connected account/);
+  assert.match(needsAccount, /checked source-account selection/);
+  assert.match(needsAccount, /account_selection.*source_quote/);
   assert.match(needsAccount, /ask_user_question/);
   assert.match(needsAccount, /first@example\.test, second@example\.test/);
   assert.ok(!/plan_task/.test(needsAccount),
     'a question the user must answer is not routed through planning');
   assert.ok(!/Use one of those exactly/.test(needsAccount),
     'and never answered with a menu of other operations');
+  const unavailableReview = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_DRAFT', provenOperations: [],
+    accountChoices: ['first@example.test', 'second@example.test'], accountReviewUnavailable: true,
+  });
+  assert.match(unavailableReview, /host source-account review did not complete/);
+  assert.match(unavailableReview, /identical account_selection/);
+  assert.doesNotMatch(unavailableReview, /ask_user_question/);
+
 });
 
 test('returned nested-call repair requires exact zero-crossing invalid-arguments settlement truth', () => {
@@ -338,7 +355,7 @@ function throwingRunner(): EventEmitter {
 }
 
 let acceptedSerial = 0;
-function acceptHostCanarySource(label: string) {
+function acceptHostCanarySource(label: string, text = `Exercise the ${label} host boundary.`, sourceData: Record<string, unknown> = {}) {
   const session = eventlog.createSession({
     id: `host-canary-${++acceptedSerial}-${label}`,
     kind: 'chat',
@@ -348,7 +365,7 @@ function acceptHostCanarySource(label: string) {
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: `Exercise the ${label} host boundary.` },
+    data: { ...sourceData, text },
   });
   const parent = {
     sessionId: session.id,
@@ -888,6 +905,7 @@ test('activated-plan carrier refusal names existing-call repair instead of an un
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorStore = capabilityManifestStores.peekCapabilityManifestStore();
   const priorFetch = globalThis.fetch;
+  const priorSemanticPort = semanticPorts.peekTurnSemanticModelPort();
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   const client = await import('../../integrations/composio/client.js');
@@ -913,35 +931,77 @@ test('activated-plan carrier refusal names existing-call repair instead of an un
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
   connected.installConnectedRegistryPort(() => ({ connectedToolkits: ['outlook'], tools: [{ slug: operationId, schema: inputSchema }] }));
   try {
-    const fixture = acceptHostCanarySource('create-external-draft');
+    const acceptedText = 'Create one Outlook draft with subject "Fixture draft" and body "Fixture body" in my connected mailbox. Do not send it.';
+    const fixture = acceptHostCanarySource('create-external-draft', acceptedText);
+    let accountReviews = 0;
+    semanticPorts.installTurnSemanticModelPort({
+      async interpret() { throw new Error('the primary model, not account routing, authors this plan'); },
+      async judgeAccountSelection(call) {
+        accountReviews += 1;
+        assert.equal(call.sessionId, fixture.session.id);
+        assert.equal(call.sourceUserSeq, fixture.source.seq);
+        assert.equal(call.acceptedText, acceptedText);
+        assert.equal(call.toolkit, 'outlook');
+        assert.equal(call.accountIdentity, accountId);
+        assert.equal(call.mode, 'current_source_default');
+        return { verdict: 'default_compatible', proposalDigest: call.proposalDigest,
+          modelIdentity: 'fixture-account-reviewer' };
+      },
+    });
     Object.assign(fixture.context, { turn: 1 });
     Object.assign(fixture.parent, { turn: 1 });
     const primed = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
     assert.equal(primed.ok, true, JSON.stringify(primed));
     if (!primed.ok) return;
-    const plan = {
-      preamble: 'I will create the requested draft without sending it.',
-      draft: {
-        criteria: ['Create one draft.'], cardinality: null,
-        destination: { posture: 'create_new', family: 'external_resource', handleRequired: true },
-        topology: { version: 1, operations: [{ id: 'create_draft', effect: 'external_write', coverage: null,
-          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } }], universes: [] },
-        bindings: [{ operationId: 'create_draft', role: 'destination', capabilityRef: 'cap:resolved:outlook_create_draft', evidence: ['result'] }],
-        deliverables: [{ id: 'draft', kind: 'result' }], evidenceRequirements: ['result'],
-      },
-    };
+    let plan: Record<string, unknown>;
     let calls = 0;
     let contractBefore: unknown;
     const model = {
       async getResponse(request: unknown) {
         calls += 1;
+        const input = (request as { input: Array<{ type?: string; callId?: string; output?: { text?: string } }> }).input;
+        const toolResults = input.filter((item) => item.type === 'function_call_result');
+        // A failed activation needs its exact tool results, not a serialized
+        // model request large enough to obscure the assertion in Node's IPC.
+        const diagnostic = JSON.stringify(toolResults.map((item) => ({
+          callId: item.callId, text: item.output?.text?.slice(0, 2_000),
+        })));
+        if (calls === 2) {
+          const discovery = toolResults.find((item) => item.callId === 'discover-draft');
+          const result = JSON.parse(discovery?.output?.text ?? '{}') as {
+            results?: Array<{ name: string; capabilityRef?: string }>;
+          };
+          const capabilityRef = result.results?.find((entry) => entry.name === operationId)?.capabilityRef;
+          assert.ok(capabilityRef, diagnostic);
+          const planning = semanticCompile.snapshotPrimaryModelPlanningContext(primed.planning.authority);
+          const capability = planning?.capabilities.find((entry) => entry.id === capabilityRef);
+          assert.ok(capability, 'discovery must publish the exact capability before plan_task');
+          assert.equal(capability.effect, 'external_write');
+          assert.equal(capability.accountScope, accountId);
+          assert.equal(capability.destinationPosture, 'create_new');
+          assert.deepEqual(capability.evidenceKinds, ['tool_result']);
+          plan = {
+            preamble: 'I will create the requested draft without sending it.',
+            draft: {
+              criteria: ['Create one draft.'], cardinality: null,
+              destination: { posture: capability.destinationPosture, family: capability.deliverableKind,
+                handleRequired: capability.handleRequired },
+              topology: { version: 1, operations: [{ id: 'create_draft', effect: capability.effect, coverage: null,
+                dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } }], universes: [] },
+              bindings: [{ operationId: 'create_draft', role: 'destination', capabilityRef: capability.id,
+                evidence: [...capability.evidenceKinds] }],
+              deliverables: [{ id: 'draft', kind: capability.deliverableKind }],
+              evidenceRequirements: [...capability.evidenceKinds],
+            },
+          };
+        }
         if (calls === 3) {
           contractBefore = expectedWorkContracts.loadExpectedWorkContract(fixture.session.id, fixture.source.seq);
-          assert.equal((contractBefore as { status: string }).status, 'ok', JSON.stringify(request));
+          assert.equal((contractBefore as { status: string }).status, 'ok', diagnostic);
+          assert.ok(eventlog.getTurnGraphEventForSource(fixture.session.id, fixture.source.seq), diagnostic);
           assert.equal(expectedWorkAdmission.actionExpectedWorkRequired(fixture.context), true);
         }
         if (calls === 4) {
-          const input = (request as { input: Array<{ type?: string; callId?: string; output?: { text?: string } }> }).input;
           const refusal = input.find((item) => item.type === 'function_call_result' && item.callId === 'repair-inner-name');
           const text = refusal?.output?.text ?? '';
           assert.match(text, /effective_inner_name_missing/);
@@ -964,10 +1024,12 @@ test('activated-plan carrier refusal names existing-call repair instead of an un
       hostFreshPlanning: primed.planning, allowToolJit: true, model: model as never });
     await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
     assert.equal(calls, 4);
+    assert.equal(accountReviews, 1);
     assert.equal(providerCalls, 0);
     assert.deepEqual(expectedWorkContracts.loadExpectedWorkContract(fixture.session.id, fixture.source.seq), contractBefore);
     assert.equal(eventlog.listEvents(fixture.session.id, { types: ['approval_requested', 'external_write_succeeded'] }).length, 0);
   } finally {
+    semanticPorts.installTurnSemanticModelPort(priorSemanticPort);
     globalThis.fetch = priorFetch;
     adapters.installProductionTransport(null);
     client.__test__.setComposioApiKeyOverride(null);
@@ -5748,6 +5810,78 @@ test('production host carries generic user-question and worker envelopes through
   }
 });
 
+
+test('production named workflow coordinator reaches the real source-bound queue without Plan', async (t) => {
+  const { writeWorkflow } = await import('../../memory/workflow-store.js');
+  const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  try {
+    for (const variant of ['normal', 'plan', 'disabled', 'missing-input', 'unbound-origin', 'unknown-workflow'] as const) {
+      await t.test(variant, async () => {
+        const name = `host-coordinator-${variant}`;
+        writeWorkflow(name, {
+          name, description: 'Summarize supplied text only.', enabled: variant !== 'disabled',
+          trigger: { manual: true },
+          steps: [{ id: 'summary', prompt: 'Summarize {{input.text}} here. Do not send or publish.', sideEffect: 'read' }],
+        });
+        const replyTarget = { type: 'origin_chat' } as const;
+        const fixture = acceptHostCanarySource(`named-coordinator-${variant}`,
+          `Run ${name} now with text Southgate is Ready. Give the result here.`, {
+            taskMode: { version: 1, kind: variant === 'plan' ? 'plan' : 'normal' },
+            ...(variant === 'unbound-origin' ? {} : {
+              originReplyTarget: replyTarget,
+              originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget),
+            }),
+          });
+        const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+          reachableBuiltinNames: new Set(['workflow_run']), firstClassNames: new Set(['call_tool']),
+          deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
+          admitBuiltinAcquisition: async (target) => target === 'workflow_run'
+            ? { ok: true } : { ok: false, kind: 'requires_readmission', outside: [target] },
+        }));
+        const model = stubModel([
+          [toolCall(`named-run-${variant}`, 'call_tool', {
+            name: 'workflow_run', args_json: JSON.stringify({
+              name: variant === 'unknown-workflow' ? 'Unrelated Zephyr Inventory Export' : name,
+              ...(variant === 'missing-input' ? {} : { inputs: JSON.stringify({ text: 'Southgate is Ready.' }) }),
+            }),
+          })],
+          [textMsg('Dispatch result received.')],
+        ]);
+        const agent = { model, tools: [carrier] };
+        bindHostCanarySurface(fixture, agent, [carrier]);
+        const outcome = await runProductionHost(fixture, agent);
+        const prepared = eventlog.listEvents(fixture.session.id, { types: ['async_work_dispatch_prepared'] });
+        assert.equal(prepared.length, variant === 'normal' ? 1 : 0,
+          JSON.stringify({ variant, terminal: outcome.terminal, output: outcome.finalOutput,
+            history: outcome.history }));
+        assert.equal(eventlog.getTurnGraphEventForSource(fixture.session.id, fixture.source.seq), null,
+          'dispatch does not compile a hidden plan');
+        assert.equal(eventlog.listEvents(fixture.session.id, { types: ['approval_requested'] }).length, 0);
+        if (variant === 'normal') {
+          assert.equal(prepared[0]?.data.sourceUserSeq, fixture.source.seq);
+          assert.equal(prepared[0]?.parentEventId, fixture.source.id);
+          assert.equal(prepared[0]?.data.originSessionId, fixture.session.id);
+          assert.equal(typeof prepared[0]?.data.runId, 'string');
+          const db = eventlog.openEventLog();
+          const row = db.prepare(`SELECT outcome_kind, host_crossing_count FROM logical_call_settlements
+            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+            .get(fixture.session.id, fixture.source.seq, `named-run-${variant}`) as Record<string, unknown>;
+          assert.equal(row.outcome_kind, 'succeeded');
+          assert.equal(row.host_crossing_count, 1);
+        }
+      });
+    }
+  } finally {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('production host external reads require one exact frozen manifest/account/schema/invoke-port binding', async (t) => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
@@ -5764,12 +5898,21 @@ test('production host external reads require one exact frozen manifest/account/s
     providerKind?: 'native_mcp' | 'composio';
     withPreparation?: boolean;
     completeCarrier?: boolean;
+    largeProjection?: boolean;
   }) => {
     const fixture = acceptHostCanarySource(`production-external-${input.label}`);
     const providerKind = input.providerKind ?? 'native_mcp';
     const operationId = providerKind === 'composio'
       ? 'GOOGLESHEETS_VALUES_GET'
       : `market_${input.label}__lookup_attorneys`;
+    const projectionInputSchema = {
+      type: 'object', additionalProperties: false,
+      properties: { city: { type: 'string' }, practiceArea: { type: 'string' } },
+      required: ['city', 'practiceArea'],
+    };
+    const projectionSchemaDigest = input.largeProjection
+      ? (await import('../../tools/tool-contract-store.js')).digestSchema(projectionInputSchema)
+      : null;
     const manifest = capabilityManifests.attachSemanticContract({
       version: 1,
       manifestId: `cap:${input.label}:attorney-lookup`,
@@ -5785,7 +5928,7 @@ test('production host external reads require one exact frozen manifest/account/s
         ? {
             externalDefinition: {
               version: 1 as const,
-              providerInputSchemaDigest: 'c'.repeat(64),
+              providerInputSchemaDigest: projectionSchemaDigest ?? 'c'.repeat(64),
               providerOutputSchemaObserved: true,
               providerOutputSchemaDigest: 'd'.repeat(64),
               semanticName: operationId,
@@ -5816,6 +5959,9 @@ test('production host external reads require one exact frozen manifest/account/s
     });
     let portBodies = 0;
     let outerBodies = 0;
+    let largeRaw: string | undefined;
+    let largeNonce: string | undefined;
+    let largeCallId: string | undefined;
     const portInvoke = async (request: {
       payload?: unknown;
       binding?: { account?: unknown; manifestDigest?: unknown; toolName?: unknown };
@@ -5888,7 +6034,38 @@ test('production host external reads require one exact frozen manifest/account/s
         } as never,
       ), { ok: true });
     }
-    const carrier = brackets.wrapToolForHarness({
+    const projectionGateway = input.largeProjection ? tool({
+      name: 'composio_execute_tool', description: 'Injected provider transport for the production read carrier.',
+      parameters: z.object({ tool_slug: z.string(), arguments: z.string().nullable(), connected_account_id: z.string().nullable() }),
+      execute: async (args) => {
+        const { formatRecallableToolText } = await import('./tool-output-format.js');
+        const { getToolOutputContext } = await import('./tool-output-context.js');
+        assert.equal(args.tool_slug, operationId);
+        assert.equal(args.connected_account_id, manifest.accountId);
+        assert.deepEqual(JSON.parse(args.arguments!), { city: 'Seattle', practiceArea: 'personal injury' });
+        const context = getToolOutputContext();
+        largeNonce = context?.settlementNonce;
+        largeCallId = context?.callId;
+        assert.ok(largeNonce && largeCallId, 'real SDK carrier brackets mint exact retention identity');
+        outerBodies += 1;
+        largeRaw = JSON.stringify({ data: { items: Array.from({ length: 25 }, (_, index) => ({
+          postId: `record-${index}`, likes: 2, shares: 0, views: 113, missing: null,
+          media: { body: 'retained nested text '.repeat(700) },
+          sharedPost: { text: `Nested caption ${index}`, value: 3 },
+        })) }, successful: true, error: null });
+        return formatRecallableToolText(largeRaw, { maxChars: 20_000 });
+      },
+    }) : null;
+    if (projectionGateway) {
+      composioSchemas.rememberToolSchema(operationId, projectionInputSchema);
+      innerDispatch._setInnerDispatchToolsForTests(new Map([['composio_execute_tool', projectionGateway as never]]));
+    }
+    const carrier = input.largeProjection
+      ? brackets.wrapToolForHarness(workCallTools.buildWorkCall({
+          reachableBuiltinNames: new Set(['composio_execute_tool']), firstClassNames: new Set(),
+          requireHostPlan: true, hostPlanningReady: () => true,
+        }) as never)
+      : brackets.wrapToolForHarness({
       type: 'function',
       name: 'call_tool',
       description: 'Invoke one exact schema acquired from the frozen capability catalog.',
@@ -5918,9 +6095,13 @@ test('production host external reads require one exact frozen manifest/account/s
       });
     }
     const scriptedModel = stubModel([
-      [toolCall(`${input.label}-external-call`, 'call_tool', {
-        name: input.completeCarrier ? 'composio_execute_tool' : operationId,
-        args_json: JSON.stringify({ city: 'Seattle', practiceArea: 'personal injury' }),
+      [toolCall(`${input.label}-external-call`, input.largeProjection ? 'work_call' : 'call_tool', {
+        ...(input.largeProjection ? { requirement_id: 'read_records' } : {}),
+        name: input.completeCarrier || input.largeProjection ? 'composio_execute_tool' : operationId,
+        args_json: JSON.stringify(input.largeProjection ? {
+          tool_slug: operationId, arguments: JSON.stringify({ city: 'Seattle', practiceArea: 'personal injury' }),
+          connected_account_id: manifest.accountId,
+        } : { city: 'Seattle', practiceArea: 'personal injury' }),
       })],
       ...(input.completeCarrier ? [[textMsg('CONTINUE: report the settled read now')]] : []),
       [textMsg(`${input.label} external read settled`)],
@@ -5949,8 +6130,45 @@ test('production host external reads require one exact frozen manifest/account/s
          WHERE session_id = ? AND source_user_seq = ?
       `).all(fixture.session.id, fixture.source.seq),
     }));
-    assert.equal(outerBodies, 0);
-    assert.equal(portBodies, input.shouldExecute ? 1 : 0);
+    assert.equal(outerBodies, input.largeProjection ? 1 : 0);
+    assert.equal(portBodies, input.shouldExecute && !input.largeProjection ? 1 : 0);
+    if (input.largeProjection) {
+      const projected: Array<Record<string, any>> = [];
+      const visit = (value: unknown): void => {
+        if (typeof value === 'string') {
+          try { visit(JSON.parse(value)); } catch { /* ordinary prompt text */ }
+        } else if (value && typeof value === 'object') {
+          const object = value as Record<string, any>;
+          if (object.__clementine?.kind === 'structured_projection_v1' && object.data?.items) projected.push(object);
+          for (const child of Object.values(object)) visit(child);
+        }
+      };
+      visit(JSON.parse(requests[1]!));
+      assert.equal(projected.length, 1, 'inspect the actual next model request, not an independently formatted example');
+      assert.equal(projected[0]!.data.items.length, 25);
+      for (const row of projected[0]!.data.items) {
+        assert.deepEqual([row.likes, row.shares, row.views, row.missing, row.sharedPost.value], [2, 0, 113, null, 3]);
+      }
+      assert.equal(eventlog.getToolOutputForInvocation(fixture.session.id,
+        largeCallId!, largeNonce!)?.output, largeRaw,
+      'actual carrier retention keeps complete original bytes under the live nonce');
+      const { redeemSuccessfulSettlementResultForHost } = await import('./result-handle.js');
+      const redeemed = redeemSuccessfulSettlementResultForHost({
+        sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+        acceptedTaskId: identities.acceptedTaskIdFor(fixture.session.id, fixture.source.seq),
+        logicalToolCallId: `${input.label}-external-call`,
+      });
+      assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+      if (redeemed.status === 'ok') {
+        assert.equal(redeemed.value.outcomeKind, 'succeeded');
+        const raw = typeof redeemed.value.rawPayload === 'string'
+          ? JSON.parse(redeemed.value.rawPayload) : redeemed.value.rawPayload;
+        assert.deepEqual(raw, JSON.parse(largeRaw!), 'canonical settlement also redeems the complete provider result');
+      }
+      assert.equal(model.calls(), 2, 'one business read and one answer, without a repair turn');
+      assert.equal(eventlog.listEvents(fixture.session.id, { types: ['turn_graph_compiled', 'approval_requested'] }).length, 0);
+
+    }
     if (input.completeCarrier) {
       const repair = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
         .filter((event) => event.data.kind === 'carrier_repaired');
@@ -5978,6 +6196,11 @@ test('production host external reads require one exact frozen manifest/account/s
           'the deterministic repair becomes a durable progress token');
       }
       assert.equal(model.calls(), 3, 'the repair adds no turn beyond the scripted call, continuation and answer');
+    }
+    if (input.largeProjection) {
+      innerDispatch._setInnerDispatchToolsForTests(null);
+      composioSchemas.resetToolSchemaCache();
+      return;
     }
     if (input.withPreparation && input.shouldExecute) {
       assert.deepEqual(
@@ -6020,6 +6243,10 @@ test('production host external reads require one exact frozen manifest/account/s
   };
 
   try {
+    await t.test('large scalar values survive the actual carrier and next model request', () => runVariant({
+      label: 'large-scalar-projection', accountMatches: true, schemaMatches: true,
+      registerPort: true, shouldExecute: true, largeProjection: true, providerKind: 'composio', withPreparation: true,
+    }));
     await t.test('exact arbitrary connected read', () => runVariant({
       label: 'exact',
       accountMatches: true,
@@ -6076,6 +6303,8 @@ test('production host external reads require one exact frozen manifest/account/s
       shouldExecute: false,
     }));
   } finally {
+    innerDispatch._setInnerDispatchToolsForTests(null);
+    composioSchemas.resetToolSchemaCache();
     productionPorts.clearProductionCapabilityPorts();
     for (const prior of priorPorts) {
       productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
@@ -8607,7 +8836,7 @@ function runJudgedHost(
   ));
 }
 
-test('production host runs the completion judge on a completion claim with no tool evidence and keeps working when it says NOT DONE (directive never in history)', async () => {
+test('production host retains completion feedback in request projection without adding an uncheckpointed draft to history)', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const verdicts = [
     { done: false, reason: 'nothing was posted: no tool ran and no link is shown' },
@@ -8633,10 +8862,11 @@ test('production host runs the completion judge on a completion claim with no to
     assert.match(judged[0]!.objective, /Post the summary to the channel/);
     assert.match(judged[0]!.reply, /posted the summary/);
     const second = JSON.stringify(model.requests[1]);
-    assert.match(second, /COMPLETION JUDGE/, 'the NOT DONE verdict reached the model as a directive');
+    assert.match(second, /RETAINED COMPLETION REVIEW/, 'the negative verdict reached the next model request');
     assert.match(second, /nothing was posted/);
-    assert.equal(JSON.stringify(outcome.history).includes('COMPLETION JUDGE'), false, 'the directive is a one-shot request layer, never canonical history');
-    assert.match(JSON.stringify(outcome.history), /Done: posted the summary/, 'the judged claim stays in history so the model sees what it said');
+    assert.equal(JSON.stringify(outcome.history).includes('RETAINED COMPLETION REVIEW'), false, 'review feedback does not alter accepted-batch history');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /Done: posted the summary/, 'the rejected draft is never an uncheckpointed canonical edge');
+    assert.match(second, /Done: posted the summary/, 'the model still receives its exact rejected draft');
     const judgedEvents = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     assert.equal(judgedEvents.length, 2, 'each verdict is durable');
     assert.equal(judgedEvents[0]!.data.fulfills, false);
@@ -8686,22 +8916,33 @@ test('the completion judge budget survives serialized checkpoint recovery and re
     judgeCalls += 1;
     return { done: false, reason: 'the requested post still has no evidence' };
   });
-  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    _setHostObjectiveJudgeForTests(null);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
   const fixture = acceptJudgedSource('judge-reentry-budget', 'Post the summary to the channel');
   const model = scriptedRecordingModel([
     [textMsg('I will post the summary.')],
-    [toolCall('judge-checkpoint-1', 'tool_search', { query: 'first lookup' })],
+    [toolCall('judge-checkpoint-1', 'call_tool', { name: 'harness_status', args_json: '{}' })],
     [textMsg('I will post the summary.')],
-    [toolCall('judge-checkpoint-2', 'tool_search', { query: 'second lookup' })],
+    [toolCall('judge-checkpoint-2', 'call_tool', { name: 'harness_status', args_json: '{}' })],
     [textMsg('I will post the summary.')],
   ]);
-  const search = {
-    type: 'function', name: 'tool_search', description: 'local lookup fixture',
-    parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false },
-    needsApproval: async () => false, invoke: async () => 'No operation found.',
-  };
-  const agent = { model, tools: [search] };
-  bindHostCanarySurface(fixture, agent, [search]);
+  // Exercise real successful carrier reads: a fabricated tool_search object
+  // was refused by its production schema and exhausted the no-progress budget,
+  // so that fixture could not isolate review-counter checkpoint ownership.
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['harness_status']),
+    firstClassNames: new Set(['call_tool']), deniedNames: new Set(), mcpToolScope: null,
+    controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async (name) => name === 'harness_status' ? { ok: true }
+      : { ok: false, kind: 'requires_readmission', outside: [name] },
+  }) as never);
+  const agent = { model, tools: [carrier] };
+  bindHostCanarySurface(fixture, agent, [carrier]);
   const run = (state: unknown) => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never, agent as never, state as never,
     { maxTurns: 8, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
@@ -8728,6 +8969,11 @@ test('the completion judge budget survives serialized checkpoint recovery and re
     'two continuations cover the whole accepted source, not each admit/finalize/continue re-entry');
   assert.equal(model.calls(), 5, 'an exhausted judge budget does not start another model cycle');
   assert.equal(final.finalOutput, 'I will post the summary.');
+  assert.deepEqual(db.prepare(`SELECT logical_tool_call_id, outcome_kind FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`).all(fixture.session.id, fixture.source.seq), [
+    { logical_tool_call_id: 'judge-checkpoint-1', outcome_kind: 'succeeded' },
+    { logical_tool_call_id: 'judge-checkpoint-2', outcome_kind: 'succeeded' },
+  ], 'the counter control includes two genuine successful reads, not no-progress refusals');
   assert.deepEqual(captured.map((blob) => JSON.parse(blob).objectiveJudgeContinuations), [1, 1, 2, 2]);
   for (const blob of captured) {
     const parsed = JSON.parse(blob);
@@ -9019,4 +9265,324 @@ test('a carried control executes instead of being replanned', async (t) => {
   });
   t.diagnostic(`carried control disposition: ${result.kind}`);
   assert.notEqual(result.kind, 'refused');
+});
+
+
+test('completion feedback survives an actual native carrier read, checkpoint hold and reopen', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    _setHostObjectiveJudgeForTests(null);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const fixture = acceptHostCanarySource('completion-feedback-native', 'Read the current harness status and report the available evidence.');
+  const rejected = 'Done. No harness status data was available.';
+  const reason = 'Read the actual status result and correct the claim of missing evidence.';
+  const corrected = 'The harness status was read; its actual current values are reported.';
+  const trigger = `feedback_checkpoint_${acceptedSerial}`;
+  const db = eventlog.openEventLog();
+  const sqlSession = fixture.session.id.replaceAll("'", "''");
+  let judges = 0;
+  _setHostObjectiveJudgeForTests(async (_objective, _reply, options) => {
+    judges += 1;
+    if (judges === 1) {
+      db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON accepted_model_batch_checkpoints
+        WHEN NEW.session_id = '${sqlSession}' BEGIN SELECT RAISE(ABORT, 'feedback recovery control'); END`);
+      return { done: false, reason };
+    }
+    assert.ok(options?.toolCallSummary?.includes(rejected));
+    assert.ok(options?.toolCallSummary?.includes(reason));
+    return { done: true, reason: 'The retained finding was resolved.' };
+  });
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['harness_status']),
+    firstClassNames: new Set(['call_tool']), deniedNames: new Set(), mcpToolScope: null,
+    controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async (name) => name === 'harness_status' ? { ok: true }
+      : { ok: false, kind: 'requires_readmission', outside: [name] },
+  }) as never);
+  const read = (id: string) => toolCall(id, 'call_tool', { name: 'harness_status', args_json: '{}' });
+  const model = scriptedRecordingModel([[read('feedback-read-1')], [textMsg(rejected)],
+    [read('feedback-read-2')], [textMsg(corrected)]]);
+  const agent = { model, tools: [carrier] };
+  bindHostCanarySurface(fixture, agent, [carrier]);
+  const run = (state: unknown) => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, state as never,
+    { maxTurns: 10, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
+  ));
+  let held: Awaited<ReturnType<typeof run>>;
+  try { held = await run([{ role: 'user', content: fixture.source.data.text }]); }
+  finally { db.exec(`DROP TRIGGER IF EXISTS ${trigger}`); }
+  assert.ok(held.serializedRecoveryState, 'the real checkpoint trigger must transfer recovery ownership');
+  const state = HostRecoveryState.fromString(held.serializedRecoveryState);
+  assert.equal(state.completionReviewFeedback?.reply, rejected);
+  assert.equal(state.completionReviewFeedback?.reason, reason);
+  assert.equal(state.objectiveJudgeContinuations, 1);
+  assert.ok(!JSON.stringify(state.history).includes(rejected), 'rejected prose never changes checkpoint history');
+  eventlog.closeEventLog();
+  let final = await run(state);
+  for (let i = 0; final.serializedRecoveryState && i < 3; i += 1) {
+    const next = HostRecoveryState.fromString(final.serializedRecoveryState);
+    assert.equal(next.completionReviewFeedback?.reply, rejected);
+    assert.equal(next.objectiveJudgeContinuations, 1);
+    final = await run(next);
+  }
+  assert.equal(final.finalOutput, corrected, JSON.stringify(final.terminal));
+  assert.equal(judges, 2);
+  assert.equal(model.calls(), 4);
+  for (const request of model.requests.slice(2)) {
+    assert.ok(JSON.stringify(request).includes(rejected));
+    assert.ok(JSON.stringify(request).includes(reason));
+  }
+  const settled = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`).all(fixture.session.id, fixture.source.seq);
+  assert.deepEqual(settled, [
+    { logical_tool_call_id: 'feedback-read-1', outcome_kind: 'succeeded' },
+    { logical_tool_call_id: 'feedback-read-2', outcome_kind: 'succeeded' },
+  ], 'both actual native reads settle exactly once');
+  assert.deepEqual(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .map((event) => event.data.continuationsUsed), [0, 1]);
+  const blob = JSON.parse(state.toString());
+  delete blob.completionReviewFeedback;
+  assert.equal(HostRecoveryState.fromString(JSON.stringify(blob)).completionReviewFeedback, undefined);
+  for (const field of ['reply', 'objective']) {
+    const corrupt = JSON.parse(state.toString());
+    corrupt.completionReviewFeedback[field] += 'corrupted';
+    assert.throws(() => HostRecoveryState.fromString(JSON.stringify(corrupt)), /invalid completion-review feedback/);
+  }
+});
+
+
+test('retained review feedback rejects foreign sources and yields to actual delivered objective steering', async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-feedback-steering-${++acceptedSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Investigate the current harness status.' } });
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:1` } };
+  const objective = source.data.text as string;
+  const reply = 'Rejected original draft.';
+  const feedback = { version: 1 as const, sessionId: session.id, sourceUserSeq: source.seq,
+    objective, objectiveDigest: sha256(objective), reply, replyDigest: sha256(reply),
+    reason: 'Old finding must not revive an abandoned investigation.' };
+  const history = [{ role: 'user', content: objective }] as never;
+  const wrongSource = new HostInterruptState(history, [], undefined, 'host_v1', undefined, undefined, 1,
+    { ...feedback, sourceUserSeq: source.seq + 1 });
+  const wrongModel = scriptedRecordingModel([[textMsg('must not run')]]);
+  const wrongAgent = { model: wrongModel, tools: [] };
+  bindHostCanarySurface(fixture, wrongAgent, []);
+  await assert.rejects(() => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, wrongAgent as never, HostInterruptState.fromString(wrongSource.toString()) as never,
+    { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
+  )), /completion_review_feedback_source_mismatch/);
+  assert.equal(wrongModel.calls(), 0);
+
+  steering.appendSteerNote(session.id, 'Stop that investigation. Reply only with the number 13.');
+  const delivered = steering.takeUndeliveredSteerNotes(session.id);
+  assert.equal(delivered.length, 1, 'use the actual delivered-steering producer');
+  const projectedSteer = steering.formatSteerBlock(delivered);
+  const state = new HostInterruptState([{ role: 'user', content: objective },
+    { role: 'user', content: projectedSteer }] as never, [], undefined, 'host_v1', undefined, undefined, 1, feedback);
+  const model = scriptedRecordingModel([[textMsg('13')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
+    { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
+  ));
+  assert.equal(result.finalOutput, '13');
+  assert.equal(model.calls(), 1);
+  assert.ok(JSON.stringify(model.requests[0]).includes(JSON.stringify(projectedSteer)),
+    'the actual request retains the entire delivered steering block, including its newlines');
+  assert.ok(!JSON.stringify(model.requests[0]).includes(feedback.reason));
+  assert.ok(!JSON.stringify(model.requests[0]).includes(reply));
+  assert.equal(eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] }).length, 0);
+});
+
+test('named workflow dispatch seals before review and final child evidence owns the verdict', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const { writeWorkflow } = await import('../../memory/workflow-store.js');
+  const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+  const queue = await import('../../tools/workflow-run-queue.js');
+  const records = await import('../../execution/workflow-run-record.js');
+  const report = await import('../../execution/workflow-run-report-back.js');
+  const terminal = await import('../../execution/workflow-origin-terminal.js');
+  let completion: typeof import('../../execution/workflow-origin-completion-review.js') | undefined;
+  const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  let prematureJudges = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    prematureJudges += 1;
+    return { done: false, reason: 'the child has not returned its actual summary' };
+  });
+  try {
+    for (const variant of ['positive', 'off', 'negative', 'unavailable', 'drift', 'wrong-source'] as const) {
+      await t.test(variant, async () => {
+        const name = `final-child-review-${variant}`;
+        writeWorkflow(name, { name, description: 'Summarize supplied text.', enabled: true,
+          trigger: { manual: true }, steps: [{ id: 'summary', prompt: 'Summarize {{input.text}}.', sideEffect: 'read' }] });
+        const replyTarget = { type: 'origin_chat' } as const;
+        const fixture = acceptHostCanarySource(name, `Run ${name} and give the summary here.`, {
+          originReplyTarget: replyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget),
+        });
+        const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `parent-${variant}` });
+        eventlog.recordRunAttemptUserInput(attempt, { turn: fixture.source.turn, role: 'user', data: fixture.source.data },
+          { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+        Object.assign(fixture.parent, { runAttemptId: attempt.attemptId });
+        const attemptState = () => eventlog.getRunAttemptBySourceUserSeq(fixture.session.id, fixture.source.seq);
+        host.captureEffectiveCompletionPolicyOnce({ sessionId: fixture.session.id,
+          sourceUserSeq: fixture.source.seq, enabled: variant !== 'off' });
+        const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+          reachableBuiltinNames: new Set(['workflow_run']), firstClassNames: new Set(['call_tool']),
+          deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
+          admitBuiltinAcquisition: async (target) => target === 'workflow_run'
+            ? { ok: true } : { ok: false, kind: 'requires_readmission', outside: [target] },
+        }));
+        const model = stubModel([
+          [toolCall(`joined-${variant}`, 'call_tool', { name: 'workflow_run',
+            args_json: JSON.stringify({ name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) }) })],
+          [textMsg('CONTINUE: waiting for the dispatched child summary')],
+        ]);
+        const agent = { model, tools: [carrier] };
+        bindHostCanarySurface(fixture, agent, [carrier]);
+        const outcome = await runProductionHost(fixture, agent);
+        assert.equal(model.calls(), 2, 'queued work must transfer before a CONTINUE or reviewer loop');
+        assert.equal(prematureJudges, 0, 'queue acknowledgement is not completion-review input');
+        assert.equal(outcome.terminal, undefined);
+        assert.equal(attemptState()?.status, 'active');
+        assert.equal(attemptState()?.finishedAt, null, 'dispatch must not finish its parent before the child');
+        completion = await import('../../execution/workflow-origin-completion-review.js');
+        const dispatches = eventlog.listEvents(fixture.session.id, { types: ['async_work_dispatched'] });
+        assert.equal(dispatches.length, 1);
+        assert.equal(dispatches[0].data.sourceUserSeq, fixture.source.seq);
+        const runId = (dispatches[0].data.runIds as string[])[0];
+        const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+        const queued = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
+        assert.equal(queued.status, 'queued', 'real group release follows durable public dispatch');
+        assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
+        const observer = queue.readWorkflowRunOriginRecords(runId).find((row) => row.version === 2);
+        assert.ok(observer && observer.version === 2);
+        const detail = 'Southgate is ready.';
+        if (variant === 'positive') {
+          eventlog.appendEvent({ sessionId: fixture.session.id, turn: 0, role: 'system',
+            type: 'goal_alignment_judged', data: { lane: 'host_v1', kind: 'completion',
+              sourceUserSeq: fixture.source.seq, fulfills: false, reason: 'queued only; no summary yet',
+              objectiveDigest: createHash('sha256').update(String(fixture.source.data.text)).digest('hex'),
+              replyDigest: createHash('sha256').update('Queued.').digest('hex'), judgedArtifacts: [] } });
+          eventlog.closeEventLog(); // older pre-child verdict survives actual SQLite reopen
+        }
+        const input = { observer, runId, evidenceRunIds: [runId], outcome: 'done' as const, detail };
+        assert.equal(report.readWorkflowOriginCompletionEvidence(input), null,
+          'queued work cannot satisfy all-member terminal evidence');
+        records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, {
+          ...queued, status: 'completed', finishedAt: new Date().toISOString(),
+          stepsTotal: 1, stepsCompleted: 1,
+          stepOutputs: { summary: { summary: detail, retainedNested: { nonce: `actual-child-${variant}` } } },
+          output: detail,
+        }));
+        assert.equal(report.checkpointWorkflowRunReportBack(file, { workflowName: name, outcome: 'done', detail }), true);
+        const evidence = report.readWorkflowOriginCompletionEvidence(input);
+        assert.ok(evidence);
+        assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, detail: 'invented result' }), null);
+        assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, evidenceRunIds: [runId, 'unowned-child'] }), null);
+        assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, runId: '../outside' }), null);
+        let finalJudges = 0;
+        completion._setWorkflowOriginCompletionJudgeForTests(async (objective, reply, context) => {
+          finalJudges += 1;
+          assert.equal(attemptState()?.finishedAt, null, 'parent remains unfinished during final review');
+          assert.equal(objective, String(fixture.source.data.text));
+          assert.equal(reply, detail);
+          assert.match(context?.toolCallSummary ?? '', new RegExp(`actual-child-${variant}`));
+          assert.match(context?.toolCallSummary ?? '', /workflowDefinitionSnapshot/);
+          if (variant === 'drift') {
+            records.withWorkflowRunRecordLock(file, () => {
+              const current = records.readWorkflowRunRecordUnlocked<Record<string, unknown>>(file)!;
+              records.writeWorkflowRunRecordDurablyUnlocked(file, { ...current, stepOutputs: { summary: 'changed after review began' } });
+            });
+          }
+          return { done: variant !== 'negative', reason: variant === 'negative' ? 'a required fact is missing' : 'actual child checked',
+            ...(variant === 'unavailable' ? { failedOpen: true } : {}),
+            selfJudge: true, ownerSelectedJudge: true, judgeModelId: 'test-selected-model', judgeProvider: 'byo' as const };
+        });
+        if (variant === 'wrong-source') {
+          const wrong = { ...input, observer: { ...observer, sourceUserSeq: fixture.source.seq + 100 } };
+          assert.equal(report.readWorkflowOriginCompletionEvidence(wrong), null);
+          assert.equal(await completion.reviewWorkflowOriginCompletion(wrong, detail), 'skipped');
+          assert.equal(finalJudges, 0);
+          return;
+        }
+        if (variant !== 'off') assert.equal(terminal.commitWorkflowOriginTerminal(input), null,
+          'sync report-back must not publish an unreviewed captured-ON result');
+        let committed: Awaited<ReturnType<typeof terminal.reviewAndCommitWorkflowOriginTerminal>>;
+        if (variant === 'positive') {
+          const { workflowOwnedUnfinishedAttemptIds } = await import('./accepted-source-outcome.js');
+          const { releaseRunInFlightAfterWorkflowTransfer } = await import('./restart-recovery.js');
+          releaseRunInFlightAfterWorkflowTransfer(fixture.session.id, attempt.attemptId, fixture.source.seq);
+          eventlog.closeEventLog();
+          eventlog.interruptOrphanedRunAttemptsAtBoot(Date.now(), {
+            preserveAttemptIds: workflowOwnedUnfinishedAttemptIds(),
+          });
+          assert.equal(attemptState()?.status, 'active', 'the restart sweep preserves this exact workflow owner');
+          assert.equal(attemptState()?.finishedAt, null);
+          // The production retry path joins all children and owns one in-flight
+          // final review. Simulate a process reopening durable records after
+          // the child finished, then two independent scheduler notifications.
+          assert.equal(report.attemptWorkflowRunReportBack(file), false);
+          assert.equal(report.attemptWorkflowRunReportBack(file), false);
+          const until = Date.now() + 3000;
+          while (!eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length && Date.now() < until) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input);
+        } else {
+          committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input);
+        }
+        if (variant === 'drift') {
+          assert.equal(committed, null);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).length, 0);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
+          return;
+        }
+        assert.ok(committed);
+        assert.ok(attemptState()?.finishedAt, 'the exact final terminal closes the parent attempt');
+        const finishedAt = attemptState()?.finishedAt;
+        assert.equal(finalJudges, variant === 'off' ? 0 : 1);
+        assert.equal(committed.presentation.status, variant === 'negative' || variant === 'unavailable' ? 'blocked' : 'done');
+        const ref = committed.event.data.completionVerdictRef as Record<string, unknown> | undefined;
+        if (variant === 'positive') {
+          assert.equal(ref?.verified, true);
+          assert.equal(ref?.replyMatches, true);
+          assert.equal(ref?.objectiveMatches, true);
+        }
+        const beforeReplay = finalJudges;
+        eventlog.closeEventLog();
+        const replayed = await terminal.reviewAndCommitWorkflowOriginTerminal(input);
+        assert.equal(replayed?.event.id, committed.event.id);
+        assert.equal(attemptState()?.finishedAt, finishedAt, 'replay does not finish the attempt twice');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(finalJudges, beforeReplay, 'reopen joins the terminal without another judge or child');
+        assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+        if (variant === 'positive') {
+          const later = eventlog.beginRunAttempt(fixture.session.id, { runId: 'later-independent-parent' });
+          const laterSource = eventlog.recordRunAttemptUserInput(later, { turn: 2, role: 'user', data: { text: 'An independent later task.' } });
+          await terminal.reviewAndCommitWorkflowOriginTerminal(input);
+          assert.equal(eventlog.getRunAttemptBySourceUserSeq(fixture.session.id, laterSource.seq)?.finishedAt, null,
+            'late prior-source report-back cannot close a sibling attempt');
+          eventlog.finishRunAttempt(later, 'completed');
+        }
+      });
+    }
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+    completion?._setWorkflowOriginCompletionJudgeForTests(null);
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });

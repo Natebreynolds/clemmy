@@ -342,6 +342,31 @@ test('heartbeat progress projects the plan oracle instead of "Still working."', 
   assert.match(after, /writing the deliverable|collecting/, after);
 });
 
+test('approval acknowledgements preserve original progress while a new real source replaces it', async () => {
+  const { composeRunProgressLine, runPlanCounters } = await import('./run-progress.js');
+  const task = accept(LIVE_PROMPT);
+  hostFreezeLiveChain(task);
+  admitSheetWrite(task);
+  const expected = composeRunProgressLine({ sessionId: task.sessionId, fallback: 'Fallback.' });
+  const counters = runPlanCounters(task.sessionId);
+  assert.match(expected, /plan 0\/3 steps done/);
+  assert.deepEqual(counters, { completed: 0, total: 3 });
+  const source = eventlog.listEvents(task.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === task.sourceUserSeq)!;
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 0, role: 'user', type: 'user_input_received', parentEventId: source.id,
+    data: { text: 'Approve the exact card.', synthetic: true,
+      liveApprovalControl: { version: 1, ownerAttemptId: 'live-original', ownerSourceUserSeq: source.seq } } });
+  assert.equal(composeRunProgressLine({ sessionId: task.sessionId, fallback: 'Fallback.' }), expected);
+  assert.deepEqual(runPlanCounters(task.sessionId), counters);
+  // A lookalike without typed ownership is still a real accepted input.
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'A separate task.', liveApprovalControl: { version: 1 } } });
+  assert.equal(composeRunProgressLine({ sessionId: task.sessionId, fallback: 'Fallback.' }), 'Fallback.');
+  assert.equal(runPlanCounters(task.sessionId), null);
+  assert.equal(composeRunProgressLine({ sessionId: task.sessionId, sourceUserSeq: source.seq, fallback: 'Fallback.' }), expected,
+    'an explicitly bound source keeps its own progress');
+});
+
 test('a bounded collection reaches one atomic artifact write; later mutations stay once-only', async () => {
   const task = accept(LIVE_PROMPT);
   hostFreezeLiveChain(task);

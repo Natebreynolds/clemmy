@@ -10,7 +10,10 @@ export default defineConfig({
   base: '/console/',
   plugins: [react()],
   resolve: {
-    alias: { '@': path.resolve(__dirname, 'src') },
+    alias: {
+      '@': path.resolve(__dirname, 'src'),
+      '@clem/chat-engine': path.resolve(__dirname, '../../packages/chat-engine/src/index.ts'),
+    },
   },
   build: {
     target: 'es2022',

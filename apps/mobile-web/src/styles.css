@@ -14,6 +14,18 @@
    contrast against light ground.
    ──────────────────────────────────────────────────────────────────── */
 
+/* The ONE semantic token layer, shared with the desktop console. Plain CSS, so
+   this Preact app and that React/Tailwind app consume the same bytes.
+
+   Mobile stays 100% LIGHT: the shared file's dark block is scoped to `.dark`,
+   a class only the console ever sets, so importing it cannot introduce a dark
+   ramp here. The owner directive and mobile-shell.test.ts both still hold.
+
+   Mobile keeps ONE accent (#b94300) for text and fill alike, because at 5.43:1
+   it is legal for both. Desktop additionally uses a brighter #f26419 as a fill.
+   Same family, same reading colour; the fill divergence is deliberate. */
+@import '../../../packages/design-tokens/tokens.css';
+
 :root {
   /* Warm paper surfaces: cream undertone, never clinical gray-white.
      Elevation DARKENS a step toward parchment — cards sit on the page the
@@ -32,13 +44,14 @@
   --fg-2: #6d5b47;
   --fg-3: #75644f;
 
-  --accent: #b94300;
+  --accent: var(--clem-primary-ink);
   --accent-hi: #c24b00;
-  --accent-deep: #963400;
+  --accent-deep: var(--clem-primary-ink-hover);
   --accent-soft: rgba(239, 95, 12, 0.10);
   --accent-glow: rgba(239, 95, 12, 0.26);
   --accent-2: #357b29;              /* leaf — connected / success */
-  --accent-warn: #8a6000;
+  --warn-soft: var(--clem-warning-tint);   /* was referenced with a fallback, never defined */
+  --accent-warn: var(--clem-warning);
   --accent-fail: #d0453a;
   --fail-soft: rgba(208, 69, 58, 0.10);
   --on-accent: #fff8f0;
@@ -73,7 +86,7 @@
   /* Smooth deceleration (ease-out-quint). Deliberately NO overshoot: things
      arrive and settle, they do not bounce. It was once called --ease-spring,
      which described motion this curve never had. */
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out: var(--clem-ease);
 
   /* Elevation is surface lightness plus a hairline, not a shadow.
      On a warm near-black ground a drop shadow barely renders anyway — it
@@ -233,6 +246,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .needs-pill {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   min-height: 44px;
   padding: 0;
   border: 0;
@@ -252,6 +266,25 @@ input, textarea, select { font: inherit; font-size: 16px; }
   transition: transform 0.14s var(--ease-out), background 0.16s ease;
 }
 .needs-pill:active .needs-pill-face { transform: scale(0.96); background: var(--accent-deep); }
+/*
+   A count that was not confirmed just now must not wear the same confident
+   solid as a live one. The pill already says the age in words (lib/needs-you.
+   ts); this is the glance-level half of the same disclosure — hollow, not
+   filled — and it applies identically to the two numeric badges, which have
+   no room for words at all.
+*/
+.needs-pill-stale .needs-pill-face {
+  background: transparent;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  font-weight: 600;
+}
+.needs-pill-stale:active .needs-pill-face { background: var(--bg-2); }
+.badge-stale {
+  background: transparent !important;
+  color: var(--accent) !important;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 /* Direct is the quiet default: one dot. */
 .conn-dot-only {
   display: inline-block;
@@ -373,6 +406,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex: 1 1 auto;
   min-width: 0;
 }
+/* What the run did, between its title and its state — the run's own output
+   line, not a status token dressed up as one. */
+.run-outcome {
+  margin-top: 2px;
+  color: var(--fg-2);
+  font-size: var(--t-sm);
+}
 
 .icon-btn {
   display: inline-flex;
@@ -465,24 +505,97 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .home { display: flex; flex-direction: column; gap: var(--sp-5); padding-top: var(--sp-2); }
 .home-section { display: flex; flex-direction: column; }
 
-.home-greet h2 {
-  font-family: var(--font-display);
-  font-size: var(--t-hero);
-  font-weight: 800;
-  letter-spacing: -0.03em;
-  line-height: 1.08;
-  margin: 0 0 var(--sp-2);
-  /* Solid, not a gradient. Gradient text on a heading is decorative rather
-     than meaningful, and by 2026 it is one of the recognizable signatures of
-     a generated interface. The greeting earns its presence from scale and
-     the warmth already in --fg; it does not need to shimmer. */
-  color: var(--fg);
+/* THE LEAD — the answer the phone opens with.
+
+   Home used to open with "Good afternoon, Nathan" in the largest type on the
+   screen and the thing that actually mattered whispered underneath it. That
+   is inverted. The greeting is an eyebrow; the answer carries the weight, and
+   it is the ONLY thing on Home at this size — which is what makes a stack of
+   lists stop reading as one flat wall. */
+.home-lead {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
 }
-.home-status {
+/* The two states where a person is genuinely the blocker are the only place
+   on Home that spends the accent on a surface. Everything else — work that is
+   merely running, work that never finished, what happened while you were away
+   — is information, and reads at paper weight. */
+.home-lead-answer,
+.home-lead-elsewhere,
+.home-lead-attention {
+  border-color: var(--line-hot);
+  background: var(--accent-soft);
+}
+/* One live region for the whole answer — headline, qualifier, provenance —
+   so a screen reader hears the count change AND how old it is, in one
+   announcement. Layout is unchanged: the gap and align-items are the
+   parent's own, inherited rather than restated. */
+.home-lead-say {
+  display: flex;
+  flex-direction: column;
+  align-items: inherit;
+  gap: 2px;
+  width: 100%;
+}
+.home-lead-clear { align-items: center; text-align: center; }
+.home-lead-mark { opacity: 0.8; margin-bottom: var(--sp-2); }
+.home-lead-eyebrow {
   margin: 0;
+  color: var(--fg-3);
+  font-size: var(--t-sm);
+}
+/* Specificity matched to `.app-main h2:not(.section-head)`, which would
+   otherwise size this heading. */
+.app-main h2.home-lead-head {
+  margin: 0;
+  font-family: var(--font-display);
+  /* Deliberately a step below the old greeting's --t-hero: it has real
+     sentences to carry, and a 38px headline that wraps to three lines is
+     the "overwhelming" the owner named, not presence. */
+  font-size: clamp(1.3125rem, 5.6vw, 1.75rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.16;
+  color: var(--fg);
+  text-wrap: balance;
+}
+.home-lead-detail {
+  margin: 6px 0 0;
   color: var(--fg-2);
   font-size: var(--t-sm);
 }
+/* How old the number above it is. Quieter than the detail — it qualifies the
+   answer, it never competes with it — but never hidden: this is the only
+   staleness disclosure left on the screen that leads with the count. */
+.home-lead-asof {
+  margin: 4px 0 0;
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+}
+/* One tap, on the headline's own terms. Not a filled button: the rows below
+   carry the real decisions and their primaries must stay the loudest thing. */
+.home-lead-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-deep);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--t-sm);
+  transition: transform var(--clem-dur-fast) var(--ease-out);
+}
+.home-lead-action:active { transform: scale(var(--clem-press)); }
+.home-lead-action svg { width: 16px; height: 16px; }
 
 /* ── cards ──────────────────────────────────────────────────────── */
 
@@ -1638,10 +1751,14 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* Stop reads as a halt, not a second send: the accent is what you press to
    ADD, so taking it away is what tells you this one takes something back. */
+/* Stop is reached when a run has gone long with nothing to show, so it is the
+   last control that should look foreign. It was painting on --surface-2,
+   --text and --hairline: three desktop-shaped names this stylesheet has never
+   defined. The fallbacks kept it visible but cool grey, on a warm-paper app. */
 .chat-stop {
-  background: var(--surface-2, #eceae6);
-  color: var(--text, #1b1b1b);
-  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.14));
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
   font-size: 13px;
   line-height: 1;
 }
@@ -2359,14 +2476,17 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* ── push prompt ────────────────────────────────────────────────── */
 
+/* A quiet prompt, not a campaign. This was a gradient wash inside an orange
+   border with a gradient-filled button — the loudest thing on a screen whose
+   job is to show what needs the owner. Accent now appears only on the verb. */
 .push-banner {
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  background: linear-gradient(180deg, rgba(239, 95, 12, 0.10), rgba(239, 95, 12, 0.04)), var(--bg-1);
-  border: 1px solid rgba(239, 95, 12, 0.26);
-  border-radius: var(--r-lg);
-  padding: var(--sp-4);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
   box-shadow: var(--shadow-card);
 }
 .push-banner-error { border-color: rgba(208, 69, 58, 0.35); }
@@ -2381,7 +2501,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .push-banner-actions { display: flex; gap: var(--sp-2); }
 .push-banner-primary {
   flex: 1;
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
+  background: var(--accent);
   color: var(--on-accent);
   border: none;
   border-radius: var(--r-md);
@@ -2404,7 +2524,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 @media (max-height: 500px) and (orientation: landscape) {
   .app-header { padding: 4px var(--sp-4); }
   .home { gap: var(--sp-3); }
-  .home-greet h2 { font-size: 24px; }
+  .app-main h2.home-lead-head { font-size: 21px; }
+  .home-lead { padding: var(--sp-3); }
   .empty { padding: 20px; }
 }
 
@@ -2412,7 +2533,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
    assistant's state is legible at a glance instead of a long scroll. */
 @media (min-width: 700px) {
   .app-main { max-width: 900px; padding-left: var(--sp-5); padding-right: var(--sp-5); }
-  .home-greet, .home-customize, .home > .screen-notice, .home > .skeleton-stack { grid-column: 1 / -1; }
+  .home-lead, .home-customize, .home > .screen-notice, .home > .skeleton-stack { grid-column: 1 / -1; }
   .home {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -3343,6 +3464,25 @@ textarea:focus-visible,
 .home-row-receipt { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--accent-2); font-size: var(--t-sm); font-weight: 700; }
 .home-row-receipt svg { width: 16px; height: 16px; }
 .home-row-error { margin: 0; color: var(--accent-fail); font-size: var(--t-xs); }
+/* A running row OPENS. It carried a pulse, an elapsed clock and a progress
+   bar while being untappable, which reads as a typing indicator rather than a
+   work item. The button wraps only the text block so the stop control beside
+   it stays independently tappable. */
+.home-run-open {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+  border-radius: var(--r-md);
+  transition: transform 0.14s var(--ease-out);
+}
+.home-run-open:active { transform: scale(0.99); }
+.home-run-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .home-run-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .home-run-head .home-row-title { flex: 1 1 auto; min-width: 0; }
 .home-run-elapsed { flex: 0 0 auto; font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
@@ -3356,8 +3496,6 @@ textarea:focus-visible,
 .home-away-glyph.warn { color: var(--accent-warn); }
 .home-away-text { flex: 1 1 auto; min-width: 0; font-size: 14px; }
 .home-away-time { flex: 0 0 auto; font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
-.home-skeleton { width: 100%; }
-.home-skeleton i { height: 44px; }
 .home-customize {
   display: flex;
   align-items: center;
@@ -3413,7 +3551,6 @@ textarea:focus-visible,
 .qa-chip:active:not(:disabled) { transform: scale(0.96); border-color: var(--line-hot); }
 .qa-chip:disabled { opacity: 0.6; }
 .qa-chip-more { padding: 0 12px; color: var(--fg-3); }
-.qa-chip-add { color: var(--accent-deep); border-style: dashed; }
 .qa-queued { border-color: rgba(53, 123, 41, 0.4); color: var(--accent-2); }
 .qa-error { border-color: rgba(208, 69, 58, 0.4); }
 .qa-note { margin: 0 2px; font-size: var(--t-xs); color: var(--fg-2); }
@@ -3638,3 +3775,88 @@ textarea.cz-input { resize: vertical; }
 .cz-status-fail { color: var(--accent-fail); }
 .cz-retry { min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: var(--accent); font-weight: 700; font-size: 12px; }
 .sheet-foot .cz-done { margin-left: auto; }
+
+/* ── long lists, cheaply ─────────────────────────────────────────── */
+/*
+   The transcript, the activity timeline and the card stacks are the only
+   places this app renders hundreds of similar rows, and they are exactly where
+   an older phone starts to feel like a web page: every offscreen row is still
+   laid out and painted on each frame.
+
+   `content-visibility: auto` skips that work for anything outside the viewport;
+   `contain-intrinsic-size` supplies a placeholder height so the scrollbar and
+   the scroll position stay honest while a row is skipped. The sizes are
+   deliberate over-estimates of a one-line row — an under-estimate is what makes
+   a list jitter as it scrolls.
+
+   Unsupported browsers ignore both properties and render exactly as before, so
+   this is a pure win with no fallback path. Deliberately NOT applied to the
+   composer, the header, or anything the user can focus off-screen.
+*/
+/*
+   Narrowed deliberately to the ROW-shaped cards. `.card settings-card` and
+   `.card settings-status` are 400-600px sections, and a 92px estimate for one
+   of those is the under-estimate this comment warns about; `.card-live` paints
+   a 9px expanding glow ring (.pulse-dot) that paint containment would clip.
+*/
+.turn,
+.activity-row,
+.card:not(.settings-card):not(.settings-status):not(.card-live),
+.running-task-card {
+  content-visibility: auto;
+}
+.turn { contain-intrinsic-size: auto 88px; }
+.activity-row { contain-intrinsic-size: auto 24px; }
+.card:not(.settings-card):not(.settings-status):not(.card-live),
+.running-task-card { contain-intrinsic-size: auto 92px; }
+/* Inbox cards are deliberately NOT in that list: a push tap scrolls one into
+   view and focuses it through a two-frame dance (screens/Inbox.tsx), and that
+   contract is not worth risking for a list that is bounded at 200 rows. */
+
+/* ── depth transitions ───────────────────────────────────────────── */
+/*
+   ONLY depth animates. lib/back-gesture.ts already models the distinction —
+   a deep view (a run, a chat, a workspace) pushes exactly one same-document
+   history entry; tabs are peers and push nothing — so wrapping that same
+   enter/close in startViewTransition() means a tab switch, which is
+   high-frequency and feels faster without motion, can never animate.
+
+   180ms is the app's default motion budget. Browsers without view transitions
+   simply run the update, and the reduced-motion block below removes the
+   animation for anyone who asked for less movement.
+*/
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 180ms;
+  animation-timing-function: var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}
+
+/* Typed Plan mode uses the same composer and reply vocabulary as normal chat. */
+.chat-mode-bar { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0 0; color: var(--fg-3); font-size: 12px; line-height: 1.4; }
+.chat-mode-bar button { flex-shrink: 0; min-height: 44px; min-width: 64px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 12px; background: var(--bg-1); color: var(--fg); font: inherit; font-weight: 600; }
+.chat-mode-bar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft, transparent); }
+.chat-mode-bar button:disabled { opacity: .6; }
+.plan-mode-label { font-size: 12px; margin: 8px 0; color: var(--fg-3); }
+.plan-review { border: 1px solid var(--line-strong); border-top: 3px solid var(--accent); background: var(--bg-1); border-radius: 14px; padding: 16px; margin: 12px 0; }
+.plan-review > * + * { margin-top: 14px; }
+.plan-review > div:first-child { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.plan-review > div:first-child > span, .plan-revision { color: var(--fg-3); font-size: 12px; font-weight: 400; }
+.plan-revision { margin-left: 8px; }
+.plan-full-text { overflow-wrap: anywhere; line-height: 1.65; font: inherit; }
+.plan-review button { min-height: 44px; border: 1px solid var(--line-strong); border-radius: 10px; padding: 10px 14px; margin: 4px 8px 4px 0; background: var(--bg-1); color: var(--fg); font: inherit; font-weight: 600; }
+.plan-review button:first-child:last-child, .plan-review > div:last-child > button:first-child { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.plan-review button:disabled { opacity: .45; }
+
+.plan-review [role="alert"] { color: var(--accent-fail); }
+
+/* Terminal state under a reply — mirrors the desktop StatusPill. Quiet by
+   default; warning tint only when the harness itself says stopped/uncertain. */
+.reply-state { margin: 6px 0 0; font-size: 13px; color: var(--fg-2); }
+.reply-state-blocked, .reply-state-uncertain { color: var(--accent-deep); }

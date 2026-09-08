@@ -28,8 +28,7 @@
  * Cost discipline (the design's §3): a second unconditional judge call on
  * every irreversible write would double hot-path latency, so a DETERMINISTIC
  * pre-filter runs first and can short-circuit:
- *   3a-i.  Skill renderer/producer never ran → block deterministically
- *          (reuse skillBodyExecutionShortfall — the lunar-audit class). No judge.
+ *   3a-i.  Retained skills are references; only goal-adopted requirements apply.
  *   3a-ii. Batch-uniformity (this send's opening is byte-identical across
  *          DISTINCT targets) → evidence fed to the judge, NOT an auto-block
  *          (a legitimately-templated announcement is also identical — the
@@ -46,10 +45,11 @@
  * writes.
  */
 import { getRuntimeEnv } from '../../config.js';
+import { modelUsageAttributionStorage } from '../usage-log.js';
 import { listEvents } from './eventlog.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { extractTargetKeys, renderPayloadForJudge } from './grounding-gate.js';
-import { gatherSessionSkills, skillBodyExecutionShortfall, type SessionSkill } from './skill-execution.js';
+import { gatherSessionSkills, renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { composeJudgedObjective } from './objective-judge.js';
 import { getActiveGoalForSession } from '../../agents/plan-proposals.js';
 import { extractJsonCandidate } from './json-repair.js';
@@ -310,6 +310,14 @@ function clipOneLine(s: string, max = 900): string {
  * APIs, and tests a stable truth surface for "why would this write be judged?"
  * instead of forcing operators to reverse-engineer it from the event log.
  */
+function retainedSkillReferences(sessionId: string): SessionSkill[] {
+  const source = modelUsageAttributionStorage.getStore();
+  return gatherSessionSkills(sessionId, {
+    sourceUserSeq: source?.sessionId === sessionId ? source.sourceUserSeq : undefined,
+    includeUnavailable: true,
+  });
+}
+
 export function summarizeGoalFidelityState(
   sessionId: string,
   toolName?: string,
@@ -321,24 +329,17 @@ export function summarizeGoalFidelityState(
   const goal = gatherGoalText(sessionId);
   let rawSkills: SessionSkill[] = [];
   try {
-    rawSkills = gatherSessionSkills(sessionId);
+    rawSkills = retainedSkillReferences(sessionId);
   } catch (err) {
     issues.push(`skills_unavailable: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  const skills = rawSkills.map((skill) => {
-    let rendererShortfall: { skill: string; prescribed: string[] } | null = null;
-    try {
-      rendererShortfall = skillBodyExecutionShortfall(skill.name, skill.body, sessionId, skill.dir);
-    } catch {
-      rendererShortfall = null;
-    }
-    return {
-      name: skill.name,
-      bodyPreview: clipOneLine(skill.body),
-      rendererShortfall,
-    };
-  });
+  // A retained reference is not an accepted renderer obligation.
+  const skills = rawSkills.map((skill) => ({
+    name: skill.name,
+    bodyPreview: clipOneLine(skill.body),
+    rendererShortfall: null as { skill: string; prescribed: string[] } | null,
+  }));
 
   if (!enabled) issues.push('goal fidelity gate is disabled');
   if (!goal) issues.push('no recoverable user goal or approved goal contract');
@@ -445,33 +446,32 @@ export type GoalFidelityJudgeFn = (input: GoalFidelityJudgeInput) => Promise<Goa
 let judgeOverride: GoalFidelityJudgeFn | null = null;
 export function _setGoalFidelityJudgeForTests(fn: GoalFidelityJudgeFn | null): void { judgeOverride = fn; }
 
-const SKILL_BODY_CLIP = 5000;
-
 export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
   return [
-    'You are a goal-fidelity judge. An agent is ABOUT TO perform an IRREVERSIBLE external action (send an email, publish a site, update a record). You verify this ONE outgoing action — BEFORE it happens — against (1) the run\'s stated GOAL and (2) the loaded SKILL, which is a committed procedure the agent agreed to follow.',
+    'You are a goal-fidelity judge. An agent is ABOUT TO perform an IRREVERSIBLE external action (send an email, publish a site, update a record). You verify this ONE outgoing action — BEFORE it happens — against the stated GOAL. Retained skill bodies are references whose relevance and adopted requirements must be interpreted from that goal; reading a skill does not commit the agent to its whole procedure.',
     '',
-    'You are NOT judging whether the whole task is done. Judge ONLY whether THIS action honors the goal\'s intent and the skill\'s DEFINING requirement — the expensive, per-item step that is the reason the skill exists (e.g. "research each firm before writing", "personalize per recipient", "render the deliverable with the bundled script"). IGNORE the skill\'s cheap/generic template language (tone, signature, formatting, persona).',
+    'You are NOT judging whether the whole task is done. Judge ONLY whether THIS action honors the goal\'s intent and any applicable framework requirement adopted by that goal — including a required per-item step (e.g. "research each firm before writing", "personalize per recipient", "render the deliverable with the bundled script"). IGNORE the skill\'s cheap/generic template language (tone, signature, formatting, persona).',
     '',
     'Mark fulfills=false ONLY for a concrete, NAMEABLE gap, such as:',
-    '- the skill requires per-target research/personalization and this payload is generic or byte-identical across DISTINCT targets (see the deterministic evidence below);',
+    '- the accepted goal adopts per-target research/personalization and this payload omits it (see the evidence below);',
     '- the goal says do ONLY X and this action also does Y;',
-    '- the skill requires a produced/rendered artifact and this action ships raw or unprocessed data.',
+    '- the accepted goal requires a produced/rendered artifact and this action ships raw or unprocessed data.',
     'Vague dissatisfaction, style, "could be better", or anything you cannot put a name to → fulfills=true (FAIL OPEN). When in doubt, fulfills=true. A pure-advice/persona skill with no concrete per-item requirement has nothing to enforce → fulfills=true.',
     ...(input.skills.length === 0
       ? ['', 'NO SKILL IS LOADED for this run — judge ONLY goal-alignment, and FAIL OPEN AGGRESSIVELY. The bar to bounce is a CONTRADICTION you can name, NOT mere under-specification. Mark fulfills=false ONLY when: (a) the goal named a SPECIFIC recipient/destination and this action targets a DIFFERENT one, OR the goal said do-not-contact X and this contacts X; (b) the goal asked for X and this action does an unrelated or contradictory Y; or (c) the content is plainly off-topic from the stated goal. CRITICAL — an UNDERSPECIFIED goal that does not spell out a recipient ("reply to them", "send it", "follow up", "email a summary", "let them know") is NOT a mismatch: the agent resolving a sensible recipient/content PLAUSIBLY serves the goal → fulfills=true. If the goal is vague or generic, or you are at all uncertain whether the action serves it → fulfills=true (FAIL OPEN). Only a clear, nameable contradiction blocks; everything else proceeds.']
       : []),
     '',
-    'SCOPE vs PROHIBITION: a skill that says "this skill does not send", "present for approval", or "never claim the email was sent" is describing its OWN SCOPE (it drafts; it does not itself send). That is NOT a prohibition on the user sending the approved draft. If the ONLY gap is that this present-for-approval step has not happened yet, set fulfills=false AND blockKind="present_for_approval" — the recovery is to present the draft to the user and ask "good to send?", NOT to rebuild the payload. Reserve blockKind="other" for a genuine violation (wrong target, off-goal, un-rendered artifact, per-item research skipped).',
+    'SCOPE vs PROHIBITION: Apply the following only when the accepted goal adopts the requirement. A skill that says "this skill does not send", "present for approval", or "never claim the email was sent" is describing its OWN SCOPE (it drafts; it does not itself send). That is NOT a prohibition on the user sending the approved draft. If the ONLY gap is that this present-for-approval step has not happened yet, set fulfills=false AND blockKind="present_for_approval" — the recovery is to present the draft to the user and ask "good to send?", NOT to rebuild the payload. Reserve blockKind="other" for a genuine violation (wrong target, off-goal, un-rendered artifact, per-item research skipped).',
     '',
     'Name the single specific gap and the concrete recovery.',
     '',
     '=== GOAL (what the user asked for) ===',
     input.goal || '(no explicit goal recovered)',
     '',
-    '=== LOADED SKILL(S) — committed procedure; enforce the DEFINING requirement, ignore generic template language ===',
+    '=== RETAINED SKILL REFERENCES — full bodies with read/version provenance; not automatic new work ===',
+    'Planning, inspection and comparison do not authorize execution. Prior or unknown-source references do not add requirements. Use the framework/version the accepted goal adopts, not merely the first or latest one read.',
     ...(input.skills.length > 0
-      ? input.skills.map((s) => `--- skill: ${s.name} ---\n${s.body.slice(0, SKILL_BODY_CLIP)}`)
+      ? input.skills.map(renderSkillReference)
       : ['(no skill loaded)']),
     '',
     '=== DETERMINISTIC EVIDENCE (computed, not inferred) ===',
@@ -583,10 +583,10 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
     new Agent({
       name: 'GoalFidelityJudge',
       instructions: [
-        'Verify an about-to-fire irreversible external action against the run\'s goal and the loaded skill\'s defining requirement.',
+        'Verify an about-to-fire irreversible external action against the run\'s goal and applicable adopted framework requirements. A skill read alone is reference material, not authority for extra execution.',
         'Reply with EXACTLY ONE LINE and nothing else, one of:',
         '"FULFILLS: <one short sentence why the action is faithful>" — use this unless there is a CONCRETE, NAMEABLE gap (vague/style/uncertain → FULFILLS, fail open);',
-        '"GAP-APPROVAL: <the gap>" — ONLY when the single gap is that the loaded skill is draft-only (it says "does not send"/"present for approval"; that is the skill\'s scope, not a ban on the user sending the approved draft);',
+        '"GAP-APPROVAL: <the gap>" — ONLY when the accepted goal requires presenting the draft before sending and that step is the single gap (it says "does not send"/"present for approval"; that is the skill\'s scope, not a ban on the user sending the approved draft);',
         '"GAP: <the single specific gap and the concrete recovery>" — a genuine violation (wrong/byte-identical target, off-goal, un-rendered artifact, per-item research skipped).',
       ].join(' '),
       // Cross-family boundary judge (avoids same-family self-grading); falls open to
@@ -621,7 +621,16 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
     if (!verdict) throw new InvalidVerdict(`goal-fidelity judge returned no FULFILLS/GAP verdict (got: ${String(raw ?? '').slice(0, 120)})`);
     return verdict;
   };
-  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  // An honoured EXACT judge pin must be given a deadline it can meet. Without
+  // this the routing carried timeoutMs and nothing consumed it, so a deliberately
+  // chosen flagship judge still raced the 25s cheap-checker default and timed out
+  // into fail-open — the 2026-07-07/07-08 shape, and indistinguishable to the
+  // owner from "the flagship judged and agreed".
+  const raced = await withJudgeHedge(
+    attempt(routing),
+    hedgeRouting ? attempt(hedgeRouting) : null,
+    routing.timeoutMs ? { timeoutMs: routing.timeoutMs } : {},
+  );
   if (raced.value) {
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
     record(raced.value.fulfills ? 'passed' : (input.skills.length === 0 ? 'advisory' : 'blocked'), winner);
@@ -694,30 +703,11 @@ export async function evaluateGoalFidelity(
 ): Promise<GoalFidelityGateResult> {
   const deferCommit = opts.deferCommit === true;
   const targets = extractTargetKeys(rawArgs);
-  const skills = gatherSessionSkills(sessionId);
+  const skills = retainedSkillReferences(sessionId);
 
-  // 3a-i. DETERMINISTIC renderer floor (no judge): a loaded skill whose
-  // RENDERER/producer script never ran was not executed — its deliverable was
-  // hand-rolled (the lunar-audit "data gathered, generate-html.js never ran"
-  // class). Block before the irreversible publish so the model runs the
-  // renderer and retries. Reuses the proven skill-execution floor.
-  for (const skill of skills) {
-    let gap;
-    try { gap = skillBodyExecutionShortfall(skill.name, skill.body, sessionId); } catch { gap = null; }
-    if (gap) {
-      const { failures, commitFailure } = recordFailure(sessionId, targets[0] ?? skill.name, deferCommit);
-      return {
-        action: 'block',
-        mode: 'renderer',
-        skill: gap.skill,
-        reason: `the ${gap.skill} skill prescribes a producer script (${gap.prescribed.join(', ')}) but it never ran this session — the deliverable was not generated by the skill`,
-        gap: `Run the ${gap.skill} skill's producer (${gap.prescribed.join(', ')}) to GENERATE the deliverable, then retry this write. Do not hand-roll what the skill is meant to produce.`,
-        targets,
-        failureCount: failures,
-        commitFailure,
-      };
-    }
-  }
+  // A bare skill_read supplies reference material. The existing semantic
+  // reviewer decides applicability against the accepted goal; it must not be
+  // preceded by an all-session renderer obligation inferred from reading.
 
   // 3a-iii. Nothing to verify WITHOUT a goal → allow (the gate never invents a
   // goal). With a goal but NO skill, the CLEMMY_GOAL_ALIGNMENT_GATE widening

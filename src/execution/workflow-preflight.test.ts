@@ -87,16 +87,54 @@ test('preflight: supplying the input clears the heads-up', () => {
   assert.deepEqual(r.missingInputs, []);
 });
 
-test('preflight: separates semantic edit recommendations from generic warnings', () => {
-  const r = preflightWorkflow(wf({
-    enabled: true,
-    description: 'Workflow that builds a client audit',
-    steps: [{ id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' }],
-  }));
+function declaredWeakResearchWorkflow(): WorkflowDefinition {
+  return wf({
+    // A disabled workflow also has a routine warning that is not an edit.
+    description: 'Inspect current source evidence.',
+    steps: [{ id: 'research', prompt: 'Research the current source evidence.', sideEffect: 'read',
+      allowedTools: ['composio_search_tools'],
+      output: { type: 'object', required_keys: ['assessment'], non_empty: ['assessment'] } }],
+  });
+}
+
+test('preflight: separates advisories for a declared output contract from generic warnings', () => {
+  const def = declaredWeakResearchWorkflow();
+  const before = structuredClone(def);
+  const r = preflightWorkflow(def);
   assert.equal(r.ok, true);
-  assert.ok(r.warnings.some((w) => /output contract/.test(w)));
-  assert.ok(r.editAdvisories.some((w) => /output contract/.test(w)));
-  assert.ok(r.editAdvisories.some((w) => /no pinned `goal`/.test(w)));
+  assert.ok(r.warnings.some((w) => /currently disabled/.test(w)));
+  assert.ok(r.warnings.some((w) => /output contract can pass without evidence/.test(w)));
+  assert.ok(r.editAdvisories.some((w) => /output contract can pass without evidence/.test(w)));
+  assert.ok(!r.editAdvisories.some((w) => /currently disabled/.test(w)));
+  assert.ok(!r.editAdvisories.some((w) => /no pinned `goal`/.test(w)), 'absence of an authored goal is not an inferred defect');
+  assert.deepEqual(def, before, 'advisories cannot strengthen the declared contract');
+});
+
+test('preflight: deliverable prose alone invents neither output nor pinned-goal obligations', () => {
+  const def = wf({ enabled: true, description: 'Workflow that builds a client audit',
+    steps: [{ id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' }] });
+  const before = structuredClone(def);
+  const r = preflightWorkflow(def);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.editAdvisories, []);
+  assert.ok(!r.warnings.some(w => /output contract|no pinned `goal`/.test(w)));
+  assert.equal(def.goal, undefined);
+  assert.equal(def.steps[0]?.output, undefined);
+  assert.deepEqual(def, before);
+  assert.doesNotMatch(renderPreflightReport('demo', r), /Recommended edits before relying|output contract|no pinned `goal`/);
+});
+
+test('preflight: an explicitly declared unusable goal remains a blocking error', () => {
+  const def = wf({ goal: { objective: ' ' } });
+  const before = structuredClone(def);
+  const r = preflightWorkflow(def);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some(error => /declares a goal with no usable objective/.test(error)));
+  const body = renderPreflightReport('demo', r);
+  assert.match(body, /Blocking issues:/);
+  assert.match(body, /declares a goal with no usable objective/);
+  assert.match(body, /no tools ran, nothing was sent/);
+  assert.deepEqual(def, before, 'invalid declared goal must not be silently repaired');
 });
 
 test('workflowEditAdvisories: ignores routine non-edit warnings', () => {
@@ -149,11 +187,8 @@ test('renderPreflightReport: legible, and states nothing was executed', () => {
 });
 
 test('renderPreflightReport: shows recommended workflow edits separately', () => {
-  const body = renderPreflightReport('demo', preflightWorkflow(wf({
-    enabled: true,
-    description: 'Workflow that builds a client audit',
-    steps: [{ id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' }],
-  })));
+  const body = renderPreflightReport('demo', preflightWorkflow(declaredWeakResearchWorkflow()));
+  assert.match(body, /Advisories:/);
   assert.match(body, /Recommended edits before relying on this workflow unattended/);
-  assert.match(body, /output contract/);
+  assert.match(body, /output contract can pass without evidence/);
 });

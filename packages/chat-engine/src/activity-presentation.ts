@@ -1,3 +1,4 @@
+import { writeRowLabel, writeRowStatus, writeRowTone } from './write-ledger.js';
 import type { ActivityItem, MessageStatus } from './types.js';
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation.js';
@@ -188,7 +189,8 @@ export function hiddenActivityCount(
 
 /**
  * Close only activity rows whose terminal event never arrived. A successful
- * turn can safely settle them as done; failures and parked/stopped turns must
+ * turn can settle ordinary activity as done; write rows require their own
+ * terminal. Failures and parked/stopped turns must
  * remain visibly non-successful.
  */
 export function settleTerminalActivity(
@@ -202,6 +204,13 @@ export function settleTerminalActivity(
       ? 'failed'
       : 'interrupted';
   return items.map((item) => {
+    if (item.write) {
+      // A chat terminal cannot certify an outstanding write reservation. Keep
+      // the call identity so a later exact write terminal can still resolve it.
+      const write = item.write.disposition === 'reserved'
+        ? { ...item.write, disposition: 'unknown' as const } : item.write;
+      return { ...item, write, label: writeRowLabel(write), status: writeRowStatus(write), tone: writeRowTone(write) };
+    }
     if (item.status !== 'running') return item;
     // Host plan rows already carry their own truth. An open requirement is
     // not done just because the chat turn ended.
@@ -272,6 +281,13 @@ export interface WorkingNowEntryLike {
   liveness: string;
   needsAttention: boolean;
   startedAt: string;
+  /** Durable-evidence time — the newest thing the record can prove, and the one
+   *  `revision` is derived from. It is NOT a heartbeat: for a workflow row it
+   *  is pinned to `startedAt` for the whole run, so it says when evidence last
+   *  landed and nothing about whether the run is alive. Optional because the
+   *  board feed projects cards that have no evidence clock at all; a row
+   *  without it is never CALLED stalled, because then it cannot be known. */
+  lastEvidenceAt?: string;
   sessionId?: string;
   /** Present only on the operational DTO; a settled row is never current. */
   terminal?: unknown;
@@ -279,22 +295,80 @@ export interface WorkingNowEntryLike {
 
 export type WorkingNowPresentation = 'working' | 'waiting' | 'needs_you';
 
+/**
+ * Which of the three things a row is. Additive on purpose: `presentation`
+ * keeps its exact old meaning for the six surfaces already rendering from it
+ * (a stalled row presents as 'needs_you', which is where every one of them
+ * already puts a row that is not in flight — out of Running, into the quiet
+ * lane), while `membership` carries the precision the counts are built from.
+ */
+export type WorkingNowMembership = 'running' | 'stalled' | 'needs_you';
+
+/**
+ * How long a row that is not executing — or one whose evidence clock ticks —
+ * may stay quiet before calling it current would be a lie.
+ *
+ * Chosen from the system's own numbers, not from taste:
+ *   · the harness clamps its heartbeat check-in to at most 240 minutes
+ *     (`intEnv(ENV_KEYS.checkInMinutes, …, 1, 240)` in budget-settings.ts), so
+ *     a healthy long run is ALLOWED by configuration to be silent for four
+ *     hours between beats;
+ *   · two consecutive missed beats is therefore the first silence the system
+ *     itself cannot explain.
+ *
+ * Erring long is the safe direction: a missed stall reads as noise, a wrong
+ * stall demotes work that is genuinely alive. It clears the 90-second
+ * foreground dwell (WORKING_NOW_FOREGROUND_MS) by 320×, so a chat turn that
+ * has been thinking for ninety seconds is never called stalled — and the
+ * owner's real rows (blocked two days ago; a run reading 273h) sit 6× and 34×
+ * past it.
+ */
+export const WORKING_NOW_STALL_MS = 8 * 60 * 60 * 1_000;
+
 export interface PresentedWorkingNowEntry<E extends WorkingNowEntryLike> {
   entry: E;
   presentation: WorkingNowPresentation;
+  /** Which of the three things this row is. `presentation` is the render hint
+   *  six surfaces already switch on; this is the truth the counts come from. */
+  membership: WorkingNowMembership;
+  /** Convenience mirror of `membership === 'stalled'`, so a surface can say so
+   *  without importing the union. */
+  stalled: boolean;
+  /** Still counted as running, but nothing durable has landed for longer than
+   *  WORKING_NOW_STALL_MS and this row carries no clock that could prove
+   *  otherwise. The honest words for it are "running, no update in 11d" — not
+   *  a stall (we cannot show it stopped) and not a bare "Running" (we would be
+   *  reading a start as if it were now). */
+  quiet: boolean;
   /** The certificate. True exactly when presentation === 'working', which is
    *  reachable only through `liveness === 'live'`. Pulse visuals render from
    *  this flag and from nothing else. */
   pulse: boolean;
   /** Server-derived age ('' when the timestamps are unusable). */
   elapsed: string;
+  /** Server-derived distance from the LAST DURABLE EVIDENCE to the snapshot —
+   *  how long this row has been quiet. '' when it cannot be known, which is
+   *  the only honest answer for a feed that carries no evidence clock. */
+  silence: string;
 }
 
 export interface WorkingNowView<E extends WorkingNowEntryLike> {
-  /** Entries actually in flight (certified live or honestly unknown). */
+  /** Entries actually in flight: recently alive, certified live or honestly
+   *  unknown. A row nothing has happened to for WORKING_NOW_STALL_MS is NOT
+   *  counted here — that count is what said "6 running" with nothing running. */
   running: number;
-  /** Entries a person is blocking: attention-flagged, awaiting_*, or stale. */
+  /** Entries a person is blocking with something to answer: attention-flagged,
+   *  awaiting_*, or a lost lease. Recent — a stale one moves to `stalled`. */
   needsYou: number;
+  /** Rows that stopped and stayed stopped past the threshold. A blocked run
+   *  from Tuesday lands here rather than in `needsYou`: it is still a pending
+   *  item (a blocked run only settles once its report-back is acknowledged —
+   *  src/dashboard/activity-projection.ts:167), so this count is the one that
+   *  carries it, and a surface that shows needs-you work must show this too. */
+  stalled: number;
+  /** Rows dropped as settled. Reported so a surface can say "nothing current,
+   *  N finished" instead of silently showing an empty panel. */
+  settled: number;
   total: number;
   /** The pill text every trigger shows, so no surface words it differently. */
   label: string;
@@ -307,11 +381,103 @@ const NEEDS_YOU_LIFECYCLES: ReadonlySet<string> = new Set([
   'blocked', 'awaiting_approval', 'awaiting_input', 'paused_budget',
 ]);
 
-function workingNowPresentationFor(entry: WorkingNowEntryLike): WorkingNowPresentation {
-  if (entry.needsAttention || NEEDS_YOU_LIFECYCLES.has(entry.lifecycle)) return 'needs_you';
-  // A stale non-terminal run lost its lease: that is a fact for a person,
-  // never quiet background running.
-  if (entry.liveness === 'stale') return 'needs_you';
+/** Lifecycles where a person has a QUESTION IN FRONT OF THEM. These never age
+ *  out into "stalled": the owner's own rule for what may lead a surface is
+ *  "when Clem needs you to answer, and when Clem finishes" — quietly demoting
+ *  an unanswered question because it got old is how a decision gets lost. */
+const ANSWERABLE_LIFECYCLES: ReadonlySet<string> = new Set([
+  'awaiting_approval', 'awaiting_input',
+]);
+
+/** Terminal read from the LIFECYCLE, for the DTOs that carry no `terminal`
+ *  field. The strict foreground DTO the phone receives is exactly that shape,
+ *  so `!entry.terminal` could never see a finished row there. */
+const SETTLED_LIFECYCLES: ReadonlySet<string> = new Set([
+  'completed', 'failed', 'cancelled',
+]);
+
+function isSettled(entry: WorkingNowEntryLike): boolean {
+  return Boolean(entry.terminal) || SETTLED_LIFECYCLES.has(entry.lifecycle);
+}
+
+/**
+ * How long this row has been quiet, in milliseconds, or null when that cannot
+ * be known. Both ends are SERVER timestamps; the client clock never enters.
+ *
+ * `lastEvidenceAt` is the projection's durable-evidence time (and the thing
+ * `revision` is itself derived from), so it is the signal used wherever it
+ * exists. `startedAt` is the fallback: a row that has produced no evidence
+ * since it started has been quiet for exactly its whole life. Returning null —
+ * rather than assuming zero or infinity — is what keeps a feed with no
+ * evidence clock (the board's cards) from being accused of stalling.
+ */
+function workingNowSilenceMs(entry: WorkingNowEntryLike, observedAt: string): number | null {
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(observed)) return null;
+  const evidence = entry.lastEvidenceAt ? Date.parse(entry.lastEvidenceAt) : Number.NaN;
+  const started = Date.parse(entry.startedAt);
+  const latest = Number.isFinite(evidence) ? evidence : started;
+  if (!Number.isFinite(latest)) return null;
+  // A clock that runs backwards is not evidence of silence.
+  return observed < latest ? 0 : observed - latest;
+}
+
+/**
+ * Has this row's evidence clock actually TICKED — has anything durable landed
+ * since it started? Only then is its silence a measurement rather than its own
+ * age. A workflow run answers false for its entire life (the projection pins
+ * `lastEvidenceAt` to `startedAt` until it finishes), which is exactly why age
+ * alone may not end its claim to be running.
+ */
+function evidenceClockAdvanced(entry: WorkingNowEntryLike): boolean {
+  if (!entry.lastEvidenceAt) return false;
+  const evidence = Date.parse(entry.lastEvidenceAt);
+  const started = Date.parse(entry.startedAt);
+  if (!Number.isFinite(evidence) || !Number.isFinite(started)) return false;
+  return evidence > started;
+}
+
+/**
+ * Is this row known NOT to be executing? A person is the blocker, or the
+ * server says the owner stopped proving it is alive. These rows already
+ * stopped, so their age is a fact about how long they have been stopped —
+ * safe to demote. Anything else is presumed to be working until something
+ * durable says otherwise.
+ */
+function workingNowHalted(entry: WorkingNowEntryLike): boolean {
+  return entry.needsAttention
+    || NEEDS_YOU_LIFECYCLES.has(entry.lifecycle)
+    || entry.liveness === 'stale';
+}
+
+function workingNowMembershipFor(
+  entry: WorkingNowEntryLike,
+  silenceMs: number | null,
+  halted: boolean,
+  clockAdvanced: boolean,
+): WorkingNowMembership {
+  // A question outranks its own age.
+  if (ANSWERABLE_LIFECYCLES.has(entry.lifecycle)) return 'needs_you';
+  // Age may end a claim of running only where it is really evidence: the row
+  // is already stopped, or its clock demonstrably ticks and went quiet. On a
+  // row that is neither, "Running · 273h" is a bad answer — but "Stopped" is a
+  // worse one, because nothing here can prove it.
+  if (silenceMs !== null && silenceMs >= WORKING_NOW_STALL_MS && (halted || clockAdvanced)) {
+    return 'stalled';
+  }
+  if (halted) return 'needs_you';
+  return 'running';
+}
+
+function workingNowPresentationFor(
+  entry: WorkingNowEntryLike,
+  membership: WorkingNowMembership,
+): WorkingNowPresentation {
+  // Both non-running memberships render in the quiet lane, which is where the
+  // six existing call sites already send anything that is not in flight. This
+  // is what lets the new class land without reshaping `presentation` out from
+  // under them.
+  if (membership !== 'running') return 'needs_you';
   // The certificate: 'working' exists only inside this branch.
   if (entry.liveness === 'live') return 'working';
   return 'waiting';
@@ -323,7 +489,10 @@ export function workingNowElapsedLabel(startedAt: string, observedAt: string): s
   const started = Date.parse(startedAt);
   const observed = Date.parse(observedAt);
   if (!Number.isFinite(started) || !Number.isFinite(observed) || observed < started) return '';
-  const ms = observed - started;
+  return compactAgeLabel(observed - started);
+}
+
+function compactAgeLabel(ms: number): string {
   if (ms < 60_000) return '<1m';
   const min = Math.round(ms / 60_000);
   if (min < 60) return `${min}m`;
@@ -334,7 +503,12 @@ export function workingNowElapsedLabel(startedAt: string, observedAt: string): s
 
 /**
  * Present the server's Working-Now entries for rendering. Pure and total:
- * `observedAt` is the snapshot's own server timestamp, passed as data.
+ * `observedAt` is the snapshot's own server timestamp, passed as data, and
+ * every age in the result is the distance between two SERVER timestamps.
+ *
+ * Membership is the three-way decision at the top of this section: settled
+ * rows leave (counted in `settled` so a surface can say so), quiet rows are
+ * reported as `stalled`, and only what is left may be called running.
  */
 export function presentWorkingNow<E extends WorkingNowEntryLike>(
   entries: readonly E[],
@@ -345,23 +519,118 @@ export function presentWorkingNow<E extends WorkingNowEntryLike>(
     omitSessionId?: string | null;
   } = {},
 ): WorkingNowView<E> {
-  const current = entries.filter((entry) => !entry.terminal
-    && !(options.omitSessionId && entry.sessionId === options.omitSessionId));
+  const watched = (entry: E): boolean => Boolean(options.omitSessionId)
+    && entry.sessionId === options.omitSessionId;
+  let settled = 0;
+  const current: E[] = [];
+  for (const entry of entries) {
+    if (isSettled(entry)) { if (!watched(entry)) settled += 1; continue; }
+    if (watched(entry)) continue;
+    current.push(entry);
+  }
   const presented = current.map((entry): PresentedWorkingNowEntry<E> => {
-    const presentation = workingNowPresentationFor(entry);
+    const silenceMs = workingNowSilenceMs(entry, observedAt);
+    const membership = workingNowMembershipFor(
+      entry,
+      silenceMs,
+      workingNowHalted(entry),
+      evidenceClockAdvanced(entry),
+    );
+    const presentation = workingNowPresentationFor(entry, membership);
     return {
       entry,
       presentation,
+      membership,
+      stalled: membership === 'stalled',
+      quiet: membership === 'running' && silenceMs !== null && silenceMs >= WORKING_NOW_STALL_MS,
       pulse: presentation === 'working',
       elapsed: workingNowElapsedLabel(entry.startedAt, observedAt),
+      silence: silenceMs === null ? '' : compactAgeLabel(silenceMs),
     };
   });
-  const needsYou = presented.filter((p) => p.presentation === 'needs_you').length;
-  const running = presented.length - needsYou;
+  const needsYou = presented.filter((p) => p.membership === 'needs_you').length;
+  const stalled = presented.filter((p) => p.membership === 'stalled').length;
+  const running = presented.length - needsYou - stalled;
+  // The label says all three, in the order a person cares about them. "6
+  // running" with nothing running was the whole defect: `running` can now only
+  // count rows something has actually happened to.
   const label = [
     running > 0 ? `${running} running` : null,
     needsYou > 0 ? `${needsYou} need${needsYou === 1 ? 's' : ''} you` : null,
+    stalled > 0 ? `${stalled} stalled` : null,
+  // No "N current tasks" fallback: the three counts partition `presented`, so
+  // a non-empty view always words itself above and that branch could never
+  // run. The empty ones stay — `settled` is non-zero whenever the board feed
+  // hands its Done column to this presenter (apps/console-web/src/lib/board.ts
+  // `presentBoardWorkingNow`), which is the case this wording exists for.
   ].filter(Boolean).join(' · ')
-    || `${presented.length} current ${presented.length === 1 ? 'task' : 'tasks'}`;
-  return { running, needsYou, total: presented.length, label, entries: presented };
+    || (settled > 0 ? `${settled} finished` : 'Nothing running');
+  return { running, needsYou, stalled, settled, total: presented.length, label, entries: presented };
+}
+
+// ─── The words on the row ─────────────────────────────────────────────────────
+//
+// The chip and the rows one element below it used to be worded by different
+// files, and they disagreed: the chip said "21 stalled" over a list whose every
+// row said "Needs review". Both now come from here, so a surface cannot invent
+// a third vocabulary — and neither one may say a past fact in the present tense.
+
+/** Human vocabulary for a server-owned lifecycle. Unknown values fail closed
+ *  instead of turning an internal spelling into user-facing state. */
+export function workingNowLifecycleLabel(lifecycle: string): string {
+  const labels: Record<string, string> = {
+    accepted: 'Accepted',
+    queued: 'Queued',
+    reasoning: 'Running',
+    retrieving: 'Reading',
+    using_tool: 'Running',
+    fanout: 'Running',
+    reducing: 'Combining',
+    verifying: 'Verifying',
+    awaiting_input: 'Waiting for input',
+    awaiting_approval: 'Waiting for approval',
+    paused_budget: 'Stopped',
+    retrying: 'Retrying',
+    completing: 'Finishing',
+    blocked: 'Needs review',
+    completed: 'Done',
+    failed: 'Failed',
+    cancelled: 'Stopped',
+  };
+  return labels[lifecycle] ?? 'Status unavailable';
+}
+
+/**
+ * The one line under a run row's title.
+ *
+ * Three cases, matching the three memberships, in the same words the pill uses:
+ *   · STALLED — it stopped, and this is how long ago. Its own lifecycle word
+ *     ("Needs review", "Running") describes the moment it stopped, and printing
+ *     that alone is what put six two-day-old blocked runs under a heading that
+ *     said Running.
+ *   · NEEDS YOU — the lifecycle word IS the ask.
+ *   · RUNNING — the server's own phase text; and when the row is `quiet`, the
+ *     age is appended rather than hidden, because a row nothing has landed on
+ *     for eleven days may not present as plain "Running".
+ *
+ * Every age here is server-derived (observedAt − lastEvidenceAt); no client
+ * clock enters.
+ */
+export function workingNowStatusLabel(input: {
+  membership: WorkingNowMembership;
+  /** From the presented entry; '' when it cannot be known. */
+  silence: string;
+  quiet?: boolean;
+  lifecycle: string;
+  /** The server's live phase text, when the DTO carries one. */
+  phase?: string;
+}): string {
+  const lifecycle = workingNowLifecycleLabel(input.lifecycle);
+  // A stalled row always has a measurable silence — membership 'stalled' is
+  // only reachable through a non-null silenceMs — so there is no "no recent
+  // activity" case to word.
+  if (input.membership === 'stalled') return `Stalled · nothing for ${input.silence}`;
+  if (input.membership === 'needs_you') return lifecycle;
+  const base = input.phase?.trim() || lifecycle;
+  return input.quiet && input.silence ? `${base} · no update in ${input.silence}` : base;
 }

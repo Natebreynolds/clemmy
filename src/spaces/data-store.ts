@@ -14,6 +14,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { resolveInSpace } from './store.js';
+import { withWorkspaceSnapshotRead } from './workspace-snapshot.js';
 
 /** Hard cap so a runaway poll loop can't fill the disk. */
 export const MAX_DATA_BYTES = 5 * 1024 * 1024;
@@ -54,6 +55,7 @@ function readTail(file: string, limit: number): unknown[] {
 
 /** Read the Space's dataset. Returns {} if absent or unreadable. */
 export function readData(slug: string): unknown {
+  return withWorkspaceSnapshotRead(slug, () => {
   const file = resolveInSpace(slug, 'data.json');
   if (!existsSync(file)) return {};
   try {
@@ -61,6 +63,7 @@ export function readData(slug: string): unknown {
   } catch {
     return {};
   }
+  });
 }
 
 export interface WriteDataResult { ok: true; bytes: number }

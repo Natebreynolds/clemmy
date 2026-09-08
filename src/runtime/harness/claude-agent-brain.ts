@@ -113,7 +113,7 @@ import {
   renderTranscriptTurns,
 } from './session-transcript.js';
 import { resolveWriteEvidence } from './work-report.js';
-import { gatherSessionSkills, skillExecutionShortfall } from './skill-execution.js';
+import { gatherSessionSkills, renderSkillReference } from './skill-execution.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../../memory/skill-store.js';
 import { renderProvenSkillForPrompt } from '../../memory/skill-choice-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput, projectCommandsLineForInput } from './context-packet.js';
@@ -2583,10 +2583,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         allowedServerSlugs: [],
         maxTools: 0,
       };
-  // Arm role-scoped discovery only when the exact Claude surface can mount the
-  // same two provider-neutral candidate adapters behind tool_search. Explicit
-  // local allowlists and user-denied external authority retain builtins_only;
-  // a missing requirement projection does too inside initializeRoles.
+  // Mount only the currently authorized candidate adapters. Discovery request
+  // ownership is independent of advisory English-clause retrieval metadata.
   const actionToolSearchCandidateSources = acceptedActionSurface
     && mode === 'full'
     && !explicitToolAuthority
@@ -2595,10 +2593,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     : undefined;
   if (acceptedActionSurface) {
     discoveryGovernor.initializeTask({
+      claimKeyVersion: 'exact_request_v1',
       sessionId,
       sourceUserSeq: userInputEvent.seq,
       knownCapability: false,
     });
+    // Compatibility only: existing sources retain frozen role bookkeeping.
     discoveryGovernor.initializeRoles({
       sessionId,
       sourceUserSeq: userInputEvent.seq,
@@ -2935,7 +2935,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   // a degraded verification — it failed open (timed out / errored) or self-judged
   // (same-family, the model graded its own homework) — record that so the
   // completion is tagged "not independently verified", never a silent green check.
-  let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
+  let completionVerification: {
+    failedOpen?: boolean; selfJudge?: boolean; ownerSelectedJudge?: boolean;
+  } | null = null;
   let completionIndependentlyVerified = false;
   let artifactVerificationPending: RunArtifact[] = [];
   let logicalRunScopeId: string | undefined;
@@ -3225,16 +3227,21 @@ async function respondViaClaudeAgentSdkBrainAttempt(
             selfJudge: verdict.selfJudge,
             detail: { lane: 'claude_sdk', freshnessStatus },
           });
-          // A selfJudge NOT-DONE (same family as the brain) gets ONE bounce,
-          // never two — the second disagreement is accepted with the advisory
-          // tag (parity with loop.ts; ask-first batch regression).
-          if (!done && verdict.selfJudge && !freshnessGap && i >= 1) {
-            completionVerification = { selfJudge: true };
+          // An UNSELECTED same-family selfJudge NOT-DONE gets ONE bounce, never
+          // two — the second disagreement is accepted with the advisory tag
+          // (parity with loop.ts; ask-first batch regression). An owner-SELECTED
+          // same-provider judge is the configured path and keeps its bounces.
+          if (!done && verdict.selfJudge && verdict.ownerSelectedJudge !== true && !freshnessGap && i >= 1) {
+            // Only reachable when the judge was NOT owner-selected.
+            completionVerification = { selfJudge: true, ownerSelectedJudge: false };
             break;
           }
           // Tag the completion's verification confidence (only when accepting).
           if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
-            completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
+            completionVerification = {
+              failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge,
+              ownerSelectedJudge: verdict.ownerSelectedJudge === true,
+            };
           }
           if (done && !verdict.failedOpen && !verdict.selfJudge) {
             completionIndependentlyVerified = true;
@@ -3296,14 +3303,14 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       // Re-inject any SKILL bodies loaded this run into the continuation. The stateless
       // SDK lane rebuilds each query from the transcript, which EXCLUDES tool results —
       // so a `skill_read` from turn 1 is LOST on the continuation, and the model would
-      // hand-roll the back half (then get bounced by the skill-execution gate → oscillate).
-      // Carry the procedure forward so a skill-driven multi-tool run survives the turn cap.
+      // lose the framework needed for the remaining accepted work. Carry retained
+      // source/version references forward without turning reads into new jobs.
       const reinjectedSkills = (() => {
         try {
-          const skills = gatherSessionSkills(sessionId);
+          const skills = gatherSessionSkills(sessionId, { sourceUserSeq: userInputEvent.seq, includeUnavailable: true });
           if (skills.length === 0) return '';
-          const bodies = skills.map((s) => `## Skill you already loaded: ${s.name} — KEEP FOLLOWING it\n${s.body.slice(0, 8000)}`).join('\n\n');
-          return `\n\nThese are the skill procedure(s) you loaded earlier this run (their content is not in this fresh context) — FOLLOW them for the remaining work; you do NOT need to skill_read again:\n${bodies}\n`;
+          const bodies = skills.map(renderSkillReference).join('\n\n');
+          return `\n\nThese are retained skill references with source/version provenance. Use only what applies to the effective accepted task; reading them did not authorize extra work or adopt every step:\n${bodies}\n`;
         } catch { return ''; }
       })();
       // A3 recall ledger: continuations run in FRESH context (tool RESULTS from
@@ -3352,62 +3359,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     }
 
-    // DETERMINISTIC skill-execution floor — parity with the loop lane, which has
-    // enforced this since the 2026-06-15 lunar-audit (an LLM judge HAD the
-    // evidence that no render script ran and still passed hand-rolled output).
-    // This lane re-injected skill bodies but never verified EXECUTION, so a
-    // skill that prescribes bundled scripts could be treated as reading
-    // material — and a single-model user has no judge to catch it either. The
-    // one-step lane records the shortfall as a terminal concern; it never mints
-    // a corrective provider query.
-    if (!durableMemoryConversationOnly && !result.limitHit && !resultIsAwaitingInput()
-      && (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off') {
-      const skillGap = skillExecutionShortfall(sessionId);
-      if (skillGap) {
-        if (continuationsUsed >= continuationBudget) {
-          notePreterminalDeliveryConcern({
-            reason: `the required skill pipeline "${skillGap.skill}" was not executed`,
-            missing: skillGap.prescribed.map((script) => `skill_execution:${skillGap.skill}:${script}`),
-          });
-        } else {
-          try {
-            appendEvent({
-              sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'heartbeat',
-              data: { kind: 'skill_execution_repair', skill: skillGap.skill, prescribed: skillGap.prescribed },
-            });
-          } catch { /* telemetry best-effort */ }
-          const priorSkillResult = result;
-          try {
-            const repaired = await runContinuation({
-              prompt: [
-                `You treated this as finished, but the "${skillGap.skill}" skill was NOT executed: you ran none of its prescribed scripts (${skillGap.prescribed.join(', ')}).`,
-                "Do NOT hand-roll the deliverable. Run the skill's actual pipeline — its bundled render script and any mandatory validate script (re-read it with skill_read if needed) — so the output matches the skill's template exactly, then finish.",
-                "Only treat this as complete once the skill's own scripts have produced and validated the artifact.",
-              ].join(' '),
-              ...runOptions,
-            });
-            // A null continuation (cancelled / budget-exhausted) leaves the
-            // original result intact rather than erasing completed work.
-            result = repaired
-              ? {
-                  ...repaired,
-                  toolUses: [...priorSkillResult.toolUses, ...repaired.toolUses],
-                  text: repaired.text?.trim() ? repaired.text : priorSkillResult.text,
-                }
-              : priorSkillResult;
-          } catch {
-            // Repair is best-effort: a failed continuation must never swallow the
-            // work already done.
-            result = priorSkillResult;
-          }
-          const dispatch = finalizedWorkflowDispatchResponse();
-          if (dispatch) return dispatch;
-        }
-      }
-    }
+    // A bare skill read is reference material. It cannot authorize another
+    // provider continuation or invent a renderer obligation for this task.
 
     // A parsed create response is not enough to claim a document/site exists.
     // Unverified pointers always become a terminal concern. A legacy bounded
@@ -4253,9 +4206,18 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       );
       const runArtifacts = logicalRunScopeId ? listRunArtifacts(sessionId, logicalRunScopeId) : [];
       const artifactReadbackVerified = runArtifacts.length > 0 && artifactVerificationPending.length === 0;
+      // A selected same-provider review is neither independent validation nor
+      // controller validation. Falling through to 'execution_controller' meant
+      // claiming a controller proof it did not have, so the candidate was simply
+      // ineligible. It now carries its own authority honestly.
+      const ownerConfiguredReview = !completionIndependentlyVerified
+        && completionVerification?.ownerSelectedJudge === true
+        && completionVerification?.failedOpen !== true;
       const learningAuthority = completionIndependentlyVerified
         ? 'independent_completion_judge' as const
-        : 'execution_controller' as const;
+        : ownerConfiguredReview
+          ? 'configured_completion_review' as const
+          : 'execution_controller' as const;
       const learningManifests = summarizeWorkManifests(sessionId);
       const learningExternalWriteStatus = freshExternalWriteRequired
         ? claudeRequestFreshExternalWriteStatus(sessionId, userInputEvent.seq)
@@ -4271,6 +4233,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         controllerValidation: controllerVerified || artifactReadbackVerified,
         failedOpen: completionVerification?.failedOpen === true,
         selfJudge: completionVerification?.selfJudge === true,
+        // A deliberately selected same-provider review is a supported path, not
+        // an absent one — the learning gate scopes its veto on this.
+        ownerSelectedJudge: completionVerification?.ownerSelectedJudge === true,
         artifactVerificationPending: artifactVerificationPending.length,
         ambiguousExternalWrites: learningExternalWriteStatus === 'ambiguous' ? 1 : 0,
         manifestRemaining: learningManifests.reduce((sum, manifest) => sum + manifest.remaining, 0),

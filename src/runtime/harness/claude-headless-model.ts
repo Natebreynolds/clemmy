@@ -12,6 +12,7 @@ import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
+import { redactSensitiveText } from '../security.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-headless-model' });
@@ -461,11 +462,44 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
  * Normalisation belongs HERE, at the adapter edge, so the shared admission
  * boundary stays provider-neutral and never learns this transport's spellings.
  */
+function headlessApiErrorStatus(result: ClaudeHeadlessEvent | undefined): number | undefined {
+  const status = result?.api_error_status;
+  return typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599
+    ? status : undefined;
+}
+
+function headlessResultIsError(result: ClaudeHeadlessEvent | undefined): boolean {
+  return Boolean(result?.is_error) || headlessApiErrorStatus(result) !== undefined;
+}
+
+/** Retain only the CLI's error fields, never the request, environment or full
+ * init event. A nonzero CLI exit can report a 429 in stdout and nothing on
+ * stderr; preserve that status for the existing provider-neutral classifier. */
+class ClaudeHeadlessProcessError extends Error {
+  readonly status?: number;
+  readonly bodyText?: string;
+
+  constructor(exit: number | string, stderr: string, result?: ClaudeHeadlessEvent) {
+    const status = headlessApiErrorStatus(result);
+    const detail = headlessResultIsError(result) ? redactSensitiveText([
+      status ? `HTTP ${status}` : '',
+      typeof result?.terminal_reason === 'string' ? result.terminal_reason : '',
+      typeof result?.result === 'string' ? result.result : '',
+    ].filter(Boolean).join(': ')).slice(0, 2000) : '';
+    const safeStderr = redactSensitiveText(stderr).slice(0, 2000);
+    super(`Claude Code headless exited ${exit}: ${[safeStderr, detail].filter(Boolean).join(' | ')}`);
+    this.name = 'ClaudeHeadlessProcessError';
+    this.status = status;
+    if (detail) this.bodyText = detail;
+  }
+}
+
 function canonicalTerminationFromResult(
   result: ClaudeHeadlessEvent | undefined,
 ): { status?: string; finish_reason?: string } {
-  if (!result?.is_error) return {};
-  const subtype = typeof result.subtype === 'string' ? result.subtype.trim().toLowerCase() : '';
+  if (!headlessResultIsError(result)) return {};
+  if (headlessApiErrorStatus(result) !== undefined) return { status: 'failed' };
+  const subtype = typeof result?.subtype === 'string' ? result.subtype.trim().toLowerCase() : '';
   // Running out of turns is a BOUNDED LIMIT, not an opaque failure: the host
   // can say what happened and a continuation is meaningful.
   if (subtype === 'error_max_turns') return { finish_reason: 'max_output_tokens' };
@@ -476,7 +510,7 @@ function canonicalTerminationFromResult(
 function modelResponseFromState(state: HeadlessRunState, outputType: ModelRequest['outputType']): ModelResponse {
   const text = normalizeClaudeHeadlessOutputText(state.text || state.emittedText, outputType);
   recordClaudeHeadlessUsage(state);
-  const errored = Boolean(state.resultEvent?.is_error);
+  const errored = headlessResultIsError(state.resultEvent);
   const termination = canonicalTerminationFromResult(state.resultEvent);
   return {
     // An errored run's partial text is never presented as a completed
@@ -618,7 +652,7 @@ async function* runClaudeHeadlessAttempt(request: ModelRequest, modelId: string,
     }
     const { code, signal } = await exit;
     if (code !== 0) {
-      throw new Error(`Claude Code headless exited ${code ?? signal ?? 'unknown'}: ${stderr().slice(0, 2000)}`);
+      throw new ClaudeHeadlessProcessError(code ?? signal ?? 'unknown', stderr(), state.resultEvent);
     }
     if (state.text && state.text.startsWith(state.emittedText)) {
       const delta = state.text.slice(state.emittedText.length);

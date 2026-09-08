@@ -1,0 +1,72 @@
+{
+  "sourceUserSeq": 133921,
+  "toolReturnedSeq": 133944,
+  "query": "create a static Space with HTML content",
+  "oldNativeRank": 18,
+  "providerCandidates": [
+    {
+      "name": "AIRTABLE_CREATE_BASE",
+      "summary": "Creates a new Airtable base with specified tables and fields within a workspace."
+    },
+    {
+      "name": "AIRTABLE_CREATE_FIELD",
+      "summary": "Creates a new field within a specified table in an Airtable base."
+    },
+    {
+      "name": "DATAFORSEO_GET_MERCHANT_AMAZON_ASIN_TASK_HTML",
+      "summary": "Tool to retrieve raw HTML results for an Amazon ASIN merchant task by ID. Use when you need to get the unprocessed HTML content of an Amazon product page after creating an ASIN task. Task results are available within 7 days of creation."
+    },
+    {
+      "name": "AIRTABLE_CREATE_RECORD_FROM_NATURAL_LANGUAGE",
+      "summary": "Creates a new record in an Airtable table from a natural language description. Fetches the table schema, uses an LLM to generate the correct field payload, and creates the record with typecast enabled for automatic type conversion."
+    },
+    {
+      "name": "AIRTABLE_CREATE_RECORDS",
+      "summary": "Tool to create multiple records (up to 10) in a specified Airtable table. Use when you need to add new rows to a table with field values. Rate limit: 5 requests per second per base."
+    },
+    {
+      "name": "DATAFORSEO_CREATE_ON_PAGE_TASK_POST",
+      "summary": "Tool to create an On Page crawl task for analyzing websites. Use when you need to audit a website for SEO, check on-page parameters, find optimization opportunities, or analyze site structure. The crawl checks 60+ parameters including meta tags, duplicate content, images, response codes, and more."
+    },
+    {
+      "name": "DATAFORSEO_GET_MERCHANT_AMAZON_PRODUCTS_TASK_HTML_BY_ID",
+      "summary": "Tool to retrieve raw HTML results for a Merchant Amazon Products task by ID. Use when you need to get the unprocessed HTML content of Amazon product pages after creating a products task."
+    },
+    {
+      "name": "DATAFORSEO_GET_MERCHANT_AMAZON_SELLERS_TASK_HTML_BY_ID",
+      "summary": "Tool to retrieve raw HTML results for a Merchant Amazon Sellers task by ID. Use when you need to get the unprocessed HTML content of an Amazon sellers page after creating a sellers task."
+    },
+    {
+      "name": "DATAFORSEO_GET_AI_OPTIMIZATION_GEMINI_LLM_SCRAPER_HTML_BY_ID",
+      "summary": "Retrieve HTML results for a completed Gemini LLM Scraper task by its unique ID. Use this action to fetch the scraped HTML content from a previously posted task. Results are available for 7 days after task posting."
+    },
+    {
+      "name": "DATAFORSEO_GET_APP_DATA_GOOGLE_APP_SEARCHES_TASK_HTML_BY_ID",
+      "summary": "Tool to retrieve raw HTML results for a Google Play app searches task by ID. Use when you need to get the unprocessed HTML content of Google Play Store app search results after creating an app searches task."
+    },
+    {
+      "name": "DATAFORSEO_GET_APP_DATA_GOOGLE_APP_REVIEWS_TASK_HTML",
+      "summary": "Tool to retrieve HTML content for Google Play app reviews by task ID. Use when you need to get the raw HTML page data of app reviews from Google Play Store for a previously submitted task. Results are available for 7 days after task posting."
+    },
+    {
+      "name": "AIRTABLE_CREATE_COMMENT",
+      "summary": "Tool to create a comment on a specific Airtable record. Use when adding comments to records, mentioning collaborators using @[userId] syntax, or creating threaded comment replies. Supports optional parentCommentId for threaded conversations."
+    },
+    {
+      "name": "AIRTABLE_CREATE_MULTIPLE_RECORDS",
+      "summary": "DEPRECATED: Use AIRTABLE_CREATE_RECORDS instead. Creates multiple new records in a specified Airtable table."
+    },
+    {
+      "name": "DATAFORSEO_GET_APP_DATA_GOOGLE_APP_INFO_TASK_HTML_BY_ID",
+      "summary": "Tool to retrieve HTML content for a Google Play app by task ID. Use when you need to get the raw HTML page data from Google Play Store for a previously submitted app info task. Results are available for 7 days after task posting."
+    },
+    {
+      "name": "AIRTABLE_CREATE_RECORD",
+      "summary": "DEPRECATED: Use CreateRecords instead. Creates a new record in a specified Airtable table; field values must conform to the table's column types."
+    },
+    {
+      "name": "DATAFORSEO_GET_AI_OPT_CHAT_GPT_LLM_SCRAPER_HTML_BY_ID",
+      "summary": "Tool to retrieve AI Optimization Chat GPT LLM Scraper task results in HTML format. Use when you need to fetch the HTML content from a previously submitted LLM scraper task using its unique task ID. The task ID remains valid for 7 days after task creation."
+    }
+  ]
+}

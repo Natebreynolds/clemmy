@@ -55,3 +55,15 @@ test('the switcher keeps the stored order, drops unknown ids, and always ends wi
   assert.deepEqual(phoneSwitcherIds(prefs, KNOWN), ['inbox', 'home', 'spaces', 'more']);
   assert.deepEqual(phoneSwitcherIds({ ...prefs, phoneSwitcher: [] }, KNOWN), ['more']);
 });
+
+test('running work has a place in the phone navigation, without a tenth section', () => {
+  const ids = phoneSwitcherIds(DEFAULT_HOME_PREFERENCES, KNOWN);
+  assert.ok(ids.includes('activity'), 'the run surface is a destination, not only a tap-through');
+  assert.equal(ids[ids.length - 1], 'more');
+  assert.ok(ids.length <= 6, 'the switcher promotes what exists rather than growing');
+  assert.equal(
+    new Set(ids).size,
+    ids.length,
+    'no duplicate destinations',
+  );
+});

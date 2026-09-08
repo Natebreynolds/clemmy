@@ -11,6 +11,12 @@ export const LEARNING_RECEIPT_VERSION = 1 as const;
 export type LearningAuthority =
   | 'goal_validation'
   | 'independent_completion_judge'
+  /** A completion review the owner explicitly configured, which may share the
+   *  brain's provider. It is NOT independent validation and must never be
+   *  relabelled as such — it is its own, honestly weaker, proof kind. Without it
+   *  a selected same-provider review fell through to a controller authority it
+   *  had no controller proof for, and was simply ineligible. */
+  | 'configured_completion_review'
   | 'execution_controller'
   | 'workflow_terminal'
   | 'background_delivery_verifier'
@@ -42,6 +48,9 @@ export interface LearningCandidateInput {
   explicitUserRequest?: boolean;
   failedOpen?: boolean;
   selfJudge?: boolean;
+  /** The completion judge was an explicit owner selection, not a no-other-family
+   *  fallback. A deliberately chosen same-provider judge is a supported path. */
+  ownerSelectedJudge?: boolean;
   awaitingUser?: boolean;
   needsAttention?: boolean;
   artifactVerificationPending?: number;
@@ -62,6 +71,10 @@ export interface LearningDecision {
 const AUTHORITIES = new Set<LearningAuthority>([
   'goal_validation',
   'independent_completion_judge',
+  // Without this the reader rejected every receipt written under the new
+  // authority, so the learning candidate was accepted and then failed
+  // validation on read-back — the allowlist and the enum had drifted apart.
+  'configured_completion_review',
   'execution_controller',
   'workflow_terminal',
   'background_delivery_verifier',
@@ -77,6 +90,9 @@ function authorityEvidence(input: LearningCandidateInput): string | null {
     case 'goal_validation':
     case 'independent_completion_judge':
       return input.independentValidation ? 'independent_validation' : null;
+    case 'configured_completion_review':
+      // Proof kind is named for what it is: a review the owner selected.
+      return input.ownerSelectedJudge ? 'owner_selected_review' : null;
     case 'execution_controller':
     case 'workflow_terminal':
     case 'background_delivery_verifier':
@@ -104,7 +120,22 @@ export function evaluateLearningCandidate(input: LearningCandidateInput): Learni
   if (!input.terminalSuccess) reasons.push('execution did not reach terminal success');
   if (!authorityProof) reasons.push(`missing ${input.authority} validation authority`);
   if (input.failedOpen) reasons.push('completion verification failed open');
-  if (input.selfJudge) reasons.push('completion was only self-judged');
+  // AUTHORITY-SCOPED, not family-scoped.
+  //
+  // This veto existed to stop a same-family fallback from standing in for
+  // independent validation. It ran unconditionally, so it also vetoed
+  // candidates whose authority never claimed independence at all — a
+  // controller-validated or owner-instructed candidate was killed by a stray
+  // judge-provenance field. And an owner who deliberately selected a
+  // same-provider judge had their configured, supported review treated as no
+  // review, which one-provider users cannot avoid.
+  //
+  // The floor that does NOT move: `failedOpen` above stays unconditional — a
+  // fail-open is NO verdict, which is exactly the "arbitrary prose becomes a
+  // verified procedure" case.
+  if (input.selfJudge && !input.ownerSelectedJudge && authorityProof === 'independent_validation') {
+    reasons.push('completion was self-judged by an unselected same-family fallback');
+  }
   if (input.awaitingUser) reasons.push('execution is awaiting user input');
   if (input.needsAttention) reasons.push('execution completed with needs-attention quality state');
 
@@ -176,9 +207,13 @@ export function isValidLearningReceipt(
   const requiredAuthorityEvidence = receipt.authority === 'goal_validation'
     || receipt.authority === 'independent_completion_judge'
     ? 'independent_validation'
-    : receipt.authority === 'manual_user_request'
-      ? 'explicit_user_request'
-      : 'controller_validation';
+    : receipt.authority === 'configured_completion_review'
+      // Re-validated as its own proof kind, so a configured review can never be
+      // read back as independent validation.
+      ? 'owner_selected_review'
+      : receipt.authority === 'manual_user_request'
+        ? 'explicit_user_request'
+        : 'controller_validation';
   if (!receipt.evidence.includes(requiredAuthorityEvidence)) return false;
   if (expected?.target && receipt.target !== expected.target) return false;
   if (expected?.sessionId && receipt.sessionId !== expected.sessionId) return false;

@@ -661,7 +661,14 @@ async function runGroundingJudge(payload: string, sources: GroundingSource[]): P
     if (!verdict) throw new InvalidVerdict(`grounding judge returned no GROUNDED/UNGROUNDED verdict (got: ${raw.slice(0, 120)})`);
     return verdict;
   };
-  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  // Honour the deadline the selected ROUTE carries. An honoured exact pin
+  // resolves with the extended deadline; ignoring it raced a deliberately
+  // chosen flagship against the 25s cheap-checker default and timed it out.
+  const raced = await withJudgeHedge(
+    attempt(routing),
+    hedgeRouting ? attempt(hedgeRouting) : null,
+    routing.timeoutMs ? { timeoutMs: routing.timeoutMs } : {},
+  );
   if (raced.value) {
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
     record(raced.value.grounded ? 'passed' : 'blocked', winner);

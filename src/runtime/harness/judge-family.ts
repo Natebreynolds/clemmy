@@ -86,6 +86,16 @@ export function boundaryJudgeTimeoutMs(): number {
  * every large audit since mid-August ('judge unavailable: judge timed out',
  * Friday dashboard 2026-09-02), silently downgrading each pinned goal to
  * advisory. A post-run audit can afford a real deadline. */
+/** Deadline for a judge the owner pinned EXACTLY (downshiftForBoundary honoured
+ *  it rather than substituting). The 25s boundary default was sized for a cheap
+ *  checker; a flagship needs the room a deliberate judge lane already gets, or
+ *  the pin converts into an all-timeout fail-open — the 2026-07-07 shape.
+ *  Tunable via CLEMMY_EXACT_JUDGE_TIMEOUT_MS. */
+export function exactJudgeBoundaryTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EXACT_JUDGE_TIMEOUT_MS', '90000') ?? '90000', 10);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;
+}
+
 export function goalJudgeTimeoutMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_GOAL_JUDGE_TIMEOUT_MS', '90000') ?? '90000', 10);
   return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;

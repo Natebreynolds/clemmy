@@ -22,6 +22,7 @@ const {
   getToolOutput,
   getToolOutputForInvocation,
   writeToolOutput,
+  openEventLog,
 } = await import('./eventlog.js');
 const {
   formatRecallableToolText,
@@ -361,4 +362,124 @@ test('densifyMarkdownForModelHead strips scrape junk, leaves normal text alone',
 
   const normal = 'A report with one image ![x](https://a.b/c.png) and prose.';
   assert.equal(densifyMarkdownForModelHead(normal), normal, 'sub-threshold text untouched');
+});
+
+
+test('reformatting an authenticated projection preserves full bytes through repeated adapters and smaller display budgets', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const context = { sessionId: session.id, callId: 'format-idempotence', toolName: 'skill_read',
+    settlementNonce: '88888888-8888-4888-8888-888888888888' };
+  const full = 'REFERENCE_START\n' + 'Complete retained framework café.\n'.repeat(3_000) + 'REFERENCE_END';
+  withToolOutputContext(context, () => {
+    const first = formatRecallableToolText(full);
+    const second = formatRecallableToolText(first);
+    const third = formatRecallableToolText(second);
+    assert.equal(second, first);
+    assert.equal(third, first);
+    assert.equal(getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.output, full);
+    const smaller = formatRecallableToolText(third, { maxChars: 2_000 });
+    assert.ok(smaller.length <= 2_000);
+    assert.equal(exactToolOutputForInvocation({ ...context, compactResult: smaller }), full);
+    closeEventLog();
+    assert.equal(getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.output, full);
+    assert.equal(getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.truncatedAtWrite, false);
+  });
+});
+
+test('another invocation or tool cannot redeem a previous formatter projection as its own original', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const context = { sessionId: session.id, callId: 'format-isolation', toolName: 'skill_read',
+    settlementNonce: '99999999-9999-4999-8999-999999999999' };
+  const full = 'Original framework details. '.repeat(2_000);
+  const projected = withToolOutputContext(context, () => formatRecallableToolText(full));
+  const other = { ...context, settlementNonce: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' };
+  withToolOutputContext(other, () => {
+    const output = formatRecallableToolText(projected);
+    assert.equal(output, projected);
+    assert.equal(exactToolOutputForInvocation({ ...other, compactResult: output }), projected,
+      'the old nonce cannot lend this invocation the previous full output');
+    assert.equal(getToolOutputForInvocation(session.id, other.callId, other.settlementNonce)?.output, projected);
+  });
+  assert.equal(exactToolOutputForInvocation({ ...context, toolName: 'unrelated_tool', compactResult: projected }), projected);
+  assert.equal(getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.output, full);
+});
+
+test('reformatting cannot turn a corrupt retained original into valid projection-only evidence', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const context = { sessionId: session.id, callId: 'format-corrupt', toolName: 'skill_read',
+    settlementNonce: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' };
+  withToolOutputContext(context, () => {
+    const projected = formatRecallableToolText('Original complete framework. '.repeat(2_000));
+    openEventLog().prepare('UPDATE tool_output_invocations SET output_full = ? WHERE session_id = ? AND call_id = ? AND invocation_nonce = ?')
+      .run('corrupted bytes', session.id, context.callId, context.settlementNonce);
+    const result = JSON.parse(formatRecallableToolText(projected));
+    assert.equal(result.ok, false);
+    assert.equal(result.error_kind, 'truncated_tool_output');
+    assert.equal(getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.truncatedAtWrite, true);
+  });
+});
+
+// Live Facebook source154281 exposed generic scalar corruption in the shared
+// production formatter: fitting numbers received their exact1–3-byte budget,
+// then the placeholder's4-byte floor replaced those real values with null.
+test('actual recallable formatter preserves fitting scalars and authentic raw bytes in large envelopes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const nonce = '44444444-4444-4444-8444-444444444444';
+  const callId = 'call-large-scalar-envelope';
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    postId: `record-${index}`,
+    likes: 2,
+    shares: 0,
+    views: 113,
+    negative: -1,
+    fraction: 0.5,
+    empty: '',
+    actualNull: null,
+    actualFalse: false,
+    media: { body: 'nested retained bytes '.repeat(700) },
+    sharedPost: { text: `Nested caption ${index}`, value: 3 },
+  }));
+  const full = JSON.stringify({ data: { items: rows }, successful: true, error: null });
+  const visible = withToolOutputContext({
+    sessionId: sess.id, callId, toolName: 'composio_execute_tool', settlementNonce: nonce,
+  }, () => formatRecallableToolText(full, { maxChars: 20_000 }));
+  const parsed = JSON.parse(visible);
+  assert.equal(parsed.data.items.length, 25);
+  for (const row of parsed.data.items) {
+    assert.deepEqual([row.likes, row.shares, row.views, row.negative, row.fraction,
+      row.empty, row.actualNull, row.actualFalse], [2, 0, 113, -1, 0.5, '', null, false]);
+    assert.equal(row.sharedPost.value, 3);
+  }
+  assert.equal(parsed.__clementine.truncated, true, 'the projection remains honestly partial');
+  assert.equal(getToolOutputForInvocation(sess.id, callId, nonce)?.output, full);
+  assert.equal(exactToolOutputForInvocation({ sessionId: sess.id, callId,
+    toolName: 'composio_execute_tool', compactResult: visible, settlementNonce: nonce }), full);
+  assert.notEqual(exactToolOutputForInvocation({ sessionId: sess.id, callId,
+    toolName: 'composio_execute_tool', compactResult: visible,
+    settlementNonce: '55555555-5555-4555-8555-555555555555' }), full,
+  'projection repair grants no authority to another invocation');
+});
+
+
+test('fitting deep subtrees survive projection depth limits with original null and zero semantics', () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const tiny = { zero: 0, two: 2, empty: '', actualNull: null, nested: { value: 113 } };
+  let deep: Record<string, unknown> = { tiny, oversized: 'x'.repeat(300_000) };
+  for (let i = 0; i < 10; i += 1) deep = { next: deep };
+  const full = JSON.stringify({ data: { deep }, successful: true });
+  const nonce = '66666666-6666-4666-8666-666666666666';
+  const visible = withToolOutputContext({ sessionId: session.id, callId: 'deep-fitting-subtree',
+    toolName: 'composio_execute_tool', settlementNonce: nonce },
+  () => formatRecallableToolText(full, { maxChars: 20_000 }));
+  const projected = JSON.parse(visible);
+  let leaf = projected.data.deep;
+  for (let i = 0; i < 10; i += 1) leaf = leaf.next;
+  assert.deepEqual(leaf.tiny, tiny, 'a fitting subtree is admitted before the depth truncation guard');
+  assert.equal(exactToolOutputForInvocation({ sessionId: session.id, callId: 'deep-fitting-subtree',
+    toolName: 'composio_execute_tool', compactResult: visible, settlementNonce: nonce }), full);
 });

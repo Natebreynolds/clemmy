@@ -253,7 +253,10 @@ test('tool_output_query still bounces genuinely non-JSON output to recall_tool_r
   // payload was JSON carrying harness prose (live 2026-09-03, platform-49
   // run 6: the model obeyed that falsehood twice and the run died).
   assert.match(res.content[0].text, /No JSON value could be recovered/);
-  assert.match(res.content[0].text, /use recall_tool_result to read it/);
+  // The PROPERTY, not the sentence: genuinely non-JSON output routes to the
+  // reader that can read text. The exact call is now computed (and a fallback
+  // named) rather than hardcoded, so assert the routing, not the phrasing.
+  assert.match(res.content[0].text, /recall_tool_result \{"call_id":"call_txt"\}/);
   assert.doesNotMatch(res.content[0].text, /is not JSON/);
 });
 

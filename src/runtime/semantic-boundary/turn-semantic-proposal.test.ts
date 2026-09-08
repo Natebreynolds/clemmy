@@ -1081,3 +1081,417 @@ test('shownGroundingDescriptors resolves a definition-qualified ref to its shown
     assert.match(body, /objective: boundedSemanticObjective\(input\.objective\)/);
   });
 }
+
+
+// ─── Typed operation/destination contract ────────────────────────────────────
+//
+// C13 source 136121 bound a named_existing edit to cap:local:workflow_create
+// (create_new); compile/seal/activation accepted it and the edit died with zero
+// writes. C14 caught that but compared each operation against the UNION of every
+// declared destination, which the reviewer's pure-validator repro showed wrong
+// three ways. This matrix is that repro, as behaviour.
+
+const WORKSPACE_SAVE = 'cap:local:space_save:reversible';
+const WORKSPACE_EDIT = 'cap:local:space_edit_view:reversible';
+const WORKFLOW_CREATE = 'cap:local:workflow_create:reversible';
+const WORKFLOW_UPDATE = 'cap:local:workflow_update:reversible';
+
+function authoring(
+  id: string,
+  deliverableKind: string,
+  posture: 'create_new' | 'named_existing',
+  inputKind: string,
+  postures?: readonly ('create_new' | 'named_existing')[],
+  // Real capabilities in one authoring family SHARE a purpose slug
+  // (author_workflow / author_workspace). That shared purpose is what makes
+  // create→edit lineage legitimate, so the fixture must model it.
+  purpose = `author_${deliverableKind}`,
+): HostCapabilityDescriptorV1 {
+  return {
+    ...descriptor(id, 'local_write', inputKind, `${deliverableKind}_revision`),
+    purpose,
+    deliverableKind,
+    applicableDeliverableKinds: [`${deliverableKind}_revision`],
+    producedOutputKinds: [`${deliverableKind}_revision`],
+    acceptedInputKinds: [inputKind],
+    destinationPosture: posture,
+    ...(postures ? { destinationPostures: postures } : {}),
+  };
+}
+
+/** The four real authoring capabilities, with space_save as the upsert it is. */
+function authoringHost(): TurnSemanticHostViewV1 {
+  const base = host();
+  const capabilities = [
+    authoring(WORKSPACE_SAVE, 'workspace', 'create_new', 'workspace_definition',
+      ['create_new', 'named_existing']),
+    authoring(WORKSPACE_EDIT, 'workspace', 'named_existing', 'workspace_patch'),
+    authoring(WORKFLOW_CREATE, 'workflow', 'create_new', 'workflow_definition'),
+    authoring(WORKFLOW_UPDATE, 'workflow', 'named_existing', 'workflow_patch'),
+  ];
+  return {
+    ...base,
+    catalog: {
+      ...base.catalog,
+      capabilityIds: new Set(capabilities.map((entry) => entry.id)),
+      capabilities,
+    },
+  };
+}
+
+function authoringWork(
+  destinations: Array<{ posture: 'create_new' | 'named_existing'; family: string }>,
+  // `dependsOn` is ORDER. `dataFrom` is DATA — only the latter establishes that
+  // a predecessor produced the artifact this operation then names.
+  operations: Array<{ id: string; ref: string; dependsOn?: string[]; dataFrom?: string[] }>,
+): NonNullable<TurnSemanticProposalV1['work']> {
+  const sinks = destinations.map((entry) => ({ ...entry, handleRequired: true }));
+  return {
+    ...work(),
+    construct: 'single_act',
+    cardinality: null,
+    requestedEffect: 'local_write',
+    destination: sinks[0] ?? null,
+    destinations: sinks,
+    topology: {
+      version: 1,
+      operations: operations.map((entry) => ({
+        id: entry.id,
+        effect: 'local_write',
+        coverage: null,
+        dependsOn: entry.dependsOn ?? [],
+        dataFrom: entry.dataFrom ?? [],
+        cardinality: { kind: 'once' },
+      })),
+      universes: [],
+    },
+    topologyHash: null,
+    operations: operations.map((entry) => ({
+      id: entry.id,
+      role: 'destination',
+      requestedEffect: 'local_write',
+      dependsOn: entry.dependsOn ?? [],
+      evidence: [],
+      capabilityRef: entry.ref,
+    })),
+    deliverables: [{ id: 'artifact', kind: 'revision' }],
+    evidenceRequirements: ['readback'],
+  };
+}
+
+function destinationMismatch(work: NonNullable<TurnSemanticProposalV1['work']>): boolean {
+  return issueCodes(validateTurnSemanticProposalV1(proposal({ work }), authoringHost()))
+    .includes('capability_ref_destination_mismatch');
+}
+
+test('VALID: a full rewrite of an EXISTING Space via the upsert space_save', () => {
+  // space_save's own description is "Create or update a Workspace". Reading only
+  // its primary create_new posture rejected a legitimate save onto an existing
+  // Space; the registry now declares both postures, which is the accurate fact.
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [{ posture: 'named_existing', family: 'workspace' }],
+      [{ id: 'op-save', ref: WORKSPACE_SAVE }],
+    )),
+    false,
+    'an upsert must satisfy a named_existing destination',
+  );
+});
+
+test('VALID: create a Space, then a targeted edit of what it just produced', () => {
+  // The edit acts on the predecessor's output, not on the plan's declared new
+  // destination. Dependency lineage is what makes named_existing legitimate here.
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [{ posture: 'create_new', family: 'workspace' }],
+      [
+        { id: 'op-create', ref: WORKSPACE_SAVE },
+        { id: 'op-edit', ref: WORKSPACE_EDIT, dependsOn: ['op-create'], dataFrom: ['op-create'] },
+      ],
+    )),
+    false,
+    'an edit of a freshly created artifact must admit',
+  );
+});
+
+test('VALID: a mixed plan that updates a workflow and creates a Space', () => {
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [
+        { posture: 'named_existing', family: 'workflow' },
+        { posture: 'create_new', family: 'workspace' },
+      ],
+      [
+        { id: 'op-workflow', ref: WORKFLOW_UPDATE },
+        { id: 'op-space', ref: WORKSPACE_SAVE },
+      ],
+    )),
+    false,
+    'each operation matches its own family; nothing here conflicts',
+  );
+});
+
+test('INVALID: a wrong workflow_create is caught even when a Space contributes create_new', () => {
+  // THE MASKED CASE. Under a union of postures, the Space's create_new made the
+  // wrong workflow_create look satisfiable. Family scoping unmasks it.
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [
+        { posture: 'named_existing', family: 'workflow' },
+        { posture: 'create_new', family: 'workspace' },
+      ],
+      [
+        { id: 'op-workflow', ref: WORKFLOW_CREATE },
+        { id: 'op-space', ref: WORKSPACE_SAVE },
+      ],
+    )),
+    true,
+    'an unrelated create_new destination must not launder a create-only workflow op',
+  );
+});
+
+test('INVALID: a wrong workflow_create for an existing workflow (the C13 live defect)', () => {
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [{ posture: 'named_existing', family: 'workflow' }],
+      [{ id: 'op-workflow', ref: WORKFLOW_CREATE }],
+    )),
+    true,
+    'C13\'s pre-persist rejection must be preserved',
+  );
+});
+
+// ─── Lineage counterexamples (C15 ruling) ────────────────────────────────────
+
+const WORKFLOW_RUN = 'cap:local:workflow_run:reversible';
+
+test('INVALID: a run receipt is not an authored artifact (order-only dependency)', () => {
+  // workflow_run shares the workflow family and declares create_new, so an
+  // ORDER edge from it to an update looked like "the predecessor made this".
+  // A dispatch receipt is not an authored workflow. Two typed facts separate
+  // them: there is no `dataFrom` edge, and run's purpose is not authoring.
+  const base = authoringHost();
+  const withRun = {
+    ...base,
+    catalog: {
+      ...base.catalog,
+      capabilityIds: new Set([...base.catalog.capabilityIds, WORKFLOW_RUN]),
+      capabilities: [
+        ...(base.catalog.capabilities ?? []),
+        authoring(WORKFLOW_RUN, 'workflow', 'create_new', 'workflow_definition', undefined,
+          'dispatch_named_workflow'),
+      ],
+    },
+  };
+  const work = authoringWork(
+    [{ posture: 'create_new', family: 'workflow' }],
+    [
+      { id: 'op-run', ref: WORKFLOW_RUN },
+      // ORDER only — deliberately no dataFrom.
+      { id: 'op-update', ref: WORKFLOW_UPDATE, dependsOn: ['op-run'] },
+    ],
+  );
+  assert.ok(
+    issueCodes(validateTurnSemanticProposalV1(proposal({ work }), withRun))
+      .includes('capability_ref_destination_mismatch'),
+    'an ordering edge from a dispatch must not establish a created workflow',
+  );
+});
+
+test('CONTROL: create then edit in the SAME authoring purpose, with data lineage, is valid', () => {
+  assert.equal(
+    destinationMismatch(authoringWork(
+      [{ posture: 'create_new', family: 'workflow' }],
+      [
+        { id: 'op-create', ref: WORKFLOW_CREATE },
+        { id: 'op-edit', ref: WORKFLOW_UPDATE, dependsOn: ['op-create'], dataFrom: ['op-create'] },
+      ],
+    )),
+    false,
+    'a genuine authoring lineage must still admit',
+  );
+});
+
+test('INVALID: two same-family targets cannot mask a wrong create binding', () => {
+  // The plan names BOTH an existing workflow and a new one but cites only
+  // workflow_create. Per-operation compatibility passes (create serves the
+  // create_new target); the named_existing target is left unserved.
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: authoringWork(
+      [
+        { posture: 'named_existing', family: 'workflow' },
+        { posture: 'create_new', family: 'workflow' },
+      ],
+      [{ id: 'op-create', ref: WORKFLOW_CREATE }],
+    ),
+  }), authoringHost());
+  assert.ok(
+    issueCodes(result).includes('destination_target_unserved'),
+    `the unserved existing-workflow target must be reported: ${issueCodes(result).join(',')}`,
+  );
+});
+
+test('CONTROL: two same-family targets each served by their own operation admit', () => {
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: authoringWork(
+      [
+        { posture: 'named_existing', family: 'workflow' },
+        { posture: 'create_new', family: 'workflow' },
+      ],
+      [
+        { id: 'op-create', ref: WORKFLOW_CREATE },
+        { id: 'op-update', ref: WORKFLOW_UPDATE },
+      ],
+    ),
+  }), authoringHost());
+  assert.ok(
+    !issueCodes(result).includes('destination_target_unserved'),
+    `both targets are served: ${issueCodes(result).join(',')}`,
+  );
+});
+
+// ─── The exact captured Space draft (live source 136708) ─────────────────────
+//
+// The failed C16 build-A Space edit first chose the correct direct space_save;
+// a missing current-source definition forced a plan fallback, and THAT plan
+// declared destination family `workspace` while citing
+// cap:local:workflow_update (deliverableKind `workflow`). It was accepted and
+// frozen, later Space discovery reported unsupported_unmaterialized, and the
+// reply falsely described tool unavailability. The reviewer's pure-validator
+// reproduction of this exact draft returned ok:true with zero issues.
+
+test('INVALID: an explicit Workspace target cannot be served by a workflow operation', () => {
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: authoringWork(
+      [{ posture: 'named_existing', family: 'workspace' }],
+      [{ id: 'update_space_heading', ref: WORKFLOW_UPDATE }],
+    ),
+  }), authoringHost());
+  assert.equal(result.ok, false, 'the captured draft must not admit');
+  assert.ok(
+    issueCodes(result).includes('destination_target_unserved'),
+    `the workspace target is unserved by any cited operation: ${issueCodes(result).join(',')}`,
+  );
+});
+
+test('CONTROL: the same Workspace target served by a Space operation admits', () => {
+  assert.ok(
+    !issueCodes(validateTurnSemanticProposalV1(proposal({
+      work: authoringWork(
+        [{ posture: 'named_existing', family: 'workspace' }],
+        [{ id: 'update_space_heading', ref: WORKSPACE_EDIT }],
+      ),
+    }), authoringHost())).includes('destination_target_unserved'),
+    'discovery of the correct Space operation must clear the refusal',
+  );
+});
+
+test('CONTROL: a read/intermediate operation is not required to serve a target', () => {
+  // Coverage asks that SOME cited operation can serve each target — never that
+  // every operation must. Reads and intermediate steps stay legal.
+  const base = authoringHost();
+  const withRead = {
+    ...base,
+    catalog: {
+      ...base.catalog,
+      capabilityIds: new Set([...base.catalog.capabilityIds, 'cap-1']),
+      capabilities: [...(base.catalog.capabilities ?? []), descriptor('cap-1', 'read', 'query', 'records')],
+    },
+  };
+  const work = authoringWork(
+    [{ posture: 'named_existing', family: 'workspace' }],
+    [{ id: 'op-edit', ref: WORKSPACE_EDIT }],
+  );
+  work.operations = [
+    { id: 'op-read', role: 'source', requestedEffect: 'read', dependsOn: [], evidence: [], capabilityRef: 'cap-1' },
+    ...work.operations,
+  ];
+  work.topology = {
+    ...work.topology!,
+    operations: [
+      { id: 'op-read', effect: 'read', coverage: { kind: 'all' }, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      ...work.topology!.operations,
+    ],
+  };
+  assert.ok(
+    !issueCodes(validateTurnSemanticProposalV1(proposal({ work }), withRead))
+      .includes('destination_target_unserved'),
+    'an intermediate read must not be penalised',
+  );
+});
+
+test('INVALID: an explicit Workspace target is unserved even when the card has NO Space descriptor', () => {
+  // The reviewer's exact-card reproduction of source 136708 / card 136712:
+  // the disclosed card carried only workflow capabilities, so a guard keyed on
+  // the card skipped the workspace target entirely and the wrong binding froze.
+  // Nativeness comes from the registry, so the target is still explicit.
+  const base = authoringHost();
+  const workflowOnlyCard = {
+    ...base,
+    catalog: {
+      ...base.catalog,
+      capabilityIds: new Set([WORKFLOW_CREATE, WORKFLOW_UPDATE]),
+      capabilities: (base.catalog.capabilities ?? []).filter((entry) => (
+        entry.id === WORKFLOW_CREATE || entry.id === WORKFLOW_UPDATE
+      )),
+    },
+  };
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: authoringWork(
+      [{ posture: 'named_existing', family: 'workspace' }],
+      [{ id: 'update_space_heading', ref: WORKFLOW_UPDATE }],
+    ),
+  }), workflowOnlyCard);
+  assert.ok(
+    issueCodes(result).includes('destination_target_unserved'),
+    `an uncovered explicit native target must demand discovery: ${issueCodes(result).join(',')}`,
+  );
+});
+
+test('CONTROL: a non-native sink family is still never second-guessed', () => {
+  // The default fixture declares a `workbook` destination, which no local
+  // registry row authors. Such a plan must pass through untouched.
+  assert.ok(
+    !issueCodes(validateTurnSemanticProposalV1(proposal(), host()))
+      .includes('destination_target_unserved'),
+    'a sink described in other terms is not a native target',
+  );
+});
+
+test('INVALID: a non-native but CATALOG-KNOWN family still requires target coverage', () => {
+  // C18 keyed coverage on the registry alone, which skipped every non-native
+  // family: a fully typed provider card with create and update operations
+  // admitted both bindings to create and left the existing target unserved.
+  // Coverage applies to registry-native OR catalog-known families.
+  const base = host();
+  const providerCard = {
+    ...base,
+    catalog: {
+      ...base.catalog,
+      capabilityIds: new Set(['cap:provider:workbook_create', 'cap:provider:workbook_update']),
+      capabilities: [
+        authoring('cap:provider:workbook_create', 'workbook', 'create_new', 'workbook_definition',
+          undefined, 'author_workbook'),
+        authoring('cap:provider:workbook_update', 'workbook', 'named_existing', 'workbook_patch',
+          undefined, 'author_workbook'),
+      ],
+    },
+  };
+  const result = validateTurnSemanticProposalV1(proposal({
+    work: authoringWork(
+      [
+        { posture: 'named_existing', family: 'workbook' },
+        { posture: 'create_new', family: 'workbook' },
+      ],
+      // Both bindings cite CREATE; the existing-workbook target is unserved.
+      [
+        { id: 'op-a', ref: 'cap:provider:workbook_create' },
+        { id: 'op-b', ref: 'cap:provider:workbook_create' },
+      ],
+    ),
+  }), providerCard);
+  assert.ok(
+    issueCodes(result).includes('destination_target_unserved'),
+    `provider coverage must hold too: ${issueCodes(result).join(',')}`,
+  );
+});

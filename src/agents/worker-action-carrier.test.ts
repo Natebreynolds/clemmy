@@ -248,7 +248,7 @@ test('a worker per-item write binds to the parent contract and reaches its inner
     sourceUserSeq: task.sourceUserSeq,
   });
   const workCall = invokable(worker as { tools?: Array<{ name?: string }> }, 'work_call');
-  const args = { path: 'drafts/lead-001.md', content: 'Follow-up for lead-001', lead_id: 'lead-001' };
+  const args = { path: 'drafts/lead-001.md', content: 'Follow-up for lead-001' };
 
   // Exactly how the worker lane runs: the parent's accepted identity is ambient
   // and worker-scoped; no work_call frame is inherited from the parent.
@@ -264,7 +264,9 @@ test('a worker per-item write binds to the parent contract and reaches its inner
         proposal: null,
         requirement_id: 'write_draft',
         universe_item_id: 'lead-001',
-        universe_selector: { argument_pointer: '/lead_id', member_id_pointer: null },
+        // A local per-item write binds its complete canonical target; do not
+        // invent a business-tool argument merely to carry the member id.
+        universe_selector: null,
         name: DRAFT_TOOL,
         args_json: JSON.stringify(args),
       }),
@@ -276,7 +278,8 @@ test('a worker per-item write binds to the parent contract and reaches its inner
   assert.doesNotMatch(rendered, /work_binding_required|ExpectedWorkBindingRequiredError/,
     'the delegated item no longer dies on a wall with no door');
   assert.doesNotMatch(rendered, /work_universe_unsealed|work_dependency_pending/, rendered);
-  assert.equal(written.length, 1, 'the inner business tool actually ran');
+  assert.deepEqual(written, [{ ...args, mode: null, append: null }],
+    'the exact schema-valid business arguments reached the inner tool once');
 
   const binding = eventlog.openEventLog().prepare(`
     SELECT requirement_id, universe_item_id, universe_seal, effect_kind,
@@ -310,7 +313,7 @@ test('a worker item outside the sealed universe is still refused', async () => {
     sourceUserSeq: task.sourceUserSeq,
   });
   const workCall = invokable(worker as { tools?: Array<{ name?: string }> }, 'work_call');
-  const args = { path: 'drafts/lead-404.md', content: 'not in the source', lead_id: 'lead-404' };
+  const args = { path: 'drafts/lead-404.md', content: 'not in the source' };
   const output = await brackets.withHarnessRunContext(
     {
       sessionId: task.sessionId,
@@ -323,7 +326,9 @@ test('a worker item outside the sealed universe is still refused', async () => {
         proposal: null,
         requirement_id: 'write_draft',
         universe_item_id: 'lead-404',
-        universe_selector: { argument_pointer: '/lead_id', member_id_pointer: null },
+        // A local per-item write binds its complete canonical target; do not
+        // invent a business-tool argument merely to carry the member id.
+        universe_selector: null,
         name: DRAFT_TOOL,
         args_json: JSON.stringify(args),
       }),
@@ -333,6 +338,63 @@ test('a worker item outside the sealed universe is still refused', async () => {
   const rendered = typeof output === 'string' ? output : JSON.stringify(output ?? null);
   assert.match(rendered, /work_cardinality_mismatch/, rendered);
   assert.equal(ran.length, 0, 'an item outside the sealed universe crosses no tool boundary');
+});
+
+test('a schema-invalid worker write crosses no effect boundary and repairs under the same accepted source', async () => {
+  const task = acceptDelegatedAction('schema-repair');
+  stageSealedSource(task, [{ id: 'lead-001' }, { id: 'lead-002' }]);
+  const written: Array<Record<string, unknown>> = [];
+  _setInnerDispatchToolsForTests(new Map([
+    [DRAFT_TOOL, {
+      name: DRAFT_TOOL,
+      invoke: async (_ctx: unknown, raw: string) => {
+        written.push(JSON.parse(raw) as Record<string, unknown>);
+        return { successful: true };
+      },
+    }],
+  ] as never));
+  const worker = await buildWorkerAgent({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  const workCall = invokable(worker as { tools?: Array<{ name?: string }> }, 'work_call');
+  const args = { path: 'drafts/lead-001.md', content: 'Follow-up for lead-001' };
+  const invoke = (innerArgs: Record<string, unknown>, callId: string) => brackets.withHarnessRunContext(
+    { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, workerScope: true },
+    () => workCall.invoke(
+      { context: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 } },
+      JSON.stringify({
+        proposal: null,
+        requirement_id: 'write_draft',
+        universe_item_id: 'lead-001',
+        universe_selector: null,
+        name: DRAFT_TOOL,
+        args_json: JSON.stringify(innerArgs),
+      }),
+      { toolCall: { callId } },
+    ),
+  );
+  const invalid = await invoke({ ...args, lead_id: 'lead-001' }, `worker-invalid-${task.label}`);
+  const rendered = typeof invalid === 'string' ? invalid : JSON.stringify(invalid ?? null);
+  assert.match(rendered, /arg_validation/, rendered);
+  assert.match(rendered, /lead_id/, rendered);
+  assert.deepEqual(written, [], 'unknown native fields cannot cross the business boundary');
+  const bindings = () => eventlog.openEventLog().prepare(`
+    SELECT universe_item_id, effect_kind, input_source_kind
+      FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND requirement_id = 'write_draft'
+  `).all(task.sessionId, task.sourceUserSeq);
+  assert.deepEqual(bindings(), [], 'schema refusal precedes membership binding');
+
+  // A real next tool call repairs the arguments while keeping this same worker,
+  // accepted source, sealed producer and requirement/member identity.
+  await invoke(args, `worker-repaired-${task.label}`);
+  assert.deepEqual(written, [{ ...args, mode: null, append: null }]);
+  assert.deepEqual(bindings(), [{
+    universe_item_id: 'lead-001',
+    effect_kind: 'local_write',
+    input_source_kind: 'complete_source_receipt',
+  }], 'repair binds exactly one genuine member under the existing source');
 });
 
 test('the gentle-call predicate excludes durable binding and authority refusals', () => {

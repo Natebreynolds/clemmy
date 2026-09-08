@@ -12,7 +12,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { after, test } from 'node:test';
+import { after, mock, test } from 'node:test';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-natural-restaurant-sheet-'));
 const PROMPT = 'Find me 10 restaurants in Santa Clarita and put them in a new Google Sheet';
@@ -110,6 +111,10 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+  { role: 'judge', modelId: 'gpt-5.5', scope: 'durable', source: 'settings' },
+]);
 process.env.CLEMMY_BRAIN_FALLOVER = 'off';
 process.env.CLEMMY_AUTH_FALLOVER = 'off';
 process.env.CLEMMY_PROACTIVE_REPORT_DEFER = 'off';
@@ -130,6 +135,8 @@ writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
   },
 }), 'utf8');
 
+const { Usage } = await import('@openai/agents');
+const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
 const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
@@ -298,6 +305,7 @@ function registeredCapability(input: {
 }
 
 after(async () => {
+  mock.restoreAll();
   innerDispatch._setInnerDispatchToolsForTests(null);
   connectedCatalog.installConnectedRegistryPort(null);
   semanticPorts.installTurnSemanticModelPort(null);
@@ -541,10 +549,28 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     throw new Error(`journey forbids external network: ${url}`);
   }) as typeof fetch;
 
-  // Instrument the forbidden pre-loop semantic/planner seam.  A "helpful"
-  // semantic fixture response here would bless the exact extra hoop this
-  // journey exists to remove, so every method fails if production calls it.
+  // The optional account-selection model wire is distinct from forbidden
+  // pre-loop interpretation/planning. Its verdict binds only the current
+  // accepted source and sole actual account; production still owns authority.
+  const accountReviewSources = new Map([[session.id, PROMPT]]);
+  let accountReviews = 0;
   semanticPorts.installTurnSemanticModelPort({
+    async judgeAccountSelection(call) {
+      const acceptedText = accountReviewSources.get(call.sessionId);
+      assert.ok(acceptedText, 'account review cannot borrow a source from another journey');
+      assert.ok(['restaurants', 'googlesheets'].includes(call.toolkit));
+      const reviewer = currentSourceAccountReviewer({
+        sessionId: () => call.sessionId,
+        acceptedText,
+        toolkit: call.toolkit,
+        accountIdentity: call.toolkit === 'restaurants' ? 'conn-restaurants' : 'conn-googlesheets',
+        acceptedSource: (sessionId, seq) => eventlog.listEvents(sessionId,
+          { sinceSeq: seq - 1, types: ['user_input_received'], limit: 1 })[0],
+      });
+      const verdict = await reviewer(call);
+      accountReviews += 1;
+      return verdict;
+    },
     async interpret() {
       semanticCalls += 1;
       throw new Error('hidden pre-loop semantic model pass');
@@ -557,6 +583,48 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       semanticCalls += 1;
       throw new Error('hidden pre-loop semantic grounding judge');
     },
+  });
+
+  // Complete the existing model-wire fixture: real captured role resolution,
+  // Agents Runner, parser and verdict publication still own completion. The
+  // mock can rule only on the ten real settled rows and exact create receipt.
+  let completionReviewSource: { sessionId: string; seq: number } | null = null;
+  const completionReviews: Array<{ sessionId: string; seq: number; modelId: string }> = [];
+  mock.method(CodexModelProvider.prototype, 'getModel', (modelId?: string) => {
+    assert.equal(modelId, 'gpt-5.5', 'the isolated owner-selected same-provider reviewer is honored');
+    return {
+      async getResponse(request: unknown) {
+        assert.ok(completionReviewSource, 'a reviewer cannot precede the accepted source');
+        const source = eventlog.listEvents(completionReviewSource.sessionId,
+          { sinceSeq: completionReviewSource.seq - 1, types: ['user_input_received'], limit: 1 })[0];
+        assert.equal(source?.seq, completionReviewSource.seq);
+        assert.equal(source?.sessionId, completionReviewSource.sessionId);
+        assert.equal(source?.data.displayText || source?.data.text, PROMPT);
+        const textValues: string[] = [];
+        const collect = (value: unknown): void => {
+          if (typeof value === 'string') textValues.push(value);
+          else if (Array.isArray(value)) value.forEach(collect);
+          else if (value && typeof value === 'object') Object.values(value).forEach(collect);
+        };
+        collect(request);
+        const actualJudgeText = textValues.join('\n');
+        assert.ok(actualJudgeText.includes(`Objective: ${PROMPT}`));
+        assert.ok(actualJudgeText.includes(SUCCESS));
+        assert.ok(actualJudgeText.includes(SHEET_URL));
+        assert.ok(actualJudgeText.includes('Retained READ results for THIS accepted source'));
+        for (const row of ROWS) {
+          assert.ok(actualJudgeText.includes(row.name), `the actual reviewer receives ${row.name}`);
+          assert.ok(actualJudgeText.includes(row.address), `the actual reviewer receives ${row.address}`);
+        }
+        assert.deepEqual(settledReadRows, ROWS.map(row => ({ ...row })));
+        assert.equal(providerCalls.at(-1)?.slug, SHEET_OPERATION,
+          'review runs after the sole successful dependent create, never as prewrite authority');
+        completionReviews.push({ ...completionReviewSource, modelId: modelId! });
+        return { usage: new Usage(), responseId: `completion-review-${completionReviews.length}`,
+          output: [textMessage('DONE: the exact ten settled restaurant rows and successful new Sheet receipt satisfy this accepted request.')] };
+      },
+      async *getStreamedResponse() { throw new Error('completion review uses the existing one-turn nonstreaming Runner'); },
+    } as never;
   });
 
   const gateway = composioTools.getComposioRuntimeTools()
@@ -647,8 +715,15 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       let output: unknown[];
       if (primaryStep === 1) {
         assert.match(serialized, new RegExp(PROMPT), 'the first primary step sees the exact accepted request');
-        assert.match(serialized, /clause-0:read/,
-          'the first primary step exposes the exact unresolved discovery role');
+        assert.ok(acceptedSource, 'the first primary step belongs to an actual accepted source');
+        const initialCard = eventlog.listEvents(session.id).find(event =>
+          event.type === 'primary_model_planning_card_snapshot'
+          && event.data.sourceUserSeq === acceptedSource!.seq);
+        assert.ok(initialCard && typeof initialCard.data.snapshotJson === 'string');
+        const initialSnapshot = JSON.parse(initialCard.data.snapshotJson);
+        assert.equal(initialSnapshot.objectiveDigest, sha256(PROMPT));
+        assert.deepEqual(initialSnapshot.capabilities, [], 'the cold source has no undisclosed operation authority');
+        assert.equal(initialSnapshot.effectCeiling, 'external_write');
         assert.doesNotMatch(serialized, /cap:resolved:restaurants_search|cap:resolved:googlesheets_sheet_from_json/,
           'blank-state capabilities are not planted into the first planning card');
         assert.equal(tools.includes(PLAN_CONTROL), false,
@@ -662,7 +737,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           'fresh discovery has not dispatched any worker');
         output = [functionCall('discover-capabilities', 'tool_search', {
           query: 'search for restaurants by location and create a new Google Sheet from the results',
-          role_key: 'clause-0:read',
+          role_key: null,
           limit: 8,
         })];
       } else if (primaryStep === 2) {
@@ -798,6 +873,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     runId: 'discord-natural-restaurant-sheet-request-1',
     onSourceAccepted(source: { seq: number; turn: number }) {
       acceptedSource = { seq: source.seq, turn: source.turn };
+      completionReviewSource = { sessionId: session.id, seq: source.seq };
     },
   };
   await discord.runDiscordHarnessConversation({
@@ -832,6 +908,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.equal(modelRequests.slice(2).some((request) => request.tools.includes(PLAN_CONTROL)), false,
     'the plan schema is absent from read, write, and final model steps');
   assert.ok(discoveryListings >= 1, 'cold discovery reaches live connected definitions');
+  assert.ok(accountReviews > 0, 'current source/default account compatibility is reviewed, not assumed');
   assert.ok(builtSurfaces.some((surface) => surface.includes(PLAN_CONTROL)));
   assert.ok(builtSurfaces.some((surface) => surface.includes('tool_search')));
   assert.ok(builtSurfaces.some((surface) => surface.includes('work_call')));
@@ -1107,6 +1184,21 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   const completions = events.filter((event) =>
     event.type === 'conversation_completed' && event.data.sourceUserSeq === sourceUserSeq);
   assert.equal(completions.length, 1, JSON.stringify(completions));
+  assert.deepEqual(completionReviews, [{ sessionId: session.id, seq: sourceUserSeq, modelId: 'gpt-5.5' }]);
+  const completionRef = completions[0]!.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(completionRef.verified, true);
+  assert.equal(completionRef.ownerSelectedJudge, true);
+  assert.equal(completionRef.selfJudge, true);
+  assert.equal(completionRef.disposition, 'reviewed');
+  assert.equal(completionRef.replyMatches, true);
+  assert.equal(completionRef.objectiveMatches, true);
+  const reviewEvent = events.find(event => event.id === completionRef.eventId);
+  assert.equal(reviewEvent?.type, 'goal_alignment_judged');
+  assert.equal(reviewEvent?.data.sourceUserSeq, sourceUserSeq);
+  assert.equal(reviewEvent?.data.judgeModelId, 'gpt-5.5');
+  assert.equal(reviewEvent?.data.replyDigest, sha256(SUCCESS));
+  assert.equal(reviewEvent?.data.objectiveDigest, sha256(PROMPT));
+  assert.notEqual(reviewEvent?.data.failedOpen, true);
   const terminalAuthorityDiagnostics = {
     graphNodeBindings: db.prepare(`
       SELECT node_id, binding_json, binding_digest
@@ -1297,6 +1389,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         kind: 'chat',
         userId: 'discord-user-natural-request',
       });
+      accountReviewSources.set(warmSession.id, PROMPT);
       const providerBefore = {
         restaurantReads,
         sheetCreates,
@@ -1479,6 +1572,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           runId: 'discord-natural-restaurant-sheet-request-warm',
           onSourceAccepted(source: { seq: number; turn: number }) {
             warmAcceptedSource = { seq: source.seq, turn: source.turn };
+            completionReviewSource = { sessionId: warmSession.id, seq: source.seq };
           },
         },
       });
@@ -1556,6 +1650,12 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       `).all(warmSession.id), [], 'candidate recall never manufactures approval authority');
       assert.equal(warmDelivery.errors.length, 0);
       assert.equal(warmDelivery.edits.at(-1), SUCCESS);
+      assert.equal(completionReviews.filter(review => review.sessionId === warmSession.id
+        && review.seq === warmAcceptedSource!.seq).length, 1);
+      const warmCompletion = eventlog.listEvents(warmSession.id).find(event =>
+        event.type === 'conversation_completed' && event.data.sourceUserSeq === warmAcceptedSource!.seq);
+      assert.equal((warmCompletion?.data.completionVerdictRef as Record<string, unknown>)?.verified, true);
+      assert.equal((warmCompletion?.data.completionVerdictRef as Record<string, unknown>)?.ownerSelectedJudge, true);
     },
   );
 
@@ -1570,6 +1670,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         kind: 'chat',
         userId: 'discord-user-natural-request',
       });
+      const reviewCallsBeforeBounded = completionReviews.length;
       const definitionRequestStart = providerDefinitionRequests.length;
       const providerCallStart = providerCalls.length;
       const restaurantReadStart = restaurantReads;
@@ -1784,7 +1885,21 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       });
       assert.equal(delivery.errors.length, 0);
       assert.equal(delivery.followups.length, 0);
-      assert.equal(delivery.edits.at(-1), BOUNDED_SUCCESS);
+      const boundedCompletion = boundedEvents.find(event => event.type === 'conversation_completed'
+        && event.data.sourceUserSeq === seq);
+      const boundedReviewRef = boundedCompletion?.data.completionVerdictRef as Record<string, unknown>;
+      assert.equal(boundedReviewRef?.verified, false);
+      assert.equal(boundedReviewRef?.failedOpen, true);
+      assert.equal(boundedReviewRef?.disposition, 'enabled_unavailable');
+      const boundedReview = boundedEvents.find(event => event.id === boundedReviewRef.eventId);
+      assert.equal(boundedReview?.type, 'goal_alignment_judged');
+      assert.equal(boundedReview?.data.sourceUserSeq, seq);
+      assert.match(String(boundedReview?.data.reason), /Complete evidence review unavailable/);
+      assert.equal(completionReviews.length, reviewCallsBeforeBounded,
+        'the real model-window admission never sends a clipped 16MiB evidence set to the reviewer');
+      assert.ok(delivery.edits.at(-1)?.startsWith(`${BOUNDED_SUCCESS}\n\nVerification note:`));
+      assert.ok(delivery.edits.at(-1)?.includes(String(boundedReview?.data.reason)));
+      assert.match(delivery.edits.at(-1) ?? '', /This result remains unreviewed\./);
     },
   );
 });

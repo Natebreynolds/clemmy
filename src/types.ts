@@ -1,3 +1,4 @@
+import type { TaskMode } from './runtime/harness/task-mode.js';
 import type { WorkflowDefinition } from './memory/workflow-store.js';
 
 export interface Models {
@@ -166,6 +167,8 @@ export interface UnifiedSessionTurn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  taskMode?: import('./runtime/harness/task-mode.js').TaskMode;
+  planArtifactRef?: import('./runtime/harness/task-mode.js').PlanRevisionRef;
   /** Exact still-pending plan proposal attached on transcript reopen. Plan
    *  decisions must resolve this id through the proposal API, never through a
    *  generic conversational "approve" turn. */
@@ -276,6 +279,8 @@ export interface TaskContinuationContext {
 }
 
 export interface AssistantRequest {
+  /** Explicit accepted request mode; never inferred from prose. */
+  taskMode?: TaskMode;
   /** Advisory capability candidates resolved ONCE for this accepted turn by
    * the shared bridge, delivered to whichever brain serves it. Bound to the
    * request — never to a phrase, a session global, or a cache. Candidates

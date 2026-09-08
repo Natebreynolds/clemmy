@@ -46,3 +46,10 @@ test('plain text and empty input pass through unchanged', () => {
   // Short URLs stay clickable-looking; only walls of URL get shortened.
   assert.equal(stripInlineMarkdown('see https://x.io/a'), 'see https://x.io/a');
 });
+
+
+test('historical awaiting-input framing stays out of compact chat cards', () => {
+  assert.equal(stripInlineMarkdown('[clementine:awaiting-user-input:final]\nWhich account should I use?'), 'Which account should I use?');
+  assert.equal(stripInlineMarkdown('[clementine:awaiting-user-input:final]'), '');
+  assert.equal(stripInlineMarkdown('The literal marker is [clementine:awaiting-user-input:final].'), 'The literal marker is [clementine:awaiting-user-input:final].');
+});

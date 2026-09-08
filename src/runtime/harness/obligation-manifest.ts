@@ -43,6 +43,7 @@ import {
   operationEvidenceContract,
   type OperationEvidenceMode,
 } from '../graph/operation-evidence-contract.js';
+import { boundOnceReadEvidenceContract } from './bound-read-evidence-contract.js';
 import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import {
   loadExpectedWorkContract,
@@ -67,6 +68,7 @@ export interface ObligationManifestNode {
   operationId: string;
   operationMode: OperationEvidenceMode;
   contentCommitMode?: 'documented_atomic_input';
+  writeEvidenceMode?: 'provider_acknowledgement_v1';
   /** Frozen structured-deliverable contract copied from the exact executable
    * graph node. Optional for legacy/non-collection nodes. */
   cardinality?: number;
@@ -329,7 +331,11 @@ export function compileObligationManifest(input: {
           || executableNode.capabilityRole === 'readback'
           ? ['records']
           : undefined);
-    const evidenceContract = operationEvidenceContract({
+    // Admission already bound this exact read to the owner's accepted coverage.
+    // Reclassifying it from a tool name or a graph role can turn one current
+    // object observation into impossible provider-exhaustion work.
+    const boundReadContract = boundOnceReadEvidenceContract({ ...identity, operation });
+    const evidenceContract = boundReadContract ?? operationEvidenceContract({
       resolvedTool: operation.resolvedTool,
       effectKind,
       reversibility: operation.reversibility,
@@ -348,7 +354,13 @@ export function compileObligationManifest(input: {
       operation.operationId,
       legacyHasSourceRead,
     );
-    const obligations = attachEvidenceObligations({
+    const acknowledgement = sealed?.writeEvidenceMode?.kind === 'provider_acknowledgement_v1'
+      && effectKind === 'external_write' && !hasSourceRead && !contentCommitMode
+      && !sealed.verification && evidenceContract.mode === 'create'
+      && !evidenceContract.requiresStaleReconciliation;
+    const obligations: EvidenceObligation[] = acknowledgement
+      ? ['commit_effect', 'execution_terminal']
+      : attachEvidenceObligations({
       effect: effectKind,
       reversibility: operation.reversibility,
       receipt: parent.effect.receipt,
@@ -356,8 +368,8 @@ export function compileObligationManifest(input: {
       operationMode: evidenceContract.mode,
       hasSourceRead,
       requiresStaleReconciliation: evidenceContract.requiresStaleReconciliation,
-      observationSufficient: observationSufficientNodeId !== null
-        && operation.nodeId === observationSufficientNodeId,
+      observationSufficient: (boundReadContract !== null && !boundReadContract.requiresExhaustion)
+        || (observationSufficientNodeId !== null && operation.nodeId === observationSufficientNodeId),
       ...(contentCommitMode ? { contentCommitMode } : {}),
     }).map((entry: NodeObligation) => entry.obligation);
     if (obligations.length === 0) continue;
@@ -369,6 +381,7 @@ export function compileObligationManifest(input: {
       operationId: operation.operationId,
       operationMode: evidenceContract.mode,
       ...(contentCommitMode ? { contentCommitMode } : {}),
+      ...(acknowledgement ? { writeEvidenceMode: 'provider_acknowledgement_v1' as const } : {}),
       ...(Number.isSafeInteger(executableNode.cardinality)
         && (executableNode.cardinality ?? 0) > 0
         ? { cardinality: executableNode.cardinality }

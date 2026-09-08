@@ -14,6 +14,7 @@ import {
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
+import { runStateLabel, workflowRunStateLabel } from '../lib/run-rows';
 import { useScreenData } from '../lib/use-screen-data';
 import { buildWorkflowRunDetail } from '../lib/workflow-run-detail';
 import { whenLabel } from '../lib/schedule-label';
@@ -273,7 +274,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
                   <div class="card-title-sm truncate">{run.id}</div>
                   <div class="card-when">
                     {live ? null : <span class={`status-dot status-${run.terminalOutcome ?? run.status}`} aria-hidden="true" />}
-                    {(run.terminalOutcome ?? run.status).replace(/_/g, ' ')}
+                    {workflowRunStateLabel(run)}
                   </div>
                 </button>
                 {live ? (
@@ -315,7 +316,7 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
       </div>
       <div class="workflow-detail-body">
         <div class="memory-section-head">
-          <span>{data?.status ?? run.status}</span>
+          <span>{runStateLabel({ status: data?.status ?? run.status })}</span>
           {run.error ? <span class="memory-section-count" style="color:var(--accent-fail)">error</span> : null}
           {typeof detail.tokensTotal === 'number' && detail.tokensTotal > 0
             ? <span class="memory-section-count">{Math.round(detail.tokensTotal / 1000)}k tokens</span>

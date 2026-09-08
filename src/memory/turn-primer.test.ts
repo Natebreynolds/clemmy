@@ -174,3 +174,24 @@ test('authoritative empty recall creates no prompt or attribution run', async ()
   assert.equal(trace?.omittedCount, 0);
   assert.equal(trace?.candidateCount, 0);
 });
+
+
+for (const surface of ['automatic_primer', 'claude_primer', 'legacy_assistant_primer'] as const) {
+  test(`${surface} requests ambient whole-task context through the existing recall facade`, async () => {
+    let seenPurpose: string | undefined;
+    _setUnifiedTurnPrimerRecallForTest(async (query, options) => {
+      seenPurpose = options?.purpose;
+      return { objective: query, purpose: options?.purpose, answerability: 'partial', perStore: { episode: 1 }, hits: [{
+        type: 'episode', ref: 'meeting-yesterday', title: 'Earlier account discussion', snippet: 'Context from the earlier meeting.',
+        score: 0.8, validFrom: '2026-09-06T20:24:00.000Z', evidence: [{ episodeId: 'meeting-yesterday', excerpt: 'Context from the earlier meeting.' }],
+      }] };
+    });
+    const result = await buildUnifiedTurnPrimer({ query: 'Create an account email plan starting today with a meeting CTA.', surface });
+    assert.equal(seenPurpose, 'ambient');
+    assert.equal(result.status, 'ok');
+    assert.match(result.text ?? '', /scope: ambient task context/);
+    assert.match(result.text ?? '', /occurred_at: 2026-09-06T20:24:00.000Z/);
+    assert.match(result.text ?? '', /Use complete, applicable facts directly/);
+    assert.doesNotMatch(result.text ?? '', /call memory_recall_all \(one call\)/, 'ambient candidates do not impose another mandatory discovery hoop');
+  });
+}

@@ -64,6 +64,12 @@ export interface TerminalDeliveryJudgeIdentity {
   modelId: string;
   judgeFamily: BoundaryJudgeRouting['judgeFamily'];
   brainFamily: BoundaryJudgeRouting['brainFamily'];
+  /** Set when this lane stood in for a judge the owner pinned. Without it a
+   *  substitute's decision is indistinguishable from the pinned model's once
+   *  the routing object is gone. */
+  substituteForExactPin?: boolean;
+  requestedModelId?: string;
+  substituteReason?: BoundaryJudgeRouting['substituteReason'];
 }
 
 export type TerminalDeliveryJudgeDecision =
@@ -275,6 +281,13 @@ function judgeIdentity(route: BoundaryJudgeRouting): TerminalDeliveryJudgeIdenti
     modelId: route.modelId,
     judgeFamily: route.judgeFamily,
     brainFamily: route.brainFamily,
+    ...(route.substituteForExactPin
+      ? {
+          substituteForExactPin: true,
+          ...(route.requestedModelId ? { requestedModelId: route.requestedModelId } : {}),
+          ...(route.substituteReason ? { substituteReason: route.substituteReason } : {}),
+        }
+      : {}),
   };
 }
 
@@ -311,6 +324,17 @@ export async function resolveProductionTerminalDeliveryJudgeRoute(): Promise<Bou
 export function selectIndependentTerminalDeliveryJudgeRoute(
   routes: readonly BoundaryJudgeRouting[],
 ): BoundaryJudgeRouting | null {
+  // EXPLICIT OWNER CHOICE GOVERNS AVAILABLE ROUTING.
+  //
+  // My previous ordering preferred cross-family first, which skipped an
+  // available explicit same-provider pin in favour of a marked substitute
+  // before any failure had occurred. Cross-family preference is the rule for
+  // UNPINNED defaults and for permitted fallback — it is not a reason to
+  // override a judge the owner actually selected.
+  for (const route of routes) {
+    if (route.model && route.ownerSelectedJudge) return route;
+  }
+  // No explicit selection: prefer a genuinely independent lane.
   for (const route of routes) {
     if (route.model && !route.selfJudge && route.judgeFamily !== route.brainFamily) {
       return route;
@@ -351,8 +375,14 @@ export async function evaluateTerminalDelivery(
   }
   if (!route) return unavailable('no_route');
   if (!route.model) return unavailable('no_model', route);
-  if (route.selfJudge) return unavailable('self_judge', route);
-  if (route.judgeFamily === route.brainFamily) return unavailable('same_family', route);
+  // Both refusals move in lockstep, gated on the same condition: changing only
+  // the first would be dead code, because the family comparison below refuses
+  // the identical route. An owner-selected judge passes both; anything else is
+  // still refused exactly as before.
+  if (!route.ownerSelectedJudge) {
+    if (route.selfJudge) return unavailable('self_judge', route);
+    if (route.judgeFamily === route.brainFamily) return unavailable('same_family', route);
+  }
 
   let timed: { output: unknown } | null;
   try {
@@ -365,7 +395,11 @@ export async function evaluateTerminalDelivery(
         tools: [],
         maxTurns: 1,
       }).then((output) => ({ output })),
-      options.timeoutMs,
+      // Caller deadline wins; otherwise honour the deadline the ROUTE carries.
+      // An honoured exact judge pin returns timeoutMs (90s); using the 25s
+      // default here made a pinned flagship time out into `unavailable`, which
+      // is indistinguishable from the judge having declined.
+      options.timeoutMs ?? route.timeoutMs,
     );
   } catch {
     return unavailable('judge_error', route);

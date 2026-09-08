@@ -34,8 +34,15 @@ import {
 import type { ExpectedWorkCallBinding } from './expected-work-admission.js';
 import {
   consumeHostConsentGrantAdmission,
+  consumeHostNativeConsentAdmission,
   type HostConsentGrantAdmissionV1,
 } from './host-interactive-consent.js';
+import {
+  loadDurableAuthorizedLocalPlanningDefinition,
+  nominateDisclosedLocalPlanningDefinition,
+  type AuthorizedLocalPlanningDefinitionV1,
+} from './local-planning-capability.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
 
 interface NestedApprovalToken {
   sessionId: string;
@@ -70,6 +77,9 @@ interface GenericNestedCallAdmissionToken {
   requirementId: string;
   hostCapabilityBindingDigest: string;
   authorityDigest: string;
+  /** Native coverage is this exact accepted call, never a synthesized work
+   * contract. It cannot be promoted into staged/derived plan authority. */
+  nativeDefinition?: AuthorizedLocalPlanningDefinitionV1;
   consentBasis:
     | 'no_effect'
     | 'exact_reversible_work'
@@ -269,6 +279,89 @@ export function issueNestedCallAdmission(input: {
   }
 }
 
+/** Redeem the consent evaluator's private proof for one disclosed native
+ * invocation. All durable source, definition and call facts are reopened. */
+export function issueExactNativeCallAdmission(input: {
+  hostCapabilityBinding: HostCallCapabilityBinding;
+  targetArgs: unknown;
+  definition: AuthorizedLocalPlanningDefinitionV1;
+  authorityDigest: string;
+  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work';
+  consentAdmission: object;
+}): object | null {
+  try {
+    const host = input.hostCapabilityBinding;
+    const local = input.definition;
+    const logical = durableLogicalCallContract(host.acceptedTaskId, host.toolName, input.targetArgs);
+    if (host.bindingKind !== 'local_envelope' || host.effect !== 'local_write'
+      || host.capabilityId !== local.capabilityRef || host.schemaFingerprint !== local.schemaFingerprint
+      || host.operationId !== local.name || host.toolName !== local.name
+      || local.descriptor.effect !== 'local_write' || !logical
+      || logical.argumentDigest !== host.effectiveArgumentDigest) return null;
+    const token: GenericNestedCallAdmissionToken = {
+      sessionId: host.sessionId, sourceUserSeq: host.sourceUserSeq,
+      acceptedTaskId: host.acceptedTaskId, logicalToolCallId: host.logicalToolCallId,
+      toolName: logical.toolName, argumentDigest: logical.argumentDigest, effect: host.effect,
+      contractId: '', requirementId: '', hostCapabilityBindingDigest: host.durableBindingDigest,
+      authorityDigest: input.authorityDigest, consentBasis: input.consentBasis,
+      nativeDefinition: local, entered: false, used: false, stagedChildIssued: false,
+    };
+    if (!exactNativeTokenIsCurrent(token, input.targetArgs, false)) return null;
+    if (!consumeHostNativeConsentAdmission({ admission: input.consentAdmission, expected: {
+      sessionId: host.sessionId, sourceUserSeq: host.sourceUserSeq,
+      acceptedTaskId: host.acceptedTaskId, logicalToolCallId: host.logicalToolCallId,
+      toolName: logical.toolName, argumentDigest: logical.argumentDigest,
+      hostCapabilityBindingDigest: host.durableBindingDigest, capabilityRef: local.capabilityRef,
+      schemaFingerprint: local.schemaFingerprint, envelopeFingerprint: local.envelopeFingerprint,
+      authorityDigest: input.authorityDigest, consentBasis: input.consentBasis,
+    } })) return null;
+    const candidate = Object.freeze({});
+    issuedGenericAdmissions.set(candidate, token);
+    return candidate;
+  } catch { return null; }
+}
+
+function exactNativeTokenIsCurrent(token: GenericNestedCallAdmissionToken, args: unknown, requireCurrentLogical: boolean): boolean {
+  try {
+    const local = token.nativeDefinition;
+    if (!local || token.used || acceptedTaskMode(token.sessionId, token.sourceUserSeq)?.kind === 'plan') return false;
+    const logical = durableLogicalCallContract(token.acceptedTaskId, token.toolName, args);
+    const current = currentLogicalCall();
+    if (!logical || logical.argumentDigest !== token.argumentDigest
+      || (requireCurrentLogical && (!current || current.acceptedTaskId !== token.acceptedTaskId
+        || current.logicalToolCallId !== token.logicalToolCallId))) return false;
+    const open = openLogicalContract(token);
+    const host = loadHostCallCapabilityBinding({ db: openEventLog(), ...token });
+    const nominated = nominateDisclosedLocalPlanningDefinition({
+      sessionId: token.sessionId, sourceUserSeq: token.sourceUserSeq,
+      capabilityRef: local.capabilityRef, operationId: token.toolName, effect: token.effect, args,
+    });
+    const physical = openEventLog().prepare(`SELECT COUNT(*) AS n FROM physical_dispatches
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+      .get(token.sessionId, token.sourceUserSeq, token.logicalToolCallId) as { n: number };
+    return !!open && open.toolName === token.toolName && open.argumentDigest === token.argumentDigest
+      && host.status === 'ok' && host.binding.bindingKind === 'local_envelope'
+      && host.binding.durableBindingDigest === token.hostCapabilityBindingDigest
+      && host.binding.effectiveArgumentDigest === token.argumentDigest
+      && host.binding.capabilityId === local.capabilityRef
+      && host.binding.schemaFingerprint === local.schemaFingerprint
+      && host.binding.effect === token.effect && physical.n === 0
+      && !!nominated && JSON.stringify(nominated) === JSON.stringify(local);
+  } catch { return false; }
+}
+
+/** Non-consuming check for work_call's immediate local dispatch boundary.
+ * The inner tool still consumes the same one-shot token before execution. */
+export function inspectCurrentExactLocalCallAdmission(input: {
+  sessionId: string; sourceUserSeq: number; logicalToolCallId: string; toolName: string; args: unknown;
+}): boolean {
+  const token = genericAdmissionStorage.getStore();
+  return !!token && token.entered && !!token.nativeDefinition
+    && token.sessionId === input.sessionId && token.sourceUserSeq === input.sourceUserSeq
+    && token.logicalToolCallId === input.logicalToolCallId && token.toolName === input.toolName
+    && exactNativeTokenIsCurrent(token, input.args, true);
+}
+
 export function withNestedCallAdmission<T>(
   candidate: object,
   run: () => Promise<T>,
@@ -276,6 +369,18 @@ export function withNestedCallAdmission<T>(
   const issued = issuedGenericAdmissions.get(candidate);
   if (!issued || issued.entered) throw new Error('nested call admission candidate is not a fresh host-issued token');
   issued.entered = true;
+  if (issued.nativeDefinition) {
+    return (async () => {
+      try {
+        const current = await loadDurableAuthorizedLocalPlanningDefinition({ sessionId: issued.sessionId,
+          sourceUserSeq: issued.sourceUserSeq, capabilityRef: issued.nativeDefinition!.capabilityRef });
+        if (!current.ok || JSON.stringify(current.definition) !== JSON.stringify(issued.nativeDefinition)) {
+          throw new Error('exact native call definition changed before nested dispatch');
+        }
+        return await genericAdmissionStorage.run(issued, run);
+      } finally { issued.used = true; }
+    })();
+  }
   return genericAdmissionStorage.run(issued, run);
 }
 
@@ -289,6 +394,11 @@ export function consumeNestedCallAdmission(input: {
 }): boolean {
   const token = genericAdmissionStorage.getStore();
   if (!token || token.used || token.sessionId !== input.sessionId) return false;
+  if (token.nativeDefinition) {
+    if (token.toolName !== input.toolName || !exactNativeTokenIsCurrent(token, input.args, true)) return false;
+    token.used = true;
+    return true;
+  }
   const current = currentLogicalCall();
   const logical = durableLogicalCallContract(token.acceptedTaskId, input.toolName, input.args);
   if (
@@ -352,7 +462,7 @@ export function issueStagedParentCallAdmission(input: {
   args: unknown;
 }): StagedParentCallAdmission | null {
   const token = genericAdmissionStorage.getStore();
-  if (!token || !token.used || token.stagedChildIssued || token.sessionId !== input.sessionId) return null;
+  if (!token || token.nativeDefinition || !token.used || token.stagedChildIssued || token.sessionId !== input.sessionId) return null;
   const current = currentLogicalCall();
   const logical = durableLogicalCallContract(token.acceptedTaskId, input.toolName, input.args);
   if (

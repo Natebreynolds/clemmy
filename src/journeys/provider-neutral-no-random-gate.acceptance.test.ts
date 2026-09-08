@@ -569,6 +569,7 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
     properties: Record<string, unknown>;
     required: string[];
     write: boolean;
+    explicitlyRequestedNamedDispatch?: boolean;
     result?: string;
   }> = [
     {
@@ -699,21 +700,22 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
       write: true,
     },
     {
-      label: 'workflow run',
+      label: 'explicit named workflow run',
       prompt: 'Run the fixture workflow now.',
       name: 'workflow_run',
       args: { name: 'fixture-workflow', inputs: '{}' },
       properties: { name: { type: 'string' }, inputs: { type: 'string' } },
       required: ['name', 'inputs'],
-      // A run queues durable execution. It is a local mutation even when all
-      // authored workflow steps are reads, so an unplanned direct run belongs
-      // in the same zero-I/O repair matrix as other surprise writes.
+      // The owner explicitly requested this named dispatch. Queuing remains
+      // mutating even when the authored steps only read, but Normal mode does
+      // not require a planning graph to dispatch that exact named workflow.
       write: true,
+      explicitlyRequestedNamedDispatch: true,
     },
   ];
 
   for (const [index, candidate] of directCases.entries()) {
-    if (candidate.write) continue;
+    if (candidate.write && !candidate.explicitlyRequestedNamedDispatch) continue;
     await t.test(candidate.label, async () => {
       const seen: Array<Record<string, unknown>> = [];
       const tool = recordingTool({
@@ -746,6 +748,30 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
         `${candidate.label}: strict nullable omission was not materialized`);
       assert.equal(result.ledger.logical_calls, 1);
       assert.equal(result.ledger.crossings, 1);
+      if (candidate.explicitlyRequestedNamedDispatch) {
+        const db = eventlog.openEventLog();
+        assert.equal(candidate.write, true, 'named dispatch remains an effectful operation');
+        assert.deepEqual(seen, [{ ...candidate.args, optional_context: null }]);
+        assert.deepEqual(db.prepare(`
+          SELECT tool_name, effect, binding_kind FROM host_call_capability_bindings
+           WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+        `).all(session.id, result.source.seq, callId), [{
+          tool_name: 'workflow_run', effect: 'local_write', binding_kind: 'local_envelope',
+        }]);
+        assert.deepEqual(db.prepare(`
+          SELECT outcome_kind, business_call, mutating FROM logical_call_settlements
+           WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+        `).all(session.id, result.source.seq, callId), [{
+          outcome_kind: 'succeeded', business_call: 1, mutating: 1,
+        }]);
+        assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM accepted_task_work_contracts
+          WHERE session_id = ? AND source_user_seq = ?`).get(session.id, result.source.seq) as { n: number }).n, 0,
+        'an explicitly requested named dispatch does not invent a Plan contract');
+        assert.deepEqual(functionCallIds(result.outcome.history), [callId]);
+        assert.deepEqual(functionResultIds(result.outcome.history), [callId]);
+        assert.deepEqual(unmatchedFunctionCallIds({ input: result.outcome.history }), []);
+        assert.equal(result.model.calls(), 2);
+      }
       assert.equal(
         result.approvals,
         0,
@@ -756,7 +782,7 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
   }
 
   for (const [index, candidate] of directCases.entries()) {
-    if (!candidate.write) continue;
+    if (!candidate.write || candidate.explicitlyRequestedNamedDispatch) continue;
     await t.test(`${candidate.label} without accepted coverage repairs before I/O`, async (caseTest) => {
       const seen: Array<Record<string, unknown>> = [];
       const tool = recordingTool({
@@ -3099,7 +3125,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.doesNotMatch(JSON.stringify(resumed), FORBIDDEN_PUBLIC_GATE);
           return;
         }
-        const resumedDb = eventlog.openEventLog();
+        let resumedDb = eventlog.openEventLog();
         const resumedSettlements = resumedDb.prepare(`
           SELECT logical_tool_call_id, execution_kind, outcome_kind, business_call,
                  mutating, requirement_id, physical_crossing_count
@@ -3270,7 +3296,25 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
 
           const durableSession = HarnessSession.load(plannedSession.id);
           assert.ok(durableSession, 'the exact accepted session must survive bookkeeping recovery');
-          durableSession.saveRecoveryState(resumed.serializedRecoveryState!);
+          const recoveryOwner = { sourceUserSeq: source.seq };
+          assert.deepEqual(durableSession.saveRecoveryState(resumed.serializedRecoveryState!, {
+            owner: recoveryOwner,
+          }), { installed: true }, 'the fixture installs the same exact source owner used by runTurn');
+          assert.equal(durableSession.recoveryOwnedByActivation(recoveryOwner), true);
+          eventlog.closeEventLog();
+          const reopenedSession = HarnessSession.load(plannedSession.id);
+          assert.ok(reopenedSession, 'the settled send and owned recovery survive an actual SQLite reopen');
+          assert.equal(reopenedSession.loadRecoveryState(), resumed.serializedRecoveryState);
+          assert.equal(reopenedSession.recoveryOwnedByActivation(recoveryOwner), true);
+          resumedDb = eventlog.openEventLog();
+          assert.deepEqual(resumedDb.prepare(`
+            SELECT logical_tool_call_id, outcome_kind, mutating, requires_reconciliation
+              FROM logical_call_settlements
+             WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+          `).all(plannedSession.id, source.seq, workCallId), [{
+            logical_tool_call_id: workCallId, outcome_kind: 'succeeded', mutating: 1,
+            requires_reconciliation: 0,
+          }], 'the landed send is a durable success before the recovery wake');
           const recoveryTurnOptions = {
             sessionId: plannedSession.id,
             input: candidate.prompt,
@@ -3294,7 +3338,16 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           const continuationBytes = HarnessSession.load(plannedSession.id)?.loadRecoveryState();
           assert.ok(continuationBytes);
           const continuation = HostRecoveryState.fromString(continuationBytes!);
-          assert.equal(continuation.phase, 'continue');
+          assert.equal(continuation.phase, 'continue', JSON.stringify({
+            phase: continuation.phase,
+            recoveryDecisions: eventlog.listEvents(plannedSession.id, { types: ['restart_recovery_decision'] })
+              .filter(event => event.data.sourceUserSeq === source.seq).map(event => event.data),
+          }));
+          assert.equal(HarnessSession.load(plannedSession.id)?.recoveryOwnedByActivation(recoveryOwner), true);
+          assert.equal(eventlog.listEvents(plannedSession.id, { types: ['restart_recovery_decision'] })
+            .filter(event => event.data.sourceUserSeq === source.seq
+              && event.data.decision === 'recovery_save_rejected').length, 0,
+          'the exact recovery owner advances its own checkpoint without a rejected save');
           assert.equal(continuation.acceptedModelBatchRef?.batchId,
             recovery.acceptedModelBatchRef?.batchId);
           assert.equal(bodies, 1, 'finalize wake cannot redispatch the provider body');
@@ -4102,7 +4155,7 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   });
   const toolName = 'workspace_roots';
   const args = {};
-  const sourceACallIds = ['retirement-source-a-1', 'retirement-source-a-2'];
+  const sourceACallIds = Array.from({ length: 4 }, (_, index) => `retirement-source-a-${index + 1}`);
   let bodies = 0;
   const sourceATools = zeroCrossingRefusalTools(
     [{ name: toolName, args }],
@@ -4136,13 +4189,24 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
     } as never,
   ));
   assert.equal(bodies, 0);
-  assert.equal(sourceAModel.calls(), 2,
-    'the no-progress governor stops before paying for a third identical dead call');
+  assert.equal(sourceAModel.calls(), 4,
+    'one initial refusal and all three existing repair opportunities exhaust before a fifth call');
+  assert.deepEqual(functionCallIds(outcomeA.history), sourceACallIds);
   assert.deepEqual(functionResultIds(outcomeA.history), sourceACallIds);
   assert.deepEqual(unmatchedFunctionCallIds({ input: outcomeA.history }), []);
-  const sourceAFirst = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[0]!)!);
-  const sourceASecond = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[1]!)!);
-  assert.deepEqual([sourceAFirst.retry, sourceASecond.retry], ['replan', 'replan']);
+  const sourceAResults = sourceACallIds.map(callId => JSON.parse(functionResultTextFor(outcomeA.history, callId)!));
+  assert.deepEqual(sourceAResults.map(result => result.retry), ['replan', 'replan', 'replan', 'replan']);
+  const sourceARepairs = eventlog.listEvents(retirementSession.id, { types: ['guardrail_tripped'] })
+    .filter(event => event.data.sourceUserSeq === sourceA.seq && event.data.kind === 'no_progress_decision');
+  assert.deepEqual(sourceARepairs.map(event => event.data.retriesRemaining), [2, 1, 0, 0]);
+  assert.deepEqual(sourceARepairs.map(event => event.data.action), ['continue', 'continue', 'continue', 'terminalize']);
+  assert.ok(sourceARepairs.every(event => event.data.attemptClass === 'zero_crossing_repair'));
+  assert.ok(sourceARepairs.every(event => Array.isArray(event.data.gained) && event.data.gained.length === 0));
+  assert.equal(new Set(sourceARepairs.map(event => event.data.consequenceKey)).size, 1);
+  assert.equal(new Set(sourceARepairs.map(event => event.data.stageTransitionsRemaining)).size, 1,
+    'repeating an existing consequence never refuels stage transitions');
+  assert.equal((eventlog.openEventLog().prepare(`SELECT COUNT(*) AS n FROM physical_dispatches
+    WHERE session_id = ? AND source_user_seq = ?`).get(retirementSession.id, sourceA.seq) as { n: number }).n, 0);
   // Since 7bd17d6f the no-progress stop is a typed, RESUMABLE terminal: the
   // retained results and next edge survive, so `resumable: false` is gone.
   assert.equal(outcomeA.terminal?.status, 'blocked');
@@ -4154,6 +4218,13 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
     lastResponseId: outcomeA.lastResponseId,
     turn: 1,
   });
+
+  eventlog.closeEventLog();
+  const reopenedRetirement = HarnessSession.load(retirementSession.id);
+  assert.ok(reopenedRetirement);
+  assert.deepEqual(functionCallIds(reopenedRetirement.toInputItems()), sourceACallIds);
+  assert.deepEqual(functionResultIds(reopenedRetirement.toInputItems()), sourceACallIds);
+  assert.deepEqual(unmatchedFunctionCallIds({ input: reopenedRetirement.toInputItems() }), []);
 
   const sourceBCallId = 'retirement-source-b-identical';
   const sourceBTools = zeroCrossingRefusalTools(
@@ -4184,6 +4255,13 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   const sourceBSecondInput = (sourceBModel.inputs()[1] as { input?: unknown } | undefined)?.input;
   const sourceBResult = JSON.parse(functionResultTextFor(sourceBSecondInput, sourceBCallId)!);
   assert.equal(sourceBResult.retry, 'replan');
+  const sourceB = eventlog.listEvents(retirementSession.id, { types: ['user_input_received'] }).at(-1);
+  assert.ok(sourceB && sourceB.seq > sourceA.seq);
+  const sourceBRepairs = eventlog.listEvents(retirementSession.id, { types: ['guardrail_tripped'] })
+    .filter(event => event.data.sourceUserSeq === sourceB.seq && event.data.kind === 'no_progress_decision');
+  assert.deepEqual(sourceBRepairs.map(event => event.data.retriesRemaining), [2],
+    'the new accepted source receives its independent existing repair budget');
+  assert.deepEqual(sourceBRepairs.map(event => event.data.action), ['continue']);
   assert.deepEqual(unmatchedFunctionCallIds({ input: sourceBSecondInput }), []);
   assert.equal(bodies, 0);
 });

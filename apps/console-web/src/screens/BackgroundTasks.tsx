@@ -211,7 +211,7 @@ export function BackgroundTasks() {
 
   return (
     <Page
-      title="Tasks"
+      title="Running"
       subtitle="Everything Clementine is working on — drag a waiting card to Running to approve it, drag to Done to cancel, click to watch live."
       actions={(
         <div className="flex flex-wrap gap-2">

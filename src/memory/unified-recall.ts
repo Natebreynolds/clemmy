@@ -14,11 +14,14 @@ export interface UnifiedHit {
   truncated?: boolean;
   score: number;
   confidence?: number;
+  validFrom?: string;
+  validTo?: string;
   evidence?: MemoryEvidenceHit['evidence'];
   whyRecalled?: string[];
 }
 
 export interface UnifiedRecallOptions {
+  purpose?: 'ambient' | 'targeted';
   limit?: number;
   perStore?: number;
   stores?: UnifiedHitType[];
@@ -30,6 +33,7 @@ export interface UnifiedRecallOptions {
 }
 
 export interface UnifiedRecallResult {
+  purpose?: 'ambient' | 'targeted';
   objective: string;
   hits: UnifiedHit[];
   perStore: Record<string, number>;
@@ -57,9 +61,10 @@ function isLiveWorldAsk(objective: string): boolean {
 }
 
 export function projectedRecallAnswerability(
-  result: Pick<UnifiedRecallResult, 'objective' | 'answerability'>,
+  result: Pick<UnifiedRecallResult, 'objective' | 'answerability' | 'purpose'>,
   hits: UnifiedHit[],
 ): UnifiedRecallResult['answerability'] {
+  if (result.purpose === 'ambient') return hits.length > 0 ? 'partial' : 'insufficient';
   const entityOrDeliverableOnly = hits.length > 0
     && hits.every((hit) => hit.type === 'entity' || hit.type === 'deliverable');
   if (entityOrDeliverableOnly && isLiveWorldAsk(result.objective)) {
@@ -109,6 +114,7 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
   const obj = objective.replace(/\s+/g, ' ').trim();
   if (!obj) return { objective: '', hits: [], perStore: {}, answerability: 'insufficient' };
   const result = await recallMemory(obj, {
+    purpose: opts.purpose,
     limit: opts.limit,
     perStore: opts.perStore,
     stores: opts.stores?.map(recallStore),
@@ -130,7 +136,12 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
     // stay compact so corroborators still fit.
     const fullValueHit = (type === 'fact' || type === 'policy')
       && (completeSet || index === 0);
-    const projected = projectSnippet(hit.text, fullValueHit ? 1_200 : 240);
+    // Selected note bodies are already indexed excerpts, explicitly labeled
+    // with source scope. The outer recall/primer budget admits or omits the
+    // whole attributed hit; do not silently reduce it to another 240-char lead.
+    const projected = type === 'vault'
+      ? { snippet: hit.text, truncated: false }
+      : projectSnippet(hit.text, fullValueHit ? 1_200 : 240);
     return {
       type,
       ref: String(hit.ref.id),
@@ -139,6 +150,8 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
       truncated: projected.truncated,
       score: hit.score,
       confidence: hit.confidence,
+      validFrom: hit.validFrom,
+      validTo: hit.validTo,
       evidence: hit.evidence,
       whyRecalled: hit.whyRecalled,
     };
@@ -146,8 +159,8 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
   // `recallMemory` judges the full stored hit. A complete-set request can only
   // be called supported when at least one evidence-backed supporting hit is also
   // complete in the projection the model actually receives.
-  const answerability = projectedRecallAnswerability({ objective: obj, answerability: result.answerability }, hits);
-  return { objective: obj, hits, perStore, answerability, diagnostics: result.diagnostics };
+  const answerability = projectedRecallAnswerability({ objective: obj, answerability: result.answerability, purpose: opts.purpose }, hits);
+  return { objective: obj, hits, perStore, answerability, diagnostics: result.diagnostics, ...(opts.purpose ? { purpose: opts.purpose } : {}) };
 }
 
 export function formatUnifiedRecall(result: UnifiedRecallResult, maxChars = 2400): string {
@@ -166,7 +179,16 @@ export function formatUnifiedPrimer(result: UnifiedRecallResult, maxChars = 1800
 
 function unifiedRecallHeader(result: UnifiedRecallResult): string {
   const recallTag = result.recallId ? `; recall: ${result.recallId}` : '';
-  return `[RELEVANT MEMORY — evidence-backed; answerability: ${result.answerability ?? 'partial'}${recallTag}]`;
+  const scope = result.purpose === 'ambient' ? '; scope: ambient task context' : '';
+  return `[RELEVANT MEMORY — evidence-backed; answerability: ${result.answerability ?? 'partial'}${scope}${recallTag}]`;
+}
+
+function unifiedTimeEvidence(hit: UnifiedHit): string {
+  if (!hit.validFrom && !hit.validTo) return '';
+  if ((hit.type === 'episode' || hit.type === 'vault') && hit.validFrom) {
+    return ` [occurred_at: ${hit.validFrom}]`;
+  }
+  return `${hit.validFrom ? ` [valid_from: ${hit.validFrom}]` : ''}${hit.validTo ? ` [valid_to: ${hit.validTo}]` : ''}`;
 }
 
 function unifiedRecallLine(hit: UnifiedHit): string {
@@ -179,7 +201,7 @@ function unifiedRecallLine(hit: UnifiedHit): string {
   const why = (hit.whyRecalled ?? []).filter(Boolean).slice(0, 3);
   const reasons = why.length > 0 ? ` [why: ${why.join('; ')}]` : '';
   const ref = unifiedHitRecallRef(hit);
-  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${hit.title}${hit.snippet ? `: ${hit.snippet}` : ''}${evidence}${sources}${reasons}`;
+  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${hit.title}${hit.snippet ? `: ${hit.snippet}` : ''}${evidence}${sources}${reasons}${unifiedTimeEvidence(hit)}`;
 }
 
 function compactText(value: string | undefined, maxChars: number): string {
@@ -192,7 +214,7 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
     fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW', deliverable: 'YOUR WORK LIVES AT',
   };
   const ref = unifiedHitRecallRef(hit);
-  const title = compactText(hit.title, 160);
+  const title = hit.type === 'vault' ? hit.title : compactText(hit.title, 160);
   // Ordinary hits are projected to <=240 chars before this formatter. A
   // fact/policy snippet longer than 360 therefore signals an exact/complete-set
   // request, where clipping the tail can silently drop roster members. Preserve
@@ -200,7 +222,9 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
   const snippetLimit = (hit.type === 'fact' || hit.type === 'policy') && hit.snippet.length > 360
     ? 1_200
     : 360;
-  const snippet = compactText(hit.snippet, snippetLimit);
+  const snippet = hit.type === 'vault'
+    ? hit.snippet.replace(/\s+/g, ' ').trim()
+    : compactText(hit.snippet, snippetLimit);
   // A note ref already is the actionable vault path; repeating the same value as
   // a source URI was one of the largest avoidable primer costs. Keep at most one
   // short, distinct source locator for episode/fact refs that need it.
@@ -208,7 +232,7 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
     .map((item) => item.sourceUri?.trim())
     .filter((uri): uri is string => Boolean(uri)))]
     .find((uri) => uri !== hit.ref && uri.length <= 240);
-  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${source ? ` [source: ${source}]` : ''}`;
+  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${source ? ` [source: ${source}]` : ''}${unifiedTimeEvidence(hit)}`;
 }
 
 /** Exact visible candidate set for a bounded recall block. Attribution must

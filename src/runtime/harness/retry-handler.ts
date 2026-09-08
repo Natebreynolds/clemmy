@@ -71,8 +71,9 @@ export function shouldRetryToolCall(
       isTransient: true,
       delayMs: 0,
       reason: `Timed out after ${Math.round((elapsedMs ?? 0) / 1000)}s — the remote operation may still be running. `
-        + 'Do not repeat this identical call: check the status of what it started, or use an '
-        + 'asynchronous start plus a status poll instead of a synchronous wait.',
+        + 'Do not repeat this identical call or start a replacement while its outcome is unknown. '
+        + 'Check the existing run using its exact returned handle; if no handle was returned, '
+        + 'reconcile the original attempt from provider evidence or report the unresolved state.',
       attempt,
       maxAttempts,
       remoteMayStillBeRunning: true,

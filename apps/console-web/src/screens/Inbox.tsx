@@ -400,7 +400,7 @@ export function Inbox() {
 
   return (
     <Page
-      title="Inbox"
+      title="Needs you"
       subtitle="Decisions waiting on you, and updates from finished work"
       actions={tab === 'needs' && approvalRows.length > 0
         ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button>

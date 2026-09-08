@@ -231,6 +231,8 @@ test('space_save collision is a no-effect invalid-arguments result and a new slu
     reengage_triggers: null,
     reengage_guidance: null,
     origin_session_id: null,
+    replacement_data_json: null,
+    expected_revision: null,
   };
   const occupiedData = JSON.stringify({ posts: [{ id: 'existing' }] });
   const intendedData = JSON.stringify({

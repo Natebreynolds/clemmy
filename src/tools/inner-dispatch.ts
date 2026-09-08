@@ -367,7 +367,14 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
-  const runContext = { context: { sessionId } };
+  const inheritedContext = inheritedNestedHarnessContext(sessionId);
+  // Local SDK adapters reopen source identity from RunContext, not just ALS.
+  // Carry the same accepted source into both contexts; otherwise the adapter
+  // overwrites the exact bracket context with sourceUserSeq:undefined and a
+  // named workflow silently enters the legacy unbound queue path.
+  const runContext = { context: { sessionId,
+    ...(inheritedContext.sourceUserSeq ? { sourceUserSeq: inheritedContext.sourceUserSeq } : {}),
+  } };
   const details = { toolCall: { callId } };
   // `certifiedBatch` is threaded into the run context ONLY on the batch runner's
   // approved execute path (dispatchBatchItemTool passes it); other nested calls
@@ -378,10 +385,12 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
   // without it every catalog-tier context-reading tool reached through
   // call_tool/inner dispatch refused with "no session context here" (live
   // 2026-07-09: background handoff looked broken on every chat surface).
-  return withToolOutputContext({ sessionId, callId, toolName: method }, () =>
+  return withToolOutputContext({ sessionId, callId, toolName: method,
+    ...(inheritedContext.sourceUserSeq ? { sourceUserSeq: inheritedContext.sourceUserSeq } : {}),
+  }, () =>
     // nestedDispatch:true exempts these calls from the direct-read fanout block.
     withHarnessRunContext({
-      ...inheritedNestedHarnessContext(sessionId),
+      ...inheritedContext,
       sessionId,
       counter: counter ?? new ToolCallsCounter(1000),
       nestedDispatch: true,

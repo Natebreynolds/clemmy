@@ -25,7 +25,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
-const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
+const { resetEventLog, closeEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
 const { inFlightCompactionThresholds } = await import('./compaction.js');
 const {
   clipOldToolResults,
@@ -340,7 +340,7 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
   );
 });
 
-test('compactInFlightToolContext — deduplicates identical results below the pressure threshold without losing recall ids', () => {
+test('compactInFlightToolContext — preserves all identical observations below the pressure threshold', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const payload = `stable-result::${'r'.repeat(700)}`;
@@ -356,11 +356,73 @@ test('compactInFlightToolContext — deduplicates identical results below the pr
 
   const compacted = compactInFlightToolContext(items, sess.id);
   const visible = JSON.stringify(compacted.nextItems);
-  assert.equal(compacted.applied, true);
-  assert.equal(visible.split(payload).length - 1, 1, 'one canonical raw result stays visible');
-  assert.equal((visible.match(/recall_tool_result/g) ?? []).length, 11);
-  assert.ok(callIds.every((callId) => visible.includes(callId)), 'every duplicate keeps an addressable call id');
+  assert.equal(compacted.applied, false);
+  assert.equal(compacted.nextItems, items, 'no model-facing history rewrite without pressure');
+  assert.equal(visible.split(payload).length - 1, 12, 'each observation retains its own result');
+  assert.ok(callIds.every((callId) => visible.includes(callId)), 'every completed call remains visible');
   assert.ok(callIds.every((callId) => getToolOutput(sess.id, callId)?.output === payload));
+
+  const original = JSON.stringify(items);
+  const pressure = compactInFlightToolContext(items, sess.id, {
+    resultTriggerTokens: 1_000, retainedResultBudgetTokens: 1_000,
+    minRetainPairs: 1, maxRetainPairs: 1,
+  });
+  assert.ok(pressure.resultTokensBefore > pressure.triggerTokens);
+  assert.equal(pressure.applied, true);
+  assert.deepEqual(pressure.callIds, callIds.slice(0, -1));
+  assert.equal(pressure.retainedPairs, 1);
+  const projected = JSON.stringify(pressure.nextItems);
+  assert.ok(Buffer.byteLength(projected, 'utf8') <= 6_000, String(Buffer.byteLength(projected, 'utf8')));
+  const summary = pressure.nextItems.find(item => {
+    const row = item as Record<string, unknown>;
+    return row.role === 'system' && typeof row.content === 'string'
+      && row.content.startsWith('[summary of older completed tool activity]');
+  }) as { content: string } | undefined;
+  assert.ok(summary);
+  const exactRecallIds = [...summary.content.matchAll(/recall_tool_result (\{[^}]+\})/g)]
+    .map(match => JSON.parse(match[1]!).call_id)
+    .filter(callId => callId !== '<call id>');
+  assert.deepEqual(exactRecallIds, callIds.slice(0, -1), 'each parked result keeps one exact callable recall address');
+  assert.ok(callIds.every(callId => getToolOutput(sess.id, callId)?.output === payload));
+  assert.deepEqual(pressure.nextItems.slice(-2), items.slice(-2), 'the newest call/result pair stays verbatim');
+  assert.equal(JSON.stringify(items), original, 'projection changes no canonical source bytes');
+  const { inspectConversationProtocol } = await import('./conversation-protocol.js');
+  assert.equal(inspectConversationProtocol(pressure.nextItems).status, 'valid');
+});
+
+test('a new workflow read stays after its accepted update request even when an older turn returned identical bytes', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'workflow update chronology' });
+  const payload = 'Workflow: fixture-workflow\nDescription: Initial.\nTrigger: manual only\n'
+    + 'native_literal: {"version":1,"expression":{"op":"literal","value":"Initial."}}\n'
+    + 'Preserved settings: ' + 's'.repeat(650);
+  const innerArgs = JSON.stringify({ name: 'fixture-workflow', section: 'full' });
+  const items = [
+    userMessage('Create fixture-workflow, then read its saved definition.'),
+    toolCall('old-read', 'workflow_get', innerArgs), toolResult('old-read', payload),
+    assistantMessage('Created and verified the initial definition.'),
+    userMessage('Now update fixture-workflow. Read its saved definition first, then change its literal.'),
+    assistantMessage('Now let me read the current definition via call_tool.'),
+    toolCall('fresh-read', 'call_tool', JSON.stringify({ name: 'workflow_get', args_json: innerArgs })),
+    toolResult('fresh-read', payload),
+  ];
+  for (const callId of ['old-read', 'fresh-read']) {
+    writeToolOutput({ sessionId: session.id, callId, tool: 'workflow_get', output: payload });
+  }
+  session.updateConversationSnapshot(items);
+  const before = JSON.stringify(items);
+  const result = compactInFlightToolContext(items, session.id, { resultTriggerTokens: 128_000 });
+  assert.equal(result.applied, false);
+  assert.equal(result.nextItems, items, 'the current call/result pair must not become a system duplicate ledger');
+  assert.equal(JSON.stringify(result.nextItems), before);
+  assert.deepEqual(result.nextItems.slice(-2), items.slice(-2), 'the latest observation stays after the pre-read assistant message');
+  const { inspectConversationProtocol } = await import('./conversation-protocol.js');
+  assert.equal(inspectConversationProtocol(result.nextItems).status, 'valid');
+  closeEventLog();
+  const reopened = HarnessSession.load(session.id)!.toInputItems();
+  assert.equal(JSON.stringify(reopened), before, 'restart retains both observations and the intervening user request');
+  assert.equal(compactInFlightToolContext(reopened, session.id, { resultTriggerTokens: 128_000 }).nextItems, reopened);
+  assert.equal(getToolOutput(session.id, 'fresh-read')?.output, payload);
 });
 
 test('compactInFlightToolContext — equal visible stubs never deduplicate distinct durable raw outputs', () => {
@@ -627,29 +689,47 @@ test('forceLayer2 triggers Layer 1 even with abundant token headroom (the stage-
   assert.equal(result.layer3.applied, false, 'Layer 3 fork is suppressed during a forced checkpoint');
 });
 
-test('compactSessionIfNeeded — idle gap + real weight triggers L1+L2 below token pressure (no fork)', async () => {
+test('a long idle gap preserves exact working history when the routed context has headroom', async () => {
   resetEventLog();
-  const session = HarnessSession.create({ kind: 'chat', title: 'idle test' });
+  const session = HarnessSession.create({ kind: 'chat', title: 'idle continuity' });
   const items: AgentInputItem[] = [];
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 28; i++) {
     const callId = `call_idle${i}`;
-    items.push(userMessage(`turn ${i}`));
-    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
-    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
-    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+    const body = `Exact draft ${i}.\n${'z'.repeat(3000)}END_${i}!`;
+    items.push(userMessage(`Keep draft ${i} for the next turn.`));
+    items.push(toolCall(callId, 'draft.read', JSON.stringify({ id: `draft-${i}` })));
+    items.push(toolResult(callId, body));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'draft.read', output: body });
   }
   session.updateConversationSnapshot(items);
-  // Big budget (no token pressure) + a 1h idle gap over the 6k-token floor → idle
-  // trigger fires L1+L2 anyway, and suppresses the Layer-3 fork (summarize in place).
-  const { result, forkRequest } = await compactSessionIfNeeded(session, items, {
-    inputBudgetTokens: 200_000, layer1ItemThreshold: 15,
-    idleMs: 60 * 60 * 1000, idleCompactionThresholdMs: 30 * 60 * 1000, idleCompactionMinTokens: 3000,
+  const before = JSON.stringify(items);
+  const previousFlag = process.env.CLEMMY_AUTO_COMPACT;
+  let summarizerCalls = 0;
+  process.env.CLEMMY_AUTO_COMPACT = 'on';
+  _setCompactionSummarizerForTests(async () => {
+    summarizerCalls++;
+    return { error: 'Idle time must not invoke a summarizer with free context.' };
   });
-  assert.ok(result.beforeTokens < 200_000 * 0.3, 'precondition: no token pressure');
-  assert.ok(result.beforeTokens > 3000, 'precondition: real weight (over the idle floor)');
-  assert.equal(result.layer1.applied, true, 'idle gap runs Layer 1 below token pressure');
-  assert.equal(result.layer3.applied, false, 'idle summarize never forks (in-place reset)');
-  assert.equal(forkRequest, undefined);
+  try {
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, items, {
+      inputBudgetTokens: 1_000_000, idleMs: 24 * 60 * 60 * 1000,
+    });
+    assert.ok(result.beforeTokens > 6000, 'exceeds the retired idle floor');
+    assert.ok(result.beforeTokens < 1_000_000 * 0.3, 'has abundant routed-model headroom');
+    assert.equal(result.modified, false);
+    assert.equal(result.layer1.applied, false);
+    assert.equal(result.layer2.applied, false);
+    assert.equal(summarizerCalls, 0);
+    assert.equal(forkRequest, undefined);
+    assert.equal(JSON.stringify(nextItems), before, 'all exact content and tool call identities survive');
+    assert.equal(JSON.stringify(items), before, 'the persisted snapshot input is not mutated');
+    closeEventLog();
+    assert.equal(JSON.stringify(HarnessSession.load(session.id)?.toInputItems()), before, 'exact working history survives reopening storage');
+  } finally {
+    if (previousFlag === undefined) delete process.env.CLEMMY_AUTO_COMPACT;
+    else process.env.CLEMMY_AUTO_COMPACT = previousFlag;
+    _setCompactionSummarizerForTests(null);
+  }
 });
 
 test('compactSessionIfNeeded — idle does NOT fire on a short gap or a tiny session', async () => {
@@ -820,8 +900,8 @@ test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its 
 // why the 12-pair gate passed while real fan-out failed.
 //
 // Parallel fan-out is exactly the shape long agentic work produces, so pin BOTH
-// orderings: dedup must still collapse, and the frame must stay protocol-valid.
-test('duplicate collapse keeps a parallel call frame protocol-valid', async () => {
+// orderings under real pressure: older pairs collapse and the newest observation remains protocol-valid.
+test('pressure collapse keeps parallel and sequential identical-result frames valid and retains the newest pair', async () => {
   const { inspectConversationProtocol } = await import('./conversation-protocol.js');
   const session = createSession({ id: 'dedup-parallel-frame', kind: 'chat' });
   const payload = `IDENTICAL::${'p'.repeat(400)}`;
@@ -839,9 +919,14 @@ test('duplicate collapse keeps a parallel call frame protocol-valid', async () =
   ];
   assert.equal(inspectConversationProtocol(parallel).status, 'valid');
 
-  const collapsed = compactInFlightToolContext(parallel, session.id);
-  assert.equal(collapsed.applied, true, 'dedup must still collapse the identical pair');
+  const pressure = { resultTriggerTokens: 1, retainedResultBudgetTokens: 1, minRetainPairs: 1, maxRetainPairs: 1 };
+  const collapsed = compactInFlightToolContext(parallel, session.id, pressure);
+  assert.equal(collapsed.applied, true, 'real pressure collapses the older pair');
   assert.equal(collapsed.collapsed, 1);
+  assert.deepEqual(collapsed.callIds, ['par-a']);
+  assert.ok(collapsed.nextItems.includes(parallel[2]!));
+  assert.ok(collapsed.nextItems.includes(parallel[4]!));
+  assert.equal(getToolOutput(session.id, 'par-a')?.output, payload, 'the old observation remains fully recallable');
   const after = inspectConversationProtocol(collapsed.nextItems);
   assert.equal(
     after.status,
@@ -861,7 +946,34 @@ test('duplicate collapse keeps a parallel call frame protocol-valid', async () =
     toolCall('seq-b', 'tool_search', '{"q":"b"}'),
     toolResult('seq-b', payload),
   ];
-  const seqCollapsed = compactInFlightToolContext(sequential, session.id);
+  const seqCollapsed = compactInFlightToolContext(sequential, session.id, pressure);
   assert.equal(seqCollapsed.collapsed, 1);
+  assert.deepEqual(seqCollapsed.callIds, ['seq-a']);
+  assert.deepEqual(seqCollapsed.nextItems.slice(-2), sequential.slice(-2));
   assert.equal(inspectConversationProtocol(seqCollapsed.nextItems).status, 'valid');
+});
+
+test('Layer 2 preserves complete tool arguments and results outside its prose summarization', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'complete summarizer context' });
+  const argumentsJson = JSON.stringify({ body: 'a'.repeat(900), destination: 'EXACT_DESTINATION_AFTER_500' });
+  const resultText = 'b'.repeat(7000) + '\nUNFINISHED_RECORD_AFTER_4000';
+  let received = '';
+  _setCompactionSummarizerForTests(async (text) => {
+    received = text;
+    return { summary: '- The returned record still needs review.', modelUsed: 'test-summarizer' };
+  });
+  try {
+    const result = await summarizeOlderMessages([
+      userMessage('Review the full result before continuing.'), assistantMessage('I will inspect it.'),
+      toolCall('call_complete_input', 'test.read', argumentsJson), toolResult('call_complete_input', resultText),
+      assistantMessage('The review is pending.'), userMessage('Continue later.'), assistantMessage('Ready.'),
+    ], session.id, 2);
+    assert.equal(result.applied, true);
+    const keptCall = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call') as { arguments?: string };
+    const keptResult = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call_result') as { output?: { text?: string } };
+    assert.equal(keptCall.arguments, argumentsJson);
+    assert.equal(keptResult.output?.text, resultText);
+    assert.ok(!received.includes('TOOL_CALL'), 'exact tool state is retained rather than sent through prose compression');
+  } finally { _setCompactionSummarizerForTests(null); }
 });

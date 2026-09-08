@@ -12,6 +12,8 @@
  * agent runs are read-only.
  */
 import { SessionStore } from '../memory/session-store.js';
+import { createWorkflowRunStatusReader, type UnifiedRunCoverage } from './workflow-run-status.js';
+export type { UnifiedRunCoverage } from './workflow-run-status.js';
 import {
   configuredSessionRetentionDays,
   getSession as getHarnessSession,
@@ -63,8 +65,21 @@ export interface ContinueHint {
   protocol: 'ndjson' | 'sse';
 }
 
+export interface UnifiedRunStep {
+  id: string;
+  label: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UnifiedRunSummary extends UnifiedSessionSummary {
+  runSteps?: UnifiedRunStep[];
+  runCoverage?: UnifiedRunCoverage;
+}
+
 export interface SessionDetail {
-  session: UnifiedSessionSummary;
+  session: UnifiedRunSummary;
   turns: UnifiedSessionTurn[];
   continueHint: ContinueHint | null;
 }
@@ -200,19 +215,26 @@ function listUserFacingHarnessRows(): HarnessSessionRow[] {
   return out;
 }
 
-function listHarnessRowsForWorkflowRun(workflowRunId: string): HarnessSessionRow[] {
+function listHarnessRowsForWorkflowRun(workflowRunId: string, reference: HarnessSessionRow): HarnessSessionRow[] {
   if (!workflowRunId) return [];
   const out: HarnessSessionRow[] = [];
   for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
     const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
-    out.push(...page.filter((row) => row.metadata?.workflowRunId === workflowRunId));
+    out.push(...page.filter((row) => workflowRunIdFor(row) === workflowRunId
+      && row.userId === reference.userId));
     if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
   }
   return out;
 }
 
 function workflowRunIdFor(row: HarnessSessionRow): string {
+  if (row.kind !== 'workflow' || !isUserFacingSession(row.id, row.channel ?? undefined)) return '';
   return typeof row.metadata?.workflowRunId === 'string' ? row.metadata.workflowRunId : '';
+}
+
+function workflowRunGroupKey(row: HarnessSessionRow): string {
+  const runId = workflowRunIdFor(row);
+  return runId ? JSON.stringify([runId, row.userId]) : '';
 }
 
 function workflowNameFor(row: HarnessSessionRow): string {
@@ -254,29 +276,55 @@ function mergedWorkflowRunRow(
 ): HarnessSessionRow {
   return {
     ...representative,
+    createdAt: rows.reduce((min, row) => row.createdAt < min ? row.createdAt : min, representative.createdAt),
+    updatedAt: rows.reduce((max, row) => row.updatedAt > max ? row.updatedAt : max, representative.updatedAt),
     metadata: mergedWorkflowRunMetadata(representative, rows),
   };
 }
 
+function summarizeWorkflowRun(representative: HarnessSessionRow, rows: HarnessSessionRow[]): UnifiedRunSummary {
+  const members = rows.length > 0 ? rows : [representative];
+  const aggregate = mergedWorkflowRunRow(representative, members);
+  return {
+    ...summarizeHarness(aggregate, workflowNameFor(aggregate) || undefined),
+    runSteps: [...members].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map((row) => ({
+        id: `${HARNESS_PREFIX}${row.id}`,
+        label: (typeof row.metadata?.stepId === 'string' && row.metadata.stepId.trim()
+          ? row.metadata.stepId.trim() : row.title || row.id).slice(0, 80),
+        status: row.status, createdAt: row.createdAt, updatedAt: row.updatedAt,
+      })),
+  };
+}
+
+function fillWorkflowRunStatus(summary: UnifiedRunSummary, readStatus: ReturnType<typeof createWorkflowRunStatusReader>): void {
+  if (!summary.runSteps) return;
+  const row = getHarnessSession(summary.id.slice(HARNESS_PREFIX.length));
+  const runId = row ? workflowRunIdFor(row) : '';
+  const projection = readStatus(runId);
+  summary.status = projection.status;
+  summary.runCoverage = projection.runCoverage;
+}
+
 function relatedHarnessRowsForPatch(row: HarnessSessionRow): HarnessSessionRow[] {
   const workflowRunId = workflowRunIdFor(row);
-  return workflowRunId ? listHarnessRowsForWorkflowRun(workflowRunId) : [row];
+  return workflowRunId ? listHarnessRowsForWorkflowRun(workflowRunId, row) : [row];
 }
 
 interface HarnessSummaryCollection {
-  summaries: UnifiedSessionSummary[];
+  summaries: UnifiedRunSummary[];
   rawIds: Set<string>;
 }
 
 function collectHarnessSummaries(): HarnessSummaryCollection {
   const rows = listUserFacingHarnessRows();
-  const out: UnifiedSessionSummary[] = [];
+  const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
   const workflowRows = new Map<string, HarnessSessionRow[]>();
   const seenWorkflowRuns = new Set<string>();
 
   for (const row of rows) {
-    const runId = workflowRunIdFor(row);
+    const runId = workflowRunGroupKey(row);
     if (!runId) continue;
     const grouped = workflowRows.get(runId);
     if (grouped) grouped.push(row);
@@ -284,15 +332,13 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
   }
 
   for (const row of rows) {
-    const runId = workflowRunIdFor(row);
+    const runId = workflowRunGroupKey(row);
     if (runId) {
       // rows are updated_at DESC, so the first one we see per run is the
       // most recent step — keep it as the run's representative row.
       if (seenWorkflowRuns.has(runId)) continue;
       seenWorkflowRuns.add(runId);
-      const aggregate = mergedWorkflowRunRow(row, workflowRows.get(runId) ?? [row]);
-      const workflowName = workflowNameFor(aggregate);
-      out.push(summarizeHarness(aggregate, workflowName || undefined));
+      out.push(summarizeWorkflowRun(row, workflowRows.get(runId) ?? [row]));
       continue;
     }
     out.push(summarizeHarness(row));
@@ -330,8 +376,8 @@ function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq:
   return null;
 }
 
-function reconstructWorkflowRunTranscript(workflowRunId: string, perSessionLimit = 1000): UnifiedSessionTurn[] {
-  const turns = listHarnessRowsForWorkflowRun(workflowRunId)
+function reconstructWorkflowRunTranscript(workflowRunId: string, reference: HarnessSessionRow, perSessionLimit = 1000): UnifiedSessionTurn[] {
+  const turns = listHarnessRowsForWorkflowRun(workflowRunId, reference)
     .flatMap((row) => listHarnessEvents(row.id, {
       types: ['user_input_received', 'conversation_completed'],
       limit: perSessionLimit,
@@ -345,7 +391,7 @@ function reconstructWorkflowRunTranscript(workflowRunId: string, perSessionLimit
 function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000): UnifiedSessionTurn[] {
   const workflowRunId = workflowRunIdFor(row);
   return workflowRunId
-    ? reconstructWorkflowRunTranscript(workflowRunId, perSessionLimit)
+    ? reconstructWorkflowRunTranscript(workflowRunId, row, perSessionLimit)
     : reconstructHarnessTranscript(row.id, perSessionLimit);
 }
 
@@ -368,9 +414,10 @@ function canonicalHarnessRowForRawId(rawId: string): HarnessSessionRow | null {
 
 function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   const runId = workflowRunIdFor(row);
-  const summaryRow = runId ? mergedWorkflowRunRow(row, listHarnessRowsForWorkflowRun(runId)) : row;
-  const workflowName = workflowNameFor(summaryRow);
-  const summary = summarizeHarness(summaryRow, runId && workflowName ? workflowName : undefined);
+  const summary: UnifiedRunSummary = runId
+    ? summarizeWorkflowRun(row, listHarnessRowsForWorkflowRun(runId, row))
+    : summarizeHarness(row);
+  fillWorkflowRunStatus(summary, createWorkflowRunStatusReader());
   const turns = reconstructHarnessDetailTurns(row);
   appendPendingApprovalTurns(row.id, turns);
   // Only a continuable chat can own an inline plan decision. Workflow,
@@ -484,7 +531,7 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
-export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSessionSummary[] {
+export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRunSummary[] {
   const store = new SessionStore();
   const q = query.q?.trim().toLowerCase() ?? '';
   const tag = query.tag?.trim() ?? '';
@@ -497,7 +544,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
 
   // Desktop side — also keep the matching records for cheap search/preview.
   const desktopRecords = new Map<string, SessionRecord>();
-  const desktop: UnifiedSessionSummary[] = [];
+  const desktop: UnifiedRunSummary[] = [];
   for (const record of store.listAll()) {
     if (isInternalSessionId(record.id)) continue;
     // If a raw id exists in both stores, the harness row is the canonical
@@ -533,6 +580,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
   });
 
   const page = all.slice(0, limit);
+  const readRunStatus = createWorkflowRunStatusReader();
 
   // Fill previews/turnCounts only for the returned page (bounds query cost).
   for (const summary of page) {
@@ -542,6 +590,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
       const last = publicTurns[publicTurns.length - 1];
       summary.preview = last ? clip(last.text, 140) : '';
     } else {
+      fillWorkflowRunStatus(summary, readRunStatus);
       fillHarnessPreviewAndCount(summary);
     }
   }
@@ -589,7 +638,7 @@ export function getUnifiedSessionDetail(id: string): SessionDetail | null {
   return detailForHarnessRow(row);
 }
 
-export function patchUnifiedSession(id: string, patch: SessionPatchInput): UnifiedSessionSummary | null {
+export function patchUnifiedSession(id: string, patch: SessionPatchInput): UnifiedRunSummary | null {
   const parsed = parseId(id);
   if (!parsed) return null;
 
@@ -627,7 +676,10 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
     });
     if (target.id === parsed.rawId) next = updated;
   }
-  const summary = summarizeHarness(next, workflowRunId ? workflowNameFor(next) || undefined : undefined);
+  const summary: UnifiedRunSummary = workflowRunId
+    ? summarizeWorkflowRun(next, listHarnessRowsForWorkflowRun(workflowRunId, next))
+    : summarizeHarness(next);
+  fillWorkflowRunStatus(summary, createWorkflowRunStatusReader());
   fillHarnessPreviewAndCount(summary);
   return summary;
 }

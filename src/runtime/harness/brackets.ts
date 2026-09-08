@@ -1,3 +1,5 @@
+import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
+import { retainedResultWayThrough } from './retained-result-routes.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
@@ -201,7 +203,8 @@ import {
   withLogicalToolCall,
 } from './attempt-identity.js';
 import { logicalCallAuthorityState } from './dispatch-ledger.js';
-import { logicalCallArgumentsAreContractible } from './logical-call-contract.js';
+import { durableLogicalCallContract, logicalCallArgumentsAreContractible } from './logical-call-contract.js';
+import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import {
   isPlainOrClementineLocalTool,
   isTrustedComposioGateway,
@@ -1128,6 +1131,9 @@ export class RecallBudget {
   constructor(
     public readonly maxCalls: number,
     public readonly maxBytes: number,
+    /** Enables a COMPUTED way-through; without it the refusal stays honest
+     *  but cannot name a specific successor. */
+    public readonly sessionId?: string,
   ) {}
 
   /**
@@ -1159,13 +1165,32 @@ export class RecallBudget {
    * suggestion to give up.
    */
   private wayThrough(callId?: string): string {
-    const exact = callId
-      ? `tool_output_query {"call_id":"${callId}"}`
-      : 'tool_output_query with that same call_id';
-    return `Do NOT retry recall_tool_result — it will refuse again this turn. `
-      + `Call ${exact} instead: it queries the SAME stored output server-side, `
-      + `is not limited to this tool's per-call slice, and spends no recall budget. `
-      + `Only if that cannot answer it, proceed with what you already have.`;
+    const stop = 'Do NOT retry recall_tool_result — it will refuse again this turn.';
+    // The successor is COMPUTED, never named here. This message used to say
+    // "call tool_output_query" unconditionally, while tool_output_query's own
+    // plain-text refusal said "use recall_tool_result" — a closed loop the
+    // model could not leave (live 2026-09-07 source 146537).
+    // A budget refusal must ALWAYS hand back an exact next call, never prose.
+    // Without a session the routes cannot be computed, so name the reader that
+    // reads the same stored output — its own refusal now computes the correct
+    // successor and excludes itself, so no loop can close through it.
+    // A budget refusal must ALWAYS hand back a next call, never prose alone.
+    // Where the routes cannot be computed (no call id, or no session) name the
+    // reader over the same stored output: its own refusal now computes the
+    // correct successor and excludes itself, so no loop can close through it.
+    if (!callId || !this.sessionId) {
+      const exact = callId
+        ? `tool_output_query {"call_id":"${callId}"}`
+        : 'tool_output_query with that same call_id';
+      return `${stop} Call ${exact} instead — it reads the SAME stored output `
+        + 'server-side and spends no recall budget.';
+    }
+    return `${stop} ${retainedResultWayThrough({
+      sessionId: this.sessionId,
+      callId,
+      exclude: ['recall_tool_result'],
+      recallCallsRemaining: 0,
+    })}`;
   }
 
   snapshot(): { calls: number; bytes: number; maxCalls: number; maxBytes: number } {
@@ -2575,6 +2600,29 @@ export function _setAfterSharedWriteReservationForTests(
   afterSharedWriteReservationForTests = hook;
 }
 
+/** Preserve the exact host-admitted native effect in its inner settlement. */
+function settlementCallIsMutating(toolName: string, args: unknown): boolean {
+  const attestation = currentHostCallAttestation();
+  const identity = currentLogicalCall();
+  const context = harnessRunContextStorage.getStore();
+  const contract = attestation ? durableLogicalCallContract(attestation.acceptedTaskId, toolName, args) : null;
+  if (attestation?.bindingKind === 'local_envelope'
+    && attestation.sessionId === context?.sessionId
+    && attestation.sourceUserSeq === context?.sourceUserSeq
+    && attestation.acceptedTaskId === identity?.acceptedTaskId
+    && attestation.logicalToolCallId === identity?.logicalToolCallId
+    && attestation.toolName === contract?.toolName
+    && attestation.argumentDigest === contract?.argumentDigest) {
+    // The exact host effect also governs configured coordinators carried by
+    // call_tool. Their capability is the configured envelope rather than a
+    // cap:local authoring nomination; that spelling cannot downgrade an
+    // admitted local write to a non-mutating settlement. This preserves the
+    // already admitted contract, and grants no new dispatch permission.
+    return attestation.effect === 'local_write';
+  }
+  return isMutatingExternalWrite(toolName, args);
+}
+
 /**
  * A nested provider adapter may have already committed the logical outcome
  * before its outer SDK wrapper receives the rendered value. The outer wrapper
@@ -2700,6 +2748,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
   ): Promise<BracketOutcome | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
+    const modeRefusal = planModeCallRefusal({ mode: acceptedTaskMode(ctx.sessionId, ctx.sourceUserSeq), toolName: tool.name, args: parsedInput });
+    if (modeRefusal) throw new Error(modeRefusal);
+
     // 0. Physical-attempt authority. This must precede counters, artifact
     // claims, write reservations, and every other bookkeeping side effect.
     assertDispatchLeaseCurrent(ctx.dispatchLease);
@@ -2728,7 +2779,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if (nestedCarrier) {
       const structurallyValid = nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool);
       if (!structurallyValid) {
-        if (!ctx.hostOwnsToolAccounting) {
+        if (!inputLocallyInvalid && !ctx.hostOwnsToolAccounting) {
           if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
           ctx.counter.increment();
         }
@@ -4142,7 +4193,31 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       const inputLocallyInvalid = exactToolInputIsLocallyInvalid(tool, input, parsedInput);
-      // A malformed carrier cannot be admitted under its arbitrary raw bytes:
+      const ctx = harnessRunContextStorage.getStore();
+      const attestation = inputLocallyInvalid && ctx?.hostOwnsToolDeadlineAndSettlement
+        ? currentHostCallAttestation()
+        : undefined;
+      const logical = attestation?.effect === 'read' ? currentLogicalCall() : undefined;
+      const rawContract = attestation
+        ? durableLogicalCallContract(attestation.acceptedTaskId, tool.name, parsedInput)
+        : null;
+      // A host can identify a read in an otherwise invalid carrier envelope
+      // (e.g. args_json is an object instead of its required JSON string).
+      // The exact SDK parser still refuses before execute, but replacing this
+      // already-admitted identity with an OUTER unknown-effect marker would
+      // poison the root before the parser can return its corrective. Preserve
+      // only this source/call/args-bound read under an opaque invalidity proof;
+      // absence, changed identity, writes, or an unproven parser stay guarded.
+      const hostOwnsInvalidRead = inputLocallyInvalid
+        && ctx?.hostOwnsToolDeadlineAndSettlement === true
+        && attestation?.effect === 'read'
+        && attestation.sessionId === ctx.sessionId
+        && attestation.sourceUserSeq === ctx.sourceUserSeq
+        && attestation.acceptedTaskId === logical?.acceptedTaskId
+        && attestation.logicalToolCallId === logical?.logicalToolCallId
+        && attestation.toolName === rawContract?.toolName
+        && attestation.argumentDigest === rawContract?.argumentDigest;
+      // Otherwise a malformed carrier cannot be admitted under arbitrary raw bytes:
       // strings and partial envelopes are not callable contracts. Bind the one
       // refusal to a safe host-owned OUTER identity instead. No inner tool is
       // named or refined, and the settlement below uses these same bytes.
@@ -4153,13 +4228,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // POISONS this accepted task's resolution: one bad payload would refuse
       // every remaining tool call of the turn instead of returning the ordinary
       // invalid-arguments error and letting the model retype the call.
-      const logicalContractArgs = inputLocallyInvalid
+      const logicalContractArgs = !hostOwnsInvalidRead && (inputLocallyInvalid
         || !logicalCallArgumentsAreContractible(tool.name, parsedInput)
         || (isNestedDispatchCarrier(tool.name)
-          && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool))
+          && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool)))
         ? { carrier: tool.name, malformed: true, version: 1 }
         : parsedInput;
-      const ctx = harnessRunContextStorage.getStore();
       // SDK call_id for THIS invocation — lets the within-task fetch-memory nudge
       // correlate a future identical call back to this one's tool_outputs row.
       const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
@@ -4210,6 +4284,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       let fanoutNudge: string | undefined;
+      const settledResultAnnotations: string[] = [];
       let artifact: ArtifactAdmission = {};
       let bracketOutcome: BracketOutcome | undefined;
       let deferredDiscoveryAdmissionError: unknown;
@@ -4473,7 +4548,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             result: exactEvidenceResult,
             resultPresent: true,
             signals: hostSignals,
-            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            mutating: settlementCallIsMutating(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null
               && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
           });
@@ -4492,7 +4567,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             callId: invokeCallId,
             ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
             args: logicalContractArgs,
-            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            mutating: settlementCallIsMutating(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null
               && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
             // Settlement consumes the exact nonce-scoped bytes, not the
@@ -4555,23 +4630,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // succeeding. Both are facts only the RESULT carries, so they are
         // recorded here alongside the existing result fingerprint.
         if (ctx) { try { noteGuardrailObservedCost(guardrailScopeKey(ctx), tool.name, outwardResult); } catch { /* advisory */ } }
-        // MID-RUN STEERING: deliver any user message that arrived while this
-        // run was working, riding the next tool result (the one channel every
-        // lane's model reads every few seconds). Appended AFTER settlement,
-        // publish detection, and recall credit consumed the clean value, so
-        // steering text can never masquerade as provider output to a gate; the
-        // parked exact-output bytes above are untouched.
+        // Settled-result guidance is host metadata, never provider raw text.
+        // Host steering is projected independently at the model boundary;
+        // legacy steering is appended only after the outermost result budget.
         if (typeof outwardResult === 'string') {
           const settledRead = settledReadSuccessAdvisory(ctx, parsedInput, outwardResult);
-          const repeated = repeatedCreationAdvisory(
-            ctx?.sessionId,
-            tool.name,
-            parsedInput,
-            classifyExternalWrite(tool.name, parsedInput).shapeKey,
-            invokeCallId,
-          );
-          const steer = steerBlockForToolBoundary(ctx?.sessionId);
-          if (settledRead || repeated || steer) return `${outwardResult}${settledRead}${repeated ?? ''}${steer}`;
+          const repeated = repeatedCreationAdvisory(ctx?.sessionId, tool.name, parsedInput,
+            classifyExternalWrite(tool.name, parsedInput).shapeKey, invokeCallId);
+          if (settledRead) settledResultAnnotations.push(settledRead);
+          if (repeated) settledResultAnnotations.push(repeated);
         }
         return outwardResult;
       }, (err) => {
@@ -4604,7 +4671,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             thrown: err,
             thrownPresent: true,
             signals: hostSignals,
-            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            mutating: settlementCallIsMutating(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null
               && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
           });
@@ -4621,7 +4688,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             callId: invokeCallId,
             ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
             args: logicalContractArgs,
-            mutating: isMutatingExternalWrite(tool.name, parsedInput),
+            mutating: settlementCallIsMutating(tool.name, parsedInput),
             businessCall: bracketOutcome?.discovery == null
               && actionTopologyRoleForRuntimeCall(tool.name, parsedInput) === 'business',
             thrown: err,
@@ -4707,15 +4774,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // (no recordPublish), so the verify-before-retry corrective's read-back is the
       // ONLY dup protection — there is no ledger backstop. (A true fix is
       // AbortController cancellation.)
+      const spillClip = (value: unknown, hostAnnotations: readonly string[] = []): unknown =>
+        typeof value === 'string' ? withToolOutputContext({
+          sessionId: ctx?.sessionId,
+          sourceUserSeq: ctx?.sourceUserSeq,
+          runScopeId: ctx ? guardrailScopeKey(ctx) : undefined,
+          callId: invokeCallId,
+          toolName: tool.name,
+          settlementNonce,
+        }, () => formatRecallableToolText(value, { hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
           const result = await invokePromise;
           // Preserve the fan-out nudge append on the success path so this block is
           // fully equivalent to the generic path below for non-timeout outcomes.
           if (fanoutNudge) {
-            return typeof result === 'string' ? `${result}\n\n${fanoutNudge}` : result;
+            return spillClip(result, [fanoutNudge]);
           }
-          return result;
+          return spillClip(result);
         } catch (err) {
           if (err instanceof ToolTimeout) {
             return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
@@ -4731,16 +4807,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // exact bytes parked with a locator, head/tail digest in context. A
       // tool that already ran formatRecallableToolText passes through
       // untouched (under-cap text is byte-identical by contract).
-      const spillClip = (value: unknown): unknown =>
-        typeof value === 'string' ? formatRecallableToolText(value) : value;
       if (fanoutNudge) {
         const result = await invokePromise;
-        return typeof result === 'string' ? `${spillClip(result)}\n\n${fanoutNudge}` : result;
+        return spillClip(result, [fanoutNudge]);
       }
-      return invokePromise.then(spillClip);
+      return invokePromise.then((value) => spillClip(value));
+      };
+      const deliverLegacySteering = (value: unknown): unknown => {
+        if (typeof value !== 'string' || ctx?.hostOwnsToolDeadlineAndSettlement || ctx?.nestedDispatch) return value;
+        return `${value}${steerBlockForToolBoundary(ctx?.sessionId)}`;
       };
       if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
-        return withLogicalToolCall(
+        return Promise.resolve(withLogicalToolCall(
           {
             sessionId: ctx.sessionId,
             sourceUserSeq: ctx.sourceUserSeq as number,
@@ -4749,9 +4827,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
             args: logicalContractArgs,
           },
           invokeBody,
-        );
+        )).then(deliverLegacySteering);
       }
-      return invokeBody();
+      return invokeBody().then(deliverLegacySteering);
     };
     const wrapped = { ...tool, invoke: wrappedInvoke } as T;
     copyToolLocalInputInvalidityAttestation(tool, wrapped);
@@ -4939,7 +5017,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: executeCallId,
           ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
           args: input,
-          mutating: isMutatingExternalWrite(tool.name, input),
+          mutating: settlementCallIsMutating(tool.name, input),
           businessCall: bracketOutcome?.discovery == null
             && actionTopologyRoleForRuntimeCall(tool.name, input) === 'business',
           thrown: err,
@@ -5019,7 +5097,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         callId: executeCallId,
         ...(ctx?.dispatchLease ? { dispatchLease: ctx.dispatchLease } : {}),
         args: input,
-        mutating: isMutatingExternalWrite(tool.name, input),
+        mutating: settlementCallIsMutating(tool.name, input),
         businessCall: bracketOutcome?.discovery == null
           && actionTopologyRoleForRuntimeCall(tool.name, input) === 'business',
         // Execute-path twin of the invoke seam above: durable evidence is the
@@ -5067,7 +5145,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // MID-RUN STEERING + already-created advisory (mirror of the invoke path):
     // both are appended AFTER settlement and credit consumed the clean value.
     const settledRead = settledReadSuccessAdvisory(ctx, input, outwardResult);
-    const steer = typeof outwardResult === 'string' ? steerBlockForToolBoundary(ctx?.sessionId) : '';
+    const steer = typeof outwardResult === 'string' && !ctx?.hostOwnsToolDeadlineAndSettlement && !ctx?.nestedDispatch
+      ? steerBlockForToolBoundary(ctx?.sessionId) : '';
     const repeatedCreate = typeof outwardResult === 'string'
       ? (repeatedCreationAdvisory(
           ctx?.sessionId,

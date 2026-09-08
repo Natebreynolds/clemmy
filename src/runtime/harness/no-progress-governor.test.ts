@@ -119,10 +119,22 @@ test('distinct host schema repair keys are stages, but an unchanged repair is st
   const repeated = observeNoProgress(second.state, {
     taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence: a,
   });
-  assert.equal(repeated.action, 'terminalize');
-  assert.equal(repeated.state.lastConsequence?.key, a.key, 'the stop names this failure, not the previous row');
+  assert.equal(repeated.action, 'continue', 'a proven zero-effect repair can spend the last existing retry');
+  assert.equal(repeated.reason, 'retry_available');
+  assert.equal(repeated.state.retriesRemaining, 0);
+  assert.equal(repeated.state.lastConsequence?.key, a.key, 'the continuation names this failure, not the previous row');
   assert.equal(repeated.state.noProgressAttempts, 1);
+  assert.equal(repeated.state.stageTransitionsRemaining, second.state.stageTransitionsRemaining,
+    'repeating a stage does not gain or consume a distinct-stage transition');
+  assert.deepEqual(repeated.state.seenConsequenceKeys, second.state.seenConsequenceKeys);
+  assert.deepEqual(repeated.gained, []);
   assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(repeated.state))), repeated.state);
+  const stopped = observeNoProgress(repeated.state, {
+    taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence: b,
+  });
+  assert.equal(stopped.action, 'terminalize', 'cycling to another seen stage cannot refill the spent retry');
+  assert.equal(stopped.state.retriesRemaining, 0);
+  assert.equal(stopped.state.stageTransitionsRemaining, repeated.state.stageTransitionsRemaining);
 });
 
 test('the lookup after the retry budget is spent terminalizes before another model call', () => {
@@ -485,8 +497,8 @@ test('host-validated schema to semantic admission is bounded acyclic progress', 
     third.state,
   );
   // Every further DISTINCT consequence is bounded progress until the budget is
-  // spent; the one after that terminalizes. (A repeated key terminalizes at
-  // once — pinned separately — so this bounds convergence, not loops.)
+  // spent; the one after that terminalizes. A repeated pre-dispatch model
+  // repair can only spend remaining retries, never refill these transitions.
   let cursor = third;
   let remaining = third.state.stageTransitionsRemaining;
   let ordinal = 0;
@@ -565,30 +577,78 @@ test('a typed repair consequence still reaches the model after one untyped looku
     'the exact same typed repair still stops without another model loop');
 });
 
-test('the same host consequence repeats once then stops without user-owned projection', () => {
+test('the same pre-dispatch model repair spends only existing retries and then stops', () => {
   const initial = initializeNoProgressGovernor({ taskKey: 'accepted:same-stage', authority: EMPTY });
   const consequence = createNoProgressConsequence({
-    stage: 'schema_invalid',
-    recovery: 'repair_model',
-    effectState: 'not_started',
+    stage: 'schema_invalid', recovery: 'repair_model', effectState: 'not_started',
     recoveryToolNames: ['work_call'],
   });
-  const first = observeNoProgress(initial, {
-    taskKey: initial.taskKey,
-    attemptClass: 'zero_crossing_repair',
-    authority: EMPTY,
-    consequence,
+  let state = initial;
+  for (let attempt = 1; attempt <= NO_PROGRESS_RETRY_BUDGET; attempt++) {
+    const decision = observeNoProgress(state, {
+      taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence,
+    });
+    assert.equal(decision.action, 'continue', `existing retry ${attempt} reaches the model`);
+    assert.equal(decision.reason, 'retry_available');
+    assert.equal(decision.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - attempt);
+    assert.equal(decision.state.noProgressAttempts, attempt - 1,
+      'only the first new repair stage is progress; repeated attempts accumulate');
+    assert.equal(decision.state.observations, attempt);
+    assert.equal(decision.state.stageTransitionsRemaining, NO_PROGRESS_STAGE_TRANSITION_BUDGET);
+    assert.deepEqual(decision.state.seenConsequenceKeys, [consequence.key]);
+    assert.deepEqual(decision.state.authority, EMPTY);
+    assert.deepEqual(decision.gained, [], 'another model opportunity does not confer authority');
+    const restored = parseNoProgressGovernorState(JSON.parse(JSON.stringify(decision.state)));
+    assert.deepEqual(restored, decision.state, 'serialization preserves spent budget');
+    assert.ok(restored);
+    state = restored;
+  }
+  const stopped = observeNoProgress(state, {
+    taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence,
   });
-  const second = observeNoProgress(first.state, {
-    taskKey: initial.taskKey,
-    attemptClass: 'zero_crossing_repair',
-    authority: EMPTY,
-    consequence,
-  });
-  assert.equal(second.action, 'terminalize');
-  assert.equal(second.reason, 'control_no_progress_exhausted');
-  assert.equal(second.publicResumable, true);
-  assert.equal(second.requiredProjection, 'factual_internal_failure');
+  assert.equal(stopped.action, 'terminalize');
+  assert.equal(stopped.reason, 'control_no_progress_exhausted');
+  assert.equal(stopped.state.retriesRemaining, 0);
+  assert.equal(stopped.state.stageTransitionsRemaining, state.stageTransitionsRemaining);
+  if (stopped.action !== 'terminalize') throw new Error('expected bounded terminal');
+  assert.equal(stopped.publicResumable, true);
+  assert.equal(stopped.requiredProjection, 'factual_internal_failure');
+});
+
+test('the repeated-repair exception excludes provider effects and every other recovery owner', () => {
+  const cases = [
+    { name: 'provider rejected before effect', attemptClass: 'provider_repair', recovery: 'repair_model', effectState: 'not_started' },
+    { name: 'provider known terminal', attemptClass: 'provider_repair', recovery: 'repair_model', effectState: 'known_terminal' },
+    { name: 'zero-crossing label with known terminal effect', attemptClass: 'zero_crossing_repair', recovery: 'repair_model', effectState: 'known_terminal' },
+    { name: 'plan admission', attemptClass: 'plan_admission', recovery: 'repair_model', effectState: 'not_started' },
+    { name: 'host recovery', attemptClass: 'zero_crossing_repair', recovery: 'retry_host', effectState: 'not_started' },
+    { name: 'factual stop', attemptClass: 'zero_crossing_repair', recovery: 'stop_factual', effectState: 'not_started' },
+    { name: 'exact user question', attemptClass: 'zero_crossing_repair', recovery: 'ask_user', effectState: 'not_started' },
+  ] as const;
+  for (const control of cases) {
+    const initial = initializeNoProgressGovernor({ taskKey: `accepted:excluded:${control.name}`, authority: EMPTY });
+    const consequence = createNoProgressConsequence({ stage: 'fixed_stage', recovery: control.recovery,
+      effectState: control.effectState,
+      ...(control.recovery === 'ask_user'
+        ? { userInput: { question: 'Which sheet?', choices: [], purpose: 'clarification' as const } } : {}) });
+    const first = observeNoProgress(initial, { taskKey: initial.taskKey, authority: EMPTY,
+      attemptClass: control.attemptClass, consequence });
+    assert.ok(first.state.retriesRemaining > 0, `${control.name}: control has unused retries`);
+    const repeated = observeNoProgress(first.state, { taskKey: initial.taskKey, authority: EMPTY,
+      attemptClass: control.attemptClass, consequence });
+    assert.equal(repeated.action, 'terminalize', `${control.name}: an unrelated cycle receives no extra repair`);
+    assert.equal(repeated.state.retriesRemaining, 0);
+  }
+  const initial = initializeNoProgressGovernor({ taskKey: 'accepted:uncertain-stays-reconciliation', authority: EMPTY });
+  const consequence = createNoProgressConsequence({ stage: 'uncertain_effect', recovery: 'reconcile', effectState: 'unknown' });
+  const first = observeNoProgress(initial, { taskKey: initial.taskKey, authority: EMPTY,
+    attemptClass: 'zero_crossing_repair', consequence });
+  const repeated = observeNoProgress(first.state, { taskKey: initial.taskKey, authority: EMPTY,
+    attemptClass: 'zero_crossing_repair', consequence });
+  assert.equal(first.action, 'reconcile');
+  assert.equal(repeated.action, 'reconcile');
+  assert.equal(repeated.state.retriesRemaining, initial.retriesRemaining,
+    'uncertain effects do not spend model-repair budget or gain repair authority');
 });
 
 test('an A to B to A repair cycle stops even while distinct stages remain available', () => {

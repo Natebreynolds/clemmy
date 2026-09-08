@@ -4,7 +4,7 @@ import {
   Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
   type LucideIcon,
 } from 'lucide-react';
-import type { HomePreferences } from './home-prefs';
+import { primaryChatNavigation, type HomePreferences } from './home-prefs';
 
 export interface NavDest {
   path: string;
@@ -21,13 +21,13 @@ export interface NavDest {
  * /inbox is now "Needs you", /tasks is "Running", /workspaces is "Projects".
  */
 export const PRIMARY_NAV: NavDest[] = [
+  { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/home', label: 'Home', icon: Home, hint: "What needs you, what's running, what got done" },
   { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
   { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now' },
-  { path: '/workspaces', label: 'Projects', icon: LayoutDashboard, hint: 'Live surfaces Clementine built for you' },
+  { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
-  { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
   { path: '/meetings', label: 'Meetings', icon: Video, hint: 'Recorded meetings & summaries' },
   { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
@@ -107,9 +107,10 @@ export function resolveSidebarNav(
     return out;
   };
 
-  const pinned = resolve(prefs.nav?.pinned);
-  const shown = resolve(prefs.nav?.shown);
-  const more = resolve(prefs.nav?.more);
+  const primary = primaryChatNavigation(prefs.nav);
+  const pinned = resolve(primary.pinned);
+  const shown = resolve(primary.shown);
+  const more = resolve(primary.more);
   for (const d of PRIMARY_NAV) {
     if (!placed.has(d.path)) {
       placed.add(d.path);

@@ -19,6 +19,7 @@
  * CLEMMY_GOAL_CONTRACT=off).
  */
 import pino from 'pino';
+import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { getRuntimeEnv } from '../config.js';
 import {
   listActiveGoalContracts,
@@ -304,7 +305,7 @@ export async function processGoalResumptions(): Promise<void> {
             await runConversation({
               sessionId: goal.sessionId!,
               input: directive,
-              judgeCompletion: true,
+              judgeCompletion: completionReviewEnabled(),
               buildAgent: (identity) => buildOrchestratorAgent({
                 userInput: directive,
                 sessionId: identity.sessionId,

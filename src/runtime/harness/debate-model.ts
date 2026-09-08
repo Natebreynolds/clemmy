@@ -29,7 +29,8 @@ import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateChecker
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
-import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from './byo-providers.js';
+import { captureByoRoutingSnapshot, resolveByoProviderForModel, resolveByoProviderForModelFromSnapshot, resolveEffectiveProviderForModel } from './byo-providers.js';
+import type { ByoBackendConfig } from '../../config.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
@@ -48,6 +49,8 @@ import {
   chooseBoundaryJudgeFamily,
   boundaryClaudeJudgeModel,
   boundaryCodexJudgeModel,
+  boundaryJudgeTimeoutMs,
+  exactJudgeBoundaryTimeoutMs,
 } from './judge-family.js';
 // Re-exported from the judge-family leaf (moved out of this file) so existing
 // importers of debate-model keep working: console-routes (debateBrainsAvailable),
@@ -856,24 +859,114 @@ function logDebateAvailabilityTransition(active: boolean): void {
  * drafters plus their judge. Returns null when the selected topology is not
  * available, leaving the normal provider byte-identical.
  */
+/** The existing boundary judge's accepted-source routing choice. Live auth is
+ * rechecked at invocation, but settings changes cannot choose a different judge. */
+export type CapturedBoundaryJudgeSelection = {
+  status: 'captured';
+  role: ResolvedRoleModel;
+  crossFamily: boolean;
+  defaultModels: { claude: string; codex: string };
+  byoProvider?: { id: string; baseURL: string; ownership: 'declared' | 'single_provider' };
+} | { status: 'unavailable'; reason: string };
+
+type AvailableBoundaryJudgeSelection = Extract<CapturedBoundaryJudgeSelection, { status: 'captured' }>;
+
+export function captureBoundaryJudgeSelection(): CapturedBoundaryJudgeSelection {
+  try {
+    // Resolve/downshift once, including the actual requested inactive binding.
+    // The resolver must never replace an unavailable owner pin with its default.
+    const role = downshiftForBoundary(resolveRoleModel('judge'));
+    let byoProvider: AvailableBoundaryJudgeSelection['byoProvider'];
+    if (role.provider === 'byo' && !role.inactiveBinding) {
+      const snapshot = captureByoRoutingSnapshot();
+      const backend = resolveByoProviderForModelFromSnapshot(role.modelId, snapshot);
+      const owners = snapshot.providers.filter((row) => row.backend === backend);
+      if (owners.length !== 1) return { status: 'unavailable', reason: 'The selected BYO judge has no unique provider identity.' };
+      const owner = owners[0]!;
+      byoProvider = { id: owner.provider.id, baseURL: owner.provider.baseURL,
+        ownership: owner.provider.modelIds.includes(role.modelId) ? 'declared' : 'single_provider' };
+    }
+    return { status: 'captured', role: {
+      modelId: role.modelId, provider: role.provider, source: role.source,
+      ...(role.inactiveBinding ? { inactiveBinding: { ...role.inactiveBinding } } : {}),
+      ...(role.matchedIntent ? { matchedIntent: role.matchedIntent } : {}),
+      ...(role.exactHeavyweightPin ? { exactHeavyweightPin: true } : {}),
+    }, crossFamily: judgeCrossFamilyEnabled(), defaultModels: {
+      claude: boundaryClaudeJudgeModel(), codex: boundaryCodexJudgeModel(),
+    }, ...(byoProvider ? { byoProvider } : {}) };
+  } catch {
+    return { status: 'unavailable', reason: 'The completion judge selection could not be captured.' };
+  }
+}
+
+/** Validate durable routing identity before allowing it to select an adapter. */
+export function isCapturedBoundaryJudgeSelection(value: unknown): value is CapturedBoundaryJudgeSelection {
+  if (!value || typeof value !== 'object') return false;
+  const data = value as Record<string, unknown>;
+  const nonempty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+  const provider = (v: unknown): boolean => v === 'claude' || v === 'codex' || v === 'byo';
+  const explicitSource = (v: unknown): boolean => v === 'settings' || v === 'chat-rule' || v === 'session';
+  if (data.status === 'unavailable') return nonempty(data.reason);
+  if (data.status !== 'captured' || typeof data.crossFamily !== 'boolean') return false;
+  if (!data.role || typeof data.role !== 'object' || !data.defaultModels || typeof data.defaultModels !== 'object') return false;
+  const role = data.role as Record<string, unknown>;
+  const defaults = data.defaultModels as Record<string, unknown>;
+  if (!nonempty(role.modelId) || !provider(role.provider)
+    || !(explicitSource(role.source) || role.source === 'default' || role.source === 'policy')
+    || !nonempty(defaults.claude) || !nonempty(defaults.codex)) return false;
+  if (role.matchedIntent !== undefined && !nonempty(role.matchedIntent)) return false;
+  if (role.exactHeavyweightPin !== undefined && typeof role.exactHeavyweightPin !== 'boolean') return false;
+  if (role.inactiveBinding !== undefined) {
+    if (!role.inactiveBinding || typeof role.inactiveBinding !== 'object') return false;
+    const inactive = role.inactiveBinding as Record<string, unknown>;
+    if (!nonempty(inactive.modelId) || !provider(inactive.provider)
+      || !explicitSource(inactive.source) || !nonempty(inactive.reason)) return false;
+  }
+  if (data.byoProvider !== undefined) {
+    if (!data.byoProvider || typeof data.byoProvider !== 'object' || role.provider !== 'byo') return false;
+    const byo = data.byoProvider as Record<string, unknown>;
+    if (!nonempty(byo.id) || !nonempty(byo.baseURL)
+      || (byo.ownership !== 'declared' && byo.ownership !== 'single_provider')) return false;
+  }
+  return role.provider !== 'byo' || Boolean(role.inactiveBinding) || data.byoProvider !== undefined;
+}
+
+/** Re-open credentials for exactly the captured registry owner. Never resolve
+ * by model name or fall back to whichever backend is now the sole provider. */
+function capturedByoBackend(selection: AvailableBoundaryJudgeSelection): ByoBackendConfig {
+  const identity = selection.byoProvider;
+  if (!identity) throw new Error('The captured BYO judge provider identity is unavailable.');
+  const rows = captureByoRoutingSnapshot().providers.filter((row) => row.provider.id === identity.id);
+  if (rows.length !== 1) throw new Error('The captured BYO judge provider is missing or ambiguous.');
+  const row = rows[0]!;
+  if (row.provider.baseURL !== identity.baseURL
+    || (identity.ownership === 'declared' && !row.provider.modelIds.includes(selection.role.modelId))) {
+    throw new Error('The captured BYO judge provider identity or model ownership has changed.');
+  }
+  if (!row.backend.configured) throw new Error('The captured BYO judge provider is unavailable.');
+  return { ...row.backend };
+}
+
 /**
  * Build the judge Model for the resolved 'judge' role, or null when that
  * provider isn't available. Shared by the debate and verify paths. Routes a BYO
  * judge to the provider that OWNS its model id (its own key+endpoint) — so a
  * MiniMax judge hits MiniMax, not whatever single backend is configured.
  */
-function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, haveCodex: boolean): Model | null {
+function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, haveCodex: boolean,
+  captured?: AvailableBoundaryJudgeSelection): Model | null {
   let model: Model | null;
   if (checker.provider === 'codex') {
     model = haveCodex ? new CodexModelProvider().getModel(checker.modelId) : null;
   } else if (checker.provider === 'byo') {
-    const byo = resolveByoProviderForModel(checker.modelId) ?? getByoBackendConfig();
+    const byo = captured ? capturedByoBackend(captured)
+      : resolveByoProviderForModel(checker.modelId) ?? getByoBackendConfig();
     model = byo.configured ? getByoModel(checker.modelId, byo) : null;
   } else {
     // claude
     if (!haveClaude) return null;
-    model = checker.modelId && checker.modelId !== getClaudeBrainModel()
-      ? new ClaudeModelProvider().getModel(checker.modelId)
+    model = captured || (checker.modelId && checker.modelId !== getClaudeBrainModel())
+      ? new ClaudeModelProvider().getModel(checker.modelId, captured ? { allowOverloadFallback: false } : undefined)
       : new ClaudeModelProvider().getModel();
   }
   if (!model) return null;
@@ -944,7 +1037,30 @@ export interface BoundaryJudgeRouting {
   /** The judge model id actually used (telemetry). */
   modelId: string;
   judgeFamily: ModelProviderClass;
+  /** Stable BYO registry owner, when a captured selection chose this route. */
+  judgeProviderId?: string;
   brainFamily: ModelProviderClass;
+  /** True when downshiftForBoundary honoured an EXPLICIT heavyweight pin rather
+   *  than substituting the cheap boundary model. Callers MUST use
+   *  `timeoutMs` below instead of the short boundary default, or the pin
+   *  becomes an all-timeout fail-open (the 2026-07-07 shape). */
+  exactHeavyweightPin?: boolean;
+  /** Deadline the caller should apply for this routing. */
+  timeoutMs?: number;
+  /** Set on any lane STANDING IN for an exact judge pin the owner requested.
+   *  A verdict carrying this flag came from a cheaper substitute, not from the
+   *  model the owner selected, and must never be reported as qualification of
+   *  that pinned model. Marked whenever the pin was REQUESTED — including when
+   *  exact resolution failed outright and the very first lane is already a
+   *  stand-in. */
+  substituteForExactPin?: boolean;
+  /** The judge model the owner actually asked for, when a substitute is in use.
+   *  Carried into durable terminal results so requested-vs-actual stays
+   *  auditable after the fact, not only at routing time. */
+  requestedModelId?: string;
+  /** Why a substitute is standing in: the exact pin never resolved, or it led
+   *  the chain and this is a later fallback lane. */
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin';
   /** Concrete provider adapter used for the call. A non-null model plus this
    * field prevents a model-id string from being resolved through a different
    * globally registered provider. */
@@ -952,6 +1068,13 @@ export interface BoundaryJudgeRouting {
   /** true ⇒ no different family was available, so the judge shares the brain's
    *  family (the correlated-error case — now OBSERVABLE, never silent). */
   selfJudge: boolean;
+  /** true ⇒ this judge came from an EXPLICIT owner binding (settings/chat-rule/
+   *  session), not a default or learned policy. Orthogonal to `selfJudge`: an
+   *  owner-selected judge may legitimately share the brain's family, and the
+   *  owner policy says such a configured path must not be rejected merely
+   *  because legacy metadata calls it selfJudge. Never derived from
+   *  substituteForExactPin — a stand-in is precisely NOT the owner's choice. */
+  ownerSelectedJudge?: boolean;
 }
 
 function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['transport'] {
@@ -964,22 +1087,26 @@ function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['
  * model. Returning only a string lets the Agents SDK resolve that string via
  * the process-global provider, which can silently put a Claude/BYO judge on the
  * Codex wire (or vice versa). */
-function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel): BoundaryJudgeRouting {
+function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel, captured?: AvailableBoundaryJudgeSelection): BoundaryJudgeRouting {
   let checker: ResolvedRoleModel;
   if (brain.provider === 'codex') {
-    checker = { modelId: boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
+    checker = { modelId: captured?.defaultModels.codex ?? boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
   } else if (brain.provider === 'claude') {
-    checker = { modelId: boundaryClaudeJudgeModel(), provider: 'claude', source: 'default' };
+    checker = { modelId: captured?.defaultModels.claude ?? boundaryClaudeJudgeModel(), provider: 'claude', source: 'default' };
   } else {
-    const configured = downshiftForBoundary(resolveRoleModel('judge'));
+    const configured = captured?.role ?? downshiftForBoundary(resolveRoleModel('judge'));
+    if (captured && configured.provider !== 'byo') {
+      throw new Error('No captured BYO completion judge route is available for a same-family fallback.');
+    }
     checker = configured.provider === 'byo'
       ? configured
       : { modelId: brain.modelId, provider: 'byo', source: 'default' };
   }
   const model = buildJudgeForRole(
     checker,
-    checker.provider === 'claude' || claudeAvailable(),
-    checker.provider === 'codex' || codexAvailable(),
+    captured ? claudeAvailable() : checker.provider === 'claude' || claudeAvailable(),
+    captured ? codexAvailable() : checker.provider === 'codex' || codexAvailable(),
+    captured,
   );
   if (!model) {
     throw new Error(`Boundary judge could not build a ${checker.provider} model for ${checker.modelId}.`);
@@ -990,7 +1117,8 @@ function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel): BoundaryJudge
     judgeFamily: checker.provider,
     brainFamily: brain.provider,
     transport: boundaryTransport(checker.provider),
-    selfJudge: true,
+    selfJudge: captured ? sameJudgeFamily(checker, brain, captured) : true,
+    ...(captured?.byoProvider && checker.provider === 'byo' ? { judgeProviderId: captured.byoProvider.id } : {}),
   };
 }
 
@@ -1009,8 +1137,20 @@ export function downshiftForBoundary(checker: ResolvedRoleModel): ResolvedRoleMo
     (checker.provider === 'claude' && /opus/.test(id))
     || (checker.provider === 'codex' && /^gpt-\d+(\.\d+)?$/.test(id)); // flagship gpt-N(.M); -mini/-nano/-fast suffixed ids pass through
   if (!heavy) return checker;
-  const fast = checker.provider === 'claude' ? boundaryClaudeJudgeModel() : boundaryCodexJudgeModel();
-  return { ...checker, modelId: fast };
+  // An EXPLICIT owner pin is not the same act as a default landing on a
+  // flagship. The 2026-07-07 incident above was a role binding riding every
+  // hot-path call under the SHORT boundary deadline; the answer is an adequate
+  // deadline for a deliberately chosen judge, not silently serving a different
+  // model than the owner selected. `source` distinguishes the two: 'default'
+  // still downshifts, an owner-set binding is honoured exactly and pays the
+  // extended deadline (exactJudgeBoundaryTimeoutMs). A substituted model cannot
+  // satisfy an exact-model requirement, and a silent substitution is the worst
+  // outcome — the owner believes a flagship judged when it did not.
+  if (checker.source === 'default') {
+    const fast = checker.provider === 'claude' ? boundaryClaudeJudgeModel() : boundaryCodexJudgeModel();
+    return { ...checker, modelId: fast };
+  }
+  return { ...checker, exactHeavyweightPin: true };
 }
 
 /**
@@ -1033,15 +1173,22 @@ export function downshiftForBoundary(checker: ResolvedRoleModel): ResolvedRoleMo
  * TRUE (same family) — the conservative direction, because self-judge grants
  * FEWER hard bounces, never more.
  */
-function sameJudgeFamily(checker: ResolvedRoleModel, brain: ResolvedRoleModel): boolean {
+function sameJudgeFamily(checker: ResolvedRoleModel, brain: ResolvedRoleModel, captured?: AvailableBoundaryJudgeSelection): boolean {
   if (checker.provider !== brain.provider) return false;
   if (checker.provider !== 'byo') return true;
   const backendFor = (modelId: string): string => {
     const resolved = resolveByoProviderForModel(modelId) ?? getByoBackendConfig();
     return (resolved.baseURL || '').trim().toLowerCase();
   };
-  const judgeBackend = backendFor(checker.modelId);
-  const brainBackend = backendFor(brain.modelId);
+  const judgeBackend = captured
+    ? capturedByoBackend(captured).baseURL.trim().toLowerCase()
+    : backendFor(checker.modelId);
+  let brainBackend: string;
+  try { brainBackend = backendFor(brain.modelId); } catch (error) {
+    // Unknown brain endpoint cannot establish independent-family review.
+    if (captured) return true;
+    throw error;
+  }
   if (!judgeBackend || !brainBackend) return true;
   return judgeBackend === brainBackend;
 }
@@ -1085,36 +1232,81 @@ export function executedBrainFamily(configured: ModelProviderClass): ModelProvid
   return configured;
 }
 
-export function resolveBoundaryJudge(): BoundaryJudgeRouting {
+/**
+ * The judge model the OWNER asked for, or null when nothing was pinned.
+ *
+ * An unavailable pin resolves with source 'default' and keeps the real request
+ * in `inactiveBinding`, so reading only the resolved source hides the request in
+ * exactly the case where a stand-in runs. Shared by the single-lane resolver and
+ * the chain so both mark substitutes the same way — the chain used to be the
+ * only one that did, and the objective judge (which calls the single-lane
+ * resolver) therefore recorded no substitute information at all.
+ */
+export function requestedJudgePinModelId(captured?: AvailableBoundaryJudgeSelection): string | null {
+  try {
+    const requested = captured?.role ?? resolveRoleModel('judge');
+    if (hasExplicitJudgeBinding(requested) && requested.modelId) return requested.modelId;
+    // (`inactiveBinding.source` is explicit-only by construction.)
+    return requested.inactiveBinding?.modelId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Mark `routing` as a stand-in when it is not the model the owner requested. */
+function markIfSubstitute(routing: BoundaryJudgeRouting, captured?: AvailableBoundaryJudgeSelection): BoundaryJudgeRouting {
+  const requested = requestedJudgePinModelId(captured);
+  if (!requested || routing.modelId === requested) return routing;
+  return {
+    ...routing,
+    substituteForExactPin: true,
+    requestedModelId: requested,
+    substituteReason: 'exact_pin_unresolved',
+  };
+}
+
+export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection): BoundaryJudgeRouting {
+  if (selection?.status === 'unavailable') throw new Error(selection.reason);
+  const captured = selection?.status === 'captured' ? selection : undefined;
   const configuredBrain = resolveRoleModel('brain');
   const brainFamily = executedBrainFamily(configuredBrain.provider);
   const brain = { ...configuredBrain, provider: brainFamily };
-  if (!judgeCrossFamilyEnabled()) {
-    return resolveSameFamilyBoundaryJudge(brain);
-  }
-  const haveClaude = claudeAvailable();
-  const haveCodex = codexAvailable();
-  const checker = downshiftForBoundary(resolveRoleModel('judge'));
+  const crossFamily = captured?.crossFamily ?? judgeCrossFamilyEnabled();
+  const checker = captured?.role ?? downshiftForBoundary(resolveRoleModel('judge'));
   if (checker.inactiveBinding) {
     throw new Error(`Configured boundary judge ${checker.inactiveBinding.modelId} is unavailable: ${checker.inactiveBinding.reason}`);
   }
-  const model = buildJudgeForRole(checker, haveClaude, haveCodex);
+  // OFF changes the preference, never an explicit owner model/provider pin.
+  // Missing credentials for that pin are unavailable in either switch position.
+  if (!crossFamily && !hasExplicitJudgeBinding(checker)) {
+    return resolveSameFamilyBoundaryJudge(brain, captured);
+  }
+  const model = buildJudgeForRole(checker, claudeAvailable(), codexAvailable(), captured);
   if (model) {
     return {
       model,
       modelId: checker.modelId,
       judgeFamily: checker.provider,
+      ...(captured?.byoProvider ? { judgeProviderId: captured.byoProvider.id } : {}),
       brainFamily,
       transport: boundaryTransport(checker.provider),
-      selfJudge: sameJudgeFamily(checker, brain),
+      ...(checker.exactHeavyweightPin ? { exactHeavyweightPin: true } : {}),
+      ...(hasExplicitJudgeBinding(checker) ? { ownerSelectedJudge: true } : {}),
+      // The deliberate-review allowance belongs to the owner's selection,
+      // independent of provider or our optional heavyweight classification.
+      // Live Grok4.6 returned a valid verdict just after the cheap-checker
+      // deadline despite being explicitly selected. Keep the default checker
+      // deadline for unselected routes and honour explicit deadline overrides.
+      timeoutMs: hasExplicitJudgeBinding(checker)
+        ? exactJudgeBoundaryTimeoutMs()
+        : boundaryJudgeTimeoutMs(),
+      selfJudge: sameJudgeFamily(checker, brain, captured),
     };
   }
   if (hasExplicitJudgeBinding(checker)) {
     throw new Error(`Configured boundary judge ${checker.modelId} is unavailable.`);
   }
-  // Fail-open: no usable cross-family judge -> a concrete cheap model on the
-  // brain's own provider wire, tagged as self-judge.
-  return resolveSameFamilyBoundaryJudge(brain);
+  return markIfSubstitute(resolveSameFamilyBoundaryJudge(brain, captured), captured);
 }
 
 /**
@@ -1148,6 +1340,47 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
 
   if (!judgeChainEnabled()) return chain; // kill-switch: single lane only
 
+  // A lane standing in for the owner's chosen judge must be marked SO THAT a
+  // substitute or fail-open verdict is never reported as qualification of that
+  // pinned model.
+  //
+  // Key off what the owner REQUESTED, not off what resolution happened to
+  // produce. Keying off `chain[0].exactHeavyweightPin` left the marking absent
+  // in precisely the case it exists for: when exact resolution fails outright
+  // (provider unavailable, build error, or the push above threw), chain[0] is
+  // ALREADY a stand-in, no lane carries the pin flag, and every fallback went
+  // out unmarked.
+  const requestedJudgeModelId = requestedJudgePinModelId();
+  // Whether the leading lane HONOURS the request is a question of model
+  // identity, not of weight class. `exactHeavyweightPin` is stamped only for
+  // flagship ids — downshiftForBoundary returns early for anything else — so
+  // keying off it labelled a perfectly healthy explicit LIGHT pin (a
+  // deliberately chosen haiku/mini judge) as `exact_pin_unresolved` while that
+  // very model was running.
+  const leadHonoursRequest = Boolean(
+    requestedJudgeModelId && chain[0]?.modelId === requestedJudgeModelId,
+  );
+  // A lane is a substitute only when it is NOT the model the owner asked for.
+  // Applying the mark by position meant a fallback lane that happened to BE the
+  // pinned model (the cheap flagship id can equal an explicit light pin) was
+  // reported as standing in for itself.
+  const markFor = (modelId: string): Partial<BoundaryJudgeRouting> => (
+    requestedJudgeModelId && modelId !== requestedJudgeModelId
+      ? {
+          substituteForExactPin: true,
+          requestedModelId: requestedJudgeModelId,
+          substituteReason: leadHonoursRequest
+            ? 'chain_fallback_after_exact_pin'
+            : 'exact_pin_unresolved',
+        }
+      : {}
+  );
+  // The pin was requested but the leading lane is not the model asked for, so
+  // that lane is itself a stand-in and must say so.
+  if (requestedJudgeModelId && !leadHonoursRequest && chain[0]) {
+    chain[0] = { ...chain[0], ...markFor(chain[0].modelId) };
+  }
+
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
   const brainFamily = chain[0]?.brainFamily ?? executedBrainFamily(resolveRoleModel('brain').provider);
@@ -1166,6 +1399,7 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
       model,
       modelId: f.modelId,
       judgeFamily: f.provider,
+      ...markFor(f.modelId),
       brainFamily,
       transport: boundaryTransport(f.provider),
       selfJudge: f.provider === brainFamily,
@@ -1176,7 +1410,15 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
   //    verdict). Deduped, so this is a no-op when member 1 already covers it.
   if (chain.length < 3) {
     // The executing family, as member 1 sees it — never the configured plan.
-    try { push(resolveSameFamilyBoundaryJudge({ ...resolveRoleModel('brain'), provider: brainFamily })); } catch { /* skip */ }
+    // This lane stands in for a requested pin exactly as the flagship lanes do:
+    // a same-family self-judge reported as the owner's chosen judge would be the
+    // worst version of the substitute problem, not an exception to it.
+    try {
+      const lastResort = resolveSameFamilyBoundaryJudge({
+        ...resolveRoleModel('brain'), provider: brainFamily,
+      });
+      push({ ...lastResort, ...markFor(lastResort.modelId) });
+    } catch { /* skip */ }
   }
 
   return chain.slice(0, 3);
@@ -1184,22 +1426,24 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
 
 /** Hedge only an unpinned checker, with a family distinct from BOTH the primary
  * and the brain. Otherwise the existing single attempt/deadline applies. */
-export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting): BoundaryJudgeRouting | null {
-  if (!judgeCrossFamilyEnabled()) return null;
+export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting, selection?: CapturedBoundaryJudgeSelection): BoundaryJudgeRouting | null {
+  if (selection?.status === 'unavailable') return null;
+  const captured = selection?.status === 'captured' ? selection : undefined;
+  if (!(captured?.crossFamily ?? judgeCrossFamilyEnabled())) return null;
   // A configured checker is a selection, not just a head start in a race.
   // Its outage/timeout stays unjudged at the existing caller boundary. A
   // faster alternate must not silently replace the selected judge's verdict.
-  const checker = resolveRoleModel('judge');
+  const checker = captured?.role ?? resolveRoleModel('judge');
   if (checker.inactiveBinding || hasExplicitJudgeBinding(checker)) return null;
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
   const candidates: Array<{ provider: 'claude' | 'codex'; modelId: string; available: boolean }> = [
-    { provider: 'claude', modelId: boundaryClaudeJudgeModel(), available: haveClaude },
-    { provider: 'codex', modelId: boundaryCodexJudgeModel(), available: haveCodex },
+    { provider: 'claude', modelId: captured?.defaultModels.claude ?? boundaryClaudeJudgeModel(), available: haveClaude },
+    { provider: 'codex', modelId: captured?.defaultModels.codex ?? boundaryCodexJudgeModel(), available: haveCodex },
   ];
   for (const c of candidates) {
     if (!c.available || c.provider === primary.judgeFamily || c.provider === primary.brainFamily) continue;
-    const model = buildJudgeForRole({ modelId: c.modelId, provider: c.provider, source: 'default' }, haveClaude, haveCodex);
+    const model = buildJudgeForRole({ modelId: c.modelId, provider: c.provider, source: 'default' }, haveClaude, haveCodex, captured);
     if (!model) continue;
     return {
       model,

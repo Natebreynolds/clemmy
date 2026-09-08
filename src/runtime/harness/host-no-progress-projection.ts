@@ -20,6 +20,7 @@ import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import { stableJsonDigest } from '../../shared/stable-json-digest.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 
 /**
  * Exact, same-source projection for the pure no-progress reducer.
@@ -272,6 +273,7 @@ function exactSchemaRefreshAuthorityTokens(
 
 function eventCapabilityTokens(
   events: readonly EventRow[],
+  exposedAt: ReadonlyMap<string, number>,
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
   exactSchemaRefreshAuthorityTokens(events, tokens);
@@ -289,9 +291,18 @@ function eventCapabilityTokens(
     }
 
     if (event.type === 'capability_discovered') {
-      const capabilities = Array.isArray(event.data.capabilities)
+      if (event.role !== 'system') continue;
+      const prepared = Array.isArray(event.data.capabilities)
         ? event.data.capabilities
         : [];
+      // Preparation can happen for off-page candidates, or before publication
+      // fails. Credit only exact refs later returned in a successful local
+      // discovery result for this accepted source. This proves exposure, not
+      // semantic relevance to the user's request.
+      const capabilities = prepared.filter((candidate) => {
+        const capabilityRef = nonEmptyString(record(candidate)?.capabilityRef);
+        return capabilityRef !== null && (exposedAt.get(capabilityRef) ?? 0) >= event.seq;
+      });
       const citable = capabilities.some((candidate) => (
         nonEmptyString(record(candidate)?.capabilityRef) !== null
       ));
@@ -396,7 +407,8 @@ function eventCapabilityTokens(
  * One accepted task may need a small sequence of pre-plan capability
  * discoveries (for example create -> update -> readback).  Catalog breadth is
  * not progress: only the FIRST host-ranked, citable capability in a settled
- * role-bound tool_search result can name a stage.  The stage identity is the
+ * tool_search result can name a stage. Legacy sources retain their role-bound
+ * checkpoint tokens. For new sources the stage identity is the
  * exact host-issued capability ref plus its structural effect; query text,
  * result prose, call ids, schema churn, and lower-ranked siblings are absent.
  *
@@ -416,25 +428,108 @@ const DISCOVERY_STAGE_EFFECTS = new Set([
   'read',
 ]);
 
+interface SettledDiscoveryPage {
+  category: 'broad_discovery' | 'exact_schema_refresh';
+  subject: string | null;
+  settledAt: number;
+  payload: UnknownRow;
+}
+
+function publicCapabilityRefs(value: unknown): string[] {
+  const candidate = record(value);
+  // A ref may remain in a row whose account or publication is unavailable.
+  // Such a row describes a repair prerequisite, not an executable capability.
+  if (!candidate || candidate.planningRefStatus !== undefined) return [];
+  const direct = nonEmptyString(candidate.capabilityRef);
+  const variants = Array.isArray(candidate.capabilityVariants)
+    ? candidate.capabilityVariants.flatMap((value) => {
+      const variant = record(value);
+      const ref = variant?.planningRefStatus === undefined
+        ? nonEmptyString(variant?.capabilityRef) : null;
+      return ref ? [ref] : [];
+    }) : [];
+  return [...new Set([...(direct ? [direct] : []), ...variants])];
+}
+
+/** Reopen only settled public pages; hidden discovery/provisioning events are
+ * not model exposure. The existing bounded result parser is shared with the
+ * role-stage projection so those two paths cannot disagree on blocked rows. */
+function settledDiscoveryPages(
+  db: Database.Database,
+  identity: HostNoProgressIdentity,
+  events: readonly EventRow[],
+): SettledDiscoveryPage[] {
+  const outcomes = new Map<string, EventRow>();
+  for (const event of events) {
+    if (event.role !== 'system' || event.type !== 'discovery_governor_outcome') continue;
+    const callId = nonEmptyString(event.data.callId);
+    if (callId) outcomes.set(callId, event);
+  }
+  const decisions = events.flatMap((event): Array<{
+    callId: string;
+    category: SettledDiscoveryPage['category'];
+    subject: string | null;
+    settledAt: number;
+  }> => {
+    if (event.role !== 'system' || event.type !== 'discovery_governor_decision') return [];
+    const callId = nonEmptyString(event.data.callId);
+    const outcome = callId ? outcomes.get(callId) : undefined;
+    const category = event.data.category;
+    return callId
+      && (category === 'broad_discovery' || category === 'exact_schema_refresh')
+      && event.data.decision === 'admitted'
+      && outcome?.data.outcome === 'succeeded'
+      && outcome.data.category === category
+      && outcome.seq > event.seq
+      ? [{ callId, category, subject: nonEmptyString(event.data.subject), settledAt: outcome.seq }]
+      : [];
+  });
+  if (decisions.length === 0) return [];
+  const callIds = [...new Set(decisions.map((decision) => decision.callId))];
+  const outputs = new Map(rows<{
+    call_id: string;
+    tool: string | null;
+    output_full: string;
+  }>(db, `
+    SELECT call_id, tool, output_full
+      FROM tool_outputs
+     WHERE session_id = ? AND call_id IN (${callIds.map(() => '?').join(', ')})
+  `, [identity.sessionId, ...callIds]).map((row) => [row.call_id, row] as const));
+  return decisions.flatMap((decision): SettledDiscoveryPage[] => {
+    const output = outputs.get(decision.callId);
+    if (!output?.tool || !isPlainOrClementineLocalTool(output.tool, 'tool_search')) return [];
+    if (Buffer.byteLength(output.output_full, 'utf8') > 64 * 1024) return [];
+    let payload: UnknownRow | null = null;
+    try { payload = record(JSON.parse(output.output_full)); } catch { /* malformed is inert */ }
+    return payload ? [{ ...decision, payload }] : [];
+  });
+}
+
 function durableRoleBoundDiscoveryStageTokens(
   db: Database.Database,
   identity: HostNoProgressIdentity,
   events: readonly EventRow[],
+  pages: readonly SettledDiscoveryPage[],
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
+  const exactRequests = rows<{ claim_key_version: number }>(db, `
+    SELECT claim_key_version FROM discovery_governor_tasks
+     WHERE session_id = ? AND source_user_seq = ?
+  `, [identity.sessionId, identity.sourceUserSeq])[0]?.claim_key_version === 1;
   const roleKeys = new Set(rows<{ role_key: string }>(db, `
     SELECT role_key
       FROM discovery_governor_roles
      WHERE session_id = ? AND source_user_seq = ?
   `, [identity.sessionId, identity.sourceUserSeq]).map((row) => row.role_key));
-  if (roleKeys.size === 0) return;
+  if (!exactRequests && roleKeys.size === 0) return;
 
   // A citable result is still not authority unless its exact ref/effect came
   // from the host's same-source capability disclosure. Ambiguous ref/effect
   // pairs fail closed instead of letting event ordering choose one.
   const capabilityEffects = new Map<string, string | null>();
+  const capabilityProvenAt = new Map<string, number>();
   for (const event of events) {
-    if (event.type !== 'capability_discovered') continue;
+    if (event.role !== 'system' || event.type !== 'capability_discovered') continue;
     const capabilities = Array.isArray(event.data.capabilities)
       ? event.data.capabilities
       : [];
@@ -455,64 +550,27 @@ function durableRoleBoundDiscoveryStageTokens(
         capabilityRef,
         existing === undefined || existing === effect ? effect : null,
       );
+      capabilityProvenAt.set(capabilityRef, Math.min(capabilityProvenAt.get(capabilityRef) ?? event.seq, event.seq));
     }
   }
   if (capabilityEffects.size === 0) return;
 
-  const succeededCallSeqById = new Map<string, number>();
-  for (const event of events) {
-    if (event.type !== 'discovery_governor_outcome' || event.data.outcome !== 'succeeded') continue;
-    const callId = nonEmptyString(event.data.callId);
-    if (callId && !succeededCallSeqById.has(callId)) {
-      succeededCallSeqById.set(callId, event.seq);
-    }
-  }
-  const decisions = events.flatMap((event) => {
-    if (event.type !== 'discovery_governor_decision') return [];
-    const callId = nonEmptyString(event.data.callId);
-    const subject = nonEmptyString(event.data.subject);
-    const settledAt = callId ? succeededCallSeqById.get(callId) : undefined;
-    return callId
-      && subject
-      && event.data.category === 'broad_discovery'
-      && event.data.decision === 'admitted'
-      && roleKeys.has(subject)
-      && settledAt !== undefined
-      && settledAt > event.seq
-      ? [{ callId, subject }]
-      : [];
-  });
-  if (decisions.length === 0) return;
-  const callIds = [...new Set(decisions.map((decision) => decision.callId))];
-  const placeholders = callIds.map(() => '?').join(', ');
-  const outputs = new Map(rows<{
-    call_id: string;
-    tool: string | null;
-    output_full: string;
-  }>(db, `
-    SELECT call_id, tool, output_full
-      FROM tool_outputs
-     WHERE session_id = ? AND call_id IN (${placeholders})
-  `, [identity.sessionId, ...callIds]).map((row) => [row.call_id, row] as const));
-
   const seenStages = new Set<string>();
-  for (const decision of decisions) {
+  for (const page of pages) {
     if (seenStages.size >= MAX_ROLE_BOUND_DISCOVERY_STAGES) break;
-    const output = outputs.get(decision.callId);
-    if (!output || output.tool?.split('__').at(-1)?.toLowerCase() !== 'tool_search') continue;
-    if (Buffer.byteLength(output.output_full, 'utf8') > 64 * 1024) continue;
-    let payload: UnknownRow | null = null;
-    try { payload = record(JSON.parse(output.output_full)); } catch { /* malformed is inert */ }
-    if (!payload || nonEmptyString(payload.role_key) !== decision.subject) continue;
+    const { payload, subject } = page;
+    if (page.category !== 'broad_discovery') continue;
+    if (!exactRequests && (!subject || !roleKeys.has(subject) || nonEmptyString(payload.role_key) !== subject)) continue;
     const ranked = Array.isArray(payload.results) ? record(payload.results[0]) : null;
     const capabilityRef = nonEmptyString(ranked?.capabilityRef);
     const effect = capabilityRef ? capabilityEffects.get(capabilityRef) : null;
-    if (!capabilityRef || !effect) continue;
-    const stage = token('operation', 'role_bound_discovery_stage', [
-      decision.subject,
-      capabilityRef,
-      effect,
-    ]);
+    if (!capabilityRef || !publicCapabilityRefs(ranked).includes(capabilityRef) || !effect
+      || (capabilityProvenAt.get(capabilityRef) ?? Infinity) > page.settledAt) continue;
+    // New sources earn credit only for an exposed exact capability, never a
+    // fresh request digest, role label, or query. Preserve old checkpoint tokens.
+    const stage = exactRequests
+      ? token('operation', 'published_discovery_stage', [capabilityRef, effect])
+      : token('operation', 'role_bound_discovery_stage', [subject, capabilityRef, effect]);
     if (seenStages.has(stage)) continue;
     seenStages.add(stage);
     tokens.operation.add(stage);
@@ -635,9 +693,17 @@ export function projectHostNoProgressAuthority(
     const identity = validIdentity(input);
     const tokens = emptySets();
     const events = exactSourceEvents(identity);
-    eventCapabilityTokens(events, tokens);
+    const pages = settledDiscoveryPages(database, identity, events);
+    const exposedAt = new Map<string, number>();
+    for (const page of pages) {
+      const results = Array.isArray(page.payload.results) ? page.payload.results : [];
+      for (const ref of results.flatMap(publicCapabilityRefs)) {
+        exposedAt.set(ref, Math.max(exposedAt.get(ref) ?? 0, page.settledAt));
+      }
+    }
+    eventCapabilityTokens(events, exposedAt, tokens);
     durableAuthorityTokens(database, identity, tokens);
-    durableRoleBoundDiscoveryStageTokens(database, identity, events, tokens);
+    durableRoleBoundDiscoveryStageTokens(database, identity, events, pages, tokens);
     return { status: 'ok', authority: sortedSnapshot(tokens) };
   } catch (error) {
     return {
@@ -1104,9 +1170,44 @@ function settlementConsequence(input: {
         effectState,
         recoveryToolNames: notStarted ? [call.name] : [],
       });
+    case 'unknown':
+      // A READ THAT FAILED CHANGED NOTHING.
+      //
+      // `unknown` is the right answer for a mutation whose fate we cannot
+      // observe — the one thing worse than failing is doing it twice, so those
+      // still stop and reconcile. A non-mutating call carries no such doubt:
+      // whatever went wrong, no effect exists to reconcile, and the model can
+      // safely repair the request or choose another read.
+      //
+      // Live 2026-09-07 source 144363: two ActivityHistories queries came back
+      // MALFORMED_QUERY from the Salesforce CLI — Salesforce had said exactly
+      // what was wrong. They settled `unknown, mutating=false, zero crossings`,
+      // mapped to stop_factual, and ended the job WITHOUT another model step,
+      // discarding the Task and Opportunity rows that had already succeeded.
+      // Two retries were still on the budget.
+      // BUSINESS read only. A control/plumbing call that returns `unknown`
+      // must NOT mint a recovery surface: its result may be locally forged
+      // prose, and naming tools from it is exactly the escalation the
+      // malformed-plan-refusal contract forbids. `business_call` separates
+      // real work from harness plumbing without reading any error text.
+      if (!settlement.mutating && settlement.business_call === 1) {
+        return createNoProgressConsequence({
+          stage: 'execution:unknown_read',
+          recovery: 'repair_model',
+          effectState,
+          // The same carrier can be repaired; one bounded search can find an
+          // alternative read when the shape itself is unsupported.
+          recoveryToolNames: [call.name, 'tool_search'],
+        });
+      }
+      return createNoProgressConsequence({
+        stage: `execution:${settlement.outcome_kind}`,
+        recovery: 'stop_factual',
+        effectState,
+        recoveryToolNames: [],
+      });
     case 'auth_failure':
     case 'input_required':
-    case 'unknown':
       return createNoProgressConsequence({
         stage: `execution:${settlement.outcome_kind}`,
         recovery: 'stop_factual',

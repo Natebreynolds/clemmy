@@ -52,6 +52,7 @@ import {
   type CanonicalVerifiedWriteCapability,
 } from './verified-write-capability-learning.js';
 import type { AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
+import { loadDurableAuthorizedLocalPlanningDefinition } from './local-planning-capability.js';
 import type { VerifiedWriteCapabilityRecordV1 } from '../../memory/verified-write-capability-store.js';
 
 const INDEX_SHORTLIST = 24;
@@ -465,13 +466,50 @@ export async function registerIndexedCapabilitiesForTurn(input: {
       prior
       && JSON.stringify(prior) !== JSON.stringify(candidate.currentLocalDefinition)
     ) {
-      // Two historical rows cannot choose among conflicting current local
+      // Two HISTORICAL rows cannot choose among conflicting current local
       // identities. This is an abstention, never store-order selection.
+      // Each candidate reobserves against its OWN origin.sourceUserSeq, so an
+      // object that was legitimately created and then edited yields two valid
+      // but different definitions and lands here.
       localByRef.delete(ref);
       ambiguousLocalRefs.add(ref);
       continue;
     }
     localByRef.set(ref, candidate.currentLocalDefinition);
+  }
+  // EXACT-SOURCE RECOVERY. The abstention above is right to refuse a choice
+  // between two histories, but it must not discard an authority THIS source
+  // holds. When the accepted source has its own durable local definition for an
+  // abstained ref, that is not a tie — it is the current answer, and historical
+  // disagreement is irrelevant to it.
+  //
+  // SCOPE — do not overstate this. It only RELOADS a durable current-source row
+  // that already exists; it cannot create one. So it is neither what made warm
+  // native writes fail nor what fixes them. An earlier revision of this comment
+  // claimed that lineage (citing C11 edit 135472 / Space create 135561) and was
+  // wrong: on a warm turn there was no current-source row for it to find in the
+  // first place. The actual cause was that priming staged indexed definitions in
+  // memory without publishing this source's durable `capability_discovered` row,
+  // so the direct call path had nothing to resolve and the turn detoured into
+  // plan_task — corrected at the priming site in
+  // admit-and-compile-accepted-source.ts, not here.
+  //
+  // What this block is worth on its own: once such a row exists, an unrelated
+  // historical tie must not hide it from the warm catalog.
+  for (const ref of ambiguousLocalRefs) {
+    try {
+      const exact = await loadDurableAuthorizedLocalPlanningDefinition({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        capabilityRef: ref,
+      });
+      if (exact.ok && exact.definition.capabilityRef === ref) {
+        localByRef.set(ref, exact.definition);
+      }
+    } catch {
+      // Recovery is additive: a failed exact-source read leaves the abstention
+      // in place. It must never invent an authority the source does not hold.
+    }
   }
   const localDefinitions = [...localByRef.values()];
   const store = peekCapabilityManifestStore();

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import matter from 'gray-matter';
 import pino from 'pino';
 import { openMemoryDb } from './db.js';
 import {
@@ -74,6 +75,7 @@ interface SemanticChunkRow {
   path: string;
   title: string | null;
   content: string;
+  mtime: number;
   vector: Buffer;
 }
 
@@ -109,7 +111,82 @@ function deriveTitle(row: Pick<RecallChunkRow, 'title' | 'path'>): string {
   return path.basename(row.path, '.md');
 }
 
+interface IndexedNoteChunk {
+  id: number;
+  path: string;
+  title: string | null;
+  content: string;
+  chunk_index: number;
+  mtime: number;
+}
+
+/** Hydrate only an already-selected exact note path. Indexed chunks are
+ * excerpts, not a claim about the complete or current file. A metadata-only
+ * lexical match still needs the note's first actual body chunk to be useful. */
+function selectedNoteEvidence(
+  row: Pick<RecallChunkRow, 'id' | 'path' | 'title' | 'content' | 'mtime'>,
+  cache: Map<string, IndexedNoteChunk[]>,
+): Pick<MemorySearchHit, 'title' | 'snippet'> {
+  let chunks = cache.get(row.path);
+  if (!chunks) {
+    try {
+      chunks = openMemoryDb().prepare(`
+        SELECT id, path, title, content, chunk_index, mtime FROM vault_chunks
+        WHERE path = ? ORDER BY chunk_index ASC
+      `).all(row.path) as IndexedNoteChunk[];
+    } catch {
+      chunks = [];
+    }
+    cache.set(row.path, chunks);
+  }
+  // An async rerank may span reindexing. Never attach a new sibling version
+  // to a selected chunk which no longer belongs to this indexed snapshot.
+  if (!chunks.some((chunk) => chunk.id === row.id
+    && chunk.content === row.content && chunk.mtime === row.mtime)) {
+    return {
+      title: deriveTitle(row),
+      snippet: `Indexed excerpt from selected chunk ${row.id}; sibling context unavailable. Reopen this source for complete or current note content.\n${row.content}`,
+    };
+  }
+  const first = chunks.find((chunk) => chunk.chunk_index === 0);
+  let metadata = '';
+  let title: string | undefined;
+  let firstBody = first?.content ?? '';
+  if (first && /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.test(first.content)) {
+    try {
+      const parsed = matter(first.content);
+      if (parsed.matter) {
+        metadata = parsed.matter;
+        firstBody = parsed.content;
+        if (typeof parsed.data.title === 'string' && parsed.data.title.trim()) {
+          title = parsed.data.title.trim();
+        }
+      }
+    } catch {
+      // Malformed/incomplete metadata remains verbatim source text. Never
+      // infer a title, occurrence date or body boundary from a failed parse.
+    }
+  }
+  const bodyOf = (chunk: Pick<IndexedNoteChunk, 'id' | 'content'>): string =>
+    chunk.id === first?.id ? firstBody : chunk.content;
+  const selectedBody = bodyOf(row);
+  const bodyChunk = selectedBody.trim()
+    ? row
+    : chunks.find((chunk) => bodyOf(chunk).trim());
+  const body = bodyChunk ? bodyOf(bodyChunk) : '';
+  return {
+    title: title ?? deriveTitle(row),
+    snippet: [
+      `Indexed excerpt from this note: selected chunk ${row.id}${bodyChunk ? `, body chunk ${bodyChunk.id}` : ''}. Reopen this source for complete or current note content.`,
+      body,
+      metadata ? `Source frontmatter (indexed chunk ${first!.id}):\n${metadata}` : '',
+    ].filter(Boolean).join('\n'),
+  };
+}
+
 export interface RecallOptions {
+  /** Ambient task context must not infer an exclusive date/type filter. */
+  purpose?: 'ambient' | 'targeted';
   /** Maximum hits to return. */
   limit?: number;
   /** Optional path prefix filter (e.g. only /vault/02-People). */
@@ -215,6 +292,7 @@ function formatOccurrenceTime(iso: string, timeZone: string): string {
 }
 
 function temporalMeetingHits(query: string, options: RecallOptions, limit: number): MemorySearchHit[] {
+  if (options.purpose === 'ambient') return [];
   const date = resolveTemporalMeetingDate(query, options);
   if (!date) return [];
   const timeZone = resolveRecallTimeZone(options.timeZone);
@@ -396,12 +474,12 @@ function rowsToHits(rows: RecallChunkRow[]): MemorySearchHit[] {
   const worst = Math.max(...ranks);
   const spread = Math.max(0.0001, worst - best);
 
+  const noteChunks = new Map<string, IndexedNoteChunk[]>();
   return rows.map((row) => {
     const normalized = 1 - (row.rank - best) / spread;
     return {
       filePath: row.path,
-      title: deriveTitle(row),
-      snippet: row.snip || row.content.slice(0, 240).replace(/\s+/g, ' '),
+      ...selectedNoteEvidence(row, noteChunks),
       score: Number((normalized * 10).toFixed(3)),
     } satisfies MemorySearchHit;
   });
@@ -416,6 +494,7 @@ async function semanticFallback(query: string, options: RecallOptions, limit: nu
       vc.path    AS path,
       vc.title   AS title,
       vc.content AS content,
+      vc.mtime   AS mtime,
       e.vector   AS vector
     FROM embeddings e
     JOIN vault_chunks vc ON vc.id = e.chunk_id
@@ -449,10 +528,10 @@ async function semanticFallback(query: string, options: RecallOptions, limit: nu
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
+  const noteChunks = new Map<string, IndexedNoteChunk[]>();
   return scored.map((entry) => ({
     filePath: entry.row.path,
-    title: deriveTitle({ title: entry.row.title, path: entry.row.path }),
-    snippet: entry.row.content.slice(0, 240).replace(/\s+/g, ' '),
+    ...selectedNoteEvidence(entry.row, noteChunks),
     score: Number((Math.max(0, entry.score) * 10).toFixed(3)),
   }));
 }

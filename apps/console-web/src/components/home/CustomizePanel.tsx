@@ -51,7 +51,7 @@ const PANE_LABELS: Record<HomePaneId, string> = {
   needs_you: 'Needs you',
   running: 'Running',
   while_away: 'While you were away',
-  projects: 'Projects',
+  projects: 'Spaces',
   workstate: 'Working together card',
 };
 
@@ -81,6 +81,7 @@ const NAV_GROUP_KEYS = new Set<string>(NAV_GROUPS.map((g) => g.key));
 const isNavGroup = (key: string): key is NavGroup => NAV_GROUP_KEYS.has(key);
 
 const HOME_PATH = '/home';
+const CHAT_PATH = '/chat';
 const HOME_DEST: NavDest = { path: HOME_PATH, label: 'Home', icon: Home, hint: 'Your command center' };
 
 /** Destination for a nav id; the sidebar's own catalog first, Home as the one built-in. */
@@ -118,7 +119,7 @@ function sameNav(a: Nav, b: Nav): boolean {
 
 /**
  * The sheet edits an EXPLICIT model: every pane in the order list, every
- * managed destination in a sidebar group, Home always pinned, no duplicates.
+ * managed destination in a sidebar group, Chat first and Home pinned, no duplicates.
  * Ids the app doesn't know (from a newer build) ride along untouched.
  */
 function normalizeNav(nav: Nav): Nav {
@@ -129,7 +130,7 @@ function normalizeNav(nav: Nav): Nav {
       seen.add(p);
       return true;
     });
-  const pinned = take(nav.pinned.includes(HOME_PATH) ? nav.pinned : [HOME_PATH, ...nav.pinned]);
+  const pinned = take([CHAT_PATH, ...(nav.pinned.includes(HOME_PATH) ? nav.pinned : [HOME_PATH, ...nav.pinned])]);
   const shown = take(nav.shown);
   const more = take(nav.more);
   const extras = MANAGED_NAV_PATHS.filter((p) => !seen.has(p));
@@ -297,7 +298,7 @@ function CustomizeSheet({ onClose }: { onClose: () => void }) {
     const { active, over } = e;
     if (!cur || !over) return;
     const id = String(active.id);
-    if (id === HOME_PATH) return; // Home stays pinned.
+    if (id === HOME_PATH || id === CHAT_PATH) return; // Chat and Home stay pinned.
     const from = containerOf(cur.nav, active.id);
     const to = containerOf(cur.nav, over.id);
     if (!from || !to || from === to) return;
@@ -324,12 +325,13 @@ function CustomizeSheet({ onClose }: { onClose: () => void }) {
         if (oldIndex >= 0 && newIndex >= 0) nav = setGroup(nav, from, arrayMove(items, oldIndex, newIndex));
       }
     }
+    nav = normalizeNav(nav);
     if (snap && sameNav(snap, nav)) return;
     commit({ nav });
   };
   const moveNav = (path: string, to: NavGroup) => {
     const cur = draftRef.current;
-    if (!cur || path === HOME_PATH) return;
+    if (!cur || path === HOME_PATH || path === CHAT_PATH) return;
     const from = groupOf(cur.nav, path);
     if (from === to) return;
     let nav: Nav = {
@@ -618,7 +620,7 @@ function NavGroupBlock({
               <CustomizeSortableRow key={path} id={path} label={dest.label}>
                 <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
                 <span className="min-w-0 flex-1 truncate">{dest.label}</span>
-                {path === HOME_PATH ? (
+                {path === HOME_PATH || path === CHAT_PATH ? (
                   <span className="shrink-0 text-caption font-semibold text-primary">Pinned</span>
                 ) : (
                   <NavGroupSelect value={group.key} label={dest.label} onChange={(to) => onMove(path, to)} />

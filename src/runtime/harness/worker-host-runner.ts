@@ -1,3 +1,4 @@
+import { parseTaskMode } from './task-mode.js';
 /** Worker packets use the same host loop and exact call admission as the
  * parent, in their own existing session/source namespace. No child can mutate
  * the parent's root, model-batch ordinals or logical run_worker settlement. */
@@ -38,6 +39,7 @@ export async function runPacketWorkerWithHost(input: {
   if (!source || !parentCall || parentCall.acceptedTaskId !== parentTaskId) {
     return 'ERROR: worker packet has no exact accepted parent call; no worker ran.';
   }
+  const inheritedMode = parseTaskMode(source.data.taskMode);
   const packetKey = workerPacketKey(input.input);
   const packetDigest = createHash('sha256').update(JSON.stringify(input.input)).digest('hex');
   const lineage = {
@@ -54,9 +56,16 @@ export async function runPacketWorkerWithHost(input: {
   const prompt = buildWorkerJobPrompt(input.input);
   // This is delegated packet provenance, not a human approval. External
   // mutations are refused by the same tool edge before any consent card.
+  // Execute grants remain parent-owned: children retain the exact parent mode
+  // as provenance and receive an explicit investigation ceiling of their own.
   const childSource = recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', parentEventId: source.id,
-    data: { text: prompt, delegatedWorker: { ...lineage, composeOnly: true, packet: input.input } },
+    data: {
+      text: prompt,
+      ...(inheritedMode?.kind === 'plan' || inheritedMode?.kind === 'execute'
+        ? { taskMode: { version: 1, kind: 'plan' }, delegatedWorker: { ...lineage, composeOnly: true, packet: input.input, parentTaskMode: inheritedMode, authority: 'investigation_only' } }
+        : { delegatedWorker: { ...lineage, composeOnly: true, packet: input.input } }),
+    },
   });
   appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_started',
     data: { ...lineage, model: input.modelId, provider: resolveEffectiveProviderForModel(input.modelId),

@@ -1,21 +1,52 @@
-import { useState } from 'preact/hooks';
-import { useBackGesture } from '../lib/back-gesture';
+import { useEffect, useState } from 'preact/hooks';
+import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
-import { presentWorkingNow } from '@clem/chat-engine';
-import { mobileRunControl } from '../lib/running-tasks';
+import { presentWorkingNow, type PresentedWorkingNowEntry } from '@clem/chat-engine';
+import { mobileRunControl, runStatusLabel } from '../lib/running-tasks';
+import { lastGoodAt, lastGoodNotice } from '../lib/last-good';
+import { runRowLabel } from '../lib/run-rows';
 import { relativeTime } from '../components/Approvals';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { Run } from './Run';
 
-export function Activity() {
-  const [openRun, setOpenRun] = useState<string | null>(null);
-  useBackGesture(openRun !== null, () => setOpenRun(null));
+interface Props {
+  /** A run addressed by the URL — a push tap, a reload, or any surface that
+   *  shows running work handing this screen its destination. */
+  initialRunId?: string | null;
+  /** Keeps the URL in step with what is open, so reload and the swipe-back
+   *  gesture both land where the user actually is. */
+  onRunChange?: (sessionId: string | null) => void;
+}
+
+export function Activity({ initialRunId, onRunChange }: Props = {}) {
+  const [openRun, setOpenRun] = useState<string | null>(initialRunId ?? null);
+  // The swipe-back closes the run AND drops it from the URL, so a reload after
+  // leaving does not reopen the run the user just walked out of. (No transition
+  // here: back-gesture already wraps the pop it is servicing.)
+  useBackGesture(openRun !== null, () => { setOpenRun(null); onRunChange?.(null); });
+  // The URL is the source of truth for which run is open: a push arriving while
+  // this screen is already mounted must move it, not be ignored.
+  useEffect(() => {
+    setOpenRun(initialRunId ?? null);
+  }, [initialRunId]);
+
+  const showRun = (sessionId: string | null): void => {
+    withDepthTransition(() => {
+      setOpenRun(sessionId);
+      onRunChange?.(sessionId);
+    });
+  };
   // "Happening now" reads the canonical server-owned working-now projection —
   // the same one the running-tasks sheet and desktop read — so a workflow
   // dispatched from chat appears here and its Stop targets the right route.
   // "Earlier" stays on the run history, which is where terminal rows live.
+  //
+  // It heads only the rows the presenter calls RUNNING. It used to head every
+  // non-terminal row, which is how six runs blocked two days earlier came to
+  // sit under the words "Happening now" — each of them still printing the live
+  // phase text it had been showing when it died.
   const { data, loading, error, offline, refresh } = useScreenData(
     async () => {
       const [runsResult, workingNow] = await Promise.all([
@@ -37,14 +68,25 @@ export function Activity() {
   const workingView = presentWorkingNow(working.entries, working.observedAt);
 
   if (openRun) {
-    return <Run sessionId={openRun} onBack={() => { setOpenRun(null); void refresh(); }} />;
+    return <Run key={openRun} sessionId={openRun} onBack={() => { showRun(null); void refresh(); }} />;
   }
 
   if (loading && runs.length === 0) {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
 
-  const notice = <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0 || workingView.total > 0} />;
+  // The run list is one of the few things the service worker keeps through a
+  // process death, so a cold open with the Mac asleep still shows work. It is
+  // stamped, never passed off as live.
+  const notice = (
+    <ScreenNotice
+      error={error}
+      offline={offline}
+      onRetry={() => void refresh()}
+      hasData={runs.length > 0 || workingView.total > 0}
+      lastGood={lastGoodNotice(lastGoodAt('/m/api/runs'), Date.now())}
+    />
+  );
 
   if (runs.length === 0 && workingView.total === 0 && (error || offline)) return <div class="home">{notice}</div>;
 
@@ -63,21 +105,25 @@ export function Activity() {
   return (
     <div class="home">
       {notice}
-      {workingView.total > 0 ? (
-        <section class="home-section">
-          <h2 class="section-head">Happening now</h2>
-          <div class="stack">
-            {workingView.entries.map((p, i) => (
-              <LiveCard key={p.entry.runKey} entry={p.entry} pulse={p.pulse} elapsed={p.elapsed} index={i} onChanged={() => void refresh()} onOpen={setOpenRun} />
-            ))}
-          </div>
-        </section>
-      ) : null}
+      {LIVE_SECTIONS.map(({ membership, head }) => {
+        const rows = workingView.entries.filter((p) => p.membership === membership);
+        if (rows.length === 0) return null;
+        return (
+          <section class="home-section" key={membership}>
+            <h2 class="section-head">{head}</h2>
+            <div class="stack">
+              {rows.map((p, i) => (
+                <LiveCard key={p.entry.runKey} presented={p} index={i} onChanged={() => void refresh()} onOpen={showRun} />
+              ))}
+            </div>
+          </section>
+        );
+      })}
       {done.length > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Earlier</h2>
           <div class="stack">
-            {done.map((run, i) => <RunCard key={run.id} run={run} index={i} onOpen={setOpenRun} />)}
+            {done.map((run, i) => <RunCard key={run.id} run={run} index={i} onOpen={showRun} />)}
           </div>
         </section>
       ) : null}
@@ -86,14 +132,22 @@ export function Activity() {
 }
 
 
-function LiveCard({ entry, pulse, elapsed, index, onChanged, onOpen }: {
-  entry: ActivityEntry;
-  pulse: boolean;
-  elapsed: string;
+/** Each membership gets its OWN heading, so a heading is never a claim about a
+ *  row underneath it. Order is what a person cares about first. */
+const LIVE_SECTIONS: ReadonlyArray<{ membership: 'needs_you' | 'running' | 'stalled'; head: string }> = [
+  { membership: 'needs_you', head: 'Waiting on you' },
+  { membership: 'running', head: 'Happening now' },
+  { membership: 'stalled', head: 'Stalled' },
+];
+
+function LiveCard({ presented, index, onChanged, onOpen }: {
+  presented: PresentedWorkingNowEntry<ActivityEntry>;
   index: number;
   onChanged: () => void;
   onOpen: (sessionId: string) => void;
 }) {
+  const entry = presented.entry;
+  const { pulse, elapsed } = presented;
   const control = mobileRunControl(entry);
   const body = (
     <>
@@ -104,9 +158,15 @@ function LiveCard({ entry, pulse, elapsed, index, onChanged, onOpen }: {
         : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
       <div class="min-w-0">
         <div class="card-title-sm">{entry.headline || 'Working…'}</div>
+        {/* One vocabulary with the chip and with Home: a row that stopped
+            says so, and how long ago, instead of replaying the phase text it
+            was showing when it stopped. */}
         <div class="card-when">
-          {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')}
-          {elapsed ? ` · ${elapsed}` : ''}
+          {runStatusLabel(presented)}
+          {/* A stalled row already states an age, and for a row whose only
+              evidence is its start the two ages are the same number — one
+              suffix, not "nothing for 2d · 2d". */}
+          {elapsed && !presented.stalled ? ` · ${elapsed}` : ''}
         </div>
       </div>
     </>
@@ -130,6 +190,9 @@ function RunCard({ run, index, live, onChanged, onOpen }: {
   onChanged?: () => void;
   onOpen?: (sessionId: string) => void;
 }) {
+  // What it did, not what the engine calls it. The list route already carries
+  // both lines (see lib/run-rows.ts); this row used to print the raw token.
+  const label = runRowLabel(run);
   return (
     <article class={`card rise ${live ? 'card-live' : ''}`} style={{ '--i': index }}>
       {live ? <span class="pulse-dot" aria-hidden="true" /> : null}
@@ -138,9 +201,10 @@ function RunCard({ run, index, live, onChanged, onOpen }: {
           beside it stays independently tappable. */}
       <button class="run-open min-w-0" onClick={() => onOpen?.(run.sessionId)}>
         <div class="card-title-sm">{run.title || 'Untitled run'}</div>
+        {label.detail ? <div class="run-outcome truncate">{label.detail}</div> : null}
         <div class="card-when">
           {live ? null : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
-          {run.status.replace(/_/g, ' ')} · {relativeTime(run.updatedAt)}
+          {label.state} · {relativeTime(run.updatedAt)}
         </div>
       </button>
       {live && onChanged ? <RunControl target={{ kind: 'run', runId: run.id }} onChanged={onChanged} /> : null}

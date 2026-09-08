@@ -1,98 +1,56 @@
-/**
- * Clem's own tools must not be deterministically outranked by the world.
- *
- * The tiering intent, stated at the call site, is:
- *   acquired live read > connected broker membership > her own catalog > the rest.
- *
- * On a planning turn that structure collapsed. PLANNING_PROVIDER_RANK_BOOST (2)
- * was applied to EVERY provider row whether or not its toolkit was connected,
- * while her own catalog got +1 — and both base scores are bounded [0,1]. So
- * providers occupied [2,3] and built-ins [1,2], and no built-in could ever
- * outrank any provider at any relevance.
- *
- * Live 2026-08-28: "I need this to update please and refresh" against a
- * workspace returned twenty SALESFORCE_/ASANA_/SLACK_/APIFY_ rows and ZERO
- * space_* tools. The workspace tools were not mis-ranked — they never entered
- * the window to be ranked.
- */
+/** Native and provider metadata share query relevance; source membership is
+ * not a permanent ranking floor. Exercise model-visible ordering in both lanes. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { registerToolSearchTool, type ToolSearchCandidateSource } from './tool-search-tool.js';
+import { AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE } from '../runtime/harness/live-read-planning-authority.js';
 
 const SRC = new URL('./tool-search-tool.ts', import.meta.url);
-
-function constant(src: string, name: string): number {
-  const m = src.match(new RegExp(`const ${name} = ([0-9.]+);`));
-  assert.ok(m, `${name} must exist`);
-  return Number(m![1]);
+async function search(query: string, planning: boolean, sources: ToolSearchCandidateSource[]) {
+  let handler!: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: typeof handler) { handler = callback; } } as never, {
+    allowedNames: new Set(['space_save', 'workflow_get']), candidateSources: sources,
+    ...(planning ? { discloseForPlanning: async () => ({ version: 1 as const, refs: {}, blockers: {} }) } : {}),
+  });
+  return JSON.parse((await handler({ query, limit: 8, cursor: null, role_key: null, account_selection: null })).content[0]!.text);
 }
+const weakProvider: ToolSearchCandidateSource = { kind: 'authorized_composio', search: async () => [{
+  name: 'CRM_EXPORT_CUSTOMERS', summary: 'Export customer records into a report.', carrier: 'work_call', score: 1,
+}] };
+const acquired: ToolSearchCandidateSource = { kind: AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, search: async () => [{
+  name: 'local_workspace_inventory', summary: 'Read workspace information from the current local connection.', carrier: 'work_call', score: 0,
+}] };
 
-test('her own catalog is not outranked by construction', () => {
-  const src = readFileSync(SRC, 'utf8');
-  const own = constant(src, 'OWN_CATALOG_RANK_BOOST');
-  const planning = constant(src, 'PLANNING_PROVIDER_RANK_BOOST');
-  // Both rankers bound base to [0,1], so the boosts alone decide whether a
-  // built-in can EVER outrank a provider. If the provider floor sits above the
-  // built-in ceiling, relevance stops mattering — that is the regression.
-  const BASE_MAX = 1;
-  const providerFloor = planning;
-  const builtinCeiling = own + BASE_MAX;
-  assert.ok(
-    builtinCeiling > providerFloor,
-    `a highly relevant built-in must be able to outrank a weak provider row (built-in ceiling ${builtinCeiling} must exceed provider floor ${providerFloor})`,
-  );
+test('relevant native metadata beats weak provider rank in planning and ordinary discovery', async () => {
+  for (const planning of [false, true]) {
+    const result = await search('create a new Space with a static HTML view', planning, [weakProvider]);
+    assert.equal(result.results[0]?.name, 'space_save');
+    assert.ok(result.results.some((row: { name: string }) => row.name === 'CRM_EXPORT_CUSTOMERS'),
+      'lower relevance changes order, not provider visibility');
+  }
 });
 
-test('an acquired live read tops the order ON A PLANNING TURN', () => {
-  const src = readFileSync(SRC, 'utf8');
-  const own = constant(src, 'OWN_CATALOG_RANK_BOOST');
-  const planning = constant(src, 'PLANNING_PROVIDER_RANK_BOOST');
-  const acquired = constant(src, 'ACQUIRED_LIVE_READ_RANK_BOOST');
-  // Equal footing must not become precedence. This is the mode that matters:
-  // citability only exists on a planning turn, so the acquired tier has to
-  // clear the built-in ceiling here.
-  assert.ok(planning + acquired > own + 1, 'acquired must outrank the built-in ceiling when planning');
-  assert.ok(acquired > 0, 'the acquired boost must remain a real tier');
+test('query-bound acquired read retains precedence on planning discovery', async () => {
+  const result = await search('create a new Space with a static HTML view', true, [weakProvider, acquired]);
+  assert.equal(result.results[0]?.name, 'local_workspace_inventory');
+  assert.equal(result.results[0]?.capabilityRef, undefined, 'ranking alone grants no callable authority');
 });
 
-test('the tier order does NOT hold on a non-planning turn — pinned as known', () => {
-  const src = readFileSync(SRC, 'utf8');
-  const own = constant(src, 'OWN_CATALOG_RANK_BOOST');
-  const connected = constant(src, 'CONNECTED_TOOLKIT_RANK_BOOST');
-  const acquired = constant(src, 'ACQUIRED_LIVE_READ_RANK_BOOST');
-  // HONEST PIN, NOT AN ASSERTION THAT ALL IS WELL.
-  //
-  // Off a planning turn the provider term drops from PLANNING_PROVIDER_RANK_BOOST
-  // to CONNECTED_TOOLKIT_RANK_BOOST (or zero), so an acquired live read sits in
-  // [2.5] against a built-in ceiling of [2.5] — it ties rather than tops. The
-  // documented order ("acquired > membership > her own catalog > the rest") is
-  // therefore a PLANNING-TURN order only, and was so before OWN_CATALOG_RANK_BOOST
-  // was raised as well; raising it changed an overlap into an exact tie.
-  //
-  // This is pinned rather than silently fixed because only orchestrator.ts passes
-  // a planning identity today; mcp-server.ts and claude-agent-brain.ts do not, and
-  // changing their ordering is a behavior change on lanes with no live measurement
-  // behind it. If a future change makes acquired top the order here too, this test
-  // SHOULD fail and be updated deliberately — that is the point of pinning it.
-  const acquiredCeilingNonPlanning = connected + acquired + 1;
-  const builtinCeiling = own + 1;
-  assert.equal(
-    acquiredCeilingNonPlanning > builtinCeiling,
-    false,
-    'off a planning turn the acquired tier does NOT clear her catalog — known, deliberate, unmeasured elsewhere',
-  );
+test('acquired read precedence does not depend on a planning-membership boost', async () => {
+  const result = await search('create a new Space with a static HTML view', false, [weakProvider, acquired]);
+  assert.equal(result.results[0]?.name, 'local_workspace_inventory');
 });
 
-test('providers keep their membership boost — visibility is not the fix', () => {
-  const src = readFileSync(SRC, 'utf8');
-  // An earlier attempt zeroed the boost for unconnected providers, which made
-  // them vanish from the window rather than merely outrankable. Two existing
-  // tests caught it. Ranking is the lever here, never visibility.
-  assert.match(
-    src,
-    /const planningOrConnected = input\.discloseForPlanning\s*\n\s*\? PLANNING_PROVIDER_RANK_BOOST/,
-    'the provider membership boost must remain unconditional on a planning turn',
-  );
+test('a relevant provider remains visible and can lead without a membership boost', async () => {
+  const provider: ToolSearchCandidateSource = { kind: 'authorized_composio', search: async () => [{
+    name: 'CONTENT_EXTRACT_ARTICLE', summary: 'Extract article text from a webpage URL.', carrier: 'work_call', score: 0,
+  }] };
+  for (const planning of [false, true]) {
+    const result = await search('extract article text from a webpage URL', planning, [provider]);
+    assert.equal(result.results[0]?.name, 'CONTENT_EXTRACT_ARTICLE');
+    assert.equal(result.results[0]?.capabilityRef, undefined);
+  }
 });
 
 // ── the window, not the rank ────────────────────────────────────────────────

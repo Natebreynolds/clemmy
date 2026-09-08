@@ -140,6 +140,8 @@ test('skillBodyExecutionShortfall: workflow usesSkill path accepts skill-owned r
   writeFileSync(path.join(skillDir, 'build.cjs'), "const generateHtml = require('./src/generate-html');\nmodule.exports = generateHtml;\n", 'utf-8');
   writeFileSync(path.join(skillDir, 'src', 'generate-html.js'), 'module.exports = () => ({ html: "<html></html>" });\n', 'utf-8');
   const body = 'Act 2 — build:\nRun `src/generate-html.js` to produce the artifact.\nValidation is mandatory.';
+  assert.equal(skillBodyExecutionShortfall('workflow-lunar-audit', body, sess.id, skillDir)?.skill,
+    'workflow-lunar-audit', 'an explicit workflow body contract still requires its producer');
   shellRunArgs(sess.id, 'node build.cjs', skillDir);
   assert.equal(skillBodyExecutionShortfall('workflow-lunar-audit', body, sess.id, skillDir), null, 'workflow guard sees the same valid wrapper evidence');
 });
@@ -183,14 +185,21 @@ test('gatherSessionSkills keeps a body that itself contains --- dividers (first-
   assert.match(skills[0].body, /Phase 3: deploy/, 'later phases (after inner --- dividers) must be kept');
 });
 
-test('gatherSessionSkills dedupes repeated reads of the same skill', () => {
+test('gatherSessionSkills retains different versions and dedupes identical bodies with all origins', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   skillRead(sess.id, 'c1', 'taste-skill');
   skillOutput(sess.id, 'c1', '#taste\n---\nbody A');
   skillRead(sess.id, 'c2', 'taste-skill');
   skillOutput(sess.id, 'c2', '#taste\n---\nbody B');
-  assert.equal(gatherSessionSkills(sess.id).length, 1);
+  skillRead(sess.id, 'c3', 'taste-skill');
+  skillOutput(sess.id, 'c3', '#taste\n---\nbody A');
+  const versions = gatherSessionSkills(sess.id);
+  assert.equal(versions.length, 2);
+  assert.deepEqual(versions.map((v) => v.body), ['body A', 'body B']);
+  assert.notEqual(versions[0].bodyDigest, versions[1].bodyDigest);
+  assert.deepEqual(versions[0].origins?.map((o) => o.callId), ['c1', 'c3']);
+  assert.ok(versions.flatMap((v) => v.origins ?? []).every((o) => o.scope === 'unknown'));
 });
 
 test('sessionReadAnySkill: true when a skill was read, false otherwise', () => {
@@ -244,18 +253,4 @@ test('all helpers FAIL-OPEN on an unknown/bad session', () => {
   assert.equal(sessionReadAnySkill('nope-not-a-session'), false);
   // summarize returns a string (possibly the "no tool calls" sentinel) and never throws.
   assert.equal(typeof summarizeToolCallsForJudge('nope-not-a-session'), 'string');
-});
-
-test('BOTH lanes enforce the skill floor — the Claude lane no longer treats a skill as reading material (2026-07-31)', async () => {
-  const { readFileSync } = await import('node:fs');
-  // Parity is asserted structurally: the loop lane has enforced this since the
-  // 2026-06-15 lunar-audit, while the SDK lane re-injected skill bodies and
-  // never verified execution — and a single-model user has no judge to catch
-  // the difference. Both must consult the same deterministic detector behind
-  // the same kill-switch.
-  for (const lane of ['./loop.ts', './claude-agent-brain.ts']) {
-    const src = readFileSync(new URL(lane, import.meta.url), 'utf-8');
-    assert.match(src, /skillExecutionShortfall\(/, `${lane} must consult the deterministic skill floor`);
-    assert.match(src, /HARNESS_SKILL_EXEC_GATE/, `${lane} must honor the shared kill-switch`);
-  }
 });

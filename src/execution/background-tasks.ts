@@ -1568,7 +1568,9 @@ export function getBackgroundTask(id: string): BackgroundTaskRecord | null {
 }
 
 export function listBackgroundTasks(filter: { status?: BackgroundTaskStatus; userId?: string; channel?: string; includeArchived?: boolean } = {}): BackgroundTaskRecord[] {
-  ensureTaskDir();
+  // Inventory is read-only, including on a fresh install. Directory-chain
+  // durability belongs to task creation/transitions, not every timer/UI scan.
+  if (!existsSync(BACKGROUND_TASK_DIR)) return [];
   return readdirSync(BACKGROUND_TASK_DIR)
     .filter((entry) => entry.endsWith('.json'))
     .map((entry) => loadTaskFile(path.join(BACKGROUND_TASK_DIR, entry)))

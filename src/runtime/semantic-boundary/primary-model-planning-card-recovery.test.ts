@@ -185,7 +185,7 @@ test('a re-prime reaches the same card the in-process same-source disclosure alr
   );
   const output = await search.invoke(
     new RunContext({ sessionId: session.id }),
-    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8, account_selection: null }),
   );
   const disclosed = JSON.parse(String(output)) as { results: Array<{ capabilityRef?: string }> };
   assert.equal(disclosed.results[0]?.capabilityRef, ref);
@@ -440,7 +440,7 @@ test('a first prime whose only card rows are durable same-source disclosures reo
   );
   const output = await search.invoke(
     new RunContext({ sessionId: origin.id }),
-    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8 }),
+    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8, account_selection: null }),
   );
   const disclosed = JSON.parse(String(output)) as { results: Array<{ capabilityRef?: string }> };
   assert.equal(disclosed.results[0]?.capabilityRef, ref);

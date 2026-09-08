@@ -51,9 +51,11 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',
   panes: { order: ['quick_actions', 'needs_you', 'running', 'while_away', 'projects'], hidden: ['workstate'] },
   nav: {
-    pinned: ['/home', '/inbox', '/tasks', '/workspaces'],
+    // Chat is the main feature; it is pinned, not folded. Spaces (/workspaces)
+    // keep the product name the phone already uses.
+    pinned: ['/home', '/chat', '/inbox', '/tasks', '/workspaces'],
     shown: ['/automate', '/connect'],
-    more: ['/chat', '/memory', '/meetings', '/goals', '/agents'],
+    more: ['/memory', '/meetings', '/goals', '/agents'],
   },
   quickActions: [],
   phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
@@ -101,6 +103,24 @@ function quickActionList(input: unknown): QuickAction[] {
 
 type RawPrefs = Partial<Record<keyof HomePreferences, unknown>>;
 
+
+/**
+ * The sidebar shape shipped before Chat was pinned. A stored nav that still
+ * equals it byte-for-byte was never shaped by the user — every save writes the
+ * full record, so an untouched file is a copy of whatever default was current.
+ * Such a file follows the NEW default; any customized sidebar is left alone.
+ */
+const LEGACY_DEFAULT_NAV = {
+  pinned: ['/home', '/inbox', '/tasks', '/workspaces'],
+  shown: ['/automate', '/connect'],
+  more: ['/chat', '/memory', '/meetings', '/goals', '/agents'],
+};
+function navUnchangedFromLegacyDefault(nav: Record<string, unknown>): boolean {
+  const same = (key: keyof typeof LEGACY_DEFAULT_NAV): boolean =>
+    JSON.stringify(stringList(nav[key])) === JSON.stringify(LEGACY_DEFAULT_NAV[key]);
+  return 'pinned' in nav && 'shown' in nav && 'more' in nav && same('pinned') && same('shown') && same('more');
+}
+
 export function normalizeHomePreferences(input: RawPrefs = {}): HomePreferences {
   const d = DEFAULT_HOME_PREFERENCES;
   const panes = (input.panes && typeof input.panes === 'object' ? input.panes : {}) as Record<string, unknown>;
@@ -114,9 +134,9 @@ export function normalizeHomePreferences(input: RawPrefs = {}): HomePreferences 
     landing,
     panes: { order, hidden },
     nav: {
-      pinned: 'pinned' in nav ? stringList(nav.pinned) : d.nav.pinned,
-      shown: 'shown' in nav ? stringList(nav.shown) : d.nav.shown,
-      more: 'more' in nav ? stringList(nav.more) : d.nav.more,
+      pinned: navUnchangedFromLegacyDefault(nav) ? d.nav.pinned : 'pinned' in nav ? stringList(nav.pinned) : d.nav.pinned,
+      shown: navUnchangedFromLegacyDefault(nav) ? d.nav.shown : 'shown' in nav ? stringList(nav.shown) : d.nav.shown,
+      more: navUnchangedFromLegacyDefault(nav) ? d.nav.more : 'more' in nav ? stringList(nav.more) : d.nav.more,
     },
     quickActions: 'quickActions' in input ? quickActionList(input.quickActions) : d.quickActions,
     phoneSwitcher: 'phoneSwitcher' in input ? stringList(input.phoneSwitcher, 12) : d.phoneSwitcher,

@@ -34,6 +34,7 @@ import { extractJsonCandidate } from './json-repair.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { hashToolCall } from './tool-guardrail.js';
+import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { SETTLED_READ_REPLAY_KIND } from './settled-read-replay-semantics.js';
 
 export const SETTLED_READ_REPEAT_REPLAY_KIND = SETTLED_READ_REPLAY_KIND;
@@ -725,7 +726,33 @@ export function resolveSettledReadRepeat(
       if (!settled || settled.toolSlug !== currentSlug) return null;
       const modelFacingOutput = returned.data.result;
       if (typeof modelFacingOutput !== 'string' || !modelFacingOutput.trim()) return null;
-      const replayOutput = stripSettledReadHarnessAdvisory(modelFacingOutput);
+      let replayOutput = stripSettledReadHarnessAdvisory(modelFacingOutput);
+      // New presentations carry host annotations inside a valid JSON envelope.
+      // Strip this rail's earlier advisory only after the same exact invocation
+      // receipt authenticates that envelope; provider-shaped metadata alone is
+      // not permission to edit provider content. Keep the raw evidence untouched.
+      if (modelFacingOutput !== authority.record.output
+        && authority.record.invocationNonce
+        && exactToolOutputForInvocation({
+          sessionId: input.sessionId,
+          callId: sourceCallId,
+          toolName: input.toolName,
+          settlementNonce: authority.record.invocationNonce,
+          compactResult: modelFacingOutput,
+        }) === authority.record.output) {
+        try {
+          const presented = JSON.parse(modelFacingOutput);
+          const annotations = presented?.__clementine?.hostAnnotations;
+          if (presented?.__clementine?.kind === 'structured_projection_v1'
+            && Array.isArray(annotations)
+            && annotations.every((note: unknown) => typeof note === 'string')) {
+            presented.__clementine.hostAnnotations = annotations
+              .map((note: string) => stripSettledReadHarnessAdvisory(note))
+              .filter((note: string) => note.trim().length > 0);
+            replayOutput = JSON.stringify(presented);
+          }
+        } catch { /* legacy plaintext keeps its existing sanitizer */ }
+      }
       if (!replayOutput.trim()) return null;
       const sourceBehaviorScopeId = eventString(called, 'runScopeId');
       if (!sourceBehaviorScopeId) return null;

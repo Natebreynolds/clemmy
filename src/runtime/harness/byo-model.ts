@@ -27,6 +27,7 @@
  * every call site and the harness loop untouched.
  */
 import OpenAI from 'openai';
+import { createHash } from 'node:crypto';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
 import { withTracelessStep } from './traceless-step-model.js';
@@ -780,7 +781,11 @@ const clientCache = new Map<string, OpenAI>();
 const modelCache = new Map<string, Model>();
 
 function clientKey(byo: ByoBackendConfig): string {
-  return `${byo.baseURL}::${byo.apiKey.slice(-8)}`;
+  // A rotation with the same suffix is a different credential. Keep the full
+  // digest private to this in-memory cache; never log it or persist the key.
+  // Static and refreshable auth must not inherit each other's cached client.
+  const credentialDigest = createHash('sha256').update(byo.apiKey, 'utf8').digest('hex');
+  return `${byo.baseURL}::${credentialDigest}::${byo.refreshBearer ? 'refreshable' : 'static'}`;
 }
 
 function makeWrappedClient(byo: ByoBackendConfig): OpenAI {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { z } from 'zod';
 import type { StrategicMetaAction } from '../../memory/strategic-option-intent.js';
 import {
@@ -556,6 +557,8 @@ export interface HostCapabilityDescriptorV1 {
   outputKind: string;
   deliverableKind: string;
   destinationPosture: 'create_new' | 'named_existing' | null;
+  /** Every posture the capability supports, when it is an upsert. */
+  destinationPostures?: readonly ('create_new' | 'named_existing')[];
   evidenceKinds: readonly string[];
   handleRequired: boolean;
   readbackRequired: boolean;
@@ -949,7 +952,141 @@ function validateProposedWork(
         'capability reference effect does not match the proposed operation',
       );
     }
+    // A capability the host currently authorizes still need not PERFORM the
+    // requested operation. `destinationPosture` is the host's own typed answer
+    // to "does this create something new, or act on a named existing thing?",
+    // and it was never compared against what the work actually targets. Live
+    // C13 source 136121 declared destination named_existing and operation
+    // update_workflow_description, then bound it to
+    // cap:local:workflow_create:reversible, whose descriptor says create_new.
+    // Compile, seal and activation accepted that contradiction; later searches
+    // ranked workflow_update first but the graph had already persisted, so
+    // nothing could repair it and the edit died with zero writes.
+    //
+    // Compatibility is PER OPERATION, against that operation's own target and
+    // dependency lineage — never against the union of every destination in the
+    // plan. The union was wrong three separate ways (reviewer repro, C14):
+    //   * it rejected a valid save onto an EXISTING Space, because space_save is
+    //     an upsert whose primary posture reads create_new;
+    //   * it rejected create-Space-then-edit-view, because the edit acts on what
+    //     the create just produced, not on the plan's declared new destination;
+    //   * it ACCEPTED a wrong workflow_create for an existing workflow whenever
+    //     an unrelated Space contributed create_new to the union.
+    // Scoping by deliverable family fixes the first and third; lineage fixes the
+    // second. Typed contracts only — no titles, tool names or keyword grammar.
+    const supportedPostures = new Set<string>([
+      ...(descriptor.destinationPosture ? [descriptor.destinationPosture] : []),
+      ...(descriptor.destinationPostures ?? []),
+    ]);
+    if (supportedPostures.size > 0) {
+      // This operation's own targets: destinations for ITS deliverable family.
+      const ownTargets = workDestinationsOf(work).filter((sink) => (
+        sink.family === descriptor.deliverableKind
+      ));
+      // LINEAGE MUST BE DATA, NOT ORDER, and the predecessor must actually
+      // AUTHOR the artifact. `dependsOn` is sequencing: a workflow_run placed
+      // before an update shares the workflow family and would have looked like
+      // it produced the workflow, when a run receipt is not an authored
+      // artifact. The typed answer is the topology's `dataFrom` edge plus the
+      // host's own `purpose`: only a predecessor in the SAME authoring purpose
+      // can have produced the thing this operation now names.
+      const dataSources = new Set(
+        work.topology?.operations.find((entry) => entry.id === operation.id)?.dataFrom ?? [],
+      );
+      const producedByPredecessor = [...dataSources].some((dep) => {
+        const predecessorOp = work.operations.find((candidate) => candidate.id === dep);
+        if (!predecessorOp || hostNativeOperation(predecessorOp)) return false;
+        const predecessorId = host.catalog.capabilityIds.has(predecessorOp.capabilityRef)
+          ? predecessorOp.capabilityRef
+          : resolveDescriptorSuccessorId(predecessorOp.capabilityRef, descriptorById);
+        const predecessor = predecessorId ? descriptorById.get(predecessorId) : undefined;
+        if (!predecessor) return false;
+        return predecessor.deliverableKind === descriptor.deliverableKind
+          && predecessor.purpose === descriptor.purpose
+          && (predecessor.destinationPosture === 'create_new'
+            || (predecessor.destinationPostures ?? []).includes('create_new'));
+      });
+      const satisfiable = ownTargets.length === 0
+        || (producedByPredecessor && supportedPostures.has('named_existing'))
+        || ownTargets.some((sink) => supportedPostures.has(sink.posture));
+      if (!satisfiable) {
+        issue(
+          issues,
+          'capability_ref_destination_mismatch',
+          `work.operations.${index}.capabilityRef`,
+          // Name BOTH sides: the model cannot see either value, and without them
+          // it re-searches blindly instead of selecting the right operation.
+          `capability destination posture ${[...supportedPostures].join('/')} cannot satisfy the ${descriptor.deliverableKind} destination posture ${[...new Set(ownTargets.map((sink) => sink.posture))].join('/')}`,
+        );
+      }
+    }
   }
+  // PLAN-LEVEL TARGET COVERAGE. Per-operation compatibility is not enough when a
+  // family declares more than one target: a plan naming both an existing
+  // workflow and a new one, but citing only workflow_create, passed every
+  // per-operation check because create satisfied the create_new target while the
+  // named_existing target went unserved. Shared family alone does not establish
+  // which artifact an operation acts on, so require instead that EVERY declared
+  // target is served by at least one operation able to act on it.
+  if (catalogOpen && descriptors.length > 0) {
+    const byId = new Map(descriptors.map((entry) => [entry.id, entry]));
+    const descriptorFor = (ref: string) => (
+      byId.get(ref) ?? (() => {
+        const bound = resolveDescriptorSuccessorId(ref, byId);
+        return bound ? byId.get(bound) : undefined;
+      })()
+    );
+    for (const sink of workDestinationsOf(work)) {
+      // An EXPLICIT NATIVE destination is one the host catalog can actually
+      // serve — some disclosed capability authors that deliverable family. Such
+      // a target must be served by a cited operation.
+      //
+      // Scoping this to "families the plan already cites operations in" was the
+      // hole: live source 136708 declared destination family `workspace` and
+      // cited only cap:local:workflow_update (deliverableKind `workflow`), so no
+      // cited operation was in the workspace family, the check skipped itself,
+      // and the plan froze a Workspace target bound to a workflow operation.
+      // Families the catalog does not author at all are still skipped, so a plan
+      // whose sinks are described in other terms is not second-guessed here.
+      // An EXPLICIT NATIVE target must be served whether or not the disclosed
+      // card happens to contain its family. Keying on the card recreated the
+      // original escape: source 136708's card carried no Space descriptor at
+      // all, so the workspace target was skipped and a workflow binding froze
+      // against it. Nativeness is a property of the REGISTRY — the host knows
+      // `workspace` and `workflow` are deliverable families it authors — not of
+      // whatever this turn happened to disclose. A sink described in other
+      // terms is not a native target and is still not second-guessed here.
+      // Registry-native OR catalog-known. Keying on the registry alone fixed the
+      // missing-Space-card escape but skipped every non-native family, so a
+      // fully typed provider card with create/update operations admitted both
+      // bindings to create and left an existing target unserved — a coverage
+      // regression against C17. Unknown aliases are still never inferred.
+      const knownFamily = NATIVE_DELIVERABLE_FAMILIES.has(sink.family)
+        || descriptors.some((entry) => entry.deliverableKind === sink.family);
+      if (!knownFamily) continue;
+      const servers = work.operations.filter((candidate) => {
+        if (hostNativeOperation(candidate)) return false;
+        if (descriptorFor(candidate.capabilityRef)?.deliverableKind !== sink.family) return false;
+        const entry = descriptorFor(candidate.capabilityRef);
+        if (!entry) return false;
+        const postures = new Set<string>([
+          ...(entry.destinationPosture ? [entry.destinationPosture] : []),
+          ...(entry.destinationPostures ?? []),
+        ]);
+        // A capability with no declared posture is unconstrained and can serve.
+        return postures.size === 0 || postures.has(sink.posture);
+      });
+      if (servers.length === 0) {
+        issue(
+          issues,
+          'destination_target_unserved',
+          'work.destinations',
+          `no cited operation can act on the ${sink.family} target with posture ${sink.posture}`,
+        );
+      }
+    }
+  }
+
   if (catalogOpen && descriptors.length > 0) {
     const byOp = new Map(work.operations.map((operation) => [operation.id, operation]));
     const descriptorById = new Map(descriptors.map((entry) => [entry.id, entry]));
@@ -1295,6 +1432,15 @@ export function semanticProposalDigest(proposal: TurnSemanticProposalV1): string
  * This function is pure: it reads no database, clock, model, provider, or
  * environment state. A successful result still carries no execution authority.
  */
+/** Deliverable families the local registry itself authors. A destination naming
+ * one of these is an EXPLICIT NATIVE target and must be served by a cited
+ * operation before a plan may freeze. */
+const NATIVE_DELIVERABLE_FAMILIES: ReadonlySet<string> = new Set(
+  TOOL_REGISTRY.flatMap((entry) => (
+    entry.localPlanning?.deliverableKind ? [entry.localPlanning.deliverableKind] : []
+  )),
+);
+
 export function validateTurnSemanticProposalV1(
   raw: unknown,
   host: TurnSemanticHostViewV1,

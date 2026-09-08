@@ -1,3 +1,6 @@
+import { acceptReplayEvent, copyReplayCursor, createReplayCursor, pollRecentReplayPages, type ReplayCursor } from './replay-cursor';
+import { readLiveApprovalControl } from '@clem/chat-engine';
+import type { TaskMode } from './task-mode';
 /**
  * Chat plumbing — ports the legacy console's chat-dock streaming
  * (console.ts ~19877) to the React app: POST /api/harness/chat, then an
@@ -66,12 +69,14 @@ export async function postChat(
   sessionId: string | null,
   attachments: string[],
   clientRequestId: string,
+  taskMode?: TaskMode,
 ): Promise<ChatPostResult> {
   const result = await apiPost<ChatPostResult>('/api/harness/chat', {
     input,
     sessionId: sessionId || undefined,
     attachments,
     clientRequestId,
+    ...(taskMode ? { taskMode } : {}),
   });
   if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
     throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });
@@ -220,6 +225,8 @@ export interface StreamHandle {
   /** Highest event seq delivered so far — the resume cursor for a late-recovery
    *  watch after the stream gives up (the run may still finish server-side). */
   getLastSeq: () => number;
+  /** Exact raw continuation plus public overlap identities for late recovery. */
+  getReplayCursor: () => ReplayCursor;
 }
 
 /**
@@ -244,6 +251,8 @@ export function runHarnessStream(
   const RECONNECT_MAX_DELAY_MS = 8_000;
   const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
   let lastSeq = Number(opts.sinceSeq) || 0;
+  const replayCursor = createReplayCursor(lastSeq);
+  let replayInFlight: Promise<void> | null = null;
   let attempts = 0;
   let outageStartedAt = 0; // 0 = healthy; else Date.now() of the first error in this outage
   let reconnectPending = false; // one reconnect cycle at a time
@@ -288,45 +297,52 @@ export function runHarnessStream(
       approvalSettleTimer = null;
       void pollReplayFallback().finally(() => {
         // A sibling discovered by replay schedules a fresh settle window.
-        if (!closed && !approvalSettleTimer) finish();
+        if (!closed && !approvalSettleTimer) {
+          if (replayCursor.pending) scheduleApprovalSettle();
+          else finish();
+        }
       });
     }, 75);
   }
 
-  const handleEvent = (ev: HarnessEvent) => {
+  const handleEvent = (ev: HarnessEvent, replayAccepted = false) => {
     if (closed) return;
     resetIdle();
     // Auto-reconnect (and the replay/fallback paths) re-deliver already-seen
     // events — dedupe by seq so the activity strip isn't duplicated. Token
     // deltas carry seq 0 and MUST still pass through every time.
-    if (ev && typeof ev.seq === 'number' && ev.seq > 0) {
-      if (ev.seq <= lastSeq) return;
-      lastSeq = ev.seq;
-    }
+    if (!replayAccepted && !acceptReplayEvent(replayCursor, sessionId, ev)) return;
+    const own = !ev.sessionId || ev.sessionId === sessionId;
+    if (own && ev.seq > 0) lastSeq = Math.max(lastSeq, ev.seq);
     sawEvent = true;
     try { opts.onEvent(ev); } catch { /* render errors shouldn't kill the stream */ }
-    if (isTerminalEvent(ev.type)) {
+    if (own && isTerminalEvent(ev.type) && !readLiveApprovalControl(ev)) {
       sawTerminal = true;
       if (ev.type === 'approval_requested') scheduleApprovalSettle();
       else finish();
     }
   };
 
-  const pollReplayFallback = async () => {
-    if (closed) return;
-    try {
-      const url = withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events/recent?sinceSeq=${lastSeq}&limit=500`);
-      const res = await fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } });
-      const data = (await res.json().catch(() => ({}))) as { events?: HarnessEvent[] };
-      for (const ev of data.events ?? []) { handleEvent(ev); if (closed) break; }
-    } catch { /* best effort */ }
+  const pollReplayFallback = (): Promise<void> => {
+    if (closed) return Promise.resolve();
+    if (replayInFlight) return replayInFlight;
+    replayInFlight = pollRecentReplayPages({
+      sessionId, cursor: replayCursor, active: () => !closed,
+      fetchPage: async (url) => {
+        const res = await fetch(withToken(url), { credentials: 'same-origin', headers: { accept: 'application/json' } });
+        if (res.ok === false) throw new Error('Session replay is temporarily unavailable.');
+        return res.json();
+      },
+      onEvent: (event) => { handleEvent(event, true); return !closed; },
+    }).catch(() => { /* retain this exact cursor for the next attempt */ }).finally(() => { replayInFlight = null; });
+    return replayInFlight;
   };
 
   const connect = () => {
     if (closed) return;
     if (es) { try { es.close(); } catch { /* ignore */ } es = null; }
     const base = `/api/sessions/${encodeURIComponent(sessionId)}/events`;
-    es = new EventSource(withToken(lastSeq > 0 ? `${base}?sinceSeq=${lastSeq}` : base));
+    es = new EventSource(withToken(replayCursor.scanSeq > 0 ? `${base}?sinceSeq=${replayCursor.scanSeq}` : base));
 
     es.addEventListener('replay', (e) => {
       try {
@@ -371,6 +387,7 @@ export function runHarnessStream(
     promise,
     stop: () => { if (!closed) { streamError = ''; finish(); } },
     getLastSeq: () => lastSeq,
+    getReplayCursor: () => copyReplayCursor(replayCursor),
   };
 }
 
@@ -385,29 +402,31 @@ export function watchForLateCompletion(
   sessionId: string,
   sinceSeq: number,
   onEvent: (ev: HarnessEvent) => void,
-  opts: { intervalMs?: number; maxAttempts?: number } = {},
+  opts: { intervalMs?: number; maxAttempts?: number; replayCursor?: ReplayCursor } = {},
 ): { cancel: () => void } {
   const intervalMs = opts.intervalMs ?? 15_000;
   const maxAttempts = opts.maxAttempts ?? 40; // ~10 minutes
   let cancelled = false;
-  let lastSeq = sinceSeq;
+  const replayCursor = opts.replayCursor ? copyReplayCursor(opts.replayCursor) : createReplayCursor(sinceSeq);
   let attempt = 0;
   const tick = async () => {
     if (cancelled) return;
     attempt += 1;
     try {
-      const url = withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events/recent?sinceSeq=${lastSeq}&limit=500`);
-      const res = await fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } });
-      const data = (await res.json().catch(() => ({}))) as { events?: HarnessEvent[] };
-      for (const ev of data.events ?? []) {
-        if (ev && typeof ev.seq === 'number' && ev.seq > 0) {
-          if (ev.seq <= lastSeq) continue;
-          lastSeq = ev.seq;
-        }
-        onEvent(ev);
-        if (isTerminalEvent(ev.type)) { cancelled = true; return; }
-      }
-    } catch { /* daemon still down — keep watching */ }
+      await pollRecentReplayPages({
+        sessionId, cursor: replayCursor, active: () => !cancelled,
+        fetchPage: async (url) => {
+          const res = await fetch(withToken(url), { credentials: 'same-origin', headers: { accept: 'application/json' } });
+          if (res.ok === false) throw new Error('Session replay is temporarily unavailable.');
+          return res.json();
+        },
+        onEvent: (event) => {
+          onEvent(event);
+          if (isTerminalEvent(event.type) && !readLiveApprovalControl(event)) cancelled = true;
+          return !cancelled;
+        },
+      });
+    } catch { /* daemon still down — keep this continuation for the next poll */ }
     if (!cancelled && attempt < maxAttempts) setTimeout(() => { void tick(); }, intervalMs);
   };
   setTimeout(() => { void tick(); }, intervalMs);

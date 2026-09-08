@@ -565,6 +565,7 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
         {
           variantId: 'create',
           capabilityRef: 'cap:local:write_file:create',
+          effect: 'local_write',
           reversibility: 'create_only',
           destructive: false,
           destinationPosture: 'create_new',
@@ -572,6 +573,7 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
         {
           variantId: 'append',
           capabilityRef: 'cap:local:write_file:append',
+          effect: 'local_write',
           reversibility: 'irreversible',
           destructive: false,
           destinationPosture: 'named_existing',
@@ -579,6 +581,7 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
         {
           variantId: 'overwrite',
           capabilityRef: 'cap:local:write_file:overwrite',
+          effect: 'local_write',
           reversibility: 'irreversible',
           destructive: true,
           destinationPosture: 'named_existing',

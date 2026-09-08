@@ -19,6 +19,8 @@ export interface RecallableToolTextOptions {
   toolName?: string | null;
   sessionId?: string;
   callId?: string;
+  /** Host commentary, separate from the provider payload and its raw receipt. */
+  hostAnnotations?: readonly string[];
 }
 
 const EXACT_OUTPUT_RECEIPT_RE = /\[exact-output-receipt:v1 nonce=([0-9a-f-]{36}) sha256=([0-9a-f]{64})\]/ig;
@@ -251,6 +253,32 @@ export function formatRecallableToolText(
   const callId = options.callId ?? active?.callId;
   const toolName = options.toolName ?? active?.toolName ?? 'tool';
   let persistenceFailed = false;
+  let hostAnnotations = [...(options.hostAnnotations ?? [])].filter((note) => note.length > 0);
+
+  // Local handlers, adapters and outer brackets can all format one result.
+  // An authenticated projection is already backed by this invocation's raw
+  // bytes; persisting the projection again would overwrite that evidence.
+  // Reuse the existing exact receipt verifier, never infer clipping from prose.
+  if (sessionId && callId && active?.settlementNonce) {
+    const exact = exactToolOutputForInvocation({ sessionId, callId, toolName,
+      compactResult: text, settlementNonce: active.settlementNonce });
+    if (exact instanceof TruncatedToolOutputResult) return JSON.stringify(exact);
+    if (typeof exact === 'string' && exact !== text) {
+      if (text.length <= maxChars && hostAnnotations.length === 0) return text;
+      // Only after exact same-invocation redemption may a smaller rendering
+      // inherit the previous host annotation envelope. Provider JSON alone
+      // cannot authenticate its metadata or lend another call this receipt.
+      try {
+        const prior = JSON.parse(text).__clementine?.hostAnnotations;
+        if (Array.isArray(prior) && prior.every((note: unknown) => typeof note === 'string')) {
+          hostAnnotations = [...new Set([...prior, ...hostAnnotations])];
+        }
+      } catch { /* non-JSON presentation has no structured host annotations */ }
+      // A caller requested a smaller display. Derive it from the same original
+      // bytes so its receipt still authenticates the complete retained result.
+      text = exact;
+    }
+  }
 
   // Persist even a small result when an exact harness invocation exists.
   // Reconciliation must never fall back to the call-id/longest-wins recall row
@@ -266,7 +294,10 @@ export function formatRecallableToolText(
       });
     } catch { persistenceFailed = true; }
   }
-  if (text.length <= maxChars) return text;
+  if (text.length <= maxChars && hostAnnotations.length === 0) return text;
+
+  const annotationText = hostAnnotations.length > 0
+    ? `[Host annotations — separate from provider result]\n${hostAnnotations.join("\n")}\n\n` : "";
 
   // The result is about to be clipped/digested. If it lists addressable
   // resources, surface their ids ABOVE the body so they survive (the root-cause
@@ -275,7 +306,7 @@ export function formatRecallableToolText(
   const withIndex = (body: string): string => (idIndex ? `${idIndex}\n\n${body}` : body);
 
   if (!sessionId || !callId || persistenceFailed) {
-    const dense = densifyMarkdownForModelHead(text);
+    const dense = `${annotationText}${densifyMarkdownForModelHead(text)}`;
     if (!idIndex) return truncateToolTextWithin(dense, maxChars);
     const boundedIndex = truncateToolTextWithin(idIndex, Math.max(1, Math.floor(maxChars * 0.5)));
     const bodyBudget = Math.max(1, maxChars - boundedIndex.length - 2);
@@ -301,6 +332,7 @@ export function formatRecallableToolText(
       callId,
       exactOutputReceipt: exactReceipt,
       resourceIndex: idIndex || undefined,
+      hostAnnotations,
     });
     if (structured) return structured;
   }
@@ -321,7 +353,7 @@ export function formatRecallableToolText(
   }
   const receiptReserve = exactReceipt ? exactReceipt.length + 1 : 0;
   const compactBudget = Math.max(200, maxChars - receiptReserve);
-  let compact = withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
+  let compact = annotationText + withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
     maxChars: compactBudget,
     toolName,
     callId,

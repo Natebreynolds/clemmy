@@ -25,6 +25,7 @@ const {
 const {
   rememberToolSchema,
   resetToolSchemaCache,
+  getCachedToolSchema,
 } = await import('../../tools/composio-schema-cache.js');
 const { digestSchema } = await import('../../tools/tool-contract-store.js');
 
@@ -99,13 +100,19 @@ test('cold adapter rehydration restores exact proof-argument validation from its
 
   assert.ok(entry.validateForegroundPayload,
     'the pre-existing proof manifest must regain its validator after the in-memory cache is cleared');
+  assert.deepEqual(getCachedToolSchema(operationId), schema,
+    'durable rehydration preserves the entire schema, independent of object-member order');
+  assert.equal(digestSchema(getCachedToolSchema(operationId)), manifest.externalDefinition!.providerInputSchemaDigest);
   const refused = entry.validateForegroundPayload!({ wrong_id: 'record-42' });
   assert.equal(refused.ok, false);
   if (refused.ok) return;
   assert.match(refused.repair, /^\[provider-dispatch:not-started:invalid-args\] FIXTURE_LOOKUP_RECORD arguments did not match its exact current schema\./);
   // Exact failing pointers replace the old top-level name lists.
   assert.match(refused.repair, /Failing paths: "\/record_key" \(missing required, expected string\), "\/wrong_id" \(unknown field\)\./);
-  assert.match(refused.repair, /Required shape at "\/": object; required: \[record_key\]; record_key\*: string, include_metadata: boolean\./);
+  const shape = refused.repair.match(/Required shape at "\/": object; required: \[record_key\]; ([^.]+)\./);
+  assert.ok(shape, 'the repair includes the required object field');
+  assert.deepEqual(new Set(shape[1]!.split(', ')), new Set(['record_key*: string', 'include_metadata: boolean']),
+    'the repair preserves both field types without depending on schema object-member order');
   // The refusal never sends the model to discovery: the recovery surface the
   // host derives from it contains only the refused carrier. The single
   // remaining mention of tool_search is the negative instruction.

@@ -1774,16 +1774,21 @@ test('runTurn replays eventlog transcript when a Claude-only session has no SDK 
   });
 
   assert.equal(result.status, 'completed');
-  const replay = seenItems.find((item) => {
-    const record = item as { role?: unknown; content?: unknown };
-    return record.role === 'system' &&
-      typeof record.content === 'string' &&
-      record.content.includes('[SESSION REPLAY]');
-  }) as { content?: string } | undefined;
-  assert.ok(replay?.content, 'standard harness lane injects the canonical eventlog replay');
-  assert.match(replay.content, /USER: Draft the Acme renewal update/);
-  assert.match(replay.content, /YOU: I drafted the Acme renewal update/);
-  assert.doesNotMatch(replay.content, /USER: pick this back up/, 'current input is not duplicated into prior history');
+  const replayText = seenItems.filter((item) => {
+    const row = item as { role?: unknown; content?: unknown };
+    return row.role === 'assistant' || (row.role === 'user' && row.content !== 'pick this back up');
+  }).map(item => {
+    const content = (item as { content?: unknown }).content;
+    return typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map(part => typeof part?.text === 'string' ? part.text : '').join('') : '';
+  }).join('\n');
+  assert.ok(!seenItems.some(item => (item as { role?: unknown; content?: unknown }).role === 'system'
+    && String((item as { content?: unknown }).content ?? '').includes('[SESSION REPLAY]')),
+  'public transcript does not become system instructions');
+  assert.ok(replayText, 'standard harness lane injects the canonical eventlog replay');
+  assert.match(replayText, /Draft the Acme renewal update/);
+  assert.match(replayText, /I drafted the Acme renewal update/);
+  assert.doesNotMatch(replayText, /USER: pick this back up/, 'current input is not duplicated into prior history');
 });
 
 test('runTurn replays only newer Claude turns missing from an older OpenAI snapshot', async () => {
@@ -1847,18 +1852,23 @@ test('runTurn replays only newer Claude turns missing from an older OpenAI snaps
     runRunner,
   });
 
-  const replay = seenItems.find((item) => {
-    const record = item as { role?: unknown; content?: unknown };
-    return record.role === 'system' &&
-      typeof record.content === 'string' &&
-      record.content.includes('[SESSION REPLAY]');
-  }) as { content?: string } | undefined;
-  assert.ok(replay?.content, 'newer Claude turn missing from the snapshot is replayed');
-  assert.match(replay.content, /USER: Now draft the renewal email/);
-  assert.match(replay.content, /YOU: I drafted the renewal email but did not send it/);
-  assert.doesNotMatch(replay.content, /Summarize the Atlas kickoff notes/, 'older snapshot-backed user turn is not duplicated');
-  assert.doesNotMatch(replay.content, /Atlas kickoff summary is saved/, 'older snapshot-backed assistant turn is not duplicated');
-  assert.doesNotMatch(replay.content, /USER: pick up the renewal draft/, 'current input is not duplicated into prior history');
+  const replayText = seenItems.filter((item) => {
+    const row = item as { role?: unknown; content?: unknown };
+    return row.role === 'assistant' || (row.role === 'user' && row.content !== 'pick up the renewal draft');
+  }).map(item => {
+    const content = (item as { content?: unknown }).content;
+    return typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map(part => typeof part?.text === 'string' ? part.text : '').join('') : '';
+  }).join('\n');
+  assert.ok(!seenItems.some(item => (item as { role?: unknown; content?: unknown }).role === 'system'
+    && String((item as { content?: unknown }).content ?? '').includes('[SESSION REPLAY]')),
+  'public transcript does not become system instructions');
+  assert.ok(replayText, 'newer Claude turn missing from the snapshot is replayed');
+  assert.match(replayText, /Now draft the renewal email/);
+  assert.match(replayText, /I drafted the renewal email but did not send it/);
+  assert.equal((replayText.match(/Summarize the Atlas kickoff notes/g) ?? []).length, 1, 'older snapshot-backed user turn is not duplicated');
+  assert.equal((replayText.match(/Atlas kickoff summary is saved/g) ?? []).length, 1, 'older snapshot-backed assistant turn is not duplicated');
+  assert.doesNotMatch(replayText, /USER: pick up the renewal draft/, 'current input is not duplicated into prior history');
 });
 
 test('runTurn replays an unpaired awaiting_user_input question into a later brain turn', async () => {
@@ -1897,16 +1907,21 @@ test('runTurn replays an unpaired awaiting_user_input question into a later brai
     runRunner,
   });
 
-  const replay = seenItems.find((item) => {
-    const record = item as { role?: unknown; content?: unknown };
-    return record.role === 'system' &&
-      typeof record.content === 'string' &&
-      record.content.includes('[SESSION REPLAY]');
-  }) as { content?: string } | undefined;
-  assert.ok(replay?.content, 'the prior pause question is replayed');
-  assert.match(replay.content, /USER: Deploy the staging build/);
-  assert.match(replay.content, /YOU: Which target should I deploy/);
-  assert.doesNotMatch(replay.content, /USER: use staging/, 'current answer is not duplicated into prior history');
+  const replayText = seenItems.filter((item) => {
+    const row = item as { role?: unknown; content?: unknown };
+    return row.role === 'assistant' || (row.role === 'user' && row.content !== 'use staging');
+  }).map(item => {
+    const content = (item as { content?: unknown }).content;
+    return typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map(part => typeof part?.text === 'string' ? part.text : '').join('') : '';
+  }).join('\n');
+  assert.ok(!seenItems.some(item => (item as { role?: unknown; content?: unknown }).role === 'system'
+    && String((item as { content?: unknown }).content ?? '').includes('[SESSION REPLAY]')),
+  'public transcript does not become system instructions');
+  assert.ok(replayText, 'the prior pause question is replayed');
+  assert.match(replayText, /Deploy the staging build/);
+  assert.match(replayText, /Which target should I deploy/);
+  assert.doesNotMatch(replayText, /USER: use staging/, 'current answer is not duplicated into prior history');
 });
 
 test('normalizeError: a non-Error object never renders as "[object Object]" (the run_failed crash)', () => {
@@ -2327,7 +2342,7 @@ test('runTurn injects a transient memory primer before the first model response'
     && ((item as { content: string }).content.includes('[MEMORY PRIMER]')),
   ) as { content: string } | undefined;
   assert.ok(primer, 'expected memory primer to be appended to model input');
-  assert.match(primer.content, /Use relevant hits/i);
+  assert.match(primer.content, /Use complete, applicable facts directly and preserve their dates and sources/);
   assert.match(primer.content, /Salesforce prospecting/i);
   assert.match(primer.content, /stale untouched accounts/i);
 
@@ -7168,7 +7183,7 @@ test('objective judge: a downstream claim-grounding bounce never leaves a premat
   );
 });
 
-test('objective judge: an unexecuted script-backed skill prevents the read receipt from skipping its deterministic floor', async () => {
+test('objective judge: an unrelated prior skill read does not add a renderer obligation to the current read', async () => {
   resetEventLog();
   const objective = [
     'Refresh the proof release queue current items from the same connected source.',
@@ -7279,8 +7294,15 @@ test('objective judge: an unexecuted script-backed skill prevents the read recei
   }));
 
   assert.equal(result.status, 'completed');
-  assert.equal(modelTurns, 2, 'the missing prescribed script forces one corrective continuation');
-  assert.equal(judgeCalls, 2, 'the read receipt never bypasses the skill-owned completion path');
+  assert.equal(modelTurns, 1, 'an unrelated prior skill read cannot force a corrective renderer turn');
+  assert.equal(judgeCalls, 0, 'the verified read path does not acquire a review obligation from an unrelated skill');
+  assert.equal(result.lastDecision?.reply, reply, 'the current requested fields remain byte-preserved');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['tool_called'] })
+      .filter((event) => event.data.tool === 'run_shell_command').length,
+    0,
+    'the unrelated renderer was never invoked',
+  );
   assert.equal(
     listEventsForConv(sess.id, { types: ['heartbeat'] })
       .filter((event) => event.data.kind === 'verified_read_completion_receipt').length,
@@ -14528,12 +14550,12 @@ test('a failing synthetic-directive turn on a chat session never surfaces the in
 });
 
 test('recall budget defaults scale with the routed window; env overrides stay absolute', async () => {
-  // 5 calls / 150KB were tuned for a 200K window — a 1M-window brain paging a
-  // large parked payload hit the cliff at 3 slices (2026-08-05 deep-look).
+  // The old five-call cliff blocked productive paging. Calls now have a
+  // 50-call runaway backstop; the 150KB context budget still scales separately.
   const { _testOnly_recallBudgetDefaults } = await import('./loop.js');
   const { recallBudgetMaxCalls, recallBudgetMaxBytes } = _testOnly_recallBudgetDefaults;
-  assert.equal(recallBudgetMaxCalls(1), 5, 'tuned default at scale 1');
-  assert.equal(recallBudgetMaxCalls(4), 20, '1M window quadruples the call budget');
+  assert.equal(recallBudgetMaxCalls(1), 50, 'runaway backstop at scale 1');
+  assert.equal(recallBudgetMaxCalls(4), 200, '1M window quadruples the call budget');
   assert.equal(recallBudgetMaxBytes(4), 600_000, '1M window quadruples the byte budget');
   const prev = process.env.CLEMMY_RECALL_MAX_CALLS;
   process.env.CLEMMY_RECALL_MAX_CALLS = '7';

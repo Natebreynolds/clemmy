@@ -15,6 +15,7 @@ import { apiGet } from '@/lib/api';
 import type { CommandCenter } from '@/lib/types';
 import { listWorkingNowSnapshot } from '@/lib/activity';
 import { presentWorkingNow } from '@/lib/activity-presentation';
+import { pollIntervalForStream, useConsoleActionStream } from '@/lib/action-stream';
 
 const NARROW_QUERY = '(max-width: 720px)';
 
@@ -44,16 +45,26 @@ export function AppShell() {
   const title = titleForPath(location.pathname);
 
   const navigate = useNavigate();
+  // ONE push subscription for the whole app, mounted here because the shell is
+  // the only component that outlives every route. It invalidates the queries
+  // below the moment the daemon acts, so the badge stops lagging reality by a
+  // poll interval. The polls stay armed as the degraded path — a stream that
+  // never connects leaves the console behaving exactly as it did before.
+  const stream = useConsoleActionStream();
   // ONE working-now source for the whole app: the server projection, rendered
   // through the ONE shared presenter (presentWorkingNow) that the drawer,
   // /tasks, and mobile also render from — never a private count of the raw
   // entries. The conversation the user is currently watching is omitted in
   // the presenter call: its bubble already narrates itself.
-  const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
+  const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, pollIntervalForStream(stream, 12_000));
   // ONE needs-you number for every badge: the command center's decision-shaped
   // list (the same query Home and Chat render), never the presenter's broader
   // 'needs attention' bucket — two denominators on one screen was the clutter.
-  const commandCenter = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
+  const commandCenter = usePoll(
+    ['command-center'],
+    () => apiGet<CommandCenter>('/api/console/home/command-center'),
+    pollIntervalForStream(stream, 6_000),
+  );
   const needsYouCount = commandCenter.data?.needsYou?.length ?? 0;
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
   const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
@@ -87,7 +98,7 @@ export function AppShell() {
     <div className="flex h-screen w-screen overflow-hidden bg-canvas text-fg">
       <a
         href="#main"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[200] focus:rounded-md focus:bg-surface focus:px-3 focus:py-2 focus:shadow-lg"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[200] focus:rounded-md focus:bg-surface focus:px-3 focus:py-2 focus:shadow-popover"
       >
         Skip to content
       </a>

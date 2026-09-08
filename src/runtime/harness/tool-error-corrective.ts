@@ -58,9 +58,10 @@ export function classifyToolError(text: string, raw?: unknown): ToolFailureKind 
 export function asyncJobTimeoutCorrective(label: string, summary: string, where = ''): string {
   return [
     `⚠️ ${label} TIMED OUT${where}: ${summary}`,
-    `A timeout means the call exceeded its time budget. If this is a LONG-RUNNING JOB — an actor/agent run, a large scrape or export, or a blocking "sync get dataset items" call — do NOT retry the SAME blocking call; it will time out again. Use the ASYNC pattern: START the job with an action that returns a run/job id (e.g. a *_RUN / *_ACT_RUNS / *_CREATE / *_START action), then POLL its status/results (e.g. *_GET / *_RUNS_GET / dataset-items) until it finishes.`,
-    `If that START call returns a QUEUED RECEIPT (a bare run/task/job id with no result yet), you do NOT need to hand-poll it in a loop: the harness auto-resolves or backgrounds a queued receipt for you and delivers the real result — just start it and continue.`,
-    `Only if this was a brief network blip (NOT a long job) should you retry the identical call ONCE.`,
+    `The HTTP wait ended; a LONG-RUNNING JOB may still be running remotely. Do NOT repeat the call or START a replacement while its outcome is unknown. First inspect the existing run using its exact returned run/job ID and current status/results tools. If no ID was returned, reconcile the original request from provider evidence; do not guess a run ID or substitute the latest run. Report the unresolved attempt if it cannot be identified.`,
+    `For work that has not started, use an ASYNC action that returns an exact run/job handle. START the job once, retain that handle, then POLL its status and retrieve the final result through separately admitted tool calls.`,
+    `A QUEUED RECEIPT is not the final result. The foreground path returns the receipt and requires those explicit status/result calls; it does not automatically poll or background the job. Each call retains its normal account, authority, cancellation and settlement checks.`,
+    `Retry a brief network blip only when the recorded evidence establishes that the original operation did not start. A timeout alone does not establish that.`,
   ].join('\n\n');
 }
 

@@ -8,6 +8,7 @@ import {
   api,
   getAuthStatus,
   getInboxSummary,
+  INBOX_SUMMARY_PATH,
   isInvalidOriginHandoffError,
   logout,
   mintOriginHandoff,
@@ -33,7 +34,20 @@ import {
   workspaceFromSearch,
   workspaceNavigationIntent,
 } from './lib/workspace-route';
+import {
+  TAB_IDS,
+  destinationSearch,
+  inboxNotificationFromSearch,
+  runFromSearch,
+  searchHasDestination,
+  tabFromSearch,
+  type TabId as Tab,
+} from './lib/deep-link';
 import { SWITCHER_MORE, phoneSwitcherIds, useHomePreferences } from './lib/home-prefs';
+import { phoneHeaderChrome } from './lib/home-presentation';
+import { appBadgeAuthAction, clearAppBadge, syncAppBadge } from './lib/app-badge';
+import { lastGoodAt } from './lib/last-good';
+import { needsYouChrome } from './lib/needs-you';
 import { useWorkingNow } from './lib/working-now';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
@@ -51,26 +65,6 @@ import { TitleSwitcher, type SwitcherEntry } from './components/TitleSwitcher';
 import { AskCapsule } from './components/AskCapsule';
 import { CustomizeSheet } from './components/CustomizeSheet';
 
-type Tab = 'home' | 'inbox' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
-
-const TAB_IDS = new Set<Tab>(['home', 'inbox', 'chats', 'agents', 'spaces', 'workflows', 'memory', 'activity', 'settings']);
-
-function tabFromSearch(search: string): Tab {
-  const value = new URLSearchParams(search).get('tab');
-  return value && TAB_IDS.has(value as Tab) ? value as Tab : 'home';
-}
-
-function inboxNotificationFromSearch(search: string): string | null {
-  return new URLSearchParams(search).get('notification');
-}
-
-/** An explicit destination (a push, a handoff, a pairing) outranks the
- * "open on launch" preference; only a bare cold launch honors it. */
-function searchHasDestination(search: string): boolean {
-  const params = new URLSearchParams(search);
-  return ['tab', 'notification', 'workspace', 'pair', 'adopt'].some((key) => params.has(key));
-}
-
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -83,6 +77,9 @@ export function App() {
   const [workspaceId, setWorkspaceId] = useState<string | null>(
     () => workspaceFromSearch(window.location.search),
   );
+  /** The run a URL addresses — a push, a reload, or a tap from any surface
+   *  that shows running work. Activity owns the run view. */
+  const [runId, setRunId] = useState<string | null>(() => runFromSearch(window.location.search));
   // The title is the navigator: tapping it opens the switcher sheet. The
   // full section menu (the left drawer) stays behind "More".
   const [switcherOpen, setSwitcherOpen] = useState(false);
@@ -105,6 +102,11 @@ export function App() {
   const [name, setName] = useState('');
   const [decisions, setDecisions] = useState(0);
   const [decisionsKnown, setDecisionsKnown] = useState(false);
+  /** When this count was last CONFIRMED — a live read, or the stamp of the
+   *  remembered copy that answered. The chrome discloses it. */
+  const [decisionsAsOf, setDecisionsAsOf] = useState<string | null>(null);
+  /** False the moment a poll fails or the worker answers off its shelf. */
+  const [decisionsLive, setDecisionsLive] = useState(false);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
   const [handoff, setHandoff] = useState<ChatHandoff | null>(null);
   /** The Chats LIST is a capsule surface; an open thread has its own composer. */
@@ -219,6 +221,7 @@ export function App() {
       setTab(tabFromSearch(window.location.search));
       setInboxNotification(inboxNotificationFromSearch(window.location.search));
       setWorkspaceId(workspaceFromSearch(window.location.search));
+      setRunId(runFromSearch(window.location.search));
     };
     window.addEventListener('popstate', syncLocation);
     return () => window.removeEventListener('popstate', syncLocation);
@@ -231,17 +234,29 @@ export function App() {
     if (!authenticated) {
       setDecisions(0);
       setDecisionsKnown(false);
+      setDecisionsAsOf(null);
+      setDecisionsLive(false);
       return;
     }
     let cancelled = false;
     const refreshCount = async () => {
       try {
         const summary = await getInboxSummary();
-        if (!cancelled) {
-          setDecisions(summary.needsYou);
-          setDecisionsKnown(true);
-        }
-      } catch { /* each screen owns its visible error; the badge keeps last good */ }
+        if (cancelled) return;
+        // A 200 off the worker's shelf is not an answer from the Mac. The
+        // stamp is how old this number actually is; without it the chrome
+        // would say "Needs you · 3" from a six-hour-old copy while the Inbox
+        // underneath honestly said it could not reach anything.
+        const stamp = lastGoodAt(INBOX_SUMMARY_PATH);
+        setDecisions(summary.needsYou);
+        setDecisionsKnown(true);
+        setDecisionsAsOf(stamp ?? new Date().toISOString());
+        setDecisionsLive(!stamp);
+      } catch {
+        // Each screen owns its visible error and the badge keeps its last
+        // good value — but it stops claiming to be current.
+        if (!cancelled) setDecisionsLive(false);
+      }
     };
     void refreshCount();
     const onWake = () => { if (document.visibilityState === 'visible') void refreshCount(); };
@@ -259,6 +274,11 @@ export function App() {
   const setAuthoritativeDecisionCount = useCallback((count: number) => {
     setDecisions(count);
     setDecisionsKnown(true);
+    // The Inbox's own sources are never served from the shelf, so a complete
+    // count it publishes was read live. The 8-second poll above corrects this
+    // the moment the daemon stops answering.
+    setDecisionsAsOf(new Date().toISOString());
+    setDecisionsLive(true);
   }, []);
 
   // The greeting name, resolved at runtime from the profile — never hardcoded,
@@ -413,18 +433,40 @@ export function App() {
     return () => { cancelled = true; };
   }, [refreshAuth]);
 
-  const navigateTo = useCallback((next: Tab, notificationId?: string | null) => {
+  const navigateTo = useCallback((
+    next: Tab,
+    target?: { notificationId?: string | null; runId?: string | null },
+  ) => {
     userNavigated.current = true;
     setTab(next);
     setWorkspaceId(null);
-    const selectedNotification = next === 'inbox' ? notificationId ?? null : null;
+    // A selection only survives onto the tab that can act on it; destinationSearch
+    // owns that rule so the URL and this state cannot disagree.
+    const selectedNotification = next === 'inbox' ? target?.notificationId ?? null : null;
+    const selectedRun = next === 'activity' ? target?.runId ?? null : null;
     setInboxNotification(selectedNotification);
-    const params = new URLSearchParams();
-    if (next !== 'home') params.set('tab', next);
-    if (next === 'inbox' && selectedNotification) params.set('notification', selectedNotification);
-    const query = params.toString();
-    window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    setRunId(selectedRun);
+    const search = destinationSearch({ tab: next, notificationId: selectedNotification, runId: selectedRun });
+    window.history.replaceState(null, '', `${window.location.pathname}${search}`);
   }, []);
+
+  /** Work is a destination: every surface that shows a run hands it here. */
+  const openRun = useCallback((sessionId: string) => {
+    haptic('light');
+    navigateTo('activity', { runId: sessionId });
+  }, [navigateTo]);
+
+  // The number on the icon is the ONE decision count, so the phone is useful
+  // without being opened. An unknown count leaves the icon exactly as it is —
+  // and so does an unknown SESSION. `authStatus` is null until /m/auth/status
+  // answers, and clearing on that null wiped a real badge on every cold open
+  // with the Mac asleep. Only a confirmed sign-out clears (see appBadgeAuthAction).
+  useEffect(() => {
+    const action = appBadgeAuthAction(authStatus);
+    if (action === 'clear') { clearAppBadge(); return; }
+    if (action === 'hold') return;
+    syncAppBadge({ count: decisions, known: decisionsKnown });
+  }, [authStatus, decisions, decisionsKnown]);
 
   // "Open on launch" — honored once, on a bare cold launch, after the record
   // has actually been read. A push, a pairing, or a tap the user already made
@@ -446,7 +488,10 @@ export function App() {
       <div class="login-shell">
         <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
         <h1>Clementine</h1>
-        <p class="error">{bootError}</p>
+        {/* The raw failure ("HTTP 500", "Failed to fetch") is engine vocabulary. Say
+            what it means for the person holding the phone; keep the raw as a detail. */}
+        <p class="error">Can’t reach Clementine right now. Nothing was lost — she’s just not answering yet.</p>
+        <p class="empty-body">{bootError}</p>
         {/* A dead-end boot screen forces a force-quit; a retry is a fetch. */}
         <button class="login-repair" onClick={() => void refreshAuth()}>Try again</button>
       </div>
@@ -521,18 +566,44 @@ export function App() {
     }, reduceMotion ? 0 : 250);
   };
 
+  // ONE presenter for all three Needs-you surfaces (pill, switcher, drawer),
+  // so none of them can claim to be current while the others disclose an age.
+  const needsYou = needsYouChrome({
+    count: decisions,
+    known: decisionsKnown,
+    asOf: decisionsAsOf,
+    live: decisionsLive,
+    nowMs: Date.now(),
+  });
+
+  // The header is identity, where you are, and connection state. Anything else
+  // it carries is a shortcut to something the CURRENT screen cannot show — so
+  // on Home, which now leads with the answer and lists the work below it, the
+  // row is three items and the title finally has room. (Before: five controls
+  // fought for it — mark, title, a "6·42" chip, a "Needs you · 86" pill and
+  // the connection state — and the title was crushed to a sliver.)
+  const headerChrome = phoneHeaderChrome({ tab, needsYouSignal: needsYou.show });
+
   const switcherEntries: SwitcherEntry[] = phoneSwitcherIds(prefs, TABS.map((t) => t.id))
     .filter((id) => id !== SWITCHER_MORE)
     .flatMap((id) => {
       const entry = TABS.find((t) => t.id === id);
-      return entry ? [{ id, label: entry.label, icon: entry.icon, badge: id === 'inbox' ? decisions : undefined }] : [];
+      if (!entry) return [];
+      const badged = id === 'inbox' && needsYou.show;
+      return [{
+        id,
+        label: entry.label,
+        icon: entry.icon,
+        badge: badged ? needsYou.badgeText : undefined,
+        badgeStale: badged ? needsYou.stale : undefined,
+        badgeLabel: badged ? needsYou.badgeAriaLabel : undefined,
+      }];
     });
 
   // The capsule is the one persistent control — on Home, Needs you, and the
   // Chats list. An open thread has its own composer; other screens have
   // their own primary action.
   const capsuleShown = tab === 'home' || tab === 'inbox' || (tab === 'chats' && chatsListVisible);
-  const decisionsLabel = decisions > 99 ? '99+' : String(decisions);
 
   return (
     <>
@@ -549,7 +620,11 @@ export function App() {
             onClick={() => { haptic('light'); setSwitcherOpen(true); }}
           >
             <span class="title-switch-text">{TAB_TITLES[tab]}</span>
-            {tab === 'inbox' && decisions > 0 ? <span class="title-badge" aria-hidden="true">{decisionsLabel}</span> : null}
+            {tab === 'inbox' && needsYou.show ? (
+              <span class={`title-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel} aria-hidden="true">
+                {needsYou.badgeText}
+              </span>
+            ) : null}
             <svg class="title-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="m6 9 6 6 6-6" />
             </svg>
@@ -558,16 +633,22 @@ export function App() {
         <div class="meta">
           {/* Compact running-work chip — the sheet's trigger, which must not
               float at the bottom now that the dock is gone. Absent at zero
-              (presenter contract: the pill disappears when total is 0). */}
-          <RunningTasksSheet />
-          {tab === 'home' && decisions > 0 ? (
+              (presenter contract: the pill disappears when total is 0), and
+              absent on the screens that already list the work themselves. */}
+          {headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} /> : null}
+          {/* The pill has no room for a banner, so it discloses the age in the
+              space it has: "Needs you · 3 · 6h ago" when the number came off
+              the worker's shelf or a poll stopped answering. It is the standing
+              signal for screens that have no other way to show it — never on
+              Home or Needs you, which say it in their own content. */}
+          {headerChrome.needsPill ? (
             <button
               type="button"
-              class="needs-pill"
-              aria-label={`${decisions} ${decisions === 1 ? 'item needs' : 'items need'} you. Open Needs you`}
+              class={`needs-pill${needsYou.stale ? ' needs-pill-stale' : ''}`}
+              aria-label={needsYou.pillAriaLabel}
               onClick={() => { haptic('light'); navigateTo('inbox'); }}
             >
-              <span class="needs-pill-face" aria-hidden="true">Needs you · {decisionsLabel}</span>
+              <span class="needs-pill-face" aria-hidden="true">{needsYou.pillText}</span>
             </button>
           ) : null}
           {door === 'direct' ? (
@@ -674,8 +755,10 @@ export function App() {
                 >
                   <span class="drawer-item-icon">{t.icon}</span>
                   <span class="drawer-item-label">{t.label}</span>
-                  {t.id === 'inbox' && decisions > 0 ? (
-                    <span class="drawer-badge">{decisions > 9 ? '9+' : decisions}</span>
+                  {t.id === 'inbox' && needsYou.show ? (
+                    <span class={`drawer-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel}>
+                      {needsYou.drawerBadgeText}
+                    </span>
                   ) : null}
                 </button>
               ))}
@@ -710,12 +793,20 @@ export function App() {
           {tab === 'home' ? (
             <Home
               name={name}
+              onOpenRun={openRun}
               onAsk={(draft) => goToChat({ draft, autoSend: true })}
               onOpenInbox={() => navigateTo('inbox')}
               onOpenWorkspace={openWorkspace}
+              onOpenActivity={() => navigateTo('activity')}
               onCustomize={() => setCustomizeOpen(true)}
               needsYouCount={decisions}
               needsYouCountKnown={decisionsKnown}
+              // The pill is suppressed on Home (Home says the number itself),
+              // so the age it used to carry travels with the number instead —
+              // same ONE presenter, so chrome and Home can never disagree
+              // about how old this count is.
+              needsYouCountLive={!needsYou.stale}
+              needsYouCountAge={needsYou.age}
             />
           ) : tab === 'inbox' ? (
             <Inbox
@@ -724,6 +815,7 @@ export function App() {
               onReply={(sessionId, draft) => goToChat({ sessionId: sessionId ?? undefined, draft })}
               onOpenSettings={() => navigateTo('settings')}
               onOpenWorkflows={() => navigateTo('workflows')}
+              onOpenRun={openRun}
             />
           ) : tab === 'chats' ? (
             <Chats
@@ -749,11 +841,33 @@ export function App() {
               <Settings
                 door={door}
                 doorCopy={DOOR_COPY[door]}
-                onSignOut={async () => { await logout(); await refreshAuth(); }}
+                onSignOut={async () => {
+                  // Sign-out is LOCAL and unconditional. Telling the daemon is
+                  // a courtesy that fails offline, and letting that failure
+                  // skip the rest left the remembered reads, the icon badge
+                  // and the signed-in shell all alive after a tap that looked
+                  // like it did nothing.
+                  let told = true;
+                  try {
+                    await logout();
+                  } catch {
+                    told = false;
+                  }
+                  clearAppBadge();
+                  setAuthStatus((s) => (s ? { ...s, authenticated: false } : s));
+                  // Only re-ask the daemon when it actually heard us; offline,
+                  // the local decision stands.
+                  if (told) await refreshAuth();
+                }}
                 onCustomize={() => setCustomizeOpen(true)}
               />
             )
-            : <Activity />}
+            : (
+              <Activity
+                initialRunId={runId}
+                onRunChange={(sessionId) => navigateTo('activity', { runId: sessionId })}
+              />
+            )}
         </ScreenBoundary>
       </main>
 
@@ -807,7 +921,7 @@ const TAB_TITLES: Record<Tab, string> = {
   inbox: 'Needs you',
   chats: 'Chats',
   agents: 'Agents',
-  spaces: 'Workspaces',
+  spaces: 'Spaces',
   workflows: 'Flows',
   memory: 'Memory',
   activity: 'Activity',

@@ -677,6 +677,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
 
 test('Claude direct discovery denies same-id replay, admits a settled continuation, and denies its unexecuted replay after restart', async () => {
   const { discoveryGovernor } = await import('./discovery-governor.js');
+  const { exactDiscoveryRequestDigest } = await import('./discovery-boundary.js');
   const session = eventlog.createSession({ kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
@@ -687,11 +688,11 @@ test('Claude direct discovery denies same-id replay, admits a settled continuati
   });
   const verdicts: Array<{ id: string; behavior: string; message?: string }> = [];
   let simulatedProviderBodies = 0;
+  const firstInput = { query: 'find a tool that can inspect configured workspace roots' };
+  const secondInput = { query: 'find another tool that can inspect repository roots' };
   setClaudeAgentSdkQueryForTest(((params: any) => {
     const firstId = 'toolu_discovery_first';
     const secondId = 'toolu_discovery_second';
-    const firstInput = { query: 'find a tool that can inspect configured workspace roots' };
-    const secondInput = { query: 'find another tool that can inspect repository roots' };
     const gen = (async function* () {
       yield {
         type: 'system', subtype: 'init', model: 'claude-sonnet-4-6',
@@ -790,7 +791,7 @@ test('Claude direct discovery denies same-id replay, admits a settled continuati
   );
   assert.match(verdicts[1]?.message ?? '', /same_call_replay/);
   assert.match(verdicts[2]?.message ?? '', /same_call_replay/);
-  assert.match(verdicts[4]?.message ?? '', /new_call_requires_retry_epoch/);
+  assert.match(verdicts[4]?.message ?? '', /same_call_replay/);
   assert.match(verdicts[7]?.message ?? '', /same_call_replay/);
   assert.equal(
     simulatedProviderBodies,
@@ -801,12 +802,23 @@ test('Claude direct discovery denies same-id replay, admits a settled continuati
     sessionId: session.id,
     sourceUserSeq: source.seq,
   });
-  assert.equal(state?.claims.broad_discovery?.callId, 'toolu_discovery_second');
-  assert.equal(
-    state?.claims.broad_discovery?.outcome,
-    'failed',
-    'the admitted continuation that never produced a tool result is settled failed at the SDK boundary',
-  );
+  assert.equal(state?.policy.claimKeyVersion, 'exact_request_v1');
+  // The compatibility category view chooses one subject, not the latest call.
+  // Both distinct requests must retain their own exact durable settlement.
+  const claims = state?.allClaims.filter((claim) => claim.category === 'broad_discovery');
+  assert.equal(claims?.length, 2);
+  const firstClaim = claims?.find((claim) => claim.callId === 'toolu_discovery_first');
+  const secondClaim = claims?.find((claim) => claim.callId === 'toolu_discovery_second');
+  assert.ok(firstClaim);
+  assert.ok(secondClaim);
+  assert.equal(firstClaim.subject, `request:${exactDiscoveryRequestDigest('tool_search', firstInput)}`);
+  assert.equal(secondClaim.subject, `request:${exactDiscoveryRequestDigest('tool_search', secondInput)}`);
+  assert.notEqual(firstClaim.subject, secondClaim.subject);
+  assert.equal(firstClaim.outcome, 'succeeded', 'the executed discovery retains its successful settlement');
+  assert.ok(firstClaim.settledAt);
+  assert.equal(secondClaim.outcome, 'failed',
+    'the admitted request that never produced a tool result is settled failed at the SDK boundary');
+  assert.ok(secondClaim.settledAt);
   assert.equal(
     eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
     4,

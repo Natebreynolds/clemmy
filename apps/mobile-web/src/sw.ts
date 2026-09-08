@@ -10,8 +10,12 @@
  *     fingerprinted so stale-cache is impossible).
  *   - Network-first for HTML so an updated index.html is picked up
  *     without a hard reload.
- *   - Never cache /m/api/* or /m/auth/* — those must always hit the
- *     network for fresh state and cookie semantics.
+ *   - Never cache /m/auth/* — credential routes must always hit the
+ *     network for fresh cookie semantics.
+ *   - Never cache an ACTIONABLE /m/api/* route. A small read-only set
+ *     (LAST_GOOD_PATHS below) keeps a stamped last-good copy so a cold
+ *     open with the Mac asleep is not a blank wall; everything else
+ *     falls through to the network exactly as before.
  *
  * Web Push handling is deferred to Week 3b. We register the listener
  * stub so a future SW activation already responds to `push` events.
@@ -20,6 +24,77 @@ const sw = self as unknown as ServiceWorkerGlobalScope;
 
 const CACHE_VERSION = 'clem-mobile-v1';
 const SHELL_ASSETS = ['/m/', '/m/manifest.webmanifest', '/m/icon.svg', '/m/apple-touch-icon.svg'];
+
+// A classic service worker (registered without { type: 'module' }, see
+// main.tsx) cannot import. These four values are the literal twin of
+// lib/last-good.ts, and last-good.test.ts fails if the two ever drift.
+const LAST_GOOD_CACHE = 'clem-mobile-last-good-v1';
+const LAST_GOOD_HEADER = 'x-clem-last-good';
+const LAST_GOOD_STORED_HEADER = 'x-clem-cached-at';
+const CLEAR_LAST_GOOD_MESSAGE = 'clem:clear-last-good';
+const LAST_GOOD_PATHS = ['/m/api/inbox/summary', '/m/api/runs'];
+
+function isLastGoodPath(pathname: string): boolean {
+  return LAST_GOOD_PATHS.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
+/**
+ * Sign-out fence for the store below.
+ *
+ * A put is fire-and-forget by design (a failed one costs freshness, never the
+ * answer) — but a poll already in flight when the page asks for the cache to
+ * be dropped would re-create the store and land its row AFTER the delete,
+ * leaving a signed-out phone able to page through the last session's work.
+ * So every request records the epoch it started in, a clear bumps it, and a
+ * put from an older epoch is abandoned. The clear also drains the puts already
+ * past that check before deleting, which closes the other half of the race.
+ */
+let lastGoodEpoch = 0;
+const pendingPuts = new Set<Promise<unknown>>();
+
+function trackPut(work: Promise<unknown>): void {
+  pendingPuts.add(work);
+  void work.then(() => pendingPuts.delete(work), () => pendingPuts.delete(work));
+}
+
+/**
+ * Network-first with a durable, stamped fallback.
+ *
+ * The stamp is the whole point: the page must be able to tell a live answer
+ * from a remembered one, so a served copy carries the time it was taken and
+ * the page reads it back off the header (lib/api.ts), keeps the connection
+ * door on "offline", and labels the screen.
+ */
+async function lastGoodFirst(request: Request): Promise<Response> {
+  // Captured BEFORE the fetch: a response that arrives after a sign-out
+  // belongs to the session that is now over.
+  const epoch = lastGoodEpoch;
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const body = await response.clone().blob();
+      const headers = new Headers(response.headers);
+      // The rotating session fingerprint is live state, not content. A stored
+      // copy replaying an old one would make every later device proof sign
+      // over a fingerprint that has since rotated.
+      headers.delete('x-clem-session-fp');
+      headers.set(LAST_GOOD_STORED_HEADER, new Date().toISOString());
+      const copy = new Response(body, { status: 200, statusText: 'OK', headers });
+      // A failed put (quota, private mode) costs freshness, never the answer.
+      trackPut(caches.open(LAST_GOOD_CACHE)
+        .then((cache) => (epoch === lastGoodEpoch ? cache.put(request, copy) : undefined))
+        .catch(() => undefined));
+    }
+    return response;
+  } catch (err) {
+    const cache = await caches.open(LAST_GOOD_CACHE);
+    const cached = await cache.match(request);
+    if (!cached) throw err;
+    const headers = new Headers(cached.headers);
+    headers.set(LAST_GOOD_HEADER, headers.get(LAST_GOOD_STORED_HEADER) ?? new Date(0).toISOString());
+    return new Response(await cached.blob(), { status: 200, statusText: 'OK', headers });
+  }
+}
 
 sw.addEventListener('install', (event) => {
   event.waitUntil(
@@ -30,8 +105,26 @@ sw.addEventListener('install', (event) => {
 sw.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(keys
+        .filter((key) => key !== CACHE_VERSION && key !== LAST_GOOD_CACHE)
+        .map((key) => caches.delete(key))))
       .then(() => sw.clients.claim()),
+  );
+});
+
+// Sign-out. A remembered read must not outlive the session that earned it, so
+// the page asks for the whole store to go the moment the credential does.
+sw.addEventListener('message', (event) => {
+  const type = (event.data as { type?: unknown } | null)?.type;
+  if (type !== CLEAR_LAST_GOOD_MESSAGE) return;
+  // Bump first: every read still in flight is now from a dead session and its
+  // put is abandoned. Then wait out the puts that already passed that check,
+  // so the delete is the LAST write, not a write the race can outlive.
+  lastGoodEpoch += 1;
+  event.waitUntil(
+    Promise.allSettled([...pendingPuts])
+      .then(() => caches.delete(LAST_GOOD_CACHE))
+      .then(() => undefined),
   );
 });
 
@@ -42,10 +135,17 @@ sw.addEventListener('fetch', (event) => {
   if (url.origin !== sw.location.origin) return;
   if (!url.pathname.startsWith('/m/')) return;
 
-  // Never cache the API or auth endpoints — they're cookie-bound and
-  // depend on the daemon's live state.
-  if (url.pathname.startsWith('/m/api/') || url.pathname.startsWith('/m/auth/')) {
-    return; // fall through to network
+  // Auth is never cached, at any age: it establishes a credential.
+  if (url.pathname.startsWith('/m/auth/')) return;
+
+  if (url.pathname.startsWith('/m/api/')) {
+    // Read-only routes keep a stamped last-good copy so a sleeping Mac is not
+    // a blank app. Everything actionable (approvals, questions, plans, trust)
+    // still falls straight through — a stale decision must never be offered.
+    if (isLastGoodPath(url.pathname)) {
+      event.respondWith(lastGoodFirst(request));
+    }
+    return;
   }
 
   // HTML navigations: network-first, fall back to cached index for offline.
@@ -89,16 +189,24 @@ sw.addEventListener('push', (event) => {
   const title = (data && typeof data.title === 'string') ? data.title : 'Clementine';
   const body = (data && typeof data.body === 'string') ? data.body : 'You have an update.';
   const url = (data && typeof data.url === 'string') ? data.url : '/m/';
-  const tag = (data && typeof data.kind === 'string') ? `clem-${data.kind}` : 'clem';
+  const notificationId = (data && typeof data.notificationId === 'string') ? data.notificationId : undefined;
+  // Collapse on the durable notification, not on its kind. While every banner
+  // read "Clem needs you", folding five of them into one lost nothing; now that
+  // each names its own run, gate or decision, a kind-wide tag would hide four
+  // real things behind the fifth. A re-delivery of the SAME id still replaces
+  // its banner instead of stacking.
+  const tag = notificationId ? `clem-n-${notificationId}` : 'clem';
   event.waitUntil(
     sw.registration.showNotification(title, {
       body,
       icon: '/m/icon.svg',
       badge: '/m/icon.svg',
-      // tag = collapse repeated pings of the same kind into one banner
-      // (e.g. five "approval pending" while the phone is locked).
       tag,
-      data: { url, notificationId: (data && typeof data.notificationId === 'string') ? data.notificationId : undefined },
+      // Deliberately no `actions`: iOS Safari drops a showNotification actions
+      // array silently and Notification.maxActions is undefined there, so a
+      // feature check passes and the buttons simply never appear. The tap
+      // itself routes to the exact card instead (see `url`).
+      data: { url, notificationId },
     }),
   );
 });

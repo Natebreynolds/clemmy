@@ -1,6 +1,17 @@
 /**
  * Home — what Clem wants you to know, the moment you open your phone.
  *
+ * It opens with an ANSWER, not with a stack of lists at one visual weight.
+ * The greeting is an eyebrow; the largest type on the screen is the single
+ * most important state, and every word of it comes from home-presentation.ts,
+ * where the rules are pure and tested against the owner's own measured
+ * numbers. Two of those rules bind this file:
+ *
+ *  - A count on this screen is the number of rows this screen renders. The
+ *    shell's total is only ever named against the screen that can show it.
+ *  - "Running" means the server certified the work LIVE. Everything else that
+ *    has not ended is unfinished, and is said in the past tense.
+ *
  * One home per truth: the Needs-you count is the shell's (ONE source, the
  * inbox summary); running work is the ONE working-now snapshot the shell
  * polls; "While you were away" comes from durable notifications, never
@@ -39,17 +50,20 @@ import { PushPrompt } from '../components/PushPrompt';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { RunControl } from '../components/RunControl';
 import { haptic } from '../lib/native-bridge';
-import { lifecycleLabel, mobileRunControl } from '../lib/running-tasks';
+import { mobileRunControl, runStatusLabel } from '../lib/running-tasks';
 import { presentWorkingNow, type PresentedWorkingNowEntry } from '@clem/chat-engine';
 import { useScreenData } from '../lib/use-screen-data';
 import { approvalKindLabel, approvalQuestion } from '../lib/inbox-presentation';
-import { homeCanSayAllClear, homeStatusLine } from '../lib/home-presentation';
+import { homeLead, homeNeedsYouPane, homeWorkPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
 const MAX_AWAY_ROWS = 4;
+// Every other pane on this screen is capped. This one was not, which is why
+// the owner's twenty-one stalled runs were the tallest thing on his phone.
+const MAX_WORK_ROWS = 4;
 const MAX_QUICK_CHIPS = 3;
 
 interface Props {
@@ -57,9 +71,22 @@ interface Props {
   onAsk: (draft: string) => void;
   onOpenInbox: () => void;
   onOpenWorkspace: (id: string) => void;
+  /** Open a run's own screen. Every surface that shows running work must be
+   *  able to reach it — a row with a pulse and a progress bar that cannot be
+   *  opened is a typing indicator, not a work item. */
+  onOpenRun: (sessionId: string) => void;
+  /** Activity lists the WHOLE working-now projection, so it is the screen a
+   *  capped work pane is allowed to name its remainder against. */
+  onOpenActivity: () => void;
   onCustomize: () => void;
   needsYouCount: number;
   needsYouCountKnown: boolean;
+  /** Whether that count came from a read that actually reached the Mac, and
+   *  how old it is if not. The header pill used to be the only thing on the
+   *  phone that disclosed this; on Home the pill is suppressed (Home says the
+   *  number itself), so the disclosure travels with the number instead. */
+  needsYouCountLive: boolean;
+  needsYouCountAge: string | null;
 }
 
 interface HomeData {
@@ -87,7 +114,19 @@ const EMPTY: HomeData = {
   approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [], workspaces: [],
 };
 
-export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, needsYouCount, needsYouCountKnown }: Props) {
+/** Sort key for the work pane's cap: a person blocking outranks live work,
+ *  which outranks a run that has been silent for days. Membership is the
+ *  shared presenter's, so this orders rows without re-deciding what they are. */
+function workRank(presented: PresentedWorkingNowEntry<ActivityEntry>): number {
+  if (presented.membership === 'needs_you') return 0;
+  if (presented.membership === 'stalled') return 2;
+  return 1;
+}
+
+export function Home({
+  name, onAsk, onOpenInbox, onOpenWorkspace, onOpenRun, onOpenActivity, onCustomize,
+  needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
+}: Props) {
   const { prefs } = useHomePreferences();
   const panes = phoneVisiblePanes(prefs);
   const paneSet = new Set<HomePaneId>(panes);
@@ -136,6 +175,31 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
   const workingNow = useWorkingNow();
   const working = workingNow.data ?? { observedAt: '', entries: [] };
   const workingView = presentWorkingNow(working.entries, working.observedAt);
+  // ONE definition of "running" in the app, and it is the shared presenter's
+  // three-way membership. Home used to count `p.pulse` — which is
+  // `liveness === 'live'` — so a run that started forty seconds ago with no
+  // declared lease horizon (liveness 'unknown', membership 'running') landed
+  // under a heading reading "Still open" while the Chats chip, reading the
+  // same snapshot through `view.running`, said "1 running". Membership is what
+  // stops six two-day-old blocked test runs filling a section headed
+  // "Running", and re-deriving it here is what made the two disagree.
+  const liveNow = workingView.running;
+  // Rows a person is BLOCKING. This is a demand and it is the one the shell's
+  // Inbox count cannot see: a workflow parked at awaiting_approval never
+  // produces an Inbox card, so this must reach the lead on its own.
+  const workNeedsYou = workingView.needsYou;
+  // Quiet past the stall threshold: started, never ended, nobody waiting.
+  const unfinished = workingView.stalled;
+  const workPane = homeWorkPane({
+    running: liveNow, needsYou: workNeedsYou, unfinished, max: MAX_WORK_ROWS,
+  });
+  // The cap decides what does NOT get shown, so the order decides what
+  // survives it: a row a person is blocking outranks live work, which outranks
+  // a run that has been silent for days. Within a group the server's order
+  // stands (Array#sort is stable).
+  const workRows = workingView.entries.slice()
+    .sort((a, b) => workRank(a) - workRank(b))
+    .slice(0, workPane.shown);
 
   // Durable results only. Open decisions live in Needs you; everything that
   // is finished, or was read, is what happened while you were away.
@@ -150,55 +214,72 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
     : [];
   const upcoming = paneSet.has('projects') ? reminders.slice(0, 3) : [];
 
-  const greeting = timeGreeting(new Date().getHours(), greetingName(name));
-  const baseStatus = homeStatusLine({
-    decisionCount: needsYouCount,
-    decisionCountKnown: needsYouCountKnown,
-    currentTaskCountKnown: workingNow.known,
-    running: workingView.running,
-    currentNeedsAttention: workingView.needsYou,
-    loading,
+  // The decision rows this screen can actually put on the glass. The shell's
+  // count is a different number and is never printed as if it were this one.
+  const needsItems: NeedsItem[] = paneSet.has('needs_you') ? [
+    ...questions.map((row): NeedsItem => ({ key: `question:${row.id}`, kind: 'question', row })),
+    ...workspaceChoosers.map((row): NeedsItem => ({ key: `chooser:${row.chooserId}`, kind: 'chooser', row })),
+    ...plans.map((row): NeedsItem => ({ key: `plan:${row.id}`, kind: 'plan', row })),
+    ...approvals.map((row): NeedsItem => ({ key: `approval:${row.approvalId}`, kind: 'approval', row })),
+  ] : [];
+  const needsShown = needsItems.slice(0, MAX_NEEDS_ROWS);
+  const needsPane = homeNeedsYouPane({
+    rendered: needsShown.length,
+    counted: needsYouCount,
+    countedKnown: needsYouCountKnown,
   });
-  const awayLine = awayRows.length > 0
-    ? `${awayRows.length} update${awayRows.length === 1 ? '' : 's'} while you were away`
-    : '';
-  const status = !loading && awayLine && !baseStatus.startsWith('Checking')
-    ? baseStatus === 'Everything is quiet' ? awayLine : `${baseStatus} · ${awayLine}`
-    : baseStatus;
 
-  const allClear = homeCanSayAllClear({
+  const greeting = timeGreeting(new Date().getHours(), greetingName(name));
+  const lead = homeLead({
     loading,
+    answerableShown: needsShown.length,
     needsYouCount,
     needsYouCountKnown,
-    currentTaskCount: workingView.total,
-    currentTaskCountKnown: workingNow.known,
-    reminderCount: upcoming.length,
-    recentChatCount: 0,
-  }) && awayRows.length === 0 && projects.length === 0;
+    countLive: needsYouCountLive,
+    countAge: needsYouCountAge,
+    running: liveNow,
+    workNeedsYou,
+    unfinished,
+    workKnown: workingNow.known,
+    workPaneShown: paneSet.has('running') && workPane.show,
+    awayCount: awayRows.length,
+    otherRows: upcoming.length + projects.length,
+  });
+  // Narrowed here, not in the callback: TypeScript drops a property narrowing
+  // the moment it crosses into a closure.
+  const leadAction = lead.action;
 
   const sections: Record<HomePaneId, () => JSX.Element | null> = {
-    quick_actions: () => (
-      <QuickActions actions={prefs.quickActions} onAsk={onAsk} onCustomize={onCustomize} />
-    ),
-    needs_you: () => (needsYouCount > 0 ? (
+    // No actions saved means no row: the door to adding one is the Customize
+    // button at the foot of the screen, which is already there.
+    quick_actions: () => (prefs.quickActions.length > 0 ? (
+      <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
+    ) : null),
+    needs_you: () => (needsPane.show ? (
       <NeedsYou
-        count={needsYouCount}
-        approvals={approvals}
-        plans={plans}
-        workspaceChoosers={workspaceChoosers}
-        questions={questions}
-        loading={loading}
+        pane={needsPane}
+        items={needsShown}
         onOpenInbox={onOpenInbox}
         onChanged={refresh}
       />
     ) : null),
-    running: () => (workingView.total > 0 ? (
+    running: () => (workPane.show ? (
       <section class="home-section" aria-labelledby="home-running">
-        <h2 id="home-running" class="section-head pane-head">Running</h2>
+        <h2 id="home-running" class="section-head pane-head">{workPane.title}</h2>
         <div class="home-card">
-          {workingView.entries.map((p, i) => (
-            <RunningRow key={p.entry.runKey} presented={p} index={i} onChanged={workingNow.refresh} />
+          {workRows.map((p, i) => (
+            <RunningRow key={p.entry.runKey} presented={p} index={i} onChanged={workingNow.refresh} onOpenRun={onOpenRun} />
           ))}
+          {/* The remainder, named against Activity — the one screen that maps
+              the whole projection. Same rule the Needs-you pane obeys. */}
+          {workPane.moreLabel ? (
+            <button type="button" class="home-row home-row-tap home-row-link" onClick={() => { haptic('light'); onOpenActivity(); }}>
+              <span>{workPane.moreLabel}</span>
+              <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+            </button>
+          ) : null}
         </div>
       </section>
     ) : null),
@@ -234,7 +315,7 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
         ) : null}
         {projects.length > 0 ? (
           <section class="home-section" aria-labelledby="home-projects">
-            <h2 id="home-projects" class="section-head pane-head">Projects</h2>
+            <h2 id="home-projects" class="section-head pane-head">Spaces</h2>
             <div class="home-card">
               {projects.map((space) => (
                 <button key={space.id} type="button" class="home-row home-row-tap" onClick={() => { haptic('light'); onOpenWorkspace(space.id); }}>
@@ -259,17 +340,48 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
 
   return (
     <div class="home">
-      <header class="home-greet rise" style={{ '--i': 0 }}>
-        <h2>{greeting}</h2>
-        <p class="home-status">{status}</p>
+      {/* THE LEAD. The greeting is an eyebrow — it was the largest type on the
+          screen and it never told anyone anything. What the phone says first
+          is now the answer, and it is the only thing at this weight. */}
+      <header class={`home-lead home-lead-${lead.tone} rise`} style={{ '--i': 0 }}>
+        {lead.tone === 'clear' ? (
+          <img class="home-lead-mark" src="/m/clemmy.png" alt="" width="52" height="52" />
+        ) : null}
+        <p class="home-lead-eyebrow">{greeting}</p>
+        {/* The answer rewrites itself as polls land — from "Catching up…" to
+            whatever is true — so it is announced. One live region for the
+            whole sentence, its qualifier and its provenance, or a screen
+            reader hears the count change and never hears how old it is. */}
+        <div class="home-lead-say" aria-live="polite">
+          <h2 class="home-lead-head">{lead.headline}</h2>
+          {lead.detail ? <p class="home-lead-detail">{lead.detail}</p> : null}
+          {/* Never render the confident version of an unknown: when the shell's
+              count came off the service-worker shelf, the number is still
+              given — with how old it is. */}
+          {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
+        </div>
+        {leadAction ? (
+          <button
+            type="button"
+            class="home-lead-action"
+            onClick={() => {
+              haptic('light');
+              if (leadAction.target === 'activity') onOpenActivity();
+              else onOpenInbox();
+            }}
+          >
+            <span>{leadAction.label}</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+          </button>
+        ) : null}
       </header>
 
-      <PushPrompt />
-
       <ScreenNotice
-        error={error}
-        offline={offline}
-        onRetry={() => void refresh()}
+        error={error ?? workingNow.error}
+        offline={offline || workingNow.offline}
+        onRetry={() => { void refresh(); void workingNow.refresh(); }}
         hasData={needsYouCount + workingView.total + awayRows.length + projects.length > 0}
       />
 
@@ -280,13 +392,11 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
 
       {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
 
-      {allClear ? (
-        <div class="empty">
-          <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
-          <p class="empty-title">All clear</p>
-          <p class="empty-body">Nothing needs you and nothing’s running. Ask her something below.</p>
-        </div>
-      ) : null}
+      {/* Housekeeping, not work. It used to sit directly under the greeting as
+          the loudest element on the screen — a gradient card above every real
+          thing Clem was doing. Enabling push matters, but never more than the
+          decision waiting on you. */}
+      <PushPrompt />
 
       <button type="button" class="home-customize" onClick={() => { haptic('light'); onCustomize(); }}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -305,10 +415,11 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
 
 type RunState = 'busy' | 'queued' | 'error';
 
-function QuickActions({ actions, onAsk, onCustomize }: {
+function QuickActions({ actions, onAsk }: {
+  /** Never empty: Home does not mount this pane without saved actions, so the
+   *  screen no longer opens with a row whose only content is an invitation. */
   actions: QuickAction[];
   onAsk: (draft: string) => void;
-  onCustomize: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
@@ -349,19 +460,6 @@ function QuickActions({ actions, onAsk, onCustomize }: {
       });
     }
   };
-
-  if (actions.length === 0) {
-    return (
-      <div class="qa-row">
-        <button type="button" class="qa-chip qa-chip-add" onClick={() => { haptic('light'); onCustomize(); }}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          Add a quick action
-        </button>
-      </div>
-    );
-  }
 
   const shown = expanded ? actions : actions.slice(0, MAX_QUICK_CHIPS);
   const overflow = actions.length - shown.length;
@@ -415,37 +513,26 @@ type NeedsItem =
   | { key: string; kind: 'plan'; row: PlanProposalRow }
   | { key: string; kind: 'approval'; row: ApprovalRow };
 
-function NeedsYou({ count, approvals, plans, workspaceChoosers, questions, loading, onOpenInbox, onChanged }: {
-  count: number;
-  approvals: ApprovalRow[];
-  plans: PlanProposalRow[];
-  workspaceChoosers: WorkspaceDestinationChooser[];
-  questions: InboxQuestion[];
-  loading: boolean;
+function NeedsYou({ pane, items, onOpenInbox, onChanged }: {
+  /** Presenter output: the count this pane is allowed to print, and how the
+   *  remainder is named. The pane is only mounted when it has rows. */
+  pane: NeedsYouPane;
+  items: NeedsItem[];
   onOpenInbox: () => void;
   onChanged: () => void | Promise<void>;
 }) {
-  const items: NeedsItem[] = [
-    ...questions.map((row): NeedsItem => ({ key: `question:${row.id}`, kind: 'question', row })),
-    ...workspaceChoosers.map((row): NeedsItem => ({ key: `chooser:${row.chooserId}`, kind: 'chooser', row })),
-    ...plans.map((row): NeedsItem => ({ key: `plan:${row.id}`, kind: 'plan', row })),
-    ...approvals.map((row): NeedsItem => ({ key: `approval:${row.approvalId}`, kind: 'approval', row })),
-  ];
-  const shown = items.slice(0, MAX_NEEDS_ROWS);
-  // The count is the shell's ONE truth; anything it counts that has no row
-  // here (a standing-permission request, a workflow gate) lives in Needs you.
-  const remaining = Math.max(0, count - shown.length);
   return (
     <section class="home-section" aria-labelledby="home-needs">
       <h2 id="home-needs" class="section-head pane-head">
         Needs you
-        <span class="section-count">{count}</span>
+        {/* The rows on this card, not the shell's total. A header that claimed
+            86 over an empty card is what this whole wave is about. */}
+        <span class="section-count">{pane.count}</span>
       </h2>
       <div class="home-card">
-        {shown.length === 0 && loading ? <div class="home-row home-row-static"><div class="skeleton-stack home-skeleton" aria-hidden="true"><i /></div></div> : null}
-        {shown.map((item) => <NeedsRow key={item.key} item={item} onOpenInbox={onOpenInbox} onChanged={onChanged} />)}
+        {items.map((item) => <NeedsRow key={item.key} item={item} onOpenInbox={onOpenInbox} onChanged={onChanged} />)}
         <button type="button" class="home-row home-row-tap home-row-link" onClick={() => { haptic('light'); onOpenInbox(); }}>
-          <span>{remaining > 0 ? `${remaining} more in Needs you` : 'Open Needs you'}</span>
+          <span>{pane.moreLabel}</span>
           <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
             <path d="m9 18 6-6-6-6" />
           </svg>
@@ -588,22 +675,30 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
 
 // ─── running ────────────────────────────────────────────────────────────────
 
-function RunningRow({ presented, index, onChanged }: {
+function RunningRow({ presented, index, onChanged, onOpenRun }: {
   presented: PresentedWorkingNowEntry<ActivityEntry>;
   index: number;
   onChanged: () => void | Promise<void>;
+  onOpenRun: (sessionId: string) => void;
 }) {
   const entry = presented.entry;
   const control = mobileRunControl(entry);
+  // Only a harness session has a run screen; a row without one stays static
+  // rather than offering a tap that goes nowhere.
+  const sessionId = entry.sessionId;
   const progress = entry.progress && entry.progress.total > 0
     ? entry.progress
     : entry.activity && typeof entry.activity.total === 'number' && entry.activity.total > 0
       ? { completed: entry.activity.completed ?? 0, total: entry.activity.total }
       : null;
   const pct = progress ? Math.max(0, Math.min(100, Math.round((progress.completed / progress.total) * 100))) : null;
-  const waiting = presented.presentation === 'needs_you';
-  return (
-    <article class={`home-row home-row-static home-run${waiting ? ' home-run-waiting' : ''}`} style={{ '--i': index }}>
+  // The warn accent means A PERSON IS THE BLOCKER, which is `membership`, not
+  // `presentation`: the presenter collapses stalled rows into the same quiet
+  // `needs_you` presentation, so reading it here painted a run that has been
+  // silent for two days as a question waiting on the owner.
+  const waiting = presented.membership === 'needs_you';
+  const head = (
+    <>
       <div class="home-run-head">
         {/* The pulse is a certificate: it animates only when the server said
             liveness === 'live'. Anything else gets a quiet dot. */}
@@ -613,8 +708,13 @@ function RunningRow({ presented, index, onChanged }: {
         <span class="home-row-title truncate">{entry.headline || 'Current task'}</span>
         {presented.elapsed ? <span class="home-run-elapsed">{presented.elapsed}</span> : null}
       </div>
+      {/* The heading is derived, but the ROW used to speak present tense under
+          it: a stalled `reasoning` run printed "Running" and a stalled
+          `blocked` run printed "Needs review" under a heading that correctly
+          said "Still open". runStatusLabel is the one place that decides, from
+          the presenter's own stall verdict and server-derived silence. */}
       <div class="home-row-note">
-        {waiting ? lifecycleLabel(entry.lifecycle) : (entry.activity?.text || lifecycleLabel(entry.lifecycle))}
+        {runStatusLabel(presented)}
         {progress ? ` · ${progress.completed} of ${progress.total}` : ''}
       </div>
       {pct !== null ? (
@@ -622,6 +722,20 @@ function RunningRow({ presented, index, onChanged }: {
           <div class="home-progress-fill" style={{ width: `${pct}%` }} />
         </div>
       ) : null}
+    </>
+  );
+  return (
+    <article class={`home-row home-row-static home-run${waiting ? ' home-run-waiting' : ''}`} style={{ '--i': index }}>
+      {sessionId ? (
+        <button
+          type="button"
+          class="home-run-open"
+          aria-label={`Open ${entry.headline || 'this run'}`}
+          onClick={() => onOpenRun(sessionId)}
+        >
+          {head}
+        </button>
+      ) : head}
       {control ? (
         <div class="home-run-control">
           <RunControl target={control.target} resumable={control.resumable} onChanged={() => void onChanged()} />

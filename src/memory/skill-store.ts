@@ -583,7 +583,7 @@ function firstSkillArtifact(value: string): string | null {
  *   - the exact skill name was requested;
  *   - declared applicability (tool family/entity slot) matches;
  *   - two identity terms from the skill name match;
- *   - the primary artifact matches and an action verb agrees.
+ *   - one requested subtask matches the primary artifact and its action or skill identity.
  *
  * The last form keeps natural requests such as "draft this email" working,
  * while preventing an incidental email action inside a Workspace recipe from
@@ -615,19 +615,20 @@ export function skillHasApplicabilityAnchor(query: string, skill: Skill): boolea
   if (sharedNameIdentity.length >= 2) return true;
 
   const primaryText = `${skill.name} ${skill.frontmatter.name ?? ''} ${skill.frontmatter.description ?? ''}`;
-  const queryArtifacts = skillSearchTokens(q).filter((term) => SKILL_ARTIFACT_TERMS.has(term));
-  const artifactBearingSegments = requestSemanticSegments(q)
-    .filter((segment) => skillSearchTokens(segment).some((term) => SKILL_ARTIFACT_TERMS.has(term)));
-  // In a compound artifact flow, one generic substep match is not enough to
-  // inject a whole procedure. A skill for the complete flow still enters via
-  // its name or declared applicability above.
-  if (artifactBearingSegments.length > 1) return false;
-  const queryArtifact = queryArtifacts[0] ?? null;
   const primaryArtifact = firstSkillArtifact(primaryText);
-  if (!queryArtifact || !primaryArtifact || queryArtifact !== primaryArtifact) return false;
-  const queryVerbs = skillActionVerbs(q);
+  if (!primaryArtifact) return false;
   const skillVerbs = skillActionVerbs(primaryText);
-  return [...queryVerbs].some((verb) => skillVerbs.has(verb));
+  // Match the skill's purpose to a requested subtask. A different artifact in
+  // another segment neither adopts this procedure nor disqualifies its useful
+  // reference. Keep the primary artifact, action and identity signals together
+  // so an incidental delivery clause cannot import a different whole recipe.
+  return requestSemanticSegments(q).some((segment) => {
+    if (firstSkillArtifact(segment) !== primaryArtifact) return false;
+    const segmentTerms = new Set(skillSearchTokens(segment));
+    const identityAgrees = [...nameTerms].some(term => !SKILL_ARTIFACT_TERMS.has(term) && segmentTerms.has(term));
+    const actionAgrees = [...skillActionVerbs(segment)].some(verb => skillVerbs.has(verb));
+    return actionAgrees || identityAgrees;
+  });
 }
 
 function boundedInt(raw: string | undefined, fallback: number, min: number, max: number): number {

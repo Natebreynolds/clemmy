@@ -13,7 +13,12 @@ export interface SwitcherEntry {
   id: string;
   label: string;
   icon: JSX.Element;
-  badge?: number;
+  /** Already capped and formatted by the shell's ONE counter presenter. */
+  badge?: string;
+  /** The count was not confirmed by a live read — see lib/needs-you.ts. */
+  badgeStale?: boolean;
+  /** What the bare numeral cannot say: the count and how old it is. */
+  badgeLabel?: string;
 }
 
 interface Props {
@@ -31,7 +36,7 @@ export function TitleSwitcher({ open, onClose, current, entries, onSelect, onMor
       <nav class="switcher-list" aria-label="Go to">
         {entries.map((entry) => {
           const isCurrent = entry.id === current;
-          const badge = entry.badge && entry.badge > 0 ? (entry.badge > 99 ? '99+' : String(entry.badge)) : null;
+          const badge = entry.badge ?? null;
           return (
             <button
               key={entry.id}
@@ -45,7 +50,17 @@ export function TitleSwitcher({ open, onClose, current, entries, onSelect, onMor
             >
               <span class="switcher-icon" aria-hidden="true">{entry.icon}</span>
               <span class="switcher-label">{entry.label}</span>
-              {badge ? <span class="switcher-badge">{badge}</span> : null}
+              {badge ? (
+                // A numeral cannot disclose its own age; the marker and the
+                // label do, exactly as the header pill's words do.
+                <span
+                  class={`switcher-badge${entry.badgeStale ? ' badge-stale' : ''}`}
+                  title={entry.badgeLabel}
+                  aria-label={entry.badgeLabel}
+                >
+                  {badge}
+                </span>
+              ) : null}
               {isCurrent ? (
                 <svg class="switcher-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M20 6 9 17l-5-5" />

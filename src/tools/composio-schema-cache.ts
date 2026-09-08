@@ -1,3 +1,4 @@
+import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import {
   digestSchema,
   fingerprintSchema,
@@ -93,6 +94,16 @@ function durableProviderObservation(record: ToolContract | null): number | undef
     : undefined;
 }
 
+/** Close SDK representation at ingestion, before cache, disk, and live
+ * authority diverge. SDK optional undefined members are absent on the provider
+ * JSON wire. No other non-JSON value is normalized into authority. */
+function providerSchemaSnapshot(value: unknown): Record<string, unknown> {
+  return JSON.parse(closedCanonicalJson(value, {
+    maxDepth: 32, maxNodes: 100_000, maxStringBytes: 1_048_576, maxTotalBytes: 2_097_152,
+    omitUndefinedObjectMembers: true,
+  })) as Record<string, unknown>;
+}
+
 /** Deposit one action's input schema. Ignores non-object schemas. */
 export function rememberToolSchema(
   toolSlug: string,
@@ -106,7 +117,7 @@ export function rememberToolSchema(
   try {
     // Provider/SDK objects are caller-owned. Snapshot before caching so a later
     // mutation cannot silently reshape the contract under an existing lease.
-    schema = structuredClone(inputParameters);
+    schema = providerSchemaSnapshot(inputParameters);
   } catch {
     return;
   }
@@ -124,7 +135,7 @@ export function rememberToolSchema(
     if (providerOutputParameters === null) observedOutputSchema = null;
     else if (!isRecord(providerOutputParameters)) return;
     else {
-      try { observedOutputSchema = structuredClone(providerOutputParameters); }
+      try { observedOutputSchema = providerSchemaSnapshot(providerOutputParameters); }
       catch { return; }
     }
   }
@@ -450,7 +461,7 @@ function refreshSchemaFromProvider(
       if (!isRecord(tool?.inputParameters)) {
         result = { outcome: 'unavailable', durationMs: Date.now() - startedAt };
       } else {
-        const observedSchema = structuredClone(tool.inputParameters);
+        const observedSchema = providerSchemaSnapshot(tool.inputParameters);
         const outputSchemaWasObserved = Object.prototype.hasOwnProperty.call(tool, 'outputParameters')
           && tool.outputParameters !== undefined;
         let observedOutputSchema: Record<string, unknown> | null | undefined;
@@ -459,7 +470,7 @@ function refreshSchemaFromProvider(
         } else if (tool.outputParameters === null) {
           observedOutputSchema = null;
         } else if (isRecord(tool.outputParameters)) {
-          observedOutputSchema = structuredClone(tool.outputParameters);
+          observedOutputSchema = providerSchemaSnapshot(tool.outputParameters);
         } else {
           result = { outcome: 'unavailable', durationMs: Date.now() - startedAt };
           return result;

@@ -208,7 +208,7 @@ test('Worker capability is the full native surface minus recursion/meta and pare
     'run_worker', 'workflow_run', 'workflow_create', 'add_cron_job',
     'create_tool', 'ask_user_question', 'notify_user', 'run_batch',
     'request_approval', 'pending_action_queue', 'pending_action_execute',
-    'pending_action_record_result',
+    'pending_action_record_result', 'publish_plan',
   ]) {
     assert.ok(!firstClass.has(blocked), `worker must NOT have ${blocked} first-class`);
     assert.ok(!rendered.split('call_tool')[1]?.includes(`\n${blocked} `), `worker catalog must NOT offer ${blocked}`);

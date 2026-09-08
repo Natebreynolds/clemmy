@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync } from 'node:fs';
@@ -154,7 +155,7 @@ test('incident replay: scoped reminder discovery ranks the firing timer above a 
   }
 });
 
-test('a uniquely named saved-workflow run is an exact workflow_run hit, not a provider hunt', async () => {
+test('an explicit workflow_run tool selection keeps its exact discovery shortcut', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
   const { WORKFLOWS_DIR } = await import('../memory/vault.js');
   const { rmSync } = await import('node:fs');
@@ -184,7 +185,7 @@ test('a uniquely named saved-workflow run is an exact workflow_run hit, not a pr
       }],
     );
     const raw = await t.handler({
-      query: 'Can you run my platform 49 workflow',
+      query: 'workflow_run',
       limit: 8,
     });
     const out = JSON.parse(raw.content[0]!.text) as {
@@ -269,6 +270,46 @@ test('call_tool discovery removes nested nullable placeholders from required lis
   assert.match(out.hint, /Omit optional\/nullable fields/);
 });
 
+test('native write disclosures expose their exact host effect and direct carrier arguments', async () => {
+  const local = await import('../runtime/harness/local-planning-capability.js');
+  for (const name of ['workflow_create', 'workflow_update', 'space_save', 'space_edit_view']) {
+    let handler!: Handler;
+    registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+      allowedNames: new Set([name]), dispatchCarrierForName: () => 'work_call',
+      async discloseForPlanning(candidates) {
+        return Object.fromEntries(candidates.flatMap((candidate) => {
+          const definitions = local.inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
+          return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
+        }));
+      },
+    });
+    const body = JSON.parse((await handler({ query: `${name} exact schema`, limit: 1 })).content[0]!.text);
+    const row = body.results[0];
+    assert.equal(row.name, name);
+    assert.equal(row.effect, 'local_write');
+    assert.equal(row.planningProvenance, 'authorized_local_registry');
+    assert.equal(row.carrier, 'work_call');
+    assert.equal(row.example.tool, 'work_call');
+    assert.equal(row.example.args.name, name);
+    assert.equal(row.example.args.requirement_id, row.capabilityRef);
+    assert.deepEqual(JSON.parse(row.example.args.args_json), { '<argument>': '<value>' });
+    assert.deepEqual(row.invocation, { name, payloadField: null });
+    assert.ok(body.schemas[name]);
+    assert.doesNotMatch(body.hint, /args_json is ONE JSON string of.*tool_slug/);
+  }
+});
+
+test('provider invocation examples retain their explicit adapter wrapper', async () => {
+  const { renderCarrierInvocationExample } = await import('./tool-search-tool.js');
+  const example = renderCarrierInvocationExample('work_call', {
+    name: 'provider_executor', fixedArgs: { tool_slug: 'EXAMPLE_CREATE' }, payloadField: 'arguments',
+  }, 'cap:example:create');
+  assert.deepEqual(JSON.parse(example.args.args_json), {
+    tool_slug: 'EXAMPLE_CREATE', arguments: { '<argument>': '<value>' },
+  });
+  assert.equal(example.args.requirement_id, 'cap:example:create');
+});
+
 test('does not promote speculative schema-bearing hits to the session hot-set', async () => {
   _resetHotSetForTest();
   const t = captureToolSearch();
@@ -329,6 +370,97 @@ test('one federated broker returns an authorized provider candidate with exact s
   assert.equal(out.results[0]?.carrier, 'work_call');
   assert.deepEqual((out.schemas.crm__mass_read as { required?: string[] }).required, ['query']);
   assert.match(out.hint, /work_call/);
+});
+
+test('account review unavailability has consistent global and row recovery without reasking the account', async () => {
+  for (const reason of ['review_unavailable', undefined] as const) {
+    let handler!: Handler;
+    registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+      allowedNames: new Set(), dispatchCarrier: 'work_call',
+      candidateSources: [{ kind: 'authorized_composio', async search() { return [{
+        name: 'OUTLOOK_CREATE_DRAFT', summary: 'Create an unsent draft', score: 1,
+        carrier: 'work_call', schema: { type: 'object', properties: {} },
+      }]; } }],
+      async discloseForPlanning() {
+        return { version: 1, refs: {}, blockers: { OUTLOOK_CREATE_DRAFT: {
+          code: 'account_selection_required', choices: ['work@fixture.invalid', 'personal@fixture.invalid'],
+          ...(reason ? { reason } : {}),
+        } } };
+      },
+    });
+    const response = await handler({ query: 'Outlook create draft' });
+    const body = JSON.parse(response.content[0]!.text);
+    if (reason) {
+      assert.match(body.hint, /Retry the identical account_selection once/);
+      assert.match(body.hint, /report that exact host blocker/);
+      assert.doesNotMatch(body.hint, /Ask the user which exact connected account/);
+      assert.ok(body.hint.includes(body.results[0].accountSelectionNextStep),
+        'the global instruction and exact row share the same typed recovery');
+      assert.equal(body.results[0].accountSelectionReason, reason);
+    } else {
+      assert.match(body.hint, /Ask the user which exact connected account/);
+      assert.match(body.hint, /work@fixture.invalid/);
+      assert.doesNotMatch(body.hint, /review unavailable/);
+    }
+  }
+});
+
+test('page guidance follows eight published choices and preserves an off-page account blocker on its own page', async () => {
+  let handler!: Handler;
+  let sourceCalls = 0;
+  const readyNames = Array.from({ length: 8 }, (_, index) => `OUTLOOK_READY_OPERATION_${index + 1}`);
+  const blockedName = 'GOOGLECALENDAR_CREATE_EVENT';
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(), dispatchCarrier: 'work_call',
+    candidateSources: [{ kind: 'authorized_composio', async search() {
+      sourceCalls += 1;
+      return [...readyNames, blockedName].map((name, index) => ({
+        name, summary: 'Create a provider item', score: 100 - index,
+        carrier: 'work_call' as const, schema: { type: 'object', properties: {} },
+      }));
+    } }],
+    async discloseForPlanning() {
+      return { version: 1, refs: Object.fromEntries(readyNames.map((name) => [name, `cap:resolved:${name.toLowerCase()}`])),
+        blockers: { [blockedName]: { code: 'account_selection_required', choices: ['calendar@fixture.invalid'] } } };
+    },
+  });
+  // Make the eight visible choices more relevant to this query. A source's
+  // artificial score must not itself override the shared relevance ranker.
+  const first = JSON.parse((await handler({ query: 'create Outlook provider item', limit: 8 })).content[0]!.text);
+  assert.deepEqual(first.results.map((row: { name: string }) => row.name), readyNames);
+  assert.ok(first.results.every((row: { capabilityRef?: string }) => row.capabilityRef));
+  assert.match(first.hint, /work_call/);
+  assert.doesNotMatch(first.hint, /account selection|Ask the user|calendar@fixture.invalid/i);
+  assert.ok(first.next_cursor);
+  const second = JSON.parse((await handler({ query: 'create Outlook provider item', limit: 8, cursor: first.next_cursor })).content[0]!.text);
+  assert.equal(sourceCalls, 1, 'the next page uses its retained disclosure');
+  assert.equal(second.results[0].name, blockedName);
+  assert.equal(second.results[0].planningRefStatus, 'account_selection_required');
+  assert.deepEqual(second.results[0].accountChoices, ['calendar@fixture.invalid']);
+  assert.match(second.hint, /Ask the user which exact connected account/);
+  assert.match(second.hint, /calendar@fixture.invalid/);
+});
+
+test('mixed ready and blocked choices keep dispatch available and account recovery specific to the selected row', async () => {
+  let handler!: Handler;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(), dispatchCarrier: 'work_call',
+    candidateSources: [{ kind: 'authorized_composio', async search() { return [
+      { name: 'OUTLOOK_CREATE_DRAFT', summary: 'Create an unsent draft', score: 2 },
+      { name: 'GOOGLECALENDAR_CREATE_EVENT', summary: 'Create a calendar event', score: 1 },
+    ].map((candidate) => ({ ...candidate, carrier: 'work_call' as const, schema: { type: 'object', properties: {} } })); } }],
+    async discloseForPlanning() { return { version: 1, refs: { OUTLOOK_CREATE_DRAFT: 'cap:resolved:outlook_create_draft' },
+      blockers: { GOOGLECALENDAR_CREATE_EVENT: { code: 'account_selection_required', choices: ['calendar@fixture.invalid'], reason: 'review_unavailable' } } }; },
+  });
+  const body = JSON.parse((await handler({ query: 'create provider item', limit: 8 })).content[0]!.text);
+  assert.equal(body.results[0].capabilityRef, 'cap:resolved:outlook_create_draft');
+  assert.match(body.hint, /work_call/);
+  assert.match(body.hint, /Only if you select an unresolved result/);
+  assert.doesNotMatch(body.hint, /Ask the user|Retry the identical account_selection/);
+  const blocked = body.results.find((row: { name: string }) => row.name === 'GOOGLECALENDAR_CREATE_EVENT');
+  assert.equal(blocked.planningRefStatus, 'account_selection_required');
+  assert.equal(blocked.accountSelectionReason, 'review_unavailable');
+  assert.match(blocked.accountSelectionNextStep, /Retry the identical account_selection once/);
 });
 
 test('the default eight-result page keeps provider rank nine reachable without a second source search', async () => {
@@ -462,8 +594,18 @@ async function redeemSchema(
       kind: string;
       sha256: string;
       chunk: string;
+      schema?: unknown;
+      complete?: boolean;
       next_cursor?: string;
     };
+    if (page.kind === 'tool_search_schema') {
+      assert.equal(chunks, 0, 'a complete object is emitted only at offset zero');
+      assert.equal(page.complete, true);
+      assert.equal(page.next_cursor, undefined);
+      assert.equal(page.sha256, handle!.sha256);
+      assert.equal(createHash('sha256').update(JSON.stringify(page.schema)).digest('hex'), handle!.sha256);
+      return page.schema;
+    }
     assert.equal(page.kind, 'tool_search_schema_chunk');
     assert.equal(page.sha256, handle!.sha256);
     serialized += page.chunk;
@@ -474,6 +616,158 @@ async function redeemSchema(
   assert.equal(serialized.length, handle!.chars);
   return JSON.parse(serialized);
 }
+
+test('subordinate previews yield before compacting an otherwise fitting first-ranked schema', async () => {
+  const name = 'PRIMARY_FULL_SCHEMA';
+  const schema = exactSizedNestedEnumSchema(9_000);
+  (schema.properties as Record<string, unknown>).payload = {
+    type: 'object', description: 'The complete input object.',
+    properties: { value: { type: 'string', description: 'This deeper annotation must remain intact.' } },
+  };
+  const t = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio', async search() { return [
+      { name, schema, summary: 'Primary full schema fixture', carrier: 'work_call' as const },
+      { name: 'SECONDARY_FULL_SCHEMA', schema: exactSizedNestedEnumSchema(100_000),
+        summary: 'Secondary schema fixture', carrier: 'work_call' as const },
+    ]; },
+  }]);
+  const raw = await t.handler({ query: 'primary full schema', limit: 8 });
+  const body = JSON.parse(raw.content[0].text);
+  assert.equal(body.results[0].name, name);
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  assert.deepEqual(body.schemas[name], schema,
+    'a lower-ranked preview must yield before any leading-schema annotations');
+});
+
+test('broad discovery reserves its first-ranked schema and direct argument guidance before subordinate previews', async () => {
+  const name = 'PRIMARY_SCHEMA_RESERVATION';
+  const schema = {
+    type: 'object', required: ['payload'], additionalProperties: false,
+    properties: { payload: {
+      type: 'object', description: 'A complete JSON object containing the exact value.',
+      examples: [{ value: 'fixture value' }], required: ['value'], additionalProperties: false,
+      properties: { value: { type: 'string', description: 'Nested reference detail. '.repeat(2_000) } },
+    } },
+  };
+  let sourceCalls = 0;
+  const t = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio', async search() {
+      sourceCalls += 1;
+      return [
+        { name, schema },
+        { name: 'SECONDARY_SCHEMA_RESERVATION', schema: exactSizedNestedEnumSchema(100_000) },
+        { name: 'TERTIARY_SCHEMA_RESERVATION', schema: exactSizedNestedEnumSchema(100_000) },
+      ].map((row) => ({ ...row, summary: 'Schema reservation fixture', carrier: 'work_call' as const }));
+    },
+  }]);
+  const raw = await t.handler({ query: 'primary reservation', limit: 8 });
+  const body = JSON.parse(raw.content[0].text);
+  assert.equal(body.results[0].name, name, 'the query ranks a choice without exactly naming a tool');
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  const preview = body.schemas[name];
+  assert.ok(preview, 'the leading argument contract stays inline after lower-ranked previews yield');
+  assert.deepEqual(preview.required, schema.required);
+  assert.deepEqual(preview.properties.payload.required, schema.properties.payload.required);
+  assert.equal(preview.properties.payload.description, schema.properties.payload.description);
+  assert.deepEqual(preview.properties.payload.examples, schema.properties.payload.examples);
+  assert.equal(preview.properties.payload.properties.value.description, undefined);
+  assert.equal(preview.additionalProperties, false);
+  assert.ok(body.schema_handles[name], 'the original annotations remain losslessly addressable');
+  assert.equal(body.schemas.SECONDARY_SCHEMA_RESERVATION, undefined);
+  assert.equal(body.schemas.TERTIARY_SCHEMA_RESERVATION, undefined);
+  assert.ok(body.schema_handles.SECONDARY_SCHEMA_RESERVATION);
+  assert.ok(body.schema_handles.TERTIARY_SCHEMA_RESERVATION);
+  assert.deepEqual(await redeemSchema(t.handler, 'primary reservation', {
+    schemas: {}, schema_handles: body.schema_handles,
+  }, name), schema);
+  assert.equal(sourceCalls, 1, 'full schema redemption never repeats provider discovery');
+});
+
+test('a genuinely oversized first-ranked schema remains complete behind its handle under the same ceiling', async () => {
+  const name = 'PRIMARY_OVERSIZED_SCHEMA';
+  const schema = exactSizedNestedEnumSchema(100_000);
+  const t = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio', async search() { return [
+      { name, schema, summary: 'Primary oversized schema fixture', carrier: 'work_call' as const },
+      { name: 'SECONDARY_OVERSIZED_SCHEMA', schema: { type: 'object' }, summary: 'Secondary schema fixture', carrier: 'work_call' as const },
+    ]; },
+  }]);
+  const raw = await t.handler({ query: 'primary oversized', limit: 8 });
+  const body = JSON.parse(raw.content[0].text);
+  assert.equal(body.results[0].name, name);
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  assert.equal(body.schemas[name], undefined, 'a reserved schema is not exempt from the intact-JSON ceiling');
+  assert.ok(body.schema_handles[name]);
+  assert.match(body.hint, /schema_handles/);
+  assert.deepEqual(await redeemSchema(t.handler, 'primary oversized', body, name), schema);
+});
+
+test('a selected schema object fits one redemption without escaping-driven model round trips', async () => {
+  const sessionId = 'whole-schema-owner';
+  const otherSessionId = 'whole-schema-other';
+  createSession({ id: sessionId, kind: 'chat' });
+  createSession({ id: otherSessionId, kind: 'chat' });
+  const schema = exactSizedNestedEnumSchema(18_523);
+  const properties = schema.properties as Record<string, unknown>;
+  const padding = properties.padding as { enum: string[] };
+  properties.escaped = { type: 'string', enum: ['"\\😀'.repeat(700)] };
+  padding.enum[0] = padding.enum[0]!.slice(JSON.stringify(schema).length - 18_523);
+  const serialized = JSON.stringify(schema);
+  assert.equal(serialized.length, 18_523);
+  assert.ok(JSON.stringify({ chunk: serialized }).length > DEFAULT_TOOL_RESULT_MAX_CHARS,
+    'the legacy full JSON-string representation cannot fit');
+  const expectedDigest = createHash('sha256').update(serialized).digest('hex');
+  let sourceCalls = 0;
+  const targetName = 'WHOLE_SCHEMA_SELECTED';
+  const firstBroker = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio',
+    async search() {
+      sourceCalls += 1;
+      return [
+        { name: 'FIRST_LARGE_SCHEMA', score: 3, schema: exactSizedNestedEnumSchema(100_000) },
+        { name: 'SECOND_LARGE_SCHEMA', score: 2, schema: exactSizedNestedEnumSchema(100_000) },
+        { name: targetName, score: 1, schema },
+      ].map((row) => ({ ...row, summary: 'Selected schema retrieval fixture', carrier: 'work_call' as const }));
+    },
+  }]);
+  const initial = await withToolOutputContext({ sessionId }, () => firstBroker.handler({ query: 'schema retrieval fixture', limit: 8 })) as Awaited<ReturnType<Handler>>;
+  const first = JSON.parse(initial.content[0].text);
+  assert.equal(first.schemas[targetName], undefined, 'the broad result needs a handle for this selected schema');
+  const handle = first.schema_handles[targetName];
+  assert.equal(handle.sha256, expectedDigest);
+  assert.equal(handle.encoding, 'json_object_or_text_chunks');
+  closeEventLog();
+  const broker = () => captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio',
+    async search() { sourceCalls += 1; throw new Error('redemption must remain local'); },
+  }]);
+  const restarted = broker();
+  const raw = await withToolOutputContext({ sessionId }, () => restarted.handler({ query: targetName, cursor: handle.cursor })) as Awaited<ReturnType<Handler>>;
+  const whole = JSON.parse(raw.content[0].text);
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  assert.equal(whole.kind, 'tool_search_schema');
+  assert.equal(whole.encoding, 'json');
+  assert.equal(whole.complete, true);
+  assert.equal(whole.next_cursor, undefined);
+  assert.equal(whole.chars, serialized.length);
+  assert.equal(whole.bytes, Buffer.byteLength(serialized));
+  assert.equal(whole.sha256, expectedDigest);
+  assert.deepEqual(whole.schema, schema);
+  assert.equal(createHash('sha256').update(JSON.stringify(whole.schema)).digest('hex'), expectedDigest);
+  for (const [scope, cursor] of [
+    [otherSessionId, handle.cursor],
+    [sessionId, `tool_search_schema:v1:${'f'.repeat(64)}:0`],
+    [sessionId, `tool_search_schema:v1:${expectedDigest}:${serialized.length}`],
+  ]) {
+    const refused = await withToolOutputContext({ sessionId: scope }, () => restarted.handler({ query: targetName, cursor })) as Awaited<ReturnType<Handler>>;
+    assert.equal(JSON.parse(refused.content[0].text).error, 'invalid_or_expired_tool_search_cursor');
+  }
+  openEventLog().prepare(`UPDATE tool_search_continuations SET content_text = 'tampered' WHERE session_id = ? AND kind = 'schema' AND content_sha256 = ?`).run(sessionId, expectedDigest);
+  closeEventLog();
+  const corrupted = await withToolOutputContext({ sessionId }, () => broker().handler({ query: targetName, cursor: handle.cursor })) as Awaited<ReturnType<Handler>>;
+  assert.equal(JSON.parse(corrupted.content[0].text).error, 'invalid_or_expired_tool_search_cursor');
+  assert.equal(sourceCalls, 1, 'whole redemption, restart and rejected cursors never repeat discovery');
+});
 
 test('page and schema cursors survive a broker/database restart only in their issuing durable session', async () => {
   const sessionId = 'tool-search-durable-owner';
@@ -727,7 +1021,8 @@ test('compact oversized schema keeps real properties whose names match annotatio
   assert.deepEqual(Object.keys(compact.properties).sort(), ['default', 'description', 'payload', 'title']);
   assert.ok(compact.properties.payload.properties.description);
   assert.equal(compact.description, undefined, 'the schema-node annotation is removed');
-  assert.equal(compact.properties.description.description, undefined, 'nested schema-node annotations are removed');
+  assert.equal(compact.properties.description.description, schema.properties.description.description, 'direct argument instructions survive selected-schema compaction');
+  assert.equal(compact.properties.payload.properties.description.description, undefined, 'deeper annotations remain compacted and losslessly addressable');
   assert.equal(compact.properties.title.title, undefined, 'title annotations are removed without deleting the title field');
   assert.equal(compact.properties.default.default, undefined, 'default annotations are removed without deleting the default field');
   assert.deepEqual(compact.properties.payload.const, {
@@ -750,6 +1045,9 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
   const server = new McpServer({ name: 'live-read-rank-pin', version: '1.0.0' });
   registerToolSearchTool(server as never, {
+    // Compare the two source classes directly; unrelated fuzzy membership is
+    // not entitled to outrank the native catalog merely to remain on page one.
+    allowedNames: new Set(),
     candidateSources: [
       {
         kind: AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
@@ -793,6 +1091,46 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
   );
   const broker = names.indexOf('UNRELATED_BROKER_QUERY_TABLE');
   assert.ok(broker > 0, 'fuzzy broker membership may still appear, but not as rank one');
+});
+
+test('malformed or empty disclosure refs cannot appear as executable capabilities', async () => {
+  const name = 'OUTLOOK_GET_MESSAGE';
+  for (const value of [null, 42, { capabilityRef: 'forged' }, '', '   ']) {
+    let handler!: Handler;
+    registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) {
+      handler = callback;
+    } } as never, {
+      allowedNames: new Set(),
+      candidateSources: [{ kind: 'authorized_composio', search: async () => [{
+        name, summary: 'Read one message.', carrier: 'work_call',
+        schema: { type: 'object', properties: {} },
+      }] }],
+      discloseForPlanning: async () => ({ [name]: value } as unknown as Record<string, string>),
+    });
+    const result = await handler({ query: name, limit: 1 });
+    const body = JSON.parse(result.content[0]!.text);
+    assert.equal(body.results[0].capabilityRef, undefined);
+    assert.equal(body.results[0].planningRefStatus, 'unsupported_unmaterialized');
+  }
+});
+
+test('a provider name or source-supplied effect cannot replace an attested published descriptor', async () => {
+  let handler!: Handler;
+  const name = 'OUTLOOK_CREATE_UNATTESTED_FIXTURE';
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) {
+    handler = callback;
+  } } as never, {
+    allowedNames: new Set(),
+    candidateSources: [{ kind: 'authorized_composio', search: async () => [{
+      name, summary: 'Create an item.', carrier: 'work_call', effect: 'local_write',
+      schema: { type: 'object', properties: {} },
+    }] }],
+    discloseForPlanning: async () => ({ [name]: 'cap:resolved:unattested-fixture' }),
+  });
+  const result = await handler({ query: name, limit: 1 });
+  const body = JSON.parse(result.content[0]!.text);
+  assert.equal(body.results[0].effect, undefined,
+    'neither a CREATE name nor an adapter field is trusted execution semantics');
 });
 
 test('TIERED RANKING: her own workflow_schedule outranks a third-party scheduler for the live query', async () => {
@@ -1161,6 +1499,7 @@ test('an unavailable source does not shadow a healthy one, and an exact hit outr
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
   const server = new McpServer({ name: 'unavailable-mixed-pin', version: '1.0.0' });
   registerToolSearchTool(server as never, {
+    allowedNames: new Set(),
     candidateSources: [
       {
         kind: 'authorized_composio',
@@ -1168,8 +1507,7 @@ test('an unavailable source does not shadow a healthy one, and an exact hit outr
       },
       {
         kind: 'authorized_external_mcp',
-        // A dominant score, so this candidate's rank against an arbitrary
-        // built-in catalog is never what this test is actually about.
+        // Source availability is tested independently of native ranking.
         search: async () => [{ name: 'LIVE_MCP_OP', summary: 'A healthy MCP source answers.', score: 1000 }],
       },
     ],
@@ -1183,4 +1521,72 @@ test('an unavailable source does not shadow a healthy one, and an exact hit outr
   assert.equal(body.unavailable?.length, 1);
   assert.equal(body.unavailable?.[0]?.source, 'authorized_composio');
   assert.ok(body.results.some((row) => row.name === 'LIVE_MCP_OP'), 'a source that answered is unaffected by a sibling outage');
+});
+
+
+test('invented schema cursor is a repairable argument refusal through the production runtime adapter', async () => {
+  const { RunContext } = await import('@openai/agents');
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const { InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
+  const { classifyAttemptOutcome } = await import('../runtime/harness/attempt-outcome.js');
+  let sourceCalls = 0;
+  const runtime = buildScopedLocalToolSearch(new Set(['tool_search']), 'call_tool', undefined, [{
+    kind: 'authorized_composio',
+    async search() { sourceCalls += 1; return []; },
+  }]);
+  assert.equal(runtime.type, 'function');
+  if (runtime.type !== 'function') throw new Error('expected exact runtime function');
+  const result = await runtime.invoke(new RunContext({ sessionId: 'schema-repair-control' }), JSON.stringify({
+    query: 'APIFY_RUN_ACTOR', cursor: 'tool_search_schema:v1:APIFY_RUN_ACTOR',
+    account_selection: null, role_key: null, limit: null,
+  }));
+  assert.ok(result instanceof InvalidArgumentsPreDispatchResult);
+  assert.equal(result.outcomeKind, 'invalid_arguments');
+  assert.equal(result.executionKind, 'refused_pre_dispatch');
+  const outcome = classifyAttemptOutcome(attemptSignalsFromTypedResult(result));
+  assert.equal(outcome.kind, 'invalid_arguments');
+  assert.equal(outcome.directive.action, 'repair_arguments');
+  assert.match(String(result), /invalid_or_expired_tool_search_cursor/);
+  assert.match(String(result), /tool name is not a schema cursor/);
+  assert.equal(sourceCalls, 0, 'malformed cursor never discovers or executes a provider operation');
+});
+
+test('workflow input encoding instructions remain in the actual selected schema on both carriers', async () => {
+  const local = await import('../runtime/harness/local-planning-capability.js');
+  for (const carrier of ['work_call', 'call_tool'] as const) {
+    for (const name of ['workflow_create', 'workflow_update']) {
+      let handler!: Handler;
+      registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+        allowedNames: new Set([name]), dispatchViaCallTool: carrier === 'call_tool', dispatchCarrierForName: () => carrier,
+        async discloseForPlanning(candidates) {
+          return Object.fromEntries(candidates.flatMap(candidate => {
+            const definitions = local.inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
+            return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
+          }));
+        },
+      });
+      const raw = await handler({ query: `${name} exact schema`, limit: 1 });
+      const body = JSON.parse(raw.content[0]!.text);
+      const schema = body.schemas[name];
+      assert.ok(schema, `${carrier}/${name}: the actual argument contract remains inline`);
+      assert.match(schema.properties.inputs.description, /JSON-encoded string/);
+      assert.match(schema.properties.inputs.description, /structured steps\[\]\.inputs/);
+      const example = /Example JSON text: (\{.+\})\./.exec(schema.properties.inputs.description)?.[1];
+      assert.deepEqual(JSON.parse(example!), { text: { type: 'string', description: 'Text supplied at runtime to summarize' } });
+      const row = body.results.find((item: { name: string }) => item.name === name);
+      assert.equal(row.carrier, carrier);
+      if (carrier === 'work_call') {
+        assert.equal(row.effect, 'local_write');
+        assert.equal(row.capabilityRef, `cap:local:${name}:reversible`);
+        assert.equal(row.invocation.name, name);
+      } else {
+        assert.equal(row.effect, undefined, 'schema presentation cannot mint a planning effect on the legacy carrier');
+        assert.equal(row.capabilityRef, undefined, 'the legacy schema-only carrier remains without planning authority');
+        assert.equal(row.invocation, undefined, 'legacy discovery retains its existing exact-name call_tool hint');
+        assert.equal(row.name, name);
+        assert.match(body.hint, /call_tool\(name, args_json\)/);
+      }
+      assert.ok(raw.content[0]!.text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+    }
+  }
 });

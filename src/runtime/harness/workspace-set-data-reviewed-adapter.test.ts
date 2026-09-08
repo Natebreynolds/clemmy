@@ -16,6 +16,8 @@ const adapters = await import('./production-capability-adapters.js');
 const reviewed = await import('./reviewed-local-workflow-capability.js');
 const store = await import('../../spaces/store.js');
 const workspaceDb = await import('../../spaces/workspace-db.js');
+const receiptProof = await import('./host-local-write-commit.js');
+const datasetContract = await import('../../spaces/workspace-set-data-contract.js');
 
 test.after(() => {
   workspaceDb.closeWorkspaceDb();
@@ -92,8 +94,16 @@ test('reviewed adapter commits one active Workspace once, replays without a writ
     created: boolean;
     contentDigest: string;
     observationId: string;
+    hostFileCommit?: string;
+    handle: string;
   };
   assert.equal(first.created, true);
+  assert.ok(first.handle.endsWith('#source=dashboard'));
+  const fileReceipt = datasetContract.workspaceDatasetHostFileCommit(JSON.stringify(first));
+  const fileFacts = receiptProof.parseHostLocalWriteCommitFacts(fileReceipt);
+  assert.ok(fileFacts, 'actual attested host carrier retains the whole-file receipt beside source identity');
+  assert.equal(fileFacts.handle, `spaces/${args.slug}/data.json`);
+  assert.equal(receiptProof.readCommittedArtifactContent(fileFacts).verified, true);
   assert.match(first.artifactId, /^workspace-dataset:v1:/);
   const dataFile = store.resolveInSpace(args.slug, 'data.json');
   const before = {
@@ -111,6 +121,7 @@ test('reviewed adapter commits one active Workspace once, replays without a writ
     binding: binding(manifest),
   }) as typeof first;
   assert.equal(replay.created, false);
+  assert.equal(replay.hostFileCommit, first.hostFileCommit, 'exact unchanged replay retains the same file proof');
   assert.equal(replay.artifactId, first.artifactId);
   assert.equal(replay.observationId, first.observationId);
   assert.equal(readFileSync(dataFile, 'utf8'), before.file);

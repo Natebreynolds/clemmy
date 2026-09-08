@@ -14,7 +14,7 @@ import { redactSensitiveText } from '../runtime/security.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
 import { isProviderCapacityExhausted } from '../shared/provider-capacity.js';
-import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles.js';
+import { resolveRoleModel, defaultForRole, readDurableBindings } from '../runtime/harness/model-roles.js';
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
@@ -4255,6 +4255,33 @@ function resolveWorkflowStepModel(step: WorkflowStepInput, workflow?: WorkflowDe
         source: routed.source,
       },
     };
+  }
+  // An ordinary untagged child honors the owner's durable worker selection.
+  // Resolve through the same live validation as the role picker; an inactive
+  // binding's learned/default fallback is not an explicit selection. Keep
+  // authenticated convergence roles and all existing pins/intent precedence.
+  if (runtimeRole === undefined && !step.intent) {
+    const binding = readDurableBindings().find((candidate) =>
+      candidate.role === 'worker' && !candidate.whenIntent);
+    if (binding?.scope === 'durable'
+      && (binding.source === 'settings' || binding.source === 'chat-rule')) {
+      const routed = resolveRoleModel('worker');
+      if (routed.modelId === binding.modelId && routed.source === binding.source
+        && !routed.matchedIntent) {
+        return {
+          model: routed.modelId,
+          trace: {
+            seam: 'workflow',
+            stepId: step.id,
+            attemptedIntent: '',
+            matchedIntent: null,
+            modelId: routed.modelId,
+            provider: routed.provider,
+            source: routed.source,
+          },
+        };
+      }
+    }
   }
   // Claude-as-the-brain: an untagged step otherwise resolves to NO model and
   // falls to MODELS.primary (gpt-*) → text-only headless under claude_oauth, so a

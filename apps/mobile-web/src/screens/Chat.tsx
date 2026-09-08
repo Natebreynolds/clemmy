@@ -14,6 +14,9 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   ChatEngine,
+  createPendingMessageStore,
+  type ComposerMode,
+  type PlanRevisionRef,
   liveActivityHeadline,
   narrateActivity,
   renderMarkdown,
@@ -35,6 +38,7 @@ import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
 import { BrainSheet } from '../components/BrainSheet';
+import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 
 interface Props {
@@ -51,6 +55,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraft] = useState(initialDraft ?? '');
+  const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
   const [planActing, setPlanActing] = useState<string | null>(null);
   const [approvalActing, setApprovalActing] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
@@ -76,9 +81,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const engine = useMemo(() => new ChatEngine({
     transport: createChatStreamTransport(),
     sessionId: initialSessionId ?? null,
+    pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
-      send: async ({ message, sessionId, idempotencyKey, steerOnly }) => {
-        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly });
+      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode }) => {
+        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode });
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
       loadSession: async (sessionId) => {
@@ -132,11 +138,14 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     autoSent.current = true;
     setDraft('');
     haptic('light');
-    void engine.send(text);
+    void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+      .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
   }, [engine, initialAutoSend, initialDraft]);
 
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
+  const planning = busy ? snapshot?.activeTaskMode?.kind === 'plan' : composerMode === 'plan';
+  const executing = busy && snapshot?.activeTaskMode?.kind === 'execute';
   const connection = snapshot?.connection ?? 'idle';
   // Present only while this client owns the in-flight turn. A turn adopted
   // from another surface has no key here, so the button stays a plain busy
@@ -203,14 +212,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   function submitDraft() {
     const text = draft.trim();
-    if (!text) return;
+    if (!text || executing) return;
     setDraft('');
     if (textareaRef.current) {
       textareaRef.current.value = '';
       autoresize(textareaRef.current);
     }
     haptic('light');
-    void engine.send(text);
+    void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+      .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
   }
 
   async function actOnPlan(planProposalId: string, action: 'approve' | 'reject') {
@@ -304,6 +314,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <MessageRow
             key={message.id}
             message={message}
+            sessionId={snapshot?.sessionId ?? undefined}
+            busy={busy}
+            onExecutePlan={ref => engine.send(`Execute the reviewed plan, revision ${ref.revision}.`, { version: 1, kind: 'execute', executeRef: ref })}
+            onRevisePlan={() => { setComposerMode('plan'); textareaRef.current?.focus(); }}
             planActing={planActing}
             planOutcome={planOutcome}
             onPlanAction={actOnPlan}
@@ -322,13 +336,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       {showJumpToLatest ? (
         <button type="button" class="chat-jump" onClick={jumpToLatest}>Jump to latest</button>
       ) : null}
+      <div class="chat-mode-bar">
+        <button type="button" aria-pressed={planning} disabled={busy}
+          onClick={() => setComposerMode(mode => mode === 'plan' ? 'normal' : 'plan')}>Plan</button>
+        <span>{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
+          ? 'Planning · investigating with read-only tools'
+          : composerMode === 'plan' ? 'Plan mode · review before Execute' : 'Normal · handle the task'}</span>
+      </div>
       <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
         <textarea
           ref={textareaRef}
           class="chat-input"
           rows={1}
           aria-label="Message Clem"
-          placeholder="Message Clem…"
+          placeholder={planning ? 'What should we plan?' : 'Message Clem…'}
           value={draft}
           onInput={(ev) => {
             const el = ev.currentTarget as HTMLTextAreaElement;
@@ -348,7 +369,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             <button
               class="chat-send"
               type="submit"
-              disabled={draft.trim().length === 0}
+              disabled={executing || draft.trim().length === 0}
               aria-label="Send while she works"
             >
               ↑
@@ -367,7 +388,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <button
             class="chat-send"
             type="submit"
-            disabled={draft.trim().length === 0}
+            disabled={executing || draft.trim().length === 0}
             aria-label="Send"
           >
             ↑
@@ -379,11 +400,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 }
 
 function MessageRow({
-  message, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
+  message, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
   onDelegatedStateChange, onDelegatedChanged,
 }: {
   message: ChatMessage;
+  sessionId?: string;
+  busy: boolean;
+  onExecutePlan: (ref: PlanRevisionRef) => Promise<void>;
+  onRevisePlan: () => void;
   planActing: string | null;
   planOutcome: Record<string, 'approved' | 'rejected' | undefined>;
   onPlanAction: (id: string, action: 'approve' | 'reject') => void;
@@ -452,6 +477,8 @@ function MessageRow({
 
   return (
     <div class={`turn turn-assistant${message.status === 'failed' ? ' turn-failed' : ''}`}>
+      {message.taskMode?.kind === 'plan' && <div class="plan-mode-label">Plan mode · read-only investigation</div>}
+      {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={busy} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
       {/* The work Clem did is ONE quiet line, not a stack of tool rows: while
           she is working it narrates the current step, and once settled it
           becomes a summary you can open. The reply is what the screen is for. */}
@@ -474,6 +501,22 @@ function MessageRow({
       ) : thinking && activity.length === 0 ? (
         <div class="reply reply-ghost">Thinking…</div>
       ) : null}
+      {/* Mirror the backend's TYPED terminal (desktop shows the same pills).
+          Without this the phone showed a blocked or paused turn as plain prose,
+          indistinguishable from a finished answer. Legacy events show nothing. */}
+      {(() => {
+        const t = message.terminal;
+        if (!t || thinking) return null;
+        const line = t.status === 'blocked' ? 'Stopped here — your work is kept'
+          : t.status === 'uncertain' ? 'Outcome uncertain — check before repeating'
+          : t.status === 'cancelled' ? 'Cancelled'
+          : t.status === 'transferred' ? 'Handed off'
+          : t.status === 'needs_input' && (t.kind === 'continue' || t.needs === 'continue') ? 'Paused — say “continue” to pick up'
+          : t.status === 'needs_input' && t.kind === 'approval' ? 'Waiting for your approval'
+          : t.status === 'needs_input' ? 'Needs your reply'
+          : null;
+        return line ? <p class={`reply-state reply-state-${t.status}`} role="status">{line}</p> : null;
+      })()}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
           <button

@@ -1,3 +1,5 @@
+import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 /**
  * TURN-CONTROL SPINE — the lane-agnostic deterministic controls, in ONE place.
  *
@@ -949,7 +951,7 @@ function decisionForSource(
 
 function latestUserSeq(rows: ReturnType<typeof listEvents>): number {
   return rows
-    .filter((row) => row.type === 'user_input_received')
+    .filter((row) => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row))
     .reduce((max, row) => Math.max(max, row.seq), 0);
 }
 
@@ -1572,6 +1574,10 @@ export function effectiveTurnObjective(
   sourceUserSeq?: number,
 ): string {
   if (!sessionId) return fallback;
+  if (Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0) {
+    const reviewed = acceptedPlanExecutionText(sessionId, Number(sourceUserSeq));
+    if (reviewed) return reviewed;
+  }
   try {
     const rows = listEvents(sessionId, { types: ['user_input_received', 'turn_preflight_decision'] });
     const exactSourceUserSeq = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0

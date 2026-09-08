@@ -63,7 +63,10 @@ export function describeExternalWrite(
   shapeKey: string | undefined,
   toolName: string,
   targets: string[],
-  write?: { irreversible?: boolean; actionKey?: string },
+  /** `tense: 'present'` is for a write that has been RESERVED but has not
+   *  settled — "Creating a draft to …". Past tense is a claim about the world
+   *  and must never be made before a terminal says so. */
+  write?: { irreversible?: boolean; actionKey?: string; tense?: 'past' | 'present' },
 ): string {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
@@ -73,7 +76,9 @@ export function describeExternalWrite(
   const has = (token: string): boolean => tokens.includes(token);
   const deliveryAllowed = write?.irreversible !== false;
   const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
-  const fallback = `Ran ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
+  /** Pick the verb for the tense asked for. One table, two readings. */
+  const v = (past: string, present: string): string => (write?.tense === 'present' ? present : past);
+  const fallback = `${v('Ran', 'Running')} ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
   const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
     : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
       : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
@@ -81,20 +86,24 @@ export function describeExternalWrite(
           : 'other';
 
   if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
-    return consequence === 'update' ? `Updated a draft${to}` : `Created a draft${to}`;
+    return consequence === 'update'
+      ? `${v('Updated', 'Updating')} a draft${to}`
+      : `${v('Created', 'Creating')} a draft${to}`;
   }
   switch (consequence) {
     case 'delete':
-      return `Deleted a record${to}`;
+      return `${v('Deleted', 'Deleting')} a record${to}`;
     case 'send':
       if (!deliveryAllowed) return fallback;
-      return has('PUBLISH') || has('POST') || has('TWEET') ? `Published a post${to}` : `Sent a message${to}`;
+      return has('PUBLISH') || has('POST') || has('TWEET')
+        ? `${v('Published', 'Publishing')} a post${to}`
+        : `${v('Sent', 'Sending')} a message${to}`;
     case 'update':
-      return fileShaped ? `Saved a file${to}` : `Updated a record${to}`;
+      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : `${v('Updated', 'Updating')} a record${to}`;
     case 'create':
-      return fileShaped ? `Saved a file${to}` : `Created a record${to}`;
+      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : `${v('Created', 'Creating')} a record${to}`;
     default:
-      return fileShaped ? `Saved a file${to}` : fallback;
+      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : fallback;
   }
 }
 

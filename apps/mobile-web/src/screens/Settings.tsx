@@ -1,3 +1,4 @@
+import { CompletionReviewCard } from '../components/CompletionReviewCard';
 import { useEffect, useState } from 'preact/hooks';
 import {
   getConnectionsHealth,
@@ -96,6 +97,8 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         codexRescue={models.data?.codexRescue}
         onChanged={() => models.refresh()}
       />
+
+      <CompletionReviewCard />
 
       <ConnectionsCard
         rows={connections.data?.connections}

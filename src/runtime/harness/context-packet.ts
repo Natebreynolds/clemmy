@@ -527,8 +527,12 @@ function focusLine(input?: string, sessionId?: string): string | null {
       }
       return `Active focus: ${focus.active.title} — ${clip(focus.active.summary, 180)}`;
     }
-    if (focus.active && focus.needsConfirm) return `Stale focus exists: ${focus.active.title}. Confirm before relying on it.`;
-    if (focus.parked.length > 0) return `Parked resumable threads: ${focus.parked.slice(0, 3).map((p) => p.title).join('; ')}`;
+    if (focus.active && focus.needsConfirm
+      && !focusSummaryIsHistoricalForRequest(focus.active, input, sessionId)) {
+      return `Stale focus exists: ${focus.active.title}. Confirm before relying on it.`;
+    }
+    const parked = focus.parked.filter((row) => !focusSummaryIsHistoricalForRequest(row, input, sessionId));
+    if (parked.length > 0) return `Parked resumable threads: ${parked.slice(0, 3).map((p) => p.title).join('; ')}`;
   } catch {
     return null;
   }
@@ -852,7 +856,7 @@ export function buildAgentContextPacket(
       : renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION)),
     ...(suppressActionSemanticEnrichment
       ? []
-      : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.')),
+      : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run. When a task merely RESEMBLES a saved workflow, do the task yourself — but that workflow already resolved the capabilities, accounts and arguments this work needs, so READ ITS STEPS FIRST (workflow_get) and reuse what it resolved instead of rediscovering it. Doing it directly means you own the run; it does not mean starting from nothing. Offer to save it as a workflow afterward only if no saved one already covers it.')),
     healthWarnings.length > 0
       ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
       : '',

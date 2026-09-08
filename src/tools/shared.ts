@@ -122,6 +122,43 @@ export function invalidArgumentsTextResult(
   return result;
 }
 
+/**
+ * A native tool outcome that CHANGED NOTHING — "already exists", an empty
+ * draft, a malformed transform. Same shape as the repairable-argument refusal
+ * above and for the same reason: ordinary MCP error content on the wire, plus a
+ * module-private nominal identity that provider or model JSON cannot forge.
+ *
+ * `isError: true` is deliberate belt-and-braces. If a carrier ever reshapes the
+ * value and the in-process identity is lost, the settlement still reads a
+ * structured failure and lands on `unknown` — inert — instead of the
+ * `succeeded, mutating=1` that made the ledger show a write that never happened.
+ */
+const NON_WRITE_TEXT_RESULTS = new WeakMap<object, string>();
+
+export function nonWriteTextResult(
+  status: string,
+  text: string,
+  options?: { maxChars?: number },
+): TextToolResult {
+  const result = textResult(text, {
+    ...(options?.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+    isError: true,
+  });
+  const token = /^[a-z0-9_]{1,32}$/.test(status) ? status : 'non_write';
+  NON_WRITE_TEXT_RESULTS.set(result, token);
+  // Deliberately NO serialized `ok:false` marker. It looks identical to an
+  // ordinary failed write, so reading it back as no-effect proof would let a
+  // mutation of unknown fate be retried. The local bridge carries this outcome
+  // in a nominal class instead, which nothing outside the process can forge.
+  return result;
+}
+
+/** The status token of an in-process non-write outcome, or null. */
+export function localNonWriteStatus(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  return NON_WRITE_TEXT_RESULTS.get(result as object) ?? null;
+}
+
 export type SdkToolInputValidationError = ModelBehaviorError & {
   originalError?: unknown;
   toolInvocation?: {
@@ -273,10 +310,12 @@ export function resolveMemoryTarget(target: string): string {
   return path.join(VAULT_DIR, target);
 }
 
-export function readText(filePath: string, fallback: string, maxChars = 12000): string {
+export function readText(filePath: string, fallback: string): string {
   if (!existsSync(filePath)) return fallback;
   try {
-    return readFileSync(filePath, 'utf-8').slice(0, maxChars);
+    // Return the complete source to textResult so it can retain the exact
+    // output before producing a bounded, recallable model projection.
+    return readFileSync(filePath, 'utf-8');
   } catch {
     return fallback;
   }

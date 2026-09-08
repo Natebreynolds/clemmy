@@ -59,5 +59,7 @@ test('disclosure provisions a proven write, not only a proven read', () => {
   // The narrowing that must stay: only candidates the visible result actually
   // returned, and only ones this turn PROVED. A disclosure is not a proof.
   assert.match(staging, /const proof = entries\.get\(`composio:\$\{candidate\.name\.trim\(\)\.toLowerCase\(\)\}`\)/);
-  assert.match(staging, /publicationGuard: \(\) => discoveryStillActive\(guard\)/);
+  assert.match(staging, /publicationGuard: \(\) => discoveryStillActive\(publicationGuard\)/);
+  assert.match(staging, /deadlineAt: input\.deadlineAt === undefined \? undefined : input\.deadlineAt - 500/,
+    'publication keeps its bounded deadline reserve rather than outliving the visible result');
 });

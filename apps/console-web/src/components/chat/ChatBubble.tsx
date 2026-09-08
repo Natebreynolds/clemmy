@@ -1,3 +1,5 @@
+import { PlanReview } from './PlanReview';
+import type { PlanRevisionRef } from '@/lib/task-mode';
 import { Fragment, useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
@@ -127,8 +129,13 @@ export function ChatBubble({
   onReject,
   onBackground,
   traceHref,
+  sessionId, executionBusy, onExecutePlan, onRevisePlan,
 }: {
   message: ChatMessage;
+  sessionId?: string;
+  executionBusy?: boolean;
+  onExecutePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
+  onRevisePlan?: () => void;
   onApprove: () => void | Promise<void>;
   onReject: () => void | Promise<void>;
   /** Detach THIS running turn to a durable background task (shown while thinking). */
@@ -268,6 +275,8 @@ export function ChatBubble({
       <DogMark size={28} className="mt-0.5 self-start" />
       <div className="min-w-0 max-w-[80%] flex-1">
         <div className="rounded-lg rounded-tl-sm border border-border bg-surface px-4 py-3 shadow-xs">
+          {message.taskMode?.kind === 'plan' && <div className="mb-2 text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
+          {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
           {thinking && !message.text ? (
             <div className="flex items-center gap-2 text-body text-muted">
               <ThinkingDots />
@@ -423,13 +432,38 @@ export function ChatBubble({
           )}
         </div>
 
-        {(message.status === 'awaiting-reply' || message.status === 'stopped' || message.status === 'failed') && (
-          <div className="mt-1.5">
-            {message.status === 'awaiting-reply' && <StatusPill tone="info">Reply below to continue</StatusPill>}
-            {message.status === 'stopped' && <StatusPill tone="neutral">Stopped</StatusPill>}
-            {message.status === 'failed' && <StatusPill tone="danger">Didn't finish</StatusPill>}
-          </div>
-        )}
+        {/* The backend's TYPED terminal decides the pill. The legacy MessageStatus
+            collapses blocked/cancelled/uncertain into "failed"/"stopped" and cannot
+            tell a question from a resumable "say continue"; when the harness sent
+            its typed facts, mirror them. Legacy events keep the old pills. */}
+        {(() => {
+          const t = message.terminal;
+          if (t?.status === 'blocked') {
+            return <div className="mt-1.5"><StatusPill tone="warning">Stopped here — your work is kept</StatusPill></div>;
+          }
+          if (t?.status === 'uncertain') {
+            return <div className="mt-1.5"><StatusPill tone="warning">Outcome uncertain — check before repeating</StatusPill></div>;
+          }
+          if (t?.status === 'cancelled' || t?.status === 'transferred') {
+            return <div className="mt-1.5"><StatusPill tone="neutral">{t.status === 'cancelled' ? 'Cancelled' : 'Handed off'}</StatusPill></div>;
+          }
+          if (t?.status === 'needs_input' && (t.kind === 'continue' || t.needs === 'continue')) {
+            return <div className="mt-1.5"><StatusPill tone="info">Paused — say “continue” to pick up</StatusPill></div>;
+          }
+          if (t?.status === 'needs_input' && t.kind === 'approval') {
+            return <div className="mt-1.5"><StatusPill tone="info">Waiting for your approval</StatusPill></div>;
+          }
+          if (message.status === 'awaiting-reply' || message.status === 'stopped' || message.status === 'failed') {
+            return (
+              <div className="mt-1.5">
+                {message.status === 'awaiting-reply' && <StatusPill tone="info">Reply below to continue</StatusPill>}
+                {message.status === 'stopped' && <StatusPill tone="neutral">Stopped</StatusPill>}
+                {message.status === 'failed' && <StatusPill tone="danger">Didn't finish</StatusPill>}
+              </div>
+            );
+          }
+          return null;
+        })()}
       </div>
     </div>
   );

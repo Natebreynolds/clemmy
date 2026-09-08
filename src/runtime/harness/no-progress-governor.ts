@@ -28,9 +28,9 @@ export const NO_PROGRESS_GOVERNOR_VERSION = 2 as const;
 export const NO_PROGRESS_RETRY_BUDGET = 3 as const;
 /**
  * Distinct host-validated repair consequences one attempt sequence may move
- * through before the host stops it. Re-entering ANY prior consequence key
- * still terminates immediately (that is the loop floor); this budget only
- * bounds genuine convergence. Live 2026-09-01: a system authoring turn fixed
+ * through before the host stops it. Re-entering a prior consequence key grants
+ * no stage credit; a proven pre-dispatch model repair can only spend remaining
+ * retries. This budget bounds genuine convergence. Live 2026-09-01: a system authoring turn fixed
  * four different plan_task complaints in a row (evidence-string pattern,
  * missing write binding, bindings coverage, topology dependency) and was
  * terminalized at the third because the budget was 2 — a converging turn
@@ -266,7 +266,7 @@ export interface NoProgressGovernorState {
   /** Clean model-led recoveries left after the last genuine gain; integer in [0, NO_PROGRESS_RETRY_BUDGET]. */
   readonly retriesRemaining: number;
   /** Host-validated consequence stages seen since the last authority gain.
-   * Re-entering any prior key is a cycle, even when another stage intervened. */
+   * Re-entering a prior key is not progress, even when another stage intervened. */
   readonly seenConsequenceKeys: readonly string[];
   readonly lastConsequence: NoProgressConsequence | null;
   /** Integer in [0, NO_PROGRESS_STAGE_TRANSITION_BUDGET]; restore validates the bound. */
@@ -566,7 +566,8 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
  * A new exact token in any authority dimension resets the retry budget.
  * A metered frame with no new token spends one retry. A new host-typed repair
  * resets the consecutive-miss counter and may spend its finite stage allowance
- * after the retry budget runs out. Repeating a repair is a cycle. Unmetered
+ * after the retry budget runs out. Repeating a pre-dispatch model repair can
+ * only spend remaining retries; other repeated consequences stop. Unmetered
  * task work never spends the budget, though its evidence/effects still reset it.
  */
 export function observeNoProgress(
@@ -674,6 +675,29 @@ export function observeNoProgress(
 
   if (consequence) {
     if (state.seenConsequenceKeys.includes(consequence.key)) {
+      if (
+        input.attemptClass === 'zero_crossing_repair'
+        && consequence.recovery === 'repair_model'
+        && consequence.effectState === 'not_started'
+        && state.retriesRemaining > 0
+      ) {
+        // The host proved that no effect started. Let the model use an existing
+        // repair opportunity without treating changed arguments as progress,
+        // granting authority, or refilling the distinct-stage allowance.
+        return Object.freeze({
+          action: 'continue',
+          reason: 'retry_available',
+          gained: Object.freeze([]) as readonly [],
+          state: Object.freeze({
+            ...state,
+            authority,
+            noProgressAttempts,
+            retriesRemaining: state.retriesRemaining - 1,
+            lastConsequence: consequence,
+            observations,
+          }) satisfies NoProgressGovernorState,
+        });
+      }
       return terminal(Object.freeze({
         ...state,
         authority,
@@ -689,8 +713,8 @@ export function observeNoProgress(
     // returns the first host-validated repair consequence. Treat that first
     // typed stage as bounded structural progress: otherwise a harmless result
     // lookup can prevent the model from ever seeing the exact schema or
-    // admission error it must repair. Repeating this consequence still
-    // terminates above, and later distinct stages remain capped by the
+    // admission error it must repair. Repeating this consequence earns no
+    // stage credit above, and later distinct stages remain capped by the
     // transition budget. V1 checkpoints restore that budget as zero and
     // therefore cannot gain new continuation authority after upgrade.
     if (state.stageTransitionsRemaining === 0) {

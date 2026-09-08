@@ -62,6 +62,8 @@ const EXEMPT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'execution_list',
   // Planning primitives — pre-execution scaffolding.
   'draft_plan',
+  // Host-owned reviewed artifact; the tool itself requires exact foreground Plan mode.
+  'publish_plan',
   // Approval + user-input — must always be callable.
   'request_approval',
   'ask_user_question',

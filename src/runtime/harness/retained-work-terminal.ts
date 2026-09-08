@@ -183,6 +183,7 @@ export function renderFailureWithRetainedWork(input: {
     : input.fallbackText;
   const inventory = retainedWorkInventoryForAcceptedSource(input);
   if (!inventory) return fallbackText;
+
   const displayed = inventory.items.slice(0, 5);
   const omitted = inventory.items.length - displayed.length;
   return [

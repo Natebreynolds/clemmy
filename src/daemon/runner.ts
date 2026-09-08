@@ -1,3 +1,4 @@
+import { workflowOwnedUnfinishedAttemptIds } from '../runtime/harness/accepted-source-outcome.js';
 import {
   closeSync,
   existsSync,
@@ -2313,12 +2314,16 @@ export async function startDaemon(
   if (interrupted > 0) {
     logger.warn({ interrupted }, 'Marked stale running background tasks as interrupted');
   }
-  // Every run attempt still 'active' at daemon boot belonged to the dead
-  // process — Discord/webhook attempts carry no run id or lease, so the
+  // Foreground activations still 'active' at daemon boot belonged to the dead
+  // process. Exact dispatched workflow owners remain unfinished until their
+  // existing child/report-back recovery publishes the source terminal.
+  // Discord/webhook attempts carry no run id or lease, so the
   // desktop-only foreign-lease sweep never reached them and they showed as
   // phantom running sessions forever (workflow recovery review).
   try {
-    const orphanedAttempts = interruptOrphanedRunAttemptsAtBoot();
+    const orphanedAttempts = interruptOrphanedRunAttemptsAtBoot(Date.now(), {
+      preserveAttemptIds: workflowOwnedUnfinishedAttemptIds(),
+    });
     if (orphanedAttempts > 0) {
       logger.warn({ orphanedAttempts }, 'Interrupted orphaned run attempts from the previous process on boot');
     }

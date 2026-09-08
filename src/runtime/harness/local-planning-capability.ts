@@ -1,3 +1,4 @@
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 /**
  * Exact Clementine-local planning authority.
  *
@@ -251,8 +252,16 @@ function declarationCanEnterLocalPlanningMutation(declaration: ToolDecl): boolea
 
 function declarationCanEnterLocalPlanningRead(declaration: ToolDecl): boolean {
   return declaration.sideEffect === 'read'
-    && declaration.projectEffect === 'read'
+    && (declaration.projectEffect === 'read' || declaration.localPlanningRead === true)
     && declaration.runtimeEffect !== 'host_only';
+}
+
+/** An explicit native read-plan declaration, distinct from project eligibility.
+ * Exact configured schema/carrier proof is still required before publication. */
+export function isRegistryDeclaredNativePlanningRead(name: string): boolean {
+  const matches = TOOL_REGISTRY.filter((entry) => entry.name === name.trim());
+  return matches.length === 1 && matches[0]!.localPlanningRead === true
+    && declarationCanEnterLocalPlanningRead(matches[0]!);
 }
 
 function declarationCanEnterLocalPlanning(declaration: ToolDecl): boolean {
@@ -451,6 +460,9 @@ function normalizedSemantics(semantics: LocalPlanningSemantics): LocalPlanningSe
     outputKind: semantics.outputKind.trim(),
     deliverableKind: semantics.deliverableKind.trim(),
     destinationPosture: semantics.destinationPosture,
+    ...(semantics.destinationPostures
+      ? { destinationPostures: [...semantics.destinationPostures] }
+      : {}),
     advisoryRoles: [...new Set(semantics.advisoryRoles.map((role) => role.trim()).filter(Boolean))],
     ...(semantics.safeMode
       ? { safeMode: normalizedSafeMode(semantics.safeMode) }
@@ -517,6 +529,8 @@ function deriveLocalPlanningDefinitionForSemantics(input: {
         name,
         sideEffect: input.declaration.sideEffect,
         projectEffect: input.declaration.projectEffect,
+        // Absent declarations preserve the historical project-read fingerprint.
+        ...(input.declaration.localPlanningRead === true ? { localPlanningRead: true } : {}),
         runtimeEffect: input.declaration.runtimeEffect ?? null,
         actionTopologyRole: input.declaration.actionTopologyRole ?? 'business',
         readOnly: {
@@ -555,6 +569,9 @@ function deriveLocalPlanningDefinitionForSemantics(input: {
     outputKind: readOnly ? 'evidence' : normalized!.outputKind,
     deliverableKind: readOnly ? 'evidence' : normalized!.deliverableKind,
     destinationPosture: readOnly ? null : normalized!.destinationPosture,
+    ...(!readOnly && normalized!.destinationPostures
+      ? { destinationPostures: normalized!.destinationPostures }
+      : {}),
     evidenceKinds: readOnly ? ['tool_result'] : ['local_commit_receipt'],
     handleRequired: readOnly ? false : normalized!.destinationPosture !== null,
     readbackRequired: false,
@@ -746,11 +763,16 @@ export async function issueAuthorizedLocalPlanningDisclosureCandidate(input: {
 }): Promise<AuthorizedLocalPlanningDisclosureOutcome> {
   const name = input.name.trim();
   if (!name || !input.configuredNames.has(name)) return null;
-  const observed = await observeCurrentLocalPlanningDefinitions({ name, carrier: input.carrier });
+  // A native contextual reader keeps its current call_tool invocation. Its
+  // separately selected Plan operation uses the canonical work_call contract;
+  // publishing that future contract must not reroute today's contextual read.
+  const planningCarrier = input.carrier === 'call_tool' && isRegistryDeclaredNativePlanningRead(name)
+    ? 'work_call' : input.carrier;
+  const observed = await observeCurrentLocalPlanningDefinitions({ name, carrier: planningCarrier });
   if (!observed.ok) return { refused: observed.reason };
   const candidate: AuthorizedLocalPlanningDisclosureCandidate = Object.freeze({
     name,
-    carrier: input.carrier,
+    carrier: planningCarrier,
     schema: observed.schema,
     sourceKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
     capabilityVariants: Object.freeze(observed.definitions.map((definition) => Object.freeze({
@@ -792,8 +814,8 @@ function definitionsEqual(
     && left.consequence === right.consequence
     && left.reversibility === right.reversibility
     && left.destructive === right.destructive
-    && JSON.stringify(left.safeMode) === JSON.stringify(right.safeMode)
-    && JSON.stringify(left.descriptor) === JSON.stringify(right.descriptor);
+    && closedCanonicalJson(left.safeMode) === closedCanonicalJson(right.safeMode)
+    && closedCanonicalJson(left.descriptor) === closedCanonicalJson(right.descriptor);
 }
 
 export async function revalidateLocalPlanningDefinition(
@@ -882,11 +904,11 @@ function minimallyValidDurableDefinition(
  * policy decision: it proves the durable disclosure row and then revalidates
  * the exact current configured name/schema/registry envelope.
  */
-export async function loadDurableAuthorizedLocalPlanningDefinition(input: {
+function readDurableAuthorizedLocalPlanningDefinition(input: {
   sessionId: string;
   sourceUserSeq: number;
   capabilityRef: string;
-}): Promise<DurableAuthorizedLocalPlanningDefinitionResult> {
+}): DurableAuthorizedLocalPlanningDefinitionResult {
   const ref = input.capabilityRef.trim();
   if (!ref) return { ok: false, reason: 'not_found' };
   const definitions: AuthorizedLocalPlanningDefinitionV1[] = [];
@@ -931,11 +953,41 @@ export async function loadDurableAuthorizedLocalPlanningDefinition(input: {
     definition.envelopeFingerprint !== first.envelopeFingerprint
     || JSON.stringify(definition) !== JSON.stringify(first)
   ))) return { ok: false, reason: 'ambiguous_durable_definition' };
-  const revalidated = await revalidateLocalPlanningDefinition(first);
+  return { ok: true, definition: first };
+}
+
+export async function loadDurableAuthorizedLocalPlanningDefinition(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  capabilityRef: string;
+}): Promise<DurableAuthorizedLocalPlanningDefinitionResult> {
+  const prior = readDurableAuthorizedLocalPlanningDefinition(input);
+  if (!prior.ok) return prior;
+  const revalidated = await revalidateLocalPlanningDefinition(prior.definition);
   if (!revalidated.ok) {
     return { ok: false, reason: 'surface_changed', detail: revalidated.reason };
   }
   return { ok: true, definition: revalidated.definition };
+}
+
+/** Synchronous nomination only. The host binds this exact source/ref/target;
+ * consent must still reopen and revalidate the current configured definition
+ * before it can authorize dispatch. This cannot acquire a new local tool. */
+export function nominateDisclosedLocalPlanningDefinition(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  capabilityRef: string;
+  operationId: string;
+  effect: string;
+  args: unknown;
+}): AuthorizedLocalPlanningDefinitionV1 | null {
+  const loaded = readDurableAuthorizedLocalPlanningDefinition(input);
+  return loaded.ok
+    && loaded.definition.name === input.operationId
+    && loaded.definition.descriptor.effect === input.effect
+    && localPlanningArgumentsMatch(loaded.definition, input.args)
+    ? loaded.definition
+    : null;
 }
 
 /** Argument-shape helper for the later consent/dispatch boundary. This module

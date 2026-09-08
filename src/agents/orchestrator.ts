@@ -1,3 +1,6 @@
+import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
+import { acceptedPlanExecution } from '../runtime/harness/accepted-plan-execution.js';
+import { buildPublishPlanTool } from '../tools/publish-plan.js';
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
@@ -64,18 +67,17 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS } from './tool-catalog.js';
 import {
   composeSessionFromStore,
   pinCompositionHotTools,
   pinCompositionTools,
 } from '../runtime/harness/session-composition.js';
-import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopologyRoleFor, deriveOrchestratorDiscoveryNames, isRegistryDeclaredRead } from '../tools/tool-registry.js';
+import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopologyRoleFor, deriveOrchestratorDiscoveryNames, isRegistryDeclaredRead, deriveGuardrailMutating, isRegisteredDelegationPrimitive } from '../tools/tool-registry.js';
 import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import { isHostOnlyActionControl } from '../tools/tool-registry.js';
-import { uniqueWorkflowRunRequest } from '../tools/named-workflow-match.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
   inspectPrimaryModelPlanningReadCapability,
@@ -99,6 +101,7 @@ import {
 import {
   durableSelectedLocalPlanningCapabilityNames,
   isRegistryDeclaredLocalPlanningCapability,
+  isRegistryDeclaredNativePlanningRead,
   isWorkCallConfiguredLocalPlanningCapability,
 } from '../runtime/harness/local-planning-capability.js';
 import {
@@ -112,6 +115,7 @@ import {
 import {
   toolSearchBrokerCoverage,
   type ToolSearchPlanningDisclosureCandidate,
+  type ToolSearchPlanningDisclosureControl,
 } from '../tools/tool-search-tool.js';
 import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
@@ -362,6 +366,7 @@ const LOCAL_MEMORY_ONLY_BUILTINS = new Set([
   'memory_search_facts',
   'recall_tool_result',
   'session_history',
+  'session_search',
   'tool_output_query',
 ]);
 const LOCAL_MEMORY_ONLY_TURN_RE = /\b(?:(?:use|using|consult|read|search|check)\s+only\s+(?:clementine(?:'s)?\s+)?local\s+memory|local\s+memory\s+only)\b/i;
@@ -757,6 +762,10 @@ function taskRequiredAccountSelectionBlockers(input: {
   const topName = typeof envelope.rows[0]?.name === 'string'
     ? envelope.rows[0].name.trim()
     : '';
+  // A typed routing nomination can resolve a choice already present in the
+  // accepted request. Let the reasoning loop make that interpretation before
+  // a host-authored question interrupts the user.
+  if (typeof envelope.rows[0]?.accountSelectionNextStep === 'string') return [];
   if (!topName || !accountSelectionCandidateMatchesRequiredRole({
     acceptedText: input.source.text,
     requirementText: requirement.text,
@@ -1854,14 +1863,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // Prior-turn texts (this session + continuation lineage), newest-first. Reused by
   // BOTH the MCP scope (continuity) and the JIT ranking query, so a bare follow-up
   // ("do it", "schedule it") ranks against the work the conversation built toward.
-  const declinedContinuation = options.taskContinuation?.disposition === 'declined';
+  const taskMode = acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq);
+  const planMode = taskMode?.kind === 'plan';
+  const reviewedReadOnlyExecution = taskMode?.kind === 'execute' && Boolean(options.sessionId && options.sourceUserSeq
+    && acceptedPlanExecution(options.sessionId, options.sourceUserSeq)?.artifact.structuredPlan?.executionDraft === null);
+  const declinedContinuation = !planMode && options.taskContinuation?.disposition === 'declined';
   const declinedParentWithNewTask =
     options.taskContinuation?.disposition === 'declined_with_new_task';
   const parentAuthorityDeclined = declinedContinuation || declinedParentWithNewTask;
-  const plainConversationSurface = options.hostPlainConversation === true;
-  const factorySkip = declinedContinuation
+  const plainConversationSurface = !planMode && options.hostPlainConversation === true;
+  const factorySkip = !planMode && (declinedContinuation
     || plainConversationSurface
-    || factorySkipForCompiledRoute(options.acceptedRoute, options.allowedToolNames);
+    || factorySkipForCompiledRoute(options.acceptedRoute, options.allowedToolNames));
   const currentUserInput = typeof options.userInput === 'string' ? options.userInput : '';
   // A dual-clause turn remains byte-exact in the provider transcript, while
   // semantic/tool acquisition sees only the fresh clause after the explicit
@@ -1932,7 +1945,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // not_reachable before the model could load the requested procedure.
     // Mutating controls such as space_save remain plan-bound because this
     // exception is read-only; business reads retain their requirement binding.
-    && !(isRegistryDeclaredRead(name) && actionTopologyRoleFor(name) === 'control')
+    && (!(isRegistryDeclaredRead(name) && actionTopologyRoleFor(name) === 'control')
+      || (isRegistryDeclaredNativePlanningRead(name) && durableSelectedLocalPlanningNames.has(name)))
     && (Boolean(hostFreshPlanning) || durableSelectedLocalPlanningNames.has(name))
   );
   const frozenContract = actionWork
@@ -1972,7 +1986,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ...(options.allowedToolNames ?? []),
           'call_tool',
           'work_call',
-          ...(hostFreshPlanning ? ['plan_task'] : []),
+          ...(planMode ? ['publish_plan', 'run_worker'] : hostFreshPlanning && !reviewedReadOnlyExecution ? ['plan_task'] : []),
         ])]
       // A planning control the host ADVERTISES must be callable. The structural
       // lookup tells the model plan_task exists and describes it; staging it
@@ -1989,7 +2003,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // into a restrictive list of one and strip the hot-set run control of a
       // uniquely named saved workflow. Only extend a list that already exists.
       : hostFreshPlanning && Array.isArray(options.allowedToolNames)
-        ? [...new Set([...options.allowedToolNames, 'plan_task'])]
+        ? [...new Set([...options.allowedToolNames, ...(planMode ? ['publish_plan'] : reviewedReadOnlyExecution ? [] : ['plan_task'])])]
         : options.allowedToolNames;
   // Prior-input retrieval here exists only to recover MCP/JIT scope. It is not
   // the provider transcript: runTurn still supplies the normal conversation
@@ -2007,16 +2021,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.taskContinuation?.parentInput ?? '',
         ...historicalPriorUserInputs,
       ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
-  const directNamedWorkflowRun = uniqueWorkflowRunRequest(scopeUserInput, priorUserInputs);
-  // A current accepted source that uniquely identifies an existing workflow
-  // already has the complete resource identity needed by workflow_run. Keep
-  // that one control on its ordinary direct admission path; sending it through
-  // local planning would add discovery/work_call while ultimately reopening
-  // the same accepted-source + queue boundary. Prior/LRU promotion alone is
-  // not enough: unrelated turns remain plan-bound.
+  // workflow_run is a structured control with its own exact accepted-source
+  // admission and queue boundary. Its availability cannot depend on a fuzzy
+  // English request match or require an unrelated planning graph.
   const routesPlanBoundLocalCapabilityForTurn = (name: string): boolean => (
-    routesPlanBoundLocalCapability(name)
-    && !(name === 'workflow_run' && directNamedWorkflowRun)
+    routesPlanBoundLocalCapability(name) && name !== 'workflow_run'
   );
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
@@ -2077,13 +2086,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const planningDisclosure = hostFreshPlanning
     ? async (
         candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-        control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+        control?: Readonly<ToolSearchPlanningDisclosureControl>,
       ) => {
         const staged = await stageDisclosedPlanningProviderCandidates({
           ...hostFreshPlanning.identity,
           candidates,
           signal: control?.signal,
           deadlineAt: control?.deadlineAt,
+          accountSelection: control?.accountSelection,
         });
         if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {
           return { version: 1 as const, refs: Object.freeze({}), blockers: Object.freeze({}) };
@@ -2105,36 +2115,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       }
     : undefined;
   if (carrierWork) {
-    // The role kernel lands independently of this subtraction slice. Optional
-    // capability detection keeps this patch apply/testable alone; once the
-    // kernel is present, the positive broker fact is what arms exact-role
-    // discovery instead of legacy task-wide compatibility.
-    const roleKernel = discoveryGovernor as typeof discoveryGovernor & {
-      initializeRoles?: (input: {
-        sessionId: string;
-        sourceUserSeq: number;
-        requirements: readonly { roleKey: string; clauseIndex: number; text: string; resolved: boolean }[];
-        brokerCoverage?: 'builtins_only' | 'authorized_external_v1';
-      }) => unknown;
-    };
-    // ROLES REGISTER ON THE ACCEPTED TASK'S DISCOVERY AUTHORITY, so the task
-    // row must exist first. Agent construction is not the same point in every
-    // lane: this one builds at the spine's capability_resolve node, UPSTREAM of
-    // runTurn's baseline initializeTask, while the Claude lane arms the task
-    // immediately before arming roles. Arming roles against a task that does
-    // not exist is a governor invariant violation — it threw and took every
-    // act-route turn on this lane down with it, in the CLI and desktop dock as
-    // well as in tests. Pair them here exactly as the Claude lane does.
-    // Nothing is bypassed: initializeTask independently verifies that
-    // (sessionId, sourceUserSeq) names a real accepted user input, and
-    // knownCapability only ever tightens policy, so it cannot downgrade a
-    // capability already proven this turn.
+    // Initialize exact request ownership before either foreground lane can
+    // discover. Existing accepted sources keep their durable replay strategy.
     discoveryGovernor.initializeTask({
+      claimKeyVersion: 'exact_request_v1',
       sessionId: options.sessionId!,
       sourceUserSeq: options.sourceUserSeq!,
       knownCapability: false,
     });
-    roleKernel.initializeRoles?.({
+    // Compatibility only: v1 sources do not register advisory clause roles.
+    discoveryGovernor.initializeRoles({
       sessionId: options.sessionId!,
       sourceUserSeq: options.sourceUserSeq!,
       requirements: (options.turnCandidates?.requirements ?? []) as readonly {
@@ -2179,7 +2169,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // structuralTools. Building its nested planner agent anyway eagerly expands
   // the full local runtime schema surface, only to discard it below. Keep the
   // construction aligned with the sole lane that can actually advertise it.
-  const plannerTool = !factorySkip && !carrierWork
+  const plannerTool = !planMode && !reviewedReadOnlyExecution && !factorySkip && !carrierWork
     ? buildPlannerTool()
     : null;
   // Fresh host planning already carries one provider-neutral topology card and
@@ -3390,6 +3380,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   let catalogBlock: string | null = null;
   let searchFirstClassCount = 0;
   let searchCatalogCount = 0;
+  let searchCatalogBytes = 0;
   let searchFirstClassTokens = 0;
   let searchCatalogTokens = 0;
   if (searchDecision.active) {
@@ -3451,6 +3442,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const workCallBuiltinNames = new Set([
         ...actionBusinessNames,
         ...localPlanningCapabilityNames,
+        // Keep context call_tool reads available; the second carrier is only a
+        // potential Plan execution surface. Exact frozen read admission still
+        // owns every selected invocation, including plans frozen later this turn.
+        ...[...policyAllowed].filter((name) => isRegistryDeclaredNativePlanningRead(name)
+          && workCallLocalSchemaNames.has(name)),
       ]);
       const visibleFirstClassNames = carrierWork
         ? new Set([...firstClassNames].filter((name) => (
@@ -3475,7 +3471,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const dispatchableActionReadNames = new Set([...policyAllowed]
         .filter((name) => isRegistryDeclaredRead(name) && !visibleFirstClassNames.has(name)));
       const discoverableNames = carrierWork
-        ? new Set([...actionBusinessNames, ...deferredActionControlNames])
+        ? new Set([...actionBusinessNames, ...deferredActionControlNames,
+            // A contextual reader can already be first-class yet still need an
+            // exact Plan ref. Its discovery row does not remove the direct door.
+            ...[...actionControlNames].filter((name) => isRegistryDeclaredNativePlanningRead(name)),
+          ])
         : deferredNames;
       firstClassDiscovery = actionScopedDiscoveryTools
         .filter((t) => visibleFirstClassNames.has((t as { name?: string }).name ?? ''))
@@ -3508,7 +3508,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // filtered to host-only controls below, so this can only ever admit a
       // host-local control — never a business tool.
       const structuralControlNames: readonly string[] = hostFreshPlanning
-        ? ['plan_task']
+        ? (planMode ? ['publish_plan'] : reviewedReadOnlyExecution ? [] : ['plan_task'])
         : [];
       const dispatcherOptions: BuildCallToolOptions = {
         // Structural controls belong in BOTH reachability sets, on BOTH turn
@@ -3561,6 +3561,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             ...dispatcherOptions,
             frozenContract,
             ...(hostFreshPlanning ? {
+              disclosedOperations: hostFreshPlanning.capabilities,
               requireHostPlan: true,
               hostPlanningReady: () => {
                 const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
@@ -3607,10 +3608,27 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               controlOnlyBuiltins: true,
             })
           : buildCallTool(dispatcherOptions);
-      const catalogText = buildCompactToolCatalog({ allowedNames: discoverableNames });
-      searchCatalogCount = discoverableNames.size;
-      searchCatalogTokens = Math.round(catalogText.length / 4);
-      catalogBlock = hostFreshPlanning ? null : [
+      // The planning card carries exact work refs, not the native reader
+      // inventory. Keep already-reachable deferred reads visible so finding
+      // their schemas can use exact local names instead of connector search.
+      // This is presentation only: no schema, binding or capability is added.
+      const lookupPresentationExcludes = new Set([...DISCOVERY_SIBLING_DOORS, ...deriveGuardrailMutating()]);
+      const catalogNames = hostFreshPlanning
+        ? new Set([...dispatchableActionReadNames].filter((name) => (
+            discoverableNames.has(name)
+            && !localPlanningCapabilityNames.has(name)
+            && !visibleFirstClassNames.has(name)
+            && !lookupPresentationExcludes.has(name)
+            && !isRegisteredDelegationPrimitive(name)
+          )))
+        : discoverableNames;
+      const catalogText = buildCompactToolCatalog({ allowedNames: catalogNames });
+      catalogBlock = hostFreshPlanning
+        ? catalogNames.size > 0 ? [
+            '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: "<one JSON object string>"}). If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
+            catalogText,
+          ].join('\n') : null
+        : [
         // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
         // read the name-only listing as evidence it had NO tool access and
         // refused the task outright (A_zero_tools stall). The catalog must be
@@ -3618,17 +3636,21 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         carrierWork
           ? frozenContract
             ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
-            : hostFreshPlanning
-              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. A sole identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision; chat does not compile a hidden plan for it. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for compound topology, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
-              : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
+            : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
       ].join('\n');
+      searchCatalogCount = catalogBlock ? catalogNames.size : 0;
+      searchCatalogBytes = Buffer.byteLength(catalogBlock ?? '', 'utf8');
+      searchCatalogTokens = Math.round((catalogBlock?.length ?? 0) / 4);
     } catch (err) {
       // Never break construction — fall back to the full first-class surface.
       firstClassDiscovery = jitDiscoveryTools;
       callTool = null;
       catalogBlock = null;
+      searchCatalogCount = 0;
+      searchCatalogBytes = 0;
+      searchCatalogTokens = 0;
     }
   }
 
@@ -3650,6 +3672,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const workCallBuiltinNames = new Set([
       ...businessNames,
       ...localPlanningCapabilityNames,
+      ...actionScopedDiscoveryTools.map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter((name) => name && !excludes.has(name)
+          && (!explicitAllowed || explicitAllowed.has(name))
+          && isRegistryDeclaredNativePlanningRead(name) && workCallLocalSchemaNames.has(name)),
     ]);
     workCallOptions = {
       reachableBuiltinNames: workCallBuiltinNames,
@@ -3658,6 +3684,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       mcpToolScope,
       frozenContract,
       ...(hostFreshPlanning ? {
+        disclosedOperations: hostFreshPlanning.capabilities,
         requireHostPlan: true,
         hostPlanningReady: () => {
           const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
@@ -3706,8 +3733,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // identity/rubric cache boundary. Calling this whole block "static" made a
   // catalog or frozen-plan revision silently revise the stable prefix.
   const volatileInstructions = [
-    batchShapeMandate,
-    carrierWork
+    !planMode && batchShapeMandate,
+    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. If a current capability changed, stop and explain the need to revise. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Do not repeat successful writes.' : null,
+    planMode ? '[explicit-plan-mode] The user selected Plan. Use this same configured reasoning loop to actively investigate all required tools, schemas, accounts, source facts, and argument values with discovery and proven reads. You may delegate bounded investigation to run_worker; every worker remains read-only. Do not execute business changes, workflow/space mutations, sends, shell operations, approvals, or plan_task. Publish the complete reviewed artifact with publish_plan: exact discovered capability refs, static schema-valid arguments, dependencies, subagent roles, verification, and dynamic values bound to earlier result paths. Never guess account IDs or pretend model-authored identities were verified. If facts remain unavailable, publish a needs_input draft with explicit missing prerequisites. This Plan turn ends with a saved artifact for review, not with execution of the proposed work. Normal reads still remain available.' : null,
+    !planMode && carrierWork
       ? frozenContract
         ? [
             '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly, and deferred controls plus local READS through the `call_tool` carrier (reads never need a proposal); `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business WRITE through `work_call`.',
@@ -3721,7 +3750,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. Emit one identified proposal-free `work_call` directly for a sole action; its tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use explicit `plan_task` for multiple actions, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work; conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) need none.'
+          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use `plan_task` for coordinated business dependencies or per-member work that needs a graph, unresolved business dependencies, an explicitly requested execution graph, ambiguity, admin, destructive, or unknown-effect work. Contextual reads followed by one authorized reversible write and ordinary readback do not require a graph merely because they happen in order. Conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) also need none.'
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,
@@ -3737,6 +3766,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   });
   const structuralTools = factorySkip
     ? []
+    : planMode
+      ? [buildPublishPlanTool(hostFreshPlanning), buildAskUserQuestionTool(), runWorkerTool]
+    : reviewedReadOnlyExecution
+      ? [buildAskUserQuestionTool(), runWorkerTool]
     : carrierWork
     // run_worker stays DIRECT on action turns: it is the fan-out coordination
     // primitive (control role), not a business operation — dropping it made
@@ -3796,6 +3829,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           active: searchDecision.active,
           firstClassCount: searchFirstClassCount,
           catalogCount: searchCatalogCount,
+          catalogBytes: searchCatalogBytes,
           estFirstClassTokens: searchFirstClassTokens,
           estCatalogTokens: searchCatalogTokens,
         },

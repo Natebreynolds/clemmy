@@ -685,3 +685,69 @@ test('an ordinary answer with no refused work and no dispatch still delivers (de
   assert.equal(committed.event.data.delivered, true);
   assert.equal('verificationMissing' in committed.event.data, false);
 });
+
+
+for (const livePolicy of ['on', 'off']) {
+  test(`unreadable captured policy publishes review unavailable without relabelling or holding successful work when live review is ${livePolicy}`, () => {
+    const prior = process.env.CLEMMY_COMPLETION_REVIEW;
+    process.env.CLEMMY_COMPLETION_REVIEW = livePolicy;
+    try {
+      const sessionId = `unreadable-policy-${livePolicy}`;
+      createSession({ id: sessionId, kind: 'chat' });
+      const outcome = acceptedAnswer(sessionId, 'Here is the requested answer.');
+      appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+        version: 2, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: 'damaged',
+      } });
+      // A retained fail-open verdict makes the old live-policy fallback hold
+      // this turn when today's setting is ON. Policy unreadability alone must
+      // never substitute today's policy or create a repeat-execution obligation.
+      appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+        lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+        fulfills: true, failedOpen: true, reason: 'Earlier review unavailable.',
+        objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+        replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+      } });
+      const committed = commitTurnOutcome(outcome);
+      assert.equal(committed.presentation.status, 'done');
+      assert.equal(committed.presentation.text, outcome.presentation.text);
+      assert.equal(committed.event.data.delivered, true);
+      const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+      assert.equal(verdict.policyEvidence, 'unreadable');
+      assert.equal(verdict.verified, false);
+      assert.equal(verdict.disposition, 'enabled_unavailable');
+    } finally {
+      if (prior === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW;
+      else process.env.CLEMMY_COMPLETION_REVIEW = prior;
+    }
+  });
+}
+
+
+for (const [label, reason, expected] of [
+  ['quota', 'The selected reviewer is rate-limited; no review was completed.', /reviewer is rate-limited/],
+  ['retained-timeout', 'judge timed out — accepting completion', /judge timed out; no review was completed/],
+] as const) {
+test(`publication keeps the ${label} reason and never calls a missing review an acceptance`, () => {
+  const sessionId = `${label}-unreviewed-publication`;
+  createSession({ id: sessionId, kind: 'chat' });
+  const outcome = acceptedAnswer(sessionId, 'Here is the requested answer.');
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+    version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+  } });
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+    lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+    fulfills: true, failedOpen: true,
+    reason,
+    objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+    replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+  } });
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.status, 'blocked');
+  assert.match(committed.presentation.text, expected);
+  assert.match(committed.presentation.text, /remains unreviewed/);
+  assert.doesNotMatch(committed.presentation.text, /accepting completion|accepted this result|without actually checking it/);
+  const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(verdict.verified, false);
+  assert.equal(verdict.disposition, 'enabled_unavailable');
+});
+}

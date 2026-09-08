@@ -466,6 +466,34 @@ test('artifact root lineage survives same-turn fallback, manual continue, and re
   );
 });
 
+test('live approval sources and exact acknowledgement terminals do not split fallback artifact lineage', () => {
+  const sid = session();
+  const source = eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create the requested report.' } });
+  const root = ledger.resolveArtifactRunScopeId(sid, 'original-report', source.seq);
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed',
+    data: { sourceUserSeq: source.seq, reason: 'awaiting_user_input', artifactRunScopeId: root } });
+  const control = eventlog.appendEvent({ sessionId: sid, turn: 0, role: 'user', type: 'user_input_received', parentEventId: source.id,
+    data: { text: 'Approve the exact card.', synthetic: true,
+      liveApprovalControl: { version: 1, ownerAttemptId: 'original-report-owner', ownerSourceUserSeq: source.seq } } });
+  eventlog.appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'conversation_completed',
+    data: { sourceUserSeq: control.seq, reason: 'mobile_approval_resolved' } });
+  assert.equal(ledger.resolveArtifactRunScopeId(sid, 'same-source-fallback'), root);
+  assert.equal(ledger.resolveArtifactRunScopeId(sid, 'explicit-control-scope', control.seq), root);
+  assert.equal(ledger.getArtifactRunScope(sid, 'explicit-control-scope')?.sourceUserSeq, control.seq,
+    'explicit source selection is unchanged, including its existing awaiting-input inheritance');
+  const answer = eventlog.appendEvent({ sessionId: sid, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Cover the production accounts.' } });
+  assert.equal(ledger.resolveArtifactRunScopeId(sid, 'answered-report', answer.seq), root,
+    'the exact acknowledgement cannot mask the original awaiting-input terminal');
+  assert.equal(ledger.getArtifactRunScope(sid, 'answered-report')?.reason, 'awaiting_user_input_reply');
+  const ordinary = eventlog.appendEvent({ sessionId: sid, turn: 3, role: 'user', type: 'user_input_received',
+    data: { text: 'New separate report.', liveApprovalControl: { version: 1 } } });
+  assert.equal(ledger.resolveArtifactRunScopeId(sid, 'separate-report'), 'separate-report',
+    'an untyped lookalike is not silently dropped from the source boundary');
+  assert.equal(ledger.getArtifactRunScope(sid, 'separate-report')?.sourceUserSeq, ordinary.seq);
+});
+
 test('artifact lineage honors the bound source sequence instead of a newer unbound input', () => {
   const sid = session();
   const source = eventlog.appendEvent({

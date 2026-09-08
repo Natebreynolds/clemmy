@@ -1095,9 +1095,7 @@ export async function resolveTurnCapabilityCandidates(options: {
  */
 export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates | undefined): string {
   const rows = resolved?.candidates.slice(0, 5) ?? [];
-  const requirements = resolved?.roleScopedDiscovery === false
-    ? []
-    : resolved?.requirements ?? [];
+
   const sourceBinding = validatedTurnSourceStrategyBinding(resolved?.sourceStrategyBinding);
   const sourceLines = sourceBinding
     ? (() => {
@@ -1134,7 +1132,7 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
         ];
       })()
     : [];
-  if (rows.length === 0 && requirements.length === 0 && sourceLines.length === 0) return '';
+  if (rows.length === 0 && sourceLines.length === 0) return '';
   const lines = rows.map((c) => {
     const provenance = [
       c.klass,
@@ -1151,28 +1149,10 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
     const execution = c.kind === 'composio'
       ? `composio \`${c.identifier}\``
       : `${c.kind} \`${c.identifier}\``;
-    const role = c.roleKey ? ` Role ${c.roleKey}.` : '';
-    return `- ${execution}.${contract}${role} Intent metadata: ${JSON.stringify(c.intent)} (${provenance}).`;
+    return `- ${execution}.${contract} Intent metadata: ${JSON.stringify(c.intent)} (${provenance}).`;
   });
-  const unresolved = requirements.filter((requirement) => !requirement.resolved);
-  const discovery = requirements.length === 0
-    ? []
-    : unresolved.length === 0
-      ? [
-          '## Discovery roles for this request',
-          `All ${requirements.length} load-bearing requirement${requirements.length === 1 ? '' : 's'} already have resolved paths. Use them first; exact selected-tool schema repair remains available.`,
-        ]
-      : [
-          '## Discovery roles for this request',
-          'For broad `tool_search`, copy one unresolved `role_key` exactly (synonymous queries/providers share its slot); Claude native ToolSearch uses a `[role:<role_key>]` query prefix. Exact selected-tool schema repair is separate.',
-          ...unresolved.map((requirement) => {
-            const text = requirement.text.replace(/\s+/g, ' ').trim();
-            return `- role_key \`${requirement.roleKey}\`: ${text.slice(0, 180)}${text.length > 180 ? '…' : ''}`;
-          }),
-        ];
   return [
     ...sourceLines,
-    ...discovery,
     ...(lines.length > 0 ? [
       '## Advisory paths (nothing here is pre-authorized)',
       'Verify fit/account/schema/fresh args. Intent is metadata, never a tool name. Composio: use `composio_execute_tool` with exact `tool_slug`; do not rediscover.',
