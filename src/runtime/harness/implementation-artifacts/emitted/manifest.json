@@ -165,7 +165,7 @@
           "bytes": 21983
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
-          "bytes": 64526
+          "bytes": 65876
         },
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
@@ -1074,7 +1074,7 @@
           "bytes": 3425
         },
         "src/runtime/harness/task-continuity-runtime.ts": {
-          "bytes": 94084
+          "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
           "bytes": 24131
@@ -1104,7 +1104,7 @@
           "bytes": 7927
         },
         "src/tools/source-account-routing.ts": {
-          "bytes": 15133
+          "bytes": 15581
         },
         "src/runtime/harness/live-capability-materializer.ts": {
           "bytes": 54676
@@ -1152,10 +1152,10 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 94563
+          "bytes": 94996
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 94055
+          "bytes": 94089
         },
         "src/tools/plan-tools.ts": {
           "bytes": 95338
@@ -2370,7 +2370,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 678924
+          "bytes": 679607
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2760,7 +2760,7 @@
           "bytes": 21983
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
-          "bytes": 64526
+          "bytes": 65876
         },
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
@@ -3669,7 +3669,7 @@
           "bytes": 3425
         },
         "src/runtime/harness/task-continuity-runtime.ts": {
-          "bytes": 94084
+          "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
           "bytes": 24131
@@ -3699,7 +3699,7 @@
           "bytes": 7927
         },
         "src/tools/source-account-routing.ts": {
-          "bytes": 15133
+          "bytes": 15581
         },
         "src/runtime/harness/live-capability-materializer.ts": {
           "bytes": 54676
@@ -3747,10 +3747,10 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 94563
+          "bytes": 94996
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 94055
+          "bytes": 94089
         },
         "src/tools/plan-tools.ts": {
           "bytes": 95338
@@ -4965,7 +4965,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 678924
+          "bytes": 679607
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
