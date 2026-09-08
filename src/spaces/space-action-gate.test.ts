@@ -720,6 +720,12 @@ test('resolving a gated approval triggers a prompt zero-body failure via the lis
 
 test('an explicit Workspace action rejection becomes a memory outcome without dispatch', async () => {
   gate.initSpaceActionApprovals();
+  // init schedules the boot-recovery pass on the next macrotask; let it run
+  // (it finds no rows) before this rejection exists, or on a slower runner it
+  // re-projects the same rejection and the seam sees two identical signals
+  // (2026-09-08 CI: 2 !== 1). The bridge itself dedupes by contentHash.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
   const captured: Array<Record<string, unknown>> = [];
   gate._setWorkspaceActionMemoryCaptureForTests(async (signal) => {
     captured.push(signal as unknown as Record<string, unknown>);

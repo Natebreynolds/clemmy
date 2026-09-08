@@ -309,6 +309,12 @@ test('cutover daemon holds durable work inert and exposes only authenticated bui
     ...process.env,
     CLEMENTINE_HOME: home,
     XDG_CACHE_HOME: cacheHome,
+    // tsx keeps a compile cache under TMPDIR. The isolated runner points TMPDIR
+    // inside the guarded home, so on the CI runner the held daemon's very first
+    // module load did fs.mkdirSync(<home>/tmp/tsx-<uid>) and the adversarial
+    // guard killed it before readiness (2026-09-08, v3.16.0 tag gate, twice).
+    // The cache is a loader convenience, never daemon behaviour: disable it.
+    TSX_DISABLE_CACHE: '1',
     CLEMMY_TEST_ISOLATED_HOME: '1',
     CLEMMY_CUTOVER_HOLD: 'on',
     CLEMMY_CUTOVER_HOLD_HEARTBEAT_MS: '20',
