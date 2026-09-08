@@ -545,3 +545,39 @@ test('configured account review uses the existing independent judge role and a c
   assert.equal((await routing.resolveSourceAccountRouting(input(source(ORIGINAL)))).kind, 'resolved');
   assert.equal((await routing.resolveSourceAccountRouting({ ...input(source('Draft a note using my outbound email skill.')), nomination: null, connections: connections.slice(0, 1) })).kind, 'resolved');
 });
+
+test('a READ with a nominated identity routes without the judge; a write with the same dead judge is review_unavailable', async () => {
+  // Live 2026-09-08: a one-call calendar read died because the judge role (a
+  // separate model with its own sign-in) failed four times. Reading the wrong
+  // calendar is visible and correctable; sending from the wrong identity is
+  // not — so only writes keep the review.
+  const calls: SourceAccountJudgeCall[] = [];
+  registry.installTurnSemanticModelPort({
+    async interpret() { throw new Error('not used'); },
+    async judgeAccountSelection(call) { calls.push(call); throw new Error('judge model sign-in expired'); },
+  });
+  const readSource = source('Hows my day looking Clem?');
+  const read = await routing.resolveSourceAccountRouting({
+    ...readSource, toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'Hows my day looking Clem?' },
+    effect: 'read',
+  });
+  assert.equal(read.kind, 'resolved', JSON.stringify(read));
+  if (read.kind === 'resolved') {
+    assert.equal(read.connection.connectionId, 'fixture-scorpion');
+    assert.equal(read.evidence.judgeModelIdentity, 'host:read_route');
+  }
+  assert.equal(calls.length, 0, 'no judge call on a read');
+  const writeSource = source('Send this from my Scorpion mailbox');
+  const write = await routing.resolveSourceAccountRouting({
+    ...writeSource, toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'from my Scorpion mailbox' },
+    effect: 'write',
+  });
+  assert.equal(write.kind, 'account_selection_required');
+  if (write.kind === 'account_selection_required') {
+    assert.equal(write.reason, 'review_unavailable');
+    assert.deepEqual(write.labels, { [SCORPION]: SCORPION, [PERSONAL]: PERSONAL }, 'choices carry labels');
+  }
+  assert.equal(calls.length, 1, 'the write asked the judge once');
+});

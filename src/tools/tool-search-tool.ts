@@ -1644,7 +1644,7 @@ export function registerToolSearchTool(
                   ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP
                   : planningBlockers[r.name]!.reason === 'not_entailed' || planningBlockers[r.name]!.reason === 'quote_not_in_source'
                   ? 'The quoted user wording did not name this account, so it was not bound. Do not retry the same selection. Ask the user which one of accountChoices to use, then repeat tool_search with account_selection quoting their answer verbatim.'
-                  : 'If the accepted user request already names the operating account, repeat tool_search with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}. The host checks source-versus-recipient meaning. Ask the user only if no account was selected or the choice remains unclear.',
+                  : 'If the user\'s request names the operating account, repeat tool_search ONCE with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}; accountChoiceLabels names each choice. Reads route on that nomination directly; writes are reviewed. If it comes back blocked again, stop discovery — the host will ask the user which account.',
               }
             : opts.discloseForPlanning && !planningRefs[r.name]
               ? localPlanningRowStatus(r.name)

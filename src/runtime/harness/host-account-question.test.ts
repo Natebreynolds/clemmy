@@ -73,3 +73,48 @@ test('a single connected account, or a stop for any other reason, passes through
   assert.equal(hostAccountQuestionForExhaustedTurn(notExhausted, { sessionId: other, sourceUserSeq: seqOther }).status, 'blocked');
   assert.equal(eventlog.listEvents(other, { types: ['awaiting_user_input'] }).length, 0);
 });
+
+const { thisTurnAccountBlockedSearchCount } = await import('../../tools/tool-search-provider-sources.js');
+
+test('two blocked searches for one operation count as the model\'s retry spent; a row that resolved does not count', () => {
+  const sessionId = 'sess-blocked-search-count';
+  const seq = seed(sessionId, ['work@example.com', 'personal@example.org']);
+  assert.equal(thisTurnAccountBlockedSearchCount({ sessionId, sourceUserSeq: seq, name: 'OUTLOOK_GET_CALENDAR_VIEW' }), 1);
+  eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_returned',
+    data: {
+      tool: 'tool_search', sourceUserSeq: seq,
+      result: JSON.stringify({ results: [{ name: 'OUTLOOK_GET_CALENDAR_VIEW', planningRefStatus: 'account_selection_required', accountChoices: ['work@example.com', 'personal@example.org'], accountSelectionReason: 'not_entailed' }] }),
+    },
+  });
+  assert.equal(thisTurnAccountBlockedSearchCount({ sessionId, sourceUserSeq: seq, name: 'OUTLOOK_GET_CALENDAR_VIEW' }), 2, 'the second blocked search is the retry');
+  eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_returned',
+    data: {
+      tool: 'tool_search', sourceUserSeq: seq,
+      result: JSON.stringify({ results: [{ name: 'OUTLOOK_GET_CALENDAR_VIEW', capabilityRef: 'cap:live:v1:abc', effect: 'read' }] }),
+    },
+  });
+  assert.equal(thisTurnAccountBlockedSearchCount({ sessionId, sourceUserSeq: seq, name: 'OUTLOOK_GET_CALENDAR_VIEW' }), 2, 'a resolved row is not a blocked search');
+});
+
+test('the host\'s question shows the account label next to the identity', () => {
+  const sessionId = 'sess-host-account-labels';
+  eventlog.createSession({ id: sessionId, kind: 'chat' });
+  const user = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hows my day looking' } });
+  eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_returned',
+    data: {
+      tool: 'tool_search', sourceUserSeq: user.seq,
+      result: JSON.stringify({ results: [{
+        name: 'OUTLOOK_GET_CALENDAR_VIEW', planningRefStatus: 'account_selection_required',
+        accountChoices: ['ca_one', 'ca_two'],
+        accountChoiceLabels: { ca_one: 'Scorpion', ca_two: 'Cameron & Kane' },
+      }] }),
+    },
+  });
+  const out = hostAccountQuestionForExhaustedTurn(exhausted(sessionId), { sessionId, sourceUserSeq: user.seq });
+  assert.equal(out.status, 'awaiting_user_input');
+  assert.match(String(out.finalOutput), /Scorpion \(ca_one\)/);
+  assert.match(String(out.finalOutput), /Cameron & Kane \(ca_two\)/);
+});
