@@ -1,3 +1,4 @@
+import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal } from './reviewed-plan-runtime.js';
 import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, formatSteerBlock } from './steer-notes.js';
@@ -569,7 +570,9 @@ import {
   prepareHostWorkCall,
   resolveHostPlanningReadCapability,
 } from '../../tools/work-call-mode.js';
-import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
+import { thisTurnSearchAccountSelectionBlockers,
+  thisTurnAccountBlockedSearchCount,
+} from '../../tools/tool-search-provider-sources.js';
 import {
   acceptedTurnCallAuthorityFor,
   armHostCallAuthority,
@@ -894,6 +897,11 @@ export function hostNoProgressBlockedText(
    * Each was patched at its own door. This is the door they share.
    */
   admissible?: ReadonlySet<string>,
+  /** The last concrete tool/provider error this turn, already redacted and
+   *  bounded. Rendered verbatim: the ledger has the answer, so the stop must
+   *  say it (live 2026-09-08: "Stopped at: authority_acquisition" while the
+   *  row above read "No default environment found. Use --target-org"). */
+  lastBlocker?: string | null,
 ): string {
   const consequence = state?.lastConsequence;
   const summary = consequence?.effectState === 'known_terminal'
@@ -915,7 +923,8 @@ export function hostNoProgressBlockedText(
           ? `Use ${usable.join(' or ')} to resolve this step, then resume this saved task from its retained results.`
           : 'Use the available discovery or read tools to resolve the next executable step, then resume this saved task from its retained results.';
       })();
-  return `${summary}\nStopped at: ${stage}.\nNext: ${next}`;
+  const because = lastBlocker && lastBlocker.trim() ? `\nWhat stopped me: ${lastBlocker.trim()}` : '';
+  return `${summary}${because}\nStopped at: ${stage}.\nNext: ${next}`;
 }
 
 
@@ -3233,8 +3242,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   /** The recovery surface most recently computed for this turn, so a stop can
    *  only name tools the turn could actually call. */
   let admissibleRecoveryToolNames: ReadonlySet<string> | undefined;
+  /** The newest concrete tool error this turn ("An error occurred while
+   *  running the tool … Error: <provider text>"), redacted and bounded. */
+  const lastConcreteToolError = (): string | null => {
+    try {
+      const identity = exactHostIdentity();
+      for (const event of listEvents(identity.sessionId, { types: ['tool_returned'], desc: true, limit: 40 })) {
+        if (event.data.sourceUserSeq !== identity.sourceUserSeq) continue;
+        const raw = event.data.result;
+        const text = typeof raw === 'string' ? raw : typeof raw === 'object' && raw && typeof (raw as { preview?: unknown }).preview === 'string' ? String((raw as { preview: string }).preview) : '';
+        const m = /An error occurred while running the tool\.?\s*(?:Please try again\.)?\s*Error:\s*([\s\S]+)/i.exec(text);
+        if (!m) continue;
+        const cleaned = redactSensitiveText(m[1]!).replace(/\s+/g, ' ').trim();
+        if (cleaned) return cleaned.length > 240 ? `${cleaned.slice(0, 237)}…` : cleaned;
+      }
+    } catch { /* advisory only */ }
+    return null;
+  };
   const stopNoProgress = (stoppedOn?: string): RunOutcome => blockedOutcome(
-    hostNoProgressBlockedText(noProgressState, stoppedOn, admissibleRecoveryToolNames),
+    hostNoProgressBlockedText(noProgressState, stoppedOn, admissibleRecoveryToolNames, lastConcreteToolError()),
     'control_no_progress_exhausted',
     true,
     stoppedOn ?? noProgressState?.lastConsequence?.stage ?? 'no_new_evidence',
@@ -7525,6 +7551,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               // The retained ledger already supplies the factual stop. A
               // final model call cannot add execution evidence to that stop.
               return stopNoProgress(attempt.consequence?.stage ?? `${attempt.attemptClass}:no_new_evidence`);
+            }
+            // ONE CLARIFYING BEAT, HOST-OWNED. When discovery has twice come back
+            // "which account?" for the same operation with more than one connected
+            // account, the model has had its retry (its nomination did not resolve, or
+            // the request never named an account). Guiding it to ask is not enough —
+            // live 2026-09-08 a user's "Hows my day looking" burned 15 calls guessing.
+            // Stop on the exhausted reason; the loop turns that into the host's own
+            // account question.
+            {
+              const askIdentity = exactHostIdentity();
+              const askable = thisTurnSearchAccountSelectionBlockers({
+                sessionId: askIdentity.sessionId,
+                sourceUserSeq: askIdentity.sourceUserSeq,
+              }).find((blocker) => blocker.choices.length > 1
+                && thisTurnAccountBlockedSearchCount({
+                  sessionId: askIdentity.sessionId,
+                  sourceUserSeq: askIdentity.sourceUserSeq,
+                  name: blocker.name,
+                }) >= 2);
+              if (askable) return stopNoProgress(`account_selection:ask_user:${askable.name}`);
             }
             if (decision.action === 'reconcile') {
               return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');

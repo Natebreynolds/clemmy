@@ -10,11 +10,19 @@ test('Plan allows proven reads, investigation workers and its exact host artifac
 test('Plan closes native/business writes, workflow escapes, approvals, shell and foreign host-control names', () => {
   for (const [toolName, args] of [
     ['space_save', {}], ['workflow_create', {}], ['workflow_update', {}], ['workflow_run', {}], ['write_file', { path: '/tmp/not-scratch-authorized', content: 'x' }], ['request_approval', {}],
-    ['run_shell_command', { command: 'echo investigation' }], ['mcp__foreign__publish_plan', {}],
+    ['run_shell_command', { command: 'rm -rf /tmp/plan-mode-write-probe' }], ['mcp__foreign__publish_plan', {}],
     ['work_call', { name: 'space_save', args_json: '{}' }],
     ['composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: '{}' }],
   ] as const) assert.match(planModeCallRefusal({ mode: plan, toolName, args }) ?? '', /PLAN_MODE_READ_ONLY/, toolName);
 });
+test('Plan lets a read-only shell command run: a read is a read, whatever carries it', () => {
+  // Live 2026-09-08: a planning turn needed `sf org list --json` to plan its
+  // query and was refused as a write, then wandered until a misleading stop.
+  for (const command of ['echo investigation', 'sf org list --json', 'gh pr list --json number']) {
+    assert.equal(planModeCallRefusal({ mode: plan, toolName: 'run_shell_command', args: { command } }), undefined, command);
+  }
+});
+
 test('Normal and Execute retain native capabilities at this mode ceiling; Execute has a separate exact reviewed-call gate', () => {
   const execute = { version: 1, kind: 'execute', executeRef: { planId: 'plan1', revision: 1, digest: 'a'.repeat(64) } } as const;
   for (const mode of [undefined, { version: 1, kind: 'normal' } as const, execute]) for (const toolName of ['workflow_create', 'workflow_update', 'space_save', 'write_file']) {

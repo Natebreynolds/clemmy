@@ -49,6 +49,10 @@ export type SourceAccountRoutingResolution =
   | {
       kind: 'account_selection_required';
       choices: readonly string[];
+      /** Human label per choice (account label, alias, or email) so the model
+       *  and the host's own question can say "Scorpion (brett@…)" instead of
+       *  an opaque connection id. */
+      labels?: Readonly<Record<string, string>>;
       /** Why the nominated account was not bound. Surfaced to the model so
        *  the next hop is a precise question to the user, never a blind retry
        *  (live 2026-09-08: three identical refusals with no reason). */
@@ -60,6 +64,15 @@ const digest = (text: string): string => createHash('sha256').update(text).diges
 const emailOf = (connection: Connection): string => String(connection.accountEmail ?? '')
   .trim().toLowerCase().replace(/^smtp:/, '');
 const identityOf = (connection: Connection): string => emailOf(connection) || connection.connectionId;
+export function accountChoiceLabels(connections: readonly Connection[]): Readonly<Record<string, string>> {
+  const labels: Record<string, string> = {};
+  for (const connection of connections) {
+    const identity = identityOf(connection);
+    const label = String(connection.accountLabel ?? connection.alias ?? emailOf(connection) ?? '').trim() || connection.connectionId;
+    if (!labels[identity]) labels[identity] = label;
+  }
+  return Object.freeze(labels);
+}
 function acceptedSource(sessionId: string, seq: number) {
   const event = listEvents(sessionId, { sinceSeq: seq - 1, types: ['user_input_received'], limit: 1 })[0];
   if (!event || event.seq !== seq || event.role !== 'user') return null;
@@ -204,6 +217,10 @@ export async function resolveSourceAccountRouting(input: {
   operation: string;
   connections: Connections;
   nomination?: SourceAccountNomination | null;
+  /** The operation's effect class. A READ never waits on the cross-family
+   *  judge: a nominated or established identity routes directly, and only a
+   *  write keeps the source-versus-recipient review. */
+  effect?: 'read' | 'write';
 }): Promise<SourceAccountRoutingResolution> {
   const toolkit = input.toolkit.trim().toLowerCase();
   const relevant = input.connections.filter((connection) => connection.slug.trim().toLowerCase() === toolkit
@@ -283,6 +300,22 @@ export async function resolveSourceAccountRouting(input: {
     establishedSourceDigest: origin.digest,
     interveningAcceptedSources,
   };
+  // READS DO NOT WAIT ON THE JUDGE. Reading the wrong calendar is visible and
+  // correctable; sending from the wrong identity is not. Live 2026-09-08: a
+  // one-call calendar read died because the judge role (a separate model with
+  // its own sign-in) failed four times. For a read, a nomination that names an
+  // exact connected identity — or the conversation's established route — is
+  // the route. The result discloses the account so the user can correct it.
+  if (input.effect === 'read' && !defaultMode && origin) {
+    return { kind: 'resolved', connection, evidence: {
+      version: 1, sessionId: input.sessionId, principalId, toolkit, identity,
+      sourceSessionId: origin.sessionId, sourceUserSeq: origin.seq,
+      sourceQuote: sourceQuote ?? '', sourceDigest: origin.digest,
+      checkedForSourceUserSeq: input.sourceUserSeq,
+      checkedForSourceDigest: source.digest,
+      judgeModelIdentity: 'host:read_route',
+    } };
+  }
   const proposalDigest = digest(JSON.stringify(subject));
   // The user may be answering the host's OWN account question. When this
   // source consumed a clarification whose options carry the connected
@@ -307,7 +340,7 @@ export async function resolveSourceAccountRouting(input: {
     interveningAcceptedSources,
     proposalDigest,
   }, connectionRevision);
-  if (!result) return { kind: 'account_selection_required', choices, reason: 'review_unavailable' };
+  if (!result) return { kind: 'account_selection_required', choices, labels: accountChoiceLabels(relevant), reason: 'review_unavailable' };
   if (result.verdict !== (defaultMode ? 'default_compatible' : 'entailed')
     || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim()) return blocked('not_entailed');
   if (defaultMode) return { kind: 'resolved', connection, evidence: {

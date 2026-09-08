@@ -191,11 +191,11 @@ test('the actual readback nomination retains the same checked account and stages
     assert.equal(entry.sourceAccountRouting?.sourceQuote, saveText, 'the durable account fact retains its actual explicit origin');
     assert.equal(entry.sourceAccountRouting?.checkedForSourceUserSeq, read.sourceUserSeq);
   }
-  assert.equal(calls.at(-1)?.sourceQuote, readQuote, 'the exact current continuation quote still reaches review');
-  assert.equal(calls.at(-1)?.establishedSource?.sourceQuote, saveText);
-  assert.equal(calls.at(-1)?.establishedSource?.previouslyChecked, true);
+  // Reads do not wait on the judge (2026-09-08): the established route is the
+  // route, its origin is retained above, and no continuity review is spent.
+  assert.equal(calls.at(-1)?.sourceQuote, saveText, 'only the initial explicit selection was reviewed');
   await provider.stageDisclosedPlanningProviderCandidates({ ...read, candidates, accountSelection: readNomination });
-  assert.equal(calls.length, 2, 'one initial selection plus one cached current continuity review, independent of operation count/retries');
+  assert.equal(calls.length, 1, 'one initial selection; a read continuation on the established route spends no judge call');
 });
 
 test('same-identity current nominations still check corrections, exact quotes, and different-account overrides', async () => {

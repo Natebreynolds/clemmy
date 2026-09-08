@@ -1446,7 +1446,9 @@ export function hostAccountQuestionForExhaustedTurn(
     blockers: blockers.map((b) => ({ name: b.name, choices: b.choices.length, reason: b.reason ?? null })),
   }, blocker ? 'host account question: exhausted turn has account choices — asking the user' : 'host account question: exhausted turn has no multi-account blocker — leaving the typed stop');
   if (!blocker) return turnResult;
-  const options = [...new Set(blocker.choices.map((choice) => choice.trim()).filter(Boolean))];
+  const labels = (blocker as { labels?: Record<string, string> }).labels ?? {};
+  const options = [...new Set(blocker.choices.map((choice) => choice.trim()).filter(Boolean))]
+    .map((choice) => (labels[choice] && labels[choice] !== choice ? `${labels[choice]} (${choice})` : choice));
   if (options.length < 2) return turnResult;
   const operation = blocker.name.trim();
   const question = `Which account should I use for ${operation.toLowerCase().replace(/_/g, ' ')}? You have more than one connected: ${options.join(', ')}.`;

@@ -1636,6 +1636,9 @@ export function registerToolSearchTool(
             ? {
                 planningRefStatus: 'account_selection_required' as const,
                 accountChoices: planningBlockers[r.name]!.choices,
+                ...((planningBlockers[r.name] as { labels?: Record<string, string> }).labels
+                  ? { accountChoiceLabels: (planningBlockers[r.name] as { labels?: Record<string, string> }).labels }
+                  : {}),
                 ...(planningBlockers[r.name]!.reason ? { accountSelectionReason: planningBlockers[r.name]!.reason } : {}),
                 accountSelectionNextStep: planningBlockers[r.name]!.reason === 'review_unavailable'
                   ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP

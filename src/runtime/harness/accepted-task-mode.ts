@@ -27,8 +27,12 @@ export function planModeCallRefusal(input: {
   if (['publish_plan', 'run_worker'].includes(name) && !identity.composioCarrier) return undefined;
   const decision = classifyRuntimeToolEffect(input.toolName, input.args);
   const effect = input.attestedEffect ?? decision.effect;
-  if ((effect === 'read' || effect === 'compute') && decision.source !== 'shell'
-    && name !== 'request_approval') return undefined;
+  // A READ IS A READ, whatever carries it. Plan's ceiling is external
+  // consequence; a shell command the host itself classified read-only
+  // (`sf org list --json`, `gh pr list`) crosses none. Live 2026-09-08: a
+  // planning turn needed the org list to plan its query and was refused as if
+  // it were a write, then wandered until it died with a misleading stop.
+  if ((effect === 'read' || effect === 'compute') && name !== 'request_approval') return undefined;
   // A PLANNING TURN MAY STILL TALK.
   //
   // Plan's ceiling is EXTERNAL CONSEQUENCE, not the absence of a read label.

@@ -43,6 +43,7 @@ import {
   registeredToolkitOfSlug,
 } from '../integrations/composio/toolkit-slug.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { accountChoiceLabels } from './source-account-routing.js';
 import {
   recallComposioAccountIdentity,
   recallComposioForSearch,
@@ -813,9 +814,9 @@ function toolSearchResultRows(result: unknown): unknown[] {
   return rows;
 }
 
-function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[]; reason?: 'review_unavailable' }> {
+function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> {
   const rows = toolSearchResultRows(result);
-  const blockers: Array<{ name: string; choices: string[]; reason?: 'review_unavailable' }> = [];
+  const blockers: Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> = [];
   for (const row of rows) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
     const record = row as {
@@ -833,7 +834,12 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
         .map((choice) => choice.trim()),
     )];
     if (choices.length === 0) continue;
+    const rawLabels = (record as { accountChoiceLabels?: unknown }).accountChoiceLabels;
+    const labels = rawLabels && typeof rawLabels === 'object' && !Array.isArray(rawLabels)
+      ? Object.fromEntries(Object.entries(rawLabels as Record<string, unknown>).filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim().length > 0))
+      : undefined;
     blockers.push({ name: record.name.trim(), choices,
+      ...(labels && Object.keys(labels).length > 0 ? { labels } : {}),
       ...(record.accountSelectionReason === 'review_unavailable' ? { reason: 'review_unavailable' as const } : {}) });
   }
   return blockers;
@@ -844,11 +850,32 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
  * capability — live 2026-08-29 invite: OUTLOOK_CALENDAR_CREATE_EVENT was
  * returned with two mailboxes, then plan_task called it undisclosed and
  * offered greenhouse/airtable. */
+/** How many tool_search returns in this turn reported `account_selection_required`
+ *  for the named operation. Two means the model already had its retry (its
+ *  nomination failed, or it could not name one); the host asks the user next. */
+export function thisTurnAccountBlockedSearchCount(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  name: string;
+}): number {
+  let count = 0;
+  try {
+    for (const event of listEvents(input.sessionId, { types: ['tool_returned'] })) {
+      if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
+      if (event.data.tool !== 'tool_search') continue;
+      if (parseToolSearchAccountBlockers(event.data.result).some((blocker) => blocker.name === input.name)) count += 1;
+    }
+  } catch {
+    return 0;
+  }
+  return count;
+}
+
 export function thisTurnSearchAccountSelectionBlockers(input: {
   sessionId: string;
   sourceUserSeq: number;
-}): Array<{ name: string; choices: readonly string[]; reason?: 'review_unavailable' }> {
-  const byName = new Map<string, { name: string; choices: string[]; reason?: 'review_unavailable' }>();
+}): Array<{ name: string; choices: readonly string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> {
+  const byName = new Map<string, { name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }>();
   try {
     for (const event of listEvents(input.sessionId, { types: ['tool_returned'] })) {
       if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
@@ -1039,6 +1066,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         start: () => resolveSourceAccountRouting({
           sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
           toolkit, operation: slug, connections, nomination: input.accountSelection,
+          effect: classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write',
         }),
         signal: input.signal,
         deadlineAt: Math.min(Date.now() + 8_000, (input.deadlineAt ?? Infinity) - 500),
@@ -1046,6 +1074,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       if (!discoveryStillActive(guard)) return empty();
       routing = outcome.kind === 'settled' ? outcome.value : {
         kind: 'account_selection_required', reason: 'review_unavailable',
+        labels: accountChoiceLabels(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)),
         choices: [...new Set(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)
           .map(connection => normalizedAccountEmail(connection.accountEmail) || connection.connectionId))],
       };
@@ -1065,6 +1094,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       blockers[slug] = Object.freeze({
         code: 'account_selection_required',
         choices: Object.freeze([...selection.choices]),
+        ...('labels' in selection && selection.labels ? { labels: selection.labels } : {}),
         ...('reason' in selection && selection.reason ? { reason: selection.reason } : {}),
       });
       continue;

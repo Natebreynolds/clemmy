@@ -74,3 +74,14 @@ test('the stop still states where it stopped', () => {
   const text = hostNoProgressBlockedText(stateNaming(['x']), 'execution:unknown_read', new Set<string>());
   assert.match(text, /Stopped at: execution:unknown_read/);
 });
+
+test('a no-progress stop says what actually stopped it when the ledger holds a concrete tool error', () => {
+  // Live 2026-09-08: the stop read "Stopped at: authority_acquisition" while
+  // the row above it read "No default environment found. Use --target-org".
+  const because = 'ReviewedCliProcessError: NoDefaultEnvError: No default environment found. Use -o or --target-org to specify an environment.';
+  const text = hostNoProgressBlockedText(null, 'authority_acquisition:no_new_evidence', undefined, because);
+  assert.match(text, /What stopped me: ReviewedCliProcessError: NoDefaultEnvError: No default environment found/);
+  assert.match(text, /Stopped at: authority_acquisition:no_new_evidence/);
+  const silent = hostNoProgressBlockedText(null, 'authority_acquisition:no_new_evidence', undefined, null);
+  assert.doesNotMatch(silent, /What stopped me/);
+});
