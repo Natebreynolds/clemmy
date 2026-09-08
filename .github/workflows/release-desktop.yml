@@ -169,6 +169,21 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
+      # Fast, cheap checks run first so a trivial break (a stale type, a file git
+      # does not track, a hygiene miss) fails the tag in minutes — the full unit
+      # suite below takes ~35 minutes on this runner (2026-09-08 v3.16.0 gate).
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Public repository hygiene
+        run: npm run check:public-hygiene
+
+      - name: Public hygiene self-tests
+        run: npm run test:public-hygiene
+
+      - name: Release asset tests
+        run: npm run test:release-assets
+
       - name: Unit tests
         run: npm test
 
@@ -180,15 +195,6 @@ jobs:
 
       - name: Proof self-tests
         run: npm run proof:selftest
-
-      - name: Public repository hygiene
-        run: npm run check:public-hygiene
-
-      - name: Public hygiene self-tests
-        run: npm run test:public-hygiene
-
-      - name: Release asset tests
-        run: npm run test:release-assets
 
       - name: Release closure tests
         run: |
@@ -203,9 +209,6 @@ jobs:
         run: |
           npm run test:packed-candidate
           npm run test:packaged-upgrade
-
-      - name: Typecheck
-        run: npm run typecheck
 
       - name: Harness gate benchmark
         run: npm run bench:gates
