@@ -1,3 +1,6 @@
+import { buildPlanningDisclosure } from './worker-planning-disclosure.js';
+import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
+import type { HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { Agent } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { createHash } from 'node:crypto';
@@ -173,6 +176,9 @@ export async function buildWorkerAgent(options: {
   sessionId?: string | null;
   /** Parent accepted-source identity. A worker dispatches under it verbatim. */
   sourceUserSeq?: number | null;
+  /** The child's primed planning context; when present its tool_search can
+   *  stage provider candidates and disclose executable refs. */
+  hostFreshPlanning?: HostFreshPlanningContextV1;
 } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const capabilityUniverseTools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
@@ -262,6 +268,17 @@ export async function buildWorkerAgent(options: {
       ].join('\n');
     }
   }
+  if (options.hostFreshPlanning) {
+    // A worker's tool_search runs with the same planning disclosure as the
+    // parent turn (2026-09-08): provider candidates are staged for the child's
+    // own accepted source and disclosed as executable refs for work_call.
+    const names = new Set(tools.map((toolRef) => (toolRef as { name?: string }).name ?? '').filter(Boolean));
+    const disclosure = buildPlanningDisclosure(options.hostFreshPlanning);
+    tools = tools.map((toolRef) => ((toolRef as { name?: string }).name === 'tool_search'
+      ? buildScopedLocalToolSearch(names, 'work_call', undefined, undefined, disclosure)
+      : toolRef));
+  }
+
   const baseInstructions = [
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
       'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',

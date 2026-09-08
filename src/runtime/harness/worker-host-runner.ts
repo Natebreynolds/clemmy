@@ -1,5 +1,6 @@
 import { parseTaskMode } from './task-mode.js';
 import { discoveryGovernor } from './discovery-governor.js';
+import { primePrimaryModelPlanningCatalog, type HostFreshPlanningContextV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
 /** Worker packets use the same host loop and exact call admission as the
  * parent, in their own existing session/source namespace. No child can mutate
  * the parent's root, model-batch ordinals or logical run_worker settlement. */
@@ -19,9 +20,12 @@ import {
 import {
   defaultToolCallsPerTurn, harnessRunContextStorage, ToolCallsCounter, withHarnessRunContext,
 } from './brackets.js';
+import pino from 'pino';
+
+const workerLogger = pino({ name: 'worker-host-runner' });
 
 export async function runPacketWorkerWithHost(input: {
-  buildAgent: (child: { sessionId: string; sourceUserSeq: number }) => Promise<Agent<RuntimeContextValue>>;
+  buildAgent: (child: { sessionId: string; sourceUserSeq: number; hostFreshPlanning?: HostFreshPlanningContextV1 }) => Promise<Agent<RuntimeContextValue>>;
   input: WorkerToolInput;
   modelId: string;
   parentSessionId: string;
@@ -93,7 +97,17 @@ export async function runPacketWorkerWithHost(input: {
       guardrailScopeId: `${session.id}::worker`, behaviorScopeId: `${session.id}::turn:1`,
       ...(input.dispatchLease ?? parent?.dispatchLease ? { dispatchLease: input.dispatchLease ?? parent!.dispatchLease } : {}),
     }, async () => {
-      const agent = await input.buildAgent({ sessionId: session.id, sourceUserSeq: childSource.seq });
+      // The child primes its own planning catalog so its tool_search can stage
+      // provider candidates and disclose executable refs — the parent's door.
+      let hostFreshPlanning: HostFreshPlanningContextV1 | undefined;
+      try {
+        const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: childSource.seq });
+        if (primed.ok) hostFreshPlanning = primed.planning;
+        else workerLogger.warn({ reason: primed.reason, childId: session.id }, 'worker planning catalog did not prime — provider discovery will be unavailable to this worker');
+      } catch (err) {
+        workerLogger.warn({ err, childId: session.id }, 'worker planning catalog priming threw');
+      }
+      const agent = await input.buildAgent({ sessionId: session.id, sourceUserSeq: childSource.seq, ...(hostFreshPlanning ? { hostFreshPlanning } : {}) });
       const { hostRunRunner } = await import('./host-turn-runner.js');
       const outcome = await hostRunRunner(new Runner({ groupId: input.parentSessionId }) as never,
         agent, [{ type: 'message', role: 'user', content: prompt }] as never, {
