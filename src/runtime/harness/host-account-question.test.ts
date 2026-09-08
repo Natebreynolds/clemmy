@@ -48,13 +48,13 @@ const exhausted = (sessionId: string) => ({
 
 test('a governor-exhausted turn with two connected accounts becomes the host\'s own question', () => {
   const sessionId = 'sess-host-account-question';
-  const seq = seed(sessionId, ['nathan.reynolds@scorpion.co', 'nathan@breakthroughcoaching.ai']);
+  const seq = seed(sessionId, ['work@example.com', 'personal@example.org']);
   const out = hostAccountQuestionForExhaustedTurn(exhausted(sessionId), { sessionId, sourceUserSeq: seq });
   assert.equal(out.status, 'awaiting_user_input');
   assert.equal((out as { blockedReason?: string }).blockedReason, undefined);
   const awaiting = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1);
   assert.ok(awaiting, 'the host published its own awaiting row');
-  assert.deepEqual(awaiting?.data.options, ['nathan.reynolds@scorpion.co', 'nathan@breakthroughcoaching.ai']);
+  assert.deepEqual(awaiting?.data.options, ['work@example.com', 'personal@example.org']);
   assert.equal(awaiting?.data.source, 'host_account_selection');
   assert.equal(awaiting?.data.sourceUserSeq, seq);
   assert.match(String(awaiting?.data.question), /which account/i);
@@ -65,7 +65,7 @@ test('a governor-exhausted turn with two connected accounts becomes the host\'s 
 
 test('a single connected account, or a stop for any other reason, passes through untouched', () => {
   const one = 'sess-host-account-single';
-  const seqOne = seed(one, ['nathan.reynolds@scorpion.co']);
+  const seqOne = seed(one, ['work@example.com']);
   assert.equal(hostAccountQuestionForExhaustedTurn(exhausted(one), { sessionId: one, sourceUserSeq: seqOne }).status, 'blocked');
   const other = 'sess-host-account-other-reason';
   const seqOther = seed(other, ['a@x.co', 'b@y.co']);
