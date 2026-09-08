@@ -59,12 +59,19 @@ async function stopChild(child: ChildProcess): Promise<void> {
   }
 }
 
-async function waitForBuildInfo(port: number, child?: ChildProcess): Promise<Record<string, unknown>> {
+async function waitForBuildInfo(
+  port: number,
+  child?: ChildProcess,
+  childOutput?: () => string,
+): Promise<Record<string, unknown>> {
   const deadline = Date.now() + 45_000;
   let lastError = 'not started';
   while (Date.now() < deadline) {
     if (child && (child.exitCode !== null || child.signalCode !== null)) {
-      throw new Error(`held daemon exited before readiness (${child.exitCode ?? child.signalCode})`);
+      // Carry the child's own words: a bare exit code sent the 2026-09-08 tag
+      // gate into a 40-minute CI failure nobody could explain from the log.
+      const tail = (childOutput?.() ?? '').trim().slice(-2_000);
+      throw new Error(`held daemon exited before readiness (${child.exitCode ?? child.signalCode})${tail ? `:\n${tail}` : ''}`);
     }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/console/build-info`, {
@@ -352,7 +359,7 @@ test('cutover daemon holds durable work inert and exposes only authenticated bui
   child.stderr?.on('data', (chunk) => { output += String(chunk); });
 
   try {
-    let build = await waitForBuildInfo(daemonPort, child);
+    let build = await waitForBuildInfo(daemonPort, child, () => output);
     assert.equal(build.cutoverHold, true);
     assert.equal(build.effectiveFreshTurnEngine, 'host_v1');
     assert.equal(build.schemaVersion, build.expectedSchemaVersion);
@@ -361,7 +368,7 @@ test('cutover daemon holds durable work inert and exposes only authenticated bui
     const heartbeatDeadline = Date.now() + 5_000;
     while (Number(build.cutoverHoldHeartbeatCount ?? 0) < 2 && Date.now() < heartbeatDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      build = await waitForBuildInfo(daemonPort, child);
+      build = await waitForBuildInfo(daemonPort, child, () => output);
     }
     assert.ok(Number(build.cutoverHoldHeartbeatCount ?? 0) >= 2, 'held daemon crossed more than one inert heartbeat');
 
