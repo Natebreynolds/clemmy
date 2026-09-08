@@ -6,6 +6,7 @@ import { getSession, listEvents } from '../runtime/harness/eventlog.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
+import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
 import { aliasLabelFor } from '../memory/account-alias-store.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
 
@@ -151,6 +152,28 @@ function newestEstablishedRoute(input: {
   return null;
 }
 
+function consumedAccountClarification(
+  sessionId: string,
+  sourceUserSeq: number,
+  answer: string,
+): NonNullable<SourceAccountJudgeCall['clarification']> | null {
+  try {
+    const consumed = readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: sourceUserSeq });
+    if (consumed.status !== 'consumed' || consumed.packet.pause.kind !== 'clarification') return null;
+    const options = consumed.packet.pause.options.filter((option) => typeof option === 'string' && option.trim());
+    if (options.length < 2) return null;
+    const resolution = consumed.resolution as { disposition?: string; selectedOption?: string; activeTaskInput?: string };
+    return {
+      question: consumed.packet.pause.question,
+      options,
+      answer: resolution.activeTaskInput?.trim() || answer,
+      selectedOption: resolution.disposition === 'selected' && resolution.selectedOption ? resolution.selectedOption : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveSourceAccountRouting(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -238,8 +261,15 @@ export async function resolveSourceAccountRouting(input: {
     interveningAcceptedSources,
   };
   const proposalDigest = digest(JSON.stringify(subject));
+  // The user may be answering the host's OWN account question. When this
+  // source consumed a clarification whose options carry the connected
+  // identities, the judge sees the question, its labeled options and the
+  // answer — "the Scorpion one" or "my default" then entails an identity the
+  // bare answer never names. Routing evidence only; the judge still decides.
+  const clarification = consumedAccountClarification(input.sessionId, input.sourceUserSeq, source.text);
   const result = await judge({
     purpose: 'turn_semantics_account_selection',
+    ...(clarification ? { clarification } : {}),
     mode,
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,

@@ -128,6 +128,17 @@ export interface SourceAccountJudgeCall {
   /** Complete ordered user-source range: between explicit origin and current source,
    * or all bounded conversation ancestors before a current-source default. */
   interveningAcceptedSources: readonly { sourceUserSeq: number; acceptedText: string }[];
+  /** The host's own account question this accepted source answered, when the
+   *  continuity store shows it consumed such a clarification. The judge then
+   *  reads the answer against the labeled options, so "the Scorpion one",
+   *  "the recommended one" or "my default" can select an identity the bare
+   *  answer never names (live 2026-09-08: every calendar run stalled here). */
+  clarification?: {
+    question: string;
+    options: readonly string[];
+    answer: string;
+    selectedOption: string | null;
+  } | null;
   proposalDigest: string;
 }
 

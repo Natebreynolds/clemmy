@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
-import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
+import { getToolOutput, getToolOutputSlice , listEvents } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import { textResult } from './shared.js';
@@ -10,6 +10,27 @@ import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
+
+/** Slices of one retained result a single session may request before the host
+ *  stops re-projecting it. Generous for real paging (a 500-row result at 50 per
+ *  page is 10 slices); a loop re-projecting 22 records by field set hits it fast. */
+export const RETAINED_RESULT_QUERY_CAP = 12;
+
+function countRetainedResultQueries(sessionId: string, callId: string): number {
+  try {
+    let n = 0;
+    for (const event of listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 400 })) {
+      const tool = event.data.tool;
+      if (tool !== 'tool_output_query' && tool !== 'recall_tool_result') continue;
+      const raw = event.data.arguments;
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+      if (text.includes(callId)) n += 1;
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -199,6 +220,13 @@ export function registerRecallTools(server: McpServer): void {
         );
       }
 
+      const recallQueries = countRetainedResultQueries(ctx.sessionId, callId);
+      if (recallQueries >= RETAINED_RESULT_QUERY_CAP) {
+        return textResult(
+          `Query budget for result "${callId}" is spent: ${recallQueries} slices of the same result have already been returned in this turn. `
+          + 'You have seen every record it holds. Do not query it again — write the deliverable from what you have, or tell the user exactly what is missing.',
+        );
+      }
       const row = getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
       if (!row) {
         return textResult(
@@ -274,6 +302,19 @@ export function registerRecallTools(server: McpServer): void {
       const ctx = harnessRunContextStorage.getStore();
       if (!ctx?.sessionId) {
         return textResult('tool_output_query is only available within a harness-managed turn. (No active session context.)');
+      }
+      // A retained result is not a database to be re-projected forever. Live
+      // 2026-09-08 (Opus): 47 tool_output_query + 13 recall_tool_result calls
+      // over ONE 22-record calendar result — a new field set or subject filter
+      // each time — until the turn budget parked with nothing written. After
+      // the cap, the caller has already seen every record several times over:
+      // say so once, hand back the records, and refuse further slices.
+      const retainedQueries = countRetainedResultQueries(ctx.sessionId, callId);
+      if (retainedQueries >= RETAINED_RESULT_QUERY_CAP) {
+        return textResult(
+          `Query budget for result "${callId}" is spent: ${retainedQueries} slices of the same result have already been returned in this turn. `
+          + 'You have seen every record it holds. Do not query it again — write the deliverable from what you have, or tell the user exactly what is missing.',
+        );
       }
       const row = getToolOutput(ctx.sessionId, callId);
       if (!row) {
