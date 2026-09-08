@@ -7,7 +7,6 @@
  * owns: the authority-sealed reviewed descriptor and executable bytes. It must
  * never import the manifest store, event log, or a native database binding.
  */
-import path from 'node:path';
 import { redactSensitiveText } from '../security.js';
 import { execFile, type ExecFileException } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -30,9 +29,6 @@ import {
   reviewedCliInputSchema,
   type ReviewedCliReadDescriptorV1,
 } from './reviewed-cli-read-config.js';
-import pino from 'pino';
-
-const logger = pino({ name: 'reviewed-cli-read-transport' });
 
 export const REVIEWED_CLI_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -304,55 +300,6 @@ function failureStatus(error: ExecFileException): ReviewedCliProcessOutcomeV1['s
 }
 
 /** Execute one exact reviewed descriptor with structured argv and no shell. */
-type OrgListEntry = { username?: unknown; alias?: unknown; isDefaultUsername?: unknown; connectedStatus?: unknown };
-
-/** Returns the healed outcome, or null when this error is not the missing-default-org
- *  case (or the org cannot be chosen without the user). May throw a
- *  ReviewedCliProcessError whose message names the exact fix. */
-async function healSalesforceDefaultOrg(input: {
-  error: unknown;
-  descriptor: ReviewedCliReadDescriptorV1;
-  call: AttestedTransportCall;
-  runArgv: (argv: readonly string[]) => Promise<ReviewedCliProcessOutcomeV1>;
-}): Promise<ReviewedCliProcessOutcomeV1 | null> {
-  const { error, descriptor, call, runArgv } = input;
-  if (!(error instanceof ReviewedCliProcessError)) return null;
-  if (path.basename(descriptor.executableRealpath) !== 'sf') return null;
-  if (!/NoDefaultEnvError|No default environment found/i.test(`${error.message}\n${error.outcome.stderr ?? ''}\n${error.outcome.stdout ?? ''}`)) return null;
-  const args = (call.args && typeof call.args === 'object' ? call.args : {}) as Record<string, unknown>;
-  if (typeof args.target_org === 'string' && args.target_org.trim()) return null;
-  if (!descriptor.arguments.some((arg) => arg.name === 'target_org')) return null;
-  let orgs: OrgListEntry[] = [];
-  try {
-    const listed = await runArgv(['org', 'list', '--json']);
-    const parsed = JSON.parse(listed.stdout ?? '') as { result?: { nonScratchOrgs?: OrgListEntry[]; scratchOrgs?: OrgListEntry[] } };
-    orgs = [...(parsed.result?.nonScratchOrgs ?? []), ...(parsed.result?.scratchOrgs ?? [])]
-      .filter((org) => typeof org.username === 'string' && org.username.trim());
-  } catch (listError) {
-    logger.warn({ err: listError }, 'sf default org self-heal: org list failed');
-    return null;
-  }
-  const connected = orgs.filter((org) => org.connectedStatus === undefined || org.connectedStatus === 'Connected');
-  const pool = connected.length > 0 ? connected : orgs;
-  const chosen = pool.find((org) => org.isDefaultUsername === true) ?? (pool.length === 1 ? pool[0] : undefined);
-  if (!chosen) {
-    const names = pool.map((org) => String(org.alias || org.username)).join(', ') || '(none authenticated)';
-    const fix = pool.length === 0
-      ? 'Run `sf org login web` on this Mac to connect a Salesforce org, then ask again.'
-      : `Run \`sf config set target-org <one of: ${names}>\` on this Mac (or tell me which org to use), then ask again.`;
-    throw new ReviewedCliProcessError({
-      ...error.outcome,
-      stderr: `${(error.outcome.stderr ?? '').trim()}\nYour Salesforce CLI has no default org, so no query can run. Orgs on this Mac: ${names}. ${fix}`.trim(),
-    });
-  }
-  const username = String(chosen.username);
-  const argv = compileReviewedCliArgv(descriptor, { ...args, target_org: username });
-  if (!argv) return null;
-  logger.info({ operationId: call.operationId, targetOrg: username, candidates: pool.length },
-    'sf default org self-heal: no default org configured — rerunning with --target-org');
-  return runArgv(argv);
-}
-
 export async function executeReviewedCliRead(
   call: AttestedTransportCall,
 ): Promise<ReviewedCliProcessOutcomeV1> {
@@ -374,7 +321,7 @@ export async function executeReviewedCliRead(
     throw new Error('reviewed CLI executable changed before dispatch');
   }
 
-  const runArgv = (argv: readonly string[]): Promise<ReviewedCliProcessOutcomeV1> => new Promise<ReviewedCliProcessOutcomeV1>((resolve, reject) => {
+  const outcome = await new Promise<ReviewedCliProcessOutcomeV1>((resolve, reject) => {
     execFile(
       descriptor!.executableRealpath,
       [...argv],
@@ -416,22 +363,6 @@ export async function executeReviewedCliRead(
     );
   });
 
-
-  let outcome: ReviewedCliProcessOutcomeV1;
-  try {
-    outcome = await runArgv(argv);
-  } catch (error) {
-    // SELF-HEAL (binding: an error that names its own fix gets applied). The
-    // Salesforce CLI refuses every command on a machine with no default org:
-    // "NoDefaultEnvError: No default environment found. Use -o or --target-org".
-    // Live 2026-09-08: a user's outreach turn died on it twice and was told it
-    // was "a setup problem on my side". The org list is a read; when exactly
-    // one connected org (or a marked default) exists, rerun with it. Otherwise
-    // the error carries the exact command the user must run.
-    const healed = await healSalesforceDefaultOrg({ error, descriptor, call, runArgv });
-    if (healed === null) throw error;
-    outcome = healed;
-  }
   let afterDescriptor: ReviewedCliReadDescriptorV1 | null = null;
   try {
     afterDescriptor = currentDescriptorForOperation(call.operationId);

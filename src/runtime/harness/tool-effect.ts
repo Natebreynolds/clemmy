@@ -747,6 +747,14 @@ export function isUnscopedShellRuntimeCall(toolName: string, args: unknown): boo
   return classifyRuntimeToolEffect(toolName, args).source === 'shell';
 }
 
+/** A provider operation the model named either bare (UPPER_SNAKE) or in its
+ *  carrier-prefixed form. Returns the bare slug, or null. Lives here — the
+ *  one file allowed to know the carrier prefix — so kernels stay neutral. */
+export function providerOperationFromNameForm(candidate: string): string | null {
+  const m = /^(?:composio:)?([A-Z0-9]+(?:_[A-Z0-9]+)+)$/i.exec(candidate.trim());
+  return m ? m[1]!.toUpperCase() : null;
+}
+
 export function classifyRuntimeToolEffect(toolName: string, args: unknown): RuntimeToolEffectDecision {
   const normalized = normalizedToolName(toolName);
   const tail = localToolTail(normalized);
@@ -843,13 +851,16 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   // Live 2026-08-29 (OPEN-THE-GATES, sess-mob-416706): namespaced MCP spelling
   // `google_sheets__batch_get` skipped this lookup, classified fail-closed as
   // write, and the live-read seam then refused a same-turn proven Sheets read.
-  // The model names a provider operation as `composio:SLUG` in work_call /
-  // requirement ids. That is the same operation the slug classifier already
-  // knows (live 2026-09-08: OUTLOOK_GET_CALENDAR_VIEW, a documented read, was
-  // refused twice as effect_unknown because the colon form fell through to
+  // The model names a provider operation in its carrier-prefixed form in
+  // work_call / requirement ids. That is the same operation the slug
+  // classifier already knows (live 2026-09-08: a documented calendar read was
+  // refused twice as effect_unknown because the prefixed form fell through to
   // the namespaced-MCP path). Classify by the slug, exactly as the gateway does.
-  const composioColon = /^composio:([A-Z0-9]+(?:_[A-Z0-9]+)+)$/i.exec(normalized);
-  if (composioColon) return classifyComposio({ tool_slug: composioColon[1]!.toUpperCase(), arguments: args });
+  // Only the PREFIXED form takes this early door; a bare UPPER_SNAKE name keeps
+  // its registry-first classification below (delegation primitives and local
+  // controls are registry authority, never a name heuristic).
+  const prefixedSlug = /^composio:/i.test(normalized) ? providerOperationFromNameForm(normalized) : null;
+  if (prefixedSlug) return classifyComposio({ tool_slug: prefixedSlug, arguments: args });
   const registered = classifyBareCurrentCatalogCapability(normalized);
   if (registered.matched) return registered.decision;
   if (isNamespaced && !isClementineLocal) {

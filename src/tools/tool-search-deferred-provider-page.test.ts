@@ -137,7 +137,9 @@ test('a native first page performs zero provider preparation; its durable provid
   assert.deepEqual(second.body.schemas[OPERATION], INPUT);
   assert.equal(f.counts.fuzzy, fuzzy, 'reopening a cursor never repeats broad discovery');
   assert.equal(f.counts.exact, 1);
-  assert.equal(f.counts.accountReviews, 1);
+  // Reads route without the judge (2026-09-08): the nominated identity is the
+  // route, so a read proves its operation with zero account reviews.
+  assert.equal(f.counts.accountReviews, 0);
   const published = catalogs.peekHostCapabilityCatalogFactory()!.get(second.body.results[0].capabilityRef);
   assert.equal(published?.manifest?.accountId, ACCOUNT);
   assert.equal(f.counts.business, 0);
