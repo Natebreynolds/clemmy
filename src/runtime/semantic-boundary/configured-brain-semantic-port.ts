@@ -27,6 +27,9 @@ import type {
   TurnSemanticModelResult,
 } from './turn-semantic-model-port.js';
 import { installTurnSemanticModelPort } from './turn-semantic-port-registry.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'configured-brain-semantic-port' });
 
 export interface ConfiguredBrainSemanticComplete {
   (input: {
@@ -122,7 +125,23 @@ async function completeStructured(input: {
   // review follows the configured judge role, which is cross-family when the
   // user's available model stack permits it. Calling the brain for both made
   // the supposedly independent gate self-approval by construction.
-  const role = resolveRoleModel(semanticModelRoleForPurpose(input.purpose));
+  const wantedRole = semanticModelRoleForPurpose(input.purpose);
+  const firstRole = resolveRoleModel(wantedRole);
+  return runOnRole(firstRole).catch(async (error) => {
+    // The judge role is cross-family by default, so it can be bound to a model
+    // whose sign-in is expired or whose provider is down while the brain that
+    // is running this very turn is fine. A review that cannot run is not a
+    // verdict — fall back to the live brain for this one call rather than
+    // refusing the user's read four times and ending the turn (live
+    // 2026-09-08: "Hows my day looking" died on review_unavailable × 4).
+    const brain = resolveRoleModel('brain');
+    if (wantedRole === 'brain' || brain.modelId === firstRole.modelId) throw error;
+    logger.warn({ err: error, judgeModelId: firstRole.modelId, brainModelId: brain.modelId, purpose: input.purpose },
+      'semantic review on the judge model failed — retrying this call on the brain');
+    return runOnRole(brain);
+  });
+
+  async function runOnRole(role: ReturnType<typeof resolveRoleModel>) {
   const started = Date.now();
   const agent = new Agent({
     name: input.purpose === 'turn_semantics'
@@ -164,6 +183,7 @@ async function completeStructured(input: {
     outputTokens: tokens.outputTokens,
     latencyMs,
   };
+  }
 }
 
 function readUsageNumber(record: Record<string, unknown>, ...keys: string[]): number {

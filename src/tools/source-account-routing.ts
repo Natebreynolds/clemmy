@@ -9,6 +9,9 @@ import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtim
 import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
 import { aliasLabelFor } from '../memory/account-alias-store.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'source-account-routing' });
 
 export const SourceAccountNominationSchema = z.object({
   toolkit: z.string().min(1).max(128),
@@ -95,7 +98,11 @@ function interveningSources(input: {
 const judgments = new WeakMap<object, Map<string, Promise<SourceAccountJudgeResult>>>();
 async function judge(call: SourceAccountJudgeCall, connectionRevision: string): Promise<SourceAccountJudgeResult | null> {
   const port = peekTurnSemanticModelPort();
-  if (!port?.judgeAccountSelection) return null;
+  if (!port?.judgeAccountSelection) {
+    logger.warn({ toolkit: call.toolkit, purpose: call.purpose, portInstalled: Boolean(port) },
+      'account-routing review has no semantic model port for this turn; the selection is reported review_unavailable');
+    return null;
+  }
   let cache = judgments.get(port);
   if (!cache) { cache = new Map(); judgments.set(port, cache); }
   const key = digest(JSON.stringify({ call, connectionRevision }));
@@ -105,7 +112,23 @@ async function judge(call: SourceAccountJudgeCall, connectionRevision: string): 
     cache.set(key, pending);
     if (cache.size > 256) cache.delete(cache.keys().next().value!);
   }
-  try { return await pending; } catch { return null; }
+  try {
+    return await pending;
+  } catch (error) {
+    // A failed review must not be remembered as the answer: the next identical
+    // selection re-runs the judge instead of replaying the rejection (live
+    // 2026-09-08: "retry the identical account_selection once" could never
+    // succeed because the rejected promise sat in this cache). And SAY WHY —
+    // a silent null became four "review_unavailable" refusals and a dead turn.
+    cache.delete(key);
+    logger.warn({
+      err: error,
+      toolkit: call.toolkit,
+      accountIdentity: call.accountIdentity,
+      purpose: call.purpose,
+    }, 'account-routing review failed — the judge model call threw; the selection is reported review_unavailable');
+    return null;
+  }
 }
 
 /** Reads only routing evidence the host persisted in its existing resolution

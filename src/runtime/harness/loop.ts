@@ -395,6 +395,9 @@ import {
   exactOriginDeliveryTargetDigest,
   sameExactOriginDeliveryTarget,
 } from '../exact-origin-delivery.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'host-loop' });
 
 /** Deterministic floor for the judge's RESUME verb: a loop that has spent its
  * final step cannot truthfully promise another in-run recovery turn. */
@@ -1423,14 +1426,25 @@ export function hostAccountQuestionForExhaustedTurn(
   turnResult: RunTurnResult,
   input: { sessionId: string; sourceUserSeq: number | undefined },
 ): RunTurnResult {
-  if (turnResult.status !== 'blocked' || turnResult.blockedReason !== 'control_no_progress_exhausted') return turnResult;
+  // The exhausted stop is typed several ways downstream (blocked, or a
+  // resumable needs_input/continue checkpoint); the REASON is the invariant.
+  if (turnResult.blockedReason !== 'control_no_progress_exhausted') return turnResult;
   if (!Number.isSafeInteger(input.sourceUserSeq) || (input.sourceUserSeq ?? 0) <= 0) return turnResult;
   let blockers: Array<{ name: string; choices: readonly string[]; reason?: string }> = [];
   try {
     blockers = thisTurnSearchAccountSelectionBlockers({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq as number })
       .filter((blocker) => blocker.choices.length > 1);
-  } catch { return turnResult; }
+  } catch (error) {
+    logger.warn({ err: error, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }, 'host account question: blocker scan threw — no question asked');
+    return turnResult;
+  }
   const blocker = blockers[0];
+  logger.info({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    status: turnResult.status,
+    blockers: blockers.map((b) => ({ name: b.name, choices: b.choices.length, reason: b.reason ?? null })),
+  }, blocker ? 'host account question: exhausted turn has account choices — asking the user' : 'host account question: exhausted turn has no multi-account blocker — leaving the typed stop');
   if (!blocker) return turnResult;
   const options = [...new Set(blocker.choices.map((choice) => choice.trim()).filter(Boolean))];
   if (options.length < 2) return turnResult;
