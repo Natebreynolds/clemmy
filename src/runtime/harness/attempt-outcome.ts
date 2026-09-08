@@ -421,5 +421,15 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   }
 
   // Text is last and cannot produce anything actionable — by design.
+  // A thrown error the regexes do not recognise, on a call the HOST proved
+  // non-mutating, cannot have left an effect behind. Treat it as transient
+  // (bounded by the retry budget) instead of the inert stop reserved for
+  // effects that might have landed. Live 2026-09-08 08:00: the daily standup
+  // workflow blocked at its first step — "effect must be reconciled" — for a
+  // read of Outlook events that threw after the 60s fuse. Mutating or
+  // unproven calls keep the inert default.
+  if (signals.mutating === false && signals.text) {
+    return outcome('transient', 'text', 'unclassified_read_failure');
+  }
   return outcome('unknown', 'text', signals.text ? 'unclassified' : undefined);
 }
