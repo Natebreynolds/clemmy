@@ -11,6 +11,7 @@ import {
 import { noteRecalledIntent } from '../memory/procedural-recall-link.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
+import { probe } from '../runtime/cli-discovery.js';
 
 /**
  * Tool-choice memory tools — the agent's interface to the per-machine
@@ -38,7 +39,7 @@ const KIND_VALUES = ['cli', 'composio', 'mcp'] as const;
 
 /** Exported for the contradiction pin: an active choice is never its own
  *  known-failed fallback. */
-export function formatChoiceRecall(intent: string): string {
+export async function formatChoiceRecall(intent: string): Promise<string>{
   const rec = recallToolChoice(intent);
   if (!rec) {
     return `No tool choice recorded yet for intent "${intent}".\nRun discovery (composio_search_tools / local_cli_list / MCP), pick the working tool, then call tool_choice_remember to save it.`;
@@ -75,9 +76,21 @@ export function formatChoiceRecall(intent: string): string {
     ? rec.fallbacks.filter((f) => !(f.kind === rec.choice!.kind && f.identifier === rec.choice!.identifier))
     : rec.fallbacks;
   if (contradicted.length > 0) {
+    const presentClis = new Set<string>();
+    for (const f of contradicted) {
+      if (f.kind !== 'cli') continue;
+      try { if (await probe(f.identifier)) presentClis.add(f.identifier); } catch { /* absence is the default */ }
+    }
     lines.push('Known-failed fallbacks (do NOT re-try these blindly):');
     for (const f of contradicted) {
-      lines.push(`  - ${f.kind}:${f.identifier} — ${f.reason} (failed ${f.failedAt})`);
+      // A failure is evidence about a moment, not a standing fact. Live
+      // 2026-09-08: "cli:sf — unavailable on this machine (failed 2026-07-28)"
+      // was recited while the probe one call later found sf installed. Say
+      // when the failure is old, and when a CLI is present on this machine now.
+      const ageDays = Math.floor((Date.now() - Date.parse(f.failedAt)) / 86_400_000);
+      const stale = Number.isFinite(ageDays) && ageDays > 14 ? ` — STALE: ${ageDays} days old; re-verify before trusting this` : '';
+      const present = f.kind === 'cli' && presentClis.has(f.identifier) ? ' — but this CLI IS installed on this machine now; that failure no longer describes it' : '';
+      lines.push(`  - ${f.kind}:${f.identifier} — ${f.reason} (failed ${f.failedAt})${present || stale}`);
     }
   }
   if (rec.choice && contradicted.length < rec.fallbacks.length) {
@@ -107,7 +120,7 @@ export function registerToolChoiceTools(server: McpServer): void {
           'Free-form intent slug describing what the user wants done. Dotted-lowercase recommended (e.g. "salesforce.accounts.list_stale", "gmail.draft_email", "github.repo.search"). The store will fuzzy-match across paraphrases.',
         ),
     },
-    async ({ intent }) => textResult(formatChoiceRecall(intent)),
+    async ({ intent }) => textResult(await formatChoiceRecall(intent)),
   );
 
   server.tool(

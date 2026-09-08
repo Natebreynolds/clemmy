@@ -9590,3 +9590,18 @@ test('named workflow dispatch seals before review and final child evidence owns 
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   }
 });
+
+test('a refusal for an account-blocked operation names the labeled accounts, not "discover it"', async () => {
+  const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
+  // Live 2026-09-08: five refusals said "not proven, discover with tool_search"
+  // while the host held the account blocker that explained them.
+  const text = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_GET_CALENDAR_VIEW',
+    provenOperations: [],
+    accountChoices: ['ca_one', 'ca_two'],
+    accountChoiceLabels: { ca_one: 'Scorpion', ca_two: 'Cameron & Kane' },
+  });
+  assert.match(text, /needs a checked source-account selection/);
+  assert.match(text, /Scorpion \(ca_one\), Cameron & Kane \(ca_two\)/);
+  assert.doesNotMatch(text, /Discover that exact operation with tool_search/);
+});

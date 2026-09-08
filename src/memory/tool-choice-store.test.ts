@@ -1440,7 +1440,7 @@ test('an active choice is never rendered as its own known-failed fallback', asyn
     ],
   });
 
-  const rendered = formatChoiceRecall(intent);
+  const rendered = await formatChoiceRecall(intent);
   assert.match(rendered, /Active choice: kind=composio, identifier=APIFY_RUN_ACTOR/);
   // The genuinely-failed sibling still warns.
   assert.match(rendered, /SOME_OTHER_ACTION/);
@@ -1453,4 +1453,25 @@ test('an active choice is never rendered as its own known-failed fallback', asyn
     .join('\n');
   assert.doesNotMatch(warned, /APIFY_RUN_ACTOR\b/, 'the active choice is not in the do-not-retry list');
   assert.match(rendered, /an argument error is a repair, not a reason to switch tools/);
+});
+
+test('a known-failed fallback says when it is stale, and when its CLI is present on this machine now', async () => {
+  // Live 2026-09-08: "cli:sf — unavailable on this machine (failed 2026-07-28)"
+  // was recited while the probe one call later found sf installed.
+  const { formatChoiceRecall } = await import('../tools/tool-choice-tools.js');
+  const intent = 'stale.cli.recall';
+  const old = new Date(Date.now() - 45 * 86_400_000).toISOString();
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'composio', identifier: 'SOME_ACTIVE_ACTION', testedAt: new Date().toISOString() },
+    fallbacks: [
+      { kind: 'cli', identifier: 'node', reason: 'CLI "node" unavailable on this machine', failedAt: old },
+      { kind: 'composio', identifier: 'SOME_OTHER_ACTION', reason: 'toolkit not connected', failedAt: old },
+    ],
+  });
+  const rendered = await formatChoiceRecall(intent);
+  const nodeLine = rendered.split('\n').find((line) => /cli:node/.test(line)) ?? '';
+  assert.match(nodeLine, /IS installed on this machine now/, nodeLine);
+  const otherLine = rendered.split('\n').find((line) => /composio:SOME_OTHER_ACTION/.test(line)) ?? '';
+  assert.match(otherLine, /STALE: 4[45] days old/, otherLine);
 });

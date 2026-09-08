@@ -1015,6 +1015,8 @@ export function hostProvenOperationRepair(input: {
   limit?: number;
   /** Live identities disclosed by this turn when routing is still unresolved. */
   accountChoices?: readonly string[];
+  /** Human label per choice when the disclosure carried one. */
+  accountChoiceLabels?: Readonly<Record<string, string>>;
   accountReviewUnavailable?: boolean;
 }): string {
   const toolkitOf = (operationId: string): string => operationId.split('_')[0] ?? '';
@@ -1049,7 +1051,7 @@ export function hostProvenOperationRepair(input: {
   }
   if (requested.length > 0 && accountChoices.length > 0) {
     return ` ${requested} is available, but it still needs a checked source-account selection.`
-      + ` The current connected choices are exactly: ${accountChoices.join(', ')}.`
+      + ` The current connected choices are exactly: ${accountChoices.map((choice) => (input.accountChoiceLabels?.[choice] && input.accountChoiceLabels[choice] !== choice ? `${input.accountChoiceLabels[choice]} (${choice})` : choice)).join(', ')}.`
       + ' If the accepted user request already named the operating account, repeat tool_search with account_selection containing its exact toolkit, identity, and a verbatim source_quote from accepted user wording in this conversation.'
       + ' If the user did not select an account or the choice remains unclear, ask_user_question with those exact choices.'
       + ' Do not substitute another provider, another operation, or a recipient address for that choice.';
@@ -4896,7 +4898,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
       const requestedOperation = (() => {
         try {
-          return (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim().toUpperCase();
+          const carried = (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim().toUpperCase();
+          if (carried) return carried;
+          // The model also names an operation as `composio:SLUG` or as a
+          // slug-shaped requirement_id. Live 2026-09-08: those refusals lost the
+          // operation and therefore the account blocker that would have
+          // explained them, and answered "not proven, discover it" instead.
+          const parsed = args && typeof args === 'object' ? args as Record<string, unknown> : null;
+          for (const candidate of [name, parsed?.requirement_id, parsed?.name]) {
+            if (typeof candidate !== 'string') continue;
+            const m = /^(?:composio:)?([A-Z0-9]+(?:_[A-Z0-9]+)+)$/i.exec(candidate.trim());
+            if (m) return m[1]!.toUpperCase();
+          }
+          return '';
         } catch {
           return '';
         }
@@ -4918,6 +4932,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           requestedOperation,
           provenOperations,
           accountChoices: accountBlockerForRequest?.choices,
+          accountChoiceLabels: (accountBlockerForRequest as { labels?: Record<string, string> } | undefined)?.labels,
           accountReviewUnavailable: accountBlockerForRequest?.reason === 'review_unavailable',
         });
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
