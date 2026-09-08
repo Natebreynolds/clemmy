@@ -48,9 +48,15 @@ function allowedWritePath(value) {
   return leasePath(value) || daemonLogPath(value);
 }
 
+// tsx (the loader the held daemon runs under in tests) keeps a compile cache
+// at $TMPDIR/tsx-<uid> and calls fs.mkdirSync for it on first module load.
+// That is loader housekeeping, not daemon behaviour; refusing it killed the
+// held daemon before readiness on the release runner (v3.16.0 gate, runs 2-3).
+const tsxCacheDir = path.join(os.tmpdir(), `tsx-${typeof process.getuid === 'function' ? process.getuid() : ''}`);
 function allowedMkdir(value) {
   const file = asPath(value);
   return file === home
+    || file === tsxCacheDir
     || file === path.join(home, 'state')
     || file === path.join(home, 'logs')
     || file === path.join(home, 'daemon.lock');
