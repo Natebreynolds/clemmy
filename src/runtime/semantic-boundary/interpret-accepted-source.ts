@@ -885,6 +885,15 @@ async function interpretOnce(input: {
 
   const judgePlanGrounding = async (): Promise<void> => {
     if (!admitted.ok) return;
+    // Ground only work the PROPOSAL supplied. A slot answer (or any proposal
+    // with work: null) carries the resumed goal's already-admitted operations
+    // in clamped; re-judging that stored plan against today's catalog could
+    // reject the ANSWER — live 2026-09-08: GLM's clean free-text calendar pick
+    // was refused as capability_grounding_conflict on the goal's own lookup.
+    const proposalWork = modelResult.raw && typeof modelResult.raw === 'object'
+      ? (modelResult.raw as { work?: unknown }).work
+      : undefined;
+    if (proposalWork === null || proposalWork === undefined) return;
     const operations = admitted.clamped.operations ?? [];
     if (operations.length === 0) return;
     if (operations.every((operation) => (

@@ -1204,3 +1204,49 @@ test('a topology-consistency failure earns the act-directly hint', async () => {
   assert.equal(hint.hostNative?.reason, 'structured_work_shape_failed');
   assert.ok(hint.hostNative?.require?.includes('NO operations'), 'the act-directly expression is named');
 });
+
+// Live 2026-09-08 (GLM 5.2): a clean free-text answer to "which calendar?"
+// (relation answer_open_slot, work: null) was rejected as
+// capability_grounding_conflict — the grounding judge re-judged the resumed
+// goal's own lookup against the current catalog and refused the ANSWER.
+// Grounding applies to work the proposal supplies, never to a slot answer.
+test('a slot answer with no proposed work is admitted without any grounding judge call', async () => {
+  resetEventLog();
+  const sessionId = 'sess-slot-answer-no-grounding';
+  createSession({ id: sessionId, kind: 'chat' });
+  const snapshot = {
+    sessionId,
+    sourceUserSeq: 2,
+    acceptedText: 'i did yes',
+    policyRevision: sha256('policy'),
+    ...AUDIENCE,
+    ...constructCatalog(),
+    resumableGoals: [{ goalId: 'goal-17', baseRevision: 4 }],
+    openQuestions: [{
+      questionId: 'question-3',
+      goalId: 'goal-17',
+      goalRevision: 4,
+      slotKey: 'resource-choice',
+      question: 'Which host should I use?',
+      options: [{ optionId: 'choice-a', label: 'Acme.io' }],
+      allowFreeText: false,
+    }],
+  };
+  const host = buildTurnSemanticHostViewV1(snapshot);
+  const calls: unknown[] = [];
+  const port: TurnSemanticModelPort = {
+    ...fakePort(calls),
+    async interpret(call) {
+      calls.push(call.purpose);
+      return {
+        raw: fakeSemanticProposal('affirmDidYouMean', call.host),
+        modelIdentity: 'fake-semantic/test',
+        inputTokens: 1, outputTokens: 1, latencyMs: 1,
+      };
+    },
+    async judgePlanGrounding() { throw new Error('a slot answer must not be grounded'); },
+  };
+  const result = await interpretAcceptedSource({ snapshot, authority: authority(host), port, turn: 1 });
+  assert.equal(result.status, 'admitted', JSON.stringify(result.record.validationIssue ?? null));
+  assert.equal(result.record.groundingJudgeCalls, 0);
+});
