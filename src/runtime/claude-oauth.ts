@@ -369,7 +369,7 @@ const EXPIRY_SKEW_MS = 60_000;
 export function assertSubscriptionToken(tokens: ClaudeOAuthTokens | null, nowMs: number = Date.now()): string {
   if (!tokens?.accessToken) {
     throw new ClaudeAuthError(
-      'No Claude login found. Sign in to Claude Code (claude.ai Max/Pro subscription) first.',
+      'No Claude sign-in found. Sign in to Claude under Settings → Models → Claude login (Max/Pro subscription). If you use Claude Code, signing in there works too.',
       'missing',
     );
   }
@@ -387,7 +387,7 @@ export function assertSubscriptionToken(tokens: ClaudeOAuthTokens | null, nowMs:
   }
   if (tokens.expiresAt && tokens.expiresAt <= nowMs + EXPIRY_SKEW_MS) {
     throw new ClaudeAuthError(
-      'Claude subscription token has expired. Re-open Claude Code to refresh your login.',
+      'Your Claude sign-in has expired. Sign in to Claude again under Settings → Models → Claude login. If you use Claude Code, re-opening it also refreshes the login.',
       'expired',
     );
   }

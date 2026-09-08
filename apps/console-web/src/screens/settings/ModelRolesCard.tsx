@@ -1,4 +1,5 @@
 import { CompletionReviewControl } from './CompletionReviewControl';
+import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
@@ -178,13 +179,22 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
   // Verify with the judge == the brain is a self-check (no real second opinion).
   const judgeSameAsBrain = mr.roles.judge.provider === mr.roles.brain.provider && mr.roles.judge.modelId === mr.roles.brain.modelId;
 
+  // A brain switch to Claude that the daemon refused for want of a sign-in
+  // (409 needsLogin). The sign-in form renders right here and the switch is
+  // retried the moment the sign-in lands, so the user never has to find the
+  // form elsewhere or re-pick the brain (live 2026-09-08: a v3.16.0 user whose
+  // in-app Claude grant had expired could not get back to Claude).
+  const [claudeSignInFor, setClaudeSignInFor] = useState<string | null>(null);
+  const claudeAuth = settings.data?.claudeAuth;
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key); setError(null); setSaved(null);
     try { await fn(); setSaved(key); refresh(); }
     catch (err) {
-      const e = err as { status?: number; body?: { needsLogin?: boolean }; message?: string };
+      const e = err as { status?: number; body?: { needsLogin?: boolean; error?: string }; message?: string };
       setError(e?.body?.needsLogin || e?.status === 409
-        ? 'Switching to Claude needs a Claude (Max/Pro) login first — sign in under “Claude login”, then try again.'
+        ? (e?.body?.error && /expired/i.test(e.body.error)
+            ? 'Your Claude sign-in has expired. Sign in again below and the switch to Claude will complete on its own.'
+            : 'Switching to Claude needs a Claude (Max/Pro) sign-in first. Sign in below and the switch will complete on its own.')
         : (e?.message ?? String(err)));
     } finally { setBusy(null); }
   };
@@ -196,11 +206,30 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
   // daemon re-pin THAT conversation to the new brain — session brain pins mean
   // the global flip alone only steers NEW conversations. Settings mounts have
   // no session and stay global-only.
-  const onBrain = (value: string) => run('brain', () =>
-    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length), sessionId)
-      : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length), sessionId)
-        : value.startsWith('claude_oauth:') ? setActiveBrain('claude_oauth', value.slice('claude_oauth:'.length), sessionId)
-          : setActiveBrain(value as ActiveBrain, undefined, sessionId));
+  const onBrain = (value: string) => run('brain', async () => {
+    const wantsClaude = value === 'claude_oauth' || value.startsWith('claude_oauth:');
+    try {
+      await (value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length), sessionId)
+        : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length), sessionId)
+          : value.startsWith('claude_oauth:') ? setActiveBrain('claude_oauth', value.slice('claude_oauth:'.length), sessionId)
+            : setActiveBrain(value as ActiveBrain, undefined, sessionId));
+      setClaudeSignInFor(null);
+    } catch (err) {
+      const e = err as { status?: number; body?: { needsLogin?: boolean } };
+      if (wantsClaude && (e?.body?.needsLogin || e?.status === 409)) setClaudeSignInFor(value);
+      throw err;
+    }
+  });
+  // The sign-in landed (settings now report a configured Claude auth): finish
+  // the switch the user asked for, once.
+  useEffect(() => {
+    if (claudeSignInFor && claudeAuth?.configured && !claudeAuth.degraded) {
+      const value = claudeSignInFor;
+      setClaudeSignInFor(null);
+      void onBrain(value);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [claudeAuth?.configured, claudeAuth?.degraded]);
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
   const onCodexRescue = (value: string) =>
@@ -260,7 +289,12 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
                 { id: 'codex_oauth' as ActiveBrain, value: 'codex_oauth', label: 'Codex — GPT-5.x', available: connected('codex') },
                 { id: 'claude_oauth' as ActiveBrain, value: 'claude_oauth', label: 'Claude — Opus', available: connected('claude') },
               ]).map((o) => (
-                <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.available ? '' : ' (not connected)'}</option>
+                <option key={o.value} value={o.value} disabled={!o.available}>
+                  {o.label}
+                  {o.available
+                    ? (o.id === 'claude_oauth' && claudeAuth?.degraded ? ' (via Claude Code)' : '')
+                    : (o.id === 'claude_oauth' && /expired/i.test(claudeAuth?.reason ?? '') ? ' (sign-in expired)' : ' (not connected)')}
+                </option>
               ))}
             </Select>
           )}
@@ -406,6 +440,11 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
       <div className="mt-4 flex items-center gap-3">
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
         {error && <span className="text-small text-danger">{error}</span>}
+        {claudeSignInFor && (
+          <div className="mt-2">
+            <ClaudeLoginForm embedded />
+          </div>
+        )}
         {mr.available.length === 0 && <span className="text-small text-muted">No models connected yet — add one under “Connected models” below, or sign in to Codex / Claude.</span>}
       </div>
     </>

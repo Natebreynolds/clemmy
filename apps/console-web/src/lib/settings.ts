@@ -256,7 +256,16 @@ export const listProviderModels = (p: { baseURL?: string; apiKey?: string; provi
   api<{ models: DiscoveredModel[] }>('/api/console/settings/model-providers/models', { method: 'POST', body: JSON.stringify(p) });
 
 // Claude (Anthropic) subscription OAuth login.
-export interface ClaudeAuth { configured: boolean; reason?: string; plan?: string; expiresAt?: string }
+export interface ClaudeAuth {
+  configured: boolean;
+  reason?: string;
+  plan?: string;
+  expiresAt?: string;
+  /** Where the live token comes from: the app's own vault, or the Claude Code CLI fallback. */
+  source?: string;
+  /** True when the app's vault sign-in is dead and only a fallback is carrying Claude. */
+  degraded?: boolean;
+}
 export const beginClaudeLogin = () =>
   api<{ flowId: string; authorizeUrl: string }>('/api/console/auth/claude/begin', { method: 'POST', body: '{}' });
 export const completeClaudeLogin = (flowId: string, code: string) =>

@@ -225,7 +225,7 @@ test('Claude switch fails closed before changing the live or persisted brain whe
     assert.equal(rejected.response.status, 409);
     assert.equal(rejected.body.kind, 'missing');
     assert.equal(rejected.body.needsLogin, true);
-    assert.match(rejected.body.error ?? '', /No Claude login found/);
+    assert.match(rejected.body.error ?? '', /No Claude sign-in found/);
     assert.equal(process.env.AUTH_MODE, 'codex_oauth');
     assert.equal(getActiveAuthMode(), 'codex_oauth');
     assert.equal(effectiveBrainValue(), 'codex_oauth:gpt-5.6-terra');
