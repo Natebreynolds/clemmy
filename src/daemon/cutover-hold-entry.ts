@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pino from 'pino';
@@ -19,6 +19,7 @@ import {
   readDaemonPid,
   registerShutdownHandlers,
   spawnDetachedDaemonEntrypoint,
+  PID_FILE,
 } from './process.js';
 import { setDaemonRuntimePhase, startSupervisorIpcHeartbeat } from './phase.js';
 
@@ -112,13 +113,25 @@ async function runForeground(): Promise<void> {
   }
 }
 
+function legacyPidProjection(): number | null {
+  try {
+    const value = Number.parseInt(readFileSync(PID_FILE, 'utf8').trim(), 10);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  } catch { return null; }
+}
+
 async function launchDetached(): Promise<void> {
   requireHeldLaunch();
   const pid = spawnDetachedDaemonEntrypoint(modulePath, ['--foreground']);
   const deadline = Date.now() + START_HANDSHAKE_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const owner = readDaemonPid();
-    if (owner === pid && isDaemonRunning()) {
+    // Lease acquisition unlinks the legacy daemon.pid projection, publishes the
+    // lease, then rewrites the projection. A launcher that reports "started"
+    // on the lease alone lets a reader open daemon.pid inside that window
+    // (2026-09-08: ENOENT under CPU contention, locally and on the release
+    // runner). Report started only once the projection names this child too.
+    if (owner === pid && isDaemonRunning() && legacyPidProjection() === pid) {
       console.log(`Held daemon started (PID ${pid}).`);
       return;
     }
