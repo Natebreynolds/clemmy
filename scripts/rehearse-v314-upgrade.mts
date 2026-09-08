@@ -770,7 +770,11 @@ async function seedV314Fixture(checkout: string, home: string): Promise<void> {
     kind: 'system',
     title: 'v3.14 migration fixture',
     body: 'This silent notification must not be replayed or duplicated by a store boot.',
-    createdAt: '2026-08-07T22:43:08.000Z',
+    // Dated relative to now: the store reaper purges notifications older than
+    // NOTIFICATION_MAX_AGE_MS (30 days) on boot, so a fixed 2026-08-07 stamp
+    // made this gate fail from 2026-09-06 onward with the fixture simply gone
+    // ("legacyFixturePreserved: false"), which read as an upgrade regression.
+    createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
     read: false,
     silent: true,
     metadata: { release: 'v3.14.0', fixture: true },
