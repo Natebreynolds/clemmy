@@ -195,6 +195,19 @@ function newestEstablishedRoute(input: {
   return null;
 }
 
+/** True when this accepted source consumed a continuity packet — the user was
+ *  answering a question (the host's labeled one, or the model's own ask).
+ *  Live 2026-09-08: the model asked "which mailbox?" itself; the answer routed
+ *  the read but was not remembered because only the host's packet kind was. */
+function sourceAnsweredAQuestion(sessionId: string, sourceUserSeq: number): boolean {
+  try {
+    const consumed = readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: sourceUserSeq });
+    return consumed.status === 'consumed';
+  } catch {
+    return false;
+  }
+}
+
 function consumedAccountClarification(
   sessionId: string,
   sourceUserSeq: number,
@@ -335,7 +348,7 @@ export async function resolveSourceAccountRouting(input: {
   // exact connected identity — or the conversation's established route — is
   // the route. The result discloses the account so the user can correct it.
   if (input.effect === 'read' && !defaultMode && origin) {
-    if (consumedAccountClarification(input.sessionId, input.sourceUserSeq, source.text)) {
+    if (sourceAnsweredAQuestion(input.sessionId, input.sourceUserSeq)) {
       // The user just answered "which account?" — remember it for reads.
       try {
         rememberAccountAlias({ toolkit, label: READ_DEFAULT_ACCOUNT_LABEL, email: emailOf(connection) || undefined, connectionId: connection.connectionId });
