@@ -5676,6 +5676,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     attempt: Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'failed' }>,
   ): 'zero_crossing' | 'effect_may_have_started' => {
     if (!attempt.invocationEntered) return 'zero_crossing';
+    // THE IRREVERSIBLE BOUNDARY DECIDES, not the fact of a failure. A host-only
+    // carrier or a LOCAL write that failed or was cancelled after dispatch left
+    // nothing outside Clem's boundary that cannot be re-run or re-read; only an
+    // external write or an admin action can half-land. Live
+    // 2026-09-08: an inbox triage delegated to workers (run_worker, a local
+    // carrier) was cancelled at the driver's deadline and the turn hard-blocked
+    // as an uncertain WRITE. The settlement still records exactly what ran.
+    {
+      // Scope: in-boundary effects (a local write, a host-only carrier such as
+      // run_worker). A registered READ keeps the existing narrow rule below and
+      // the caller-abort hold its pins protect; an unknown effect stays uncertain.
+      const effect = currentFrameEffects.get(call.callId);
+      if (effect === 'local_write' || effect === 'host_only') return 'zero_crossing';
+    }
     try {
       const identity = exactHostIdentity();
       const redeemed = redeemDurableLogicalCallSettlementForHost({

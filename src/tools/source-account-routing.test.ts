@@ -577,7 +577,35 @@ test('a READ with a nominated identity routes without the judge; a write with th
   assert.equal(write.kind, 'account_selection_required');
   if (write.kind === 'account_selection_required') {
     assert.equal(write.reason, 'review_unavailable');
-    assert.deepEqual(write.labels, { [SCORPION]: SCORPION, [PERSONAL]: PERSONAL }, 'choices carry labels');
+    // The user's own alias for an account (registered earlier in this file) is
+    // the label; an account with no alias falls back to its email.
+    assert.deepEqual(write.labels, { [SCORPION]: 'scorpion', [PERSONAL]: PERSONAL }, 'choices carry labels');
   }
   assert.equal(calls.length, 1, 'the write asked the judge once');
+});
+
+test('an answered "which account?" becomes the toolkit\'s remembered read default; the question is never asked twice', async () => {
+  const { rememberAccountAlias } = await import('../memory/account-alias-store.js');
+  const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
+  registry.installTurnSemanticModelPort({
+    async interpret() { throw new Error('not used'); },
+    async judgeAccountSelection() { throw new Error('the judge must not be consulted for a read default'); },
+  });
+  const before = await routing.resolveSourceAccountRouting({
+    ...source('Hows my day looking?'), toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW', connections, nomination: null, effect: 'read',
+  });
+  assert.equal(before.kind, 'account_selection_required', 'two accounts and no default: the host will ask');
+  rememberAccountAlias({ toolkit: 'outlook', label: READ_DEFAULT_ACCOUNT_LABEL, email: PERSONAL, connectionId: 'fixture-personal' });
+  const after = await routing.resolveSourceAccountRouting({
+    ...source('Hows my day looking?'), toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW', connections, nomination: null, effect: 'read',
+  });
+  assert.equal(after.kind, 'resolved', JSON.stringify(after));
+  if (after.kind === 'resolved') {
+    assert.equal(after.connection.connectionId, 'fixture-personal');
+    assert.equal(after.evidence.judgeModelIdentity, 'host:read_default');
+  }
+  const write = await routing.resolveSourceAccountRouting({
+    ...source('Send it from my mailbox'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(write.kind, 'account_selection_required', 'a remembered READ default never routes a write');
 });

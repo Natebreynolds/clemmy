@@ -23,3 +23,12 @@ test('settlementRequiresReconciliation is gated on the irreversible boundary', (
     'a local write or read that may have started must not hard-block; only external_write/admin reconcile',
   );
 });
+
+test('a failed or cancelled in-boundary call (local write, host-only carrier) is zero-crossing, never an uncertain write', () => {
+  // Live 2026-09-08: an inbox triage delegated to workers (run_worker) was
+  // cancelled at the driver's deadline and the turn hard-blocked as uncertain.
+  assert.match(
+    SRC,
+    /const effect = currentFrameEffects\.get\(call\.callId\);\s*\n\s*if \(effect === 'local_write' \|\| effect === 'host_only'\) return 'zero_crossing';/,
+  );
+});

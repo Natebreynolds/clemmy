@@ -7,7 +7,7 @@ import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
-import { aliasLabelFor } from '../memory/account-alias-store.js';
+import { aliasLabelFor, resolveAccountAlias, rememberAccountAlias } from '../memory/account-alias-store.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import pino from 'pino';
 
@@ -60,15 +60,22 @@ export type SourceAccountRoutingResolution =
     }
   | { kind: 'resolved'; connection: Connection; evidence: SourceAccountRoutingEvidence };
 
+/** The alias label under which an answered "which account?" for a READ is
+ *  remembered, so the same question is never asked twice for that toolkit. */
+export const READ_DEFAULT_ACCOUNT_LABEL = 'default read account';
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const emailOf = (connection: Connection): string => String(connection.accountEmail ?? '')
   .trim().toLowerCase().replace(/^smtp:/, '');
 const identityOf = (connection: Connection): string => emailOf(connection) || connection.connectionId;
+const toolkit = (connection: Connection): string => String(connection.slug ?? '').trim().toLowerCase();
 export function accountChoiceLabels(connections: readonly Connection[]): Readonly<Record<string, string>> {
   const labels: Record<string, string> = {};
   for (const connection of connections) {
     const identity = identityOf(connection);
-    const label = String(connection.accountLabel ?? connection.alias ?? emailOf(connection) ?? '').trim() || connection.connectionId;
+    // A label the user gave this account (the alias store) beats the
+    // provider's own; the provider's beats the email; the id is last.
+    const label = aliasLabelFor(toolkit(connection), emailOf(connection) || undefined, connection.connectionId)
+      ?? (String(connection.accountLabel ?? connection.alias ?? emailOf(connection) ?? '').trim() || connection.connectionId);
     if (!labels[identity]) labels[identity] = label;
   }
   return Object.freeze(labels);
@@ -241,8 +248,32 @@ export async function resolveSourceAccountRouting(input: {
   const latest = newestEstablishedRoute({ ...input, principalId, toolkit });
   if (!nomination && latest === 'conflict') return blocked();
   let established = !nomination && latest !== 'conflict' ? latest : null;
+  const connectionRevision = digest(JSON.stringify(relevant.map((candidate) => ({
+    id: candidate.connectionId, identity: identityOf(candidate), status: candidate.status,
+  })).sort((a, b) => a.id.localeCompare(b.id))));
   const defaultMode = !nomination && !established;
-  if (defaultMode && choices.length !== 1) return blocked();
+  if (defaultMode && choices.length !== 1) {
+    // NOTHING WAS LEARNED was the gap: after the host's own "which account?"
+    // she asked again next conversation. For a READ, the answer the user gave
+    // once is this toolkit's remembered default; use it and say so.
+    if (input.effect === 'read') {
+      const remembered = resolveAccountAlias(READ_DEFAULT_ACCOUNT_LABEL, toolkit);
+      const match = remembered ? relevant.find((connection) => (
+        (remembered.connectionId && connection.connectionId === remembered.connectionId)
+        || (remembered.email && emailOf(connection) === remembered.email.toLowerCase())
+      )) : undefined;
+      if (match) {
+        return { kind: 'resolved', connection: match, evidence: {
+          version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit,
+          identity: identityOf(match),
+          sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
+          checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
+          connectionRevision, judgeModelIdentity: 'host:read_default',
+        } };
+      }
+    }
+    return blocked();
+  }
   const proposedIdentity = nomination?.identity.trim() ?? established?.identity ?? choices[0]!;
   const exact = relevant.filter((connection) => connection.connectionId === proposedIdentity
     || emailOf(connection) === proposedIdentity.toLowerCase());
@@ -288,9 +319,6 @@ export async function resolveSourceAccountRouting(input: {
   });
   if (!interveningAcceptedSources) return blocked();
   const mode = defaultMode ? 'current_source_default' : 'explicit_selection';
-  const connectionRevision = digest(JSON.stringify(relevant.map((candidate) => ({
-    id: candidate.connectionId, identity: identityOf(candidate), status: candidate.status,
-  })).sort((a, b) => a.id.localeCompare(b.id))));
   const subject = {
     mode, connectionRevision,
     sessionId: input.sessionId, principalId, sourceUserSeq: input.sourceUserSeq,
@@ -307,6 +335,12 @@ export async function resolveSourceAccountRouting(input: {
   // exact connected identity — or the conversation's established route — is
   // the route. The result discloses the account so the user can correct it.
   if (input.effect === 'read' && !defaultMode && origin) {
+    if (consumedAccountClarification(input.sessionId, input.sourceUserSeq, source.text)) {
+      // The user just answered "which account?" — remember it for reads.
+      try {
+        rememberAccountAlias({ toolkit, label: READ_DEFAULT_ACCOUNT_LABEL, email: emailOf(connection) || undefined, connectionId: connection.connectionId });
+      } catch { /* memory is a convenience, never a gate */ }
+    }
     return { kind: 'resolved', connection, evidence: {
       version: 1, sessionId: input.sessionId, principalId, toolkit, identity,
       sourceSessionId: origin.sessionId, sourceUserSeq: origin.seq,

@@ -1,4 +1,5 @@
 import { parseTaskMode } from './task-mode.js';
+import { discoveryGovernor } from './discovery-governor.js';
 /** Worker packets use the same host loop and exact call admission as the
  * parent, in their own existing session/source namespace. No child can mutate
  * the parent's root, model-batch ordinals or logical run_worker settlement. */
@@ -67,6 +68,19 @@ export async function runPacketWorkerWithHost(input: {
         : { delegatedWorker: { ...lineage, composeOnly: true, packet: input.input } }),
     },
   });
+  // A worker is an accepted task of its own. Without this baseline discovery
+  // policy its tool_search is denied (task_not_initialized) and its reads are
+  // refused as unproven — live 2026-09-08: an inbox triage delegated to two
+  // mailbox workers came back 0/2 with nothing done. Same door the parent
+  // turn walks through; the live boundary still fails closed on misuse.
+  try {
+    discoveryGovernor.initializeTask({
+      claimKeyVersion: 'exact_request_v1',
+      sessionId: session.id,
+      sourceUserSeq: childSource.seq,
+      knownCapability: false,
+    });
+  } catch { /* the live boundary fails closed if discovery is attempted anyway */ }
   appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_started',
     data: { ...lineage, model: input.modelId, provider: resolveEffectiveProviderForModel(input.modelId),
       role: input.input.intent, childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
