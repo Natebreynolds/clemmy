@@ -134,9 +134,16 @@ export function classifyHostModelFrame(input: {
       : { kind: 'refused', reason: 'host_control_requires_sole_call_frame' };
   }
   if (freshPlans.length === 0) {
+    // A READ NEEDS NO PLAN. The plan-sibling rule exists so a graph-bound
+    // mutation cannot be smuggled through a bare work_call; a read or compute
+    // call acquires no graph authority by crossing it (the inner dispatcher
+    // still re-proves operation, account, schema and effect). Live 2026-09-08:
+    // a calendar read was frame-refused for lacking a plan sibling.
     const directWorkCallLookalike = input.calls.some((call) => (
       isPlainOrClementineLocalTool(call.name, 'work_call')
       && !call.proposalFreeWorkCarrier
+      && call.effect !== 'read'
+      && call.effect !== 'compute'
     ));
     if (directWorkCallLookalike) {
       return { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' };

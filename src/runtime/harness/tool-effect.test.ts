@@ -987,3 +987,11 @@ test('the workflow step result channel is a registered read-effect host control,
   });
   assert.equal(actionTopologyRoleForRuntimeCall('workflow_step_result', { data: {} }), 'control');
 });
+
+test('a provider operation named in the composio:SLUG form classifies by its slug, never as unknown', () => {
+  // Live 2026-09-08: work_call named composio:OUTLOOK_GET_CALENDAR_VIEW (a
+  // documented read) was refused twice as effect_unknown.
+  assert.equal(classifyRuntimeToolEffect('composio:OUTLOOK_GET_CALENDAR_VIEW', {}).effect, 'read');
+  assert.equal(classifyRuntimeToolEffect('composio:OUTLOOK_GET_CALENDAR_VIEW', {}).source, 'composio');
+  assert.equal(classifyRuntimeToolEffect('composio:OUTLOOK_SEND_EMAIL', {}).effect, 'external_write');
+});

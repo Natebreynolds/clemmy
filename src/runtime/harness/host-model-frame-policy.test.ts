@@ -180,14 +180,22 @@ test('identified proposal-free calls remain ordinary until the exact tool edge',
     }), { kind: 'ordinary' }, call.effectiveName ?? 'unidentified');
   }
 
+  // A READ NEEDS NO PLAN (2026-09-08): an unmarked lookalike that classifies
+  // as a read or compute passes the frame — the exact tool edge re-proves it.
+  // A write lookalike with no configured-tool provenance is still refused.
   assert.deepEqual(classifyHostModelFrame({
     calls: [work({ proposalFreeWorkCarrier: false })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  }), { kind: 'ordinary' }, 'a read lookalike is decided at the tool edge, not by a plan-sibling rule');
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [work({ proposalFreeWorkCarrier: false, effectiveName: 'GOOGLESHEETS_UPDATE_VALUES_BATCH', effect: 'external_write' })],
     planActivated: false,
     allowFreshPlanReadFusion: true,
   }), {
     kind: 'refused',
     reason: 'host_planned_work_call_requires_plan_sibling',
-  }, 'an unmarked work_call lookalike retains no configured-tool provenance');
+  }, 'an unmarked WRITE lookalike retains no configured-tool provenance');
 
   assert.deepEqual(classifyHostModelFrame({
     calls: [plan()],
