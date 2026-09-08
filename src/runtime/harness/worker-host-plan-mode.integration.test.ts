@@ -27,6 +27,7 @@ const { withLogicalToolCall } = await import('./attempt-identity.js');
 const { acceptedTaskMode } = await import('./accepted-task-mode.js');
 const plans = await import('./plan-artifacts.js');
 const { runPacketWorkerWithHost } = await import('./worker-host-runner.js');
+const { discoveryGovernor } = await import('./discovery-governor.js');
 const { getComputerTools } = await import('../../tools/computer-tools.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
@@ -77,6 +78,11 @@ for (const parentKind of ['plan', 'execute'] as const) test(`a real delegated ${
         childSourceSeq = child.sourceUserSeq;
         assert.notEqual(childId, session.id);
         assert.deepEqual(acceptedTaskMode(childId, childSourceSeq), { version: 1, kind: 'plan' });
+        // A worker child owns a discovery task from the moment it is accepted
+        // (2026-09-08: without it, tool_search was denied task_not_initialized).
+        assert.equal(discoveryGovernor.initializeTask({
+          claimKeyVersion: 'exact_request_v1', sessionId: childId, sourceUserSeq: childSourceSeq, knownCapability: false,
+        }).status, 'existing', 'the worker child already owns its discovery task');
         const tools = getComputerTools().filter((entry) => 'name' in entry && ['read_file', 'write_file'].includes(entry.name))
           .map((entry) => brackets.wrapToolForHarness(entry as never));
         assert.equal(tools.length, 2);
