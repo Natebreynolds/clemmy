@@ -5347,8 +5347,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // prose, owns that effect decision. Carry it to frame pairing so the
           // model receives the canonical effect_unknown marker and cannot
           // reason from (or retry after) a misleading ordinary result.
+          // Reconciliation HARD-BLOCKS the turn, so it is reserved for the
+          // irreversible boundary: an external write or an admin action that
+          // may have half-landed and cannot simply be re-run. A read, compute,
+          // or LOCAL write (a space refresh, a memory note — all inside Clem's
+          // own home) that may have started is correctable in place, so it
+          // settles and the model gets the ordinary result. Live 2026-09-08:
+          // platform-49 blocked on space_refresh, a non-mutating local view
+          // rebuild, because the flag tripped for every effect class.
           settlementRequiresReconciliation =
-            invoked.settlement.outcome.directive.requiresReconciliation === true;
+            invoked.settlement.outcome.directive.requiresReconciliation === true
+            && (effect === 'external_write' || effect === 'admin');
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
