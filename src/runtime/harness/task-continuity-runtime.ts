@@ -52,6 +52,7 @@ import {
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import {
   ambiguousOpenSlotTargetFromLastInterpretation,
+  readPersistedSemanticInterpretation,
   taskRelationFromLastInterpretation,
   typedClassificationFromLastInterpretation,
   type TypedClarificationClassificationV1,
@@ -156,12 +157,20 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
     input.sessionId,
     input.sourceUserSeq,
   );
+  // The host could not READ the answer at all (the projection was rejected or
+  // never persisted). That is not the user's fault and never a reason to park
+  // the session: the open question is re-asked so the next answer stays
+  // adjacent and consumable. Measured 2026-09-08: a correct option answer was
+  // rejected by a host-side catalog id bound and the session held silently.
+  const unreadable = readPersistedSemanticInterpretation(input.sessionId, input.sourceUserSeq)
+    ?.validationOutcome !== 'admitted';
   const openSlot = current.packet.pause.slot;
   if (
-    !ambiguous
-    || !openSlot
+    !openSlot
+    || (!ambiguous && !unreadable)
     || (
-      ambiguous.target !== null
+      ambiguous
+      && ambiguous.target !== null
       && (
         ambiguous.target.goalId !== openSlot.goalId
         || ambiguous.target.baseRevision !== openSlot.revision

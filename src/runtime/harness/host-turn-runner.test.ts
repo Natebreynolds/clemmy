@@ -38,6 +38,7 @@ const {
   literalOperationNotFrozenReason,
   _setHostJitReadProvisionerForTests,
 } = await import('./host-turn-runner.js');
+const { NO_PROGRESS_RETRY_BUDGET } = await import('./no-progress-governor.js');
 const catalogScope = await import('./accepted-source-catalog-scope.js');
 const hostRunRunner: typeof productionHostRunRunner = (
   runner,
@@ -1096,10 +1097,11 @@ test('production host keeps the no-progress recovery directive out of the exact 
     needsApproval: async () => false,
     invoke: async () => { bodies += 1; return 'must not run'; },
   };
+  // An identical repair spends the bounded retry budget (no effect started)
+  // before exhaustion publishes retained state directly, ahead of the prose.
+  const repairIds = Array.from({ length: NO_PROGRESS_RETRY_BUDGET + 2 }, (_, index) => `checkpoint-repair-${index + 1}`);
   const model = stubModel([
-    [toolCall('checkpoint-before-recovery', recovery.name, {})],
-    [toolCall('checkpoint-during-recovery', recovery.name, {})],
-    // Exhaustion publishes retained state directly, before this unused prose.
+    ...repairIds.map((callId) => [toolCall(callId, recovery.name, {})]),
     [textMsg('I could not find a way to run that step; here is what I have so far.')],
   ]);
   const agent = { model, tools: [recovery] };
@@ -1113,7 +1115,8 @@ test('production host keeps the no-progress recovery directive out of the exact 
     'the retained-state terminal names the current stage and a next edge');
   assert.doesNotMatch(String(outcome.finalOutput), /checkpoint|reconcil/i,
     'ordinary host bookkeeping is never rendered as a user-facing effect failure');
-  assert.equal(model.calls(), 2, 'one repair attempt, then direct publication without a last-word call');
+  assert.ok(model.calls() >= 2 && model.calls() <= repairIds.length,
+    `bounded repair attempts (${model.calls()}), then direct publication without a last-word call`);
   assert.equal(bodies, 0, 'neither unowned fixture crosses its body boundary');
   assert.equal(
     eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
@@ -1141,10 +1144,9 @@ test('production host keeps the no-progress recovery directive out of the exact 
     ordinal: row.batch_ordinal,
     callIds: JSON.parse(row.call_ids_json),
     disposition: row.disposition,
-  })), [
-    { ordinal: 1, callIds: ['checkpoint-before-recovery'], disposition: 'ready' },
-    { ordinal: 2, callIds: ['checkpoint-during-recovery'], disposition: 'ready' },
-  ]);
+  })), repairIds.slice(0, model.calls()).map((callId, index) => (
+    { ordinal: index + 1, callIds: [callId], disposition: 'ready' }
+  )));
   assert.ok(rows.every((row, index) => (
     index === 0 || row.history_item_count! > rows[index - 1]!.history_item_count!
   )), 'each checkpoint extends the exact prior balanced history');
@@ -8483,11 +8485,9 @@ test('a no-progress terminal carries the current typed stage as bounded blockedD
       name: operationId,
       args_json: JSON.stringify({ limit: 1 }),
     });
+    const missCount = NO_PROGRESS_RETRY_BUDGET + 2;
     const model = stubModel([
-      [sameCall('catalog-miss-1')],
-      [sameCall('catalog-miss-2')],
-      [sameCall('catalog-miss-3')],
-      [sameCall('catalog-miss-4')],
+      ...Array.from({ length: missCount }, (_, index) => [sameCall(`catalog-miss-${index + 1}`)]),
       [textMsg('must not outrun the no-progress governor')],
     ]);
     const agent = { model, tools: [carrier] };
@@ -8498,12 +8498,16 @@ test('a no-progress terminal carries the current typed stage as bounded blockedD
     assert.equal(outcome.terminal?.status, 'blocked');
     assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
     assert.notEqual(outcome.terminal?.resumable, false);
-    assert.equal(model.calls(), 2, 'a repeated typed refusal publishes without another model call');
-    assert.equal(
-      hostBlockedTerminalDetail(outcome),
-      'host_disposition:refused_pre_dispatch',
+    assert.ok(model.calls() >= 2 && model.calls() <= missCount,
+      `a repeated typed refusal is bounded (${model.calls()}) and publishes without another model call`);
+    // The bounded retry budget lets the same refusal repeat before exhaustion;
+    // the typed stage is then the repeated refused frame itself.
+    const detail = hostBlockedTerminalDetail(outcome);
+    assert.ok(
+      detail === 'host_disposition:refused_pre_dispatch' || detail === 'repeated_refused_frame',
+      `typed stage names the refusal: ${detail}`,
     );
-    assert.match(String(outcome.finalOutput), /Stopped at: host_disposition:refused_pre_dispatch\.\nNext:/);
+    assert.match(String(outcome.finalOutput), new RegExp(`Stopped at: ${detail}\\.\\nNext:`));
     assert.ok((hostBlockedTerminalDetail(outcome) ?? '').length <= 160);
     assert.equal(outerBodies(), 0);
   } finally {

@@ -42,7 +42,14 @@ type Connections = Awaited<ReturnType<typeof listUsableConnectedToolkits>>;
 type Connection = Connections[number];
 export type SourceAccountRoutingResolution =
   | { kind: 'none' }
-  | { kind: 'account_selection_required'; choices: readonly string[]; reason?: 'review_unavailable' }
+  | {
+      kind: 'account_selection_required';
+      choices: readonly string[];
+      /** Why the nominated account was not bound. Surfaced to the model so
+       *  the next hop is a precise question to the user, never a blind retry
+       *  (live 2026-09-08: three identical refusals with no reason). */
+      reason?: 'review_unavailable' | 'not_entailed' | 'quote_not_in_source';
+    }
   | { kind: 'resolved'; connection: Connection; evidence: SourceAccountRoutingEvidence };
 
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
@@ -156,7 +163,9 @@ export async function resolveSourceAccountRouting(input: {
   const relevant = input.connections.filter((connection) => connection.slug.trim().toLowerCase() === toolkit
     && /^(?:active|enabled|initiated)$/i.test(connection.status ?? ''));
   const choices = [...new Set(relevant.map(identityOf))];
-  const blocked = (): SourceAccountRoutingResolution => ({ kind: 'account_selection_required', choices });
+  const blocked = (
+    reason?: 'not_entailed' | 'quote_not_in_source',
+  ): SourceAccountRoutingResolution => ({ kind: 'account_selection_required', choices, ...(reason ? { reason } : {}) });
   const source = acceptedSource(input.sessionId, input.sourceUserSeq);
   const session = getSession(input.sessionId);
   if (!source || !session) return blocked();
@@ -206,7 +215,7 @@ export async function resolveSourceAccountRouting(input: {
     }
     return null;
   })();
-  if (!origin || (sourceQuote !== null && !origin.text.includes(sourceQuote))) return blocked();
+  if (!origin || (sourceQuote !== null && !origin.text.includes(sourceQuote))) return blocked(sourceQuote !== null ? 'quote_not_in_source' : undefined);
   if (established?.checkedForSourceUserSeq === input.sourceUserSeq
     && established.checkedForSourceDigest === source.digest) {
     return { kind: 'resolved', connection, evidence: established };
@@ -247,7 +256,7 @@ export async function resolveSourceAccountRouting(input: {
   }, connectionRevision);
   if (!result) return { kind: 'account_selection_required', choices, reason: 'review_unavailable' };
   if (result.verdict !== (defaultMode ? 'default_compatible' : 'entailed')
-    || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim()) return blocked();
+    || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim()) return blocked('not_entailed');
   if (defaultMode) return { kind: 'resolved', connection, evidence: {
     version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit, identity,
     sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,

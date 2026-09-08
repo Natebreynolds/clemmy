@@ -696,7 +696,8 @@ export interface ToolSearchPlanningBlocker {
    * provider exposes no mailbox identity. */
   choices: readonly string[];
   /** Host-owned diagnostic; publication failures never imply an account question. */
-  reason?: 'review_unavailable' | 'proof_publication_expired' | 'proof_not_registered'
+  reason?: 'review_unavailable' | 'not_entailed' | 'quote_not_in_source'
+    | 'proof_publication_expired' | 'proof_not_registered'
     | 'exact_definition_unavailable'
     | NonNullable<ProofProvisionResult['refusal']>['code'];
 }
@@ -1638,6 +1639,8 @@ export function registerToolSearchTool(
                 ...(planningBlockers[r.name]!.reason ? { accountSelectionReason: planningBlockers[r.name]!.reason } : {}),
                 accountSelectionNextStep: planningBlockers[r.name]!.reason === 'review_unavailable'
                   ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP
+                  : planningBlockers[r.name]!.reason === 'not_entailed' || planningBlockers[r.name]!.reason === 'quote_not_in_source'
+                  ? 'The quoted user wording did not name this account, so it was not bound. Do not retry the same selection. Ask the user which one of accountChoices to use, then repeat tool_search with account_selection quoting their answer verbatim.'
                   : 'If the accepted user request already names the operating account, repeat tool_search with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}. The host checks source-versus-recipient meaning. Ask the user only if no account was selected or the choice remains unclear.',
               }
             : opts.discloseForPlanning && !planningRefs[r.name]

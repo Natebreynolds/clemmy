@@ -1495,3 +1495,41 @@ test('INVALID: a non-native but CATALOG-KNOWN family still requires target cover
     `provider coverage must hold too: ${issueCodes(result).join(',')}`,
   );
 });
+
+// Measured 2026-09-08 (sess-desktop-11b34e80…, source 156520): the host's own
+// live catalog carried "cap:live:v1:<24>:<24>:<64>:reacquired:<16>" — 154
+// characters. The opaque-id bound was 128, so the host rejected its OWN view,
+// the whole interpretation was marked invalid, a correct option answer became
+// keepOpen, and the fresh turn parked on pending_continuity with no terminal.
+test('a host-minted live capability id longer than 128 chars is not an invalid catalog id', () => {
+  const liveId = `cap:live:v1:${'c'.repeat(24)}:${'b'.repeat(24)}:${'1'.repeat(64)}:reacquired:${'d'.repeat(16)}`;
+  assert.equal(liveId.length, 154);
+  const live = descriptor(liveId, 'read', 'query', 'records');
+  const result = validateTurnSemanticProposalV1(proposal(), host({
+    catalog: {
+      capabilityIds: new Set([liveId, 'cap-1']),
+      workflowIds: new Set(['workflow-1']),
+      capabilities: [live, descriptor('cap-1', 'read', 'query', 'records')],
+    },
+  }));
+  assert.ok(!issueCodes(result).includes('host_invalid_catalog_id'), JSON.stringify(issueCodes(result)));
+});
+
+
+// Live 2026-09-08: the owner answered "which calendar?" and the model returned
+// answer_open_slot with the right option PLUS a sketched work plan. The old rule
+// rejected the whole projection for the plan alone, so a correct answer was
+// discarded and the question re-asked. Supplied work is inert on a slot answer.
+test('a slot answer that also sketches work is admitted; a replacement goal is still not', () => {
+  const answered = {
+    relation: 'answer_open_slot' as const,
+    targetGoal: activeGoal,
+    goal: null,
+    slotAnswers: [{ kind: 'option' as const, questionId: 'question-3', slotKey: 'resource-choice', optionId: 'choice-a' }],
+  };
+  const admitted = validateTurnSemanticProposalV1(proposal({ ...answered, work: work() }), host());
+  assert.deepEqual(issueCodes(admitted), []);
+  assert.ok(admitted.ok && admitted.checked.proposal.work === null, 'the sketched work is dropped, never grounded or executed');
+  assert.ok(issueCodes(validateTurnSemanticProposalV1(proposal({ ...answered, work: null, goal: goal() }), host()))
+    .includes('illegal_relation_payload'));
+});

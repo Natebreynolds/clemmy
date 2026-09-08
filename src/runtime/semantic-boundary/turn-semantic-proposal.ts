@@ -61,7 +61,12 @@ const MAX_SLOT_ANSWERS = 1;
 const MAX_SLOT_VALUE_CHARS = 4_000;
 const MAX_RATIONALE_CHARS = 2_000;
 
-const OPAQUE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,127}$/;
+// Opaque ids are host-minted. Live capability ids carry a 64-hex digest plus
+// a "reacquired:<hash>" suffix (154 chars measured 2026-09-08), and the old
+// 128 cap made the host reject its OWN catalog: the whole interpretation was
+// marked invalid, a correct slot answer became keepOpen, the clarification
+// packet stayed live and the fresh turn parked on pending_continuity forever.
+const OPAQUE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,255}$/;
 
 const opaqueIdSchema = z.string().min(1).max(128).regex(OPAQUE_ID_RE);
 const nonBlankString = (max: number) => z.string().min(1).max(max).regex(/\S/);
@@ -804,6 +809,12 @@ function validateRelationMatrix(
       return;
     case 'answer_open_slot':
       requireExactActiveGoal(proposal, host, issues);
+      // A slot answer may arrive with a sketched work plan ("the Scorpion
+      // calendar — and here is how I'd do it"). The projection reads only
+      // slotAnswers[0]; supplied work is never executed from a slot answer, so
+      // rejecting it only discarded a correct answer (live 2026-09-08: the
+      // owner's calendar pick was refused twice and the question re-asked).
+      // A replacement goal is still illegal here.
       if (proposal.goal !== null || !carriesNoWork || noAnswers) {
         issue(issues, 'illegal_relation_payload', '', 'answer_open_slot requires slot answers and no replacement goal or work');
       }
@@ -1458,7 +1469,16 @@ export function validateTurnSemanticProposalV1(
       })),
     };
   }
-  const proposal = deepFreeze(parsed.data);
+  // Work sketched beside a slot answer is inert: the projection reads only
+  // slotAnswers[0] and the resumed goal already owns its work. Drop it HERE so
+  // relation, work, grounding and the payload hash all see the answer alone —
+  // live 2026-09-08 a correct calendar pick was rejected three times in a row
+  // (relation payload, then catalog grounding) for a plan that would never run.
+  const proposal = deepFreeze(
+    parsed.data.relation === 'answer_open_slot' && parsed.data.work !== null
+      ? { ...parsed.data, work: null }
+      : parsed.data,
+  );
   const issues: TurnSemanticValidationIssue[] = [];
   validateRelationMatrix(proposal, host, issues);
   validateGoalDraft(proposal, host, issues);

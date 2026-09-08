@@ -5381,6 +5381,20 @@ async function runConversationWithinRuntimeConfig(
     sessionId: options.sessionId,
     sourceUserSeq,
   });
+  // An open clarification the accepted source did not settle is re-asked here,
+  // unconditionally. Until now this only ran when the planning catalog failed;
+  // when the catalog primed fine the unconsumed packet reached
+  // prepareProviderHistory, which held the turn on pending_continuity with no
+  // terminal and no wake (the packet is consumed only by admission). Clem
+  // always reports back for clarification; she never parks silently.
+  if (hostOwnsFreshTurn) {
+    const reoffered = reofferUnresolvedAcceptedSourceClarification({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      turn: acceptedSource.turn,
+    });
+    if (reoffered) return reoffered;
+  }
   const hostPlanningCatalog = hostOwnsFreshTurn && !hostPlainConversation
     ? await primePrimaryModelPlanningCatalog({
         sessionId: options.sessionId,

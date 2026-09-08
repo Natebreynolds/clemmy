@@ -12,14 +12,14 @@ const FMT = readFileSync(new URL('../runtime/harness/tool-output-format.ts', imp
 test('the eviction list excludes the exact-selected schema', () => {
   assert.match(
     SRC,
-    /const shownSchemaNames = \[\.\.\.schemaNames\]\s*\n\s*\.filter\(\(name\) => name !== selectedSchemaName\);/,
+    /const shownSchemaNames = \[\.\.\.schemaNames\]\s*\n\s*\.filter\(\(name\) => name !== primarySchemaName\);/,
     'the selected contract must not be in the ordinary eviction list',
   );
 });
 
 test('guidance is surrendered BEFORE the selected schema', () => {
   const guidanceAt = SRC.indexOf('delete guidance[selectedExactly.name];');
-  const lastResortAt = SRC.indexOf('ensureSchemaHandle(selectedSchemaName);');
+  const lastResortAt = SRC.lastIndexOf('ensureSchemaHandle(primarySchemaName);');
   assert.ok(guidanceAt > 0 && lastResortAt > 0, 'both steps must exist');
   assert.ok(guidanceAt < lastResortAt, 'guidance must be dropped before the argument contract');
 });
@@ -27,7 +27,7 @@ test('guidance is surrendered BEFORE the selected schema', () => {
 test('the selected schema is only evicted as a genuine last resort, and stays addressable', () => {
   const tail = SRC.split('delete guidance[selectedExactly.name];')[1]!.slice(0, 900);
   assert.match(tail, /text\.length > DEFAULT_TOOL_RESULT_MAX_CHARS/);
-  assert.match(tail, /ensureSchemaHandle\(selectedSchemaName\)/,
+  assert.match(tail, /ensureSchemaHandle\(primarySchemaName\)/,
     'the bytes must be retained behind the content-addressed handle');
 });
 

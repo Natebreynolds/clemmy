@@ -1535,3 +1535,49 @@ test('an either/or clarification invites a slot answer even without an interroga
     'a compound answer must still be refused',
   );
 });
+
+// Measured 2026-09-08 (sess-desktop-11b34e80…): Clem asked which calendar, the
+// owner answered, the semantic port read it correctly (answer_open_slot, opt-1)
+// but the host REJECTED its own projection (a host catalog id failed the opaque
+// bound). The packet stayed live, prepareProviderHistory held the fresh turn on
+// pending_continuity, and nothing could wake it. An answer the host could not
+// read must re-ask the question — never park.
+test('an unreadable (not admitted) answer to an open clarification re-offers the question instead of holding', () => {
+  const sessionId = 'sess-reoffer-unreadable';
+  const origin = accepted(sessionId, 'prep notes for my external meetings this week');
+  continuity.createTaskContinuityPacket({
+    sessionId,
+    originatingSourceUserSeq: origin.seq,
+    pause: {
+      kind: 'clarification',
+      question: 'Which Outlook calendar should I pull?',
+      options: [],
+      slot: { goalId: `goal:${sessionId}:${origin.seq}`, revision: 0, questionId: `question:${origin.seq}`, slotKey: 'reply' },
+    },
+  });
+  const answer = accepted(sessionId, 'My default calendar.');
+  const seedInterpretation = (validationOutcome: 'invalid' | 'admitted', raw: Record<string, unknown>) => {
+    const event = eventlog.appendEvent({
+      sessionId, turn: 1, role: 'system', type: 'turn_semantics_interpreted',
+      data: { purpose: 'turn_semantics', sourceUserSeq: answer.seq, inputHash: 'a', audienceHash: 'b', policyRevision: 'c', validationOutcome, raw },
+    });
+    const db = eventlog.openEventLog();
+    db.prepare(`DELETE FROM turn_semantics_claims WHERE session_id = ? AND source_user_seq = ?`).run(sessionId, answer.seq);
+    db.prepare(`INSERT INTO turn_semantics_claims (session_id, source_user_seq, owner, created_at, event_id, input_hash, audience_hash, policy_revision)
+                VALUES (?, ?, 'test', ?, ?, 'a', 'b', 'c')`).run(sessionId, answer.seq, new Date().toISOString(), event.id);
+  };
+  seedInterpretation('invalid', {
+    version: 1, relation: 'answer_open_slot', goal: null, work: null,
+    slotAnswers: [{ kind: 'option', questionId: `question:${origin.seq}`, slotKey: 'reply', optionId: 'opt-1' }],
+  });
+  const reoffer = runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: answer.seq });
+  assert.ok(reoffer, 'the host could not read the answer, so the same question is re-asked');
+  assert.equal(reoffer?.question, 'Which Outlook calendar should I pull?');
+
+  // An ADMITTED reading that simply moved on is not a re-ask (unchanged behaviour).
+  seedInterpretation('admitted', { version: 1, relation: 'new_goal', goal: { openSlots: [] }, work: { kind: 'x' } });
+  assert.equal(
+    runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: answer.seq }),
+    null,
+  );
+});

@@ -1239,8 +1239,14 @@ test('a second schema refusal with a new failing-path set continues; an identica
 
   const afterFirst = observe(initial, first.consequence);
   assert.equal(afterFirst.action, 'continue');
-  const afterIdentical = observe(afterFirst.state, identical.consequence);
-  assert.equal(afterIdentical.action, 'terminalize', 'the same mistake again terminalizes');
+  // The same mistake spends the bounded retry budget (no effect started), then terminalizes.
+  let afterIdentical = observe(afterFirst.state, identical.consequence);
+  assert.equal(afterIdentical.action, 'continue', 'the same mistake spends a retry first');
+  for (let spent = 1; afterIdentical.action === 'continue'; spent += 1) {
+    assert.ok(spent <= NO_PROGRESS_RETRY_BUDGET, 'the same mistake must stay bounded');
+    afterIdentical = observe(afterIdentical.state, identical.consequence);
+  }
+  assert.equal(afterIdentical.action, 'terminalize', 'the same mistake terminalizes once its retries are spent');
 
   const afterProgress = observe(afterFirst.state, progressed.consequence);
   assert.equal(afterProgress.action, 'continue', 'a new failing-path set is bounded structural progress');
@@ -1249,6 +1255,10 @@ test('a second schema refusal with a new failing-path set continues; an identica
     hostNoProgressRecoveryDirective(afterProgress.state),
     new RegExp(`Call ${SCHEMA_REPAIR_CARRIER} exactly once with one corrected JSON object for the same operation`),
   );
-  const afterRepeatedProgress = observe(afterProgress.state, progressed.consequence);
+  let afterRepeatedProgress = observe(afterProgress.state, progressed.consequence);
+  for (let spent = 0; afterRepeatedProgress.action === 'continue'; spent += 1) {
+    assert.ok(spent < NO_PROGRESS_RETRY_BUDGET, 'the repeated progress consequence must stay bounded');
+    afterRepeatedProgress = observe(afterRepeatedProgress.state, progressed.consequence);
+  }
   assert.equal(afterRepeatedProgress.action, 'terminalize');
 });

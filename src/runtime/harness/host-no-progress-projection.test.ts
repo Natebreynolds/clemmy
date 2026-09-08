@@ -2057,12 +2057,24 @@ test('two repair keys mint two consequence keys; the same key re-enters one and 
   });
   const first = observe(initial, firstA);
   assert.equal(first.action, 'continue');
-  const identicalRepeat = observe(first.state, secondA);
-  assert.equal(identicalRepeat.action, 'terminalize', 'an identical repair attempt terminalizes');
+  // The host proved no effect started, so an identical repair spends the
+  // bounded retry budget before it terminalizes. Never an unbounded loop.
+  let identicalRepeat = observe(first.state, secondA);
+  assert.equal(identicalRepeat.action, 'continue', 'an identical repair spends a retry first');
+  if (identicalRepeat.action === 'continue') assert.equal(identicalRepeat.reason, 'retry_available');
+  for (let spent = 1; identicalRepeat.action === 'continue'; spent += 1) {
+    assert.ok(spent <= NO_PROGRESS_RETRY_BUDGET, 'identical repairs must stay bounded');
+    identicalRepeat = observe(identicalRepeat.state, secondA);
+  }
+  assert.equal(identicalRepeat.action, 'terminalize', 'an identical repair terminalizes once the retry budget is spent');
   const progressed = observe(first.state, firstB);
   assert.equal(progressed.action, 'continue', 'a new failing-path set continues');
   if (progressed.action === 'continue') assert.equal(progressed.reason, 'consequence_progress');
-  const repeatedB = observe(progressed.state, firstB);
+  let repeatedB = observe(progressed.state, firstB);
+  for (let spent = 0; repeatedB.action === 'continue'; spent += 1) {
+    assert.ok(spent < NO_PROGRESS_RETRY_BUDGET, 'the repeated new consequence must stay bounded');
+    repeatedB = observe(repeatedB.state, firstB);
+  }
   assert.equal(repeatedB.action, 'terminalize');
 });
 
@@ -2102,7 +2114,12 @@ test('unkeyed schema refusals distinguish canonical operation and arguments with
     const first = reduce(initializeNoProgressGovernor({ taskKey: 'unkeyed-schema-fallback', authority }), a);
     const second = reduce(first.state, corrected);
     assert.equal(second.action, 'continue', 'a missing repairKey cannot turn distinct schema repairs into a cycle');
-    assert.equal(reduce(second.state, corrected).action, 'terminalize', 'an unchanged repair still stops');
+    let unchanged = reduce(second.state, corrected);
+    for (let spent = 0; unchanged.action === 'continue'; spent += 1) {
+      assert.ok(spent < NO_PROGRESS_RETRY_BUDGET, 'an unchanged repair must stay bounded');
+      unchanged = reduce(unchanged.state, corrected);
+    }
+    assert.equal(unchanged.action, 'terminalize', 'an unchanged repair still stops once its retries are spent');
     let cursor = first;
     for (let index = 1; index < ids.length; index += 1) {
       cursor = reduce(cursor.state, project(ids[index]!, 'fixture_lookup', JSON.stringify({ limit: index })));

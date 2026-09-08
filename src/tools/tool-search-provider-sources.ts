@@ -406,7 +406,7 @@ type PlanningConnectionSelection =
       kind: 'resolved';
       connection: Awaited<ReturnType<typeof listUsableConnectedToolkits>>[number];
     }
-  | { kind: 'account_selection_required'; choices: readonly string[] }
+  | { kind: 'account_selection_required'; choices: readonly string[]; reason?: 'review_unavailable' | 'not_entailed' | 'quote_not_in_source' }
   | { kind: 'unavailable' };
 
 /** Select an account only from current provider identity facts. Duplicate
@@ -1065,7 +1065,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       blockers[slug] = Object.freeze({
         code: 'account_selection_required',
         choices: Object.freeze([...selection.choices]),
-        ...('reason' in selection && selection.reason === 'review_unavailable' ? { reason: 'review_unavailable' as const } : {}),
+        ...('reason' in selection && selection.reason ? { reason: selection.reason } : {}),
       });
       continue;
     }
