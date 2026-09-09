@@ -78,7 +78,7 @@ import {
   type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
-import { validateGoal, toGoalEvidence, type GoalValidationResult } from './goal-validate.js';
+import { validateGoal, toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
 import {
   ensureWorkflowRunGoal,
   recordGoalValidation,
@@ -4003,7 +4003,7 @@ function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessi
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
+  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'goal_validation_unmet' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
   note: string;
 }
 
@@ -4026,6 +4026,13 @@ export function workflowAdvisoryRequiresAttention(
       // A dead judge is not proof the deliverable is bad. It is still delivered
       // loudly as a quality advisory, but it does not count as a workflow
       // failure or trigger chronic-failure accounting by itself.
+      return false;
+    case 'goal_validation_unmet':
+      // Every step ran and the deliverable went out; only the judge's opinion
+      // of the evidence disagrees (goalMissIsJudgeOnlyAdvisory). Delivered
+      // work reads as delivered, with the per-criterion note attached — never
+      // as a blocked, resumable run (live 2026-09-09, Slack update posted then
+      // typed blocked).
       return false;
     case 'synthesis_degraded':
       // Every step already completed and verified — only the final prose
@@ -14869,17 +14876,34 @@ async function processOneRunFile(
       const publicForEachFailures = isCompiledProjectRun
         ? forEachFailures.filter((failure) => failure.stepId === publicTerminalStepId)
         : forEachFailures;
+      // A judge-only goal miss on a run whose every step ran is an advisory
+      // that rides the delivered report, not a block (see
+      // goalMissIsJudgeOnlyAdvisory for the live case).
+      const goalMissAdvisoryOnly = goalDecision?.action === 'escalate'
+        && goalMissIsJudgeOnlyAdvisory(goalVerdict, {
+          blockedSteps: blockedSteps.length,
+          forEachFailures: publicForEachFailures.length,
+          targetMissed,
+        });
+      if (goalMissAdvisoryOnly) {
+        const unmet = (goalVerdict?.perCriterion ?? []).filter((criterion) => !criterion.pass);
+        qualityAdvisories.push({
+          stepId: '(run goal)',
+          kind: 'goal_validation_unmet',
+          note: `Pinned goal review: ${unmet.length} of ${goalVerdict?.perCriterion.length ?? unmet.length} criteria not evidenced to the judge — ${unmet.map((criterion) => criterion.detail ?? criterion.criterion).join(' | ').slice(0, 600)}`,
+        });
+      }
       const publicQualityAdvisories = isCompiledProjectRun
         ? qualityAdvisories.filter((advisory) => advisory.stepId === publicTerminalStepId)
         : qualityAdvisories;
       const hasForEachFailures = publicForEachFailures.length > 0;
       const reviewRequiredAdvisory = publicQualityAdvisories.find(workflowAdvisoryRequiresAttention);
-      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed || Boolean(reviewRequiredAdvisory);
+      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || (goalMissed && !goalMissAdvisoryOnly) || Boolean(reviewRequiredAdvisory);
       const attentionReason =
         blockedSteps[0]?.reason ??
         (hasForEachFailures
           ? `${publicForEachFailures.length} forEach item${publicForEachFailures.length === 1 ? '' : 's'} failed`
-          : goalMissed
+          : goalMissed && !goalMissAdvisoryOnly
           ? `pinned goal not met — ${goalDecision?.reason ?? 'criteria unmet'}`
           : targetMissed
           ? `target not confirmed: ${targetVerdict?.gap ?? 'deliverable may not reach the workflow target'}`
@@ -15194,7 +15218,9 @@ async function processOneRunFile(
       // evidence + what to do (the deliverable itself is never hidden).
       const goalSummary = goalDecision?.action === 'satisfied' && runGoal
         ? `\n\n🎯 Pinned goal validated — ${runGoal.successCriteria.length > 0 ? `all ${runGoal.successCriteria.length} criteria met` : 'objective met'}.`
-        : goalMissed
+        : goalMissed && goalMissAdvisoryOnly
+          ? `\n\n🎯 Pinned goal review — the work above was delivered; the judge could not evidence every criterion:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nReview if the gap matters, or adjust the goal.`
+          : goalMissed
           ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
           : '';
       // Wave 2.2 (structured run summary): emit "succeeded because X + artifacts

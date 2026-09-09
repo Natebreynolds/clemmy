@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { validateGoal, extractLocalPathFromCriterion, extractRequiredKeysFromCriterion, toGoalEvidence, scoreGoalVerdicts } = await import('./goal-validate.js');
+const { validateGoal, extractLocalPathFromCriterion, extractRequiredKeysFromCriterion, toGoalEvidence, scoreGoalVerdicts, goalMissIsJudgeOnlyAdvisory } = await import('./goal-validate.js');
 
 function passingJudge(calls: { objective: string; evidence: string }[] = []) {
   return async (objective: string, evidence: string) => {
@@ -339,3 +339,28 @@ test('required-keys criteria are checked in CODE against real step outputs — t
   );
   assert.equal(extractRequiredKeysFromCriterion('the report reads well'), null);
 });
+
+test('goalMissIsJudgeOnlyAdvisory: a judge-only miss on a fully-run workflow is an advisory, a proven miss or a blocked step is not', () => {
+  const clean = { blockedSteps: 0, forEachFailures: 0, targetMissed: false };
+  const judgeOnly = { perCriterion: [
+    { criterion: 'reads done', pass: false, method: 'judge' as const, detail: 'attributionReads count 0' },
+    { criterion: 'posted once', pass: true, method: 'judge' as const },
+  ] };
+  // Live 2026-09-09: Slack posted, judge disagreed with the evidence shape.
+  assert.equal(goalMissIsJudgeOnlyAdvisory(judgeOnly, clean), true);
+  // A deterministic (proven) failed criterion still blocks.
+  assert.equal(goalMissIsJudgeOnlyAdvisory({ perCriterion: [
+    { criterion: 'file exists', pass: false, method: 'deterministic' as const },
+    ...judgeOnly.perCriterion,
+  ] }, clean), false);
+  // Anything else wrong with the run keeps the block.
+  assert.equal(goalMissIsJudgeOnlyAdvisory(judgeOnly, { ...clean, blockedSteps: 1 }), false);
+  assert.equal(goalMissIsJudgeOnlyAdvisory(judgeOnly, { ...clean, forEachFailures: 2 }), false);
+  assert.equal(goalMissIsJudgeOnlyAdvisory(judgeOnly, { ...clean, targetMissed: true }), false);
+  // A dead judge is the separate goal_validation_unavailable advisory, never this one.
+  assert.equal(goalMissIsJudgeOnlyAdvisory({ ...judgeOnly, judgeFailedOpen: true }, clean), false);
+  // Nothing failed / no verdict: not a miss at all.
+  assert.equal(goalMissIsJudgeOnlyAdvisory({ perCriterion: [{ criterion: 'a', pass: true, method: 'judge' as const }] }, clean), false);
+  assert.equal(goalMissIsJudgeOnlyAdvisory(null, clean), false);
+});
+

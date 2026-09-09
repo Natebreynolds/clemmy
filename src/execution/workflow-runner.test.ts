@@ -2560,6 +2560,7 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   // the trust-killer — it must surface for review, never pass as clean success.
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unmet' }), false, 'delivered work with a judge-only goal miss reads as delivered');
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
   // Tier-1 item 3: a judge OUTAGE on a legacy run is reported honestly as
   // "completed unverified" — but an infra blip must NEVER flip a good run to

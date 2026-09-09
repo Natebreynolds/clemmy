@@ -92,6 +92,36 @@ function directiveForFailure(c: GoalCriterionVerdict): GoalFailedDirective {
 /** Compute the numeric scorecard + structured directives from per-criterion
  *  verdicts. Pure; folded into every validateGoal return so callers always have
  *  a percentage and an actionable fix-list. */
+/**
+ * A JUDGE-ONLY miss is an advisory, not a block.
+ *
+ * Live 2026-09-09: team-activity-slack-updates posted to Slack (receipt,
+ * message ts, external_write_succeeded), then the pinned-goal judge failed one
+ * criterion on evidence shape ("attributionReads count 0") and the run was
+ * typed blocked + needs-attention + "resumable". Nothing was blocked; the
+ * deliverable went out. 4 of 12 September runs were this class, 0 were
+ * delivery failures.
+ *
+ * The rule: when every step ran (no blocked steps, no fan-out failures, no
+ * missed deliverable target) and every failed criterion is the judge's
+ * OPINION (method 'judge'), the miss rides the report as a quality advisory
+ * and the run reads succeeded. A deterministic failed criterion (a proven
+ * miss: missing file, missing key) still blocks — objective truth cannot
+ * read as success. A dead judge ('skipped') is already the separate
+ * goal_validation_unavailable advisory.
+ */
+export function goalMissIsJudgeOnlyAdvisory(
+  verdict: Pick<GoalValidationResult, 'perCriterion' | 'judgeFailedOpen'> | null | undefined,
+  run: { blockedSteps: number; forEachFailures: number; targetMissed: boolean },
+): boolean {
+  if (!verdict) return false;
+  if (run.blockedSteps > 0 || run.forEachFailures > 0 || run.targetMissed) return false;
+  if (verdict.judgeFailedOpen === true) return false;
+  const failed = verdict.perCriterion.filter((criterion) => !criterion.pass);
+  if (failed.length === 0) return false;
+  return failed.every((criterion) => criterion.method === 'judge');
+}
+
 export function scoreGoalVerdicts(perCriterion: GoalCriterionVerdict[]): {
   successRatePercent: number;
   criteriaMet: number;
