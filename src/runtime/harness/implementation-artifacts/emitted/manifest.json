@@ -1527,7 +1527,7 @@
           "bytes": 10621
         },
         "src/memory/auto-capture.ts": {
-          "bytes": 52117
+          "bytes": 52463
         },
         "src/runtime/harness/durable-memory-receipt.ts": {
           "bytes": 14991
@@ -4131,7 +4131,7 @@
           "bytes": 10621
         },
         "src/memory/auto-capture.ts": {
-          "bytes": 52117
+          "bytes": 52463
         },
         "src/runtime/harness/durable-memory-receipt.ts": {
           "bytes": 14991
