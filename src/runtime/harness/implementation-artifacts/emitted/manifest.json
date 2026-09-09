@@ -885,7 +885,7 @@
           "bytes": 3845
         },
         "src/execution/workflow-objective-judge.ts": {
-          "bytes": 12380
+          "bytes": 12980
         },
         "src/execution/workflow-contract-proposals.ts": {
           "bytes": 32491
@@ -1647,7 +1647,7 @@
           "bytes": 3019
         },
         "src/runtime/harness/context-packet.ts": {
-          "bytes": 43807
+          "bytes": 43514
         },
         "src/runtime/harness/recovery-presentation-truth.ts": {
           "bytes": 3424
@@ -3483,7 +3483,7 @@
           "bytes": 3845
         },
         "src/execution/workflow-objective-judge.ts": {
-          "bytes": 12380
+          "bytes": 12980
         },
         "src/execution/workflow-contract-proposals.ts": {
           "bytes": 32491
@@ -4245,7 +4245,7 @@
           "bytes": 3019
         },
         "src/runtime/harness/context-packet.ts": {
-          "bytes": 43807
+          "bytes": 43514
         },
         "src/runtime/harness/recovery-presentation-truth.ts": {
           "bytes": 3424
