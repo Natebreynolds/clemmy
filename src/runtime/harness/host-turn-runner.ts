@@ -17,6 +17,7 @@ import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
+import { normalizeCallableArguments } from './callable-contract.js';
 /**
  * HOST-owned chat turn stepping — the Runner de-ownership cut.
  *
@@ -1026,10 +1027,7 @@ export function hostProvenOperationRepair(input: {
   const sameToolkit = requestedToolkit
     ? proven.filter((operationId) => toolkitOf(operationId) === requestedToolkit)
     : [];
-  const otherToolkits = proven.filter((operationId) => (
-    !requestedToolkit || toolkitOf(operationId) !== requestedToolkit
-  ));
-  const ranked = [...sameToolkit, ...otherToolkits].slice(0, Math.max(1, input.limit ?? 12));
+  const ranked = (requestedToolkit ? sameToolkit : proven).slice(0, Math.max(1, input.limit ?? 12));
   // THE OPERATION THE CALL NAMED IS THE SUBJECT. Live 2026-09-05: the model
   // asked for a write this turn had not proven, one unrelated READ from the
   // same toolkit happened to be in the proven set, and the reply was a menu
@@ -1059,12 +1057,9 @@ export function hostProvenOperationRepair(input: {
   const requestedIsProven = requested.length > 0
     && proven.some((operationId) => operationId.trim().toUpperCase() === requested);
   if (requested.length > 0 && !requestedIsProven) {
-    const context = ranked.length === 0
-      ? ' Nothing is proven for this step yet.'
-      : sameToolkit.length > 0
-        ? ` Proven for this step so far: ${ranked.join(', ')}.`
-        : ` Nothing from ${requestedToolkit} is proven for this step; do not substitute another provider for it.`
-          + ` What IS proven here: ${ranked.join(', ')}.`;
+    const context = ranked.length > 0
+      ? ` Proven for this step so far: ${ranked.join(', ')}.`
+      : ` Nothing from ${requestedToolkit} is proven for this step; do not substitute another provider for it.`;
     return ` ${requested} is not proven for this step.${context}`
       + ' Discover that exact operation with tool_search. Use its published executable capabilityRef and work_call example when present.'
       + ' If discovery reports unsupported_unmaterialized, report that host materialization blocker; do not invent a requirement_id.'
@@ -4862,6 +4857,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
         }
         return undefined;
+      }
+      // Live source 166111: a valid work_call carried an unterminated
+      // args_json string. Contract parsing failed before capability lookup,
+      // but the generic refusal sent the model back to discovery and offered
+      // an unrelated provider. Report the parser's actual repair; the next
+      // call still needs all existing authority and schema checks.
+      if (lastExactProductionMiss === 'logical_call_contract_missing') {
+        const effective = unwrapRuntimeEffectiveToolIdentity(name, args);
+        const normalized = normalizeCallableArguments({
+          kind: 'direct', toolName: effective.toolName ?? '', args: effective.args,
+        });
+        if (effective.toolName && normalized.error) {
+          return `Tool '${name}' was refused before dispatch because the arguments for '${effective.toolName}' could not be parsed.`
+            + ` Failed check: logical_call_contract_missing. ${redactSensitiveText(normalized.errorDetail ?? normalized.error)}.`
+            + ' No local or external mutation was attempted. Correct the arguments and retry the same operation through the same carrier.';
+        }
       }
       // Name the operations this turn actually bound.
       //

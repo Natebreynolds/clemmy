@@ -144,6 +144,11 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   assert.match(spellingSlip, /Operations found during discovery: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
   assert.match(spellingSlip, /does not establish executable readiness/);
   assert.match(spellingSlip, /do not guess a requirement_id or repeat unchanged discovery/);
+  for (const unrelated of foreign) {
+    for (const repair of [withStaleRead, wrongProvider, spellingSlip]) {
+      assert.ok(!repair.includes(unrelated), 'repair guidance must not offer unrelated providers');
+    }
+  }
 
   assert.match(
     hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),

@@ -4,7 +4,7 @@
 
 The other agent stopped at `8d5ca856bc279b881dc522560b8938c61e5edee3`. This pass owns the refinements below. No release version was changed and no tag or push was performed.
 
-The authoritative refinement candidate is now `/Users/nathan.reynolds/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`, runtime-code commit `9ae684ef19e1954a228f531a8fe64021f9c4c116`, followed by test-only commit `c1a7dd1e`. Branch `codex/beta-freeze-20260908` also retains that commit. The original `/Users/nathan.reynolds/clementine-next` checkout is unrelated dirty work and was left untouched.
+The authoritative refinement candidate is `/Users/nathan.reynolds/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`. The baseline refinement/full-suite commits were `9ae684ef19e1954a228f531a8fe64021f9c4c116` and `c1a7dd1e`; later memory, native-call and file-revision commits and their exact live evidence are recorded below. The original `/Users/nathan.reynolds/clementine-next` checkout is unrelated dirty work and was left untouched.
 
 The earlier live runs used `/Users/nathan.reynolds/clementine-next-live-iteration-31`. During the second full suite, an external process switched that checkout from the candidate branch to `ui/spaces-live` at 18:40:36 Pacific and reset that branch to `origin/main` (`8d5ca856`) at 18:40:58. The source therefore changed under running tests. That run is invalid qualification; its module-export and implementation-generation errors must not be presented as isolated regressions in the frozen refinement candidate. No source was reset or overwritten to fight the other process. Reports were copied to the private candidate, and the full suite restarted there. `output/post-3161-live/checkout-collision-reflog.txt` preserves the observed reflog. Merge the preserved harness candidate with completed UI work before building a combined tag; do not assume the UI checkout still contains these refinements.
 
@@ -108,9 +108,9 @@ The owner's website example is a separate qualification requirement: clarify the
 The predeclared six-stage specification is retained in `output/post-3161-live/website-journey-spec.md`. Reports use `website-*-report.json`, with a separate artifact/semantic review; an appropriate clarifying question is an intermediate outcome, not proof the whole website is finished. Results must be read from the completed reports, not inferred from this test plan. The five earlier simple live turns do not qualify this long journey.
 
 
-## Website findings and the next refinements (September 8 Pacific)
+## Initial website failures (September 8 Pacific)
 
-The six-stage journey is now exercised, with failures preserved. It is **not an end-to-end pass**: the requested audience/CTA edit did not land. All six initial reports used `71e7bb8b` except the memory replay and cold recall, which used `b07bfd4a` (source fingerprint `ac73f3b5dd46bdc641076082848af338c3d25c72064bbd6760db9436293403c7`). All routed to Opus 5. Reports and independent review are in `output/post-3161-live/website-*-report.json` and `website-semantic-review.json`.
+The initial journey failed at the requested audience/CTA edit. Those failures are preserved; the later successful revision does not turn this into a clean single-candidate journey. Initial reports used `71e7bb8b` except the memory replay and cold recall, which used `b07bfd4a` (source fingerprint `ac73f3b5dd46bdc641076082848af338c3d25c72064bbd6760db9436293403c7`). All routed to Opus 5. Reports and independent review are in `output/post-3161-live/website-*-report.json` and `website-semantic-review.json`.
 
 - Opening, source 165633: useful bundled brief question; no tools or writes; 19.1 s.
 - Directions, 165654: read the installed design skill and offered two useful directions; 4 calls, 53.3 s. The Higgsfield availability claim exceeded the paginated discovery evidence; this does not prove no connection exists.
@@ -127,7 +127,7 @@ The next source refinement prepares a known exact native call inside the host be
 Next: retain durable prior file bytes and actual file evidence before relaxing ordinary overwrite classification; qualify the same feedback request against actual before/after files. Also keep tracking paginated availability overclaims, repeated list_files schema mistakes, stale one-off tasks injected as standing preferences, and focus lifecycle claims. None is closed by a generic “done” terminal.
 
 
-## Recoverable native file revisions — implemented, live replay next
+## Recoverable native file revisions
 
 The discovery refinement is committed at `caea10f0`. The subsequent file refinement makes append/overwrite recoverable through prior-byte snapshots under the protected `state/local-file-revisions` store. It flushes the preimage and prepared journal before changing the target, writes the replacement atomically, and publishes a stable per-target descriptor. Create stays exclusive. A failed backup leaves the existing file unchanged; a failure after an effect is not falsely reported as no write. File permissions and append boundary behavior are retained. Existing typed-state, sensitive-file and installed-skill protections are checked against canonical paths as well.
 
@@ -136,3 +136,31 @@ The registry now declares `file_revision`, and append/overwrite are reversible. 
 The 24,000-byte write_file cap is removed. Actual registered-tool tests write and read back complete large HTML and multibyte text, perform a revision, retain exact prior bytes, and restore the original through the same tool. Tests also cover failed snapshot storage, symlink substitution, unchanged unrelated files, permissions, create exclusivity, and refusal to edit protected receipts. The `.env` control verifies the existing sensitive-path approval remains; an initial fixture used `.ssh/config`, which is not in the existing sensitive-path classifier and was corrected without widening that classifier.
 
 Final focused batch: **393 passed, zero failed, one skipped** (`file-revision-final-checks-2.log`), including host turn execution, receipt evidence, completion contract, consent, registry, native authoring, and MCP carrier tests. Earlier logs preserve failures: one metadata expectation, one optional-boolean fixture, and canonical path aliases initially bypassing typed-state checks; all corrected before live cutover. The prior full 15,459-test suite predates these changes and is not current full-suite qualification. Native call preparation had its separate 18-test pass. Live revision case is predeclared in `website-07-revision.json`; original files and failed approvals remain intact until the new authorized edit.
+
+## Website revision, checkpoint and cold recall after the fixes
+
+File runtime commit `6a475752`, attested at `234b21d256f7a733deb2e4cc09cf34261ad315e2`, served fingerprint `9991294e7485a46be5fd67949d0a75eddfc6aee91acd75b4ba5f466ea270a57c`. Backend/typecheck and mobile asset builds passed. These three later turns used that exact candidate with Opus 5; no owner model settings or review policy were changed.
+
+| Turn | Source | Brain requests | Calls | Successful file writes | Plan | Wall |
+|---|---:|---:|---:|---:|---:|---:|
+| Finish private-workshop retarget | 166111 | 8 | 10 | 1 | 0 | 225.4 s |
+| Save latest project checkpoint | 166237 | 4 | 3 | 0 | 0 | 61.8 s |
+| Fresh-session recall after restart | 166302 | 4 | 5 | 0 | 0 | 42.0 s |
+
+The retarget landed in `index.html`; `styles.css` is byte-for-byte unchanged. The protected revision's preimage matches the original HTML, and its current target matches the saved HTML. Optional completion review reports nonempty file coverage with `judgedMatch:true`, `currentMatch:true`, and a verified terminal. Independent rendered inspection at 1280 px desktop and 390 px phone shows the updated private-workshop copy with no horizontal overflow. Proof: `website-07-artifact-proof.json`, the original/after files, and `website-07-revision-report.json`. The new HTML digest is `b90d78a8f56a1b84614fb9ac6005e2fc0777109e5530ee73096970e44b4ed060`; unchanged CSS is `359d77978f51a8ffab5237a880e2bcc0206a154c3dc1dde901ec0279363acf2b`.
+
+This is an artifact success, **not a clean-attempt or speed pass**. The first write had malformed nested JSON. The journal records its pre-dispatch refusal even though no logical settlement row exists for that unparseable contract. Counting only settlement rows would hide it. The model repaired it, searched again, and completed one write without an approval request. The earlier approval `apr-9gl8` remains untouched as evidence.
+
+The checkpoint saved the correct completed revision and remaining owner review/publication decision. Its first focus_update passed `expected_version:null`, got a v0 conflict, and repaired to 0. Focus #145 still has `status:active`, workstate `mode:monitor`, and PAUSED in prose; this is not proof of a parked lifecycle. The fresh recall read the actual HTML and CSS, correctly reported the retarget finished, and explicitly distinguished stale pre-pivot memory from current files. It repaired one list_files argument error. Both reports passed their predeclared mechanical assertions, with these additional semantic limitations retained in `website-semantic-review.json`.
+
+## Malformed arguments should repair the call, not send Clem searching
+
+Source 166111's rejected call was recovered from the retained encrypted model-request history, not inferred from a clipped event preview. The outer carrier JSON was valid; its `args_json` had an unterminated string at position 14373. The existing callable parser already identifies this. The host instead returned `logical_call_contract_missing` with a generic missing-capability explanation, suggested discovery, and listed a Google Drive operation unrelated to the requested local file.
+
+The host now uses that existing parser error when contract construction fails and directs correction of the same operation through the same carrier. The call still cannot dispatch with malformed arguments; no automatic JSON repair, schema widening, new permission, or extra model call was added. The unrelated-provider repair menu was also removed when an exact requested toolkit is known. Account-selection and host-review-unavailable guidance remain intact.
+
+The real host/native-file integration test reproduces the malformed nested carrier, then a corrected call: zero effect from the malformed input, exactly one physical write after correction, no search or approval, and current file evidence. The provider-guidance test rejects unrelated alternatives. Both tests failed before the source fix (`argument-repair-before.log`) and passed afterward. Final related host, contract, recovery and receipt batch: **310 passed, zero failed** (`argument-repair-final-checks.log`); typechecking and diff checks passed. The earlier 393-case file batch and full-suite result remain scoped to their own commits.
+
+The final healthy-path live edit is predeclared in `argument-repair-live.json` and `argument-repair-live-spec.md`. Its result must be read from `argument-repair-live-report.json` and independent artifact proof; this paragraph does not claim a pending run passed. That natural call does not isolate malformed-input recovery; the integration test supplies the controlled proof.
+
+Remaining practical issues include the repeated list_files schema mismatch, focus pause lifecycle, paginated provider-availability overclaims, old one-off tasks in standing memory, cache/review duplication, and the previously recorded cancellation/async ownership cases. No paid generation, public deployment, Grok run, combined UI qualification, or new full-suite qualification is claimed by this local journey.

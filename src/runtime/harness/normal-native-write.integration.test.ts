@@ -286,12 +286,13 @@ test('separate accepted Normal workflow create and edit use their own exact nati
 });
 
 
-test('an exact file overwrite commits once without rediscovery or a redundant approval', async () => {
+for (const malformedFirst of [false, true]) {
+test(`an exact file overwrite commits once without rediscovery or a redundant approval (malformed first: ${malformedFirst})`, async () => {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
-  const session = eventlog.createSession({ id: 'known-native-overwrite', kind: 'chat', userId: 'native-fixture-owner' });
-  const file = path.join(TEST_HOME, 'known-draft.html');
+  const session = eventlog.createSession({ id: `known-native-overwrite-${malformedFirst}`, kind: 'chat', userId: 'native-fixture-owner' });
+  const file = path.join(TEST_HOME, `known-draft-${malformedFirst}.html`);
   writeFileSync(file, 'Original draft\n');
   const prompt = `Update ${file} to Revised draft.`;
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
@@ -307,11 +308,20 @@ test('an exact file overwrite commits once without rediscovery or a redundant ap
   const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
     reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
     settlementLane: 'byo', hostPlanningReady: () => true }) as never);
-  const model = stubModel([[toolCall('known-file-edit', 'work_call', {
+  const carriedArgs = {
     requirement_id: capabilityRef, source_call_ids: null, source_record_ids: null,
     universe_item_id: null, universe_selector: null, seal_amendment: null,
     name: 'write_file', args_json: JSON.stringify(args),
-  })], [textMessage('The requested file revision is saved.')]]);
+  };
+  const responses = [[toolCall('known-file-edit', 'work_call', carriedArgs)],
+    [textMessage('The requested file revision is saved.')]];
+  if (malformedFirst) {
+    // Real live failure: the outer carrier is valid, but its nested JSON ends
+    // inside a string. Nothing may dispatch until the model repairs the bytes.
+    const malformedArgs = JSON.stringify({ path: file, mode: 'overwrite', content: 'Revised draft' }).slice(0, -2);
+    responses.unshift([toolCall('malformed-file-edit', 'work_call', { ...carriedArgs, args_json: malformedArgs })]);
+  }
+  const model = stubModel(responses);
   const agent = { model, tools: [workCall] };
   localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set(['write_file']) });
   const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
@@ -325,8 +335,13 @@ test('an exact file overwrite commits once without rediscovery or a redundant ap
     behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
     [{ type: 'message', role: 'user', content: prompt }] as never,
     { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
-  assert.equal(model.calls(), 2, JSON.stringify(result.history));
+  assert.equal(model.calls(), malformedFirst ? 3 : 2, JSON.stringify(result.history));
   assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
+  if (malformedFirst) {
+    assert.match(JSON.stringify(result.history), /argument payload is not valid JSON/);
+    assert.match(JSON.stringify(result.history), /Correct the arguments and retry the same operation/);
+    assert.doesNotMatch(JSON.stringify(result.history), /binding is absent or changed|not proven for this step|What IS proven/);
+  }
   assert.ok(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef,
     operationId: 'write_file', effect: 'local_write', args }));
   assert.equal(Boolean(result.hasInterruptions), false);
@@ -342,3 +357,4 @@ test('an exact file overwrite commits once without rediscovery or a redundant ap
   assert.equal(evidence.artifacts[0]?.evidenceContract, 'file');
   assert.equal(evidence.artifacts[0]?.digestMatches, true);
 });
+}
