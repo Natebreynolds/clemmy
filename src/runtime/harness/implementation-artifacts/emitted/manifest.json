@@ -162,7 +162,7 @@
           "bytes": 11181
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 21983
+          "bytes": 22960
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 65876
@@ -1293,7 +1293,7 @@
           "bytes": 6038
         },
         "src/tools/work-call.ts": {
-          "bytes": 103870
+          "bytes": 104392
         },
         "src/runtime/harness/host-interactive-consent.ts": {
           "bytes": 59366
@@ -1599,7 +1599,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 441154
+          "bytes": 443647
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -1614,7 +1614,7 @@
           "bytes": 3954
         },
         "src/tools/publish-plan.ts": {
-          "bytes": 18273
+          "bytes": 19680
         },
         "src/runtime/harness/session-role-overrides.ts": {
           "bytes": 1342
@@ -1713,7 +1713,7 @@
           "bytes": 10702
         },
         "src/runtime/harness/claude-agent-worker.ts": {
-          "bytes": 10596
+          "bytes": 10759
         },
         "src/runtime/harness/async-read-refinement-terminal-projection.ts": {
           "bytes": 3227
@@ -1902,7 +1902,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 130821
+          "bytes": 131143
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -2055,7 +2055,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 726797
+          "bytes": 727224
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 141284
@@ -2310,7 +2310,7 @@
           "bytes": 5893
         },
         "src/runtime/harness/claude-agent-sdk.ts": {
-          "bytes": 188001
+          "bytes": 188605
         },
         "src/runtime/harness/claude-agent-workflow-step.ts": {
           "bytes": 29001
@@ -2400,7 +2400,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 689779
+          "bytes": 693794
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2502,7 +2502,7 @@
           "bytes": 5311
         },
         "src/runtime/harness/expected-work-admission.ts": {
-          "bytes": 135786
+          "bytes": 137089
         },
         "src/runtime/harness/attempt-settlement.ts": {
           "bytes": 62346
@@ -2787,7 +2787,7 @@
           "bytes": 11181
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 21983
+          "bytes": 22960
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 65876
@@ -3918,7 +3918,7 @@
           "bytes": 6038
         },
         "src/tools/work-call.ts": {
-          "bytes": 103870
+          "bytes": 104392
         },
         "src/runtime/harness/host-interactive-consent.ts": {
           "bytes": 59366
@@ -4224,7 +4224,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 441154
+          "bytes": 443647
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -4239,7 +4239,7 @@
           "bytes": 3954
         },
         "src/tools/publish-plan.ts": {
-          "bytes": 18273
+          "bytes": 19680
         },
         "src/runtime/harness/session-role-overrides.ts": {
           "bytes": 1342
@@ -4338,7 +4338,7 @@
           "bytes": 10702
         },
         "src/runtime/harness/claude-agent-worker.ts": {
-          "bytes": 10596
+          "bytes": 10759
         },
         "src/runtime/harness/async-read-refinement-terminal-projection.ts": {
           "bytes": 3227
@@ -4527,7 +4527,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 130821
+          "bytes": 131143
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -4680,7 +4680,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 726797
+          "bytes": 727224
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 141284
@@ -4935,7 +4935,7 @@
           "bytes": 5893
         },
         "src/runtime/harness/claude-agent-sdk.ts": {
-          "bytes": 188001
+          "bytes": 188605
         },
         "src/runtime/harness/claude-agent-workflow-step.ts": {
           "bytes": 29001
@@ -5025,7 +5025,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 689779
+          "bytes": 693794
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -5127,7 +5127,7 @@
           "bytes": 5311
         },
         "src/runtime/harness/expected-work-admission.ts": {
-          "bytes": 135786
+          "bytes": 137089
         },
         "src/runtime/harness/attempt-settlement.ts": {
           "bytes": 62346
