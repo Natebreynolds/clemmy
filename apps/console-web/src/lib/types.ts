@@ -15,6 +15,8 @@ export interface HarnessEvent {
   /** Present on frames bridged from a helper's worker session — the helper
    *  (`item`) whose agent row these steps nest under. */
   worker?: { sessionId: string; item: string };
+  /** Present on frames from a workflow run's activity stream — the step id. */
+  step?: string;
 }
 
 export interface ChatPostResult {

@@ -372,3 +372,44 @@ export const triggerCron = (jobName: string) =>
 export const listSkills = () => apiGet<{ skills: SkillRow[]; count: number }>('/api/console/skills');
 export const installSkill = (url: string) => apiPost('/api/console/skills/install', { url });
 export const checkSkillUpdates = () => apiPost('/api/console/skills/check-updates');
+
+/** The live half of the Automate list: which runs are in flight (and on which
+ *  step) and what fires next. `/api/console/workflows` carries neither. */
+export interface WorkflowActiveRun {
+  workflowName: string;
+  workflowSlug: string | null;
+  runId: string;
+  status: string;
+  lastEventAt: string | null;
+  inFlightStepId: string | null;
+}
+export interface WorkflowUpcoming {
+  workflowName: string;
+  at: string;
+  day?: string;
+  time?: string;
+  schedule?: string;
+}
+export interface WorkflowsHome {
+  activeRuns: WorkflowActiveRun[];
+  upcoming: WorkflowUpcoming[];
+  counts?: Record<string, number>;
+}
+export const getWorkflowsHome = () => apiGet<WorkflowsHome>('/api/console/workflows/home');
+
+/** "in 2h" / "tomorrow 07:30" for the next occurrence; '' when none. */
+export function nextRunLabel(upcoming: readonly WorkflowUpcoming[], workflowName: string, now: number = Date.now()): string {
+  const next = upcoming
+    .filter((u) => u.workflowName === workflowName)
+    .map((u) => Date.parse(u.at))
+    .filter((t) => Number.isFinite(t) && t > now)
+    .sort((a, b) => a - b)[0];
+  if (next === undefined) return '';
+  const mins = Math.round((next - now) / 60_000);
+  if (mins < 1) return 'next run any moment';
+  if (mins < 60) return `next run in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `next run in ${hours}h`;
+  const d = new Date(next);
+  return `next run ${d.toLocaleDateString(undefined, { weekday: 'short' })} ${d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+}

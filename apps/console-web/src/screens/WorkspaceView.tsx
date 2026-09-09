@@ -27,6 +27,7 @@ import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalE
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
+import { getWorkflowsHome } from '@/lib/automate';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -143,6 +144,10 @@ function WorkspaceViewForId({ id }: { id: string }) {
   // state are pure derivations over it (lib/space-build); the preview below
   // re-renders as revisions land (viewMtimeMs poll + the live action stream).
   const buildState = spaceBuildState(chat.messages);
+  // A linked workflow that is running right now says so on its chip — the
+  // Space is where its output lands, so its progress belongs here too.
+  const workflowsHome = usePoll(['workflows-home'], getWorkflowsHome, 6000, { enabled: (detail.data?.linkedWorkflows ?? []).length > 0 });
+  const runningWorkflows = new Map((workflowsHome.data?.activeRuns ?? []).map((run) => [run.workflowName, run]));
   const threadEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => { threadEndRef.current?.scrollIntoView({ block: 'end' }); }, [chat.messages]);
   // A placeholder Space whose build never started (the page was reloaded before
@@ -344,8 +349,11 @@ function WorkspaceViewForId({ id }: { id: string }) {
             onClick={() => navigate(`/automate?workflow=${encodeURIComponent(wf.name)}`)}
             className={`hidden items-center gap-1 rounded-full border border-border px-2 py-0.5 text-caption md:inline-flex ${wf.enabled ? 'text-muted hover:text-primary hover:border-primary/40' : 'text-faint line-through'}`}
           >
-            <Zap className="h-3 w-3" aria-hidden />
+            {runningWorkflows.has(wf.name)
+              ? <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-hidden />
+              : <Zap className="h-3 w-3" aria-hidden />}
             <span className="max-w-[160px] truncate">{wf.name}</span>
+            {runningWorkflows.get(wf.name)?.inFlightStepId && <span className="text-primary">· {runningWorkflows.get(wf.name)?.inFlightStepId}</span>}
           </button>
         ))}
         <div className="ml-auto flex items-center gap-1.5">

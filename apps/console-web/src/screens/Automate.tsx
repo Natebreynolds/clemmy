@@ -13,6 +13,12 @@ import { usePoll } from '@/lib/poll';
 import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
+import { ActivityCard } from '@/components/chat/ActivityCard';
+import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
+import { useWorkflowRunActivity } from '@/lib/session-activity';
+import { useWorkflowRunEvents } from '@/lib/workflow-run-events';
+import { buildWorkflowRunDetail } from '@/lib/workflow-run-detail';
+import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { cn } from '@/lib/cn';
 import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
@@ -20,6 +26,8 @@ import {
   listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
+  getWorkflowsHome,
+  nextRunLabel,
 } from '@/lib/automate';
 import { getAgentSystemMetrics } from '@/lib/advanced';
 
@@ -60,6 +68,13 @@ export function Automate() {
   const [filter, setFilter] = useState<WorkflowFilter>('all');
 
   const workflows = usePoll(['workflows'], listWorkflows, 10000);
+  // The live half: in-flight runs (with their step) and what fires next.
+  // Polls faster while something is running; every workflow write refreshes
+  // the list instantly through the change stream.
+  const home = usePoll(['workflows-home'], getWorkflowsHome, 4000, { enabled: tab === 'workflows' });
+  useWorkflowChanges();
+  const activeRuns = home.data?.activeRuns ?? [];
+  const upcoming = home.data?.upcoming ?? [];
   const skills = usePoll(['skills'], listSkills, 15000, { enabled: tab === 'skills' });
   const systemQ = usePoll(['agent-system-metrics'], getAgentSystemMetrics, 15000, { enabled: tab !== 'skills' });
 
@@ -151,7 +166,7 @@ export function Automate() {
     <Page
       title="Automate"
       subtitle="Workflows and skills"
-      actions={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
+      actions={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
         {tabs.map((t) => {
@@ -191,7 +206,7 @@ export function Automate() {
         workflows.isLoading
           ? <CardGridSkeleton />
           : wf.length === 0
-            ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
+            ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
             : (
               <>
                 <div className="mb-4 flex flex-wrap gap-1.5">
@@ -216,6 +231,8 @@ export function Automate() {
                       const status = workflowCardStatus(w);
                       const schedule = w.trigger?.schedule || w.triggerSchedule;
                       const lastRunAgo = relativeRunTime(w.lastRunAt);
+                      const active = activeRuns.find((run) => run.workflowName === w.name || run.workflowSlug === w.name);
+                      const nextRun = schedule ? nextRunLabel(upcoming, w.name) : '';
                       return (
                         <Card key={w.name} className="flex flex-col p-5">
                           <div className="mb-2 flex items-start justify-between gap-3">
@@ -226,7 +243,20 @@ export function Automate() {
                           </div>
                           <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
                           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-                            {status && (
+                            {active && (
+                              <button
+                                type="button"
+                                title={active.inFlightStepId ? `Running step ${active.inFlightStepId} — open to watch` : 'Running — open to watch'}
+                                onClick={() => setOpenRun({ workflow: w.name, runId: active.runId })}
+                                className="cursor-pointer"
+                              >
+                                <StatusPill tone="live">
+                                  <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current align-middle" aria-hidden />
+                                  {active.status === 'parked' || active.status.startsWith('blocked') ? 'Waiting' : 'Running'}{active.inFlightStepId ? ` · ${active.inFlightStepId}` : ''}
+                                </StatusPill>
+                              </button>
+                            )}
+                            {status && !(active && status.aboutLastRun) && (
                               // A pill about the last run opens that run; anything else opens the workflow.
                               <button
                                 type="button"
@@ -239,7 +269,7 @@ export function Automate() {
                             )}
                             <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
                               {typeof w.stepCount === 'number' && <span>{w.stepCount} step{w.stepCount === 1 ? '' : 's'}</span>}
-                              {schedule && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(schedule, w.trigger?.timezone)}</span>}
+                              {schedule && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(schedule, w.trigger?.timezone)}{nextRun ? ` · ${nextRun}` : ''}</span>}
                               {w.lastRunId && lastRunAgo && (
                                 <button type="button" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })} className="cursor-pointer underline-offset-2 hover:text-fg hover:underline">
                                   last run {lastRunAgo}
@@ -355,6 +385,18 @@ function RunWorkspaceDrawer({
   const workspace: RunWorkspace | undefined = workspaceQ.data;
   const selectedRun = runs.find((run) => run.id === selectedRunId);
   const selectedTone = statusTone(selectedRun?.status);
+  // Live: the run's own activity stream (every step session + helper, one
+  // feed) on the same card the chat uses; structure: the durable step log.
+  const runLive = ['queued', 'running', 'finalizing', 'parked', 'blocked_capability', 'blocked_mutation'].includes(String(selectedRun?.status ?? ''));
+  const runActivity = useWorkflowRunActivity(selectedRunId ?? null);
+  const runEvents = useWorkflowRunEvents(workflow, selectedRunId ?? null, runLive);
+  const runDetail = buildWorkflowRunDetail(runEvents);
+  const stepNow = runDetail.steps.find((step) => step.status === 'running')?.stepId
+    ?? [...runActivity.items].reverse().find((row) => row.step)?.step;
+  const doneSteps = runDetail.steps.filter((step) => step.status === 'done' || step.status === 'skipped').length;
+  const runTitle = runLive
+    ? `Running${stepNow ? ` · ${stepNow}` : ''}${runDetail.steps.length ? ` · ${doneSteps} of ${runDetail.steps.length} steps` : ''}`
+    : undefined;
 
   const runChecker = async () => {
     if (!selectedRunId) return;
@@ -484,6 +526,23 @@ function RunWorkspaceDrawer({
                     </section>
                   )}
 
+                  {(runLive || runActivity.items.length > 0) && (
+                    <ActivityCard
+                      items={runActivity.items}
+                      live={runLive}
+                      progress={runLive ? runActivity.progress : undefined}
+                      title={runTitle}
+                      terminalOutcome={runDetail.runStatus === 'failed' ? 'failed' : runDetail.runStatus === 'cancelled' ? 'interrupted' : 'completed'}
+                      defaultOpen
+                      footer={runLive ? 'Steps and helpers appear here as they happen.' : undefined}
+                    />
+                  )}
+                  {runEvents.length > 0 && (
+                    <section>
+                      <h3 className="mb-2 text-h3 text-fg">Steps</h3>
+                      <WorkflowRunDetail events={runEvents} />
+                    </section>
+                  )}
                   {workspace?.goal && (
                     <section className="rounded-md border border-border bg-surface px-4 py-3">
                       <div className="mb-1 flex items-center gap-1.5 text-label text-muted">

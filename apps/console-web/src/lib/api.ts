@@ -96,7 +96,7 @@ function shouldNavigateForBootstrap(targetHref: string, currentHref: string): bo
   }
 }
 
-function withToken(path: string): string {
+export function withToken(path: string): string {
   const token = getAuthToken();
   if (!token) return path;
   return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);

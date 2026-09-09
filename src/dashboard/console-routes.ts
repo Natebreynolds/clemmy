@@ -14429,6 +14429,110 @@ export function registerConsoleRoutes(
    * action bus — the real-time operator view of tool calls, workflow node
    * transitions, model routing, memory consolidation, and safety guards.
    */
+  // ONE live stream per workflow run — every step session (`workflow:<runId>:<step>`)
+  // and every helper a step spawned, folded into the same public frames the
+  // chat's activity card renders. Automate used to poll artifacts every 4s and
+  // never saw a step or a tool call; runs started by cron or the Run button had
+  // no origin chat, so their frames landed on the bus with no subscriber at all
+  // (owner 2026-09-08: "similar pass with the workflow section visibility").
+  app.get('/api/console/workflows/runs/:runId/activity', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runId = req.params.runId;
+    if (!runId || runId.includes(':')) { res.status(400).json({ error: 'invalid run id' }); return; }
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let closed = false;
+    const writeEvent = (eventName: string, payload: unknown): void => {
+      if (closed || res.destroyed) return;
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+    const stepOfSession = (sessionId: string): string => {
+      const rest = sessionId.slice('workflow:'.length);
+      const colon = rest.indexOf(':');
+      return colon === -1 ? '' : rest.slice(colon + 1);
+    };
+    // A helper spawned by a step runs under `sess-worker-*`; its lineage names
+    // the step session, so its steps belong to this run too.
+    const workerParentCache = new Map<string, { parent: string; item: string } | null>();
+    const workerParent = (sessionId: string): { parent: string; item: string } | null => {
+      let hit = workerParentCache.get(sessionId);
+      if (hit === undefined) {
+        try {
+          const meta = getHarnessSession(sessionId)?.metadata ?? {};
+          const parent = typeof meta.parentSessionId === 'string' ? meta.parentSessionId : '';
+          hit = parent ? { parent, item: typeof meta.item === 'string' ? meta.item : '' } : null;
+        } catch { hit = null; }
+        workerParentCache.set(sessionId, hit);
+      }
+      return hit;
+    };
+    const belongsToRun = (sessionId: string): { step: string; worker?: { sessionId: string; item: string } } | null => {
+      if (workflowRunIdFromSession(sessionId) === runId) return { step: stepOfSession(sessionId) };
+      if (sessionId.startsWith('sess-worker-')) {
+        const lineage = workerParent(sessionId);
+        if (lineage && workflowRunIdFromSession(lineage.parent) === runId) {
+          return { step: stepOfSession(lineage.parent), worker: { sessionId, item: lineage.item } };
+        }
+      }
+      return null;
+    };
+    const sinceSeqRaw = typeof req.query.sinceSeq === 'string' ? Number(req.query.sinceSeq) : 0;
+    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? sinceSeqRaw : 0;
+
+    // 1) Replay what the run's sessions have already said, oldest first.
+    try {
+      const prefix = `workflow:${runId}`;
+      const sessions = listHarnessSessions({ kind: 'workflow', status: 'any', limit: 500 })
+        .filter((row) => row.id === prefix || row.id.startsWith(`${prefix}:`));
+      const rows: HarnessEventRow[] = [];
+      for (const session of sessions) {
+        try {
+          for (const ev of listHarnessEvents(session.id, { sinceSeq, limit: 300 })) {
+            if (isCanonicalBridgedActivity(ev)) rows.push(ev);
+          }
+        } catch { /* one missing step session costs only its replay */ }
+      }
+      rows.sort((a, b) => a.seq - b.seq);
+      const replay = projectHarnessEventsForPublic(rows.slice(-500)).map((row) => {
+        const tag = belongsToRun(row.sessionId);
+        return tag ? { ...row, ...tag } : row;
+      });
+      writeEvent('replay', { runId, events: replay });
+    } catch (err) {
+      console.error('workflow run activity replay failed:', err);
+      writeEvent('replay', { runId, events: [] });
+    }
+
+    // 2) Live frames from any session of this run, tagged with the step (and
+    //    the helper, when a step spawned one).
+    const unsubscribe = actionBus.subscribe((event) => {
+      if (event.kind !== 'harness.public_event') return;
+      const tag = belongsToRun(event.sessionId);
+      if (!tag) return;
+      if (!isCanonicalBridgedActivity(event.event)) return;
+      writeEvent('event', { ...event.event, ...tag });
+    });
+
+    const heartbeat = setInterval(() => {
+      if (closed || res.destroyed) return;
+      res.write(`: ping\n\n`);
+    }, 15_000);
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  });
+
   app.get('/api/console/telemetry/stream', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     res.status(200);

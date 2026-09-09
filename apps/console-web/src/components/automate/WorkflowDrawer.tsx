@@ -339,7 +339,7 @@ type DryRunTraceStep = NonNullable<NonNullable<WorkflowCertification['dryRun']>[
 // A readable, deterministic "here's what this does" view built entirely from the
 // workflow definition + dry-run trace (no LLM). Accurate by construction: the
 // impact strip and per-step effects come from the same trace the runner uses.
-function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
+export function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
   const steps = wf.steps ?? [];
   if (steps.length === 0) return null;
   const trace = new Map<string, DryRunTraceStep>((wf.certification?.dryRun?.steps ?? []).map((s) => [s.stepId, s]));

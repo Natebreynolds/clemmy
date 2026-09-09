@@ -1,6 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
+import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -46,6 +47,10 @@ export interface ActivityItem {
   finishedAt?: number;
   /** A step a helper reported: the agent row it nests under. */
   parentId?: string;
+  /** The workflow step this row happened in (run activity streams tag frames). */
+  step?: string;
+  /** An authoring call's definition — the workflow taking shape (see workflow-build.ts). */
+  draft?: WorkflowDraft;
   /** kind 'batch' only: live meter state from authoritative batch_progress events.
    *  `throttled` flips true while the runner is backing off a provider rate-limit. */
   batch?: { done: number; total: number; failed: number; throttled?: boolean };
@@ -424,6 +429,12 @@ const REUSED_RESULT_LABEL = 'Reused earlier result';
 /** The helper a bridged frame belongs to — the stream tags a worker
  *  session's frames with `worker: { sessionId, item }`; the agent row for that
  *  helper is `a-<item>`. */
+/** The workflow step a run-activity frame was tagged with, if any. */
+function stepOf(ev: unknown): string {
+  const step = (ev as { step?: unknown } | null)?.step;
+  return typeof step === 'string' ? step : '';
+}
+
 function helperOf(ev: unknown): { sessionId: string; item: string } | null {
   const w = (ev as { worker?: { sessionId?: unknown; item?: unknown } } | null)?.worker;
   if (!w || typeof w.sessionId !== 'string' || typeof w.item !== 'string' || !w.item) return null;
@@ -596,9 +607,13 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       // A helper's step (the stream tags frames bridged from a worker session
       // with the helper they belong to) nests under that helper's agent row.
       const helper = helperOf(ev);
+      const step = stepOf(ev);
+      const draft = workflowDraftFromArgs(tool, d.args ?? d.arguments);
       return [...prev, {
         id: callId ? `${helper ? `${helper.sessionId}:` : ''}t-${callId}` : `t${prev.length}-${tool}`,
         ...(helper ? { parentId: `a-${helper.item}` } : {}),
+        ...(step ? { step } : {}),
+        ...(draft ? { draft } : {}),
         kind: 'tool',
         label: reused ? REUSED_RESULT_LABEL : toolLabel,
         ...(detail ? { detail } : {}),
@@ -655,7 +670,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'worker_started': {
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running', startedAt: Date.now() }];
+      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running', startedAt: Date.now(), ...(stepOf(ev) ? { step: stepOf(ev) } : {}) }];
     }
     case 'worker_result': {
       // UPSERT: on non-Claude (orchestrator) lanes worker_started historically
