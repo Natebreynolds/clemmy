@@ -129,10 +129,16 @@ test('a persistently failing first agent cannot starve later due agents', async 
   assert.equal(summaries[2].succeeded, 1);
 });
 
-test('a timed-out turn holds the global lane until its provider promise settles', async () => {
+test('a timed-out turn holds the global lane within grace until its provider promise settles', async () => {
   const slugs = ['overlap-alpha', 'overlap-beta'];
   for (const slug of slugs) seedAgent(slug);
   process.env.AUTONOMY_V2_AGENTS = slugs.join(',');
+
+  // This case checks settlement before the grace deadline. Real filesystem
+  // work between ticks can exceed the isolated runner's 50 ms grace under
+  // suite load; the next case explicitly advances this same clock past it.
+  const coordinatorNow = Date.now();
+  _testOnly_setAutonomyCoordinatorNow(() => coordinatorNow);
 
   const turns: string[] = [];
   let releaseFirst: (() => void) | undefined;
