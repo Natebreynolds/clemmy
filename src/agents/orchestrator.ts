@@ -75,7 +75,6 @@ import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissi
 import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import { isHostOnlyActionControl } from '../tools/tool-registry.js';
-import { uniqueWorkflowRunRequest } from '../tools/named-workflow-match.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
   inspectPrimaryModelPlanningReadCapability,
@@ -112,6 +111,7 @@ import {
 import {
   toolSearchBrokerCoverage,
   type ToolSearchPlanningDisclosureCandidate,
+  type ToolSearchPlanningDisclosureControl,
 } from '../tools/tool-search-tool.js';
 import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
@@ -757,6 +757,10 @@ function taskRequiredAccountSelectionBlockers(input: {
   const topName = typeof envelope.rows[0]?.name === 'string'
     ? envelope.rows[0].name.trim()
     : '';
+  // A typed routing nomination can resolve a choice already present in the
+  // accepted request. Let the reasoning loop make that interpretation before
+  // a host-authored question interrupts the user.
+  if (typeof envelope.rows[0]?.accountSelectionNextStep === 'string') return [];
   if (!topName || !accountSelectionCandidateMatchesRequiredRole({
     acceptedText: input.source.text,
     requirementText: requirement.text,
@@ -2007,16 +2011,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.taskContinuation?.parentInput ?? '',
         ...historicalPriorUserInputs,
       ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
-  const directNamedWorkflowRun = uniqueWorkflowRunRequest(scopeUserInput, priorUserInputs);
-  // A current accepted source that uniquely identifies an existing workflow
-  // already has the complete resource identity needed by workflow_run. Keep
-  // that one control on its ordinary direct admission path; sending it through
-  // local planning would add discovery/work_call while ultimately reopening
-  // the same accepted-source + queue boundary. Prior/LRU promotion alone is
-  // not enough: unrelated turns remain plan-bound.
+  // workflow_run is a structured control with its own exact accepted-source
+  // admission and queue boundary. Its availability cannot depend on a fuzzy
+  // English request match or require an unrelated planning graph.
   const routesPlanBoundLocalCapabilityForTurn = (name: string): boolean => (
-    routesPlanBoundLocalCapability(name)
-    && !(name === 'workflow_run' && directNamedWorkflowRun)
+    routesPlanBoundLocalCapability(name) && name !== 'workflow_run'
   );
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
@@ -2077,13 +2076,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const planningDisclosure = hostFreshPlanning
     ? async (
         candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-        control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+        control?: Readonly<ToolSearchPlanningDisclosureControl>,
       ) => {
         const staged = await stageDisclosedPlanningProviderCandidates({
           ...hostFreshPlanning.identity,
           candidates,
           signal: control?.signal,
           deadlineAt: control?.deadlineAt,
+          accountSelection: control?.accountSelection,
         });
         if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {
           return { version: 1 as const, refs: Object.freeze({}), blockers: Object.freeze({}) };
@@ -3619,7 +3619,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? frozenContract
             ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
             : hostFreshPlanning
-              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. A sole identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision; chat does not compile a hidden plan for it. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for compound topology, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
+              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. Each identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision. Independent exact reversible writes can proceed one call at a time; chat does not compile a hidden plan for them. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for dependency or set topology, unresolved dependencies, an explicit tracked plan, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
               : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
@@ -3721,7 +3721,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. Emit one identified proposal-free `work_call` directly for a sole action; its tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use explicit `plan_task` for multiple actions, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work; conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) need none.'
+          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use explicit `plan_task` for dependency or set topology, unresolved dependencies, an explicit tracked plan, ambiguity, admin, destructive, or unknown-effect work; conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) need none.'
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,

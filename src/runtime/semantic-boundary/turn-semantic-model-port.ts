@@ -111,10 +111,38 @@ export interface PlanGroundingJudgeResult {
   latencyMs: number;
 }
 
+/** Routing evidence only: this judgment never grants a provider effect. */
+export interface SourceAccountJudgeCall {
+  purpose: 'turn_semantics_account_selection';
+  mode: 'explicit_selection' | 'current_source_default';
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedText: string;
+  /** Exact nominated user quote, which may continue establishedSource implicitly. */
+  sourceQuote: string | null;
+  toolkit: string;
+  accountIdentity: string;
+  accountLabel: string | null;
+  /** An exact earlier user source from this conversation, never arbitrary history. */
+  establishedSource: { acceptedText: string; sourceQuote: string; previouslyChecked: boolean } | null;
+  /** Complete ordered user-source range: between explicit origin and current source,
+   * or all bounded conversation ancestors before a current-source default. */
+  interveningAcceptedSources: readonly { sourceUserSeq: number; acceptedText: string }[];
+  proposalDigest: string;
+}
+
+export interface SourceAccountJudgeResult {
+  verdict: 'entailed' | 'default_compatible' | 'conflict' | 'uncertain';
+  proposalDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
   judgeSourceEffect?(call: SourceEffectJudgeCall): Promise<SourceEffectJudgeResult>;
   /** One whole-plan grounding judgment. May not select or invent a capability. */
   judgePlanGrounding?(call: PlanGroundingJudgeCall): Promise<PlanGroundingJudgeResult>;
+  /** Checks source-versus-recipient meaning using the existing judge role. */
+  judgeAccountSelection?(call: SourceAccountJudgeCall): Promise<SourceAccountJudgeResult>;
 }

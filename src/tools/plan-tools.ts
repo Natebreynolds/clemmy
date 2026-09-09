@@ -43,6 +43,7 @@ import {
   recordPlanTaskPreparationCheckpoint,
 } from '../runtime/harness/plan-task-post-settlement.js';
 import { bindAdmittedNodeCapability } from '../runtime/harness/graph-node-capability.js';
+import { selectProviderAcknowledgementMode } from '../runtime/harness/provider-acknowledgement-contract.js';
 import {
   freezeCatalogSnapshotForSource,
   canonicalCatalogIdentityOf,
@@ -74,8 +75,6 @@ import {
   loadDurableAuthorizedLocalPlanningDefinition,
 } from '../runtime/harness/local-planning-capability.js';
 import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
-import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
-import { acceptedSourceIsWorkflowInternal } from '../runtime/harness/named-workflow-host-dispatch.js';
 import {
   accountSelectionForCitedWrite,
   citedLegsUnblockedByAccount,
@@ -411,7 +410,7 @@ function settledPreamble(raw: string): string {
 
 function planningCatalogText(capabilities: readonly HostCapabilityDescriptorV1[]): string {
   if (capabilities.length === 0) {
-    return '(The initial planning card had no exact capability descriptors. Use foreground tool_search; cite only exact capabilityRef values it returns.)';
+    return '(No capability descriptors are listed on this card. Cite exact executable capabilityRef values from the latest disclosure for this request; use tool_search if needed.)';
   }
   return JSON.stringify(capabilities.map((capability) => ({
     capabilityRef: capability.id,
@@ -706,6 +705,10 @@ async function sealFreshPlanCapabilityBindings(input: {
     const sealedBinding = sealBoundCapability({
       nodeId: node.id,
       binding: bound.binding,
+      ...(bound.binding.manifest ? { writeEvidenceMode: selectProviderAcknowledgementMode({
+        graph: input.graph, operationId: node.id, workContractId: input.workContractId,
+        manifest: bound.binding.manifest,
+      }) ?? undefined } : {}),
       // This is a capability-selection seal, not invocation identity. The
       // same host-owned projection is used by the admitted graph executor.
       argumentDigest: createHash('sha256').update(JSON.stringify({
@@ -1252,21 +1255,6 @@ function planAdmissionRecoveryTool(
       : admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search');
 }
 
-function priorAcceptedSourceTexts(sessionId: string, sourceUserSeq: number): string[] {
-  try {
-    return listEvents(sessionId, { types: ['user_input_received'] })
-      .filter((event) => event.seq < sourceUserSeq)
-      .map((event) => {
-        const display = typeof event.data.displayText === 'string' ? event.data.displayText.trim() : '';
-        const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
-        return display || text;
-      })
-      .filter((text) => text.length > 0);
-  } catch {
-    return [];
-  }
-}
-
 async function executePlanTask(
   input: PlanTaskInput,
   planning?: HostFreshPlanningContextV1,
@@ -1315,27 +1303,9 @@ async function executePlanTask(
       ? continuation.parentInput.trim()
       : consumingObjective;
   if (!objective) throw new Error('plan_task accepted source text is missing');
-  // A workflow step's own accepted text names its workflow and says "run";
-  // the step surface denies workflow_run, so the class guard decides first
-  // (lane parity with tryHostDispatchNamedWorkflow).
-  const uniqueWorkflow = acceptedSourceIsWorkflowInternal(sessionId, sourceUserSeq) ? null : uniqueWorkflowRunRequest(
-    objective,
-    priorAcceptedSourceTexts(sessionId, sourceUserSeq),
-  );
-  if (uniqueWorkflow) {
-    // OPEN-THE-GATES C2/C: a uniquely named workflow is invoked with
-    // workflow_run. plan_task here sent GLM into admission, then she
-    // workflow_get'd three times and invented a host-gate refusal
-    // (sess-desktop-ca4779, zero workflow_run calls).
-    return JSON.stringify({
-      ok: false,
-      code: 'plan_not_required',
-      detail: 'this accepted request uniquely names an existing workflow; call workflow_run with that exact name',
-      workflowName: uniqueWorkflow.name,
-      repair: `Call workflow_run with name "${uniqueWorkflow.name}". Do not plan_task. Do not workflow_get unless the user asked to inspect the definition.`,
-      recoveryTool: 'workflow_run',
-    });
-  }
+  // A submitted plan is optional user/model structure. Catalog similarity to
+  // a saved workflow cannot veto it or replace its accepted objective. The
+  // normal source, capability, topology and effect admission below decides.
   // Change 2: a check may refuse only if the missing fact is outside the
   // host. Two connected Outlook mailboxes is that fact. tool_search already
   // returned the matching write with account_selection_required; admitting
@@ -1713,10 +1683,11 @@ export function buildPlanTaskTool(input: {
     name: 'plan_task',
     description: [
       'Admit and freeze one action plan or exact reviewed Clementine-local read plan for the current accepted request inside this foreground model loop.',
-      'Reads never need a plan: run any disclosed read through work_call first and look at the data. Call this tool for the write, or for a multi-operation action, once the data is in hand. Resolve any missing exact capability refs with tool_search first. Then call this tool first in its tool-call frame. It may stand alone, or it may be followed by exactly one proposal-free work_call for a dependency-root read/compute operation declared in this draft. No write, admin, unknown, dependent, or additional sibling is allowed. Include the brief user-facing preamble in this call.',
+      'Use this tool when the user requests a plan, operations depend on one another, or a workflow needs coordinated execution. Independent reads and writes may run directly through proposal-free work_call using the exact currently disclosed executable capabilityRef; planning remains optional for independent work. Each call still passes the existing tool-edge consent and effect checks. Resolve missing exact capability refs with tool_search.',
+      'When using plan_task, call it first in its tool-call frame. It may stand alone, or it may be followed by exactly one proposal-free work_call for a dependency-root read/compute operation declared in this draft. That frame cannot include a write, admin, unknown, dependent, or additional sibling call. Include the brief user-facing preamble in this call.',
       'This is a host-only control: it performs no provider/business I/O and grants no approval. After success, every work_call must pass proposal:null.',
       'Use topology as the sole operation DAG. Put capabilityRef/role/evidence annotations in bindings; do not copy effects or dependencies into bindings. coverage is required for reads and null for non-reads. dependsOn means ORDER only. When a later operation consumes prior result bytes, also name its exact immediate source in dataFrom; for example read_source once with dataFrom:[], then write_once with dependsOn:["read_source"] and dataFrom:["read_source"]. Use cardinality each only for genuine per-member work; a counted collection written once stays once.',
-      `Exact host planning catalog: ${planningCatalogText(input.planning.capabilities)}`,
+      `Planning capabilities disclosed for this request: ${planningCatalogText(input.planning.capabilities)}`,
     ].join(' '),
     parameters: PlanTaskSdkSchema,
     // A plan can only be admitted against a capability the host DISCLOSED, so

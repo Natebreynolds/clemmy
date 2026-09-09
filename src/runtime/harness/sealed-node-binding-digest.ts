@@ -11,6 +11,7 @@ import type { CapabilityManifestOperationSemanticsV1 } from './capability-manife
 import type { MutationVerificationRecipeV1 } from './mutation-verification-contract.js';
 import type { AsyncReadContinuationRecipeV1 } from './async-read-continuation-contract.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
+import type { ProviderAcknowledgementModeV1 } from './provider-acknowledgement-contract.js';
 
 export interface SealedNodeBindingDigestInput {
   nodeId: string;
@@ -37,6 +38,7 @@ export interface SealedNodeBindingDigestInput {
   verification?: MutationVerificationRecipeV1;
   /** Host-owned async read successor; never inferred after graph admission. */
   asyncRead?: AsyncReadContinuationRecipeV1;
+  writeEvidenceMode?: ProviderAcknowledgementModeV1;
 }
 
 export function sealedNodeBindingDigestOf(binding: SealedNodeBindingDigestInput): string {
@@ -56,5 +58,6 @@ export function sealedNodeBindingDigestOf(binding: SealedNodeBindingDigestInput)
     ...(binding.operationSemantics ? { operationSemantics: binding.operationSemantics } : {}),
     ...(binding.verification ? { verification: binding.verification } : {}),
     ...(binding.asyncRead ? { asyncRead: binding.asyncRead } : {}),
+    ...(binding.writeEvidenceMode ? { writeEvidenceMode: binding.writeEvidenceMode } : {}),
   }), 'utf8').digest('hex');
 }

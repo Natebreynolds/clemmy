@@ -22,7 +22,7 @@ const guardrail = await import('../runtime/harness/tool-guardrail.js');
 const { discoveryGovernor } = await import('../runtime/harness/discovery-governor.js');
 const { buildOrchestratorAgent } = await import('./orchestrator.js');
 const { clearFocus, createFocus, listFocuses } = await import('../memory/focus.js');
-const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
+const { _setInnerDispatchToolsForTests, dispatchBatchItemTool } = await import('../tools/inner-dispatch.js');
 const { registerToolSearchTool } = await import('../tools/tool-search-tool.js');
 
 type Invokable = Tool<unknown> & {
@@ -105,7 +105,7 @@ async function searchExact(
       // Codex strict tool schemas represent an omitted optional as explicit
       // null. The MCP/Claude spelling may omit role_key; this direct OpenAI
       // invocation must exercise the exact wire shape the model receives.
-      JSON.stringify({ query: name, role_key: null, limit: 2 }),
+      JSON.stringify({ query: name, role_key: null, limit: 2, account_selection: null }),
       { toolCall: { callId: `search-${name}` } },
     ),
   );
@@ -162,7 +162,7 @@ test('fresh accepted action subtracts dormant controls without opening archaeolo
     // Workspace create/read/edit.
     'space_save', 'space_get', 'space_edit_view',
     // Durable memory + learned procedure recall remain independent of history.
-    'memory_recall', 'skill_read',
+    'memory_recall', 'skill_read', 'session_history',
     // Explicit current-task writes are ordinary fresh controls, not archaeology.
     'focus_set', 'focus_update', 'focus_clear', 'focus_park',
   ];
@@ -177,7 +177,6 @@ test('fresh accepted action subtracts dormant controls without opening archaeolo
 
   // Exact-name search is never authority to reopen prior-task archaeology.
   const archaeology = [
-    'session_history',
     'resume_held_task',
     'background_task_status',
     'background_tasks_recent',
@@ -305,8 +304,8 @@ test('anaphoric continuation requires and uses durable task state', async () => 
 
   for (const focus of listFocuses({ limit: 50 })) clearFocus(focus.id, 'abandoned');
   const noDurableTask = await acceptedAction('Continue where we left off.');
-  const refused = await searchExact(noDurableTask, 'session_history');
-  assert.equal(refused.results.some((entry) => entry.name === 'session_history'), false,
+  const refused = await searchExact(noDurableTask, 'resume_held_task');
+  assert.equal(refused.results.some((entry) => entry.name === 'resume_held_task'), false,
     'anaphoric wording alone must not mint recovery authority');
 });
 
@@ -355,5 +354,42 @@ test('exact capability selection bypasses semantic discovery ranking', async () 
   } finally {
     if (previousEmbeddingsDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED;
     else process.env.EMBEDDINGS_DISABLED = previousEmbeddingsDisabled;
+  }
+});
+
+
+test('a fresh exact history-locator request can discover the read without acquiring task recovery', async () => {
+  const prompt = 'This is a read-only conversation-history test. Do not consult durable memory, use connectors, run shell commands, or change anything. Inspect only these two synthetic conversation windows using session_history: session_id sess-retained-A through_seq 123; session_id sess-retained-B through_seq 456. Find the conversation containing subject marker CLEMMY-LIVE-0905-C6-2245. Return its session ID and the exact three composed subjects and bodies as JSON, preserving the body newline and punctuation. Do not include provider IDs or any other conversations.';
+  const retained = eventlog.createSession({ id: 'sess-retained-B', kind: 'chat', userId: 'retained-owner' });
+  const priorSource = eventlog.appendEvent({ sessionId: retained.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Keep the exact retained drafts.' } });
+  eventlog.appendEvent({ sessionId: retained.id, turn: 1, role: 'system', type: 'conversation_completed', data: { sourceUserSeq: priorSource.seq, reply: 'EXACT RETAINED DRAFT CONTENT.' } });
+  const fixture = await acceptedAction(prompt);
+  eventlog.ensureSessionUserId(fixture.sessionId, 'retained-owner');
+  if (namesOf(fixture.agent).has('session_history')) {
+    assert.ok(invokable(fixture.agent, 'session_history').parameters, 'an exact named history tool may be promoted directly');
+  } else {
+    const found = await searchExact(fixture, 'session_history');
+    assert.equal(found.results[0]?.name, 'session_history');
+    assert.equal(found.results[0]?.carrier, 'call_tool');
+    assert.ok(found.schemas.session_history);
+  }
+  const args = { session_id: retained.id, through_seq: 456, max_turns: null,
+    offset_chars: null, max_chars: null, snapshot_sha256: null };
+  const context = { sessionId: fixture.sessionId, sourceUserSeq: fixture.sourceUserSeq,
+    turn: fixture.turn, counter: new ToolCallsCounter(1_000) };
+  const directlyVisible = namesOf(fixture.agent).has('session_history');
+  const exact = await withHarnessRunContext(context, () => invokable(fixture.agent, directlyVisible ? 'session_history' : 'call_tool')
+    .invoke({ context }, JSON.stringify(directlyVisible ? args : { name: 'session_history', args_json: JSON.stringify(args) }),
+      { toolCall: { callId: 'history-retained-primary-surface' } }));
+  assert.match(String(exact), /EXACT RETAINED DRAFT CONTENT/);
+  // The production nested dispatcher carries source identity in its harness
+  // context even when the child SDK RunContext only contains the session id.
+  const nested = await withHarnessRunContext(context, () => dispatchBatchItemTool('session_history', args,
+    fixture.sessionId, context.counter, undefined,
+    { accounting: 'transport_mirror', canonicalCallId: 'history-retained-nested-surface' }));
+  assert.match(String(nested), /EXACT RETAINED DRAFT CONTENT/);
+  for (const name of ['resume_held_task', 'focus_activate', 'execution_create']) {
+    const unavailable = await searchExact(fixture, name);
+    assert.equal(unavailable.results.some(row => row.name === name), false);
   }
 });

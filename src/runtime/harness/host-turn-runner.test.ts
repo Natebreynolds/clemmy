@@ -101,8 +101,9 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   // Live 2026-09-05, from the phone: the model asked for OUTLOOK_CREATE_DRAFT,
   // which this turn had not proven. One unrelated Outlook READ was in the
   // proven set, so the reply was a menu headed "use one of those exactly" —
-  // reads offered in place of a write, with no mention of plan_task, the only
-  // door a write takes. It re-searched eighteen times and the turn died.
+  // reads offered in place of a write. It re-searched eighteen times and the
+  // turn died. Proven writes now share the read discovery path; planning is
+  // for work topology, not a second capability-acquisition door.
   const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
   const foreign = [
     'GREENHOUSE_CREATE_USER_EMAIL', 'OPENAI_CREATE_MESSAGE', 'AIRTABLE_CREATE_RECORD',
@@ -115,7 +116,11 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
   });
   assert.match(withStaleRead, /OUTLOOK_CREATE_DRAFT is not proven for this step/);
-  assert.match(withStaleRead, /plan_task/, 'the write door is named');
+  assert.match(withStaleRead, /published executable capabilityRef and work_call example/);
+  assert.match(withStaleRead, /existing tool edge still decides allow, deny, or ask/);
+  assert.match(withStaleRead, /unsupported_unmaterialized.*do not invent a requirement_id/);
+  assert.doesNotMatch(withStaleRead, /WRITE or SEND does not|plan_task first/,
+    'a write is not sent back through the retired staging-only rule');
   assert.ok(!/Use one of those exactly/.test(withStaleRead),
     'a menu of reads is never offered as the answer to a write');
 
@@ -127,14 +132,17 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   });
   assert.match(wrongProvider, /Nothing from OUTLOOK is proven/);
   assert.match(wrongProvider, /do not substitute another provider/);
-  assert.match(wrongProvider, /plan_task/);
+  assert.match(wrongProvider, /Discover that exact operation with tool_search/);
 
-  // A spelling slip on an operation that IS proven keeps the exact-list reply.
+  // A discovered operation still needs a published executable ref. The live
+  // readback failure recognized the account/operation but never materialized it.
   const spellingSlip = hostProvenOperationRepair({
     requestedOperation: 'OUTLOOK_GET_DRAFTS_MAIL_FOLDER',
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
   });
-  assert.match(spellingSlip, /The operations proven for this step are: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
+  assert.match(spellingSlip, /Operations found during discovery: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
+  assert.match(spellingSlip, /does not establish executable readiness/);
+  assert.match(spellingSlip, /do not guess a requirement_id or repeat unchanged discovery/);
 
   assert.match(
     hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),
@@ -151,13 +159,22 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
     accountChoices: ['first@example.test', 'second@example.test'],
   });
-  assert.match(needsAccount, /still needs you to say which connected account/);
+  assert.match(needsAccount, /checked source-account selection/);
+  assert.match(needsAccount, /account_selection.*source_quote/);
   assert.match(needsAccount, /ask_user_question/);
   assert.match(needsAccount, /first@example\.test, second@example\.test/);
   assert.ok(!/plan_task/.test(needsAccount),
     'a question the user must answer is not routed through planning');
   assert.ok(!/Use one of those exactly/.test(needsAccount),
     'and never answered with a menu of other operations');
+  const unavailableReview = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_DRAFT', provenOperations: [],
+    accountChoices: ['first@example.test', 'second@example.test'], accountReviewUnavailable: true,
+  });
+  assert.match(unavailableReview, /host source-account review did not complete/);
+  assert.match(unavailableReview, /identical account_selection/);
+  assert.doesNotMatch(unavailableReview, /ask_user_question/);
+
 });
 
 test('returned nested-call repair requires exact zero-crossing invalid-arguments settlement truth', () => {

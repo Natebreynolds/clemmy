@@ -34,6 +34,11 @@ export interface ClosedCanonicalJsonOptions {
   maxNodes?: number;
   maxStringBytes?: number;
   maxTotalBytes?: number;
+  /** Provider SDK ingestion only: JSON wire objects can acquire enumerable
+   * optional members with value undefined. Omit only those object members;
+   * arrays, hidden/accessor properties and every other invalid value remain
+   * errors. Authority and argument callers keep the strict default. */
+  omitUndefinedObjectMembers?: boolean;
 }
 
 export class ClosedCanonicalJsonError extends Error {
@@ -67,8 +72,9 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 /**
  * Encode the closed JSON value domain into deterministic bytes.
  *
- * Unlike JSON.stringify, this never calls toJSON/getters, never drops unknown
- * values, and never treats prototype-bearing objects as data. The encoder
+ * Unlike JSON.stringify, this never calls toJSON/getters or treats foreign
+ * prototype-bearing objects as data. Unknown values are rejected; the explicit
+ * provider-ingestion option omits only undefined enumerable object members. The encoder
  * inspects property descriptors before reading any value and bounds work while
  * traversing, so the returned bytes are the complete value that was reviewed.
  */
@@ -203,7 +209,18 @@ export function closedCanonicalJson(
             keyPath,
           );
         }
-        if (index > 0) token(',', path);
+        if (options.omitUndefinedObjectMembers === true && descriptor.value === undefined) {
+          // Omission changes wire bytes, not the bounded traversal work.
+          nodes += 1;
+          if (nodes > maxNodes) {
+            throw new ClosedCanonicalJsonError('canonical JSON exceeds the node limit', 'node_limit', keyPath);
+          }
+          if (Buffer.byteLength(key, 'utf8') > maxStringBytes) {
+            throw new ClosedCanonicalJsonError('string exceeds the canonical JSON string limit', 'string_limit', keyPath);
+          }
+          continue;
+        }
+        if (fields.length > 0) token(',', path);
         const encodedKey = encodeString(key, keyPath);
         token(':', keyPath);
         fields.push(`${encodedKey}:${visit(descriptor.value, keyPath, depth + 1)}`);

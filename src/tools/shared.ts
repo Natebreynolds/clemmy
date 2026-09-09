@@ -273,10 +273,12 @@ export function resolveMemoryTarget(target: string): string {
   return path.join(VAULT_DIR, target);
 }
 
-export function readText(filePath: string, fallback: string, maxChars = 12000): string {
+export function readText(filePath: string, fallback: string): string {
   if (!existsSync(filePath)) return fallback;
   try {
-    return readFileSync(filePath, 'utf-8').slice(0, maxChars);
+    // Return the complete source to textResult so it can retain the exact
+    // output before producing a bounded, recallable model projection.
+    return readFileSync(filePath, 'utf-8');
   } catch {
     return fallback;
   }

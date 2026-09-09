@@ -1,0 +1,147 @@
+[
+  {
+    "slug": "clem-smoke-flow-18289",
+    "name": "clem-smoke-flow-18289",
+    "enabled": false
+  },
+  {
+    "slug": "clem-smoke-flow-30722",
+    "name": "clem-smoke-flow-30722",
+    "enabled": false
+  },
+  {
+    "slug": "clem-smoke-flow-8177",
+    "name": "clem-smoke-flow-8177",
+    "enabled": true
+  },
+  {
+    "slug": "daily-overdue-salesforce-meetings",
+    "name": "daily-overdue-salesforce-meetings",
+    "enabled": false
+  },
+  {
+    "slug": "daily-prospect-outreach",
+    "name": "daily-prospect-outreach",
+    "enabled": false
+  },
+  {
+    "slug": "daily-standup-email",
+    "name": "daily-standup-email",
+    "enabled": true
+  },
+  {
+    "slug": "daily-summary",
+    "name": "daily-summary",
+    "enabled": true
+  },
+  {
+    "slug": "end-of-day",
+    "name": "end-of-day",
+    "enabled": true
+  },
+  {
+    "slug": "end-of-week-team-sales-snapshot",
+    "name": "end-of-week-team-sales-snapshot",
+    "enabled": true
+  },
+  {
+    "slug": "find-stale-market-leader-accounts-without-opportunities",
+    "name": "Find Stale Market Leader Accounts Without Opportunities",
+    "enabled": false
+  },
+  {
+    "slug": "friday-dashboard-daily-refresh",
+    "name": "friday-dashboard-daily-refresh",
+    "enabled": true
+  },
+  {
+    "slug": "lunar-local-audit",
+    "name": "lunar-local-audit",
+    "enabled": false
+  },
+  {
+    "slug": "midday-outreach",
+    "name": "midday-outreach",
+    "enabled": false
+  },
+  {
+    "slug": "monday-salesforce-opportunity-report",
+    "name": "Monday Salesforce Opportunity Report",
+    "enabled": false
+  },
+  {
+    "slug": "morning-briefing",
+    "name": "morning-briefing",
+    "enabled": true
+  },
+  {
+    "slug": "morning-prospect-prep",
+    "name": "morning-prospect-prep",
+    "enabled": false
+  },
+  {
+    "slug": "objective-execution-loop",
+    "name": "Objective Execution Loop",
+    "enabled": true
+  },
+  {
+    "slug": "outlook-scorpion-inbox-read-canary",
+    "name": "Outlook Scorpion Inbox Read Canary",
+    "enabled": false
+  },
+  {
+    "slug": "outlook-triage-hourly",
+    "name": "outlook-triage-hourly",
+    "enabled": false
+  },
+  {
+    "slug": "past-due-opportunities-daily-alert",
+    "name": "past-due-opportunities-daily-alert",
+    "enabled": false
+  },
+  {
+    "slug": "platform-49-slack-channel-review",
+    "name": "platform-49-slack-channel-review",
+    "enabled": true
+  },
+  {
+    "slug": "proposal-audit-brief",
+    "name": "proposal-audit-brief",
+    "enabled": true
+  },
+  {
+    "slug": "salesforce-quarterly-to-sheets",
+    "name": "salesforce-quarterly-to-sheets",
+    "enabled": false
+  },
+  {
+    "slug": "salesforce-to-airtable-prospect-enrichment",
+    "name": "salesforce-to-airtable-prospect-enrichment",
+    "enabled": false
+  },
+  {
+    "slug": "scorpion-audit",
+    "name": "scorpion-audit",
+    "enabled": false
+  },
+  {
+    "slug": "scorpion-facebook-trends",
+    "name": "scorpion-facebook-trends",
+    "enabled": true
+  },
+  {
+    "slug": "social-manager-rc-1785193205",
+    "name": "social-manager-rc-1785193205",
+    "enabled": true
+  },
+  {
+    "slug": "team-activity-slack-updates",
+    "name": "team-activity-slack-updates",
+    "enabled": true
+  },
+  {
+    "slug": "weekly-review",
+    "name": "weekly-review",
+    "enabled": true
+  }
+]

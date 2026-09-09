@@ -256,7 +256,17 @@ function closedCanonicalJson(value, options = {}) {
             keyPath
           );
         }
-        if (index > 0) token(",", path5);
+        if (options.omitUndefinedObjectMembers === true && descriptor.value === void 0) {
+          nodes += 1;
+          if (nodes > maxNodes) {
+            throw new ClosedCanonicalJsonError("canonical JSON exceeds the node limit", "node_limit", keyPath);
+          }
+          if (Buffer.byteLength(key, "utf8") > maxStringBytes) {
+            throw new ClosedCanonicalJsonError("string exceeds the canonical JSON string limit", "string_limit", keyPath);
+          }
+          continue;
+        }
+        if (fields.length > 0) token(",", path5);
         const encodedKey = encodeString(key, keyPath);
         token(":", keyPath);
         fields.push(`${encodedKey}:${visit(descriptor.value, keyPath, depth + 1)}`);

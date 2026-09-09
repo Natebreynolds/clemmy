@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { captureBackendRuntimeDependencyDigests } from './lib/dev-backend-readiness.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const git = (args) => execFileSync('git', args, {
@@ -43,6 +44,7 @@ writeFileSync(
     gitDirty,
     sourceFingerprint,
     expectedSchemaVersion: HARNESS_SCHEMA_VERSION,
+    backendRuntimeDependencies: captureBackendRuntimeDependencyDigests(repoRoot),
     ...implementation,
   })}\n`,
   'utf8',

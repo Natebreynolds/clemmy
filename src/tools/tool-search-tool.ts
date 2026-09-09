@@ -17,12 +17,12 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { SourceAccountNominationSchema, type SourceAccountNomination } from './source-account-routing.js';
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
-import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
@@ -36,6 +36,7 @@ import {
   type AuthorizedLiveReadPlanningAuthorityV1,
 } from '../runtime/harness/live-read-planning-authority.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import type { ProofProvisionResult } from '../runtime/harness/proof-provisioned-catalog.js';
 import {
   readToolSearchContinuation,
   TOOL_SEARCH_CONTINUATION_MAX_ENTRIES as DURABLE_TOOL_SEARCH_CONTINUATION_MAX_ENTRIES,
@@ -150,6 +151,8 @@ function scoreDiscoveredSourceCandidate(
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
+const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
+const CAPABILITY_PUBLICATION_NEXT_STEP = 'The operation and account have not yet produced an executable capabilityRef. Search once for the exact operation you need, retaining the same account selection. Call it only after that search returns a capabilityRef. If publication remains unavailable, report its exact host blocker; do not invent a ref, broaden discovery, or ask the user to repeat the account.';
 /** One physical broker search retains at most the same window the public
  * surface can request. A smaller first page therefore never makes rank nine
  * unreachable, while provider/catalog scans remain strictly bounded. */
@@ -477,6 +480,9 @@ export interface ToolSearchCandidateSource {
   search(input: {
     query: string;
     limit: number;
+    /** Advisory selection must cross the same accepted-source check before
+     * it can help an adapter acquire account-scoped candidates. */
+    accountSelection?: SourceAccountNomination | null;
     signal?: AbortSignal;
     /** Absolute wall deadline owned by the broker. Adapters with multiple
      * internal reads should settle slightly before it so partial progress can
@@ -688,17 +694,26 @@ export function attachToolSearchSelectedAccountEvidence(
 }
 
 export interface ToolSearchPlanningBlocker {
-  code: 'account_selection_required';
+  code: 'account_selection_required' | 'capability_publication_required';
   /** Stable current identities the user can name on the next accepted turn.
    * Emails are preferred; an opaque connection id is used only when the
    * provider exposes no mailbox identity. */
   choices: readonly string[];
+  /** Host-owned diagnostic; publication failures never imply an account question. */
+  reason?: 'review_unavailable' | 'proof_publication_expired' | 'proof_not_registered'
+    | NonNullable<ProofProvisionResult['refusal']>['code'];
 }
 
 export interface ToolSearchPlanningDisclosureOutcome {
   version: 1;
   refs: Readonly<Record<string, string>>;
   blockers: Readonly<Record<string, ToolSearchPlanningBlocker>>;
+}
+
+export interface ToolSearchPlanningDisclosureControl {
+  signal: AbortSignal;
+  deadlineAt: number;
+  accountSelection?: SourceAccountNomination | null;
 }
 
 function isPlanningDisclosureOutcome(
@@ -735,7 +750,7 @@ export function toolSearchBrokerCoverage(
 
 function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
   return carrier === 'work_call'
-    ? 'Invoke the selected result through work_call by copying its literal example. For one fresh standalone write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
+    ? 'Invoke the selected result through work_call by copying its literal example. For each independent proposal-free write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
     : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
 }
 
@@ -847,7 +862,7 @@ export function registerToolSearchTool(
      * the current host catalog. Candidate prose itself grants nothing. */
     discloseForPlanning?: (
       candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-      control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+      control?: Readonly<ToolSearchPlanningDisclosureControl>,
     ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
       | Readonly<Record<string, string>>
       | ToolSearchPlanningDisclosureOutcome;
@@ -863,6 +878,8 @@ export function registerToolSearchTool(
         .min(1)
         .max(400)
         .describe('What you want to do, in plain language.'),
+      account_selection: SourceAccountNominationSchema.nullable().optional()
+        .describe('Source-account routing only, never approval. If the accepted user request already identifies the account to operate in/as, nominate its exact current connected email or connection ID, toolkit, and a verbatim source_quote from accepted user wording in this conversation. Do not treat recipients, attendees, third-party accounts, reported or quoted instructions, or skill names as operating-account selections. On account_selection_required, use the returned choices to resolve an account the user already named; ask the user only if their selection is genuinely missing or unclear. Pass null when no nomination is needed.'),
       role_key: z
         .string()
         .min(1)
@@ -889,11 +906,12 @@ export function registerToolSearchTool(
         .default(null)
         .describe('next_cursor or schema_handles[*].cursor from a prior result in this session; null means the first page.'),
     },
-    async ({ query, role_key, limit, cursor }: {
+    async ({ query, role_key, limit, cursor, account_selection }: {
       query: string;
       role_key?: string | null;
       limit?: number | null;
       cursor?: string | null;
+      account_selection?: SourceAccountNomination | null;
     }) => {
       const continuationSessionId = getToolOutputContext()?.sessionId;
       // A continuation is a read of bytes retained by an earlier admitted
@@ -925,17 +943,12 @@ export function registerToolSearchTool(
         .find((entry) => queryExplicitlyNamesTool(query, entry.name));
       const exactKnownButDenied = !exactEntry && catalogEntries()
         .some((entry) => queryExplicitlyNamesTool(query, entry.name));
-      // A uniquely named saved workflow plus execution text is an exact
-      // selection of workflow_run — not a fuzzy hunt across Composio actors
-      // (live 2026-08-29: "run my platform 49 workflow" ranked APIFY_RUN_ACTOR).
-      const uniqueWorkflowRun = !exactEntry && uniqueWorkflowRunRequest(query)
-        ? scopedCatalog.find((entry) => entry.name === 'workflow_run')
-        : undefined;
+      // Only a structured tool-name selection receives the exact-hit shortcut.
+      // Workflow-name similarity remains advisory ranking, never a substitute
+      // for the requested operation or a reason to skip provider discovery.
       const exactNamedHit: RankedCatalogEntry | undefined = exactEntry
         ? { ...exactEntry, score: 1 }
-        : uniqueWorkflowRun
-          ? { ...uniqueWorkflowRun, score: 1 }
-          : undefined;
+        : undefined;
       // Sources the provider itself could not answer, so the model is told
       // "could not reach X" and can retry — never silence that reads as "X
       // does not exist" (see CandidateSourceUnavailableError).
@@ -980,6 +993,7 @@ export function registerToolSearchTool(
                 // returns is paged locally and never fetched a second time.
                 source.search({
                   query,
+                  accountSelection: account_selection,
                   limit: requestedLimit,
                   signal: controller.signal,
                   deadlineAt: sourceDeadlineAt,
@@ -1227,6 +1241,17 @@ export function registerToolSearchTool(
               | null
             > = [];
             for (const group of groups) {
+              const expiredDisclosure = (reason: ToolSearchPlanningBlocker['reason'] = 'proof_publication_expired'): ToolSearchPlanningDisclosureOutcome => ({
+                version: 1,
+                refs: Object.freeze({}),
+                blockers: Object.freeze(Object.fromEntries(group
+                  .filter((candidate) => candidate.sourceKind === 'authorized_composio')
+                  .map((candidate) => [candidate.name, {
+                    code: 'capability_publication_required' as const,
+                    choices: Object.freeze([]),
+                    reason,
+                  }]))),
+              });
               let timer: ReturnType<typeof setTimeout> | undefined;
               const controller = new AbortController();
               const groupBudgetMs = Math.min(
@@ -1234,7 +1259,7 @@ export function registerToolSearchTool(
                 remainingBrokerMs(),
               );
               if (groupBudgetMs <= 0) {
-                outcomes.push(null);
+                outcomes.push(expiredDisclosure());
                 continue;
               }
               const groupDeadlineAt = Date.now() + groupBudgetMs;
@@ -1243,7 +1268,8 @@ export function registerToolSearchTool(
                   Promise.resolve(disclose(group, {
                     signal: controller.signal,
                     deadlineAt: groupDeadlineAt,
-                  })).catch(() => null),
+                    accountSelection: account_selection,
+                  })).catch(() => expiredDisclosure('proof_not_registered')),
                   new Promise<null>((resolve) => {
                     timer = setTimeout(() => {
                       controller.abort();
@@ -1255,8 +1281,8 @@ export function registerToolSearchTool(
                   controller.signal.aborted
                   || Date.now() >= groupDeadlineAt
                   || remainingBrokerMs() <= 0
-                  ? null
-                  : outcome,
+                  ? expiredDisclosure()
+                  : outcome ?? expiredDisclosure(),
                 );
               } finally {
                 if (timer) clearTimeout(timer);
@@ -1310,7 +1336,20 @@ export function registerToolSearchTool(
           ? opts.dispatchCarrierForName(exactNamedHit.name)
           : null
       );
-      const hint = (() => {
+      const invocationHint = (): string => {
+        if (exactCarrier) return dispatchHint(exactCarrier);
+        if (opts.dispatchCarrierForName) {
+          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
+            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the action arguments; do not serialize the arguments object a second time. For each independent proposal-free write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead.';
+        }
+        const fixedCarrier = opts.dispatchCarrier
+          ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
+        if (fixedCarrier) return dispatchHint(fixedCarrier);
+        return opts.allowedNames
+          ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
+      };
+      const hintForRows = (rows: readonly (typeof rankedWindow)[number][]): string => {
         // A provider that did not answer must never read like a capability
         // that does not exist. Lead with this only when it plausibly explains
         // an otherwise-empty result — an exact/built-in hit already answered
@@ -1324,11 +1363,39 @@ export function registerToolSearchTool(
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
           return `Could not reach: ${causes}. This is a provider/connection problem, not evidence the capability is missing — do not conclude it does not exist or invent a reference for it. Retry this search once, or tell the user the connection could not be reached if it keeps failing.`;
         }
-        if (Object.keys(planningBlockers).length > 0) {
-          const choices = [...new Set(Object.values(planningBlockers).flatMap((blocker) => blocker.choices))];
-          return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
+        // Disclosure covers the retained window, while a model sees one page.
+        // An unresolved alternative must not override a ready visible choice
+        // or leak an off-page account into the page's recovery instruction.
+        const visibleBlockers = rows.flatMap((row) => planningBlockers[row.name]
+          ? [[row.name, planningBlockers[row.name]!] as const]
+          : []);
+        const visibleRefs = rows.filter((row) => Boolean(planningRefs[row.name]));
+        if (visibleBlockers.length > 0) {
+          const available = rows.some((row) => !planningBlockers[row.name] && (
+            Boolean(planningRefs[row.name])
+            || localPlanningRowStatus(row.name).planningRefStatus === 'dispatch_now'
+          ));
+          if (available) {
+            return 'Use a result with a capabilityRef or dispatch_now status if it satisfies the task, following its own carrier and invocation example (work_call for business results; call_tool for controls). Only if you select an unresolved result, follow that result\'s specific recovery step; another result\'s account or publication blocker does not block an available choice.';
+          }
+          const reviewUnavailable = visibleBlockers
+            .filter(([, blocker]) => blocker.code === 'account_selection_required'
+              && blocker.reason === 'review_unavailable')
+            .map(([name]) => name);
+          if (reviewUnavailable.length > 0) {
+            return `Account-routing review unavailable for ${reviewUnavailable.join(', ')}. ${ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP} Any other account blockers remain listed on their individual results.`;
+          }
+          const accountBlockers = visibleBlockers.map(([, blocker]) => blocker)
+            .filter((blocker) => blocker.code === 'account_selection_required');
+          if (accountBlockers.length > 0) {
+            const choices = [...new Set(accountBlockers.flatMap((blocker) => blocker.choices))];
+            return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
+          }
+          const publication = visibleBlockers
+            .map(([name, blocker]) => `${name}: ${blocker.reason ?? 'proof_not_registered'}`).join(', ');
+          return `Capability publication unavailable (${publication}). ${CAPABILITY_PUBLICATION_NEXT_STEP} Other results with a capabilityRef remain executable.`;
         }
-        if (opts.discloseForPlanning && Object.keys(planningRefs).length === 0) {
+        if (opts.discloseForPlanning && visibleRefs.length === 0) {
           // "No plan ref" is not "no door". The names below fail the plan-citation
           // gate, which is exactly what routes them to the call_tool dispatcher,
           // so they are invocable on this turn. Telling the model to refine
@@ -1336,7 +1403,7 @@ export function registerToolSearchTool(
           // holding the tool with a full schema (live 2026-08-27, seq 90427).
           // Destructive rows are deliberately never named here — a page that
           // cannot plan them must not nudge the model to fire them either.
-          const callableNow = rankedWindow
+          const callableNow = rows
             .map((row) => row.name)
             .filter((name) => {
               const status = localPlanningRowStatus(name);
@@ -1347,18 +1414,8 @@ export function registerToolSearchTool(
           }
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
-        if (exactCarrier) return dispatchHint(exactCarrier);
-        if (opts.dispatchCarrierForName) {
-          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
-            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the action arguments; do not serialize the arguments object a second time. For one fresh standalone write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead.';
-        }
-        const fixedCarrier = opts.dispatchCarrier
-          ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
-        if (fixedCarrier) return dispatchHint(fixedCarrier);
-        return opts.allowedNames
-          ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
-          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
-      })();
+        return invocationHint();
+      };
 
       type RankedWindowRow = (typeof rankedWindow)[number];
 
@@ -1387,10 +1444,20 @@ export function registerToolSearchTool(
           ...(planningRefs[r.name] && selectedAccountForName(r.name)
             ? { selectedAccount: selectedAccountForName(r.name)! }
             : {}),
-          ...(planningBlockers[r.name]
+          ...(planningBlockers[r.name]?.code === 'capability_publication_required'
+            ? {
+                planningRefStatus: 'materialization_unavailable' as const,
+                materializationReason: planningBlockers[r.name]!.reason ?? 'proof_not_registered',
+                materializationNextStep: CAPABILITY_PUBLICATION_NEXT_STEP,
+              }
+            : planningBlockers[r.name]
             ? {
                 planningRefStatus: 'account_selection_required' as const,
                 accountChoices: planningBlockers[r.name]!.choices,
+                ...(planningBlockers[r.name]!.reason ? { accountSelectionReason: planningBlockers[r.name]!.reason } : {}),
+                accountSelectionNextStep: planningBlockers[r.name]!.reason === 'review_unavailable'
+                  ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP
+                  : 'If the accepted user request already names the operating account, repeat tool_search with account_selection={toolkit, identity: one exact accountChoices value, source_quote: verbatim user wording from this conversation}. The host checks source-versus-recipient meaning. Ask the user only if no account was selected or the choice remains unclear.',
               }
             : opts.discloseForPlanning && !planningRefs[r.name]
               ? localPlanningRowStatus(r.name)
@@ -1404,6 +1471,7 @@ export function registerToolSearchTool(
                 : {}),
           ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
           ...('invocation' in r && r.invocation
+            && planningBlockers[r.name]?.code !== 'capability_publication_required'
             ? { example: renderCarrierInvocationExample(
                 'carrier' in r && r.carrier
                   ? r.carrier
@@ -1508,7 +1576,7 @@ export function registerToolSearchTool(
           // fact, distinct from and never implied by an empty `results`.
           ...(unavailable.length > 0 ? { unavailable } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
-          hint,
+          hint: hintForRows(rows),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,

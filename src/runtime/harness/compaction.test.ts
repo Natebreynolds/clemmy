@@ -25,7 +25,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
-const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
+const { resetEventLog, closeEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
 const { inFlightCompactionThresholds } = await import('./compaction.js');
 const {
   clipOldToolResults,
@@ -627,29 +627,47 @@ test('forceLayer2 triggers Layer 1 even with abundant token headroom (the stage-
   assert.equal(result.layer3.applied, false, 'Layer 3 fork is suppressed during a forced checkpoint');
 });
 
-test('compactSessionIfNeeded — idle gap + real weight triggers L1+L2 below token pressure (no fork)', async () => {
+test('a long idle gap preserves exact working history when the routed context has headroom', async () => {
   resetEventLog();
-  const session = HarnessSession.create({ kind: 'chat', title: 'idle test' });
+  const session = HarnessSession.create({ kind: 'chat', title: 'idle continuity' });
   const items: AgentInputItem[] = [];
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 28; i++) {
     const callId = `call_idle${i}`;
-    items.push(userMessage(`turn ${i}`));
-    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
-    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
-    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+    const body = `Exact draft ${i}.\n${'z'.repeat(3000)}END_${i}!`;
+    items.push(userMessage(`Keep draft ${i} for the next turn.`));
+    items.push(toolCall(callId, 'draft.read', JSON.stringify({ id: `draft-${i}` })));
+    items.push(toolResult(callId, body));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'draft.read', output: body });
   }
   session.updateConversationSnapshot(items);
-  // Big budget (no token pressure) + a 1h idle gap over the 6k-token floor → idle
-  // trigger fires L1+L2 anyway, and suppresses the Layer-3 fork (summarize in place).
-  const { result, forkRequest } = await compactSessionIfNeeded(session, items, {
-    inputBudgetTokens: 200_000, layer1ItemThreshold: 15,
-    idleMs: 60 * 60 * 1000, idleCompactionThresholdMs: 30 * 60 * 1000, idleCompactionMinTokens: 3000,
+  const before = JSON.stringify(items);
+  const previousFlag = process.env.CLEMMY_AUTO_COMPACT;
+  let summarizerCalls = 0;
+  process.env.CLEMMY_AUTO_COMPACT = 'on';
+  _setCompactionSummarizerForTests(async () => {
+    summarizerCalls++;
+    return { error: 'Idle time must not invoke a summarizer with free context.' };
   });
-  assert.ok(result.beforeTokens < 200_000 * 0.3, 'precondition: no token pressure');
-  assert.ok(result.beforeTokens > 3000, 'precondition: real weight (over the idle floor)');
-  assert.equal(result.layer1.applied, true, 'idle gap runs Layer 1 below token pressure');
-  assert.equal(result.layer3.applied, false, 'idle summarize never forks (in-place reset)');
-  assert.equal(forkRequest, undefined);
+  try {
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, items, {
+      inputBudgetTokens: 1_000_000, idleMs: 24 * 60 * 60 * 1000,
+    });
+    assert.ok(result.beforeTokens > 6000, 'exceeds the retired idle floor');
+    assert.ok(result.beforeTokens < 1_000_000 * 0.3, 'has abundant routed-model headroom');
+    assert.equal(result.modified, false);
+    assert.equal(result.layer1.applied, false);
+    assert.equal(result.layer2.applied, false);
+    assert.equal(summarizerCalls, 0);
+    assert.equal(forkRequest, undefined);
+    assert.equal(JSON.stringify(nextItems), before, 'all exact content and tool call identities survive');
+    assert.equal(JSON.stringify(items), before, 'the persisted snapshot input is not mutated');
+    closeEventLog();
+    assert.equal(JSON.stringify(HarnessSession.load(session.id)?.toInputItems()), before, 'exact working history survives reopening storage');
+  } finally {
+    if (previousFlag === undefined) delete process.env.CLEMMY_AUTO_COMPACT;
+    else process.env.CLEMMY_AUTO_COMPACT = previousFlag;
+    _setCompactionSummarizerForTests(null);
+  }
 });
 
 test('compactSessionIfNeeded — idle does NOT fire on a short gap or a tiny session', async () => {
@@ -864,4 +882,29 @@ test('duplicate collapse keeps a parallel call frame protocol-valid', async () =
   const seqCollapsed = compactInFlightToolContext(sequential, session.id);
   assert.equal(seqCollapsed.collapsed, 1);
   assert.equal(inspectConversationProtocol(seqCollapsed.nextItems).status, 'valid');
+});
+
+test('Layer 2 preserves complete tool arguments and results outside its prose summarization', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'complete summarizer context' });
+  const argumentsJson = JSON.stringify({ body: 'a'.repeat(900), destination: 'EXACT_DESTINATION_AFTER_500' });
+  const resultText = 'b'.repeat(7000) + '\nUNFINISHED_RECORD_AFTER_4000';
+  let received = '';
+  _setCompactionSummarizerForTests(async (text) => {
+    received = text;
+    return { summary: '- The returned record still needs review.', modelUsed: 'test-summarizer' };
+  });
+  try {
+    const result = await summarizeOlderMessages([
+      userMessage('Review the full result before continuing.'), assistantMessage('I will inspect it.'),
+      toolCall('call_complete_input', 'test.read', argumentsJson), toolResult('call_complete_input', resultText),
+      assistantMessage('The review is pending.'), userMessage('Continue later.'), assistantMessage('Ready.'),
+    ], session.id, 2);
+    assert.equal(result.applied, true);
+    const keptCall = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call') as { arguments?: string };
+    const keptResult = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call_result') as { output?: { text?: string } };
+    assert.equal(keptCall.arguments, argumentsJson);
+    assert.equal(keptResult.output?.text, resultText);
+    assert.ok(!received.includes('TOOL_CALL'), 'exact tool state is retained rather than sent through prose compression');
+  } finally { _setCompactionSummarizerForTests(null); }
 });

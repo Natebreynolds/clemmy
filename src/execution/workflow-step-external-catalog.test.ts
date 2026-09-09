@@ -18,6 +18,7 @@ const { provisionExactWorkflowProviderOperations } = await import(
   '../tools/tool-search-provider-sources.js'
 );
 const { digestSchema } = await import('../tools/tool-contract-store.js');
+const { installTurnSemanticModelPort } = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const {
   attachSemanticContract,
   capabilityManifestDigest,
@@ -444,8 +445,16 @@ test('Platform49 preflight provisions its missing Slack read and Sheets write wi
   assert.equal(factory.get(prohibitedWrite.manifestId), undefined);
 });
 
-test('exact workflow provisioner binds schema, account, and effect for reads and writes in one bounded set', async () => {
+test('exact workflow provisioner binds schema, account, and effect for reads and writes in one bounded set', async (t) => {
   resetEventLog();
+  installTurnSemanticModelPort({
+    async interpret() { throw new Error('account selection must not compile a hidden plan'); },
+    async judgeAccountSelection(call) {
+      assert.equal(call.mode, 'current_source_default');
+      return { verdict: 'default_compatible', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-account-review' };
+    },
+  });
+  t.after(() => installTurnSemanticModelPort(null));
   const acceptedInput = [
     'Use SLACK_RETRIEVE_DETAILED_USER_INFORMATION.',
     'Then use GOOGLESHEETS_INSERT_DIMENSION.',
@@ -806,8 +815,16 @@ test('rendered workflow data cannot nominate an external operation', async () =>
   assert.deepEqual(result, { status: 'none' });
 });
 
-test('exact workflow provisioner reports a requested operation that did not register as a refusal, never ok', async () => {
+test('exact workflow provisioner reports a requested operation that did not register as a refusal, never ok', async (t) => {
   resetEventLog();
+  installTurnSemanticModelPort({
+    async interpret() { throw new Error('account selection must not compile a hidden plan'); },
+    async judgeAccountSelection(call) {
+      assert.equal(call.mode, 'current_source_default');
+      return { verdict: 'default_compatible', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-account-review' };
+    },
+  });
+  t.after(() => installTurnSemanticModelPort(null));
   const acceptedInput = 'Use SLACK_RETRIEVE_DETAILED_USER_INFORMATION.';
   const session = createSession({ kind: 'workflow', userId: 'workflow:exact-provider-unregistered' });
   const source = appendEvent({

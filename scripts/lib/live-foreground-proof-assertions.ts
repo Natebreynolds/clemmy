@@ -1,0 +1,81 @@
+import { z } from 'zod';
+
+export const LiveTurnExpectationSchema = z.object({
+  replyIncludes: z.array(z.string().min(1)).optional(),
+  replyExcludes: z.array(z.string().min(1)).optional(),
+  maxModelRequests: z.number().int().nonnegative().optional(),
+  maxToolSearches: z.number().int().nonnegative().optional(),
+  maxToolCalls: z.number().int().nonnegative().optional(),
+  minToolCalls: z.number().int().positive().optional(),
+  maxWallMs: z.number().positive().optional(),
+  successfulMutations: z.number().int().nonnegative().optional(),
+  activatedPlans: z.number().int().nonnegative().optional(),
+  providerAcknowledgements: z.number().int().nonnegative().optional(),
+  forbiddenTools: z.array(z.string().min(1)).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, 'At least one task assertion is required');
+
+export const LiveProofMessageSchema = z.union([
+  z.string().trim().min(1).transform((message) => ({ message, expect: undefined })),
+  z.object({ message: z.string().trim().min(1), expect: LiveTurnExpectationSchema }).strict(),
+]);
+
+export interface LiveTurnFacts {
+  reply: string;
+  terminalStatus: string | null;
+  modelRequests: number;
+  toolSearches: number;
+  toolCalls: number;
+  wallMs: number | null;
+  perTool: Record<string, number>;
+  activatedPlans?: number;
+  providerAcknowledgements?: number;
+  settlements: Array<{
+    mutating: number; outcome_kind: string; requires_reconciliation: number;
+    physical_crossing_count: number; host_crossing_count: number;
+  }>;
+}
+
+/** A final "done" answer is not proof of a completed task. Check payload and
+ * journal evidence independently; provider readback remains a separate leg. */
+export function checkLiveTurn(expect: z.infer<typeof LiveTurnExpectationSchema>, facts: LiveTurnFacts): string[] {
+  const failures: string[] = [];
+  if (facts.terminalStatus !== 'done') failures.push(`terminal: expected done, got ${facts.terminalStatus}`);
+  for (const value of expect.replyIncludes ?? []) {
+    if (!facts.reply.includes(value)) failures.push(`reply missing exact text: ${JSON.stringify(value)}`);
+  }
+  for (const value of expect.replyExcludes ?? []) {
+    if (facts.reply.includes(value)) failures.push(`reply contains forbidden text: ${JSON.stringify(value)}`);
+  }
+  for (const [label, actual, maximum] of [
+    ['model requests', facts.modelRequests, expect.maxModelRequests],
+    ['tool searches', facts.toolSearches, expect.maxToolSearches],
+    ['tool calls', facts.toolCalls, expect.maxToolCalls],
+    ['wall time', facts.wallMs, expect.maxWallMs],
+  ] as const) {
+    if (maximum !== undefined && (actual === null || actual > maximum)) failures.push(`${label}: ${actual} exceeds ${maximum}`);
+  }
+  if (expect.minToolCalls !== undefined && facts.toolCalls < expect.minToolCalls) failures.push(`tool calls: ${facts.toolCalls} below ${expect.minToolCalls}`);
+  // Count durable path evidence, not plan_task attempts or completion prose.
+  // The separate receipt audit still authenticates individual proof bytes.
+  for (const [label, actual, expected] of [
+    ['activated plans', facts.activatedPlans, expect.activatedPlans],
+    ['provider acknowledgements', facts.providerAcknowledgements, expect.providerAcknowledgements],
+  ] as const) {
+    if (expected !== undefined && actual !== expected) failures.push(`${label}: expected ${expected}, got ${actual ?? 'unavailable'}`);
+  }
+  const mutations = facts.settlements.filter((row) => row.mutating === 1);
+  if (expect.successfulMutations !== undefined) {
+    const successful = mutations.filter((row) => row.outcome_kind === 'succeeded'
+      && row.requires_reconciliation === 0 && row.physical_crossing_count + row.host_crossing_count > 0);
+    if (successful.length !== expect.successfulMutations || mutations.length !== successful.length) {
+      failures.push(`mutations: expected exactly ${expect.successfulMutations} successful settled effects; got ${successful.length} successful / ${mutations.length} total`);
+    }
+    if (mutations.some((row) => row.physical_crossing_count > 1 || row.host_crossing_count > 1)) {
+      failures.push('a mutating logical call crossed its execution boundary more than once');
+    }
+  }
+  for (const tool of expect.forbiddenTools ?? []) {
+    if ((facts.perTool[tool] ?? 0) > 0) failures.push(`forbidden tool used: ${tool}`);
+  }
+  return failures;
+}

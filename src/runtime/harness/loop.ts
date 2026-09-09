@@ -9908,27 +9908,25 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ];
   }
 
-  // Cross-session prefix injection. The seed function in discord-harness
-  // writes a cross_session_prefix event when a fresh session opens with
-  // prior same-channel context. Without injecting it into items here,
-  // the agent only sees it if it explicitly calls session_history —
-  // which it often skips. Prepending as a system message guarantees
-  // the agent reads the continuation context BEFORE deciding what tool
-  // to call. (Observed in the missing-focus regression: agent skipped
-  // session_history, called memory_recall, picked the wrong sheet.)
-  // Only on the FIRST turn — subsequent turns already have it in
-  // compactedItems via session history replay.
-  if (turn === 1 || compactedItems.length === 0) {
+  // Same-conversation context is also seeded when an older daemon's active
+  // successor first returns after upgrade. Inject every missing prefix before
+  // choosing a tool, even after turn one; an existing exact item prevents
+  // duplication. These public historical exchanges carry no execution grants.
+  {
     try {
       const prefixEvents = listEvents(options.sessionId, { types: ['cross_session_prefix'] });
       if (prefixEvents.length > 0) {
-        const prefixText = prefixEvents
+        const prefixTexts = prefixEvents
           .map((e) => {
             const text = (e.data as { text?: unknown })?.text;
             return typeof text === 'string' ? text : '';
           })
-          .filter(Boolean)
-          .join('\n\n');
+          .filter(Boolean);
+        const existingSystemTexts = compactedItems.flatMap((item) => {
+          const candidate = item as unknown as { role?: unknown; content?: unknown };
+          return candidate.role === 'system' ? [itemText(candidate.content)] : [];
+        });
+        const prefixText = prefixTexts.filter((text) => !existingSystemTexts.some((existing) => existing.includes(text))).join('\n\n');
         if (prefixText) {
           compactedItems.unshift({ role: 'system', content: prefixText } as AgentInputItem);
         }

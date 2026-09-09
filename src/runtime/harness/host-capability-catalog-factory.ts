@@ -45,6 +45,7 @@ import {
   type SealedNodeBindingDigestInput,
 } from './sealed-node-binding-digest.js';
 import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
+import { parseProviderAcknowledgementMode, type ProviderAcknowledgementModeV1 } from './provider-acknowledgement-contract.js';
 
 export type {
   GraphNodeCapabilityInvoke,
@@ -931,6 +932,14 @@ export function persistSealedNodeBinding(input: {
   binding: SealedNodeBinding;
 }): boolean {
   const db = openEventLog();
+  const existing = loadSealedNodeBinding(input.sessionId, input.sourceUserSeq, input.binding.nodeId);
+  if (existing) return existing.bindingDigest === input.binding.bindingDigest;
+  // Completion policy may be selected only before this business operation is
+  // admitted. Recovery may replay its existing seal, never downgrade a write.
+  if (input.binding.writeEvidenceMode && db.prepare(`
+    SELECT 1 FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND requirement_id = ? LIMIT 1
+  `).get(input.sessionId, input.sourceUserSeq, input.binding.nodeId)) return false;
   const inserted = db.prepare(`
     INSERT OR IGNORE INTO graph_node_bindings
       (session_id, source_user_seq, node_id, binding_json, binding_digest)
@@ -943,8 +952,7 @@ export function persistSealedNodeBinding(input: {
     input.binding.bindingDigest,
   );
   if (inserted.changes === 1) return true;
-  const existing = loadSealedNodeBinding(input.sessionId, input.sourceUserSeq, input.binding.nodeId);
-  return existing?.bindingDigest === input.binding.bindingDigest;
+  return loadSealedNodeBinding(input.sessionId, input.sourceUserSeq, input.binding.nodeId)?.bindingDigest === input.binding.bindingDigest;
 }
 
 export function loadSealedNodeBinding(
@@ -966,6 +974,9 @@ export function loadSealedNodeBinding(
       || canonicalLogicalToolName(binding.providerOperationId) !== binding.logicalToolName
     ) return null;
     if (binding.bindingDigest !== row.binding_digest) return null;
+    if (binding.writeEvidenceMode !== undefined && (!parseProviderAcknowledgementMode(binding.writeEvidenceMode)
+      || binding.effect !== 'external_write' || binding.verification || binding.asyncRead
+      || binding.operationSemantics?.atomicInputContent)) return null;
     if (binding.verification !== undefined && !parseMutationVerificationRecipe(binding.verification)) return null;
     const asyncRead = binding.asyncRead === undefined
       ? null
@@ -1010,6 +1021,7 @@ export function sealBoundCapability(input: {
    * creating a digest cycle. The final binding digest covers the recipe. */
   verification?: (baseBindingDigest: string) => MutationVerificationRecipeV1 | null;
   asyncRead?: (baseBindingDigest: string) => AsyncReadContinuationRecipeV1 | null;
+  writeEvidenceMode?: ProviderAcknowledgementModeV1;
 }): SealedNodeBinding {
   const providerOperationId = input.binding.manifest?.operationId ?? input.binding.toolName;
   const logicalToolName = canonicalLogicalToolName(providerOperationId);
@@ -1034,6 +1046,7 @@ export function sealBoundCapability(input: {
     account: input.binding.account,
     effect: input.binding.effect,
     destination: input.binding.destination,
+    ...(input.writeEvidenceMode ? { writeEvidenceMode: input.writeEvidenceMode } : {}),
     ...(input.binding.manifest?.operationSemantics
       ? { operationSemantics: input.binding.manifest.operationSemantics }
       : {}),

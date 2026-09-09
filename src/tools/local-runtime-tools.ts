@@ -50,6 +50,7 @@ import {
   type ToolSearchCandidateSource,
   type ToolSearchPlanningDisclosureOutcome,
   type ToolSearchPlanningDisclosureCandidate,
+  type ToolSearchPlanningDisclosureControl,
 } from './tool-search-tool.js';
 import { markFreshPlanDisclosureSearch } from './tool-search-mode.js';
 import { registerHarnessStatusTools } from './harness-status-tools.js';
@@ -502,6 +503,7 @@ export function buildScopedLocalToolSearch(
   candidateSources?: readonly ToolSearchCandidateSource[],
   discloseForPlanning?: (
     candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+    control?: Readonly<ToolSearchPlanningDisclosureControl>,
   ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
     | Readonly<Record<string, string>>
     | ToolSearchPlanningDisclosureOutcome,

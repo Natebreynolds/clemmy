@@ -44,6 +44,7 @@ import {
   peekHostCapabilityCatalogFactory,
   canonicalCatalogIdentityOf,
   catalogIdentitiesEqual,
+  persistedCatalogSnapshotManifestIdsForSource,
   type CanonicalCatalogIdentityV1,
 } from './host-capability-catalog-factory.js';
 import {
@@ -111,6 +112,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function toolkitOf(slug: string): string {
   return slug.split('_')[0]?.toLowerCase() ?? '';
+}
+
+/** The exact retired host default; explicit adapter/caller contracts are not
+ * eligible for either prospective withholding or a policy successor. */
+export function isLegacyGenericProviderWriteEvidencePolicy(manifest: CapabilityManifestV1 | undefined): boolean {
+  return Boolean(manifest
+    && manifest.providerKind === 'composio'
+    && manifest.effect === 'external_write'
+    && manifest.provenance.issuer === 'host:resolution-proof'
+    && !manifest.externalDefinition?.verification
+    && !manifest.operationSemantics?.atomicInputContent
+    && manifest.readbackContract === undefined
+    && manifest.evidenceContract.readbackRequired === true
+    && manifest.evidenceContract.kinds.length === 2
+    && manifest.evidenceContract.kinds.includes('receipt')
+    && manifest.evidenceContract.kinds.includes('readback'));
 }
 
 function currentProofManifestLineage(input: {
@@ -410,6 +427,9 @@ export async function registerProofProvisionedCapabilities(identity: {
     );
     const factory = peekHostCapabilityCatalogFactory() ?? createHostCapabilityCatalogFactory();
     const store = peekCapabilityManifestStore() ?? resolveCapabilityManifestStore();
+    const frozenSource = persistedCatalogSnapshotManifestIdsForSource(identity);
+    const mayUpgradeLegacyEvidencePolicy = options.recoveryExpectedIdentities === undefined
+      && !frozenSource.ok && frozenSource.reason === 'missing_snapshot';
 
     for (const entry of entries) {
       if (options.publicationGuard && !options.publicationGuard()) return { registered };
@@ -478,6 +498,15 @@ export async function registerProofProvisionedCapabilities(identity: {
         && 'mutation' in verification ? verification.mutation : null;
       const readbackVerification: ReadbackVerificationContractV1 | null = verification
         && 'readback' in verification ? verification.readback : null;
+      // A generic provider acknowledgement does not promise an independently
+      // verifiable receipt or a readback operation. Only an adapter-authored
+      // contract may advertise those stronger obligations.
+      const evidenceContract: CapabilityManifestV1['evidenceContract'] = {
+        kinds: atomicContentCommit
+          ? [...atomicContentCommit.evidence]
+          : write ? verification ? ['receipt', 'readback'] : ['tool_result'] : ['payload'],
+        readbackRequired: write && !atomicContentCommit && verification !== null,
+      };
       const advisoryRoles = advisoryRolesForProofEntry({
         effect: write ? 'external_write' : 'read',
         schema,
@@ -514,7 +543,7 @@ export async function registerProofProvisionedCapabilities(identity: {
       const currentInstalled = currentLineage[0];
       const outputSchemaDigest = outputSchema ? digestSchema(outputSchema) : undefined;
       const currentDefinition = currentInstalled?.manifest;
-      const currentMatches = Boolean(
+      const currentDefinitionMatches = Boolean(
         currentDefinition
         && currentDefinition.operationId === slug
         && currentDefinition.effect === effect
@@ -532,10 +561,20 @@ export async function registerProofProvisionedCapabilities(identity: {
         && JSON.stringify(currentDefinition.operationSemantics ?? null)
           === JSON.stringify(operationSemantics)
       );
+      // This old producer default was a contractual overclaim, not harmless
+      // display decoration. Replace only that known host-authored default on
+      // fresh discovery, under a successor id. Explicit adapter/caller evidence
+      // and already-frozen source identities keep their original requirements.
+      const upgradeLegacyEvidencePolicy = currentDefinitionMatches
+        && mayUpgradeLegacyEvidencePolicy
+        && write && !verification && !atomicContentCommit
+        && isLegacyGenericProviderWriteEvidencePolicy(currentDefinition);
+      const currentMatches = currentDefinitionMatches && !upgradeLegacyEvidencePolicy;
       const semanticDefinitionFingerprint = sha256(JSON.stringify({
         definitionFingerprint,
         verification,
         operationSemantics,
+        evidenceContract,
       }));
       const capabilityId = currentMatches
         ? currentDefinition!.manifestId
@@ -612,12 +651,7 @@ export async function registerProofProvisionedCapabilities(identity: {
               },
             }
           : {}),
-        evidenceContract: {
-          kinds: atomicContentCommit
-            ? [...atomicContentCommit.evidence]
-            : write ? ['receipt', 'readback'] : ['payload'],
-          readbackRequired: write && !atomicContentCommit,
-        },
+        evidenceContract,
         provenance: {
           issuer: 'host:resolution-proof',
           issuedAt: '1970-01-01T00:00:00.000Z',
@@ -657,9 +691,10 @@ export async function registerProofProvisionedCapabilities(identity: {
       });
       // Identity is the PROVIDER definition (`currentMatches`: operation,
       // effect, version, fingerprint, account, port, schema digests,
-      // verification, semantics). When it matches the installed manifest, the
+      // verification, semantics, and the explicit legacy evidence-policy
+      // migration above). When it matches the installed manifest, the
       // installed manifest IS the registration. Host-side decoration (behaviour
-      // hints, evidence kinds, roles) evolves with this builder and must never
+      // hints and roles) evolves with this builder and must never
       // fork the durable identity under the same id: live 2026-09-01, 28 rows
       // installed before behaviour hints existed made every fresh proof mint a
       // different digest for the SAME id, the store refused it, and the

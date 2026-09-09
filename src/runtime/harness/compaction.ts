@@ -1,7 +1,6 @@
 import type { AgentInputItem } from '@openai/agents';
 import { Agent, Runner } from '@openai/agents';
 import { createHash } from 'node:crypto';
-import { MODELS } from '../../config.js';
 import {
   appendEvent,
   getToolOutput,
@@ -26,7 +25,7 @@ import { toolCallHint } from './tool-call-hint.js';
  *   Layer 1 — clip `function_call_result.output.text` for items older
  *             than the last N turns. Deterministic, no LLM call.
  *   Layer 2 — summarize older messages into a single `system` message
- *             via a single Codex turn. Validates call_id references.
+ *             via the configured worker model. Validates call_id references.
  *   Layer 3 — auto-fresh fork when even Layer 1+2 leaves the input above
  *             90% of budget. Returns a "fork to new session" signal so
  *             the channel layer can hand off.
@@ -263,11 +262,13 @@ export function describeCanonicalClippedToolResult(
   return { callId: row.callId, toolName, originalChars, clippedAt };
 }
 
-// Cheap, fast model for summarization. The fast tier is gpt-5.4-mini (or
-// equivalent) — summarization is straightforward and doesn't need the
-// primary's reasoning budget.
-function getSummarizerModel(): string {
-  return MODELS.fast || MODELS.primary || 'gpt-5.4-mini';
+// Summarization is delegated work. Use the canonical worker assignment,
+// whose default follows the configured brain and whose explicit assignments
+// retain their provider. A legacy fast-tier id can name an unsupported or
+// unrelated provider even while the user's selected brain works normally.
+async function getSummarizerModel(): Promise<string> {
+  const { resolveRoleModel } = await import('./model-roles.js');
+  return resolveRoleModel('worker').modelId;
 }
 
 export interface CompactionOptions {
@@ -290,18 +291,12 @@ export interface CompactionOptions {
    * (fork) is suppressed — the checkpoint IS the reset.
    */
   forceLayer2?: boolean;
-  /**
-   * Age/idle-aware compaction (Phase 4a). Milliseconds since the session's last
-   * turn (the caller reads session.lastActivityAt() BEFORE this turn writes
-   * back). When the gap exceeds idleCompactionThresholdMs AND the transcript
-   * carries real weight (> idleCompactionMinTokens), proactively run Layer 1 +
-   * Layer 2 so a stale thread summarizes its old turns instead of dragging the
-   * full transcript into the return turn — even when it's below token pressure.
-   * Like forceLayer2, it summarizes IN PLACE (no Layer-3 fork). Omitted → no
-   * idle trigger (byte-identical to today).
-   */
+  /** @deprecated Accepted for caller compatibility only. Elapsed idle time
+   * is not context pressure and never authorizes information loss. */
   idleMs?: number;
+  /** @deprecated Ignored; compaction follows model context pressure. */
   idleCompactionThresholdMs?: number;
+  /** @deprecated Ignored; compaction follows model context pressure. */
   idleCompactionMinTokens?: number;
   /** Test injection. */
   now?: () => string;
@@ -982,7 +977,7 @@ function serializeForSummarizer(items: AgentInputItem[]): string {
 }
 
 /**
- * Run a single summarization turn against the cheap mini model. Returns
+ * Run a single summarization turn against the selected worker model. Returns
  * the bullet-summary text, or null on failure. Failures are non-fatal
  * for the outer compaction loop — Layer 2 is best-effort, and Layer 3
  * can still take over if needed.
@@ -1011,12 +1006,15 @@ export function capSummarizerInput(serializedOlder: string, summarizerModelId: s
 }
 
 async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTurnResult> {
-  const model = getSummarizerModel();
-  // Cap BEFORE the test hook so the pin can observe exactly what a live
-  // summarizer would receive.
-  serializedOlder = capSummarizerInput(serializedOlder, model);
-  if (summarizerTurnForTests) return summarizerTurnForTests(serializedOlder);
   try {
+    const modelId = await getSummarizerModel();
+    // Cap to the selected worker's window before the test hook or transport.
+    serializedOlder = capSummarizerInput(serializedOlder, modelId);
+    if (summarizerTurnForTests) return await summarizerTurnForTests(serializedOlder);
+    // Resolve through the same credential router as other host model calls;
+    // a utility Runner must not inherit the SDK's ambient OpenAI provider.
+    const { resolveHarnessModel } = await import('./codex-client.js');
+    const model = await resolveHarnessModel(modelId);
     const agent = new Agent({
       name: 'Compaction Summarizer',
       model,
@@ -1033,7 +1031,7 @@ async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTur
     if (!text || !text.trim()) {
       return { error: 'summarizer returned empty output' };
     }
-    return { summary: text.trim(), modelUsed: model };
+    return { summary: text.trim(), modelUsed: modelId };
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
@@ -1292,19 +1290,10 @@ export async function compactSessionIfNeeded(
   // multi-tool run while 85-99% of context was free. Token pressure is the real
   // signal; item count only matters when those items are actually filling the
   // window.
-  // Age/idle trigger (Phase 4a): a long-idle thread with real weight proactively
-  // summarizes so the return turn isn't dragged by the full stale transcript.
-  // Default threshold 30 min idle, 6k tokens.
-  const idleThresholdMs = opts.idleCompactionThresholdMs ?? 30 * 60 * 1000;
-  const idleMinTokens = opts.idleCompactionMinTokens ?? 6000;
-  const idleTrigger =
-    typeof opts.idleMs === 'number'
-    && opts.idleMs > idleThresholdMs
-    && beforeTokens > idleMinTokens;
-
+  // Returning after a break preserves the same working context. Only
+  // context pressure or an explicit stage checkpoint can trigger compaction.
   const layer1Trigger =
     opts.forceLayer2
-    || idleTrigger
     || beforeTokens > budget * l1Frac
     || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
   if (layer1Trigger) {
@@ -1329,7 +1318,7 @@ export async function compactSessionIfNeeded(
   }
 
   // Layer 2
-  if (opts.forceLayer2 || idleTrigger || postL1Tokens > budget * l2Frac) {
+  if (opts.forceLayer2 || postL1Tokens > budget * l2Frac) {
     const l2 = await summarizeOlderMessages(nextItems, session.id, retainMessages);
     result.layer2 = {
       applied: l2.applied,
@@ -1348,12 +1337,10 @@ export async function compactSessionIfNeeded(
     postL1Tokens = result.afterTokens;
   }
 
-  // Layer 3 — fork. Suppressed during a forced stage checkpoint OR an idle
-  // summarize: those passes reset IN PLACE, so we never also recommend a session
-  // fork on the same pass (idle summarizing shouldn't yank the user into a new
-  // session; if it's still huge, the next active turn's token pressure forks).
+  // A forced stage checkpoint resets in place. Ordinary overflow remains
+  // governed by the routed context budget, independent of session age.
   let forkRequest: ForkRequest | undefined;
-  if (!opts.forceLayer2 && !idleTrigger && postL1Tokens > budget * l3Frac) {
+  if (!opts.forceLayer2 && postL1Tokens > budget * l3Frac) {
     forkRequest = buildForkRequest(nextItems, session.id);
     result.layer3 = { applied: true, forkRequested: true };
   }

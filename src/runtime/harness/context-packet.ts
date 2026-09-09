@@ -527,8 +527,12 @@ function focusLine(input?: string, sessionId?: string): string | null {
       }
       return `Active focus: ${focus.active.title} — ${clip(focus.active.summary, 180)}`;
     }
-    if (focus.active && focus.needsConfirm) return `Stale focus exists: ${focus.active.title}. Confirm before relying on it.`;
-    if (focus.parked.length > 0) return `Parked resumable threads: ${focus.parked.slice(0, 3).map((p) => p.title).join('; ')}`;
+    if (focus.active && focus.needsConfirm
+      && !focusSummaryIsHistoricalForRequest(focus.active, input, sessionId)) {
+      return `Stale focus exists: ${focus.active.title}. Confirm before relying on it.`;
+    }
+    const parked = focus.parked.filter((row) => !focusSummaryIsHistoricalForRequest(row, input, sessionId));
+    if (parked.length > 0) return `Parked resumable threads: ${parked.slice(0, 3).map((p) => p.title).join('; ')}`;
   } catch {
     return null;
   }

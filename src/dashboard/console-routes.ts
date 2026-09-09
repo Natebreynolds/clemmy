@@ -5,7 +5,8 @@ import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
 import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
@@ -430,6 +431,16 @@ import {
   resolveEffectiveProviderForModel,
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
+
+// Process identity is captured once, outside route registration. Recomputing
+// Date.now() - uptime on every request drifted by one millisecond and made a
+// completed live proof appear to have crossed a daemon restart. timeOrigin is
+// the process boot clock; later wall-clock corrections cannot change it.
+const CONSOLE_PROCESS_IDENTITY = Object.freeze({
+  daemonInstanceId: randomUUID(),
+  daemonProcessId: process.pid,
+  startedAt: new Date(performance.timeOrigin).toISOString(),
+});
 
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
@@ -8231,7 +8242,7 @@ export function registerConsoleRoutes(
         // Preserve the legacy package walk as a compatibility fallback while
         // exposing the exact runtime identity used by launch/proof checks.
         version: buildInfo.version === 'unknown' ? version ?? 'unknown' : buildInfo.version,
-        startedAt: new Date(process.uptime() * 1000 * -1 + Date.now()).toISOString(),
+        ...CONSOLE_PROCESS_IDENTITY,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

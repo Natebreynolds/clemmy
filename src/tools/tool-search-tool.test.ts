@@ -154,7 +154,7 @@ test('incident replay: scoped reminder discovery ranks the firing timer above a 
   }
 });
 
-test('a uniquely named saved-workflow run is an exact workflow_run hit, not a provider hunt', async () => {
+test('an explicit workflow_run tool selection keeps its exact discovery shortcut', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
   const { WORKFLOWS_DIR } = await import('../memory/vault.js');
   const { rmSync } = await import('node:fs');
@@ -184,7 +184,7 @@ test('a uniquely named saved-workflow run is an exact workflow_run hit, not a pr
       }],
     );
     const raw = await t.handler({
-      query: 'Can you run my platform 49 workflow',
+      query: 'workflow_run',
       limit: 8,
     });
     const out = JSON.parse(raw.content[0]!.text) as {
@@ -329,6 +329,95 @@ test('one federated broker returns an authorized provider candidate with exact s
   assert.equal(out.results[0]?.carrier, 'work_call');
   assert.deepEqual((out.schemas.crm__mass_read as { required?: string[] }).required, ['query']);
   assert.match(out.hint, /work_call/);
+});
+
+test('account review unavailability has consistent global and row recovery without reasking the account', async () => {
+  for (const reason of ['review_unavailable', undefined] as const) {
+    let handler!: Handler;
+    registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+      allowedNames: new Set(), dispatchCarrier: 'work_call',
+      candidateSources: [{ kind: 'authorized_composio', async search() { return [{
+        name: 'OUTLOOK_CREATE_DRAFT', summary: 'Create an unsent draft', score: 1,
+        carrier: 'work_call', schema: { type: 'object', properties: {} },
+      }]; } }],
+      async discloseForPlanning() {
+        return { version: 1, refs: {}, blockers: { OUTLOOK_CREATE_DRAFT: {
+          code: 'account_selection_required', choices: ['work@fixture.invalid', 'personal@fixture.invalid'],
+          ...(reason ? { reason } : {}),
+        } } };
+      },
+    });
+    const response = await handler({ query: 'Outlook create draft' });
+    const body = JSON.parse(response.content[0]!.text);
+    if (reason) {
+      assert.match(body.hint, /Retry the identical account_selection once/);
+      assert.match(body.hint, /report that exact host blocker/);
+      assert.doesNotMatch(body.hint, /Ask the user which exact connected account/);
+      assert.ok(body.hint.includes(body.results[0].accountSelectionNextStep),
+        'the global instruction and exact row share the same typed recovery');
+      assert.equal(body.results[0].accountSelectionReason, reason);
+    } else {
+      assert.match(body.hint, /Ask the user which exact connected account/);
+      assert.match(body.hint, /work@fixture.invalid/);
+      assert.doesNotMatch(body.hint, /review unavailable/);
+    }
+  }
+});
+
+test('page guidance follows eight published choices and preserves an off-page account blocker on its own page', async () => {
+  let handler!: Handler;
+  let sourceCalls = 0;
+  const readyNames = Array.from({ length: 8 }, (_, index) => `OUTLOOK_READY_OPERATION_${index + 1}`);
+  const blockedName = 'GOOGLECALENDAR_CREATE_EVENT';
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(), dispatchCarrier: 'work_call',
+    candidateSources: [{ kind: 'authorized_composio', async search() {
+      sourceCalls += 1;
+      return [...readyNames, blockedName].map((name, index) => ({
+        name, summary: 'Create a provider item', score: 100 - index,
+        carrier: 'work_call' as const, schema: { type: 'object', properties: {} },
+      }));
+    } }],
+    async discloseForPlanning() {
+      return { version: 1, refs: Object.fromEntries(readyNames.map((name) => [name, `cap:resolved:${name.toLowerCase()}`])),
+        blockers: { [blockedName]: { code: 'account_selection_required', choices: ['calendar@fixture.invalid'] } } };
+    },
+  });
+  const first = JSON.parse((await handler({ query: 'create provider item', limit: 8 })).content[0]!.text);
+  assert.deepEqual(first.results.map((row: { name: string }) => row.name), readyNames);
+  assert.ok(first.results.every((row: { capabilityRef?: string }) => row.capabilityRef));
+  assert.match(first.hint, /work_call/);
+  assert.doesNotMatch(first.hint, /account selection|Ask the user|calendar@fixture.invalid/i);
+  assert.ok(first.next_cursor);
+  const second = JSON.parse((await handler({ query: 'create provider item', limit: 8, cursor: first.next_cursor })).content[0]!.text);
+  assert.equal(sourceCalls, 1, 'the next page uses its retained disclosure');
+  assert.equal(second.results[0].name, blockedName);
+  assert.equal(second.results[0].planningRefStatus, 'account_selection_required');
+  assert.deepEqual(second.results[0].accountChoices, ['calendar@fixture.invalid']);
+  assert.match(second.hint, /Ask the user which exact connected account/);
+  assert.match(second.hint, /calendar@fixture.invalid/);
+});
+
+test('mixed ready and blocked choices keep dispatch available and account recovery specific to the selected row', async () => {
+  let handler!: Handler;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(), dispatchCarrier: 'work_call',
+    candidateSources: [{ kind: 'authorized_composio', async search() { return [
+      { name: 'OUTLOOK_CREATE_DRAFT', summary: 'Create an unsent draft', score: 2 },
+      { name: 'GOOGLECALENDAR_CREATE_EVENT', summary: 'Create a calendar event', score: 1 },
+    ].map((candidate) => ({ ...candidate, carrier: 'work_call' as const, schema: { type: 'object', properties: {} } })); } }],
+    async discloseForPlanning() { return { version: 1, refs: { OUTLOOK_CREATE_DRAFT: 'cap:resolved:outlook_create_draft' },
+      blockers: { GOOGLECALENDAR_CREATE_EVENT: { code: 'account_selection_required', choices: ['calendar@fixture.invalid'], reason: 'review_unavailable' } } }; },
+  });
+  const body = JSON.parse((await handler({ query: 'create provider item', limit: 8 })).content[0]!.text);
+  assert.equal(body.results[0].capabilityRef, 'cap:resolved:outlook_create_draft');
+  assert.match(body.hint, /work_call/);
+  assert.match(body.hint, /Only if you select an unresolved result/);
+  assert.doesNotMatch(body.hint, /Ask the user|Retry the identical account_selection/);
+  const blocked = body.results.find((row: { name: string }) => row.name === 'GOOGLECALENDAR_CREATE_EVENT');
+  assert.equal(blocked.planningRefStatus, 'account_selection_required');
+  assert.equal(blocked.accountSelectionReason, 'review_unavailable');
+  assert.match(blocked.accountSelectionNextStep, /Retry the identical account_selection once/);
 });
 
 test('the default eight-result page keeps provider rank nine reachable without a second source search', async () => {

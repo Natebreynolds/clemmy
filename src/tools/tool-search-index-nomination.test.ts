@@ -207,7 +207,7 @@ async function composioCandidates(query: string, signal?: AbortSignal, deadlineA
     allowedServerSlugs: [],
     toolPatterns: [],
     maxTools: 0,
-  } as never, { sessionId: 'nomination-proof', sourceUserSeq: 1 });
+  } as never);
   const source = sources.find((entry) => entry.kind === 'authorized_composio');
   assert.ok(source, 'the composio candidate source must exist');
   return source!.search({ query, limit: 8, signal, deadlineAt });
@@ -372,10 +372,26 @@ async function runCausalPlanningDisclosure(input: {
     sourceKind: 'authorized_composio' as const,
     schema: candidate!.schema,
   };
-  await providerSources.stageDisclosedPlanningProviderCandidates({
-    ...identity,
-    candidates: [planningCandidate],
+  const routingRegistry = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+  routingRegistry.installTurnSemanticModelPort({
+    async interpret() { throw new Error('metadata disclosure does not interpret work'); },
+    async judgeAccountSelection(call) {
+      assert.equal(call.acceptedText, input.query);
+      return { verdict: call.mode === 'current_source_default' ? 'default_compatible' : 'entailed',
+        proposalDigest: call.proposalDigest, modelIdentity: 'fixture-account-judge' };
+    },
   });
+  try {
+    await providerSources.stageDisclosedPlanningProviderCandidates({
+      ...identity,
+      candidates: [planningCandidate],
+      // These multi-account fixtures explicitly name the tested account in
+      // their accepted query; generic singleton fixtures use checked defaults.
+      ...((input.connections?.length ?? 1) > 1 ? { accountSelection: {
+        toolkit: input.toolkit, identity: input.connectionId, source_quote: input.query,
+      } } : {}),
+    });
+  } finally { routingRegistry.installTurnSemanticModelPort(null); }
   const refs = await semantic.disclosePrimaryModelPlanningCapabilities({
     authority: primed.planning.authority,
     candidates: [planningCandidate],
@@ -837,6 +853,143 @@ test('an ambiguous connected account never fetches or deposits an indexed operat
   assert.ok(!names.includes(operation));
   assert.ok(!exactLookups.includes(operation), 'account selection is required before exact materialization');
   assert.equal(schemaCache.liveComposioSchemaFingerprint(operation), undefined);
+});
+
+test('typed source selection reaches the best indexed operation on the first five-row discovery page', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const registry = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+  const resolution = await import('../runtime/harness/capability-resolution.js');
+  const operation = 'OUTLOOK_CREATE_DRAFT';
+  const query = 'outlook create draft email message';
+  const accepted = 'Save those exact three drafts in the Outlook Drafts folder for my work mailbox.';
+  const accountSelection = { toolkit: 'outlook', identity: 'operator@work.invalid', source_quote: accepted };
+  const variants = [
+    'OUTLOOK_CREATE_ME_MESSAGE_REPLY_ALL_DRAFT', 'OUTLOOK_CREATE_FORWARD_DRAFT',
+    'OUTLOOK_CREATE_REPLY_ALL_DRAFT', 'OUTLOOK_CREATE_ME_REPLY_ALL_DRAFT',
+    'OUTLOOK_CREATE_USER_MAIL_FOLDER_MESSAGE_REPLY_DRAFT',
+  ];
+  try {
+    for (const includeDesiredInFuzzy of [false, true]) {
+      schemaCache.resetToolSchemaCache();
+      capabilityIndex._resetCapabilityIndexForTest();
+      eventlog.resetEventLog();
+      const candidateRows = variants.map(slug => ({
+        slug, name: slug.replaceAll('_', ' '), toolkit: { slug: 'outlook' },
+        description: 'Create an Outlook email message reply draft to an existing message.',
+        inputParameters: { type: 'object', required: ['message_id'], properties: { message_id: { type: 'string' } } },
+        outputParameters: READ_OUTPUT, version: 'fixture-reply-v1',
+      }));
+      if (includeDesiredInFuzzy) candidateRows.push({
+        slug: operation, name: 'Create draft', toolkit: { slug: 'outlook' },
+        description: 'Create a standalone Outlook draft.',
+        inputParameters: { type: 'object', required: ['message_id'], properties: { message_id: { type: 'string' } } },
+        outputParameters: READ_OUTPUT, version: 'fixture-draft-v1',
+      });
+      installBroker({
+        exact: [operation, ...variants], fuzzyRows: candidateRows,
+        connections: [
+          { id: 'ca_work', toolkit: 'outlook', email: 'operator@work.invalid' },
+          { id: 'ca_personal', toolkit: 'outlook', email: 'operator@personal.invalid' },
+        ],
+      });
+      capabilityIndex.recordCapabilityOperations([
+        { identifier: operation, displayName: 'Create draft email message',
+          description: 'Create a new Outlook draft email message with subject and body.' },
+        ...variants.map(identifier => ({ identifier, displayName: identifier,
+          description: 'Reply to an existing message.' })),
+      ].map(row => ({ ...row, carrierKind: 'composio' as const, carrier: 'outlook',
+        effectClass: 'write' as const, effectProvenance: 'declared' as const })));
+      assert.equal(capabilityIndex.searchCapabilityOperations(query)[0]?.identifier, operation,
+        'the fixture reproduces the independently observed best local-index match');
+      const session = eventlog.createSession({ id: `typed-nomination-first-page-${includeDesiredInFuzzy}`, kind: 'chat', userId: 'fixture-owner' });
+      const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: accepted } });
+      const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+      const continuationText = 'Save one more draft in that same mailbox.';
+      let judgeCalls = 0;
+      registry.installTurnSemanticModelPort({
+        async interpret() { throw new Error('discovery must not invent a work plan'); },
+        async judgeAccountSelection(call) {
+          judgeCalls++;
+          assert.equal(call.acceptedText, call.sourceUserSeq === source.seq ? accepted : continuationText,
+            'full accepted source, not the short query');
+          assert.equal(call.accountIdentity, accountSelection.identity);
+          return { verdict: 'entailed', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-judge' };
+        },
+      });
+      const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
+        authority: 'none', reason: 'isolated Composio discovery', maxTools: 0,
+      } as never, identity).filter(entry => entry.kind === 'authorized_composio');
+      let handler!: (input: unknown) => Promise<{ content: Array<{ text: string }> }>;
+      registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: typeof handler) { handler = callback; } } as never, {
+        dispatchCarrier: 'work_call', candidateSources: sources,
+        async discloseForPlanning(candidates, control) {
+          const staged = await providerSources.stageDisclosedPlanningProviderCandidates({
+            ...identity, candidates, ...control,
+          });
+          return { version: 1, refs: {}, blockers: staged.blockers };
+        },
+      });
+      const response = await handler({ query, account_selection: accountSelection, limit: 5, cursor: null, role_key: null });
+      const body = JSON.parse(response.content[0]!.text);
+      assert.equal(body.results[0]?.name, operation,
+        'live indexed base operation must lead the first page even if fuzzy omitted it or ranked it after five variants');
+      assert.ok(body.results.every((row: { name: string }) => row.name.startsWith('OUTLOOK_')),
+        'relevant provider rows occupy the first page without unrelated local create tools');
+      assert.equal(body.results[0]?.planningRefStatus, 'materialization_unavailable',
+        'this fixture intentionally publishes no authority from ranking alone');
+      assert.ok(exactLookups.includes(operation), 'the advisory row must be exactly revalidated');
+      assert.ok(providerToolCalls.filter(call => Array.isArray(call.tools)).every(call => (call.tools as string[]).length <= 6));
+      assert.equal(judgeCalls, 1, 'source acquisition and final staging share one checked routing judgment');
+      const proven = resolution.provenCapabilityEntriesForTurn(identity).find(entry => entry.identifier === operation);
+      assert.equal(proven?.accountIdentity, 'ca_work');
+      assert.equal(proven?.sourceAccountRouting?.sourceQuote, accepted);
+
+      const continuation = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user',
+        type: 'user_input_received', data: { text: continuationText } });
+      const followupProvider = providerSources.buildAuthorizedToolSearchCandidateSources({
+        authority: 'none', reason: 'isolated continuation', maxTools: 0,
+      } as never, { sessionId: session.id, sourceUserSeq: continuation.seq })
+        .find(entry => entry.kind === 'authorized_composio')!;
+      const followup = await followupProvider.search({ query, limit: 5 });
+      assert.equal(followup[0]?.name, operation,
+        'a checked continuing route unlocks the index without a repeated nomination or account phrase');
+      assert.equal(judgeCalls, 2, 'the current continuation is checked once against the earlier selected route');
+    }
+  } finally { registry.installTurnSemanticModelPort(null); }
+});
+
+test('an unsupported source nomination cannot unlock indexed metadata acquisition', async () => {
+  const registry = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+  const operation = 'OUTLOOK_CREATE_DRAFT_UNSUPPORTED_SELECTION';
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  eventlog.resetEventLog();
+  installBroker({ exact: [operation], connections: [
+    { id: 'ca_work', toolkit: 'outlook', email: 'operator@work.invalid' },
+    { id: 'ca_personal', toolkit: 'outlook', email: 'operator@personal.invalid' },
+  ] });
+  nominate(operation);
+  const session = eventlog.createSession({ id: 'unsupported-nomination', kind: 'chat', userId: 'fixture-owner' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create a draft in my personal mailbox.' } });
+  let judgeCalls = 0;
+  registry.installTurnSemanticModelPort({
+    async interpret() { throw new Error('unexpected interpretation'); },
+    async judgeAccountSelection(call) {
+      judgeCalls++;
+      return { verdict: 'conflict', proposalDigest: call.proposalDigest, modelIdentity: 'fixture-judge' };
+    },
+  });
+  try {
+    const provider = providerSources.buildAuthorizedToolSearchCandidateSources({ authority: 'none', maxTools: 0 } as never,
+      { sessionId: session.id, sourceUserSeq: source.seq }).find(entry => entry.kind === 'authorized_composio')!;
+    const rows = await provider.search({ query: 'calendar create draft', limit: 5, accountSelection: {
+      toolkit: 'outlook', identity: 'operator@work.invalid', source_quote: 'Create a draft in my personal mailbox.',
+    } });
+    assert.equal(judgeCalls, 1);
+    assert.ok(!rows.some(row => row.name === operation));
+    assert.ok(!exactLookups.includes(operation));
+    assert.equal(schemaCache.liveComposioSchemaFingerprint(operation), undefined);
+  } finally { registry.installTurnSemanticModelPort(null); }
 });
 
 test('an aborted planning stage cannot deposit a late connection resolution', async () => {

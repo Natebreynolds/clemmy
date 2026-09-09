@@ -922,15 +922,14 @@ test('model history keeps the earliest valid rolling-upgrade terminal and leaves
   assert.equal(rawCount.count, 2, 'private audit rows are retained');
 });
 
-test('renderTranscriptTurns formats USER:/YOU: lines and trims long turns to 800', () => {
+test('renderTranscriptTurns formats USER:/YOU: lines without shortening retained content', () => {
   const long = 'x'.repeat(900);
   const block = renderTranscriptTurns([
     { who: 'user', text: 'hello' },
     { who: 'assistant', text: long },
   ]);
   assert.match(block, /^ {2}USER: hello$/m);
-  assert.match(block, / {2}YOU: x{800}…$/m);
-  assert.ok(!block.includes('x'.repeat(801)), 'trimmed to 800 chars + ellipsis');
+  assert.ok(block.endsWith(`  YOU: ${long}`), 'every retained content character survives projection');
 });
 
 test('renderTranscriptTurns NEUTRALIZES a tool-call-shaped ASSISTANT turn (kills the narration-replay loop)', () => {

@@ -82,3 +82,27 @@ test('depth, node, string, and total-byte budgets are enforced while traversing'
     (error: unknown) => error instanceof ClosedCanonicalJsonError && error.code === 'total_byte_limit',
   );
 });
+
+
+test('provider ingestion omits only enumerable undefined object members while strict authority encoding remains closed', () => {
+  const schema = { omitted: undefined, anyOf: [{ description: undefined, type: 'string', optional: undefined }], tail: undefined };
+  assert.throws(() => closedCanonicalJson(schema), (error: unknown) => error instanceof ClosedCanonicalJsonError && error.code === 'unsupported_type');
+  const options = { omitUndefinedObjectMembers: true };
+  assert.equal(closedCanonicalJson(schema, options), '{"anyOf":[{"type":"string"}]}');
+  let reads = 0;
+  const accessor = Object.defineProperty({}, 'description', { enumerable: true, get() { reads += 1; return undefined; } });
+  const hidden = Object.defineProperty({}, 'description', { enumerable: false, value: undefined });
+  const symbol = { [Symbol('extra')]: undefined };
+  for (const value of [[undefined], accessor, hidden, symbol, { value: NaN }, { value() {} }]) {
+    assert.throws(() => closedCanonicalJson(value, options));
+  }
+  assert.equal(reads, 0);
+});
+
+
+test('omitted SDK members still consume traversal limits', () => {
+  assert.throws(() => closedCanonicalJson({ a: undefined, b: undefined }, { omitUndefinedObjectMembers: true, maxNodes: 2 }),
+    (error: unknown) => error instanceof ClosedCanonicalJsonError && error.code === 'node_limit');
+  assert.throws(() => closedCanonicalJson({ oversized: undefined }, { omitUndefinedObjectMembers: true, maxStringBytes: 2 }),
+    (error: unknown) => error instanceof ClosedCanonicalJsonError && error.code === 'string_limit');
+});

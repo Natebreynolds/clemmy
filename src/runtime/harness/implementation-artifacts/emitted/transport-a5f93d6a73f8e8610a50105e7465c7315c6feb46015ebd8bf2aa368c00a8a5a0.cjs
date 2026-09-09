@@ -733,7 +733,17 @@ function closedCanonicalJson(value, options = {}) {
             keyPath
           );
         }
-        if (index > 0) token(",", path8);
+        if (options.omitUndefinedObjectMembers === true && descriptor.value === void 0) {
+          nodes += 1;
+          if (nodes > maxNodes) {
+            throw new ClosedCanonicalJsonError("canonical JSON exceeds the node limit", "node_limit", keyPath);
+          }
+          if (Buffer.byteLength(key, "utf8") > maxStringBytes) {
+            throw new ClosedCanonicalJsonError("string exceeds the canonical JSON string limit", "string_limit", keyPath);
+          }
+          continue;
+        }
+        if (fields.length > 0) token(",", path8);
         const encodedKey = encodeString(key, keyPath);
         token(":", keyPath);
         fields.push(`${encodedKey}:${visit(descriptor.value, keyPath, depth + 1)}`);
@@ -1114,7 +1124,7 @@ var TOOL_REGISTRY = [
   // surface, absent from the carrier universe, and walled by the work-binding
   // gate (live 2026-08-11: '"run_worker" is not a deferred callable tool').
   { name: "run_worker", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "full-extra", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Spawn a stateless Worker on ONE item using a structured parent-planned job packet." },
-  { name: "session_history", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "Read recent conversation history for a session." },
+  { name: "session_history", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Read exact conversation history for an authorized session, with lossless paging and an inclusive event boundary." },
   { name: "session_pause", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Save a structured handoff for a session so work can resume cleanly after context drift, a\u2026" },
   { name: "session_resume", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Summarize a session using its continuity brief and recent transcript so work can resume c\u2026" },
   { name: "set_model_role", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Route a model ROLE to a specific model, when the user asks in chat (e.g." },

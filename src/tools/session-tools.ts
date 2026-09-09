@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -8,7 +9,12 @@ import { PlanStore } from '../planning/plan-store.js';
 import { INBOX_DIR, TASKS_FILE, parseTasks, sessions, textResult } from './shared.js';
 import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { getSession as getHarnessSession, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
-import { pullRecentTurnsForHarnessHistory, renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import { exactSessionHistoryForTool, pullRecentTurnsForHarnessHistory, renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
+import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import type { ConversationTurn, SessionRecord } from '../types.js';
 
 interface DiscoveredWorkItem {
@@ -197,43 +203,73 @@ function sessionRecordForContinuity(sessionId: string): { session: SessionRecord
   return { session: legacy, source: 'legacy' };
 }
 
+/** Exact locator equality, not an operation/prose classifier. A named sibling
+ * such as session-A-long cannot authorize reading the shorter session-A. */
+function containsExactSessionLocator(text: string, sessionId: string): boolean {
+  const isIdentifierChar = (char: string | undefined): boolean => Boolean(char && /[\p{L}\p{N}_.:-]/u.test(char));
+  for (let offset = text.indexOf(sessionId); offset >= 0; offset = text.indexOf(sessionId, offset + sessionId.length)) {
+    if (!isIdentifierChar(text[offset - 1]) && !isIdentifierChar(text[offset + sessionId.length])) return true;
+  }
+  return false;
+}
+
 export function registerSessionTools(server: McpServer): void {
   server.tool(
     'session_history',
-    'Read recent conversation history for a session. Use through_seq to freeze the transcript, completed-action ledger, and continuation prefixes at an inclusive harness event boundary. Falls back to harness cross-session-prefix events when the v0.2 transcript store is empty for the given session (Discord sessions live in the harness eventlog, not the v0.2 sessions store).',
+    'Read exact public conversation history for the current session or an explicitly named session owned by the same principal. This read grants no task continuation or write authority. through_seq is an inclusive harness event boundary. No turn text is shortened. Large histories return lossless pages: repeat the same session_id, through_seq, max_turns and snapshot_sha256 with next_offset_chars as offset_chars until complete. max_turns optionally selects recent exchanges; omitted reads all retained exchanges. earlier_before_seq identifies older exchanges excluded by that explicit window.',
     {
       session_id: z.string().min(1),
-      max_turns: z.number().int().min(1).max(40).optional(),
-      // Some model transports serialize an omitted optional number as null.
-      // Treat that as "no boundary" instead of failing a read-only continuity
-      // lookup after the model has already done useful work.
+      max_turns: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullish(),
       through_seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullish(),
+      offset_chars: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullish(),
+      max_chars: z.number().int().min(100).max(DEFAULT_TOOL_RESULT_MAX_CHARS - 2_048).nullish()
+        .describe('Maximum exact content characters in this page; default uses the complete tool-result transport page budget. More content remains available at next_offset_chars.'),
+      snapshot_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullish()
+        .describe('For subsequent pages copy the first page digest, so a changed transcript cannot silently replace the requested snapshot.'),
     },
-    async ({ session_id, max_turns, through_seq }) => {
-      const throughSeq = through_seq ?? undefined;
-      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000, throughSeq);
-      if (transcript) return textResult(transcript);
-
-      // Fallback: harness sessions (Discord, workflow chat) record their
-      // transcript via the harness eventlog, not the v0.2 sessions store.
-      // Pull the cross_session_prefix + recent user_input/agent reply
-      // events so the agent sees the back-reference instead of "no
-      // history" on turn 1 of a freshly-created Discord session.
-      // (Fix shipped 2026-05-24 after the "Yep, let's do the first 10"
-      // incident — see [[project_session_status_semantics]].)
-      try {
-        const prefixEvents = listHarnessEvents(session_id, { types: ['cross_session_prefix'] })
-          .filter((event) => throughSeq === undefined || event.seq <= throughSeq);
-        if (prefixEvents.length > 0) {
-          const lines = prefixEvents.map((e) => {
-            const text = (e.data as { text?: unknown })?.text;
-            return typeof text === 'string' ? text : '';
-          }).filter(Boolean);
-          if (lines.length > 0) return textResult(lines.join('\n\n'));
-        }
-      } catch { /* ignore — graceful degradation */ }
-
-      return textResult('No history yet for that session.');
+    async ({ session_id, max_turns, through_seq, offset_chars, max_chars, snapshot_sha256 }) => {
+      const context = getToolOutputContext();
+      const harnessContext = harnessRunContextStorage.getStore();
+      const sourceUserSeq = context?.sourceUserSeq
+        ?? (harnessContext?.sessionId === context?.sessionId ? harnessContext?.sourceUserSeq : undefined);
+      const requester = context?.sessionId ? getHarnessSession(context.sessionId) : null;
+      const legacyRequester = !requester && context?.sessionId ? sessions.get(context.sessionId) : null;
+      const target = getHarnessSession(session_id);
+      const legacyTarget = !target ? sessions.get(session_id) : null;
+      const requesterPrincipal = requester?.userId || legacyRequester?.userId || requester?.id;
+      const targetPrincipal = target?.userId || legacyTarget?.userId || target?.id;
+      const sameSession = Boolean(context?.sessionId && context.sessionId === session_id && (requester || legacyRequester?.turns.length));
+      const source = requester && sourceUserSeq
+        ? listHarnessEvents(requester.id, { sinceSeq: sourceUserSeq - 1, types: ['user_input_received'], limit: 1 })
+          .find(event => event.seq === sourceUserSeq)
+        : undefined;
+      const explicitLocator = Boolean(source && containsExactSessionLocator(publicUserInputText(source.data), session_id));
+      const ancestor = requester && requesterPrincipal
+        ? sameConversationAncestorSessionIds({ sessionId: requester.id, principalId: requesterPrincipal }).includes(session_id)
+        : false;
+      if (!sameSession && !(requesterPrincipal && requesterPrincipal === targetPrincipal && (explicitLocator || ancestor))) {
+        return textResult('session_history denied: the host requesting session must own this history, and cross-session reads require an exact accepted-source session locator or validated conversation ancestry.', { isError: true });
+      }
+      const offset = offset_chars ?? 0;
+      if (offset > 0 && (!snapshot_sha256 || (target && through_seq == null))) {
+        return textResult('session_history page denied: copy snapshot_sha256 and through_seq from the first page before requesting an offset.', { isError: true });
+      }
+      const history = exactSessionHistoryForTool({ sessionId: session_id, throughSeq: through_seq ?? undefined, maxTurns: max_turns ?? undefined });
+      const digest = createHash('sha256').update(JSON.stringify({ version: 1, sessionId: session_id,
+        throughSeq: history.throughSeq, maxTurns: max_turns ?? null, text: history.text })).digest('hex');
+      if ((snapshot_sha256 && snapshot_sha256 !== digest) || offset > history.text.length) {
+        return textResult('session_history page denied: the requested snapshot digest or offset no longer matches; restart at offset_chars:0 for a new explicit snapshot.', { isError: true });
+      }
+      let end = Math.min(history.text.length, offset + (max_chars ?? DEFAULT_TOOL_RESULT_MAX_CHARS - 2_048));
+      // Do not split a UTF-16 surrogate pair between transport pages.
+      if (end < history.text.length && /[\uD800-\uDBFF]/.test(history.text[end - 1] ?? '')) end -= 1;
+      const header = {
+        version: 1, session_id, through_seq: history.throughSeq, max_turns: max_turns ?? null,
+        snapshot_sha256: digest, total_chars: history.text.length, offset_chars: offset,
+        returned_chars: end - offset, next_offset_chars: end < history.text.length ? end : null,
+        complete: end === history.text.length, empty: history.text.length === 0, earlier_before_seq: history.earlierBeforeSeq,
+      };
+      return textResult(`${JSON.stringify(header)}\n\n${history.text.slice(offset, end)}`);
     },
   );
 

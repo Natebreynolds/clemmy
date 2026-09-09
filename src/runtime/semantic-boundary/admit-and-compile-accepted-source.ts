@@ -45,6 +45,7 @@ import {
   canonicalResolvedCapabilityId,
   canonicalCatalogIdentityOf,
   isCurrentCallableCatalogEntry,
+  persistedCatalogSnapshotManifestIdsForSource,
   type RegisteredHostCapability,
 } from '../harness/host-capability-catalog-factory.js';
 import { currentAcceptedSourceCatalogManifestScope } from '../harness/accepted-source-catalog-scope.js';
@@ -53,7 +54,7 @@ import {
   type TurnSemanticProposalV1,
 } from './turn-semantic-proposal.js';
 import { selectRelevantCapabilityDescriptors } from './capability-candidate-retrieval.js';
-import { registerProofProvisionedCapabilities } from '../harness/proof-provisioned-catalog.js';
+import { isLegacyGenericProviderWriteEvidencePolicy, registerProofProvisionedCapabilities } from '../harness/proof-provisioned-catalog.js';
 import { createProductionMcpReadCarrier } from '../harness/production-mcp-read-carrier.js';
 import { parseNamespacedTool } from '../mcp-namespace-shim.js';
 import {
@@ -1782,6 +1783,9 @@ export async function primePrimaryModelPlanningCatalog(input: {
       reason: `durable initial planning card is unavailable: ${durableInitialCard.reason}`,
     };
   }
+  const frozenSource = persistedCatalogSnapshotManifestIdsForSource(input);
+  const withholdLegacyEvidencePolicy = durableInitialCard.status === 'missing'
+    && !frozenSource.ok && frozenSource.reason === 'missing_snapshot';
   let indexedDescriptors: HostCapabilityDescriptorV1[] = [];
   let indexedRegisteredIds = new Set<string>();
   let indexedLocalDefinitions: AuthorizedLocalPlanningDefinitionV1[] = [];
@@ -1806,7 +1810,13 @@ export async function primePrimaryModelPlanningCatalog(input: {
     || catalogManifestScope.operationIds.has(
       (entry.manifest?.operationId ?? entry.toolName).toUpperCase(),
     )
-  ));
+  )).filter((entry) => {
+    if (!withholdLegacyEvidencePolicy || !isLegacyGenericProviderWriteEvidencePolicy(entry.manifest)) return true;
+    // A fresh card must not advertise the retired receipt/readback default.
+    // Exact discovery performs the normal account/definition checks and can
+    // publish its successor; this filter cannot mutate shared/frozen entries.
+    return false;
+  });
   const catalogDescriptors = catalogEntries.flatMap((entry) => {
     const descriptor = hostDescriptorFromRegistered(entry);
     if (!descriptor) return [];
@@ -2262,11 +2272,11 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       proof?.accountIdentity?.trim() || null,
       'composio',
     );
-    const descriptor = proofById.get(capabilityRef);
-    if (!descriptor || !proof) continue;
+    const proofDescriptor = proofById.get(capabilityRef);
+    if (!proofDescriptor || !proof) continue;
     const providerInputSchemaDigest = digestSchema(candidate.schema);
     const accountIdentity = proof.accountIdentity?.trim() || 'runtime';
-    if (descriptor.accountScope !== accountIdentity) continue;
+    if (proofDescriptor.accountScope !== accountIdentity) continue;
     const providerDefinition = currentComposioProviderDefinition({
       identifier: name,
       schema: candidate.schema as Record<string, unknown>,
@@ -2276,6 +2286,22 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       !providerDefinition
       || providerDefinition.providerInputSchemaDigest !== providerInputSchemaDigest
     ) continue;
+    // Discovery may just have published a current manifest after this card
+    // was primed. Its exact checked contract outranks the advisory proof's
+    // generic shape; otherwise an acknowledgement-only write regains an
+    // invented readback requirement at the disclosure boundary.
+    const publishedEntry = peekHostCapabilityCatalogFactory()?.get(capabilityRef);
+    const publishedDescriptor = publishedEntry ? hostDescriptorFromRegistered(publishedEntry) : null;
+    const publishedDefinition = publishedEntry ? stagedProviderDefinitionFromRegistered(publishedEntry) : null;
+    const descriptor = publishedDescriptor
+      && publishedEntry?.manifest?.providerKind === 'composio'
+      && publishedEntry.manifest.operationId.toLowerCase() === name.toLowerCase()
+      && publishedEntry.manifest.accountId === accountIdentity
+      && publishedDescriptor.accountScope === accountIdentity
+      && publishedDescriptor.effect === proofDescriptor.effect
+      && stagedProviderDefinitionsEqual(publishedDefinition, providerDefinition)
+      ? publishedDescriptor
+      : proofDescriptor;
     const prior = catalog.stagedById.get(capabilityRef);
     if (prior && (
       prior.identifier.toLowerCase() !== name.toLowerCase()

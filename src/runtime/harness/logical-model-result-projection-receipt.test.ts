@@ -34,6 +34,7 @@ const hostResults = await import('./host-model-result-receipt.js');
 const compaction = await import('./compaction.js');
 const provenance = await import('./model-request-provenance.js');
 const promptCache = await import('./prompt-cache-observation.js');
+const { HarnessSession } = await import('./session.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -877,4 +878,175 @@ test('a clipped host refusal reverses from the sealed host frame, not from the p
       && error.code === 'host_result_projection_mismatch',
     'a stub that matches no sealed host frame is still refused',
   );
+});
+
+test('idle clipping of a nested projected result survives the next source and restart without trusting raw recall bytes', async () => {
+  const task = accept('nested catalog result before idle');
+  const callId = 'idle-nested-catalog';
+  const toolName = 'call_tool';
+  const innerToolName = 'composio_list_tools';
+  const args = { name: innerToolName, args_json: '{"toolkit":"outlook"}' };
+  const admission = admit({ task, callId, toolName, args });
+  settleRead({
+    task,
+    logicalToolCallId: callId,
+    observerCallId: callId,
+    toolName: innerToolName,
+    args: { toolkit: 'outlook' },
+  });
+  const original = textResult({
+    callId,
+    toolName,
+    text: JSON.stringify({ toolkit: 'outlook', projected: 'bounded model catalog '.repeat(1_500) }),
+  });
+  const receipt = projections.recordLogicalModelResultProjectionReceipt({ admission, resultItem: original });
+  assert.equal(receipt.status, 'recorded', JSON.stringify(receipt));
+  if (receipt.status !== 'recorded') return;
+  assert.equal(receipt.receipt.settlementIdentityKind, 'observer');
+  const sealed = checkpoints.finalizeAcceptedModelBatch(admission, { committedResultItems: [original] });
+  assert.equal(sealed.status, 'committed', JSON.stringify(sealed));
+  if (sealed.status !== 'committed') return;
+
+  // Production parks the INNER operation's raw output while the model sees
+  // the OUTER carrier's bounded projection. Both the name and bytes differ.
+  eventlog.writeToolOutput({
+    sessionId: task.sessionId,
+    callId,
+    tool: innerToolName,
+    output: JSON.stringify({ toolkit: 'outlook', raw: 'full provider catalog '.repeat(25_000) }),
+  });
+  const sentinelCallId = 'idle-nested-recent-result';
+  const sentinelToolName = 'session_history';
+  const sentinelAdmitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    preHistory: sealed.checkpoint.history,
+    previousResponseId: sealed.checkpoint.lastResponseId,
+    frameHistory: frame({ callId: sentinelCallId, toolName: sentinelToolName }),
+  });
+  assert.equal(sentinelAdmitted.status, 'admitted', JSON.stringify(sentinelAdmitted));
+  if (sentinelAdmitted.status !== 'admitted') return;
+  const sentinelAdmission = sentinelAdmitted.admission;
+  settleRead({ task, logicalToolCallId: sentinelCallId, toolName: sentinelToolName });
+  const sentinel = textResult({ callId: sentinelCallId, toolName: sentinelToolName, text: 'Recent result.' });
+  assert.equal(projections.recordLogicalModelResultProjectionReceipt({
+    admission: sentinelAdmission, resultItem: sentinel,
+  }).status, 'recorded');
+  assert.equal(checkpoints.finalizeAcceptedModelBatch(sentinelAdmission, {
+    committedResultItems: [sentinel],
+  }).status, 'committed');
+
+  const session = HarnessSession.load(task.sessionId)!;
+  session.updateConversationSnapshot([
+    { role: 'user', content: task.text } as AgentInputItem,
+    ...Array.from({ length: 7 }, (_, index) => ({
+      role: 'assistant', content: `Earlier completed draft discussion ${index}.`,
+    } as AgentInputItem)),
+    ...frame({ callId, toolName, args }), structuredClone(original),
+    ...frame({ callId: sentinelCallId, toolName: sentinelToolName }), sentinel,
+  ]);
+  compaction._setCompactionSummarizerForTests(async () => ({ error: 'summarizer unavailable' }));
+  let nextItems: AgentInputItem[];
+  try {
+    const compacted = await compaction.compactSessionIfNeeded(session, session.toInputItems(), {
+      idleMs: 73 * 60_000,
+      inputBudgetTokens: 1_000_000,
+      layer1RetainTurns: 1,
+    });
+    assert.ok(compacted.result.beforeTokens > 6_000);
+    assert.ok(compacted.result.beforeTokens < 1_000_000 * 0.3, 'idle, not token pressure, must trigger');
+    assert.equal(compacted.result.layer1.clipped, 1);
+    assert.equal(compacted.result.layer2.applied, false);
+    assert.equal(compacted.result.layer2.error, 'summarizer unavailable');
+    nextItems = compacted.nextItems;
+    session.updateConversationSnapshot(nextItems);
+  } finally {
+    compaction._setCompactionSummarizerForTests(null);
+  }
+  const clipped = nextItems.find((item) => (item as { callId?: string }).callId === callId
+    && (item as { type?: string }).type === 'function_call_result')!;
+  const clip = compaction.describeCanonicalClippedToolResult(clipped);
+  assert.ok(clip);
+  assert.equal(authority.closeHostReadOnlyCallAuthority({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, outcome: 'completed',
+  }).status, 'closed');
+  const nextTask = accept('continue those same drafts', task.sessionId);
+  const request = {
+    ...modelRequest({ task: nextTask, callId, toolName, result: clipped }),
+    input: [...nextItems, { role: 'user', content: nextTask.text } as AgentInputItem],
+  };
+  const recorded = provenance.recordModelRequestDispatchProvenance({
+    sessionId: nextTask.sessionId,
+    sourceUserSeq: nextTask.sourceUserSeq,
+    request: request as never,
+    hostProjection: promptCache.canonicalPromptCacheRequest(request as never),
+  });
+  assert.equal(provenance.projectModelRequestProvenance(recorded.record.recordId).status, 'ok');
+  eventlog.closeEventLog();
+  assert.equal(provenance.projectModelRequestProvenance(recorded.record.recordId).status, 'ok',
+    'restart reconstruction uses the same immutable receipt and sealed projection');
+  assert.deepEqual(HarnessSession.load(task.sessionId)!.toInputItems(), nextItems);
+  assert.equal(projections.logicalModelResultProjectionReceiptRowsForCall(
+    eventlog.openEventLog(), task.sessionId, callId,
+  )[0]?.result_item_sha256, receipt.receipt.resultItemSha256, 'compaction must not rewrite the receipt');
+
+  const assertRefused = (candidate: AgentInputItem, label: string): void => {
+    const forgedRequest = modelRequest({ task: nextTask, callId, toolName, result: candidate });
+    assert.throws(() => provenance.recordModelRequestDispatchProvenance({
+      sessionId: nextTask.sessionId,
+      sourceUserSeq: nextTask.sourceUserSeq,
+      request: forgedRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(forgedRequest as never),
+    }), (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'logical_result_projection_mismatch', label);
+  };
+  const wrongCount = structuredClone(clipped) as AgentInputItem & {
+    __clippedMeta: { bytes: number }; output: { text: string };
+  };
+  wrongCount.__clippedMeta.bytes += 1;
+  wrongCount.output.text = compaction.canonicalToolResultClipPlaceholder(
+    toolName, clip.originalChars + 1, callId, clip.clippedAt,
+  );
+  assertRefused(wrongCount, 'a canonical stub with the wrong original size is refused');
+  const changedMetadata = { ...structuredClone(clipped), providerData: { forged: true } } as AgentInputItem;
+  assertRefused(changedMetadata, 'a sealed original cannot authorize changed whole-item metadata');
+  const backdated = structuredClone(clipped) as AgentInputItem & {
+    __clippedMeta: { at: string }; output: { text: string };
+  };
+  const beforeReceipt = new Date(Date.parse(receipt.receipt.recordedAt) - 1_000).toISOString();
+  backdated.__clippedMeta.at = beforeReceipt;
+  backdated.output.text = compaction.canonicalToolResultClipPlaceholder(
+    toolName, clip.originalChars, callId, beforeReceipt,
+  );
+  assertRefused(backdated, 'a canonical stub cannot predate its immutable receipt');
+
+  // A byte-identical original sealed by ANOTHER session is not an owner for
+  // this session's projection. Its own receipt alone cannot reconstruct it.
+  const unsealedTask = accept('another principal without an accepted frame');
+  const unsealedAdmission = admit({ task: unsealedTask, callId, toolName, args });
+  settleRead({
+    task: unsealedTask, logicalToolCallId: callId, observerCallId: callId,
+    toolName: innerToolName, args: { toolkit: 'outlook' },
+  });
+  assert.equal(projections.recordLogicalModelResultProjectionReceipt({
+    admission: unsealedAdmission, resultItem: original,
+  }).status, 'recorded');
+  eventlog.writeToolOutput({
+    sessionId: unsealedTask.sessionId, callId, tool: innerToolName, output: 'different raw payload',
+  });
+  const unsealedClipped = structuredClone(original);
+  const unsealedAt = new Date().toISOString();
+  assert.equal(compaction.clipOldToolResults([unsealedClipped, sentinel], 1, { now: () => unsealedAt }), 1);
+  eventlog.appendEvent({
+    sessionId: unsealedTask.sessionId, turn: 0, role: 'system', type: 'condenser_applied',
+    data: { layer1: { applied: true, clipped: 1, collapsedToolPairs: 0 } },
+  });
+  const unsealedRequest = modelRequest({ task: unsealedTask, callId, toolName, result: unsealedClipped });
+  assert.throws(() => provenance.recordModelRequestDispatchProvenance({
+    sessionId: unsealedTask.sessionId,
+    sourceUserSeq: unsealedTask.sourceUserSeq,
+    request: unsealedRequest as never,
+    hostProjection: promptCache.canonicalPromptCacheRequest(unsealedRequest as never),
+  }), (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+    && error.code === 'logical_result_projection_mismatch', 'a different session cannot donate a sealed frame');
 });

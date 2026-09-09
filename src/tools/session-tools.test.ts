@@ -15,18 +15,22 @@ import assert from 'node:assert/strict';
 const { registerSessionTools } = await import('./session-tools.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { loadSessionBrief } = await import('../memory/session-briefs.js');
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 
 type ToolResult = { content?: Array<{ text?: string }> };
 type Handler = (input: Record<string, unknown>) => Promise<ToolResult>;
 
-function registeredToolHandlers(): Map<string, Handler> {
+function registeredToolHandlers(requesterSessionId?: string, sourceUserSeq?: number): Map<string, Handler> {
   const handlers = new Map<string, Handler>();
   const server = {
     tool(name: string, ...args: unknown[]) {
       const handler = args.at(-1);
       if (typeof handler !== 'function') throw new Error(`tool ${name} missing handler`);
-      handlers.set(name, handler as Handler);
+      handlers.set(name, requesterSessionId
+        ? input => withToolOutputContext({ sessionId: requesterSessionId, sourceUserSeq, toolName: name },
+          () => (handler as Handler)(input)) as Promise<ToolResult>
+        : handler as Handler);
     },
   };
   registerSessionTools(server as never);
@@ -52,7 +56,7 @@ test('session_history prefers harness transcript and action ledger over same-id 
     createdAt: new Date().toISOString(),
   });
 
-  const history = registeredToolHandlers().get('session_history');
+  const history = registeredToolHandlers(sessionId).get('session_history');
   assert.ok(history);
   const text = resultText(await history!({ session_id: sessionId, max_turns: 10 }));
 
@@ -91,7 +95,7 @@ test('session_history through_seq excludes later turns while retaining pre-bound
     data: { shapeKey: 'CRM_UPDATE', targets: ['record:after-handoff-555'] },
   });
 
-  const history = registeredToolHandlers().get('session_history');
+  const history = registeredToolHandlers(sessionId).get('session_history');
   assert.ok(history);
   const text = resultText(await history!({
     session_id: sessionId,
@@ -113,7 +117,7 @@ test('session_history treats a transport-serialized null through_seq as omitted'
   createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Null boundary' });
   appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'NULL-BOUNDARY-IS-UNBOUNDED' } });
 
-  const history = registeredToolHandlers().get('session_history');
+  const history = registeredToolHandlers(sessionId).get('session_history');
   assert.ok(history);
   const text = resultText(await history!({
     session_id: sessionId,
@@ -166,7 +170,7 @@ test('session_history still falls back to legacy SessionStore sessions', async (
   store.appendTurn(sessionId, { role: 'user', text: 'Legacy question', createdAt: new Date().toISOString() });
   store.appendTurn(sessionId, { role: 'assistant', text: 'Legacy answer', createdAt: new Date().toISOString() });
 
-  const history = registeredToolHandlers().get('session_history');
+  const history = registeredToolHandlers(sessionId).get('session_history');
   assert.ok(history);
   const text = resultText(await history!({ session_id: sessionId, max_turns: 10 }));
 
@@ -224,4 +228,63 @@ test('session_pause builds harness handoff briefs from canonical harness history
   assert.match(resumeText, /Canonical harness history/);
   assert.match(resumeText, /USER: Prepare the client risk review/);
   assert.match(resumeText, /YOU: I gathered the source notes/);
+});
+
+
+test('exact retained-history request reads only authorized session windows and losslessly pages long completed drafts', async () => {
+  const principal = 'history-owner';
+  const first = createSession({ id: 'sess-history-retained-first', kind: 'chat', userId: principal });
+  const second = createSession({ id: 'sess-history-retained-second', kind: 'chat', userId: principal });
+  const foreign = createSession({ id: 'sess-history-other-principal', kind: 'chat', userId: 'different-owner' });
+  const unnamed = createSession({ id: 'sess-history-not-requested', kind: 'chat', userId: principal });
+  const requester = createSession({ id: 'sess-history-reader', kind: 'chat', userId: principal });
+  appendEvent({ sessionId: first.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Unrelated synthetic conversation.' } });
+  const firstEnd = appendEvent({ sessionId: first.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Unrelated synthetic reply.' } });
+  const authored = appendEvent({ sessionId: second.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Compose three drafts preserving exact bytes.' } });
+  const drafts = [
+    { subject: 'CLEMMY-LIVE-0905-C6-2245-A', body: `Redwood appointment follow-up.\n${'Exact retained words. '.repeat(1300)}Second line stays here.` },
+    { subject: 'CLEMMY-LIVE-0905-C6-2245-B', body: 'Juniper proposal follow-up: ready for review?' },
+    { subject: 'CLEMMY-LIVE-0905-C6-2245-C', body: 'Willow formatting check. Keep this exact punctuation!' },
+  ];
+  const reply = JSON.stringify(drafts, null, 2);
+  const boundary = appendEvent({ sessionId: second.id, turn: 1, role: 'system', type: 'conversation_completed', data: { sourceUserSeq: authored.seq, reply } });
+  appendEvent({ sessionId: second.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'AFTER-BOUNDARY-MUST-NOT-APPEAR' } });
+  appendEvent({ sessionId: foreign.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'FOREIGN-PRIVATE-TEXT' } });
+  const prompt = `This is a read-only conversation-history test. Do not consult durable memory, use connectors, run shell commands, or change anything. Inspect only these two synthetic conversation windows using session_history: session_id ${first.id} through_seq ${firstEnd.seq}; session_id ${second.id} through_seq ${boundary.seq}. Find the conversation containing subject marker CLEMMY-LIVE-0905-C6-2245. Return its session ID and the exact three composed subjects and bodies as JSON, preserving the body newline and punctuation. Do not include provider IDs or any other conversations.`;
+  const source = appendEvent({ sessionId: requester.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
+  const history = registeredToolHandlers(requester.id, source.seq).get('session_history')!;
+  let offset = 0;
+  let snapshot: string | undefined;
+  let assembled = '';
+  let pages = 0;
+  do {
+    const result = resultText(await history({ session_id: second.id, through_seq: boundary.seq, offset_chars: offset, snapshot_sha256: snapshot }));
+    assert.ok(result.length < 20_000, 'the lossless page fits the actual tool transport without a second clipping pass');
+    const separator = result.indexOf('\n\n');
+    const header = JSON.parse(result.slice(0, separator));
+    const body = result.slice(separator + 2);
+    assert.equal(body.length, header.returned_chars);
+    assert.equal(header.through_seq, boundary.seq);
+    if (snapshot) assert.equal(header.snapshot_sha256, snapshot);
+    snapshot = header.snapshot_sha256;
+    assembled += body;
+    pages += 1;
+    offset = header.next_offset_chars;
+    assert.ok(pages < 10, 'test fixture must converge through its explicit pages');
+  } while (offset !== null);
+  assert.ok(pages > 1, 'the long draft actually crosses a page boundary');
+  assert.ok(assembled.includes(reply), 'all three exact complete draft objects survive, including the long first body and final punctuation');
+  assert.match(assembled, new RegExp(`source_seq=${authored.seq} event_seq=${boundary.seq}`));
+  assert.doesNotMatch(assembled, /AFTER-BOUNDARY-MUST-NOT-APPEAR/);
+  assert.match(resultText(await history({ session_id: first.id, through_seq: firstEnd.seq })), /Unrelated synthetic reply/);
+  assert.match(resultText(await history({ session_id: unnamed.id })), /session_history denied/);
+  const prefixSource = appendEvent({ sessionId: requester.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: `Read session_id ${unnamed.id}-different` } });
+  assert.match(resultText(await registeredToolHandlers(requester.id, prefixSource.seq).get('session_history')!({ session_id: unnamed.id })), /session_history denied/,
+    'a longer named session locator cannot authorize a matching prefix');
+  assert.match(resultText(await history({ session_id: second.id, through_seq: boundary.seq, offset_chars: 1, snapshot_sha256: '0'.repeat(64) })), /snapshot digest/);
+  assert.match(resultText(await registeredToolHandlers().get('session_history')!({ session_id: second.id })), /session_history denied/);
+  const foreignSource = appendEvent({ sessionId: requester.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: `Read session_id ${foreign.id}` } });
+  const denied = resultText(await registeredToolHandlers(requester.id, foreignSource.seq).get('session_history')!({ session_id: foreign.id }));
+  assert.match(denied, /session_history denied/);
+  assert.doesNotMatch(denied, /FOREIGN-PRIVATE-TEXT/);
 });

@@ -67,6 +67,7 @@ export interface ObligationManifestNode {
   operationId: string;
   operationMode: OperationEvidenceMode;
   contentCommitMode?: 'documented_atomic_input';
+  writeEvidenceMode?: 'provider_acknowledgement_v1';
   /** Frozen structured-deliverable contract copied from the exact executable
    * graph node. Optional for legacy/non-collection nodes. */
   cardinality?: number;
@@ -348,7 +349,13 @@ export function compileObligationManifest(input: {
       operation.operationId,
       legacyHasSourceRead,
     );
-    const obligations = attachEvidenceObligations({
+    const acknowledgement = sealed?.writeEvidenceMode?.kind === 'provider_acknowledgement_v1'
+      && effectKind === 'external_write' && !hasSourceRead && !contentCommitMode
+      && !sealed.verification && evidenceContract.mode === 'create'
+      && !evidenceContract.requiresStaleReconciliation;
+    const obligations: EvidenceObligation[] = acknowledgement
+      ? ['commit_effect', 'execution_terminal']
+      : attachEvidenceObligations({
       effect: effectKind,
       reversibility: operation.reversibility,
       receipt: parent.effect.receipt,
@@ -369,6 +376,7 @@ export function compileObligationManifest(input: {
       operationId: operation.operationId,
       operationMode: evidenceContract.mode,
       ...(contentCommitMode ? { contentCommitMode } : {}),
+      ...(acknowledgement ? { writeEvidenceMode: 'provider_acknowledgement_v1' as const } : {}),
       ...(Number.isSafeInteger(executableNode.cardinality)
         && (executableNode.cardinality ?? 0) > 0
         ? { cardinality: executableNode.cardinality }

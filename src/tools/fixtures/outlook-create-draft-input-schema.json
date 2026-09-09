@@ -1,0 +1,107 @@
+{
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": "string",
+      "description": "Content of the email draft; use `is_html` to specify if HTML or plain text.",
+      "title": "Body",
+      "examples": [
+        "Let's meet to discuss the project."
+      ]
+    },
+    "is_html": {
+      "type": "boolean",
+      "description": "Specifies if the `body` is HTML. If `False`, `body` is plain text. Set to `True` when `body` contains HTML markup; otherwise markup renders as literal text.",
+      "title": "Is Html",
+      "default": false
+    },
+    "subject": {
+      "type": "string",
+      "description": "Subject line for the email draft.",
+      "title": "Subject",
+      "minLength": 1,
+      "maxLength": 255,
+      "examples": [
+        "Team Meeting"
+      ]
+    },
+    "user_id": {
+      "type": "string",
+      "description": "User ID (GUID) or user principal name (email) for S2S (app-only) authentication. Required when using application permissions. If not provided, defaults to '/me' endpoint for delegated authentication.",
+      "title": "User Id",
+      "examples": [
+        "43f0c14d-bca8-421f-b762-c3d8dd75be1f",
+        "user@example.com"
+      ]
+    },
+    "attachment": {
+      "description": "Optional file(s) to attach. Accepts a single file or a list of files.",
+      "anyOf": [
+        {
+          "title": "FileUploadable",
+          "format": "path",
+          "type": "string",
+          "file_uploadable": true
+        },
+        {
+          "type": "array",
+          "items": {
+            "title": "FileUploadable",
+            "format": "path",
+            "type": "string",
+            "file_uploadable": true
+          }
+        }
+      ],
+      "title": "Attachment"
+    },
+    "cc_recipients": {
+      "type": "array",
+      "description": "Optional list of CC (carbon copy) recipient email addresses. Must be provided as an array of strings, e.g., [\"cc@example.com\"].",
+      "title": "Cc Recipients",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "examples": [
+        [
+          "manager@example.com"
+        ]
+      ]
+    },
+    "to_recipients": {
+      "type": "array",
+      "description": "Optional list of primary 'To' recipient email addresses. Must be provided as an array of strings, e.g., [\"user@example.com\"] for a single recipient or [\"user1@example.com\", \"user2@example.com\"] for multiple recipients. Do not pass as a JSON-encoded string. Can be omitted when creating a draft to be completed later. To send the draft, at least one valid address must be present across `to_recipients`, `cc_recipients`, or `bcc_recipients`.",
+      "title": "To Recipients",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "examples": [
+        [
+          "johndoe@example.com",
+          "janedoe@example.com"
+        ]
+      ]
+    },
+    "bcc_recipients": {
+      "type": "array",
+      "description": "Optional list of BCC (blind carbon copy) recipient email addresses. Must be provided as an array of strings, e.g., [\"bcc@example.com\"].",
+      "title": "Bcc Recipients",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "examples": [
+        [
+          "stakeholder@example.com"
+        ]
+      ]
+    }
+  },
+  "required": [
+    "subject",
+    "body"
+  ],
+  "title": "CreateEmailDraftRequest"
+}

@@ -214,6 +214,10 @@ test('generic proof replay preserves adapter-authored mutation and readback veri
     factory.get(selectedReadbackId)?.manifest?.externalDefinition?.verification,
     readbackContracts.verificationContract,
   );
+  assert.deepEqual(factory.get(selectedUpdateId)?.manifest?.evidenceContract,
+    { kinds: ['receipt', 'readback'], readbackRequired: true });
+  assert.deepEqual(factory.get(selectedUpdateId)?.manifest?.readbackContract,
+    { required: true, contentDigestRequired: true });
 
   // Whole-proof/JIT registration has no selected-definition row. It must
   // reconstruct the same reviewed contracts from the exact live schemas,
@@ -238,4 +242,30 @@ test('generic proof replay preserves adapter-authored mutation and readback veri
     factory.get(selectedReadbackId)?.manifest?.externalDefinition?.verification,
     readbackContracts.verificationContract,
   );
+  assert.deepEqual(factory.get(selectedUpdateId)?.manifest?.evidenceContract,
+    { kinds: ['receipt', 'readback'], readbackRequired: true });
+});
+
+test('documented atomic content commits retain receipt and content-commit evidence', async () => {
+  const operation = 'GOOGLESHEETS_SHEET_FROM_JSON';
+  const schema = { type: 'object', required: ['sheet_name', 'sheet_json'], properties: {
+    sheet_name: { type: 'string' }, sheet_json: { type: 'string' },
+  } };
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  schemas._setToolSchemaLoaderForTests(async (identifier) => identifier === operation ? {
+    inputParameters: schema, outputParameters: PROVIDER_ENVELOPE,
+    providerObservedAt: Date.now(), providerOperationVersion: '20260905_atomic',
+  } : null);
+  const session = eventlog.createSession({ id: 'atomic-producer-evidence', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create the sheet with the supplied records.' } });
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'capability_resolution', data: {
+    sourceUserSeq: source.seq, authoritativeForTask: true, entries: [{ intent: 'create the sheet', kind: 'composio',
+      identifier: operation, status: 'proven', connection: 'active', accountIdentity: ACCOUNT, effectClass: 'write' }],
+  } });
+  const result = await provisioning.registerProofProvisionedCapabilities({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(result.refusal, undefined, JSON.stringify(result));
+  const entry = factory.get(catalogs.canonicalResolvedCapabilityId(operation, ACCOUNT, 'composio'));
+  assert.ok(entry?.manifest?.operationSemantics?.atomicInputContent);
+  assert.deepEqual(entry.manifest.evidenceContract, { kinds: ['receipt', 'content_commit'], readbackRequired: false });
 });
