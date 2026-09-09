@@ -1222,4 +1222,23 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
       assert.match(settled.resultHandleDigest ?? '', /^[a-f0-9]{64}$/);
     }
   }
+
+  // The modern foreground intentionally has no turn graph. Its real durable
+  // business settlements still keep tools available for terse follow-ups,
+  // including after event-log reopen; no keyword list supplies the lineage.
+  const { freshHostConversationSurfaceOnly } = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
+  const { sessionHasPriorRetrieveOrAct } = await import('../runtime/graph/turn-graph-shadow.js');
+  assert.equal(sessionHasPriorRetrieveOrAct(sessionId, sourceUserSeq), false,
+    'the current source cannot be its own prior work');
+  eventlog.closeEventLog();
+  const followup = eventlog.appendEvent({ sessionId, turn: 2, role: 'user',
+    type: 'user_input_received', data: { text: 'What about yesterday?' } });
+  assert.equal(freshHostConversationSurfaceOnly({ sessionId, sourceUserSeq: followup.seq }), false,
+    'a graphless read follow-up lost its tool surface after reopen');
+  const unrelated = eventlog.createSession({ id: `${sessionId}-unrelated`, kind: 'chat' });
+  const greeting = eventlog.appendEvent({ sessionId: unrelated.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'hey' } });
+  assert.equal(freshHostConversationSurfaceOnly({ sessionId: unrelated.id, sourceUserSeq: greeting.seq }), true,
+    "another session's business work disabled the greeting shortcut");
+
 });
