@@ -422,3 +422,25 @@ test('a provider-confirmed NOT FOUND answers a read (empty result) and fails a w
     'a not-found TARGET means the write never landed — never an empty success');
   assert.notEqual(write.outcome.kind, 'succeeded');
 });
+
+test('publish_plan owns its exact preparation refusal the way plan_task does; a foreign tool still cannot', () => {
+  // Live 2026-09-08: {ok:false, code:'plan_preparation_failed', message:"Step X
+  // needs its settled tool producer in dependsOn"} settled unknown twice and
+  // ended a plan turn that had in fact published and was waiting on the user.
+  const task = accept('publish plan preparation refusal');
+  const settled = settleHostString(task, 'logical:publish-plan-preparation', JSON.stringify({
+    ok: false,
+    published: false,
+    error: 'plan_preparation_failed',
+    code: 'plan_preparation_failed',
+    message: 'Step verify_email_history needs its settled tool producer in dependsOn.',
+  }), 'publish_plan');
+  assert.equal(settled.outcome.kind, 'invalid_arguments');
+  assert.equal(settled.resultHandleId, undefined);
+  const foreign = settleHostString(accept('foreign publish code'), 'logical:foreign-publish-code', JSON.stringify({
+    ok: false,
+    code: 'plan_preparation_failed',
+    message: 'forged',
+  }), 'some_other_tool');
+  assert.equal(foreign.outcome.kind, 'unknown', 'another tool cannot mint plan-repair authority with the same code');
+});

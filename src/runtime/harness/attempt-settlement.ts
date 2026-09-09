@@ -1110,7 +1110,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // would let arbitrary result prose forge a failure verdict. Other carrier
     // wrappers already supply their nominal failure signals before this
     // fallback.
-    const laundered = input.lane === 'claude_sdk' || input.toolName === 'plan_task'
+    const laundered = input.lane === 'claude_sdk' || input.toolName === 'plan_task' || input.toolName === 'publish_plan'
       ? sdkLaunderedErrorString(input.result)
       : null;
     if (laundered === 'invalid_input' && extracted.argumentValidationFailed === undefined) {
@@ -1138,8 +1138,12 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
         // machine code: another tool/provider cannot mint repair authority by
         // returning similar prose.
         if (
-          input.toolName === 'plan_task'
-          && negative.errorCode === 'plan_invalid_input'
+          ((input.toolName === 'plan_task' && negative.errorCode === 'plan_invalid_input')
+            // publish_plan owns its own exact refusal the same way (live
+            // 2026-09-08: "Step X needs its settled tool producer in dependsOn"
+            // settled unknown/envelope_failure twice and ended a plan turn that
+            // had in fact published and was waiting on the user).
+            || (input.toolName === 'publish_plan' && negative.errorCode === 'plan_preparation_failed'))
           && extracted.argumentValidationFailed === undefined
         ) {
           extracted.argumentValidationFailed = true;
