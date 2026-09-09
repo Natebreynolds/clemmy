@@ -137,3 +137,8 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     judges: mr ? flatChoices(mr.roleOptions?.judge ?? mr.available) : [],
   };
 }
+
+/** "Claude — Opus 4.8 (flagship)" → "Opus 4.8": the chip has 150px, the provider is the dot. */
+export function shortModelLabel(label: string): string {
+  return label.replace(/^[^—–-]+[—–-]\s*/, '').replace(/\s*\(.*\)\s*$/, '').trim() || label;
+}

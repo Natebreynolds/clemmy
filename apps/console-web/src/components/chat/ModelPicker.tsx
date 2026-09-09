@@ -9,7 +9,7 @@ import { Link } from 'react-router-dom';
 import { ChevronUp, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
-import { PROVIDER_LABEL, roleLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
+import { PROVIDER_LABEL, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
 import { ClaudeLoginForm } from '@/screens/settings/ClaudeLoginForm';
 
 function dotColor(provider: string): string {
@@ -62,7 +62,7 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
   }, [open]);
   const mr = roles.mr;
   if (!mr) return null;
-  const brain = roleLabel(mr, 'brain');
+  const brain = shortModelLabel(roleLabel(mr, 'brain'));
   const brainProv = mr.roles.brain.provider;
   const workerProv = mr.roles.worker.provider;
   const judgeProv = mr.roles.judge.provider;
@@ -78,7 +78,7 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
         className="inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1 pl-2 pr-2.5 text-small font-semibold text-fg shadow-xs transition-colors hover:border-border-strong"
       >
         <span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden />
-        <span className="max-w-[140px] truncate">{brain}</span>
+        <span className="max-w-[150px] truncate">{brain}</span>
         <span className="flex" aria-hidden>
           <span className="h-2 w-2 rounded-full ring-1 ring-surface" style={{ backgroundColor: dotColor(workerProv) }} />
           <span className="-ml-0.5 h-2 w-2 rounded-full ring-1 ring-surface" style={{ backgroundColor: dotColor(judgeProv) }} />

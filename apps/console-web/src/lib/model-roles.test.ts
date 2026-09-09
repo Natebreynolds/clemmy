@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { brainCall, brainChoices, brainProvider, currentBrainValue, roleLabel } from './model-roles.js';
+import { brainCall, brainChoices, brainProvider, currentBrainValue, roleLabel, shortModelLabel } from './model-roles.js';
 import type { ModelRolesSnapshot } from './settings.js';
 
 const mr: ModelRolesSnapshot = {
@@ -44,4 +44,10 @@ test('role labels read as the option label, falling back to the id', () => {
   assert.equal(roleLabel(mr, 'brain'), 'Claude Opus 5');
   assert.equal(roleLabel(mr, 'worker'), 'GLM 5.3');
   assert.equal(roleLabel({ ...mr, roles: { ...mr.roles, judge: { modelId: 'mystery', provider: 'byo', source: 'settings' } } }, 'judge'), 'mystery');
+});
+
+test('the chip label drops the provider prefix and the parenthetical tail', () => {
+  assert.equal(shortModelLabel('Claude — Opus 4.8 (flagship)'), 'Opus 4.8');
+  assert.equal(shortModelLabel('GPT 5.6 Terra'), 'GPT 5.6 Terra');
+  assert.equal(shortModelLabel('Codex — GPT-5.x'), 'GPT-5.x');
 });
