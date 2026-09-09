@@ -24,11 +24,24 @@ test('settlementRequiresReconciliation is gated on the irreversible boundary', (
   );
 });
 
-test('a failed or cancelled in-boundary call (local write, host-only carrier) is zero-crossing, never an uncertain write', () => {
-  // Live 2026-09-08: an inbox triage delegated to workers (run_worker) was
-  // cancelled at the driver's deadline and the turn hard-blocked as uncertain.
-  assert.match(
+test('after invocation the immutable settlement owns the crossing disposition; only a proven pre-dispatch refusal with zero crossings is zero-crossing', () => {
+  // Live 2026-09-08 first made a failed/cancelled LOCAL write or host-only
+  // carrier zero-crossing by effect class alone. Live 2026-09-09 reversed
+  // that: an unresolved worker timeout classified as "no effect" disagreed
+  // with checkpoint admission (which required reconciliation) and the turn
+  // looped on finalization instead of letting the model continue. The effect
+  // class does not prove that children drained or that a local write never
+  // landed; the settlement does. Cooperative worker parks still return their
+  // exact remainder normally (see host-turn-runner.test.ts, "an unresolved
+  // worker timeout checkpoints its actual uncertainty once without replay").
+  assert.doesNotMatch(
     SRC,
     /const effect = currentFrameEffects\.get\(call\.callId\);\s*\n\s*if \(effect === 'local_write' \|\| effect === 'host_only'\) return 'zero_crossing';/,
+    'an effect class must not short-circuit the settlement-owned disposition',
+  );
+  assert.match(
+    SRC,
+    /if \(!attempt\.invocationEntered\) return 'zero_crossing';[\s\S]{0,1200}settlement\.executionKind === 'refused_pre_dispatch'\s*\n\s*&& settlement\.physicalCrossingCount === 0\s*\n\s*&& settlement\.hostCrossingCount === 0\s*\n\s*\) return 'zero_crossing';/,
+    'before invoke: zero-crossing; after invoke: only an exact refused_pre_dispatch settlement with zero crossings',
   );
 });
