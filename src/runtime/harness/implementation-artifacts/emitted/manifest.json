@@ -1599,7 +1599,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 438267
+          "bytes": 441154
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -2400,7 +2400,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 684659
+          "bytes": 689779
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4224,7 +4224,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 438267
+          "bytes": 441154
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -5025,7 +5025,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 684659
+          "bytes": 689779
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
