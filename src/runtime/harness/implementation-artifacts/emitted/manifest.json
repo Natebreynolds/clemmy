@@ -1413,7 +1413,7 @@
           "bytes": 62060
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 47349
+          "bytes": 47380
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
@@ -4017,7 +4017,7 @@
           "bytes": 62060
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 47349
+          "bytes": 47380
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
