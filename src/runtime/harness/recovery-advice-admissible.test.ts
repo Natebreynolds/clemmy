@@ -85,17 +85,3 @@ test('a no-progress stop says what actually stopped it when the ledger holds a c
   const silent = hostNoProgressBlockedText(null, 'authority_acquisition:no_new_evidence', undefined, null);
   assert.doesNotMatch(silent, /What stopped me/);
 });
-
-test('the completion judge sees a bounded window of retained evidence, never every byte', async () => {
-  // Measured 2026-09-08: full evidence made the judge call 95,842 uncached
-  // input tokens for an 88-token verdict, on every turn.
-  const { boundedJudgeEvidence, JUDGE_EVIDENCE_MAX_CHARS } = await import('./host-turn-runner.js');
-  const small = 'x'.repeat(1000);
-  assert.equal(boundedJudgeEvidence(small), small, 'small evidence passes through untouched');
-  const big = 'H'.repeat(40_000) + 'T'.repeat(40_000);
-  const bounded = boundedJudgeEvidence(big);
-  assert.ok(bounded.length < JUDGE_EVIDENCE_MAX_CHARS + 400, `bounded to ~${JUDGE_EVIDENCE_MAX_CHARS} chars, got ${bounded.length}`);
-  assert.ok(bounded.startsWith('HHHH'), 'keeps the head');
-  assert.ok(bounded.endsWith('TTTT'), 'keeps the tail');
-  assert.match(bounded, /characters of retained results elided for the judge/);
-});

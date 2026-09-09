@@ -792,20 +792,6 @@ export function aggregateHostPreparationRefusalProgress(
  * value-opaque: provider/tool names and arguments are model input, not safe
  * terminal presentation authority.
  */
-/** The completion judge rules on evidence, not on every byte of it. Measured
- *  live 2026-09-08: with the full retained read results the judge call was
- *  95,842 uncached input tokens for an 88-token verdict — about a third of the
- *  turn's cost and ~5 s of latency, on every turn. Keep the head and the tail
- *  of the evidence (what was read, and the last records) and say what was
- *  elided; a verdict does not need all seventy-one email bodies. */
-export const JUDGE_EVIDENCE_MAX_CHARS = 24_000;
-export function boundedJudgeEvidence(summary: string, max = JUDGE_EVIDENCE_MAX_CHARS): string {
-  if (summary.length <= max) return summary;
-  const head = Math.floor(max * 0.7);
-  const tail = max - head;
-  return `${summary.slice(0, head)}\n… [${summary.length - max} characters of retained results elided for the judge; the reply above must still carry the artifact] …\n${summary.slice(-tail)}`;
-}
-
 export const HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT =
   'I stopped before doing anything external: this step was not set up with permission to use its tool. That is a setup problem on my side, not a missing login or a disconnected account. Nothing was sent or changed. Run it again and I will retry; if it repeats, tell me and I will dig in.';
 
@@ -3384,7 +3370,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             : settled.evidenceAvailable
               ? 'This request produced no receipt-bound artifact.'
               : 'The artifact evidence store could not be read for this request. You have NO artifact evidence — do not accept completion on the assistant\'s wording alone.',
-          `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${boundedJudgeEvidence(readEvidence.summary)}`,
+          // Keep the complete evidence the receipt below claims was judged.
+          // Head/tail clipping hid middle records, including facts that could
+          // contradict the answer. The selected model's existing context
+          // admission owns capacity; presentation must not discard evidence.
+          `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
           'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
             + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
             + 'artifacts the objective never requested. Unavailable optional or irrelevant reads do not create '
