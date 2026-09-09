@@ -1,6 +1,6 @@
 # Harness latency refinements — September 8, 2026 Pacific
 
-Harness ownership remains `/Users/nathan.reynolds/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`. UI work belongs to the other agent. No version bump, tag, push or UI edit is part of this pass.
+Harness ownership remains `/Users/you/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`. UI work belongs to the other agent. No version bump, tag, push or UI edit is part of this pass.
 
 ## Evidence behind the changes
 
