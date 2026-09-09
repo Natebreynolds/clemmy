@@ -26,6 +26,7 @@ const Inbox = lazyNamed(() => import('./screens/Inbox'), 'Inbox');
 const BackgroundTasks = lazyNamed(() => import('./screens/BackgroundTasks'), 'BackgroundTasks');
 const Goals = lazyNamed(() => import('./screens/Goals'), 'Goals');
 const Automate = lazyNamed(() => import('./screens/Automate'), 'Automate');
+const AutomateCreate = lazyNamed(() => import('./screens/AutomateCreate'), 'AutomateCreate');
 const Connect = lazyNamed(() => import('./screens/Connect'), 'Connect');
 const Memory = lazyNamed(() => import('./screens/Memory'), 'Memory');
 const Meetings = lazyNamed(() => import('./screens/Meetings'), 'Meetings');
@@ -173,6 +174,7 @@ export function App() {
             <Route path="/tasks" element={deferred(<BackgroundTasks />)} />
             <Route path="/goals" element={deferred(<Goals />)} />
             <Route path="/automate" element={deferred(<Automate />)} />
+            <Route path="/automate/new" element={deferred(<AutomateCreate />)} />
             <Route path="/connect" element={deferred(<Connect />)} />
             <Route path="/memory" element={deferred(<Memory />)} />
             <Route path="/meetings" element={deferred(<Meetings />)} />
