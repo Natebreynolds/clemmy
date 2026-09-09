@@ -1158,7 +1158,7 @@
           "bytes": 95292
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 95825
+          "bytes": 97916
         },
         "src/tools/plan-tools.ts": {
           "bytes": 95338
@@ -1764,7 +1764,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 72274
+          "bytes": 72456
         },
         "src/runtime/harness/preflight-conversation.ts": {
           "bytes": 28477
@@ -2559,7 +2559,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 166287
+          "bytes": 166495
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -3762,7 +3762,7 @@
           "bytes": 95292
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 95825
+          "bytes": 97916
         },
         "src/tools/plan-tools.ts": {
           "bytes": 95338
@@ -4368,7 +4368,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 72274
+          "bytes": 72456
         },
         "src/runtime/harness/preflight-conversation.ts": {
           "bytes": 28477
@@ -5163,7 +5163,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 166287
+          "bytes": 166495
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
