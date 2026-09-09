@@ -1080,7 +1080,7 @@
           "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 24131
+          "bytes": 24706
         },
         "src/runtime/harness/plan-task-post-settlement.ts": {
           "bytes": 58073
@@ -3684,7 +3684,7 @@
           "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 24131
+          "bytes": 24706
         },
         "src/runtime/harness/plan-task-post-settlement.ts": {
           "bytes": 58073
