@@ -48,7 +48,7 @@ after(() => {
   rmSync(fixtureHome, { recursive: true, force: true });
 });
 
-for (const { count, limit, native = false, planned = false } of [{ count: 10, limit: 128 }, { count: 50, limit: 128 }, { count: 10, limit: 2 }, { count: 3, limit: 4, native: true }, { count: 3, limit: 2, native: true }, { count: 3, limit: 2, native: true, planned: true }]) test(`${count} authorized ${native ? 'native' : 'provider'} drafts queue through eight slots with activation budget ${limit}${planned ? ' and accepted Plan' : ''}`, async () => {
+for (const { count, limit, native = false, planned = false } of [{ count: 10, limit: 128 }, { count: 50, limit: 128 }, { count: 10, limit: 2 }, { count: 3, limit: 4, native: true }, { count: 3, limit: 2, native: true }, { count: 3, limit: 2, native: true, planned: true }, { count: 3, limit: 3, native: true, planned: true }, { count: 3, limit: 8, native: true, planned: true }, { count: 50, limit: 128, native: true, planned: true }]) test(`${count} authorized ${native ? 'native' : 'provider'} drafts queue through eight slots with activation budget ${limit}${planned ? ' and accepted Plan' : ''}`, async () => {
   const bodies: unknown[] = [];
   const provider = async (call: unknown) => {
     bodies.push(call);
@@ -99,46 +99,39 @@ for (const { count, limit, native = false, planned = false } of [{ count: 10, li
     async getResponse(request: { input: Array<{ callId?: string; output?: { text?: string } }> }) {
       step += 1;
       let output: unknown[];
-      if (step === 1) output = [call('discover-draft', 'tool_search', { query: native ? 'write_file' : 'OUTLOOK_CREATE_DRAFT', limit: 3 })];
-      else if (step === 2) {
+      const discovered = () => {
         const discovery = JSON.parse(request.input.find(x => x.callId === 'discover-draft' && x.output)?.output?.text ?? '{}');
         const found = discovery.results?.find((x: { name: string }) => x.name === (native ? 'write_file' : rawTool.slug));
         const ref = native ? found?.capabilityVariants?.find((v: { capabilityRef: string }) => v.capabilityRef.endsWith(':create'))?.capabilityRef : found?.capabilityRef;
         assert.ok(ref, JSON.stringify(discovery));
-        if (planned) {
-          const workTopology = { version: 1 as const,
-            operations: [{ id: 'draft_email', effect: 'local_write' as const, coverage: null,
-              dependsOn: [], dataFrom: [], cardinality: { kind: 'each' as const, universeId: 'contacts' } }],
-            universes: [{ id: 'contacts', seal: 'accepted_input' as const,
-              members: Array.from({ length: count }, (_, i) => `contact-${i+1}`) }] };
-          const destination = { posture: 'create_new' as const, family: 'file', handleRequired: true };
-          const admitted = await semantic.admitAndCompilePrimaryModelProposal({
-            identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
-            surface: 'direct', planningCatalogAuthority: primed.planning.authority,
-            proposal: { version: 1, relation: 'new_goal', targetGoal: null,
-              goal: { objective: text, criteria: [{ id: 'drafts', statement: `Exactly ${count} separate drafts are saved.` }],
-                openSlots: [], candidates: [{ kind: 'capability', id: ref }] },
-              work: { construct: 'fanout', cardinality: null, destinations: [destination], destination,
-                requestedEffect: 'local_write', topology: workTopology, topologyHash: topology.workTopologyDigest(workTopology),
-                operations: [{ id: 'draft_email', role: 'destination', requestedEffect: 'local_write', capabilityRef: ref,
-                  dependsOn: [], evidence: ['local_commit_receipt'] }],
-                deliverables: [{ id: 'drafts', kind: 'file' }], evidenceRequirements: ['local_commit_receipt'] },
-              slotAnswers: [], rationale: 'Use the exact discovered local writer for each contact.' },
-          });
-          assert.ok(admitted.ok, JSON.stringify(admitted));
-          const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
-          const frozen = contracts.freezePrimaryModelExpectedWorkContract(identity);
-          assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
-          const activated = workAdmission.activateActionExpectedWork(identity);
-          assert.ok(activated.status === 'activated' || activated.status === 'replayed', JSON.stringify(activated));
-        }
-
-        output = Array.from({ length: count }, (_, i) => call(`draft-${i+1}`, 'work_call', { requirement_id: planned ? 'draft_email' : ref,
-          universe_item_id: planned ? `contact-${i+1}` : null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null,
-          name: native ? 'write_file' : 'composio_execute_tool', args_json: JSON.stringify(native
-            ? { path: path.join(fixtureHome, `draft-${i+1}.eml`), mode: 'create', content: `To: contact${i+1}@example.test\nSubject: Monday\nCan we meet Monday?` }
-            : { tool_slug: rawTool.slug,
-            arguments: JSON.stringify({ subject: `Draft ${i+1}`, body: 'Can we meet Monday?', to_recipients: [`contact${i+1}@example.test`] }) }) }));
+        return { found, ref: ref as string };
+      };
+      const drafts = (ref: string) => Array.from({ length: count }, (_, i) => call(`draft-${i+1}`, 'work_call', { requirement_id: planned ? 'draft_email' : ref,
+        universe_item_id: planned ? `contact-${i+1}` : null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null,
+        name: native ? 'write_file' : 'composio_execute_tool', args_json: JSON.stringify(native
+          ? { path: path.join(fixtureHome, `draft-${i+1}.eml`), mode: 'create', content: `To: contact${i+1}@example.test\nSubject: Monday\nCan we meet Monday?` }
+          : { tool_slug: rawTool.slug,
+          arguments: JSON.stringify({ subject: `Draft ${i+1}`, body: 'Can we meet Monday?', to_recipients: [`contact${i+1}@example.test`] }) }) }));
+      if (step === 1) output = [call('discover-draft', 'tool_search', { query: native ? 'write_file' : 'OUTLOOK_CREATE_DRAFT', limit: 3 })];
+      else if (step === 2 && planned) {
+        // The production Plan door: the model publishes its topology through
+        // plan_task; the host activates expected work from the settled winner.
+        // Admitting a proposal directly bypasses that winner and refuses the
+        // first batch as a foreign catalog change (catalog_snapshot_changed).
+        const { ref } = discovered();
+        output = [call('plan-drafts', 'plan_task', { preamble: `I will save ${count} draft files now.`, draft: {
+          criteria: [`Exactly ${count} separate drafts are saved.`], cardinality: null,
+          destination: { posture: 'create_new', family: 'file', handleRequired: true },
+          topology: { version: 1,
+            operations: [{ id: 'draft_email', effect: 'local_write', coverage: null, dependsOn: [], dataFrom: [],
+              cardinality: { kind: 'each', universeId: 'contacts' } }],
+            universes: [{ id: 'contacts', seal: 'accepted_input', members: Array.from({ length: count }, (_, i) => `contact-${i+1}`) }] },
+          bindings: [{ operationId: 'draft_email', role: 'write', capabilityRef: ref, evidence: ['local_commit_receipt'] }],
+          deliverables: [{ id: 'drafts', kind: 'file' }], evidenceRequirements: ['local_commit_receipt'] } })];
+      } else if (step === (planned ? 3 : 2)) {
+        const planReply = planned ? request.input.find(x => x.callId === 'plan-drafts' && x.output)?.output?.text ?? '' : '';
+        if (planned) assert.match(planReply, /"ok":\s*true/, planReply.slice(0, 600));
+        output = drafts(discovered().ref);
       } else output = [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Fixture complete.' }] }];
       return { responseId: `outreach-${step}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output };
     },
@@ -158,10 +151,30 @@ for (const { count, limit, native = false, planned = false } of [{ count: 10, li
     () => hostRunRunner(runner as never, agent as never, [{ role: 'user', content: text }] as never,
       { maxTurns: 5, hostTurnEngine: 'host_v1', hostJudgeCompletion: false,
         toolExecution: { maxFunctionToolConcurrency: 8 }, context: { sessionId: session.id, sourceUserSeq: source.seq } } as never));
-  if (limit === 2) {
+  const charged = planned ? 2 : 1; // discovery (+ plan) precede the first draft
+  if (limit < count + charged) {
+    // THE ACTIVATION BOUNDARY IS A CHECKPOINT. The ceiling propagates as the
+    // typed limit, the drafts that ran are committed, and every untouched
+    // sibling is closed as stopped-before-dispatch so the frame's receipts
+    // commit and the next activation can re-issue exactly the remainder.
     await assert.rejects(attempt, error => error instanceof brackets.ToolCallsLimitExceeded,
       'an activation boundary must checkpoint the completed write and untouched siblings, not fail receipt commit');
-    assert.equal(bodies.length, 1);
+    assert.equal(bodies.length, Math.max(0, limit - charged));
+    const db = eventlog.openEventLog();
+    const drafts = db.prepare(`SELECT l.logical_tool_call_id AS id, l.state, s.execution_kind, s.outcome_kind, s.outcome_detail
+        FROM logical_tool_calls l LEFT JOIN logical_call_settlements s
+          ON s.session_id = l.session_id AND s.source_user_seq = l.source_user_seq AND s.logical_tool_call_id = l.logical_tool_call_id
+       WHERE l.session_id = ? AND l.logical_tool_call_id LIKE 'draft-%' ORDER BY l.logical_tool_call_id`).all(session.id) as Array<{
+      id: string; state: string; execution_kind: string | null; outcome_kind: string | null; outcome_detail: string | null }>;
+    assert.equal(drafts.length, count, 'every draft in the frame was admitted');
+    assert.ok(drafts.every(row => row.state === 'settled'), JSON.stringify(drafts));
+    const ran = drafts.filter(row => row.execution_kind !== 'refused_pre_dispatch' && row.outcome_kind === 'succeeded');
+    const stopped = drafts.filter(row => row.execution_kind === 'refused_pre_dispatch'
+      && /activation_budget_stopped_before_dispatch/.test(row.outcome_detail ?? ''));
+    assert.equal(ran.length, bodies.length, 'exactly the drafts that ran are settled as succeeded');
+    assert.equal(stopped.length, count - bodies.length, 'every untouched sibling is settled as stopped before dispatch');
+    const receipts = db.prepare(`SELECT COUNT(*) AS n FROM logical_model_result_projection_receipts WHERE session_id = ?`).get(session.id) as { n: number };
+    assert.ok(receipts.n >= count, `the frame's result receipts committed (${receipts.n} < ${count})`);
     return;
   }
   const outcome = await attempt;
@@ -170,8 +183,8 @@ for (const { count, limit, native = false, planned = false } of [{ count: 10, li
     const row = x as { callId?: string; output?: { text?: string } };
     return { callId: row.callId, text: row.output?.text?.slice(0, 750) };
   })));
-  assert.equal(counter.calls, count + 1, 'one charge per logical call, including native transport mirrors');
-  assert.equal(step, 3, 'one discovery, one batch, one answer; no model repair is needed');
+  assert.equal(counter.calls, count + (planned ? 2 : 1), 'one charge per logical call, including native transport mirrors');
+  assert.equal(step, planned ? 4 : 3, 'one discovery, (one plan,) one batch, one answer; no model repair is needed');
   assert.equal(outcome.serializedRecoveryState, undefined);
   const settled = eventlog.openEventLog().prepare(`SELECT outcome_kind FROM logical_call_settlements
     WHERE session_id = ? AND logical_tool_call_id LIKE 'draft-%'`).all(session.id);

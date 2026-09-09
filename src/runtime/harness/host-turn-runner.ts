@@ -5836,6 +5836,42 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       (attempt): attempt is Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'tool_calls_limit' }> =>
         attempt?.status === 'tool_calls_limit',
     )?.error;
+    if (toolCallsLimit) {
+      // AN ACTIVATION BOUNDARY IS A CHECKPOINT, NOT A FAILED FRAME. The
+      // scheduler stopped assigning work at the ceiling, so every call at or
+      // after it provably never entered invocation. Close those admitted
+      // identities as stopped-before-dispatch under the same exact contract
+      // the sibling-barrier path uses, so the frame's result receipts can
+      // commit around the calls that DID run. Without this the not-started
+      // dispositions had no settlement, the receipt commit failed, and the
+      // exact checkpoint re-entered five times against the same spent budget
+      // before dying at exact_checkpoint_admission_exhausted (live 2026-09-09,
+      // 31 of 50 drafts saved, batch 6 never dispatched). The next activation
+      // re-issues these items under fresh call ids; nothing is replayed.
+      let provenEntries: ProvenCompletionEntry[] | null = null;
+      try { provenEntries = sourceProvenCarrierEntries(); } catch { provenEntries = null; }
+      for (const [index, call] of calls.entries()) {
+        const attempt = attempts[index];
+        if (attempt && attempt.status !== 'tool_calls_limit') continue;
+        // Reopen the SAME completed carrier bytes the admission digest was
+        // minted from (the finalize-recovery path does exactly this for
+        // barrier-skipped siblings); raw model bytes would fail the digest
+        // check and leave the identity open.
+        let argumentsJson = call.argumentsJson;
+        try {
+          if (provenEntries) argumentsJson = completedCarrierCallArguments(call, provenEntries, true).argumentsJson;
+        } catch { argumentsJson = call.argumentsJson; }
+        settlePendingCallBeforeDispatch({
+          callId: call.callId,
+          name: call.name,
+          rawItem: {
+            name: call.name,
+            callId: call.callId,
+            arguments: materializedArgumentsJson(toolByName.get(call.name), argumentsJson),
+          },
+        }, 'activation_budget_stopped_before_dispatch', true);
+      }
+    }
     const settlementReconciliation = attempts.map((attempt) => (
       attempt?.status === 'returned'
       && attempt.value.settlementRequiresReconciliation === true
@@ -6065,13 +6101,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const identity = exactHostIdentity();
         const acceptedTaskId = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
         const row = db.prepare(`
-          SELECT accepted_task_id, tool_name, argument_digest, state
+          SELECT accepted_task_id, tool_name, argument_digest, raw_argument_digest, state
             FROM logical_tool_calls
            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
         `).get(identity.sessionId, identity.sourceUserSeq, pending.callId) as {
           accepted_task_id: string;
           tool_name: string;
           argument_digest: string;
+          raw_argument_digest: string | null;
           state: 'open' | 'settled';
         } | undefined;
         // A call refused before the common logical admission wall is owned by
@@ -6091,10 +6128,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           pending.name,
           args,
         );
+        // A refinement REWRITES argument_digest from the raw admission bytes
+        // to the provider-ready ones; raw_argument_digest keeps the immutable
+        // admission identity. This reconstruction comes from the accepted
+        // outer bytes, so it can only ever match the RAW digest of a refined
+        // call. Comparing against the refined digest alone made every
+        // refined-but-unstarted sibling unsettleable: the receipt commit then
+        // failed and the exact checkpoint re-entered until its budget died
+        // (live 2026-09-09, 31/50 drafts). The settlement store accepts either
+        // digest for the same reason (2026-08-11); this seam now does too.
         if (
           !recovery
           || recovery.toolName !== row.tool_name
-          || recovery.argumentDigest !== row.argument_digest
+          || (recovery.argumentDigest !== row.argument_digest
+            && recovery.argumentDigest !== row.raw_argument_digest)
         ) return false;
         if (unstarted) {
           // A barrier-skipped sibling never entered invocation. Prove that fact
