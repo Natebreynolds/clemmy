@@ -42,12 +42,17 @@ export function layoutConstellation(seedId: string, nodes: GraphNode[], edges: G
   const ring2: string[] = [];
   for (const r of ring1) for (const n of adj.get(r) ?? []) { if (!seen.has(n) && ring2.length < caps.ring2) { seen.add(n); ring2.push(n); } }
   const cx = width / 2; const cy = height / 2;
-  const place = (ids: string[], radius: number, ring: 1 | 2, offset: number): StarNode[] => ids.map((id, i) => {
+  // Ellipses sized to the box so every node (and its label) stays inside.
+  const place = (ids: string[], rx: number, ry: number, ring: 1 | 2, offset: number): StarNode[] => ids.map((id, i) => {
     const a = offset + (i / Math.max(1, ids.length)) * Math.PI * 2;
     const n = byId.get(id)!;
-    return { id, label: starLabel(n), type: n.type, x: Math.round(cx + Math.cos(a) * radius), y: Math.round(cy + Math.sin(a) * radius * 0.62), ring };
+    return { id, label: starLabel(n), type: n.type, x: Math.round(cx + Math.cos(a) * rx), y: Math.round(cy + Math.sin(a) * ry), ring };
   });
-  const out: StarNode[] = [{ id: seedId, label: starLabel(seed, 24), type: seed.type, x: cx, y: cy, ring: 0 }, ...place(ring1, Math.min(cx, cy) * 1.15, 1, -Math.PI / 2), ...place(ring2, Math.min(cx, cy) * 1.8, 2, -Math.PI / 2 + 0.35)];
+  const out: StarNode[] = [
+    { id: seedId, label: starLabel(seed, 24), type: seed.type, x: cx, y: cy, ring: 0 },
+    ...place(ring1, cx * 0.6, cy * 0.55, 1, -Math.PI / 2),
+    ...place(ring2, cx * 0.86, cy * 0.8, 2, -Math.PI / 2 + 0.4),
+  ];
   const pos = new Map(out.map((n) => [n.id, n]));
   const starEdges: StarEdge[] = [];
   const dedupe = new Set<string>();
