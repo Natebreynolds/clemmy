@@ -3202,6 +3202,8 @@ export interface RunTurnOptions {
   internalContinuation?: boolean;
   /** See RunConversationOptions.reuseRecordedUserInput. */
   reuseRecordedUserInput?: boolean;
+  /** See RunConversationOptions.hostOwnedContinuation. */
+  hostOwnedContinuation?: true;
   /** Exact accepted source event owned by this logical user request. */
   sourceUserSeq?: number;
   /** Stable logical infrastructure-error episode retained only while the
@@ -3416,6 +3418,12 @@ export interface RunConversationOptions {
   maxTurns?: number;
   /** Forwarded to each underlying runTurn(). */
   toolCallsPerTurn?: number;
+  /** A host-owned continuation of the SAME accepted source (a fresh activation
+   * after the per-activation tool ceiling). The accepted history already ends
+   * with the committed frame, so no new user item is appended — appending one
+   * changes the pre-history digest the accepted-batch chain verifies and every
+   * later admission is refused. Carry any directive as `continuationSteer`. */
+  hostOwnedContinuation?: true;
   /** Runtime-authored accepted source (for example a proactive outcome
    * directive). Suppresses automatic memory on the first physical turn too. */
   suppressMemoryCapture?: true;
@@ -3637,9 +3645,15 @@ export async function runConversationContinuingPastToolCallsLimit(
       memoryPrimerQuery: _noPrimer,
       ...stableOptions
     } = options;
+    const accepted = acceptedUserEvent(options.sessionId, checkpointSourceUserSeq);
     result = await runConversation({
       ...stableOptions,
-      input: buildContinueInput(result.lastDecision?.summary, { auto: true }),
+      // The accepted source text stays the input (planning, memory, and the
+      // recorded acceptance all key on it); the resume directive rides as a
+      // steer so the accepted history is not extended by a new user item.
+      input: typeof accepted.data.text === 'string' ? accepted.data.text : options.input,
+      continuationSteer: buildContinueInput(result.lastDecision?.summary, { auto: true }),
+      hostOwnedContinuation: true,
       sourceUserSeq: checkpointSourceUserSeq,
       reuseRecordedUserInput: true,
       deferToolCallsLimitTerminal: true,
@@ -5823,6 +5837,7 @@ async function runConversationWithinRuntimeConfig(
           : {}),
         turnEngine: frozenTurnEngine,
         reuseRecordedUserInput: true,
+        ...(options.hostOwnedContinuation ? { hostOwnedContinuation: true as const } : {}),
         maxTurns: options.maxTurns,
         toolCallsPerTurn: options.toolCallsPerTurn,
         makeRunner: options.makeRunner,
@@ -10292,7 +10307,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     } catch { /* graceful — never block a turn on prefix injection */ }
   }
 
-  const items: AgentInputItem[] = adoptedCheckpointContinuation
+  const items: AgentInputItem[] = adoptedCheckpointContinuation || options.hostOwnedContinuation === true
     ? [...compactedItems]
     : [
         ...compactedItems,

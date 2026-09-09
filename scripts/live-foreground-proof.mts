@@ -184,7 +184,7 @@ try {
     turn.measurement = measureAcceptedTurn(home, sessionId, source.seq);
     turn.modelRequests = (db.prepare('SELECT count(*) n FROM model_request_provenance WHERE session_id=? AND source_user_seq=?').get(sessionId, source.seq) as { n: number }).n;
     turn.settlements = db.prepare(`SELECT logical_tool_call_id, mutating, business_call, outcome_kind,
-      execution_kind, physical_crossing_count, host_crossing_count, requires_reconciliation
+      execution_kind, outcome_detail, physical_crossing_count, host_crossing_count, requires_reconciliation
       FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?`).all(sessionId, source.seq);
     turn.activatedPlans = (db.prepare(`SELECT count(*) n FROM events a
       JOIN events g ON g.id = json_extract(a.data_json, '$.graphEventId')

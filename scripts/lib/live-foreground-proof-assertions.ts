@@ -42,7 +42,8 @@ export interface LiveTurnFacts {
   activatedPlans?: number;
   providerAcknowledgements?: number;
   settlements: Array<{
-    mutating: number; outcome_kind: string; requires_reconciliation: number;
+    logical_tool_call_id?: string; mutating: number; outcome_kind: string; requires_reconciliation: number;
+    execution_kind?: string; outcome_detail?: string | null;
     physical_crossing_count: number; host_crossing_count: number;
   }>;
 }
@@ -81,12 +82,25 @@ export function checkLiveTurn(expect: z.infer<typeof LiveTurnExpectationSchema>,
   ] as const) {
     if (expected !== undefined && actual !== expected) failures.push(`${label}: expected ${expected}, got ${actual ?? 'unavailable'}`);
   }
-  const mutations = facts.settlements.filter((row) => row.mutating === 1);
+  // A sibling the host deliberately stopped at an activation boundary carries
+  // mutating INTENT but proves zero crossings and the host's typed reason; it
+  // is a checkpoint, not a failed or uncertain effect. Every other mutating
+  // settlement must be a clean success. (The boundary rows are still audited
+  // below: zero crossings, the exact typed reason.)
+  const boundaryStopped = facts.settlements.filter((row) => row.mutating === 1
+    && row.execution_kind === 'refused_pre_dispatch'
+    && /activation_budget_stopped_before_dispatch/.test(row.outcome_detail ?? ''));
+  const mutations = facts.settlements.filter((row) => row.mutating === 1 && !boundaryStopped.includes(row));
   if (expect.successfulMutations !== undefined) {
     const successful = mutations.filter((row) => row.outcome_kind === 'succeeded'
       && row.requires_reconciliation === 0 && row.physical_crossing_count + row.host_crossing_count > 0);
     if (successful.length !== expect.successfulMutations || mutations.length !== successful.length) {
       failures.push(`mutations: expected exactly ${expect.successfulMutations} successful settled effects; got ${successful.length} successful / ${mutations.length} total`);
+    }
+    for (const row of boundaryStopped) {
+      if (row.physical_crossing_count + row.host_crossing_count !== 0 || row.requires_reconciliation !== 0) {
+        failures.push(`an activation-boundary stop crossed its execution boundary (${row.logical_tool_call_id})`);
+      }
     }
     if (mutations.some((row) => row.physical_crossing_count > 1 || row.host_crossing_count > 1)) {
       failures.push('a mutating logical call crossed its execution boundary more than once');

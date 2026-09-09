@@ -1901,7 +1901,13 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     return { frame, output };
   };
 
-  const built = tool({
+  // The description restates turn STATE (the frozen contract, what is READY),
+  // not the callable contract: name + parameters remain fingerprinted, prose
+  // does not. A resumed activation of the same accepted source otherwise
+  // re-sealed a changed envelope and the immutable host root refused it as
+  // `authority_conflict` (live 2026-09-09, the second activation of a planned
+  // 50-draft batch). Same marker plan_task carries for the same reason.
+  const built = Object.assign(tool({
     name: 'work_call',
     description: [
       frozenAuthority
@@ -2025,7 +2031,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       } catch { /* not an envelope — wrap it */ }
       return refusalResult(frame.refusalKind, rendered) as unknown as string;
     },
-  });
+  }), { descriptionCarriesTurnState: true as const });
 
   const renderPreparationRefusal = (output: unknown): string => {
     if (output instanceof ExternalWritePreDispatchResult) return output.output;
