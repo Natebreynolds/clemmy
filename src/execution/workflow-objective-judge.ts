@@ -105,13 +105,6 @@ export function buildWorkflowObjective(
   if (workflow.synthesis?.prompt?.trim()) {
     pushUnique(`The final deliverable should satisfy: ${workflow.synthesis.prompt.trim()}`);
   }
-  // Descriptions explain intent, but the authored steps and output contracts
-  // define the actual work. Omitting them made an exact-response workflow
-  // fail review for not producing an invented report. Keep their complete
-  // content, including requirements beyond a long descriptive preamble.
-  if (workflow.steps?.length) {
-    parts.push(`Authored workflow steps and output contracts:\n${safeJson(workflow.steps)}`);
-  }
   const inputKeys = Object.keys(inputs ?? {});
   if (inputKeys.length) {
     const rendered = inputKeys.map((k) => `${k}=${renderInput(inputs[k])}`).join(', ');
@@ -236,6 +229,12 @@ export async function judgeWorkflowTarget(
   const objectivePrompt = [
     "This is a BACKGROUND WORKFLOW's target — the complete deliverable the user needs while they are away:",
     objective,
+    // Keep these in judge context, not in the displayable/persisted goal.
+    // Both inferred and owner-authored goals need the actual instructions;
+    // a description alone can make the judge invent a missing deliverable.
+    ...(opts.workflow.steps?.length
+      ? ['', `Authored workflow steps and output contracts:\n${safeJson(opts.workflow.steps)}`]
+      : []),
     ...((opts.goal?.successCriteria?.length ?? 0) > 0
       ? [
           '',
