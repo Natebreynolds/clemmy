@@ -10,6 +10,7 @@ import {
   ensureDir,
   listWorkspaceProjects,
   textResult,
+  invalidArgumentsTextResult,
 } from './shared.js';
 import { appendTimer, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
 import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
@@ -215,7 +216,7 @@ export function registerAdminTools(server: McpServer): void {
 
   server.tool(
     'workspace_info',
-    'Get detailed info about a local project including README, CLAUDE.md, manifest, and structure.',
+    'Inspect a local project directory: README, imported agent notes, manifest, and structure. project_path must be a directory. Read a known file directly with read_file.',
     {
       project_path: z.string().min(1),
       include_tree: z.boolean().optional(),
@@ -223,19 +224,19 @@ export function registerAdminTools(server: McpServer): void {
     async ({ project_path, include_tree }) => {
       const resolved = resolveHomePath(project_path);
       if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-        return textResult(`Not a directory: ${resolved}`);
+        return invalidArgumentsTextResult(`Not a directory: ${resolved}. workspace_info requires a project directory. To read a known file, use read_file with its path.`);
       }
 
       const sections: string[] = [`# ${path.basename(resolved)}`, `Path: ${resolved}`];
       const claudePath = path.join(resolved, '.claude', 'CLAUDE.md');
       if (existsSync(claudePath)) {
-        sections.push('', '## Imported Agent Notes', readFileSync(claudePath, 'utf-8').slice(0, 3000));
+        sections.push('', '## Imported Agent Notes', readFileSync(claudePath, 'utf-8'));
       }
 
       for (const readmeName of ['README.md', 'readme.md', 'README']) {
         const readmePath = path.join(resolved, readmeName);
         if (!existsSync(readmePath)) continue;
-        sections.push('', `## ${readmeName}`, readFileSync(readmePath, 'utf-8').slice(0, 3000));
+        sections.push('', `## ${readmeName}`, readFileSync(readmePath, 'utf-8'));
         break;
       }
 
@@ -267,7 +268,6 @@ export function registerAdminTools(server: McpServer): void {
         const tree = readdirSync(resolved)
           .filter((entry) => !entry.startsWith('.'))
           .sort()
-          .slice(0, 60)
           .map((entry) => {
             const fullPath = path.join(resolved, entry);
             try {
@@ -276,9 +276,12 @@ export function registerAdminTools(server: McpServer): void {
               return entry;
             }
           });
-        sections.push('', '## Structure', ['```', ...tree, '```'].join('\n'));
+        sections.push('', '## Structure (non-hidden entries)', ['```', ...tree, '```'].join('\n'));
       }
 
+      // Retain complete sources before the shared formatter budgets the model
+      // view. Pre-slicing here permanently lost requirements and late files,
+      // even when the model followed the exact-result recall pointer.
       return textResult(sections.join('\n'));
     },
   );

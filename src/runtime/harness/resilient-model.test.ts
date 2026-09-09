@@ -18,6 +18,59 @@ function policy(over: Partial<ResiliencePolicy> = {}): ResiliencePolicy {
   return { label: 'test', capability: CLAUDE_CAP, sleep: noSleep, ...over };
 }
 
+test('an explicit provider refusal is not an empty-response retry (real Anthropic adapter shape)', async () => {
+  const { Agent, Runner } = await import('@openai/agents');
+  const { aisdk } = await import('@openai/agents-extensions/ai-sdk');
+  const { createAnthropic } = await import('@ai-sdk/anthropic');
+  let calls = 0;
+  const provider = createAnthropic({ apiKey: 'fixture-only', fetch: async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ id: 'msg-refusal', type: 'message', role: 'assistant',
+      model: 'claude-opus-5', content: [], stop_reason: 'refusal', stop_sequence: null,
+      usage: { input_tokens: 4396, output_tokens: 0 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  } });
+  const model = withResilience(aisdk(provider('claude-opus-5')), policy());
+  await assert.rejects(new Runner().run(new Agent({ name: 'RefusalFixture', model, tools: [], modelSettings: {} }), 'Review this report.'),
+    (error: unknown) => error instanceof BoundaryError && error.kind === 'model.refused' && !error.retryable);
+  assert.equal(calls, 1, 'a terminal provider refusal must not consume four identical requests');
+});
+
+test('a streamed provider refusal before content does not retry or publish empty success', async () => {
+  let calls = 0;
+  const model = withResilience({
+    async getResponse() { throw new Error('unexpected nonstream request'); },
+    async *getStreamedResponse() {
+      calls += 1;
+      yield { type: 'response_started' } as never;
+      yield { type: 'model', event: { type: 'finish', finishReason: { unified: 'content-filter', raw: 'refusal' } } } as never;
+      yield { type: 'response_done', response: { output: [], usage: {} } } as never;
+    },
+  }, policy());
+  await assert.rejects(async () => { for await (const _ of model.getStreamedResponse(req())) { /* consume */ } },
+    (error: unknown) => error instanceof BoundaryError && error.kind === 'model.refused' && !error.retryable);
+  assert.equal(calls, 1);
+});
+
+test('the traceless host adapter retains refusal metadata for the surrounding retry classifier', async () => {
+  const { withTracelessStep } = await import('./traceless-step-model.js');
+  let calls = 0;
+  const model = withResilience(withTracelessStep({
+    async getResponse() { throw new Error('unexpected traced request'); },
+    async *getStreamedResponse() {
+      calls += 1;
+      yield { type: 'model', event: { type: 'finish', finishReason: { unified: 'content-filter', raw: 'refusal' } } } as never;
+      yield { type: 'response_done', response: { id: 'refused', output: [], usage: { inputTokens: 10, outputTokens: 0, totalTokens: 10 } } } as never;
+    },
+  }), policy());
+  await assert.rejects(model.getResponse(req()), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError);
+    assert.equal(error.kind, 'model.refused');
+    assert.deepEqual(pick(classifyModelError(error)), { retryable: false, kind: 'model.refused', isAuth: false });
+    return true;
+  });
+  assert.equal(calls, 1);
+});
+
 // --- translateSettings (G1) -------------------------------------------------
 
 test('translateSettings: anthropic effort tier -> providerOptions.anthropic.effort', () => {

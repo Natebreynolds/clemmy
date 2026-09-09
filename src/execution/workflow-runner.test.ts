@@ -7958,3 +7958,20 @@ test('rememberProvenWorkflowStepTool learns a provider call that crossed wrapped
   assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin wrapped local', 'send')),
     'a wrapper around a local tool is not a provider pin');
 });
+
+
+test('a blocked JSON-text step finalizes as blocked and withholds its dependent write', () => {
+  const blocked = { blocked: true, reason: 'The brief write was refused before dispatch.' };
+  const step = { id: 'prepare', prompt: 'Prepare the brief.' };
+  const result = finalizeStepOutput('blocked-json-control', 'blocked-json-control-run', step, JSON.stringify(blocked));
+  assert.deepEqual(result, blocked);
+  const events = readWorkflowEvents('blocked-json-control', 'blocked-json-control-run');
+  assert.ok(events.some(event => event.kind === 'step_completed' && event.meta?.blocked === true));
+  const skips = planBlockedDependencySkips([
+    step,
+    { id: 'deliver', prompt: 'Use the prepared brief.', dependsOn: ['prepare'] },
+    { id: 'independent', prompt: 'Read independent data.' },
+  ], { prepare: result });
+  assert.deepEqual(skips.map(entry => entry.stepId), ['deliver']);
+  assert.match(skips[0].output.reason, /write was refused/);
+});

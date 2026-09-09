@@ -126,13 +126,13 @@ test('Normal mode creates and edits actual native Space and workflow definitions
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
   const session = eventlog.createSession({ id: 'normal-native-authoring', kind: 'chat' });
-  const prompt = 'Create a native Space and a manual workflow from my inline content, then edit their description and display text. Do not run the workflow.';
+  const prompt = 'Create a native Space and a manual workflow from my inline content, then edit their description and display text. Also schedule a separate brief once and disable it before it runs. Do not run either workflow.';
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.equal(primed.ok, true);
   if (!primed.ok) return;
-  const names = ['space_save', 'space_edit_view', 'workflow_create', 'workflow_update'];
+  const names = ['space_save', 'space_edit_view', 'workflow_create', 'workflow_update', 'workflow_schedule', 'workflow_unschedule'];
   const refs = new Map<string, string>();
   for (const name of names) {
     const search = buildScopedLocalToolSearch(new Set([name]), 'work_call', undefined, undefined,
@@ -158,6 +158,8 @@ test('Normal mode creates and edits actual native Space and workflow definitions
       steps: [{ id: 'literal', sideEffect: 'read', transform: transform('original') }] } },
     { name: 'workflow_update', args: { name: 'Normal Native Workflow', description: 'Edited native workflow',
       steps: [{ id: 'literal', sideEffect: 'read', transform: transform('edited') }] } },
+    { name: 'workflow_schedule', args: { name: 'normal-scheduled-brief', description: 'Prepare a local brief once.', run_at: '2026-09-11T22:30:00Z', instructions: 'Read the local performance CSV and summarize it.', toolCall: null } },
+    { name: 'workflow_unschedule', args: { name: 'normal-scheduled-brief' } },
   ];
   const model = stubModel([...inputs.map((input, index) => [toolCall(`normal-native-${index}`, 'work_call', {
     requirement_id: refs.get(input.name), source_call_ids: null, source_record_ids: null,
@@ -172,10 +174,10 @@ test('Normal mode creates and edits actual native Space and workflow definitions
   if (!sealed.ok) return;
   capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
-  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(8),
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(16),
     behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
     [{ type: 'message', role: 'user', content: prompt }] as never,
-    { maxTurns: 6, hostTurnEngine: 'host_v1', context: identity } as never));
+    { maxTurns: 8, hostTurnEngine: 'host_v1', context: identity } as never));
   const results = result.history.filter((item: any) => item.type === 'function_call_result');
   assert.equal(result.terminal, undefined, JSON.stringify({ results,
     settlements: eventlog.openEventLog().prepare('SELECT * FROM logical_call_settlements WHERE session_id = ?').all(session.id),
@@ -194,11 +196,14 @@ test('Normal mode creates and edits actual native Space and workflow definitions
   assert.ok(workflow, JSON.stringify(results));
   assert.equal(workflow.data.description, 'Edited native workflow');
   assert.equal(workflow.data.enabled, true);
+  const scheduled = workflowStore.readWorkflow('normal-scheduled-brief')!;
+  assert.equal(scheduled.data.enabled, false);
+  assert.equal(scheduled.data.trigger.onceAt, '2026-09-11T22:30:00.000Z');
   assert.equal(workflow.data.trigger.manual, true);
   assert.equal(workflow.data.steps[0]!.transform?.expression.op, 'literal');
   assert.equal((workflow.data.steps[0]!.transform?.expression as any).value, 'edited');
   const physical = eventlog.openEventLog().prepare('SELECT tool_name, state FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ? ORDER BY rowid').all(session.id, source.seq);
-  assert.equal(physical.length, 4, JSON.stringify({ results, physical }));
+  assert.equal(physical.length, names.length, JSON.stringify({ results, physical }));
   assert.deepEqual(physical, names.map(tool_name => ({ tool_name, state: 'returned' })));
   const settlements = eventlog.openEventLog().prepare(`SELECT mutating, outcome_kind, host_crossing_count
     FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`).all(session.id, source.seq);

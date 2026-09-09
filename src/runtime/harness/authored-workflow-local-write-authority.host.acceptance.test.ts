@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -206,6 +206,7 @@ function createStepFixture(input: {
   kind: 'workflow' | 'chat';
   sideEffect: 'read' | 'write' | 'send';
   requiresApproval?: boolean;
+  prompt?: string;
 }) {
   const suffix = String(++serial);
   const workflowRunId = `run-local-write-${suffix}`;
@@ -215,7 +216,7 @@ function createStepFixture(input: {
   const attemptId = `attempt:workflow:${workflowRunId}:${stepId}`;
   const sessionId = `workflow:${workflowRunId}:${stepId}`;
   const planProposalId = `workflow:${workflowName}:${workflowRunId}:${stepId}`;
-  const prompt = 'Compact the task ledger with task_hygiene, refresh the active goal with goal_upsert, then return a structured result.';
+  const prompt = input.prompt ?? 'Compact the task ledger with task_hygiene, refresh the active goal with goal_upsert, then return a structured result.';
   const definition = {
     name: workflowName,
     description: 'Exercise authored coverage for reversible local ledger writes.',
@@ -660,4 +661,26 @@ test('create and recoverable overwrite retain distinct exact authored-work risk 
   assert.notEqual(updated?.call.argumentDigest, created?.call.argumentDigest);
   assert.notEqual(updated?.call.semanticBasis.digest, created?.call.semanticBasis.digest,
     'a recoverable update keeps its own declared mode instead of inheriting create authority');
+});
+
+
+test('a real schema-on-demand workflow agent writes through its configured carrier on authored local authority', async () => {
+  const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
+  const target = path.join(TEST_HOME, 'workspace', 'scheduled-brief.md');
+  mkdirSync(path.dirname(target), { recursive: true });
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write', prompt: `Write ${target} with the text Prepared.` });
+  assert.equal(fixture.recorded.status, 'ready');
+  const model = stubModel([
+    [toolCall('scheduled-write', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ path: target, content: 'Prepared.\n', mode: 'create', append: null }) })],
+    [textMsg('Prepared.')],
+  ]);
+  const agent = await buildWorkflowStepAgent({ sessionId: fixture.session.id, userInput: fixture.source.data.text as string });
+  agent.model = model as never;
+  const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
+  assert.ok(existsSync(target), JSON.stringify(outcome.history));
+  assert.equal(readFileSync(target, 'utf8'), 'Prepared.\n');
+  assert.equal(pendingApprovalCount(fixture), 0);
+  const writes = nonRefusedSettlements(fixture).filter(row => row.logical_tool_call_id === 'scheduled-write');
+  assert.equal(writes.length, 1, JSON.stringify(writes));
+  assert.equal(writes[0].outcome_kind, 'succeeded');
 });

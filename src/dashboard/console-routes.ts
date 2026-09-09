@@ -5843,6 +5843,8 @@ export function registerConsoleRoutes(
     }
     const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {
       triggerSchedule: typeof body.triggerSchedule === 'string' ? body.triggerSchedule : undefined,
+      triggerOnceAt: typeof body.triggerOnceAt === 'string' ? body.triggerOnceAt : undefined,
+      clearTriggerOnceAt: body.clearTriggerOnceAt === true,
       clearTriggerSchedule: body.clearTriggerSchedule === true,
       timezone: typeof body.timezone === 'string' ? body.timezone : undefined,
       triggerWebhookPath: typeof body.triggerWebhookPath === 'string' ? body.triggerWebhookPath : undefined,

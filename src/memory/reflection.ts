@@ -27,6 +27,7 @@ import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
 import { upsertEntity } from './entity-identity.js';
@@ -1156,6 +1157,8 @@ interface ConflictDecision {
    *  the old wrong fact stayed active + recallable next to its correction
    *  forever whenever the boundary judge was down. */
   unresolved?: boolean;
+  /** Host-observed failure, never a model-supplied claim of failure. */
+  unresolvedReason?: string;
 }
 
 function sanitizeConflictDecision(value: unknown): ConflictDecision | null {
@@ -1195,7 +1198,7 @@ export async function resolveConflict(
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
   const model = getReflectorModel();
-  if (!model) return { decision: 'ADD', unresolved: true };
+  if (!model) return { decision: 'ADD', unresolved: true, unresolvedReason: 'No memory conflict resolver is available.' };
   try {
     const agent = new Agent({
       name: 'Memory Conflict Resolver',
@@ -1221,12 +1224,14 @@ export async function resolveConflict(
     ].join('\n');
     const result = await runner.run(agent, prompt);
     const final = (result as { finalOutput?: unknown }).finalOutput;
-    return sanitizeConflictDecision(final) ?? { decision: 'ADD', unresolved: true };
-  } catch {
+    return sanitizeConflictDecision(final) ?? { decision: 'ADD', unresolved: true, unresolvedReason: 'The memory conflict resolver returned no valid decision.' };
+  } catch (error) {
     // Conservative: on any failure, ADD. Better to have a duplicate
     // than to lose a real fact — but flag it so the retry queue
     // re-resolves the conflict instead of leaving it live forever.
-    return { decision: 'ADD', unresolved: true };
+    const reason = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').slice(0, 400);
+    logger.warn({ reason }, 'memory conflict resolver failed; saved fact still needs reconciliation');
+    return { decision: 'ADD', unresolved: true, unresolvedReason: `Memory conflict review failed: ${reason}` };
   }
 }
 
@@ -1281,6 +1286,9 @@ export interface ConsolidateOutcome {
   deleted: number;
   noop: number;
   importanceAdded: number;
+  /** Related facts remain active after a resolver failure. Foreground callers
+   * must distinguish saving the candidate from completing a correction. */
+  unresolvedConflict?: { factIds: number[]; reason: string };
 }
 
 export interface ConsolidateOptions {
@@ -2022,13 +2030,19 @@ async function consolidateFactInner(
       || explicitCorrectionRelated.length > 0
     );
   if (decision.decision === 'ADD' && similar.length > 0 && (decision.unresolved || confidentAddOverNearDuplicate)) {
+    const factIds = (explicitCorrectionRelated.length > 0 ? explicitCorrectionRelated : similar)
+      .map((fact) => fact.id).filter((id) => id !== added.id);
+    if (decision.unresolved && factIds.length > 0) {
+      out.unresolvedConflict = {
+        factIds,
+        reason: decision.unresolvedReason ?? 'No valid conflict decision was applied to the related facts.',
+      };
+    }
     try {
       const { recordUnresolvedConflict } = await import('./conflict-retry.js');
       recordUnresolvedConflict({
         candidateFactId: added.id,
-        similarFactIds: explicitCorrectionRelated.length > 0
-          ? explicitCorrectionRelated.map((fact) => fact.id)
-          : similar.map((fact) => fact.id),
+        similarFactIds: factIds,
       });
     } catch { /* the queue is a safety net; the ADD itself already stands */ }
   }

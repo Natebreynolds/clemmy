@@ -4,6 +4,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { WorkflowStepOutputContractSchema } from './workflow-output-schema.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -115,7 +116,7 @@ import {
   workflowTerminalOutcomeNeedsAttention,
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
-import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+import { withWorkflowCommit } from '../execution/workflow-commit.js';
 
 function originatingAcceptedUserText(): string {
   const ctx = getToolOutputContext();
@@ -157,22 +158,6 @@ export interface AuthoredWorkflowResult {
   boundNotes: string[];
   advisories: string[];
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
-}
-
-/** Stamp the exact workflow artifact only after the canonical reader reopens
- * the directory layout. Create, whole-definition update, and targeted-step
- * edit all use this one receipt grammar, so the harness proves the final bytes
- * instead of trusting authoring prose. */
-function withWorkflowCommit(dirName: string, result: string): string {
-  const entry = readWorkflow(dirName);
-  if (!entry || entry.name !== dirName || entry.layout !== 'directory') {
-    throw new Error(`Workflow ${dirName} was committed but its exact local artifact could not be reopened.`);
-  }
-  return withHostLocalWriteCommitFromFile({
-    createdId: dirName,
-    committedPath: entry.filePath,
-    result,
-  });
 }
 
 /**
@@ -722,33 +707,6 @@ export function parseWorkflowResourcesJson(
   return resources ?? {};
 }
 
-/**
- * Step OUTPUT contract (WorkflowStepOutputContract). Shared by workflow_create
- * + workflow_update so authors can DECLARE what a step produces. Optional, by
- * design: a step with no `output` is unverified — byte-identical to before
- * (the gradual-typing / Dagster-asset-check posture). When declared, the engine
- * verifies the step's output against it before recording completion
- * (verifyStepOutput, runtime-enforced). Named properties (not an open map), so
- * it fills reliably under strict-mode function-calling.
- */
-const WorkflowStepOutputContractSchema = z.object({
-  type: z.enum(['string', 'number', 'boolean', 'object', 'array']).optional()
-    .describe('The shape the step must produce.'),
-  required_keys: z.array(z.string()).optional()
-    .describe('For an object output: top-level keys that must be present and non-null.'),
-  non_empty: z.array(z.string()).optional()
-    .describe('Dot-paths whose value must be NON-EMPTY (a non-blank string, an array with ≥1 item, or an object with ≥1 key); "" / "." means the whole output. Declare on a data-producing step so a zero-row / blocked-but-shaped result ({prospects: []}) HALTS and reports back instead of feeding empty data downstream.'),
-  min_items: z.record(z.string(), z.number().int().nonnegative()).optional()
-    .describe('Map of dot-path → minimum array length (e.g. {"prospects": 1}). Stricter form of non_empty for "this source must yield at least N rows".'),
-  verify: z.object({
-    path_exists: z.array(z.string()).optional()
-      .describe('Dot-paths in the output whose value must be an existing file path.'),
-    url_present: z.array(z.string()).optional()
-      .describe('Dot-paths in the output whose value must be a non-empty http(s) URL.'),
-  }).optional()
-    .describe('Concrete-handle checks — confirm the named output values are REAL (a file that exists, a non-empty URL), so "produced a brief" cannot pass when the file/URL does not actually exist.'),
-  description: z.string().optional().describe('One-line note on what this step produces.'),
-});
 
 const WorkflowStepInputBindingSchema = z.object({
   type: z.enum(['string', 'number', 'boolean', 'object', 'array']).optional()
@@ -1064,6 +1022,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       })).min(1).describe('REQUIRED model-authored semantic graph. Include every business step in execution order/dependency form; the host validates and compiles this graph but does not invent missing steps.'),
       project: z.string().optional().describe('Default local workspace/project name or path for this workflow. Use when steps operate in a specific repo or local project; step-level project overrides it.'),
       trigger_schedule: z.string().optional(),
+      trigger_once_at: z.string().optional().describe('One-time absolute ISO timestamp with Z or UTC offset. Use instead of trigger_schedule for a single future run; the host consumes the occurrence without a self-edit step.'),
       trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Use this whenever the user says a local time so 8 AM means their 8 AM, not the server host time.'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
@@ -1079,7 +1038,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, project, trigger_schedule, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
+    async ({ name, description, steps, project, trigger_schedule, trigger_once_at, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
       // The already-running primary model owns semantic topology. Refuse a
       // missing graph even for direct/internal callers that bypass the tool
       // schema; keyword synthesis here would be a second, less-informed author.
@@ -1109,6 +1068,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (stepGraphError) return nonWriteTextResult('invalid_graph', stepGraphError);
       const triggerResult = buildWorkflowTrigger({
         schedule: trigger_schedule,
+        onceAt: trigger_once_at,
         timezone: trigger_timezone,
         webhookPath: trigger_webhook_path,
         events: trigger_events,
@@ -1475,6 +1435,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           enabled: w.enabled,
           trigger: {
             schedule: w.trigger.schedule ?? null,
+            onceAt: w.trigger.onceAt ?? null,
             timezone: w.trigger.timezone ?? null,
             manual: w.trigger.manual ?? false,
           },
@@ -1619,7 +1580,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           return `  - ${resource.id}: ${resource.kind}${label} via ${surface} -> ${selector}${required}`;
         }).join('\n')
         : '  (none)';
-      const trigger = w.trigger.schedule ? `schedule: ${w.trigger.schedule}` : (w.trigger.manual ? 'manual only' : 'manual');
+      const trigger = w.trigger.onceAt ? `once at: ${w.trigger.onceAt}` : w.trigger.schedule ? `schedule: ${w.trigger.schedule}` : (w.trigger.manual ? 'manual only' : 'manual');
       const allowed = w.allowedTools && w.allowedTools.length > 0
         ? w.allowedTools.map((t) => (typeof t === 'string' ? t : `${t.name}${t.approval === 'required' ? ' (approval)' : ''}`)).join(', ')
         : '(any)';
@@ -1762,7 +1723,9 @@ export function registerOrchestrationTools(server: McpServer): void {
       project: z.string().optional().describe('Set or clear the workflow-level default local workspace/project. Empty string clears it.'),
       clear_project: z.boolean().optional().describe('Pass true to remove the workflow-level default local project.'),
       trigger_schedule: z.string().optional(),
+      trigger_once_at: z.string().optional().describe('One-time absolute ISO timestamp with Z or UTC offset. Use instead of trigger_schedule for a single future run; the host consumes the occurrence without a self-edit step.'),
       trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Pass when changing scheduled local-time workflows.'),
+      clear_trigger_once_at: z.boolean().optional().describe('Remove the one-time trigger. Does not cancel an already queued or executing run.'),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Pass an empty string or clear_trigger_webhook_path=true to remove it.'),
       clear_trigger_webhook_path: z.boolean().optional().describe('Pass true to remove an existing webhook trigger path.'),
@@ -1782,7 +1745,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_once_at, clear_trigger_once_at, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
       // OpenAI strict function schemas materialize omitted nullable optionals as
       // `null`. workflow_update is a PATCH surface: null must mean "omitted",
       // never "clear this field" and never `.trim()` on null. Preserve explicit
@@ -1792,6 +1755,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       project = project ?? undefined;
       clear_project = clear_project ?? undefined;
       trigger_schedule = trigger_schedule ?? undefined;
+      trigger_once_at = trigger_once_at ?? undefined;
+      clear_trigger_once_at = clear_trigger_once_at ?? undefined;
       trigger_timezone = trigger_timezone ?? undefined;
       clear_trigger_schedule = clear_trigger_schedule ?? undefined;
       trigger_webhook_path = trigger_webhook_path ?? undefined;
@@ -1868,6 +1833,8 @@ export function registerOrchestrationTools(server: McpServer): void {
 
       const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {
         triggerSchedule: trigger_schedule,
+        triggerOnceAt: trigger_once_at,
+        clearTriggerOnceAt: clear_trigger_once_at,
         clearTriggerSchedule: clear_trigger_schedule,
         timezone: trigger_timezone,
         triggerWebhookPath: trigger_webhook_path,
@@ -1934,7 +1901,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         resourcesProvided || clear_resources ? 'resources' : '',
         synthesis_prompt !== undefined ? 'synthesis' : '',
         portable_models ? 'model portability' : '',
-        trigger_schedule !== undefined || clear_trigger_schedule ? 'schedule' : '',
+        trigger_schedule !== undefined || clear_trigger_schedule || trigger_once_at !== undefined || clear_trigger_once_at ? 'schedule' : '',
         trigger_webhook_path !== undefined || clear_trigger_webhook_path ? 'webhook trigger' : '',
         trigger_events !== undefined || clear_trigger_events ? 'event triggers' : '',
       ].filter(Boolean);

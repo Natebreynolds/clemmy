@@ -40,6 +40,7 @@ export type BoundaryErrorKind =
   | 'model.overloaded'
   | 'model.transport_timeout'
   | 'model.empty_completion'
+  | 'model.refused'
   | 'model.auth_expired'
   | 'model.http_5xx'
   // An unclassified/non-transient model-or-runtime failure that would otherwise dead-end

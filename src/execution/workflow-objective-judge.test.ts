@@ -8,6 +8,7 @@ import {
   judgeWorkflowTarget,
 } from './workflow-objective-judge.js';
 import type { ObjectiveJudgeVerdict } from '../runtime/harness/objective-judge.js';
+import { buildObjectiveJudgePrompt } from '../runtime/harness/objective-judge.js';
 
 const wf = (over: Record<string, unknown> = {}) => ({
   name: 'weekly-seo-brief',
@@ -20,6 +21,33 @@ const judgeReturning = (v: ObjectiveJudgeVerdict) => {
   const fn = async () => { calls += 1; return v; };
   return { fn, calls: () => calls };
 };
+
+test('workflow review carries complete source evidence and the complete deliverable into the actual judge prompt', async () => {
+  const finalOutput = 'start\n' + 'row\n'.repeat(4000) + 'REQUIRED_FINAL_ROW';
+  const evidence = 'call_tool -> write_file: succeeded\n' + 'evidence\n'.repeat(2000)
+    + 'CURRENT_RECEIPT_MATCH: Prepared through the carrier.\n';
+  let prompt = '';
+  const verdict = await judgeWorkflowTarget({
+    workflow: wf(), inputs: {}, finalOutput,
+    executionEvidence: () => ({ available: true, summary: evidence }),
+    judgeFn: async (objective, response, context) => {
+      prompt = buildObjectiveJudgePrompt(objective, response, context);
+      return { done: true, reason: 'Saved content and execution receipts are present.' };
+    },
+  } as Parameters<typeof judgeWorkflowTarget>[0]);
+  assert.equal(verdict.judged, true);
+  assert.ok(prompt.includes(finalOutput), 'workflow rendering must not cut the delivered result before model admission');
+  assert.ok(prompt.includes(evidence), 'the real prompt must receive retained bytes, not only the file path');
+  assert.ok(!prompt.includes('elided from the MIDDLE'));
+});
+
+test('a fail-open model result is unavailable, never a successful workflow review', async () => {
+  const verdict = await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'A real result',
+    judgeFn: async () => ({ done: true, failedOpen: true, reason: 'Selected model capacity unavailable' }) });
+  assert.equal(verdict.reached, true, 'an unavailable reviewer does not repeat work');
+  assert.equal(verdict.judged, false);
+  assert.equal(verdict.unavailable, true);
+});
 
 // ── buildWorkflowObjective ───────────────────────────────────────────────
 

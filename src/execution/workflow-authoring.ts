@@ -19,6 +19,7 @@ import {
 } from './workflow-gap-test.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { codifyMechanicalSteps } from './workflow-codify.js';
 import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
@@ -38,6 +39,7 @@ export interface WorkflowReadinessGapPayload {
 export interface WorkflowTriggerCreateInput {
   manual?: boolean;
   schedule?: string;
+  onceAt?: string;
   timezone?: string;
   webhookPath?: string;
   events?: WorkflowEventTrigger[];
@@ -46,6 +48,8 @@ export interface WorkflowTriggerCreateInput {
 export interface WorkflowTriggerPatchInput {
   triggerSchedule?: string;
   clearTriggerSchedule?: boolean;
+  triggerOnceAt?: string;
+  clearTriggerOnceAt?: boolean;
   timezone?: string;
   triggerWebhookPath?: string;
   clearTriggerWebhookPath?: boolean;
@@ -288,6 +292,11 @@ export function buildWorkflowTrigger(input: WorkflowTriggerCreateInput = {}): { 
   const timezone = input.timezone?.trim() ?? '';
   const webhookPath = input.webhookPath?.trim() ?? '';
   const events = input.events;
+  // Deferred strict schemas materialize omitted optional fields as null.
+  // Preserve the ordinary manual/cron path when no one-time instant was set.
+  const once = input.onceAt == null ? undefined : parseWorkflowOnceAt(input.onceAt);
+  if (once && !once.ok) return once;
+  if (once && schedule) return { ok: false, error: 'Choose one time trigger: run_at for one occurrence or cron for repetition.' };
   if (schedule && !validateCronExpression(schedule)) {
     return { ok: false, error: `invalid cron expression: "${schedule}"` };
   }
@@ -296,6 +305,7 @@ export function buildWorkflowTrigger(input: WorkflowTriggerCreateInput = {}): { 
     trigger: {
       manual: input.manual ?? true,
       ...(schedule ? { schedule } : {}),
+      ...(once?.ok ? { onceAt: once.at } : {}),
       ...(timezone ? { timezone } : {}),
       ...(webhookPath ? { webhookPath } : {}),
       ...(events && events.length > 0 ? { events } : {}),
@@ -305,10 +315,10 @@ export function buildWorkflowTrigger(input: WorkflowTriggerCreateInput = {}): { 
 
 export function workflowTriggerCreateInputFromUnknown(body: Record<string, unknown>): { ok: true; input: WorkflowTriggerCreateInput } | { ok: false; error: string } {
   const nestedTrigger = body.trigger && typeof body.trigger === 'object' && !Array.isArray(body.trigger)
-    ? body.trigger as { manual?: unknown; schedule?: unknown; timezone?: unknown; webhookPath?: unknown; events?: unknown }
+    ? body.trigger as { manual?: unknown; schedule?: unknown; onceAt?: unknown; timezone?: unknown; webhookPath?: unknown; events?: unknown }
     : undefined;
   if (nestedTrigger) {
-    const allowed = new Set(['manual', 'schedule', 'timezone', 'webhookPath', 'events']);
+    const allowed = new Set(['manual', 'schedule', 'onceAt', 'timezone', 'webhookPath', 'events']);
     const unknown = Object.keys(nestedTrigger).filter((k) => !allowed.has(k));
     if (unknown.length > 0) return { ok: false, error: `unrecognized trigger field(s): ${unknown.join(', ')}` };
   }
@@ -316,6 +326,8 @@ export function workflowTriggerCreateInputFromUnknown(body: Record<string, unkno
     ok: true,
     input: {
       manual: typeof nestedTrigger?.manual === 'boolean' ? nestedTrigger.manual : true,
+      onceAt: typeof body.triggerOnceAt === 'string' ? body.triggerOnceAt
+        : typeof nestedTrigger?.onceAt === 'string' ? nestedTrigger.onceAt : undefined,
       schedule: typeof body.triggerSchedule === 'string'
         ? body.triggerSchedule
         : typeof nestedTrigger?.schedule === 'string' ? nestedTrigger.schedule : undefined,
@@ -342,6 +354,21 @@ export function applyWorkflowTriggerPatch(
   let nextTrigger: WorkflowTrigger = { ...(current ?? { manual: true }) };
   let changed = false;
 
+  if (patch.triggerOnceAt !== undefined && patch.triggerSchedule?.trim()) {
+    return { ok: false, error: 'Choose one time trigger: trigger_once_at or trigger_schedule.' };
+  }
+  if (patch.clearTriggerOnceAt === true) {
+    delete nextTrigger.onceAt;
+    changed = true;
+  } else if (patch.triggerOnceAt !== undefined) {
+    const once = parseWorkflowOnceAt(patch.triggerOnceAt);
+    if (!once.ok) return once;
+    delete nextTrigger.schedule;
+    delete nextTrigger.interval;
+    nextTrigger.onceAt = once.at;
+    changed = true;
+  }
+
   if (patch.clearTriggerSchedule === true) {
     const { schedule: _drop, ...rest } = nextTrigger;
     nextTrigger = withTz({ ...rest, manual: true }) as WorkflowTrigger;
@@ -351,14 +378,17 @@ export function applyWorkflowTriggerPatch(
     if (schedule && !validateCronExpression(schedule)) {
       return { ok: false, error: `invalid cron: ${schedule}` };
     }
-    if (schedule) nextTrigger = withTz({ ...nextTrigger, schedule, manual: nextTrigger.manual ?? true }) as WorkflowTrigger;
+    if (schedule) {
+      delete nextTrigger.onceAt;
+      nextTrigger = withTz({ ...nextTrigger, schedule, manual: nextTrigger.manual ?? true }) as WorkflowTrigger;
+    }
     else {
       const { schedule: _drop, ...rest } = nextTrigger;
       nextTrigger = withTz({ ...rest, manual: true }) as WorkflowTrigger;
     }
     changed = true;
   } else if (tz !== existingTz) {
-    nextTrigger = withTz({ ...(current ?? { manual: true }) }) as WorkflowTrigger;
+    nextTrigger = withTz({ ...nextTrigger }) as WorkflowTrigger;
     changed = true;
   }
 

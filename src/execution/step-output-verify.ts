@@ -15,6 +15,7 @@
  * no URL" class) is caught as a hard verification failure, not a silent pass.
  */
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import type { WorkflowStepOutputContract, WorkflowContractType } from '../memory/workflow-store.js';
 
 export interface StepOutputVerifyResult {
@@ -129,7 +130,10 @@ export function verifyStepOutput(
 
   if (contract.verify?.path_exists) {
     for (const p of contract.verify.path_exists) {
-      const resolved = resolvePath(value, p);
+      // A file target may be known at authoring time, or returned in a field
+      // (or at the root) by the step. All three check the real filesystem;
+      // none accepts the assistant's claim that it wrote a file.
+      const resolved = path.isAbsolute(p) ? p : p === '' || p === '.' ? value : resolvePath(value, p);
       if (typeof resolved !== 'string' || resolved.trim().length === 0) {
         problems.push(`verify.path_exists: output "${p}" is not a file path string`);
       } else if (!fileExists(resolved.trim())) {
@@ -224,6 +228,16 @@ export function coerceOutputForContract(
   output: unknown,
   contract: WorkflowStepOutputContract | undefined,
 ): unknown {
+  // A control outcome keeps its meaning across the JSON-text tool boundary,
+  // even without an output contract. Only a complete top-level envelope is
+  // normalized; prose quoting an example never becomes a blocked result.
+  if (isBlockedStepOutput(output)) return output;
+  if (typeof output === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(output);
+      if (isBlockedStepOutput(parsed)) return parsed;
+    } catch { /* ordinary output text */ }
+  }
   if (!contract) return output;
   // A string contract asks for non-empty deliverable TEXT. A step that hands
   // back a structured result (workflow_step_result with an object or array —

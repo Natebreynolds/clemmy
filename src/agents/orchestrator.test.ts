@@ -3457,3 +3457,19 @@ test('isCommitSafeWorkerFallover: mirrors the chat-lane eligibility ladder (2026
   assert.equal(isCommitSafeWorkerFallover('string error'), false);
   assert.equal(isCommitSafeWorkerFallover(undefined), false);
 });
+
+
+test('worker failures claim zero dispatch only when the batch proves no body started', async () => {
+  const { WorkerBatchGenerationCancelledError } = await import('./worker-batch-execution.js');
+  const { CancelledPreDispatchResult, HostLocalExecutionFailureResult } = await import('../runtime/harness/attempt-settlement.js');
+  const zero = orchestratorInternalsForTest.workerBatchBodyFailure(new WorkerBatchGenerationCancelledError('spent before entry', 'deadline', 0));
+  assert.ok((zero as unknown) instanceof CancelledPreDispatchResult);
+  assert.match(String(zero), /Nothing was dispatched/);
+  for (const error of [new WorkerBatchGenerationCancelledError('late body', 'deadline', 1), new Error('unknown body failure')]) {
+    const result = orchestratorInternalsForTest.workerBatchBodyFailure(error);
+    assert.ok((result as unknown) instanceof HostLocalExecutionFailureResult);
+    assert.match(String(result), /Work may have started/);
+    assert.match(String(result), /do not replay unresolved work/);
+    assert.doesNotMatch(String(result), /NOT started|No item was dispatched/);
+  }
+});

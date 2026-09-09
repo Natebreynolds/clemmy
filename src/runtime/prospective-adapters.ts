@@ -11,6 +11,7 @@ import type { CheckInTemplate } from '../agents/check-in-templates.js';
 import type { PlanProposal } from '../agents/plan-proposals.js';
 import type { BackgroundTaskRecord } from '../execution/background-tasks.js';
 import { workflowTriggerPayloadHash } from '../execution/workflow-trigger-registry.js';
+import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import type { TimerEntry } from './timers.js';
 import {
@@ -92,6 +93,17 @@ export function workflowProspectiveDefinitions(
   const objective = workflow.goal?.objective || workflow.description || `Run workflow ${workflow.name}`;
 
   const schedule = workflow.trigger?.schedule?.trim();
+  const once = workflow.trigger?.onceAt === undefined ? undefined : parseWorkflowOnceAt(workflow.trigger.onceAt);
+  if (once?.ok && !schedule && !workflow.trigger.interval) {
+    definitions.push({
+      id: prospectiveIntentionId('workflow_schedule', workflowSlug),
+      sourceKind: 'workflow_schedule', sourceId: workflowSlug, objective,
+      trigger: { kind: 'time', at: once.at },
+      action: { kind: 'run_workflow', ref: workflowSlug, summary: objective },
+      workflowName: workflowSlug, risk, approvalMode, recurring: false,
+      metadata: { workflowSlug },
+    });
+  }
   if (schedule) {
     definitions.push({
       id: prospectiveIntentionId('workflow_schedule', workflowSlug),

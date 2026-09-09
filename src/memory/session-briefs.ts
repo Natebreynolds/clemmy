@@ -201,13 +201,17 @@ export function saveSessionManualHandoff(input: {
   blockers?: string[];
   context?: string;
 }): SessionBriefRecord {
+  // This is an explicit saved record, not a prompt preview. Keep every
+  // substantive item and its internal whitespace/case; display budgets belong
+  // to the readers and must not destroy the only copy of unfinished work.
+  const retainItems = (items: string[]): string[] => [...new Set(items.map(item => item.trim()).filter(Boolean))];
   const manual: SessionManualHandoff = {
     pausedAt: new Date().toISOString(),
-    completed: cleanList(input.completed, 12, 180),
-    remaining: cleanList(input.remaining, 12, 180),
-    decisions: cleanList(input.decisions ?? [], 12, 180),
-    blockers: cleanList(input.blockers ?? [], 12, 180),
-    context: cleanText(input.context ?? '', 1200),
+    completed: retainItems(input.completed),
+    remaining: retainItems(input.remaining),
+    decisions: retainItems(input.decisions ?? []),
+    blockers: retainItems(input.blockers ?? []),
+    context: (input.context ?? '').trim(),
   };
 
   const canonicalSession = canonicalSessionForBrief(input.session);
@@ -240,6 +244,8 @@ export function renderSessionContinuity(brief: SessionBriefRecord | null, maxCha
     `## Summary\n${brief.auto.summary}`,
     brief.auto.nextStep ? `## Next Best Step\n${brief.auto.nextStep}` : '',
     brief.manual?.context ? `## Manual Context\n${brief.manual.context}` : '',
+    brief.manual?.completed?.length ? renderListSection('Completed From Last Handoff', brief.manual.completed, '- [x] ') : '',
+    brief.manual?.decisions?.length ? renderListSection('Decisions From Last Handoff', brief.manual.decisions) : '',
     renderListSection('Recent User Requests', brief.auto.recentUserRequests),
     renderListSection('Open Questions', brief.auto.openQuestions),
     brief.auto.activePlan ? `## Active Plan\n${brief.auto.activePlan}` : '',
@@ -248,7 +254,9 @@ export function renderSessionContinuity(brief: SessionBriefRecord | null, maxCha
   ].filter(Boolean);
 
   const joined = sections.join('\n\n').trim();
-  return joined.length > maxChars ? `${joined.slice(0, maxChars).trim()}\n…(continuity truncated)` : joined;
+  return joined.length > maxChars
+    ? `${joined.slice(0, maxChars).trim()}\n…(continuity preview; full saved handoff: session_resume ${JSON.stringify({ session_id: brief.sessionId })})`
+    : joined;
 }
 
 export function renderSessionResume(session: SessionRecord, brief: SessionBriefRecord | null): string {
@@ -257,7 +265,9 @@ export function renderSessionResume(session: SessionRecord, brief: SessionBriefR
     `Updated: ${session.updatedAt}`,
     brief?.manual?.pausedAt ? `Last handoff: ${brief.manual.pausedAt}` : '',
     '',
-    renderSessionContinuity(brief, 3200),
+    // The resume tool passes this through the shared lossless result formatter.
+    // A second private cut here made omitted decisions impossible to recover.
+    renderSessionContinuity(brief, Number.MAX_SAFE_INTEGER),
   ].filter(Boolean);
 
   const transcript = session.turns

@@ -225,6 +225,8 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { readWorkflowTargetEvidence } from './workflow-target-evidence.js';
+import { captureWorkflowTargetReviewPolicy, type WorkflowTargetReviewPolicy } from './workflow-target-review-policy.js';
 import {
   runWatcherJudge,
   workflowWatcherJudgeEnabled,
@@ -833,6 +835,8 @@ export interface WorkflowRunGoalValidationV1 {
 export interface QueuedRunRecord {
   id: string;
   workflow: string;
+  /** Optional review only; captured before execution and immutable on resume. */
+  targetReviewPolicy?: WorkflowTargetReviewPolicy;
   inputs?: Record<string, string>;
   status?: string;
   /** Durable project execution that owns a catalogless compiled root run. */
@@ -1630,6 +1634,7 @@ function writeRunRecord(
       mutationContractSnapshot: _staleMutationContractSnapshot,
       workflowDefinitionSnapshot: _staleWorkflowDefinitionSnapshot,
       terminalOutcome: _staleTerminalOutcome,
+      targetReviewPolicy: _staleTargetReviewPolicy,
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
@@ -6853,8 +6858,9 @@ export function finalizeStepOutput(
 ): unknown {
   // Bind a JSON-text output to the declared contract shape BEFORE verifying, so
   // a step that emitted the right keys as text (not a structured object) passes
-  // and downstream steps receive the real object. No contract → unchanged.
-  const bound = step.output ? coerceOutputForContract(output, step.output) : output;
+  // and downstream steps receive the real object. Explicit blocked envelopes
+  // are control outcomes even when the author omitted an output contract.
+  const bound = coerceOutputForContract(output, step.output);
   // A step that legitimately BLOCKED (returns {blocked:true, reason}) is
   // signaling it couldn't produce its deliverable — surface that block + its
   // REASON via the success-path self-heal (detectBlockedSteps reports
@@ -14185,6 +14191,7 @@ async function processOneRunFile(
     }
 
     const isResume = run.status === 'running' || run.status === 'finalizing';
+    const targetReviewPolicy = captureWorkflowTargetReviewPolicy(filePath, run.id);
     let runningRecord = writeRunRecord(filePath, {
       ...run,
       status: 'running',
@@ -14524,6 +14531,8 @@ async function processOneRunFile(
             goal: legacyRunGoal ?? undefined,
             fallbackBody: baseSuccessBody,
             isPartialRun: Boolean(run.targetStepId),
+            executionEvidence: () => readWorkflowTargetEvidence(run.id),
+            reviewPolicy: targetReviewPolicy,
           });
         } catch { /* fail-open: a target-judge error never affects a completed run */ }
         // Verdict door (T3-B4): one canonical audit row per judge decision —
@@ -14531,7 +14540,8 @@ async function processOneRunFile(
         if (targetVerdict?.judged) {
           appendWorkflowEvent(workflow.name, run.id, {
             kind: 'verdict_recorded',
-            meta: { door: 'workflow_target', pass: targetVerdict.reached, reason: targetVerdict.gap.slice(0, 400) },
+            meta: { door: 'workflow_target', pass: targetVerdict.reached, reason: targetVerdict.gap.slice(0, 400),
+              ...(targetVerdict.reviewer ? { reviewer: targetVerdict.reviewer } : {}) },
           });
         }
         // A judge OUTAGE on a legacy (no declared goal) run means NOTHING

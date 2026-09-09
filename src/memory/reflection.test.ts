@@ -1634,6 +1634,22 @@ test('getResolverStats: a novel fact tallies as an ADD (resolver observability)'
   }
 });
 
+test('consolidateFact returns unresolved evidence only for a failed decision, not a considered ADD', async () => {
+  for (const unresolved of [true, false]) {
+    resetMemoryDb();
+    const prior = rememberFact({ kind: 'user', content: 'Northlight prospect drafts end with Next step, beginning Would it be useful.' });
+    const outcome = await consolidateFact(
+      { kind: 'user', text: 'Northlight prospect drafts end with Permission, beginning May I send.', authority: 'user', trustLevel: 1 },
+      {},
+      { resolver: async () => ({ decision: 'ADD', ...(unresolved ? { unresolved: true, unresolvedReason: 'test resolver unavailable' } : {}) }) },
+    );
+    assert.equal(outcome.written, 1);
+    assert.equal(getFact(prior.id)?.active, true, 'similarity alone cannot remove a fact');
+    if (unresolved) assert.deepEqual(outcome.unresolvedConflict, { factIds: [prior.id], reason: 'test resolver unavailable' });
+    else assert.equal(outcome.unresolvedConflict, undefined, 'a deliberate complementary ADD is not mislabeled failed');
+  }
+});
+
 test('consolidateFact: resolver DELETE on a pinned fact is blocked — fact stays active, candidate ADDed', async () => {
   resetMemoryDb();
   const prot = rememberFact({ kind: 'feedback', content: 'Never send Acme mail from legacy-mail.example.' });

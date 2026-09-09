@@ -86,6 +86,7 @@ export function describeCron(cron: string): string {
 
 /** One-line "when does this run" phrase. */
 export function describeSchedule(def: WorkflowDefinition): string {
+  if (def.trigger?.onceAt) return `Once at ${def.trigger.onceAt}${def.enabled === false ? ' — currently paused (disabled)' : ''}.`;
   const schedule = def.trigger?.schedule;
   if (!schedule) return 'On demand — it runs when you ask.';
   const tz = def.trigger?.timezone ? ` (${def.trigger.timezone})` : '';
@@ -296,7 +297,7 @@ export function describeWorkflowOneLine(def: WorkflowDefinition): string {
   const gated = (def.steps ?? []).some(
     (s) => s.requiresApproval === true || (s as { requires_approval?: boolean }).requires_approval === true,
   );
-  const when = def.trigger?.schedule ? describeCron(def.trigger.schedule) : 'on demand';
+  const when = def.trigger?.onceAt ? `once at ${def.trigger.onceAt}` : def.trigger?.schedule ? describeCron(def.trigger.schedule) : 'on demand';
   const bits = [`${when}`, `${stepCount} step${stepCount === 1 ? '' : 's'}`];
   if (def.project) bits.push(`project ${def.project}`);
   if (gated) bits.push('pauses for approval');

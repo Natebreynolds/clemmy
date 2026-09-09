@@ -381,7 +381,8 @@ export interface WorkflowStepOutputContract {
    * Engine-checked in P3.5 (verifyStepOutput).
    */
   verify?: {
-    /** Output dot-paths whose value must be an existing filesystem path. */
+    /** Absolute filesystem paths or output dot-paths whose value names an
+     * existing path. Empty string / '.' selects a path-valued root output. */
     path_exists?: string[];
     /** Output dot-paths whose value must be a non-empty http(s) URL. */
     url_present?: string[];
@@ -391,6 +392,9 @@ export interface WorkflowStepOutputContract {
 
 export interface WorkflowTrigger {
   schedule?: string;
+  /** One host-owned occurrence. Its queue receipt consumes it durably; no
+   * workflow step needs to disable or edit its own definition. */
+  onceAt?: string;
   /** Exact fixed-duration recurrence. Unlike cron, this is anchored to the
    * activation instant and is independent of host timezone/civil time. */
   interval?: WorkflowIntervalV1;

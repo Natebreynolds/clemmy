@@ -82,6 +82,9 @@ const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefus
  *  APICallError (statusCode / responseHeaders / isRetryable) without importing
  *  it, so the wrapper stays provider-neutral. */
 export function classifyModelError(err: unknown): ErrorClass {
+  if (err instanceof BoundaryError && err.kind === 'model.refused') {
+    return { retryable: false, kind: 'model.refused', isAuth: false, sameProviderRetryable: false };
+  }
   const e = err as { statusCode?: unknown; status?: unknown; responseHeaders?: Record<string, string>; isRetryable?: unknown; message?: unknown; name?: unknown } | null;
   const status = typeof e?.statusCode === 'number' ? e.statusCode
     : typeof e?.status === 'number' ? e.status
@@ -215,6 +218,24 @@ function isEmptyResponse(res: ModelResponse): boolean {
   return !res || !Array.isArray(res.output) || res.output.length === 0;
 }
 
+/** Provider protocol metadata, never inference from a model's prose. The AI
+ * SDK retains a nonstream finish reason in providerData and streams it in the
+ * finish event. A refusal is a terminal response, not a transient empty result.
+ */
+export function isProviderRefusalFinish(value: unknown): boolean {
+  if (value === 'content-filter' || value === 'refusal') return true;
+  if (!value || typeof value !== 'object') return false;
+  const reason = value as { unified?: unknown; raw?: unknown };
+  return reason.unified === 'content-filter' || reason.raw === 'refusal';
+}
+
+function providerRefusalError(label: string): BoundaryError {
+  return new BoundaryError({ kind: 'model.refused', retryable: false,
+    userMessage: 'The selected model declined this response.',
+    operatorMessage: `${label}: the provider returned a refusal; no answer was produced and the request was not retried.`,
+    context: { label, finishReason: 'refusal' } });
+}
+
 // The aisdk adapter emits a leading `{type:'model', event:{type:'stream-start'}}`
 // (and a trailing `finish` / `response-metadata`) around the real content. These
 // METADATA frames must NOT count as "committed real content" — otherwise an
@@ -316,6 +337,9 @@ export class ResilientModel implements Model {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await this.inner.getResponse(req);
+        if (isEmptyResponse(res) && isProviderRefusalFinish(res.providerData?.finishReason)) {
+          throw providerRefusalError(this.policy.label);
+        }
         if (isEmptyResponse(res) && attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'model returned empty completion — retrying (always-an-output invariant)');
           await this.sleep(backoffMs(attempt, { retryable: true, kind: 'model.empty_completion', isAuth: false }));
@@ -373,7 +397,11 @@ export class ResilientModel implements Model {
 
       try {
         for await (const ev of this.inner.getStreamedResponse(req)) {
-          const e = ev as { type?: string; response?: { output?: unknown[] } };
+          const e = ev as { type?: string; event?: { type?: string; finishReason?: unknown }; response?: { output?: unknown[]; providerData?: { finishReason?: unknown } } };
+          if (!committed && ((e.type === 'model' && e.event?.type === 'finish' && isProviderRefusalFinish(e.event.finishReason))
+            || (e.type === 'response_done' && isProviderRefusalFinish(e.response?.providerData?.finishReason)))) {
+            throw providerRefusalError(this.policy.label);
+          }
           if (e.type === 'response_done') {
             sawDone = true;
             const emptyOutput = !Array.isArray(e.response?.output) || e.response!.output!.length === 0;

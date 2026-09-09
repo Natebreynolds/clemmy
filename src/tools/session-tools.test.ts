@@ -16,7 +16,7 @@ const { registerSessionTools } = await import('./session-tools.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { loadSessionBrief } = await import('../memory/session-briefs.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+const { createSession, appendEvent, getToolOutputForInvocation } = await import('../runtime/harness/eventlog.js');
 
 type ToolResult = { content?: Array<{ text?: string }> };
 type Handler = (input: Record<string, unknown>) => Promise<ToolResult>;
@@ -162,6 +162,27 @@ test('session_resume and session_pause prefer harness continuity over same-id le
   assert.match(brief!.auto.summary, /canonical harness transcript/i);
   assert.match(brief!.auto.summary, /canonical harness answer/i);
   assert.doesNotMatch(brief!.auto.summary, /bg-continuity-ghost/);
+});
+
+test('session_pause producer preserves a full handoff for session_resume and its retained output', async () => {
+  const sessionId = 'sess-full-explicit-handoff';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Website handoff' });
+  const handlers = registeredToolHandlers();
+  const completed = ['The first prototype is saved. Preserve its approved copy exactly.'];
+  const remaining = Array.from({ length: 15 }, (_, i) => `Deliverable ${i + 1}: ${'original requirement '.repeat(30)}REQUIREMENT_END_${i + 1}`);
+  const decisions = ['Use the dark design selected by the owner.', 'No deployment until requested.'];
+  const context = 'Exact design brief:\n' + 'Design context\n'.repeat(160) + 'FINAL_CONTEXT_MARKER';
+  await handlers.get('session_pause')!({ session_id: sessionId, completed, remaining, decisions, context });
+  assert.deepEqual(loadSessionBrief(sessionId)?.manual?.remaining, remaining);
+  const callId = 'full-handoff-resume';
+  const settlementNonce = 'full-handoff-resume-nonce';
+  await withToolOutputContext({ sessionId, callId, toolName: 'session_resume', settlementNonce },
+    () => registeredToolHandlers().get('session_resume')!({ session_id: sessionId }));
+  const retained = getToolOutputForInvocation(sessionId, callId, settlementNonce);
+  assert.ok(retained, 'the shared formatter retains the complete tool output');
+  for (const value of [...completed, ...remaining, ...decisions, context]) {
+    assert.ok(retained.output.includes(value), 'every authored requirement can be recovered from the actual resume output');
+  }
 });
 
 test('session_history still falls back to legacy SessionStore sessions', async () => {

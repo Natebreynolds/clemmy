@@ -25,8 +25,11 @@ export function withTracelessStep(inner: Model): Model {
       if (getCurrentTrace()) return inner.getResponse(request);
       const stream = inner.getStreamedResponse({ ...request, tracing: false });
       let done: Extract<StreamEvent, { type: 'response_done' }> | undefined;
+      let finishReason: unknown;
       for await (const event of stream) {
         if (event.type === 'response_done') done = event;
+        const metadata = event as { type?: string; event?: { type?: string; finishReason?: unknown } };
+        if (metadata.type === 'model' && metadata.event?.type === 'finish') finishReason = metadata.event.finishReason;
       }
       if (!done) {
         throw new Error('model stream ended without a response_done event');
@@ -41,9 +44,10 @@ export function withTracelessStep(inner: Model): Model {
           totalTokens: usage?.totalTokens ?? 0,
         }),
         responseId: done.response.id,
-        ...('providerData' in done.response
-          ? { providerData: (done.response as { providerData?: Record<string, unknown> }).providerData }
-          : {}),
+        providerData: {
+          ...(done.response as { providerData?: Record<string, unknown> }).providerData,
+          ...(finishReason === undefined ? {} : { finishReason }),
+        },
       };
     },
     getStreamedResponse(request: ModelRequest) {

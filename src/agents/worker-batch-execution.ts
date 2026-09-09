@@ -420,6 +420,9 @@ export async function runResumableWorkerBatch<
   }
 
   let cursor = 0;
+  // Remainder state may return to pending after cancellation. It cannot prove
+  // that no body crossed its execution boundary: keep that fact monotonically.
+  let startedBodies = 0;
   let admissionClosed = false;
   const nextIndex = (): number | null => {
     if (controller.signal.aborted) return null;
@@ -461,6 +464,7 @@ export async function runResumableWorkerBatch<
         const itemStartedAt = runtime.now();
         try {
           lease.assertCurrent();
+          startedBodies += 1;
           const output = await input.execute(spec, lease);
           lease.assertCurrent();
           state.output = output;
@@ -491,7 +495,7 @@ export async function runResumableWorkerBatch<
       throw new WorkerBatchGenerationCancelledError(
         'worker batch body did not settle before the outer deadline; safe typed remainder withheld',
         'deadline',
-        states.filter((state) => state.state !== 'pending').length,
+        startedBodies,
       );
     }
     // A cross-process successor may take only an explicitly revoked claim.

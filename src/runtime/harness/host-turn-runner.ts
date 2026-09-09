@@ -5702,20 +5702,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     attempt: Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'failed' }>,
   ): 'zero_crossing' | 'effect_may_have_started' => {
     if (!attempt.invocationEntered) return 'zero_crossing';
-    // THE IRREVERSIBLE BOUNDARY DECIDES, not the fact of a failure. A host-only
-    // carrier or a LOCAL write that failed or was cancelled after dispatch left
-    // nothing outside Clem's boundary that cannot be re-run or re-read; only an
-    // external write or an admin action can half-land. Live
-    // 2026-09-08: an inbox triage delegated to workers (run_worker, a local
-    // carrier) was cancelled at the driver's deadline and the turn hard-blocked
-    // as an uncertain WRITE. The settlement still records exactly what ran.
-    {
-      // Scope: in-boundary effects (a local write, a host-only carrier such as
-      // run_worker). A registered READ keeps the existing narrow rule below and
-      // the caller-abort hold its pins protect; an unknown effect stays uncertain.
-      const effect = currentFrameEffects.get(call.callId);
-      if (effect === 'local_write' || effect === 'host_only') return 'zero_crossing';
-    }
+    // The immutable settlement owns recovery after entry, including local
+    // coordinators. Their effect class does not prove that children drained or
+    // that a local write never landed. Calling an unresolved timeout "no
+    // effect" disagrees with checkpoint admission and creates a retry loop
+    // without ever allowing the model to continue. Cooperative worker parks
+    // return their exact remainder normally; a hard timeout must preserve its
+    // uncertainty until that work is reconciled.
     try {
       const identity = exactHostIdentity();
       const redeemed = redeemDurableLogicalCallSettlementForHost({
@@ -8699,10 +8692,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let consentCall: PendingHostCall['consentCall'];
       if (mutation && parsedArguments && tool && approvalExactProduction) {
         consentOwned = true;
+        // The attestation names the canonical operation, even when a carrier
+        // supplied its arguments. Reopen that same canonical material: pairing
+        // write_file with {name,args_json} loses its mode and falsely rejects
+        // the authored step's existing write authority.
+        const authoredMaterial = durableLogicalCallRecoveryMaterial(
+          approvalExactProduction.attestation.acceptedTaskId,
+          approvalExactProduction.logicalToolName,
+          approvalExactProduction.logicalArgs,
+        );
         const authoredWorkflowConsent = acceptedFrame.ref
+          && authoredMaterial?.toolName === approvalExactProduction.attestation.toolName
+          && authoredMaterial.argumentDigest === approvalExactProduction.attestation.argumentDigest
           ? await evaluateAuthoredWorkflowMutationConsent({
               attestation: approvalExactProduction.attestation,
-              args: approvalExactProduction.logicalArgs,
+              args: authoredMaterial.args,
               acceptedBatch: acceptedFrame.ref,
               callIndex,
             })

@@ -32,6 +32,7 @@ import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js'
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { parseWorkflowInterval } from '../shared/workflow-interval.js';
+import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   argsHaveStaticSendTarget,
@@ -114,6 +115,7 @@ export interface WorkflowFrontmatter {
   description?: string;
   enabled?: boolean;
   trigger?: {
+    onceAt?: unknown;
     schedule?: string;
     interval?: unknown;
     manual?: boolean;
@@ -1420,6 +1422,13 @@ export function validateWorkflowDefinition(
     }
   }
 
+  if (data.trigger?.onceAt !== undefined) {
+    const once = parseWorkflowOnceAt(data.trigger.onceAt);
+    if (!once.ok) errors.push(once.error);
+    if (data.trigger.schedule !== undefined || data.trigger.interval !== undefined) {
+      errors.push('trigger.onceAt cannot accompany a recurring schedule or interval.');
+    }
+  }
   if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
     errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
   }

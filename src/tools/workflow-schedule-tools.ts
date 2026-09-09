@@ -2,7 +2,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { readWorkflow } from '../memory/workflow-store.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { textResult } from './shared.js';
+import { textResult, nonWriteTextResult } from './shared.js';
+import { withWorkflowCommit } from '../execution/workflow-commit.js';
+import { WorkflowStepOutputContractSchema } from './workflow-output-schema.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
@@ -78,8 +80,13 @@ const scheduleParams = {
   cron: z
     .string()
     .min(9)
-    .max(60)
-    .describe('5-field cron expression in local time. Examples: "0 9 * * 1-5" = weekdays at 9am, "0 14 * * FRI" → use "0 14 * * 5" (numeric), "*/30 * * * *" = every 30 min. Use 0-59 0-23 1-31 1-12 0-6.'),
+    .max(60).nullish()
+    .describe('For repeating work only: a 5-field cron expression in local time. For one-time work omit this and use run_at. Examples: "0 9 * * 1-5" = weekdays at 9am; "*/30 * * * *" = every 30 min.'),
+  run_at: z.string().optional().describe('For one-time work: absolute ISO 8601 timestamp with Z or UTC offset, e.g. 2026-09-11T15:30:00-07:00. Omit cron. The host queues this occurrence once, including after sleep/restart; no self-unscheduling step is needed.'),
+  sideEffect: z.enum(['read', 'write', 'send']).optional()
+    .describe('Declare what the scheduled step does: read = gathers/analyzes data; write = saves a file or changes state reversibly; send = sends/publishes externally. Set write for a saved brief. This declaration travels with the workflow into execution; instructions alone do not grant write authority. Omission preserves an existing step declaration.'),
+  output: WorkflowStepOutputContractSchema.optional()
+    .describe('Declare the final deliverable for runtime verification. For a saved file use type:object, required_keys:["file"], verify:{path_exists:["file"]}, and instruct the step to return its file path. Use the same output contract as workflow_create; omission preserves an existing contract.'),
   instructions: z
     .string()
     .max(4000)
@@ -119,26 +126,29 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
   server.tool(
     'workflow_schedule',
     [
-      'Schedule a workflow to fire on a cron expression. Use this whenever the user asks to "schedule X for Y time" / "post this Friday at 2pm" / "every weekday morning, do Z".',
-      'Authors (or updates) a workflow at ~/.clementine-next/vault/00-System/workflows/<name>/SKILL.md with trigger.schedule set. The daemon polls every minute and fires matching workflows automatically.',
+      'Schedule work once at run_at or repeatedly on cron. Use run_at for "this Friday at 2pm" and cron for "every weekday morning". Exactly one time argument is required.',
+      'Authors (or updates) a workflow at ~/.clementine-next/vault/00-System/workflows/<name>/SKILL.md. The daemon queues due work automatically and preserves a one-time occurrence across restart. A workflow step must never edit its own schedule to simulate one-time work.',
       'Two authoring styles — set exactly one of `instructions` or `toolCall`:',
       '  - `instructions`: LLM prompt for the step. Best for "compose and send" / "analyze and report" tasks.',
       '  - `toolCall`: direct {slug, args} invocation. Best for "post this exact content" / known Composio action.',
       'Returns the saved workflow path and the next scheduled run time. Idempotent — passing an existing `name` UPDATES that workflow.',
     ].join('\n'),
     scheduleParams,
-    async ({ name, description, cron, instructions, toolCall, allowSends, requiresApproval, approvalPreview, enabled, timezone }) => {
+    async ({ name, description, cron, run_at, sideEffect, output, instructions, toolCall, allowSends, requiresApproval, approvalPreview, enabled, timezone }) => {
       if (!isValidSlug(name)) {
-        return textResult(`Error: workflow name "${name}" is not a valid slug. Use lowercase kebab-case: "instagram-friday-post", "daily-briefing".`);
+        return nonWriteTextResult('invalid_arguments', `Error: workflow name "${name}" is not a valid slug. Use lowercase kebab-case: "instagram-friday-post", "daily-briefing".`);
       }
-      if (!validateCronExpression(cron)) {
-        return textResult(`Error: "${cron}" is not a valid 5-field cron expression. Use minute hour day-of-month month day-of-week (numeric, 0-based for day-of-week).`);
+      if (Boolean(cron) === Boolean(run_at)) {
+        return nonWriteTextResult('invalid_arguments', 'Error: supply exactly one of run_at (one-time) or cron (repeating).');
+      }
+      if (cron && !validateCronExpression(cron)) {
+        return nonWriteTextResult('invalid_arguments', `Error: "${cron}" is not a valid 5-field cron expression. Use minute hour day-of-month month day-of-week (numeric, 0-based for day-of-week).`);
       }
       if ((!instructions || !instructions.trim()) && !toolCall) {
-        return textResult('Error: pass either `instructions` (LLM prompt) or `toolCall` ({slug, args}). One must be set.');
+        return nonWriteTextResult('invalid_arguments', 'Error: pass either `instructions` (LLM prompt) or `toolCall` ({slug, args}). One must be set.');
       }
       if (instructions && instructions.trim() && toolCall) {
-        return textResult('Error: pass either `instructions` OR `toolCall`, not both. Pick the style that fits the task.');
+        return nonWriteTextResult('invalid_arguments', 'Error: pass either `instructions` OR `toolCall`, not both. Pick the style that fits the task.');
       }
       let stepPrompt: string;
       let allowedTools: string[] = [];
@@ -146,7 +156,7 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         try {
           JSON.parse(toolCall.args);
         } catch {
-          return textResult(`Error: toolCall.args must be valid JSON. Got: ${toolCall.args.slice(0, 120)}`);
+          return nonWriteTextResult('invalid_arguments', `Error: toolCall.args must be valid JSON. Got: ${toolCall.args.slice(0, 120)}`);
         }
         stepPrompt = buildToolCallPrompt(toolCall.slug, toolCall.args);
         allowedTools = ['composio_execute_tool'];
@@ -167,31 +177,34 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       // which sets trigger_schedule without touching steps.
       const prevSteps = existing?.data.steps ?? [];
       if (existing && prevSteps.length > 1) {
-        return textResult(
+        return nonWriteTextResult('invalid_workflow',
           `Workflow "${name}" already has ${prevSteps.length} steps — workflow_schedule would rebuild it as a single step and discard the rest. `
-            + `To set ONLY its schedule, use workflow_update("${name}", trigger_schedule: "${cron}"). To redefine what it does, edit it with workflow_update.`,
+            + `To set ONLY its schedule, use workflow_update with ${run_at ? 'trigger_once_at' : 'trigger_schedule'} and the existing name. To redefine what it does, edit it with workflow_update.`,
         );
       }
       const priorStep = prevSteps[0];
       const stepRequiresApproval = requiresApproval ?? priorStep?.requiresApproval;
       const stepApprovalPreview = approvalPreview ?? priorStep?.approvalPreview;
       const resolvedAllowSends = allowSends ?? existing?.data.allowSends;
-      const triggerResult = buildWorkflowTrigger({ schedule: cron, timezone: resolvedTz });
-      if (!triggerResult.ok) return textResult(`Error: ${triggerResult.error}`);
+      const triggerResult = buildWorkflowTrigger({ schedule: cron ?? undefined, onceAt: run_at, timezone: resolvedTz });
+      if (!triggerResult.ok) return nonWriteTextResult('invalid_arguments', `Error: ${triggerResult.error}`);
       const def: WorkflowDefinition = {
         name,
         description,
         enabled: enabled !== false,
         trigger: triggerResult.trigger,
-        allowedTools,
+        allowedTools: toolCall ? allowedTools : existing?.data.allowedTools ?? allowedTools,
         ...(resolvedAllowSends !== undefined ? { allowSends: resolvedAllowSends } : {}),
         steps: [
           {
-            // Preserve the single step's id + output contract on a reschedule;
-            // only the prompt is (re)set from the caller's instructions/toolCall.
+            // Rescheduling must not silently discard execution metadata or the
+            // authority the author already declared for this exact step.
+            ...priorStep,
             id: priorStep?.id ?? 'main',
             prompt: stepPrompt,
-            ...(priorStep?.output ? { output: priorStep.output } : {}),
+            ...(sideEffect != null ? { sideEffect } : {}),
+            ...(output != null ? { output } : {}),
+            ...(requiresApproval === false ? { requiresApproval: false } : {}),
             ...(stepRequiresApproval
               ? { requiresApproval: true, approvalPreview: stepApprovalPreview || 'Review this scheduled action before it runs.' }
               : {}),
@@ -209,13 +222,16 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       // ENABLED workflow that fails validation is refused; disable to draft.
       const writeCheck = prepareWorkflowCreateForWrite(def);
       if (writeCheck.status === 'invalid') {
-        return textResult(
+        return nonWriteTextResult('invalid_workflow',
           `Workflow "${name}" was NOT scheduled — fix these first (or pass enabled=false to draft it):\n- ${writeCheck.errors.join('\n- ')}`,
         );
       }
 
       const written = writeWorkflowAndSyncTriggers(name, writeCheck.def);
-      const next = nextFireDescription(cron);
+      const timing = triggerResult.trigger.onceAt
+        ? `one-time occurrence at ${triggerResult.trigger.onceAt}` : `cron "${cron}"`;
+      const next = triggerResult.trigger.onceAt
+        ? `once at or after ${triggerResult.trigger.onceAt} (on the next scheduler tick)` : nextFireDescription(cron!);
       const verb = existing ? 'Updated' : 'Created';
       const gapQuestions = renderWorkflowGapQuestions(writeCheck.gaps);
       const visualContract = renderWorkflowVisualContract(
@@ -224,10 +240,10 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       const advisories = (writeCheck.repairs.length > 0 || writeCheck.warnings.length > 0)
         ? `\n\nHeads up (advisory — the workflow was saved):\n- ${[...writeCheck.repairs, ...writeCheck.warnings].join('\n- ')}`
         : '';
-      return textResult(
-        `${verb} workflow "${name}" with cron "${cron}". ${writeCheck.def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — resolve readiness/validation issues, then enable it.'}\nFile: ${written.filePath}`
+      return textResult(withWorkflowCommit(name,
+        `${verb} workflow "${name}" with ${timing}. ${writeCheck.def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — resolve readiness/validation issues, then enable it.'}\nFile: ${written.filePath}`
           + `${visualContract ? `\n\n${visualContract}` : ''}${advisories}${gapQuestions}`,
-      );
+      ));
     },
   );
 
@@ -243,18 +259,18 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
     },
     async ({ name }) => {
       if (!isValidSlug(name)) {
-        return textResult(`Error: invalid workflow name "${name}".`);
+        return nonWriteTextResult('invalid_arguments', `Error: invalid workflow name "${name}".`);
       }
       const entry = readWorkflow(name);
       if (!entry) {
-        return textResult(`No workflow named "${name}" found.`);
+        return nonWriteTextResult('not_found', `No workflow named "${name}" found.`);
       }
       if (!entry.data.enabled) {
-        return textResult(`Workflow "${name}" is already disabled.`);
+        return nonWriteTextResult('already_disabled', `Workflow "${name}" is already disabled. Nothing was changed.`);
       }
       const updated: WorkflowDefinition = { ...entry.data, enabled: false };
       writeWorkflowAndSyncTriggers(name, updated);
-      return textResult(`Workflow "${name}" disabled. The definition remains on disk — re-enable any time via workflow_schedule with the same name.`);
+      return textResult(withWorkflowCommit(name, `Workflow "${name}" disabled. The definition remains on disk. This prevents future queueing; an already queued or running occurrence needs workflow cancellation separately.`));
     },
   );
 }

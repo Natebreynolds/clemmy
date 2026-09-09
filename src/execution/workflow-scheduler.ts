@@ -29,6 +29,7 @@ import {
   resolveWorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
   prospectiveIntentionId,
@@ -885,6 +886,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
     workflowName: string;
     entryName: string;
     schedule: string;
+    onceAtMs?: number;
     timezone?: string;
     scheduleKey: string;
   }>();
@@ -896,7 +898,11 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   for (const entry of workflows) {
     const wf = entry.data;
     if (!wf.enabled) continue;
-    const schedule = wf.trigger?.schedule;
+    const once = wf.trigger?.onceAt === undefined ? undefined : parseWorkflowOnceAt(wf.trigger.onceAt);
+    // Malformed or conflicting time definitions never fall through to cron.
+    if (once && (!once.ok || wf.trigger.schedule !== undefined || wf.trigger.interval !== undefined)) continue;
+    const onceAtMs = once?.ok ? once.atMs : undefined;
+    const schedule = once?.ok ? `once:${once.at}` : wf.trigger?.schedule;
     if (!schedule || typeof schedule !== 'string') continue;
 
     // The directory/entry slug is stable identity. Display names are mutable,
@@ -909,6 +915,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       workflowName: wf.name,
       entryName: entry.name,
       schedule,
+      ...(onceAtMs !== undefined ? { onceAtMs } : {}),
       timezone,
       scheduleKey,
     });
@@ -918,7 +925,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       pending
       && (
         pending.scheduleKey !== scheduleKey
-        || (Number.isFinite(state.lastRunAtMs[dedupeKey]) && pending.atMs <= state.lastRunAtMs[dedupeKey])
+        || (onceAtMs === undefined && Number.isFinite(state.lastRunAtMs[dedupeKey]) && pending.atMs <= state.lastRunAtMs[dedupeKey])
       )
     ) {
       delete state.pendingByWorkflow[dedupeKey];
@@ -927,6 +934,26 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
 
     const lastFiredAtMs = state.lastRunAtMs[dedupeKey];
     const legacyLastKey = state.lastRunByMinute[dedupeKey];
+    if (onceAtMs !== undefined) {
+      // The queue's existing immutable receipt is the completion cursor. It
+      // survives scheduler-state loss and queue-file retirement, and is only
+      // minted when that exact occurrence has durably entered the run queue.
+      const accepted = readWorkflowTriggerReceiptAcceptance(`workflow-schedule:v1:${entry.name}:${onceAtMs}`);
+      if (accepted) {
+        delete state.pendingByWorkflow[dedupeKey];
+        result.deduped.push(wf.name);
+      } else if (onceAtMs <= now.getTime()) {
+        state.pendingByWorkflow[dedupeKey] = {
+          firstDueAtMs: onceAtMs, atMs: onceAtMs,
+          minuteKey: currentMinuteKey(new Date(onceAtMs)), scheduleKey, missed: 0,
+        };
+      } else {
+        delete state.pendingByWorkflow[dedupeKey];
+      }
+      // Unlike a recurring cron scan, a one-time commitment remains due even
+      // after a long sleep or a first boot after its date. No annual replay.
+      continue;
+    }
     for (const m of window) {
       if (!cronMatches(schedule, m, timezone)) continue;
       const atMs = minuteFloor(m.getTime());
@@ -982,7 +1009,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       return occurrence ? { dedupeKey, config, occurrence } : undefined;
     })
     .filter((candidate): candidate is NonNullable<typeof candidate> =>
-      candidate !== undefined && candidate.occurrence.atMs <= nowMinuteMs);
+      candidate !== undefined && candidate.occurrence.atMs <= now.getTime());
 
   // A live-minute commitment always goes first. Stale recovery is oldest-first
   // so a recurring early config entry cannot continually starve older siblings.

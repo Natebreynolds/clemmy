@@ -785,7 +785,19 @@ export function registerMemoryTools(server: McpServer): void {
         const reconciliation = reconciledAutoCaptures > 0
           ? ` · reconciled ${reconciledAutoCaptures} auto-captured duplicate${reconciledAutoCaptures === 1 ? '' : 's'}`
           : '';
-        return textResult(`${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}`);
+        // A saved candidate is not a resolved correction. Give the current
+        // brain the exact still-active records so it can finish an owner
+        // correction with existing tools instead of silently waiting for a
+        // background resolver that may be unavailable on this account.
+        const unresolvedFacts = outcome.unresolvedConflict?.factIds
+          .map(id => getFact(id)).filter((fact): fact is ConsolidatedFact => Boolean(fact?.active)) ?? [];
+        const conflict = unresolvedFacts.length > 0
+          ? `\nMemory conflict unresolved: ${outcome.unresolvedConflict!.reason}\n`
+            + `The new fact is saved as [fact:${outcome.factId}], but these related facts are still active:\n`
+            + unresolvedFacts.map(fact => `[fact:${fact.id}] ${fact.kind}: ${fact.content}`).join('\n')
+            + '\nCompare these records with the owner’s actual instruction. For a requested correction, use memory_forget (soft deletion) on only the exact superseded facts; preserve complementary facts and unrelated instructions. Do not claim the correction is fully applied while its contradictory prior facts remain active.'
+          : '';
+        return textResult(`${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}${conflict}`);
       } catch (err) {
         return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
       }

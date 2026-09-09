@@ -61,6 +61,19 @@ test('verify.path_exists uses the injected existence check', () => {
   assert.match(missing.problems[0], /does not exist/);
 });
 
+test('file verification supports literal artifact paths and a path-valued root without inventing output fields', () => {
+  const artifact = '/tmp/friday brief.md';
+  const seen: string[] = [];
+  const exists = (p: string) => { seen.push(p); return p === artifact; };
+  assert.equal(verifyStepOutput({ type: 'string', verify: { path_exists: [artifact] } }, artifact, exists).ok, true);
+  assert.equal(verifyStepOutput({ verify: { path_exists: ['.'] } }, artifact, exists).ok, true);
+  assert.equal(verifyStepOutput({ verify: { path_exists: [''] } }, artifact, exists).ok, true);
+  assert.deepEqual(seen, [artifact, artifact, artifact]);
+  assert.equal(verifyStepOutput({ verify: { path_exists: ['/tmp/missing.md'] } }, 'Done', exists).ok, false);
+  assert.equal(verifyStepOutput({ verify: { path_exists: ['artifact.path'] } }, { artifact: { path: '/tmp/missing.md' } }, exists).ok, false);
+  assert.equal(verifyStepOutput({ verify: { path_exists: ['.'] } }, { claim: 'created' }, exists).ok, false);
+});
+
 test('the missing-artifact regression: claims success but returns no real URL → caught', () => {
   // deploy_to_netlify returned {status:"blocked"} with no url — the exact
   // class P4 exists to catch.
@@ -111,4 +124,15 @@ test('multiple problems accumulate', () => {
   );
   assert.equal(r.ok, false);
   assert.ok(r.problems.length >= 2);
+});
+
+
+test('an explicit blocked envelope stays structured with no contract or a string contract', () => {
+  const blocked = { blocked: true, reason: 'The write was refused.', intended_file: '/tmp/missing-brief.md' };
+  for (const contract of [undefined, { type: 'string' as const }, { type: 'object' as const }]) {
+    assert.deepEqual(coerceOutputForContract(blocked, contract), blocked);
+    assert.deepEqual(coerceOutputForContract(JSON.stringify(blocked), contract), blocked);
+  }
+  assert.equal(coerceOutputForContract('Example: {"blocked":true}', undefined), 'Example: {"blocked":true}');
+  assert.equal(coerceOutputForContract('{"blocked":false}', undefined), '{"blocked":false}');
 });

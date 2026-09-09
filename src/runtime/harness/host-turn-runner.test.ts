@@ -8262,6 +8262,49 @@ test('a dead registered read replans instead of poisoning the turn', async () =>
   }
 });
 
+test('an unresolved worker timeout checkpoints its actual uncertainty once without replay', async () => {
+  const fixture = acceptHostCanarySource('worker-hard-deadline');
+  let bodies = 0;
+  const worker = brackets.wrapToolForHarness({
+    type: 'function', name: 'run_worker', description: 'Run one worker.',
+    parameters: { type: 'object', properties: { item: { type: 'string' }, prompt: { type: 'string' } }, required: ['item', 'prompt'] },
+    needsApproval: async () => false,
+    invoke: async () => {
+      bodies += 1;
+      const error = new Error('worker body did not drain before its deadline');
+      error.name = 'TimeoutError';
+      throw error;
+    },
+  });
+  const model = stubModel([
+    [toolCall('worker-hard-timeout', 'run_worker', { item: 'review', prompt: 'Review the retained results.' })],
+    [textMsg('This must not be reached while the worker effect is unresolved.')],
+  ]);
+  const agent = { model, tools: [worker] };
+  bindHostCanarySurface(fixture, agent, [worker]);
+  const outcome = await runProductionHost(fixture, agent);
+  const db = eventlog.openEventLog();
+  const settled = db.prepare(`SELECT outcome_kind, requires_reconciliation, host_crossing_count
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?
+      AND logical_tool_call_id = ?`).get(fixture.session.id, fixture.source.seq, 'worker-hard-timeout');
+  assert.deepEqual(settled, { outcome_kind: 'uncertain_write', requires_reconciliation: 1, host_crossing_count: 1 });
+  assert.equal(bodies, 1);
+  assert.equal(model.calls(), 1);
+  assert.equal(outcome.hold, undefined, 'an admissible reconciliation checkpoint must not enter the checkpoint-store retry loop');
+  assert.equal(outcome.terminal?.reason, 'tool_effect_uncertain');
+  assert.deepEqual(dispositionMarkers(outcome.history), [{
+    disposition: 'effect_unknown', effect: 'may_have_started', retry: 'do_not_retry', requiresReconciliation: true,
+  }]);
+  const checkpoints = db.prepare(`SELECT disposition FROM accepted_model_batch_checkpoints
+    WHERE session_id = ? AND source_user_seq = ?`).all(fixture.session.id, fixture.source.seq);
+  assert.deepEqual(checkpoints, [{ disposition: 'reconciliation_required' }]);
+  eventlog.closeEventLog();
+  const { prepareAcceptedModelBatchRestart } = await import('./accepted-model-batch-checkpoint.js');
+  const reopened = prepareAcceptedModelBatchRestart({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
+  assert.equal(reopened.status, 'reconciliation_required', JSON.stringify(reopened));
+  assert.equal(bodies, 1, 'reopening recovery evidence never invokes the stalled worker again');
+});
+
 // ─── The retirement terminal names what the host can measure ─────────────────
 //
 // Live 2026-08-25 (Discord "top 5 opportunities → sheet"): four minutes of

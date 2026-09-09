@@ -513,7 +513,26 @@ function resolveChatWorkerModel(input: Pick<WorkerToolInput, 'intent' | 'item' |
   };
 }
 
+function workerBatchBodyFailure(error: unknown): string {
+  const details = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  if (error instanceof WorkerBatchGenerationCancelledError && error.startedBodies === 0) {
+    // Proven: the generation was cancelled (spent outer deadline, caller
+    // abort, supersession) before any item body was admitted. A pre-dispatch
+    // refusal — no handle, no progress — that the model can simply reissue.
+    return new CancelledPreDispatchResult(
+      `ERROR: workers were NOT started — the batch was cancelled before any item was admitted (${details}). `
+      + 'Nothing was dispatched and nothing was retained; reissue this same run_worker call when the step has budget.',
+      error.name, error.kind,
+    ) as unknown as string;
+  }
+  return new HostLocalExecutionFailureResult(
+    `ERROR: the worker batch failed before all results settled (${details}). `
+    + 'Work may have started. Inspect the exact worker receipts before continuing; do not replay unresolved work or assume nothing changed.',
+  ) as unknown as string;
+}
+
 export const orchestratorInternalsForTest = {
+  workerBatchBodyFailure,
   resolveChatWorkerModel,
   workerIntentRoutingEnabled,
 };
@@ -2379,21 +2398,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // and the model was told to retry an item that never dispatched. Hand
       // settlement the local-failure carrier it already reads (local-runtime
       // precedent): failed local execution, no handle, no credited progress.
-      const details = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-      if (error instanceof WorkerBatchGenerationCancelledError && error.startedBodies === 0) {
-        // Proven: the generation was cancelled (spent outer deadline, caller
-        // abort, supersession) before any item body was admitted. A pre-dispatch
-        // refusal — no handle, no progress — that the model can simply reissue.
-        return new CancelledPreDispatchResult(
-          `ERROR: workers were NOT started — the batch was cancelled before any item was admitted (${details}). `
-          + 'Nothing was dispatched and nothing was retained; reissue this same run_worker call when the step has budget.',
-          error.name, error.kind,
-        ) as unknown as string;
-      }
-      return new HostLocalExecutionFailureResult(
-        `ERROR: workers were NOT started — the batch body failed before settling (${details}). `
-        + 'No item was dispatched by this call and no result was retained; check worker receipts for any item that already ran, then reissue only what is missing.',
-      ) as unknown as string;
+      return workerBatchBodyFailure(error);
     },
     execute: async (callParams, runContext, details) => {
       const call = callParams as WorkerToolCall;

@@ -1,4 +1,5 @@
 import { classifyModelError } from './resilient-model.js';
+import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
 import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
@@ -642,8 +643,11 @@ export async function runHedgedJudge<T>(
     recordCompletionJudgeMetric(failure, startedAt, routing, lane);
     const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
     const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
+    const transportError = failure === 'error' ? raced.errors.find((error) => error instanceof Error) : undefined;
     const unavailableReason = contextFailure instanceof Error ? contextFailure.message
       : rateLimited ? 'A completion reviewer was rate-limited; no review was completed. Choose an available reviewer in Settings.'
+        : transportError instanceof Error
+          ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
     return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}) };
   } catch (err) {

@@ -404,6 +404,18 @@ test('a pinned provider quota failure remains unjudged and preserves an actionab
   assert.deepEqual(calls, [{ provider: 'claude', modelId: 'claude-sonnet-5' }], 'an exact pin cannot silently substitute a reviewer');
 });
 
+test('a reviewer transport failure retains its concrete cause without leaking credentials', async () => {
+  mock.method(ClaudeModelProvider.prototype, 'getModel', () => ({
+    async getResponse() { throw new Error('Invalid response stream; api_key=reviewer-fixture-secret'); },
+    async *getStreamedResponse() { throw new Error('unexpected stream'); },
+  }));
+  const result = await completion();
+  assert.equal(result.value, null);
+  assert.equal(result.failure, 'error');
+  assert.match(result.unavailableReason ?? '', /Invalid response stream/);
+  assert.ok(!result.unavailableReason?.includes('reviewer-fixture-secret'));
+});
+
 test('workflow report-back actual judge wire owns the parent source and captured provider inside a child context', async () => {
   const host = await import('./host-turn-runner.js');
   const brackets = await import('./brackets.js');

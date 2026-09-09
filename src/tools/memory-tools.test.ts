@@ -236,6 +236,19 @@ test('memory_remember reconciles the same-turn auto-capture wrapper into one act
   );
 });
 
+test('memory_remember exposes unresolved prior facts to the current brain instead of claiming a finished correction', async () => {
+  const first = rememberFact({ kind: 'user', content: 'Northlight prospect drafts use Subject, Observation, Relevance, Next step. Next step starts Would it be useful.' });
+  const second = rememberFact({ kind: 'user', content: 'The Northlight prospect draft format ends with Next step, starting Would it be useful.' });
+  const handler = registeredToolHandlers().get('memory_remember')!;
+  const result = await handler({ kind: 'user', content: 'Northlight prospect drafts use Subject, Observation, Relevance, Permission. Permission starts May I send.' });
+  assert.match(result.content[0].text, /unresolved/i);
+  assert.match(result.content[0].text, /memory_forget/);
+  assert.ok(result.content[0].text.includes(`[fact:${first.id}]`));
+  assert.ok(result.content[0].text.includes(`[fact:${second.id}]`));
+  assert.equal(getFact(first.id)?.active, true, 'no unjudged automatic deletion');
+  assert.equal(getFact(second.id)?.active, true);
+});
+
 test('reconcile does NOT retire an auto-capture wrapper that carries a distinct extra fact (no data loss)', async () => {
   // Regression: containment matching would deactivate a wrapper holding
   // "<clause> AND <a distinct fact>", silently dropping the distinct fact.

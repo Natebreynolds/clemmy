@@ -33,6 +33,9 @@ const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+const { judgeWorkflowTarget } = await import('../../execution/workflow-objective-judge.js');
+const { captureWorkflowTargetReviewPolicy, parseWorkflowTargetReviewPolicy } = await import('../../execution/workflow-target-review-policy.js');
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
 const request = 'Please refresh my Facebook trends report using the Scorpion Facebook URL https://www.facebook.com/scorpion.co and report back the findings.';
@@ -119,6 +122,134 @@ const eligible = (sourceWorkAttempted: boolean, nextAction = 'completed') => sho
   sourceWorkAttempted, nextAction, continuationsUsed: 0, maxContinuations: 2,
 });
 
+test('workflow review captures OFF before work, stays OFF after disk reopen and skips evidence/model work', async () => {
+  const dir = path.join(home, 'workflows', 'runs');
+  mkdirSync(dir, { recursive: true });
+  const runId = `review-policy-${++serial}`;
+  const file = path.join(dir, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'example', status: 'queued' }));
+  const previous = process.env.CLEMMY_COMPLETION_REVIEW;
+  try {
+    process.env.CLEMMY_COMPLETION_REVIEW = 'off';
+    const off = captureWorkflowTargetReviewPolicy(file, runId);
+    assert.equal(off.status, 'captured');
+    if (off.status !== 'captured') throw new Error(off.reason);
+    assert.equal(off.enabled, false);
+    const bytes = readFileSync(file, 'utf8');
+    process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+    events.closeEventLog();
+    const reopened = captureWorkflowTargetReviewPolicy(file, runId);
+    assert.deepEqual(reopened, off);
+    assert.equal(readFileSync(file, 'utf8'), bytes, 're-entry does not rewrite the captured policy');
+    const verdict = await judgeWorkflowTarget({ workflow: { name: 'example', description: 'Save a report' }, inputs: {},
+      finalOutput: 'Saved report', reviewPolicy: reopened,
+      executionEvidence: () => { throw new Error('OFF must not read evidence'); },
+      judgeFn: async () => { throw new Error('OFF must not invoke a model'); } });
+    assert.equal(verdict.reached, true);
+    assert.equal(verdict.judged, false);
+    assert.equal(verdict.unavailable, undefined, 'OFF is a policy choice, not an outage');
+    assert.match(verdict.gap, /disabled by owner/);
+
+    // Present malformed policy never defaults to today's ON switch.
+    writeFileSync(file, JSON.stringify({ id: runId, targetReviewPolicy: { ...off, enabled: 'false' } }));
+    assert.equal(captureWorkflowTargetReviewPolicy(file, runId).status, 'unavailable');
+    assert.equal(parseWorkflowTargetReviewPolicy(null).status, 'unavailable');
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW;
+    else process.env.CLEMMY_COMPLETION_REVIEW = previous;
+  }
+});
+
+test('workflow review forwards the captured judge identity without changing a real negative verdict', async () => {
+  const selection = { status: 'captured' as const,
+    role: { modelId: 'claude-opus-5', provider: 'claude' as const, source: 'settings' as const },
+    crossFamily: false, defaultModels: { claude: 'claude-opus-5', codex: 'gpt-5.6-terra' } };
+  const verdict = await judgeWorkflowTarget({ workflow: { name: 'example', description: 'Save a report with recommendations.' },
+    inputs: {}, finalOutput: 'Report saved', executionEvidence: () => ({ available: true, summary: 'Saved content: metrics only.' }),
+    reviewPolicy: { version: 1, status: 'captured', enabled: true, judgeSelection: selection },
+    judgeFn: async (_objective, _response, context) => {
+      assert.deepEqual(context?.boundaryJudgeSelection, selection);
+      return { done: false, reason: 'The saved report has no recommendations.' };
+    } });
+  assert.equal(verdict.judged, true);
+  assert.equal(verdict.reached, false, 'existence of a file cannot discharge its actual content requirements');
+});
+
+test('workflow target review uses exact run receipts, current file bytes and carrier identity, surviving SQLite reopen', async () => {
+  const { withHostLocalWriteCommitFromFile } = await import('./host-local-write-commit.js');
+  const runId = `target-proof-${++serial}`;
+  function workflowSource(run: string, step: string) {
+    const sessionId = `workflow:${run}:${step}`;
+    events.createSession({ id: sessionId, kind: 'chat' });
+    const event = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create the requested report.', workflowRunId: run } });
+    return { sessionId, sourceUserSeq: event.seq, turn: 1 };
+  }
+  const identity = workflowSource(runId, 'main');
+  const file = path.join(home, 'target-evidence.md');
+  const text = 'Prepared through the carrier.\n' + 'Complete report row.\n'.repeat(900) + 'DECISIVE_FRAMEWORK_TAIL\n';
+  writeFileSync(file, text);
+  retainedRead(identity, 'write_file', withHostLocalWriteCommitFromFile({ createdId: 'target-evidence', committedPath: file, result: 'Saved.' }), true);
+  events.appendEvent({ ...identity, role: 'Clem', type: 'tool_called', data: { sourceUserSeq: identity.sourceUserSeq,
+    tool: 'call_tool', effectiveTool: 'write_file', accounting: 'top_level', canonicalCallId: 'read:write_file' } });
+  retainedRead(identity, 'read_file', text);
+  // A similarly prefixed run is deliberately not this run.
+  retainedRead(workflowSource(`${runId}-other`, 'main'), 'read_file', 'UNRELATED_RESULT_MUST_NOT_LEAK');
+  events.closeEventLog();
+  const evidence = readWorkflowTargetEvidence(runId);
+  assert.equal(evidence.available, true, evidence.summary);
+  assert.match(evidence.summary, /call_tool -> write_file/);
+  assert.match(evidence.summary, /current saved content matches the committed raw bytes/);
+  assert.ok(evidence.summary.includes(text));
+  assert.ok(!evidence.summary.includes('UNRELATED_RESULT_MUST_NOT_LEAK'));
+  let prompt = '';
+  await judgeWorkflowTarget({ workflow: { name: 'target-proof', description: 'Create the report.' }, inputs: {},
+    finalOutput: JSON.stringify({ file }), executionEvidence: () => readWorkflowTargetEvidence(runId),
+    judgeFn: async (objective, response, context) => {
+      prompt = buildObjectiveJudgePrompt(objective, response, context);
+      return { done: true, reason: 'Report saved with the requested framework.' };
+    } });
+  assert.ok(prompt.includes(text));
+  assert.match(prompt, /call_tool -> write_file/);
+
+  // A positive judge cannot vouch for bytes changed during its own call.
+  const drifted = await judgeWorkflowTarget({ workflow: { name: 'target-proof', description: 'Create the report.' }, inputs: {},
+    finalOutput: JSON.stringify({ file }), executionEvidence: () => readWorkflowTargetEvidence(runId),
+    judgeFn: async () => { writeFileSync(file, 'Unrelated replacement'); return { done: true, reason: 'Looked complete.' }; } });
+  assert.equal(drifted.judged, false);
+  assert.equal(drifted.unavailable, true);
+  const changed = readWorkflowTargetEvidence(runId);
+  assert.equal(changed.available, false);
+  assert.match(changed.summary, /content_digest_mismatch/);
+  rmSync(file);
+  assert.equal(readWorkflowTargetEvidence(runId).available, false, 'missing file is not a valid retained positive');
+});
+
+test('workflow target evidence compares the latest exact handle across step sources and keeps missing receipts unresolved', async () => {
+  const { withHostLocalWriteCommitFromFile } = await import('./host-local-write-commit.js');
+  const runId = `target-revisions-${++serial}`;
+  const file = path.join(home, 'target-revisions.md');
+  function write(step: string, value: string, missingReceipt = false) {
+    const sessionId = `workflow:${runId}:${step}`;
+    events.createSession({ id: sessionId, kind: 'chat' });
+    const source = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Update the report.' } });
+    writeFileSync(file, value);
+    retainedRead({ sessionId, sourceUserSeq: source.seq, turn: 1 }, 'write_file', missingReceipt ? 'Saved.'
+      : withHostLocalWriteCommitFromFile({ createdId: 'target-revisions', committedPath: file, result: 'Saved.' }), true);
+  }
+  write('z-first', 'Initial report');
+  write('a-second', 'Final report');
+  const evidence = readWorkflowTargetEvidence(runId);
+  assert.equal(evidence.available, true, evidence.summary);
+  assert.match(evidence.summary, /earlier revision, superseded/);
+  assert.match(evidence.summary, /current saved content matches/);
+  assert.ok(evidence.summary.includes('Final report'));
+  assert.ok(!evidence.summary.includes('current content UNVERIFIED'));
+  write('third', 'Final report', true);
+  const missing = readWorkflowTargetEvidence(runId);
+  assert.equal(missing.available, false);
+  assert.match(missing.summary, /promised_receipt_missing_or_malformed/);
+});
+
 test('discovery, native reads and failed business attempts are review eligibility, never proof of completion', () => {
   for (const tool of ['tool_search', 'workflow_get', 'memory_recall_all', 'apify_get_actor', 'work_call']) {
     const identity = accepted();
@@ -178,6 +309,21 @@ test('an authenticated empty result stays visible evidence rather than missing b
   assert.equal(evidence.results[0]?.status, 'verified');
   assert.match(evidence.summary, /"items":\[\]/);
   assert.match(evidence.summary, /Records=0/);
+});
+
+test('reviewed text loses only its JSON transport encoding, including literal escapes and middle records', () => {
+  const identity = accepted('Review every line of the retained text.');
+  const text = Array.from({ length: 500 }, (_, i) => `Record ${i}: "quoted" \\literal\\n — café 🧡`).join('\n');
+  const handle = retainedRead(identity, 'read_file', text);
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.ok(evidence.summary.includes(text), 'every character from the original string must be present');
+  assert.equal(evidence.results[0]?.resultHandleId, handle);
+  assert.equal(evidence.results[0]?.presentation, 'decoded_text');
+  assert.equal(evidence.results[0]?.shownByteCount, Buffer.byteLength(text));
+  assert.equal(evidence.results[0]?.rawByteCount, Buffer.byteLength(JSON.stringify(text)));
+  assert.equal(evidence.results[0]?.contentComplete, true);
+  assert.ok(evidence.results[0]!.shownByteCount! < evidence.results[0]!.rawByteCount!);
 });
 
 test('corrupt retained read bytes cannot enter the judge as authenticated results', () => {

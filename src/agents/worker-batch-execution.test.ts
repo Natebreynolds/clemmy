@@ -273,6 +273,7 @@ test('an abort-ignoring body withholds typed remainder and fails closed after th
     run,
     (error) => error instanceof batchExecution.WorkerBatchGenerationCancelledError
       && error.kind === 'deadline'
+      && error.startedBodies === 1
       && /withheld/.test(error.message),
   );
   assert.equal(batchExecution._workerBatchObservationCountForTest(), 0);

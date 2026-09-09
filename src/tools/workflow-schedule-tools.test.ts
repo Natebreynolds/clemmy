@@ -43,6 +43,27 @@ beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
+test('one-time schedule preserves the absolute instant and has no recurring cron or retirement step', async () => {
+  const result = await scheduleTool()({ name: 'friday-preparation', description: 'Prepare a local team review before the meeting.',
+    run_at: '2026-09-11T15:30:00-07:00', instructions: 'Read the current local performance CSV and save the brief locally.',
+    toolCall: null, enabled: true });
+  assert.match(resultText(result), /one-time occurrence at 2026-09-11T22:30:00.000Z/);
+  const saved = readWorkflow('friday-preparation')!.data;
+  assert.equal(saved.trigger.onceAt, '2026-09-11T22:30:00.000Z');
+  assert.equal(saved.trigger.schedule, undefined);
+  assert.equal(saved.steps.length, 1);
+  assert.equal(saved.steps[0]!.prompt, 'Read the current local performance CSV and save the brief locally.');
+});
+
+test('one-time authoring refuses ambiguous timing before saving anything', async () => {
+  for (const timing of [{}, { run_at: '2026-09-11T15:30:00' }, { run_at: '2026-09-11T22:30:00Z', cron: '* * * * *' }]) {
+    const result = await scheduleTool()({ name: 'ambiguous-preparation', description: 'Read current local information.',
+      instructions: 'Read the current local input.', toolCall: null, ...timing });
+    assert.match(resultText(result), /Error:/);
+    assert.equal(readWorkflow('ambiguous-preparation'), null);
+  }
+});
+
 test('enabled schedule retains the requested state while readiness questions stay advisory', async () => {
   // The same authoring policy as workflow_create: structural and effect checks
   // still apply, but prose readiness questions cannot silently disable the schedule.
@@ -162,4 +183,39 @@ test('a clean research/report schedule is written and may surface gap questions'
   assert.ok(/Created workflow "daily-digest"/.test(text), `expected create, got: ${text}`);
   assert.match(text, /Workflow visual contract:/);
   assert.ok(readWorkflow('daily-digest'), 'workflow must be written');
+});
+
+
+test('scheduled local work carries its authored effect and real artifact contract', async () => {
+  const output = { type: 'object' as const, required_keys: ['file'], verify: { path_exists: ['file'] } };
+  await scheduleTool()({
+    name: 'prepare-once', description: 'Prepare an internal performance brief.',
+    run_at: '2026-09-11T15:30:00-07:00', cron: null,
+    instructions: 'Read the current local data and write the brief file.',
+    toolCall: null, sideEffect: 'write', output, allowSends: false,
+  });
+  const saved = readWorkflow('prepare-once')!.data;
+  assert.equal(saved.steps[0].sideEffect, 'write', 'future local writes retain their explicit authored authority');
+  assert.deepEqual(saved.steps[0].output, output, 'the future run checks the actual artifact');
+  assert.equal(saved.steps[0].requiresApproval, undefined, 'no extra approval step is introduced');
+});
+
+test('rescheduling an authored single step preserves its effect, tool scope and execution metadata', async () => {
+  const output = { verify: { path_exists: ['file'] } };
+  writeWorkflow('preserve-once', {
+    name: 'preserve-once', description: 'Prepare a local brief.', enabled: true,
+    trigger: { schedule: '0 9 * * 1' }, allowedTools: ['read_file', 'write_file'],
+    steps: [{ id: 'prepare', prompt: 'Prepare the brief.', sideEffect: 'write', output,
+      allowedTools: ['read_file', 'write_file'], maxTurns: 9, intent: 'analysis' }],
+  });
+  const prior = readWorkflow('preserve-once')!.data;
+  await scheduleTool()({
+    name: 'preserve-once', description: 'Prepare a local brief.',
+    run_at: '2026-09-11T15:30:00-07:00', cron: null,
+    instructions: 'Prepare the brief using current data.', toolCall: null,
+    sideEffect: null, output: null,
+  });
+  const saved = readWorkflow('preserve-once')!.data;
+  assert.deepEqual(saved.steps[0], { ...prior.steps[0], prompt: 'Prepare the brief using current data.' });
+  assert.deepEqual(saved.allowedTools, prior.allowedTools);
 });
