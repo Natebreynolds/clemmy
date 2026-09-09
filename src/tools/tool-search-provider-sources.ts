@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { rankCatalogEntriesLexically } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
 import {
   mcpToolScopeAuthority,
@@ -12,6 +13,7 @@ import {
   canonicalMcpToolIdentity,
   mcpServerAliasMatches,
   mcpToolAllowedByScope,
+  mcpToolDiscoveryScope,
   stripMcpToolCarrier,
 } from '../runtime/mcp-tool-authority.js';
 import {
@@ -1827,10 +1829,14 @@ export function buildAuthorizedToolSearchCandidateSources(
             : candidates;
         }
       }
-      const server = getOrCreateExternalMcpServers({ ...scope, queryText: query });
+      const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
       const tools = await server.listTools();
       if (signal?.aborted) return [];
-      return tools.slice(0, limit).map((tool, index): ToolSearchBrokerCandidate => ({
+      const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({
+        name: tool.name, oneLiner: typeof tool.description === 'string' ? tool.description : '',
+        tool,
+      })));
+      return ranked.slice(0, limit).map(({ tool }, index): ToolSearchBrokerCandidate => ({
         name: stripMcpToolCarrier(tool.name),
         summary: typeof tool.description === 'string'
           ? tool.description

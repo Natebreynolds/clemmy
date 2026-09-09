@@ -444,8 +444,10 @@ export function prepareWorkflowCreateForWrite(
   const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   if (compiled.def.enabled && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
   const gaps = analyzeWorkflowGaps(prep.def);
-  const defToWrite = gaps.length > 0 ? { ...prep.def, enabled: false } : prep.def;
-  return preparedFromWrite(prep, gaps.length > 0 ? 'readiness_gaps' : 'ready', defToWrite, gaps, extra);
+  // Match update/enable: wording-based readiness questions are advisories,
+  // not authority to disable valid owner-requested work. Structural validation
+  // above and execution-time effect checks still govern the actual operation.
+  return preparedFromWrite(prep, 'ready', prep.def, gaps, extra);
 }
 
 export function prepareWorkflowUpdateForWrite(

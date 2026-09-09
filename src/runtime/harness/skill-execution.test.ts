@@ -254,3 +254,32 @@ test('all helpers FAIL-OPEN on an unknown/bad session', () => {
   // summarize returns a string (possibly the "no tool calls" sentinel) and never throws.
   assert.equal(typeof summarizeToolCallsForJudge('nope-not-a-session'), 'string');
 });
+
+
+test('judge tool and worker evidence belongs to the current source, including late old results', async () => {
+  resetEventLog();
+  const watcher = await import('./watcher-judge.js');
+  const session = createSession({ kind: 'chat' });
+  const old = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Delegate the first review.' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'agent', type: 'tool_called', data: { tool: 'run_worker', callId: 'old-worker', sourceUserSeq: old.seq } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'worker_started', data: { item: 'old-review', parentSourceUserSeq: old.seq } });
+  const current = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Repair the existing drafts directly.' } });
+  // Arrival after the new request does not transfer ownership to it.
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'worker_result', data: { item: 'old-review', ok: false, sourceUserSeq: old.seq } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'agent', type: 'tool_called', data: { tool: 'work_call', callId: 'current-read', sourceUserSeq: current.seq } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'agent', type: 'tool_called', data: { tool: 'legacy-unattributed', callId: 'unknown' } });
+  const scope = { sourceUserSeq: current.seq };
+  assert.equal(summarizeToolCallsForJudge(session.id, scope), 'work_call×1');
+  assert.equal(watcher.summarizeWorkerProgressForWatcher(session.id, scope), '');
+  const seen: string[] = [];
+  const stop = watcher.observeWorkerFanoutStart(session.id, (event) => seen.push(String(event.data.item)), current.seq);
+  try {
+    appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'worker_started', data: { item: 'late-old', sourceUserSeq: old.seq } });
+    appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'worker_started', data: { item: 'conflicting', sourceUserSeq: current.seq, parentSourceUserSeq: old.seq } });
+    appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'worker_started', data: { item: 'current-review', parentSourceUserSeq: current.seq } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(seen, ['current-review']);
+    assert.match(watcher.summarizeWorkerProgressForWatcher(session.id, scope), /1 started \(current-review\)/);
+    assert.doesNotMatch(watcher.summarizeWorkerProgressForWatcher(session.id, scope), /old-review|late-old|conflicting/);
+  } finally { stop(); }
+});

@@ -2472,7 +2472,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
       });
-      if (callItems.length > 1) {
+      // A single live worker needs the same cancellation/drain ownership as a
+      // fan-out. Otherwise the hard tool deadline wins before the child returns,
+      // leaving the parent with an unresolved coordinator result.
+      if (callItems.length > 1 || (currentToolAbortDeadlineAt() !== undefined
+        && (manifestBinding || harnessRunContextStorage.getStore()?.dispatchLease))) {
         // Deterministic batch (2026-07-21): the harness owns the parallelism so
         // a brain that would have serialized N run_worker calls no longer pays
         // N× wall time. Per-item worker slots keep provider throttling honest;
@@ -2536,7 +2540,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 ...(details as Record<string, unknown> | undefined),
                 signal: lease.signal,
                 ...(details?.toolCall?.callId
-                  ? { toolCall: { ...details.toolCall, callId: `${details.toolCall.callId}-i${spec.index}` } }
+                  ? { toolCall: { ...details.toolCall, callId: callItems.length > 1 ? `${details.toolCall.callId}-i${spec.index}` : details.toolCall.callId } }
                   : {}),
               };
               try {
@@ -2578,6 +2582,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               .filter((entry) => entry.output !== undefined)
               .map((entry) => `--- item: ${entry.item} ---\n${entry.output}`),
           ].join('\n\n');
+        }
+        if (callItems.length === 1 && batch.items[0]?.output !== undefined) {
+          return [
+            ...(allRequestedItemsReused && manifestBinding ? [
+              `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+            ] : []),
+            outs[0], durableReuseGuidance,
+          ].filter(Boolean).join('\n\n');
         }
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
@@ -3029,7 +3041,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (sessionId) {
         if (claudeAgentSdkWorkerEnabled(workerModel)) {
           try {
-            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
           } catch { /* telemetry is best-effort */ }
         }
         if (manifestBinding) {

@@ -7,9 +7,8 @@ import { acceptedTaskModeIdentity } from '../runtime/harness/accepted-task-mode.
 import { parsePlanRevisionRef } from '../runtime/harness/task-mode.js';
 import { publishPlanRevision, type PlanStructuredOutline } from '../runtime/harness/plan-artifacts.js';
 import { canonicalCatalogIdentityOf, isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
-import { loadDurableAuthorizedLocalPlanningDefinition } from '../runtime/harness/local-planning-capability.js';
+import { loadDurableAuthorizedLocalPlanningDefinition, resolveConfiguredLocalPlanningTool } from '../runtime/harness/local-planning-capability.js';
 import { snapshotPrimaryModelPlanningContext, snapshotPrimaryModelSelectedStagedPlanningDescriptors, type HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
-import { getLocalToolSchemas } from './local-runtime-tools.js';
 import { getCachedToolSchema } from './composio-schema-cache.js';
 import { digestSchema } from './tool-contract-store.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../shared/closed-canonical-json.js';
@@ -73,7 +72,7 @@ function publicationError(error: unknown): string {
     error: 'invalid_plan_input', message: 'Repair the listed fields in publish_plan; no plan was published.', issues: issueDetails(original) });
   if (invalidInput) return JSON.stringify({ ok: false, published: false,
     error: 'invalid_plan_input', message: 'publish_plan requires a valid JSON object matching its typed parameters; no plan was published.' });
-  return JSON.stringify({ ok: false, published: false, error: 'plan_preparation_failed',
+  return JSON.stringify({ ok: false, published: false, error: 'plan_preparation_failed', code: 'plan_preparation_failed',
     message: error instanceof Error ? error.message : 'Plan preparation failed; no plan was published.' });
 }
 
@@ -140,15 +139,19 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     let schema: Record<string, unknown>;
     let identity: unknown;
     if (localDefinition) {
-      const localSchema = getLocalToolSchemas().get(localDefinition.name);
-      if (!localSchema) throw new Error(`Step ${step.id}: local operation schema is unavailable.`);
+      const configured = await resolveConfiguredLocalPlanningTool(localDefinition.name, localDefinition.carrier);
+      if (!configured?.parameters) throw new Error(`Step ${step.id}: local operation schema is unavailable.`);
       // Zod attaches a non-enumerable ~standard adapter to its JSON Schema.
       // Freeze the documented JSON representation, not that runtime adapter.
-      schema = JSON.parse(JSON.stringify(z.toJSONSchema(localSchema))) as Record<string, unknown>;
+      schema = JSON.parse(JSON.stringify(configured.parameters)) as Record<string, unknown>;
       identity = { kind: 'local_registry', definition: localDefinition, inputSchemaDigest: digestSchema(schema) };
-      const parsedArguments = localSchema.safeParse(step.staticArguments);
-      if (step.dynamicBindings.length) validatePlanArgumentPreparation({ schema, staticArguments: step.staticArguments, dynamicBindings: step.dynamicBindings, localIssues: parsedArguments.success ? [] : parsedArguments.error.issues });
-      else if (!parsedArguments.success) throw new Error(`Step ${step.id}: static arguments do not match the exact local schema: ${JSON.stringify(issueDetails(parsedArguments.error))}. staticArgumentsJson must contain the selected tool's input fields directly, without a call_tool or work_call wrapper.`);
+      const parsedArguments = configured.argumentSchema?.safeParse(step.staticArguments);
+      if (step.dynamicBindings.length) validatePlanArgumentPreparation({ schema, staticArguments: step.staticArguments, dynamicBindings: step.dynamicBindings,
+        ...(parsedArguments ? { localIssues: parsedArguments.success ? [] : parsedArguments.error.issues } : {}) });
+      else {
+        const validation = parsedArguments ? { ok: true as const } : validateProofProviderArguments({ schema, payload: step.staticArguments });
+        if (parsedArguments?.success === false || !validation.ok) throw new Error(`Step ${step.id}: static arguments do not match the exact local schema: ${JSON.stringify(parsedArguments?.success === false ? issueDetails(parsedArguments.error) : !validation.ok ? validation.failingPaths : [])}. staticArgumentsJson must contain the selected tool's input fields directly, without a call_tool or work_call wrapper.`);
+      }
     } else {
       const entry = peekHostCapabilityCatalogFactory()?.get(step.capabilityRef);
       const canonical = entry && isCurrentCallableCatalogEntry(entry) ? canonicalCatalogIdentityOf(entry) : null;

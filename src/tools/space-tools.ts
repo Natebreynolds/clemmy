@@ -461,6 +461,7 @@ export function registerSpaceTools(server: McpServer): void {
       `ONE-OFF MOBILE CONTENT: when this is a new static report/calendar whose complete content is already in hand, pass initial_data_json in THIS SAME call instead of planning a second space_set_data mutation. It is a create-only, full JSON document capped at ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes and cannot be combined with data_sources. Include top-level _mobile. For long authored copy, each _mobile record may add body (up to 4,000 characters) and links: [{label,url}] (http(s) only), alongside short fields. The single commit makes the view, data, and phone handoff restart-safe together.`,
       'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
       'STATIC BOARD EDIT: space_get returns the complete current document and snapshot revision. To update its data and phone content, pass replacement_data_json plus that expected_revision here, with view_html when the view also changes. They commit as one revision. This updates the root document; space_set_data instead edits a named source within a source-based dataset.',
+      'TARGETED EDIT: preserve all content outside the requested change, including existing HTML, stored data and phone content. Do not add explanations, audit notes or other improvements to the saved artifact unless requested. Put any explanation or suggestion in your chat reply.',
       'Changing a Composio data source auto-refreshes on save and reports the row count. Editing an installed legacy runner requests fresh pinned-entrypoint approval and leaves the Workspace active with its prior dataset until approved.',
       'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
     ].join('\n'),
@@ -1120,6 +1121,7 @@ export function registerSpaceTools(server: McpServer): void {
     [
       'Edit only an existing Workspace HTML view, such as its layout, styling, buttons or client-side logic. Stored data and phone content stay unchanged. For a static board record edit, use space_save with replacement_data_json, expected_revision and updated view_html so the stored document and rendered values change together.',
       'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view — call space_get_view first (optionally grep for the spot) to read the exact current text. It snapshots the prior version and bumps the version. The open Workspace auto-refreshes after this view-only edit.',
+      'Preserve everything outside the requested change. Put explanations or suggestions in chat; do not insert unrequested notes or improvements into the saved view.',
       'Use space_save with inline view_html instead for an ordinary full rewrite, or when changing data sources / actions; view_path remains oversized-file compatibility.',
     ].join('\n'),
     {

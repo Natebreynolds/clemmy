@@ -262,11 +262,12 @@ type OperationResultContract = 'file' | 'acknowledgement' | 'other' | 'undeclare
 function operationResultContract(toolName: string): OperationResultContract {
   const entry = TOOL_REGISTRY.find((candidate) => candidate.name === toolName);
   const outputKind = entry?.localPlanning?.outputKind;
+  if (outputKind?.endsWith('_revision') || outputKind === 'workspace_observation') return 'file';
+  if (entry?.resultContract === 'acknowledgement') return 'acknowledgement';
   // `outputKind` is an open string and 75 of 86 writes do not declare one.
   // ABSENT metadata is not an acknowledgement contract — it is simply not a
   // declaration, and must not be read as "this operation owes nothing".
   if (typeof outputKind !== 'string' || !outputKind.trim()) return 'undeclared';
-  if (outputKind.endsWith('_revision') || outputKind === 'workspace_observation') return 'file';
   if (outputKind === 'deletion_receipt') return 'acknowledgement';
   return 'other';
 }
@@ -3038,17 +3039,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // constants so this mount cannot outspend the legacy one.
   const hostWatcherEnabled = watcherJudgeEnabled();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
-  const hostWatcherSteer: { pending: WatcherVerdict | null } = { pending: null };
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
   let hostWatcherLastCheckedAt = 0;
   let hostWatcherCheckInFlight = false;
   /** Parent business tool calls so far (control tools never move the cadence). */
-  const hostWatcherToolCalls = (): number => history.filter((item) => {
-    const row = item as { type?: unknown; name?: unknown };
-    return row.type === 'function_call'
-      && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
-  }).length;
+  const hostWatcherToolCalls = (): number => {
+    try {
+      const identity = exactHostIdentity();
+      // Count settled work for this source, including across recovery. The
+      // session transcript also contains old turns and cannot own this cadence.
+      const rows = openEventLog().prepare(`
+        SELECT logical.tool_name AS name FROM logical_call_settlements settled
+        JOIN logical_tool_calls logical USING (session_id, source_user_seq, logical_tool_call_id)
+        WHERE settled.session_id = ? AND settled.source_user_seq = ?
+      `).all(identity.sessionId, identity.sourceUserSeq) as Array<{ name: string }>;
+      return rows.filter((row) => !HOST_JUDGE_CONTROL_TOOL_NAMES.has(row.name)).length;
+    } catch { return 0; }
+  };
   const hostWatcherGate = (watcherToolCalls: number): WatcherGateInput => ({
     enabled: true,
     totalToolCalls: watcherToolCalls,
@@ -3068,20 +3077,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     hostWatcherChecksUsed += 1;
     hostWatcherLastCheckedAt = watcherToolCalls;
     const watcherObjective = judgedObjective();
-    const watcherSessionId = exactHostIdentity().sessionId;
+    const watcherIdentity = exactHostIdentity();
     const watcherJudge = currentWatcherJudge();
     void (async () => {
       try {
         const verdict = await watcherJudge({
           objective: watcherObjective,
           toolCallSummary: [
-            summarizeToolCallsForJudge(watcherSessionId),
-            summarizeWorkerProgressForWatcher(watcherSessionId),
+            summarizeToolCallsForJudge(watcherIdentity.sessionId, watcherIdentity),
+            summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity),
           ].filter(Boolean).join('; '),
           latestAssistantNote: '',
           toolCallCount: watcherToolCalls,
         });
-        if (verdict && !verdict.onTrack) hostWatcherSteer.pending = verdict;
+        if (verdict && !verdict.onTrack && judgedObjective() === watcherObjective) {
+          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective };
+        }
       } catch { /* the watcher is silent on any failure */ }
       finally { hostWatcherCheckInFlight = false; }
     })();
@@ -3104,7 +3115,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const start = (): void => startHostWatcherCheck(watcherToolCalls);
       if (parentScope) harnessRunContextStorage.run(parentScope, start);
       else start();
-    });
+    }, exactHostIdentity().sourceUserSeq);
     try {
       return await run();
     } finally {
@@ -7472,13 +7483,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // shared check/injection budgets. A resolved drift verdict rides the
     // ordinary one-shot directive at THIS continuation boundary.
     if (hostProduction && hostWatcherEnabled) {
-      const drift = hostWatcherSteer.pending;
+      const drift = hostWatcherSteer.pending?.objective === judgedObjective()
+        ? hostWatcherSteer.pending : null;
+      if (!drift) hostWatcherSteer.pending = null;
       if (drift && !drift.onTrack && hostWatcherInjectionsUsed < MAX_WATCHER_INJECTIONS) {
         hostWatcherSteer.pending = null;
         hostWatcherInjectionsUsed += 1;
         pendingHostModelDirective = [
           pendingHostModelDirective,
-          `TRAJECTORY WATCHER (an independent check of the work so far against the ORIGINAL request) says OFF TRACK: ${drift.miss.slice(0, 300)}`,
+          `TRAJECTORY WATCHER (a check of this request’s work against the current accepted objective) says OFF TRACK: ${drift.miss.slice(0, 300)}`,
           drift.steer.slice(0, 300),
         ].filter(Boolean).join(' ');
         try {
@@ -7490,6 +7503,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             data: {
               lane: 'host_v1',
               kind: 'watcher',
+              sourceUserSeq: exactHostIdentity().sourceUserSeq,
+              objectiveDigest: createHash('sha256').update(drift.objective, 'utf8').digest('hex'),
               fulfills: false,
               reason: drift.miss.slice(0, 600),
               steer: drift.steer.slice(0, 300),

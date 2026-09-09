@@ -802,7 +802,7 @@ export function getOrCreateExternalMcpServers(rawScope?: McpToolScope): MCPServe
   // slip past a restrictive turn.
   const narrowed = narrowToAmbientAuthority(rawScope);
   const scope = narrowed ? withoutDeniedServers(narrowed) : narrowed;
-  if (!scope || scope.allowAll) {
+  if (!scope) {
     return ensureAllExternalBaseShim();
   }
 
@@ -810,6 +810,10 @@ export function getOrCreateExternalMcpServers(rawScope?: McpToolScope): MCPServe
   // acquire — the only genuinely empty surface.
   if (mcpToolScopeAuthority(scope) === 'none') {
     return emptyExternalShim;
+  }
+
+  if (scope.allowAll) {
+    return ensureAllExternalBaseShim();
   }
 
   // Advertising nothing is a budget, not a boundary. Hand back a shim that

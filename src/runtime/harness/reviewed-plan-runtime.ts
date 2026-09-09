@@ -1,10 +1,8 @@
 /** Exact reviewed preparation at activation and each business call. No grants. */
-import { z } from 'zod';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { canonicalCatalogIdentityOf, isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
-import { revalidateLocalPlanningDefinition, issueAuthorizedLocalPlanningDisclosureCandidate, type AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
-import { getLocalToolSchemas } from '../../tools/local-runtime-tools.js';
+import { revalidateLocalPlanningDefinition, issueAuthorizedLocalPlanningDisclosureCandidate, resolveConfiguredLocalPlanningTool, type AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { disclosePrimaryModelPlanningCapabilities, type HostFreshPlanningContextV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
@@ -37,9 +35,9 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
     if (binding.identity.kind === 'local_registry') {
       const prior = binding.identity.definition as AuthorizedLocalPlanningDefinitionV1;
       const current = await revalidateLocalPlanningDefinition(prior);
-      const schema = getLocalToolSchemas().get(prior.name);
-      if (!current.ok || !schema || digestSchema(z.toJSONSchema(schema)) !== binding.identity.inputSchemaDigest) throw new Error(`Reviewed native tool ${prior.name} changed. Revise the plan before execution.`);
-      const candidate = await issueAuthorizedLocalPlanningDisclosureCandidate({ name: prior.name, carrier: prior.carrier, configuredNames: new Set(getLocalToolSchemas().keys()) });
+      const configured = await resolveConfiguredLocalPlanningTool(prior.name, prior.carrier);
+      if (!current.ok || !configured?.parameters || digestSchema(JSON.parse(JSON.stringify(configured.parameters))) !== binding.identity.inputSchemaDigest) throw new Error(`Reviewed native tool ${prior.name} changed. Revise the plan before execution.`);
+      const candidate = await issueAuthorizedLocalPlanningDisclosureCandidate({ name: prior.name, carrier: prior.carrier, configuredNames: new Set([configured.name]) });
       if (!candidate || 'refused' in candidate) throw new Error(`Reviewed native tool ${prior.name} is no longer available.`);
       await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority, candidates: [candidate] });
     } else {

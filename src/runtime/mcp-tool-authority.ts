@@ -46,6 +46,27 @@ export function stripMcpToolCarrier(toolName: string): string {
   return toolName.trim().replace(/^mcp__/i, '');
 }
 
+/** Active lookup searches the authorized catalog, not the initial prompt's
+ * relevance shortlist. Preserve user restrictions; ranking happens after list. */
+export function mcpToolDiscoveryScope(scope: McpToolScope): McpToolScope {
+  const authority = mcpToolScopeAuthority(scope);
+  return {
+    reason: `Active discovery: ${scope.reason}`,
+    authority,
+    deniedServerSlugs: scope.deniedServerSlugs,
+    ...(authority === 'catalog' ? { allowAll: true } : {}),
+    ...(authority === 'server_set' ? { allowedServerSlugs: scope.allowedServerSlugs } : {}),
+    ...(authority === 'exact' ? {
+      allowedToolNames: scope.allowedToolNames ?? [],
+      allowedServerSlugs: [...new Set((scope.allowedToolNames ?? []).flatMap(name => {
+        const parsed = parseNamespacedTool(stripMcpToolCarrier(name));
+        return parsed ? [parsed.serverSlug] : [];
+      }))],
+    } : {}),
+    ...(authority === 'none' ? { maxTools: 0, allowedServerSlugs: [] } : {}),
+  };
+}
+
 /**
  * May this exact tool run on this turn?
  *

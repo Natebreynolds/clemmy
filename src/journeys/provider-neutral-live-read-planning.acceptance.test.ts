@@ -531,6 +531,16 @@ test('disjoint CLI and native MCP discovery preserve exact provider-neutral read
     && /^cap:live:v1:/.test(row.capabilityRef ?? '')), JSON.stringify(choiceRows));
   assert.equal(new Set(choiceRows.map(row => row.capabilityRef)).size, 2);
   assert.equal(countLines(mcpBusinessCounter), 0, 'offering two choices executed a business read');
+  // The live sheet/CRM failure had catalog authority but a provider-named
+  // advertisement shortlist. Active search must still reach this real peer.
+  const hiddenRun = await createPlanning('catalog-outside-advertisement', naturalQuery);
+  const hidden = await ordinaryPlanningSearch({ objective: naturalQuery,
+    scope: { reason: 'sheet and CRM intent', authority: 'catalog', allowedServerSlugs: ['salesforce', 'google'], toolPatterns: ['missing'], maxTools: 0 },
+    ...hiddenRun });
+  const discovered = hidden.results.filter(row => [mcpOperation, `${mcpServerName}__${secondTool}`].includes(row.name));
+  assert.equal(discovered.length, 2, JSON.stringify(hidden));
+  assert.ok(discovered.every(row => /^cap:live:v1:/.test(row.capabilityRef ?? '')), 'lookup must materialize exact callable read authority');
+  assert.equal(countLines(mcpBusinessCounter), 0, 'discovering an omitted reader is not a business read');
   await mcpServers.invalidateConfiguredMcpServers();
   delete config[mcpServerName].env.LR_SECOND_TOOL_NAME;
   writeFileSync(configPath, JSON.stringify(config), 'utf8');

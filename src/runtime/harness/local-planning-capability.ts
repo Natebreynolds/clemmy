@@ -1,4 +1,5 @@
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import type { ZodType } from 'zod';
 /**
  * Exact Clementine-local planning authority.
  *
@@ -84,6 +85,7 @@ interface ConfiguredLocalTool {
   /** Positive proof that this exact schema belongs to the generic local
    * work_call dispatcher rather than only to a first-class/call_tool surface. */
   workCallLocalDispatch?: boolean;
+  argumentSchema?: ZodType;
 }
 
 type ConfiguredLocalToolObserver = (
@@ -115,6 +117,7 @@ async function defaultConfiguredLocalTool(
         name,
         parameters: z.toJSONSchema(schema),
         workCallLocalDispatch: true,
+        argumentSchema: schema,
       };
     }
     // Some registry-declared local mutations (for example the SDK-backed
@@ -130,10 +133,13 @@ async function defaultConfiguredLocalTool(
     .map((tool) => tool as unknown as { name?: unknown; parameters?: unknown })
     .filter((tool) => tool.name === name);
   if (matches.length !== 1 || typeof matches[0]?.name !== 'string' || !matches[0].parameters) return null;
-  return { name: matches[0].name, parameters: matches[0].parameters };
+  // The core surface can carry provider-strict required+nullable placeholders.
+  // Deferred callers omit those same optional fields. Use the same contract
+  // discovery publishes, including when Plan later reopens this core tool.
+  return { name: matches[0].name, parameters: relaxJsonSchemaForDeferred(matches[0].parameters) };
 }
 
-async function configuredLocalTool(
+export async function resolveConfiguredLocalPlanningTool(
   name: string,
   carrier: LocalPlanningCarrier,
 ): Promise<ConfiguredLocalTool | null> {
@@ -673,7 +679,7 @@ export async function observeCurrentLocalPlanningDefinition(input: {
   const declarations = TOOL_REGISTRY.filter((entry) => entry.name === name);
   if (declarations.length !== 1) return { ok: false, reason: 'not_exact_registry_row' };
   const declaration = declarations[0]!;
-  const configured = await configuredLocalTool(name, input.carrier);
+  const configured = await resolveConfiguredLocalPlanningTool(name, input.carrier);
   if (!configured || configured.name !== name) return { ok: false, reason: 'not_configured' };
   if (
     declarationCanEnterLocalPlanningRead(declaration)
@@ -698,7 +704,7 @@ export async function observeCurrentLocalPlanningDefinitions(input: {
   const declarations = TOOL_REGISTRY.filter((entry) => entry.name === name);
   if (declarations.length !== 1) return { ok: false, reason: 'not_exact_registry_row' };
   const declaration = declarations[0]!;
-  const configured = await configuredLocalTool(name, input.carrier);
+  const configured = await resolveConfiguredLocalPlanningTool(name, input.carrier);
   if (!configured || configured.name !== name) return { ok: false, reason: 'not_configured' };
   if (
     declarationCanEnterLocalPlanningRead(declaration)

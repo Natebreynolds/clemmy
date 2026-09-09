@@ -43,9 +43,9 @@ beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
-test('enabled ungated-send schedule is saved DISABLED pending readiness answers', async () => {
-  // Approval gates are opt-in (allowSends: true by default), but readiness
-  // questions still keep unclear outbound sends from going live blind.
+test('enabled schedule retains the requested state while readiness questions stay advisory', async () => {
+  // The same authoring policy as workflow_create: structural and effect checks
+  // still apply, but prose readiness questions cannot silently disable the schedule.
   const result = await scheduleTool()({
     name: 'midday-sender',
     description: 'Compose and send the outreach emails at midday.',
@@ -57,12 +57,12 @@ test('enabled ungated-send schedule is saved DISABLED pending readiness answers'
   });
   const text = resultText(result);
   assert.ok(/Created workflow/.test(text), `expected creation, got: ${text}`);
-  assert.match(text, /Currently DISABLED/);
+  assert.doesNotMatch(text, /Currently DISABLED/);
   assert.match(text, /outside world/);
   assert.match(text, /Workflow visual contract:/);
   const written = readWorkflow('midday-sender')?.data;
   assert.ok(written, 'workflow must be written');
-  assert.equal(written.enabled, false);
+  assert.equal(written.enabled, true);
 });
 
 test('strict send mode refuses a send-looking schedule without an approval gate', async () => {
