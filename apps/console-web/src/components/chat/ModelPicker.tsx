@@ -20,9 +20,11 @@ function dotColor(provider: string): string {
 function Roster({ rows, value, busy, onPick }: { rows: BrainChoice[]; value: string; busy: boolean; onPick: (v: string) => void }) {
   const groups = new Map<string, BrainChoice[]>();
   for (const r of rows) groups.set(r.provider, [...(groups.get(r.provider) ?? []), r]);
+  // Signed-in providers first: the roster opens on what can actually be picked.
+  const ordered = [...groups.entries()].sort((a, b) => Number(b[1].some((r) => r.available)) - Number(a[1].some((r) => r.available)));
   return (
     <div className="mx-4 mb-2 max-h-60 overflow-y-auto rounded-md bg-subtle">
-      {[...groups.entries()].map(([provider, list]) => (
+      {ordered.map(([provider, list]) => (
         <div key={provider}>
           <div className="px-3 pb-0.5 pt-2 text-[11px] font-semibold uppercase tracking-wide text-faint">{PROVIDER_LABEL[provider] ?? provider}</div>
           {list.map((r) => {
@@ -36,7 +38,7 @@ function Roster({ rows, value, busy, onPick }: { rows: BrainChoice[]; value: str
                 className={cn('grid w-full grid-cols-[auto_1fr_auto] items-center gap-2.5 px-3 py-1.5 text-left text-small transition-colors hover:bg-hover disabled:cursor-default', on && 'font-semibold', !r.available && 'text-faint hover:bg-transparent')}
               >
                 <span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(r.provider) }} aria-hidden />
-                <span className="truncate">{r.label}{r.note && <span className="ml-1.5 font-normal text-faint">{r.note}</span>}</span>
+                <span className="truncate">{shortModelLabel(r.label)}{r.note && <span className="ml-1.5 font-normal text-faint">{r.note}</span>}</span>
                 <span className="text-caption text-success">{on ? 'current' : ''}</span>
               </button>
             );
@@ -87,7 +89,7 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
       </button>
       {open && (
         <div role="dialog" aria-label="Models for this conversation" className="absolute bottom-full right-0 z-30 mb-2 w-[420px] rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg">
-          <div className="grid grid-cols-[84px_1fr] items-center gap-3 px-4 py-2">
+          <div className="grid grid-cols-[96px_1fr] items-center gap-3 px-4 py-2">
             <span><span className="block text-small font-semibold text-fg">Brain</span><span className="block text-caption text-faint">{sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
             <button type="button" onClick={() => setRoster((v) => !v)} aria-expanded={roster} disabled={busy} className="inline-flex items-center justify-between gap-2 rounded-md bg-subtle px-2.5 py-1.5 text-small font-semibold text-fg hover:bg-hover">
               <span className="inline-flex min-w-0 items-center gap-2"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden /><span className="truncate">{brain}</span></span>
@@ -96,8 +98,8 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
           </div>
           {roster && <Roster rows={roles.brains} value={roles.brainValue} busy={busy} onPick={(v) => { setRoster(false); void roles.onBrain(v); }} />}
           {roles.claudeSignInFor && <div className="mx-4 mb-2"><ClaudeLoginForm embedded /></div>}
-          <div className="grid grid-cols-[84px_1fr] items-center gap-3 border-t border-border px-4 py-2">
-            <span><span className="block text-small font-semibold text-fg">Workers</span><span className="block text-caption text-faint">parallel helpers · everywhere</span></span>
+          <div className="grid grid-cols-[96px_1fr] items-center gap-3 border-t border-border px-4 py-2">
+            <span><span className="block text-small font-semibold text-fg">Workers</span><span className="block text-caption text-faint">helpers · everywhere</span></span>
             <select
               aria-label="Workers model"
               disabled={busy}
@@ -109,8 +111,8 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
               {roles.workers.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
             </select>
           </div>
-          <div className="grid grid-cols-[84px_1fr] items-center gap-3 border-t border-border px-4 py-2">
-            <span><span className="block text-small font-semibold text-fg">Judge</span><span className="block text-caption text-faint">checks the work · everywhere</span></span>
+          <div className="grid grid-cols-[96px_1fr] items-center gap-3 border-t border-border px-4 py-2">
+            <span><span className="block text-small font-semibold text-fg">Judge</span><span className="block text-caption text-faint">checks · everywhere</span></span>
             <select
               aria-label="Judge model"
               disabled={busy}
