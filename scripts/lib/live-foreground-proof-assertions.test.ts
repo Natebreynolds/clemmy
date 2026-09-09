@@ -6,6 +6,26 @@ const facts: LiveTurnFacts = {
   reply: 'Subject A\nExact body.', terminalStatus: 'done', modelRequests: 1,
   toolSearches: 0, toolCalls: 0, wallMs: 100, perTool: {}, settlements: [],
 };
+test('a declared clarification may pause while completion and effect assertions remain strict', () => {
+  const paused = { ...facts, terminalStatus: 'needs_input', reply: 'Who is the website for?' };
+  assert.match(checkLiveTurn({ successfulMutations: 0 }, paused).join('\n'), /terminal: expected done/);
+  const expect = LiveProofMessageSchema.parse({
+    message: 'Help me design a website.',
+    expect: { terminalStatuses: ['done', 'needs_input'], successfulMutations: 0 },
+  }).expect!;
+  assert.deepEqual(checkLiveTurn(expect, paused), []);
+  assert.deepEqual(checkLiveTurn(expect, facts), []);
+  for (const terminalStatus of ['blocked', 'failed', 'cancelled', null]) {
+    assert.match(checkLiveTurn(expect, { ...paused, terminalStatus }).join('\n'), /terminal: expected/);
+  }
+  assert.match(checkLiveTurn(expect, { ...paused, settlements: [{
+    mutating: 1, outcome_kind: 'succeeded', requires_reconciliation: 0,
+    physical_crossing_count: 1, host_crossing_count: 0,
+  }] }).join('\n'), /mutations:/);
+  for (const terminalStatuses of [[], ['blocked'], ['anything']]) {
+    assert.equal(LiveProofMessageSchema.safeParse({ message: 'test', expect: { terminalStatuses } }).success, false);
+  }
+});
 test('done prose does not pass exact payload or effect assertions', () => {
   assert.equal(checkLiveTurn({ replyIncludes: ['Exact body.'], successfulMutations: 0 }, facts).length, 0);
   assert.equal(checkLiveTurn({ replyIncludes: ['Exact body.'] }, { ...facts, reply: 'Exact body' }).length, 1);

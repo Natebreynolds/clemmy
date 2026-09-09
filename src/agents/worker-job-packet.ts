@@ -395,6 +395,7 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
     '- If resolvedTools says "none needed" or omits a capability that is truly required, do the smallest possible discovery for that missing capability only.',
     '- If a listed tool call fails or returns missing data, fix and retry that call once. After one genuine retry fails, return ERROR with the specific reason.',
     '- Do not ask the user, notify the user, mutate shared task/execution state, or perform work outside this single item.',
+    '- Preserve evidence strength in your answer: distinguish directly observed facts, claims made by a source, your inferences, and unknowns. Include the supporting source or tool result and its limitations. Search-result order or a summary is not a measured ranking, market share, or performance result.',
     '- Return only the requested expectedOutput. If the item failed, the final line must start with ERROR:',
     ...(input.expectedWork
       ? [
@@ -402,7 +403,7 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
           // concluded the capability was unavailable, and quit with ZERO tool
           // calls. Under a contract, business capabilities exist ONLY behind
           // work_call — say so, and hand the worker its exact binding.
-          `- CONTRACTED ITEM: your business call is made through work_call with requirement_id "${input.expectedWork.requirementId}" and universe_item_id set to this packet's canonical item id, proposal:null (the contract is already frozen). File writes, provider actions, and every other business capability in this worker are reachable ONLY through that bound work_call — they are deliberately not first-class tools here. Never conclude a capability is unavailable without attempting the bound call; a refusal returns the frozen plan to correct against.`,
+          `- CONTRACTED ITEM: your business call is made through work_call with requirement_id "${input.expectedWork.requirementId}" and universe_item_id set to this packet's canonical item id (the contract is already frozen). Use only fields in the callable schema. File writes, provider actions, and every other business capability in this worker are reachable ONLY through that bound work_call — they are deliberately not first-class tools here. Never conclude a capability is unavailable without attempting the bound call; a refusal returns the frozen plan to correct against.`,
         ]
       : []),
     ...(remembered

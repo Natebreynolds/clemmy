@@ -1388,6 +1388,9 @@ export function commitTurnOutcome(
     }, true);
     effectiveOptions = {
       ...effectiveOptions,
+      // The verification projection changed done to blocked. Derive the
+      // compatibility reason from that outcome instead of retaining success.
+      legacyReason: undefined,
       metadata: { ...(effectiveOptions.metadata ?? {}), verificationDetail: detail },
     };
   }

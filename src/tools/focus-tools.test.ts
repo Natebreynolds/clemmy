@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { z } from 'zod';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-focus-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -17,7 +18,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerFocusTools } = await import('./focus-tools.js');
 const { createFocus, getFocusById, getFocusWorkstate } = await import('../memory/focus.js');
-const { resetMemoryDb } = await import('../memory/db.js');
+const { resetMemoryDb, closeMemoryDb } = await import('../memory/db.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
 type ToolResult = { content?: Array<{ text?: string }> };
@@ -36,6 +37,29 @@ function handlers(): Map<string, ToolHandler> {
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('a project checkpoint survives the public focus schemas and database reopen without clipping', async () => {
+  resetMemoryDb();
+  const tools = new Map<string, ToolHandler>();
+  registerFocusTools({ tool(name: string, _description: string, shape: z.ZodRawShape, handler: ToolHandler) {
+    tools.set(name, (input) => handler(z.object(shape).parse(input)));
+  } } as never);
+  const summary = 'Juniper & Clay uses a cream-and-copper editorial direction. '
+    + 'The local prototype exists; its published audience has not changed yet. '.repeat(12)
+    + 'Decision at the end: private groups, CTA Plan a private workshop, publication pending.';
+  assert.ok(summary.length > 800);
+  await tools.get('focus_set')!({ resource_ref: 'project:juniper-clay', title: 'Juniper & Clay', summary });
+  closeMemoryDb();
+  assert.equal(getFocusById(1)?.summary, summary);
+  const revised = summary + ' The owner paused the project after reviewing the preview.';
+  await tools.get('focus_update')!({ id: 1, summary: revised });
+  await tools.get('focus_park')!({ id: 1, reason: 'Owner paused the project.' });
+  closeMemoryDb();
+  assert.equal(getFocusById(1)?.summary, revised);
+  assert.equal(getFocusById(1)?.status, 'paused');
+  const recalled = await tools.get('focus_get')!({});
+  assert.ok(recalled.content?.[0]?.text?.includes(revised));
 });
 
 test('focus_update patches the shared notebook and focus_get exposes it', async () => {

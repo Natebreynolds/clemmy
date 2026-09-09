@@ -812,6 +812,18 @@ test('workflow_create accepts a call-only read step and queues a creation test',
   assert.equal(run.status, 'creation_test');
 });
 
+test('actual workflow_create returns a saved enabled local schedule despite a fan-out wording advisory', async () => {
+  const result = await workflowCreate()({ name: 'local-single-brief', description: 'One brief from account data.', trigger_schedule: '0 9 * * 5',
+    steps: [
+      { id: 'read_csv', prompt: 'Read the local performance CSV.', sideEffect: 'read' },
+      { id: 'write_brief', dependsOn: ['read_csv'], prompt: 'Single-pass write, NOT per-item fan-out. Write ONE file with two bullets, each of the form account: attainment.', sideEffect: 'write' },
+    ],
+  });
+  assert.equal(readWorkflow('local-single-brief')!.data.enabled, true, resultText(result));
+  assert.match(resultText(result), /Optional authoring review/);
+  assert.doesNotMatch(resultText(result), /saved DISABLED|stayed DISABLED/);
+});
+
 test('workflow_create tolerates model-emitted null optionals on authored steps', async () => {
   const soql = 'SELECT Id, Name, StageName, Amount, CloseDate FROM Opportunity WHERE IsClosed = false ORDER BY CloseDate ASC LIMIT 50';
   const result = await workflowCreate()({
@@ -1124,16 +1136,16 @@ test('workflow_create saves the authored text task and exposes typed runtime inp
   assert.equal(saved.inputs?.source_text.required, true);
 });
 
-test('workflow_create keeps workflows with readiness gaps disabled', async () => {
+test('workflow_create reports readiness advice without silently disabling an authored workflow', async () => {
   const result = await workflowCreate()({
     name: 'gapful-send-wf',
     description: 'Send outreach.',
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
   });
   const text = resultText(result);
-  assert.match(text, /saved DISABLED pending readiness answers/);
-  assert.match(text, /readiness gap test/i);
-  assert.equal(readWorkflow('gapful-send-wf')!.data.enabled, false);
+  assert.match(text, /Optional authoring review/);
+  assert.doesNotMatch(text, /saved DISABLED pending readiness answers/);
+  assert.equal(readWorkflow('gapful-send-wf')!.data.enabled, true);
 });
 
 test('workflow_create and workflow_update surface the visual contract to authoring agents', async () => {
@@ -1384,7 +1396,9 @@ test('workflow lifecycle routes create/update/enable/run through shared workflow
     trigger_events: trigger,
     steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list for {{input.leadId}}.' }],
   });
-  assert.match(resultText(created), /saved DISABLED pending readiness answers/);
+  assert.match(resultText(created), /Optional authoring review/);
+  assert.equal(readWorkflow('lifecycle-shared-wf')!.data.enabled, true);
+  await workflowSetEnabled()({ name: 'lifecycle-shared-wf', enabled: false });
   assert.equal(readWorkflow('lifecycle-shared-wf')!.data.enabled, false);
   assert.deepEqual(fireWorkflowSystemEvent('crm.lifecycle.created', { leadId: 'pre-enable' }), []);
 
@@ -1872,7 +1886,7 @@ test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + val
   assert.equal(readWorkflow('zz-promote-test')!.data.steps.length, 2);
 });
 
-test('commitAuthoredWorkflow applies the shared create readiness gate', () => {
+test('commitAuthoredWorkflow preserves enabled state and returns shared readiness advice', () => {
   const built = commitAuthoredWorkflow({
     name: 'Shared Gate Commit',
     description: 'Send outreach.',
@@ -1883,8 +1897,8 @@ test('commitAuthoredWorkflow applies the shared create readiness gate', () => {
 
   assert.equal(built.ok, true, built.errors.join('; '));
   assert.ok(built.gaps.length > 0, 'readiness gaps are returned to the caller');
-  assert.equal(built.savedDef.enabled, false);
-  assert.equal(readWorkflow('shared-gate-commit')!.data.enabled, false);
+  assert.equal(built.savedDef.enabled, true);
+  assert.equal(readWorkflow('shared-gate-commit')!.data.enabled, true);
 });
 
 test('draftToDefinition preserves inferred forEach loops and list output contracts', () => {

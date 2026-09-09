@@ -1190,21 +1190,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       const createBindReport = [...chatBind.boundNotes, ...created.boundNotes].length > 0
         ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
       const advisoryTail = `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
-        + `${renderWorkflowGapQuestions(created.gaps)}`;
-      if (created.gaps.length > 0) {
-        if (created.savedDef.enabled) {
-          created.savedDef.enabled = false;
-          writeWorkflowAndSyncTriggers(dirName, created.savedDef);
-        }
-        return textResult(withWorkflowCommit(
-          dirName,
-          `Created workflow "${name}" (saved DISABLED pending readiness answers). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
-          + `${appendDataSources(created.savedDef)}`
-          + `${appendVisualContract(created.executionPlan)}`
-          + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
-          + `${renderReadinessHold(name)}${advisoryTail}`,
-        ));
-      }
+        + (created.gaps.length ? `\n\nOptional authoring review (does not block this workflow):${renderWorkflowGapQuestions(created.gaps)}` : '');
       if (needsCreationTest) {
         const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
         const missingSmokeInputs = missingWorkflowRunInputs(created.savedDef, testInputs);

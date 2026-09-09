@@ -1,6 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mcpToolAllowedByScope } from './mcp-tool-authority.js';
+import { mcpToolAllowedByScope, mcpToolDiscoveryScope } from './mcp-tool-authority.js';
+import { filterMcpToolsForScope } from './mcp-tool-filter.js';
+
+test('active discovery keeps authorized readers hidden by the prompt shortlist and preserves explicit restrictions', () => {
+  const tools = ['harbor_accounts__list_account_targets', 'harbor_accounts__list_account_revenue', 'other__read'].map(name => ({ name, description: 'Read account data', inputSchema: { type: 'object' } })) as never;
+  const scope = { reason: 'sheet and CRM intent', authority: 'catalog' as const, allowedServerSlugs: ['salesforce', 'google'], maxTools: 0, toolPatterns: ['missing'] };
+  assert.deepEqual(filterMcpToolsForScope(tools, scope), []);
+  assert.equal(filterMcpToolsForScope(tools, mcpToolDiscoveryScope(scope)).length, 3);
+  const restricted = mcpToolDiscoveryScope({ ...scope, authority: 'server_set', allowedServerSlugs: ['harbor_accounts'] });
+  assert.equal(filterMcpToolsForScope(tools, restricted).length, 2);
+  const exact = mcpToolDiscoveryScope({ ...scope, authority: 'exact', allowedToolNames: ['harbor_accounts__list_account_revenue'] });
+  assert.deepEqual(filterMcpToolsForScope(tools, exact).map(t => t.name), ['harbor_accounts__list_account_revenue']);
+  const denied = mcpToolDiscoveryScope({ ...scope, deniedServerSlugs: ['harbor_accounts'] });
+  assert.equal(mcpToolAllowedByScope('harbor_accounts__list_account_targets', denied), false);
+  assert.deepEqual(filterMcpToolsForScope(tools, mcpToolDiscoveryScope({ ...scope, authority: 'none' })), []);
+});
 
 test('MCP authority honours the user decision and ignores the context budget', () => {
   const tool = 'dataforseo__serp_organic_live';

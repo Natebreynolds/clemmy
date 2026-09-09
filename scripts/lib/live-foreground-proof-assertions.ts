@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { parseTaskMode } from '../../src/runtime/harness/task-mode.js';
 
 export const LiveTurnExpectationSchema = z.object({
+  /** Fixture-only intermediate outcomes. Completion remains the default. */
+  terminalStatuses: z.array(z.enum(['done', 'needs_input'])).nonempty().optional(),
   replyIncludes: z.array(z.string().min(1)).optional(),
   replyExcludes: z.array(z.string().min(1)).optional(),
   /** Fixture-only response contract, never a runtime/model output limit. */
@@ -49,7 +51,10 @@ export interface LiveTurnFacts {
  * journal evidence independently; provider readback remains a separate leg. */
 export function checkLiveTurn(expect: z.infer<typeof LiveTurnExpectationSchema>, facts: LiveTurnFacts): string[] {
   const failures: string[] = [];
-  if (facts.terminalStatus !== 'done') failures.push(`terminal: expected done, got ${facts.terminalStatus}`);
+  const terminalStatuses = expect.terminalStatuses ?? ['done'];
+  if (!terminalStatuses.some((status) => status === facts.terminalStatus)) {
+    failures.push(`terminal: expected ${terminalStatuses.join(' or ')}, got ${facts.terminalStatus}`);
+  }
   for (const value of expect.replyIncludes ?? []) {
     if (!facts.reply.includes(value)) failures.push(`reply missing exact text: ${JSON.stringify(value)}`);
   }

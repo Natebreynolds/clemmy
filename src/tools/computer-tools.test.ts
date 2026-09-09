@@ -22,7 +22,6 @@ let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
 let shellMutatesAuthorizationState: typeof import('./computer-tools.js').shellMutatesAuthorizationState;
 let shellWritesInstalledSkillSource: typeof import('./computer-tools.js').shellWritesInstalledSkillSource;
 let writeTargetsAuthorizationState: typeof import('./computer-tools.js').writeTargetsAuthorizationState;
-let WRITE_FILE_MAX_CONTENT_BYTES: number;
 
 before(async () => {
   ({
@@ -34,7 +33,6 @@ before(async () => {
     shellMutatesAuthorizationState,
     shellWritesInstalledSkillSource,
     writeTargetsAuthorizationState,
-    WRITE_FILE_MAX_CONTENT_BYTES,
   } = await import('./computer-tools.js'));
 });
 
@@ -159,11 +157,15 @@ async function invokeWrite(input: { path: string; content: string; mode?: 'creat
   const tool = writeTool() as unknown as {
     invoke: (runContext: unknown, input: string, details: unknown) => Promise<string>;
   };
-  return tool.invoke(
+  const result = await tool.invoke(
     { context: { sessionId: 'sess-write-test', turn: 0 } },
     JSON.stringify(input),
     { toolCall: { callId: `call_${Date.now()}` } },
   );
+  // Legacy acknowledgement checks stay readable; the raw receipt and its
+  // current-byte verification are exercised in local-file-revision.test.ts.
+  return String(result).replace(/^\[clementine:host-local-write-commit:v1\] [^\n]+\n/, '')
+    .split('\n\n').filter(part => !part.startsWith('Previous bytes retained at ')).join('\n\n');
 }
 
 async function invokeShell(input: { command: string; cwd?: string | null; timeout_ms?: number | null }): Promise<string> {
@@ -244,35 +246,13 @@ test('write_file append:false starts a fresh file even when one exists (chunk-re
   assert.equal(readFileSync(file, 'utf-8'), 'fresh start\n');
 });
 
-test('write_file REFUSES content over the ~24KB cap and writes NOTHING', async () => {
-  const file = path.join(tmpHome, 'toobig.html');
-  const oversize = 'x'.repeat(WRITE_FILE_MAX_CONTENT_BYTES + 1);
-  const out = await invokeWrite({ path: file, content: oversize, mode: null });
-  assert.match(out, /Refused: content is \d+ bytes, over the 24000-byte/);
-  assert.match(out, /NOTHING was written/);
-  assert.match(out, /append:false.*append:true/s, 'refusal instructs the append-chunk protocol');
-  assert.equal(existsSync(file), false, 'the file must not exist after a refused oversize write');
-});
-
-test('write_file cap boundary is exact: 24000 bytes writes, 24001 refuses', async () => {
-  const atCap = path.join(tmpHome, 'atcap.txt');
-  const overCap = path.join(tmpHome, 'overcap.txt');
-  // Exactly at the cap → written (ASCII: 1 char = 1 byte).
-  const exact = 'a'.repeat(WRITE_FILE_MAX_CONTENT_BYTES);
-  assert.equal(await invokeWrite({ path: atCap, content: exact, mode: null }), `Wrote ${atCap} (${WRITE_FILE_MAX_CONTENT_BYTES} chars).`);
-  assert.equal(existsSync(atCap), true);
-  // One byte over → refused.
-  assert.match(await invokeWrite({ path: overCap, content: exact + 'a', mode: null }), /Refused: content is 24001 bytes/);
-  assert.equal(existsSync(overCap), false);
-});
-
-test('write_file cap counts UTF-8 BYTES, not characters (multibyte content)', async () => {
-  const file = path.join(tmpHome, 'multibyte.txt');
-  // '€' is 3 UTF-8 bytes. 8001 of them = 24003 bytes > cap, though only 8001 chars.
-  const euros = '€'.repeat(8001);
-  assert.ok(euros.length < WRITE_FILE_MAX_CONTENT_BYTES, 'fewer CHARS than the cap');
-  assert.match(await invokeWrite({ path: file, content: euros, mode: null }), /Refused: content is 24003 bytes/);
-  assert.equal(existsSync(file), false);
+test('write_file retains complete content above the former cap, including multibyte text', async () => {
+  for (const [name, content] of [['large.html', '<p>Complete section</p>\n'.repeat(4000)], ['multibyte.txt', '€'.repeat(12000)]]) {
+    const file = path.join(tmpHome, name!);
+    const result = await invokeWrite({ path: file, content: content!, mode: null });
+    assert.match(result, /^Wrote /);
+    assert.equal(readFileSync(file, 'utf8'), content!.endsWith('\n') ? content : content + '\n');
+  }
 });
 
 test('write_file append:null with mode is byte-identical to prior behavior (backward compatible)', async () => {

@@ -82,6 +82,40 @@ for (const variant of ['fanout', 'no_fanout'] as const) test(`watcher cadence re
   writeFileSync(path.join(frozen, 'apps', 'desktop', 'package.json'), JSON.stringify({ name: 'clemmy-desktop', version: '3.16.0' }));
   const argumentsJson = CAPTURED_ARGUMENTS.replace(oldPath, noncePath);
   const prompt = PROMPT.replaceAll(oldPath, noncePath).replaceAll(oldFrozen, frozen);
+  // Produce actual prior-source settlements and balanced history. Fake old
+  // tool results cannot stand in for the checkpoint-owned transcript.
+  const oldSource = eventlog.appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Read all fourteen local fixture files.' } });
+  const priorFiles = Array.from({ length: 14 }, (_, i) => {
+    const file = path.join(frozen, `prior-${i}.json`);
+    writeFileSync(file, JSON.stringify({ index: i }));
+    return file;
+  });
+  watcher._setWatcherJudgeForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
+  let oldSteps = 0;
+  const oldModel = {
+    async getResponse() {
+      return { responseId: `prior-${++oldSteps}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: oldSteps === 1 ? priorFiles.map((file, i) => ({ type: 'function_call', callId: `prior-read-${i}`, name: 'read_file', arguments: JSON.stringify({ path: file, max_chars: null }) }))
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Fourteen prior reads retained.' }] }],
+      };
+    }, getStreamedResponse: modelStream,
+  };
+  const oldPrime = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: oldSource.seq });
+  assert.ok(oldPrime.ok);
+  if (!oldPrime.ok) return;
+  const oldAgent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: oldSource.seq,
+    userInput: 'Read all fourteen local fixture files.', hostFreshPlanning: oldPrime.planning,
+    allowedToolNames: ['read_file'], model: oldModel as never,
+    mcpToolScope: { authority: 'none', reason: 'prior source fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+  });
+  const oldRunner = new EventEmitter();
+  const oldOutcome = await brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: oldSource.seq,
+    counter: new brackets.ToolCallsCounter(30), behaviorScopeId: `${session.id}::old`,
+  }, () => hostRunRunner(oldRunner as never, oldAgent as never, [{ type: 'message', role: 'user', content: 'Read all fourteen local fixture files.' }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', hostJudgeCompletion: false, context: { sessionId: session.id, sourceUserSeq: oldSource.seq } } as never));
+  assert.equal(oldOutcome.terminal, undefined);
+  assert.equal(oldSteps, 2);
+  const oldHistory = oldOutcome.history;
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
 
   // The stubbed watcher judge: records its observation window against the
@@ -174,7 +208,7 @@ for (const variant of ['fanout', 'no_fanout'] as const) test(`watcher cadence re
   Object.assign(runner, { run() { throw new Error('The legacy model loop must never run'); } });
   const outcome = await brackets.withHarnessRunContext({
     sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(6), behaviorScopeId: `${session.id}::turn:1`,
-  }, () => hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: prompt }] as never, {
+  }, () => hostRunRunner(runner as never, agent as never, [...oldHistory, { type: 'message', role: 'user', content: prompt }] as never, {
     maxTurns: 4, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq },
   } as never));
   assert.equal(Boolean(outcome.hasInterruptions), false);
@@ -208,6 +242,7 @@ for (const variant of ['fanout', 'no_fanout'] as const) test(`watcher cadence re
     `window [${check!.startedAt}, ${check!.finishedAt}] must overlap workers [${firstStartedAt}, ${lastResultAt}]`);
   // Same channel, same inputs as the cadence check, plus the children's progress.
   assert.match(check!.input.objective, /parallel auditor acceptance/);
+  assert.doesNotMatch(check!.input.toolCallSummary, /read_file×14|read_file×16/, 'prior-source calls never enter the current watcher evidence');
   assert.match(check!.input.toolCallSummary, /parallel workers: \d+ started \(audit-\d/);
   // The coordinator call is still OPEN while its children run, so the parent
   // trajectory count is the settled business-call count the cadence uses (0).

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { rankCatalogEntriesLexically } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
 import {
   mcpToolScopeAuthority,
@@ -12,6 +13,7 @@ import {
   canonicalMcpToolIdentity,
   mcpServerAliasMatches,
   mcpToolAllowedByScope,
+  mcpToolDiscoveryScope,
   stripMcpToolCarrier,
 } from '../runtime/mcp-tool-authority.js';
 import {
@@ -63,6 +65,7 @@ import { verifiedReadOriginIsCanonical } from '../runtime/read-path/verified-rea
 import { listEvents } from '../runtime/harness/eventlog.js';
 import {
   createProductionLiveReadAcquisitionRegistry,
+  createProductionMcpLiveReadAcquisitionAdapter,
   createProductionReviewedCliLiveReadAcquisitionAdapter,
   type ProductionLiveReadCarrierAdapterV1,
   type ProductionLiveReadNominationV1,
@@ -1765,16 +1768,54 @@ export function buildAuthorizedToolSearchCandidateSources(
   scope: McpToolScope,
   planningIdentity?: { sessionId: string; sourceUserSeq: number },
 ): readonly ToolSearchCandidateSource[] {
+  const prepareExternalMcpCandidates: NonNullable<ToolSearchCandidateSource['prepareCandidates']> = async ({
+    candidates, signal, deadlineAt,
+  }) => {
+    const guard = { signal, deadlineAt };
+    if (!planningIdentity || !discoveryStillActive(guard)) return [];
+    return (await Promise.all(candidates.map(async (candidate): Promise<ToolSearchBrokerCandidate | null> => {
+      const operation = canonicalMcpToolIdentity(candidate.name);
+      if (!operation || !candidate.schema || !mcpToolAllowedByScope(operation, scope)) return null;
+      const serverName = operation.slice(0, operation.indexOf('__'));
+      // The model-visible shortlist comes from live tools/list, not an
+      // objective-to-capability assertion. Only its exact selected identity
+      // enters the existing read materializer; account/schema/effect and
+      // independent observation checks remain unchanged.
+      const registry = createProductionLiveReadAcquisitionRegistry({
+        configuredAdapters: () => [createProductionMcpLiveReadAcquisitionAdapter({ serverName })],
+        adapterAllowed: (adapter) => liveReadAdapterAllowedByMcpScope(scope, adapter),
+        nominationAllowed: (nomination) => liveReadNominationAllowedByMcpScope(scope, nomination),
+      });
+      const acquired = await registry.acquire({
+        requirementId: `foreground-read-native:${planningIdentity.sourceUserSeq}:${operation}`,
+        objective: operation,
+        effect: 'read',
+      }, guard);
+      if (!discoveryStillActive(guard)) return null;
+      // Non-read operations keep their metadata and existing exact native
+      // disclosure path. Failure to acquire a read never invents a read proof.
+      if (acquired.status === 'blocked') return candidate;
+      const issued = issueAuthorizedLiveReadPlanningAuthority({
+        identity: planningIdentity,
+        materialized: acquired,
+        publicationGuard: () => discoveryStillActive(guard),
+      });
+      if (!issued || !discoveryStillActive(guard)) return null;
+      if (digestSchema(issued.schema) !== digestSchema(candidate.schema)) return candidate;
+      return { ...candidate, name: issued.name, schema: issued.schema, planningAuthority: issued.authority };
+    }))).filter((candidate): candidate is ToolSearchBrokerCandidate => candidate !== null);
+  };
   const externalMcp: ToolSearchCandidateSource = {
     kind: 'authorized_external_mcp',
-    async search({ query, limit, signal }) {
+    ...(planningIdentity ? { prepareCandidates: prepareExternalMcpCandidates } : {}),
+    async search({ query, limit, signal, deadlineAt }) {
       if (signal?.aborted) return [];
       const exactOperation = exactExternalMcpOperationFromQuery(query);
       if (exactOperation) {
         const exact = await resolveAuthorizedExternalMcpToolDefinition(exactOperation, scope);
         if (signal?.aborted) return [];
         if (exact) {
-          return [{
+          const candidates: ToolSearchBrokerCandidate[] = [{
             name: stripMcpToolCarrier(exact.name),
             summary: typeof exact.description === 'string'
               ? exact.description
@@ -1783,12 +1824,19 @@ export function buildAuthorizedToolSearchCandidateSources(
             carrier: 'work_call',
             score: 1,
           }];
+          return planningIdentity
+            ? prepareExternalMcpCandidates({ candidates, query, reuseSearchPreparation: false, signal, deadlineAt: deadlineAt ?? Infinity })
+            : candidates;
         }
       }
-      const server = getOrCreateExternalMcpServers({ ...scope, queryText: query });
+      const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
       const tools = await server.listTools();
       if (signal?.aborted) return [];
-      return tools.slice(0, limit).map((tool, index): ToolSearchBrokerCandidate => ({
+      const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({
+        name: tool.name, oneLiner: typeof tool.description === 'string' ? tool.description : '',
+        tool,
+      })));
+      return ranked.slice(0, limit).map(({ tool }, index): ToolSearchBrokerCandidate => ({
         name: stripMcpToolCarrier(tool.name),
         summary: typeof tool.description === 'string'
           ? tool.description
@@ -1800,22 +1848,24 @@ export function buildAuthorizedToolSearchCandidateSources(
     },
   };
 
-  /** Planning callers use one provider-neutral acquisition registry for both
-   * native MCP and reviewed CLI reads. This replaces (rather than accompanies)
-   * the legacy MCP source, so a single tool_search never lists the same MCP
-   * server twice. The returned token is only a nomination; disclosure reopens
-   * every fact from current host authority. */
+  /** Discovery exposes current native MCP candidates for the model to select;
+   * exact disclosure below reopens their schema, account and effect. The
+   * automatic acquisition registry's all-terms/exact-one nomination contract
+   * is not a search filter: it hid usable connected tools on natural queries
+   * and erased multiple legitimate choices. Reviewed CLI reads retain their
+   * registry-issued authority, with no second enumeration of MCP servers. */
   const liveReadRegistrySource: ToolSearchCandidateSource | null = planningIdentity
     ? (() => {
-        const registry = createProductionLiveReadAcquisitionRegistry({
-          adapterAllowed: (adapter) => liveReadAdapterAllowedByMcpScope(scope, adapter),
-          nominationAllowed: (nomination) => liveReadNominationAllowedByMcpScope(scope, nomination),
-        });
         return {
           kind: AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
           async search({ query, signal, deadlineAt }) {
             const guard = { signal, deadlineAt };
             if (!discoveryStillActive(guard)) return [];
+            const registry = createReviewedCliOnlyLiveReadRegistry({
+              adapterAllowed: (adapter) => liveReadAdapterAllowedByMcpScope(scope, adapter),
+              nominationAllowed: (nomination) => liveReadNominationAllowedByMcpScope(scope, nomination),
+            });
+            if (!registry) return [];
             const queryDigest = createHash('sha256')
               .update(`${planningIdentity.sessionId}\0${planningIdentity.sourceUserSeq}\0${query}`, 'utf8')
               .digest('hex');
@@ -1835,24 +1885,8 @@ export function buildAuthorizedToolSearchCandidateSources(
                 planningAuthority: issued.authority,
               }];
             };
-            // Exact-one across every MCP server plus CLI hides a unique
-            // reviewed CLI when an unrelated carrier is slow, missing, or
-            // unavailable. Cite the CLI first; it is local closed data.
-            const cliOnly = createReviewedCliOnlyLiveReadRegistry({
-              adapterAllowed: (adapter) => liveReadAdapterAllowedByMcpScope(scope, adapter),
-              nominationAllowed: (nomination) => liveReadNominationAllowedByMcpScope(scope, nomination),
-            });
-            if (cliOnly) {
-              const cliAcquired = await cliOnly.acquire({
-                requirementId: `foreground-read-cli:${queryDigest}`,
-                objective: query,
-                effect: 'read',
-              }, guard);
-              if (!discoveryStillActive(guard)) return [];
-              if (cliAcquired.status !== 'blocked') return issue(cliAcquired);
-            }
             const acquired = await registry.acquire({
-              requirementId: `foreground-read:${queryDigest}`,
+              requirementId: `foreground-read-cli:${queryDigest}`,
               objective: query,
               effect: 'read',
             }, guard);
@@ -2127,8 +2161,9 @@ export function buildAuthorizedToolSearchCandidateSources(
     },
   };
 
-  // A planning surface must never mount both native-MCP discovery paths. The
-  // metadata-only legacy source remains solely for callers that do not own a
-  // primary planning identity yet.
-  return [liveReadRegistrySource ?? externalMcp, composio];
+  // These sources are disjoint: native MCP metadata is enumerated once; the
+  // read registry here contains reviewed CLI descriptors only. Presenting a
+  // candidate grants no execution permission; planning disclosure and the
+  // actual invocation still consume the exact current host binding.
+  return [...(liveReadRegistrySource ? [liveReadRegistrySource] : []), externalMcp, composio];
 }

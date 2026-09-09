@@ -17,6 +17,7 @@ import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
+import { normalizeCallableArguments } from './callable-contract.js';
 /**
  * HOST-owned chat turn stepping — the Runner de-ownership cut.
  *
@@ -237,7 +238,7 @@ export interface SourceArtifactEvidence {
     /** Why an artifact could not be verified, retained rather than dropped. */
     unresolvedReason?: string;
     /** `file` promises a host-file receipt; `none` is a settled effect with a
-     *  different success contract (deletion, write_file); `unknown` is evidence
+     *  different success contract (such as deletion); `unknown` is evidence
      *  that could not be resolved at all. Only `file` can require content. */
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
   }>;
@@ -253,20 +254,20 @@ export interface SourceArtifactEvidence {
  * exactly backwards, and it hid the failure.
  *
  * `*_revision` output kinds are the committed-artifact contract (workflow and
- * workspace authoring). `deletion_receipt` is an acknowledgement, and
- * `local_artifact` is an ordinary file tool with its own contract; neither owes
- * a host-local-write-commit receipt.
+ * workspace and ordinary file authoring). `deletion_receipt` is an
+ * acknowledgement and owes no host-local-write-commit receipt.
  */
 type OperationResultContract = 'file' | 'acknowledgement' | 'other' | 'undeclared';
 
 function operationResultContract(toolName: string): OperationResultContract {
   const entry = TOOL_REGISTRY.find((candidate) => candidate.name === toolName);
   const outputKind = entry?.localPlanning?.outputKind;
+  if (outputKind?.endsWith('_revision') || outputKind === 'workspace_observation') return 'file';
+  if (entry?.resultContract === 'acknowledgement') return 'acknowledgement';
   // `outputKind` is an open string and 75 of 86 writes do not declare one.
   // ABSENT metadata is not an acknowledgement contract — it is simply not a
   // declaration, and must not be read as "this operation owes nothing".
   if (typeof outputKind !== 'string' || !outputKind.trim()) return 'undeclared';
-  if (outputKind.endsWith('_revision') || outputKind === 'workspace_observation') return 'file';
   if (outputKind === 'deletion_receipt') return 'acknowledgement';
   return 'other';
 }
@@ -396,7 +397,7 @@ export function settledSourceArtifacts(input: {
         // The contract is decided by the REGISTRY, before the payload is
         // consulted. An operation that owes a receipt and did not produce a
         // usable one is UNRESOLVED — a real failure. One that never owed a file
-        // (a deletion acknowledgement, an ordinary file tool) is settled work
+        // (such as a deletion acknowledgement) is settled work
         // whose settlement is its evidence.
         // Reached only after redemption AND the full provenance conjunction
         // succeeded — the result is authenticated. Only here can a contract
@@ -792,20 +793,6 @@ export function aggregateHostPreparationRefusalProgress(
  * value-opaque: provider/tool names and arguments are model input, not safe
  * terminal presentation authority.
  */
-/** The completion judge rules on evidence, not on every byte of it. Measured
- *  live 2026-09-08: with the full retained read results the judge call was
- *  95,842 uncached input tokens for an 88-token verdict — about a third of the
- *  turn's cost and ~5 s of latency, on every turn. Keep the head and the tail
- *  of the evidence (what was read, and the last records) and say what was
- *  elided; a verdict does not need all seventy-one email bodies. */
-export const JUDGE_EVIDENCE_MAX_CHARS = 24_000;
-export function boundedJudgeEvidence(summary: string, max = JUDGE_EVIDENCE_MAX_CHARS): string {
-  if (summary.length <= max) return summary;
-  const head = Math.floor(max * 0.7);
-  const tail = max - head;
-  return `${summary.slice(0, head)}\n… [${summary.length - max} characters of retained results elided for the judge; the reply above must still carry the artifact] …\n${summary.slice(-tail)}`;
-}
-
 export const HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT =
   'I stopped before doing anything external: this step was not set up with permission to use its tool. That is a setup problem on my side, not a missing login or a disconnected account. Nothing was sent or changed. Run it again and I will retry; if it repeats, tell me and I will dig in.';
 
@@ -1041,10 +1028,7 @@ export function hostProvenOperationRepair(input: {
   const sameToolkit = requestedToolkit
     ? proven.filter((operationId) => toolkitOf(operationId) === requestedToolkit)
     : [];
-  const otherToolkits = proven.filter((operationId) => (
-    !requestedToolkit || toolkitOf(operationId) !== requestedToolkit
-  ));
-  const ranked = [...sameToolkit, ...otherToolkits].slice(0, Math.max(1, input.limit ?? 12));
+  const ranked = (requestedToolkit ? sameToolkit : proven).slice(0, Math.max(1, input.limit ?? 12));
   // THE OPERATION THE CALL NAMED IS THE SUBJECT. Live 2026-09-05: the model
   // asked for a write this turn had not proven, one unrelated READ from the
   // same toolkit happened to be in the proven set, and the reply was a menu
@@ -1074,12 +1058,9 @@ export function hostProvenOperationRepair(input: {
   const requestedIsProven = requested.length > 0
     && proven.some((operationId) => operationId.trim().toUpperCase() === requested);
   if (requested.length > 0 && !requestedIsProven) {
-    const context = ranked.length === 0
-      ? ' Nothing is proven for this step yet.'
-      : sameToolkit.length > 0
-        ? ` Proven for this step so far: ${ranked.join(', ')}.`
-        : ` Nothing from ${requestedToolkit} is proven for this step; do not substitute another provider for it.`
-          + ` What IS proven here: ${ranked.join(', ')}.`;
+    const context = ranked.length > 0
+      ? ` Proven for this step so far: ${ranked.join(', ')}.`
+      : ` Nothing from ${requestedToolkit} is proven for this step; do not substitute another provider for it.`;
     return ` ${requested} is not proven for this step.${context}`
       + ' Discover that exact operation with tool_search. Use its published executable capabilityRef and work_call example when present.'
       + ' If discovery reports unsupported_unmaterialized, report that host materialization blocker; do not invent a requirement_id.'
@@ -3058,17 +3039,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // constants so this mount cannot outspend the legacy one.
   const hostWatcherEnabled = watcherJudgeEnabled();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
-  const hostWatcherSteer: { pending: WatcherVerdict | null } = { pending: null };
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
   let hostWatcherLastCheckedAt = 0;
   let hostWatcherCheckInFlight = false;
   /** Parent business tool calls so far (control tools never move the cadence). */
-  const hostWatcherToolCalls = (): number => history.filter((item) => {
-    const row = item as { type?: unknown; name?: unknown };
-    return row.type === 'function_call'
-      && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
-  }).length;
+  const hostWatcherToolCalls = (): number => {
+    try {
+      const identity = exactHostIdentity();
+      // Count settled work for this source, including across recovery. The
+      // session transcript also contains old turns and cannot own this cadence.
+      const rows = openEventLog().prepare(`
+        SELECT logical.tool_name AS name FROM logical_call_settlements settled
+        JOIN logical_tool_calls logical USING (session_id, source_user_seq, logical_tool_call_id)
+        WHERE settled.session_id = ? AND settled.source_user_seq = ?
+      `).all(identity.sessionId, identity.sourceUserSeq) as Array<{ name: string }>;
+      return rows.filter((row) => !HOST_JUDGE_CONTROL_TOOL_NAMES.has(row.name)).length;
+    } catch { return 0; }
+  };
   const hostWatcherGate = (watcherToolCalls: number): WatcherGateInput => ({
     enabled: true,
     totalToolCalls: watcherToolCalls,
@@ -3088,20 +3077,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     hostWatcherChecksUsed += 1;
     hostWatcherLastCheckedAt = watcherToolCalls;
     const watcherObjective = judgedObjective();
-    const watcherSessionId = exactHostIdentity().sessionId;
+    const watcherIdentity = exactHostIdentity();
     const watcherJudge = currentWatcherJudge();
     void (async () => {
       try {
         const verdict = await watcherJudge({
           objective: watcherObjective,
           toolCallSummary: [
-            summarizeToolCallsForJudge(watcherSessionId),
-            summarizeWorkerProgressForWatcher(watcherSessionId),
+            summarizeToolCallsForJudge(watcherIdentity.sessionId, watcherIdentity),
+            summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity),
           ].filter(Boolean).join('; '),
           latestAssistantNote: '',
           toolCallCount: watcherToolCalls,
         });
-        if (verdict && !verdict.onTrack) hostWatcherSteer.pending = verdict;
+        if (verdict && !verdict.onTrack && judgedObjective() === watcherObjective) {
+          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective };
+        }
       } catch { /* the watcher is silent on any failure */ }
       finally { hostWatcherCheckInFlight = false; }
     })();
@@ -3124,7 +3115,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const start = (): void => startHostWatcherCheck(watcherToolCalls);
       if (parentScope) harnessRunContextStorage.run(parentScope, start);
       else start();
-    });
+    }, exactHostIdentity().sourceUserSeq);
     try {
       return await run();
     } finally {
@@ -3384,7 +3375,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             : settled.evidenceAvailable
               ? 'This request produced no receipt-bound artifact.'
               : 'The artifact evidence store could not be read for this request. You have NO artifact evidence — do not accept completion on the assistant\'s wording alone.',
-          `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${boundedJudgeEvidence(readEvidence.summary)}`,
+          // Keep the complete evidence the receipt below claims was judged.
+          // Head/tail clipping hid middle records, including facts that could
+          // contradict the answer. The selected model's existing context
+          // admission owns capacity; presentation must not discard evidence.
+          `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
           'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
             + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
             + 'artifacts the objective never requested. Unavailable optional or irrelevant reads do not create '
@@ -4873,6 +4868,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
         }
         return undefined;
+      }
+      // Live source 166111: a valid work_call carried an unterminated
+      // args_json string. Contract parsing failed before capability lookup,
+      // but the generic refusal sent the model back to discovery and offered
+      // an unrelated provider. Report the parser's actual repair; the next
+      // call still needs all existing authority and schema checks.
+      if (lastExactProductionMiss === 'logical_call_contract_missing') {
+        const effective = unwrapRuntimeEffectiveToolIdentity(name, args);
+        const normalized = normalizeCallableArguments({
+          kind: 'direct', toolName: effective.toolName ?? '', args: effective.args,
+        });
+        if (effective.toolName && normalized.error) {
+          return `Tool '${name}' was refused before dispatch because the arguments for '${effective.toolName}' could not be parsed.`
+            + ` Failed check: logical_call_contract_missing. ${redactSensitiveText(normalized.errorDetail ?? normalized.error)}.`
+            + ' No local or external mutation was attempted. Correct the arguments and retry the same operation through the same carrier.';
+        }
       }
       // Name the operations this turn actually bound.
       //
@@ -7472,13 +7483,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // shared check/injection budgets. A resolved drift verdict rides the
     // ordinary one-shot directive at THIS continuation boundary.
     if (hostProduction && hostWatcherEnabled) {
-      const drift = hostWatcherSteer.pending;
+      const drift = hostWatcherSteer.pending?.objective === judgedObjective()
+        ? hostWatcherSteer.pending : null;
+      if (!drift) hostWatcherSteer.pending = null;
       if (drift && !drift.onTrack && hostWatcherInjectionsUsed < MAX_WATCHER_INJECTIONS) {
         hostWatcherSteer.pending = null;
         hostWatcherInjectionsUsed += 1;
         pendingHostModelDirective = [
           pendingHostModelDirective,
-          `TRAJECTORY WATCHER (an independent check of the work so far against the ORIGINAL request) says OFF TRACK: ${drift.miss.slice(0, 300)}`,
+          `TRAJECTORY WATCHER (a check of this request’s work against the current accepted objective) says OFF TRACK: ${drift.miss.slice(0, 300)}`,
           drift.steer.slice(0, 300),
         ].filter(Boolean).join(' ');
         try {
@@ -7490,6 +7503,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             data: {
               lane: 'host_v1',
               kind: 'watcher',
+              sourceUserSeq: exactHostIdentity().sourceUserSeq,
+              objectiveDigest: createHash('sha256').update(drift.objective, 'utf8').digest('hex'),
               fulfills: false,
               reason: drift.miss.slice(0, 600),
               steer: drift.steer.slice(0, 300),
@@ -8073,8 +8088,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
         if (!effective.toolName || args.name !== effective.toolName) continue;
         const identity = exactHostIdentity();
-        if (!nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef: args.requirement_id,
-          operationId: effective.toolName, effect: 'local_write', args: effective.args })) continue;
+        const localCall = { ...identity, capabilityRef: args.requirement_id,
+          operationId: effective.toolName, args: effective.args };
+        if (!nominateDisclosedLocalPlanningDefinition({ ...localCall, effect: 'local_write' })) {
+          const { prepareHostLocalCall } = await import('./host-local-call-preparation.js');
+          if (!await prepareHostLocalCall(agent, localCall)) continue;
+        }
         const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
         const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
         if (!prepared) continue;

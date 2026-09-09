@@ -26,6 +26,8 @@ const {
   selectMcpPrewarmServerSlugs,
 } = await import('./mcp-servers.js');
 const { invalidateMcpServerDiscoveryCache } = await import('./mcp-config.js');
+const { harnessRunContextStorage } = await import('./harness/brackets.js');
+const { mcpToolDiscoveryScope } = await import('./mcp-tool-authority.js');
 const {
   deleteToolChoice,
   listToolChoices,
@@ -81,6 +83,18 @@ after(async () => {
   clearToolChoices();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
+
+for (const ambient of [null, { reason: 'owner withheld external access', authority: 'none' as const }]) {
+  test(`broad discovery stays cold under ${ambient === null ? 'a locked lane' : 'denied turn authority'}`, async () => {
+    await harnessRunContextStorage.run({ mcpToolScope: ambient } as never, async () => {
+      const scope = mcpToolDiscoveryScope({ reason: 'active catalog search', authority: 'catalog' });
+      const server = getOrCreateExternalMcpServers(scope);
+      assert.deepEqual(await server.listTools(), []);
+      assert.equal(mcpServersTestHooks.cacheState().allExternalBaseCreated, false);
+      assert.deepEqual(mcpServersTestHooks.cacheState().scopedExternalBaseKeys, []);
+    });
+  });
+}
 
 test('named external scope creates only a scoped server-set base, not the all-external base', () => {
   getOrCreateExternalMcpServers({

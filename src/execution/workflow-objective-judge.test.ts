@@ -51,6 +51,25 @@ test('buildWorkflowObjective: empty when nothing declared and no inputs', () => 
   assert.equal(obj, '');
 });
 
+test('the judge receives complete authored steps without adding them to the displayable goal', async () => {
+  const instruction = 'Reply with exactly this text and nothing else: Refinement workflow complete';
+  const outputDescription = "The exact literal string 'Refinement workflow complete'";
+  const workflow = wf({ description: 'Refinement check updated', description_body: 'Background context. '.repeat(300),
+    steps: [{ id: 'refinement_check', prompt: instruction,
+      output: { type: 'string', non_empty: [''], description: outputDescription } }] });
+  const goal = deriveLegacyWorkflowRunGoal(workflow, { reference: 'x'.repeat(300) + 'COMPLETE_INPUT_TAIL' });
+  assert.ok(goal);
+  assert.ok(!goal.objective.includes(instruction), 'the user-facing goal must not grow an internal step dump');
+  assert.ok(!goal.objective.includes(outputDescription));
+  assert.ok(goal.objective.includes('COMPLETE_INPUT_TAIL'));
+  let seen = '';
+  await judgeWorkflowTarget({ workflow, inputs: {}, goal, finalOutput: 'Refinement workflow complete',
+    judgeFn: async (objective) => { seen = objective; return { done: true, reason: 'The specified response is present.' }; } });
+  assert.ok(seen.includes(instruction));
+  assert.ok(seen.includes(outputDescription));
+  assert.ok(seen.includes('COMPLETE_INPUT_TAIL'));
+});
+
 test('deriveLegacyWorkflowRunGoal: derives provisional goal from intent, inputs, and output contracts', () => {
   const goal = deriveLegacyWorkflowRunGoal(
     wf({

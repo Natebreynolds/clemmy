@@ -8074,7 +8074,7 @@ async function runConversationCore(
         // returns '' on error and the prompt builder only renders a real summary.
         const skillContext = {
           skills: loadedSkills,
-          toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+          toolCallSummary: summarizeToolCallsForJudge(options.sessionId, { sourceUserSeq: activeSourceUserSeq }),
         };
         // A bare follow-up ("just mine please") judged in isolation is
         // inherently ambiguous → false NOT-finished retries (5 in the live
@@ -8787,7 +8787,7 @@ async function runConversationCore(
         // publishing instead of leaving a receiptless optimized completion.
         const lateVerdict = await objectiveJudge(objective, userVisibleSummary, {
           skills: gatherSessionSkills(options.sessionId, { sourceUserSeq: activeSourceUserSeq, includeUnavailable: true }),
-          toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+          toolCallSummary: summarizeToolCallsForJudge(options.sessionId, { sourceUserSeq: activeSourceUserSeq }),
         });
         recordVerdictEvent(options.sessionId, turnResult.turn, {
           door: 'completion',
@@ -9256,7 +9256,7 @@ async function runConversationCore(
           const verdict = await watcherJudge({
             objective,
             ...(successCriteria ? { successCriteria } : {}),
-            toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+            toolCallSummary: summarizeToolCallsForJudge(options.sessionId, { sourceUserSeq: activeSourceUserSeq }),
             latestAssistantNote,
             toolCallCount: watcherToolCallCount,
           });

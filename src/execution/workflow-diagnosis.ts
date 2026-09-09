@@ -1027,12 +1027,9 @@ export function humanizeStepOutput(raw: unknown): string {
   const obj = coerceObject(raw);
   if (!obj) return typeof raw === 'string' ? raw : JSON.stringify(raw);
   if (obj.blocked === true) return `⚠️ blocked: ${String(obj.reason ?? 'no reason given')}`;
-  for (const key of ['body', 'summary', 'message', 'text', 'notification']) {
-    const v = obj[key];
-    if (typeof v === 'string' && v.trim()) return v.trim();
-  }
   const structuredResult = renderStructuredResult(obj);
-  if (structuredResult) return structuredResult;
+  if (structuredResult) return typeof obj.ok === 'boolean'
+    ? `${obj.ok ? '✓ done' : '✗ failed'}\n${structuredResult}` : structuredResult;
   // No human-readable field — this is a bookkeeping result (the step's
   // real content already went out via notify_user). Render a terse status
   // line with any obvious count metrics, NOT raw JSON.
@@ -1047,6 +1044,7 @@ export function humanizeStepOutput(raw: unknown): string {
 }
 
 const STRUCTURED_RESULT_TEXT_KEYS = new Set([
+  'body', 'summary', 'message', 'text', 'notification',
   'finding',
   'detail',
   'description',
@@ -1082,11 +1080,13 @@ function renderStructuredResult(root: Record<string, unknown>): string | null {
   const urls: string[] = [];
   const seen = new Set<string>();
   const visited = new Set<object>();
+  let omitted = false;
 
   const add = (value: string): void => {
-    if (lines.length >= MAX_STRUCTURED_RESULT_LINES) return;
+    if (lines.length >= MAX_STRUCTURED_RESULT_LINES) { omitted = true; return; }
     const bounded = boundedResultLine(value);
     if (!bounded) return;
+    if (bounded.length < value.replace(/\s+/g, ' ').trim().length) omitted = true;
     const key = bounded.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
@@ -1102,22 +1102,25 @@ function renderStructuredResult(root: Record<string, unknown>): string | null {
     depth = 0,
     sensitiveAncestor = false,
   ): void => {
-    if (depth > 4 || lines.length >= MAX_STRUCTURED_RESULT_LINES || value === null || value === undefined) return;
+    if (value === undefined) return;
+    if (depth > 4 || lines.length >= MAX_STRUCTURED_RESULT_LINES) { omitted = true; return; }
     // A credential/auth container taints its whole subtree. A benign-looking
     // descendant key such as `detail`, `summary`, or `url` must never regain
     // public presentation authority merely because its immediate key is safe.
     const tainted = sensitiveAncestor || (parentKey.length > 0 && sensitiveKey(parentKey));
     if (tainted) return;
-    if (typeof value === 'string') {
-      if (STRUCTURED_RESULT_TEXT_KEYS.has(parentKey.toLowerCase()) || STRUCTURED_RESULT_URL_KEY.test(parentKey)) {
-        add(value);
-      }
+    if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+      if (parentKey === 'ok' || parentKey === 'notified') return;
+      const text = value === null ? 'null' : String(value);
+      if (typeof value === 'string' && (STRUCTURED_RESULT_TEXT_KEYS.has(parentKey.toLowerCase()) || STRUCTURED_RESULT_URL_KEY.test(parentKey))) add(text);
+      else add(parentKey ? `${parentKey}: ${text}` : text);
       return;
     }
     if (typeof value !== 'object') return;
     if (visited.has(value)) return;
     visited.add(value);
     if (Array.isArray(value)) {
+      if (value.length > MAX_STRUCTURED_RESULT_LINES) omitted = true;
       for (const item of value.slice(0, MAX_STRUCTURED_RESULT_LINES)) visit(item, parentKey, depth + 1);
       return;
     }
@@ -1136,7 +1139,8 @@ function renderStructuredResult(root: Record<string, unknown>): string | null {
     }
     for (const [key, child] of Object.entries(record)) {
       if (sensitiveKey(key)) continue;
-      if (child && typeof child === 'object') visit(child, key, depth + 1, tainted);
+      if (typeof child === 'string' && (STRUCTURED_RESULT_TEXT_KEYS.has(key.toLowerCase()) || STRUCTURED_RESULT_URL_KEY.test(key))) continue;
+      visit(child, key, depth + 1, tainted);
     }
   };
 
@@ -1146,8 +1150,9 @@ function renderStructuredResult(root: Record<string, unknown>): string | null {
   let rendered = lines.join('\n');
   if (rendered.length > MAX_STRUCTURED_RESULT_CHARS) {
     rendered = `${rendered.slice(0, MAX_STRUCTURED_RESULT_CHARS - 1).trimEnd()}…`;
+    omitted = true;
   }
-  return rendered;
+  return omitted ? `${rendered}\nAdditional result content is retained in the workflow run.` : rendered;
 }
 
 /**

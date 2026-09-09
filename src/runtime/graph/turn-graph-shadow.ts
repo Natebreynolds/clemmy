@@ -12,6 +12,7 @@ import {
   getSession,
   getTurnGraphEventForSource,
   listEvents,
+  openEventLog,
   type EventRow,
 } from '../harness/eventlog.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
@@ -81,6 +82,16 @@ export function sessionHasPriorRetrieveOrAct(sessionId: string, beforeSourceUser
   if (!sessionId.trim() || !Number.isSafeInteger(beforeSourceUserSeq) || beforeSourceUserSeq <= 0) {
     return false;
   }
+  // Ordinary foreground work no longer needs a graph. Its durable business
+  // settlements carry the same conversational lineage after restart. This is
+  // only evidence to keep the model's tool surface available, never authority
+  // to repeat an effect. Discovery/control rows cannot establish business work.
+  if (openEventLog().prepare(`
+    SELECT 1 FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq > 0
+       AND source_user_seq < ? AND business_call = 1
+     LIMIT 1
+  `).get(sessionId, beforeSourceUserSeq)) return true;
   return listEvents(sessionId, { types: ['turn_graph_compiled'] }).some((event) => {
     const source = event.data?.sourceUserSeq;
     const route = event.data?.route;

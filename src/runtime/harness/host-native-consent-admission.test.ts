@@ -28,6 +28,7 @@ after(() => {
 async function fixture(mode: 'normal' | 'plan' = 'normal', options: {
   persistBinding?: boolean;
   disclose?: boolean;
+  targetPath?: string;
 } = {}) {
   const sessionId = `native-consent-${randomUUID()}`;
   log.createSession({ id: sessionId, kind: 'chat', userId: 'fixture-owner' });
@@ -52,7 +53,7 @@ async function fixture(mode: 'normal' | 'plan' = 'normal', options: {
   assert.equal(root.status, 'armed');
   if (root.status !== 'armed') throw new Error('missing root');
   const acceptedTaskId = root.authority.identity.acceptedTaskId;
-  const args = { path: path.join(fixtureHome, 'new-draft.txt'), content: 'Exact original body.', mode: 'create', append: null };
+  const args = { path: options.targetPath ?? path.join(fixtureHome, 'new-draft.txt'), content: 'Exact original body.', mode: 'create', append: null };
   const logical = contracts.durableLogicalCallContract(acceptedTaskId, 'write_file', args)!;
   const logicalToolCallId = 'native-create';
   const base = { sessionId, sourceUserSeq: source.seq, acceptedTaskId,
@@ -174,4 +175,13 @@ test('native coverage requires both the persisted exact call and its current-sou
     assert.equal((log.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
       .get(f.sessionId) as { n: number }).n, 0);
   }
+});
+
+test('recoverable file metadata does not remove the existing sensitive-path approval', async () => {
+  const f = await fixture('normal', { targetPath: path.join(fixtureHome, '.env') });
+  const result = await consent.evaluateUncoveredHostMutationConsent(f.request);
+  assert.equal(result.status, 'decided', JSON.stringify(result));
+  if (result.status !== 'decided') return;
+  assert.equal(result.decision.kind, 'needs_user');
+  assert.equal(result.nestedAdmission, undefined);
 });

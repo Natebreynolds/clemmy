@@ -220,6 +220,24 @@ test('prepareWorkflowCreateForWrite codifies an eligible mechanical step into a 
   assert.equal(prepared.codifyNotes.length, 1);
 });
 
+test('creating scheduled single-file work keeps wording-based fan-out advice from disabling it', () => {
+  const def = {
+    name: 'account-review-once', description: 'Prepare one file from two accounts.', enabled: true,
+    trigger: { schedule: '0 9 * * 5', timezone: 'America/Los_Angeles' },
+    steps: [
+      { id: 'read_csv', prompt: 'Read the performance CSV.', sideEffect: 'read' as const },
+      { id: 'write_brief', dependsOn: ['read_csv'], prompt: 'Single-pass write, NOT per-item fan-out. Write ONE file containing exactly two bullets, each of the form account: booked revenue and attainment.', sideEffect: 'write' as const },
+    ],
+  };
+  const created = prepareWorkflowCreateForWrite(def);
+  assert.equal(created.status, 'ready', JSON.stringify(created.errors));
+  assert.equal(created.def.enabled, true);
+  assert.ok(created.gaps.some(gap => gap.stepId === 'write_brief'), 'the original heuristic still produces advice, never a disable decision');
+  assert.equal(prepareWorkflowUpdateForWrite(def, def).def.enabled, true);
+  assert.equal(prepareWorkflowEnableForWrite(def).def.enabled, true);
+  assert.equal(prepareWorkflowCreateForWrite({ ...def, enabled: false }).def.enabled, false, 'an owner-disabled draft stays disabled');
+});
+
 test('prepareWorkflowUpdateForWrite codifies only when the caller requests the compiler pass', () => {
   const before = {
     name: 'codify-update-wf',

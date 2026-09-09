@@ -7,7 +7,8 @@
  * on the immutable step's receipt, exactly once per admitted occurrence, with
  * zero approval cards. A chat session wearing forged workflow metadata, a step
  * AUTHORED `requiresApproval`, and a declared irreversible local mode
- * (write_file overwrite) all stay refused before any body runs.
+ * (workflow deletion) all stay refused before any body runs. Recoverable file
+ * revisions share the reversible local-write path.
  *
  * Run: node scripts/run-tests-isolated.mjs \
  *   src/runtime/harness/authored-workflow-local-write-authority.host.acceptance.test.ts
@@ -138,7 +139,7 @@ interface FixtureTool {
   parameters: Record<string, unknown>;
 }
 
-const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file', FixtureTool> = {
+const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_delete', FixtureTool> = {
   task_hygiene: {
     name: 'task_hygiene',
     parameters: {
@@ -155,6 +156,13 @@ const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file', FixtureTool> 
       properties: { title: { type: 'string' }, status: { type: 'string' } },
       required: ['title', 'status'],
       additionalProperties: false,
+    },
+  },
+  workflow_delete: {
+    name: 'workflow_delete',
+    parameters: {
+      type: 'object', properties: { slug: { type: 'string' } },
+      required: ['slug'], additionalProperties: false,
     },
   },
   write_file: {
@@ -577,31 +585,32 @@ test('a step AUTHORED requiresApproval keeps its gate: no receipt, local write r
   assert.equal(pendingApprovalCount(fixture), 0);
 });
 
-test('declared irreversible local modes stay outside the authored coverage: write_file overwrite refused, ledger write still proceeds', async () => {
+test('authored local work covers recoverable file revisions and ledger writes, while workflow deletion stays refused', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write' });
   assert.equal(fixture.recorded.status, 'ready');
-  const { bodies, tools } = fixtureTools(['task_hygiene', 'write_file']);
+  const { bodies, tools } = fixtureTools(['task_hygiene', 'write_file', 'workflow_delete']);
   const overwrite = { path: 'notes/existing.md', content: 'replace everything', mode: 'overwrite', append: null };
   const model = stubModel([
     [toolCall('hyg-2', 'task_hygiene', { apply: true })],
     [toolCall('ow-1', 'write_file', overwrite)],
-    [textMsg('overwrite refused, ledger compacted')],
+    [toolCall('delete-1', 'workflow_delete', { slug: fixture.workflowSlug })],
+    [textMsg('file revised and ledger compacted; deletion refused')],
   ]);
   const agent = { model, tools };
   const envelope = bindSurface(fixture, agent, tools);
 
   const outcome = await runProductionHost(fixture, agent);
-  assert.equal(outcome.finalOutput, 'overwrite refused, ledger compacted', JSON.stringify(outcome.history));
-  assert.deepEqual(bodies, { task_hygiene: 1, write_file: 0 });
+  assert.equal(outcome.finalOutput, 'file revised and ledger compacted; deletion refused', JSON.stringify(outcome.history));
+  assert.deepEqual(bodies, { task_hygiene: 1, write_file: 1, workflow_delete: 0 });
   assert.deepEqual(dispositionMarkers(outcome.history), [{ disposition: 'refused_pre_dispatch', retry: 'replan' }]);
   assert.equal(pendingApprovalCount(fixture), 0);
   assert.deepEqual(
     nonRefusedSettlements(fixture).map((row) => row.logical_tool_call_id),
-    ['hyg-2'],
+    ['hyg-2', 'ow-1'],
   );
 });
 
-test('the declared-semantics path is the discriminator, not the tool name: write_file create is covered, overwrite is not', async () => {
+test('create and recoverable overwrite retain distinct exact authored-work risk projections', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write' });
   assert.equal(fixture.recorded.status, 'ready');
   const { tools } = fixtureTools(['write_file']);
@@ -639,10 +648,16 @@ test('the declared-semantics path is the discriminator, not the tool name: write
   assert.equal(created?.decision.kind, 'proceed', JSON.stringify(created));
   if (created?.decision.kind === 'proceed') assert.equal(created.decision.basis, 'exact_reversible_work');
   assert.deepEqual(created?.call.risk, { reversibility: 'reversible', consequence: 'create', destructive: false });
-  assert.equal(await authorityAdapter.evaluateAuthoredWorkflowMutationConsent({
+  const updated = await authorityAdapter.evaluateAuthoredWorkflowMutationConsent({
     attestation: localAttestation(fixture, envelope, 'wf-overwrite', 'write_file', overwrite),
     args: overwrite,
     acceptedBatch: admitted.admission,
     callIndex: 1,
-  }), null, 'an overwrite never inherits the authored step coverage');
+  });
+  assert.equal(updated?.decision.kind, 'proceed', JSON.stringify(updated));
+  if (updated?.decision.kind === 'proceed') assert.equal(updated.decision.basis, 'exact_reversible_work');
+  assert.deepEqual(updated?.call.risk, { reversibility: 'reversible', consequence: 'update', destructive: false });
+  assert.notEqual(updated?.call.argumentDigest, created?.call.argumentDigest);
+  assert.notEqual(updated?.call.semanticBasis.digest, created?.call.semanticBasis.digest,
+    'a recoverable update keeps its own declared mode instead of inheriting create authority');
 });

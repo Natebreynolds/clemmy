@@ -172,6 +172,7 @@ export function registerWorkerTools(server: McpServer): void {
       'Each worker runs in its own isolated context — keeps YOUR context from ballooning over many items, and runs the work concurrently instead of one-at-a-time (which blows your turn budget).',
       'The packet (objective, resolvedTools, context, instructions, expectedOutput) applies to every item. Workers cannot see your prior tool outputs — paste the details they need into the packet.',
       'When to use: 3+ independent items of the same kind. Aggregate the tight results the workers return.',
+      'Preserve the evidence and limitations in worker results when composing the final artifact. A worker conclusion is not independent verification: do not strengthen an inference or search-result ordering into a measured factual claim. Check the finished artifact against the requested skill and content requirements before handing it back.',
       'For external Composio mutations, workers are COMPOSE-ONLY: they may read/reason, then must return one exact {id, composioSlug, args, account_alias?} payload. The parent validates and aggregates those payloads into ONE run_batch action="propose" call, whose immutable pending batch gets one approval and one parent commit. A worker mutation is mechanically refused with WORKER_COMPOSE_ONLY and zero provider dispatch.',
       `On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with ${toolCallHint('tool_output_query', { call_id: '<call id>' })} only where an exact figure is needed.`,
       'For durable multi-wave or multi-phase work, include workManifest. Its phases are per-item worker stages; exclude parent-only ranking, merge, final synthesis, and reporting. Declare canonical item ids and the graph once, then map changed labels back with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
@@ -238,7 +239,11 @@ export function registerWorkerTools(server: McpServer): void {
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
       });
-      if (callItems.length > 1) {
+      // A single live worker needs the same cancellation/drain ownership as a
+      // fan-out. Otherwise the hard tool deadline wins before the child returns,
+      // leaving the parent with an unresolved coordinator result.
+      if (callItems.length > 1 || (currentToolAbortDeadlineAt() !== undefined
+        && (manifestBinding || harnessRunContextStorage.getStore()?.dispatchLease))) {
         // Deterministic batch: the harness owns the parallelism (bounded pool;
         // real provider throttling stays with the per-item worker slots), so a
         // brain that would have serialized N calls no longer pays N× wall time.
@@ -318,6 +323,14 @@ export function registerWorkerTools(server: McpServer): void {
               .filter((entry) => entry.output !== undefined)
               .map((entry) => `--- item: ${entry.item} ---\n${entry.output}`),
           ].join('\n\n'));
+        }
+        if (callItems.length === 1 && batch.items[0]?.output !== undefined) {
+          const annotations = allRequestedItemsReused && manifestBinding ? [
+            `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+            ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+          ] : [];
+          return { content: [{ type: 'text' as const, text: annotations.length
+            ? formatRecallableToolText(outs[0]!, { hostAnnotations: annotations }) : outs[0]! }] };
         }
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
@@ -444,7 +457,7 @@ export function registerWorkerTools(server: McpServer): void {
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          resultEvent = appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
@@ -688,7 +701,7 @@ export function registerWorkerTools(server: McpServer): void {
       // running specialist immediately, not only when worker_result lands). Cheap,
       // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
       try {
-        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
       } catch { /* telemetry is best-effort */ }
       if (manifestBinding) {
         try {

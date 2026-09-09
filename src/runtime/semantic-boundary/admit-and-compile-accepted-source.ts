@@ -2161,8 +2161,8 @@ export async function primePrimaryModelPlanningCatalog(input: {
   };
 }
 
-/** Monotonically disclose only exact operations returned by this source's
- * visible foreground tool_search. Existing live entries remain executable;
+/** Monotonically disclose exact operations from foreground tool_search or
+ * host preparation of a configured native call. Existing live entries remain executable;
  * novel provider entries are staged and cannot cross a business boundary
  * until plan_task publishes and revalidates the selected subset. */
 export async function disclosePrimaryModelPlanningCapabilities(input: {
@@ -2294,7 +2294,8 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       }
       continue;
     }
-    if (candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE) {
+    if (candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE
+      || (candidate.sourceKind === 'authorized_external_mcp' && candidate.planningAuthority)) {
       const reopened = inspectAuthorizedLiveReadPlanningAuthority({
         authority: candidate.planningAuthority,
         identity: {
@@ -2305,7 +2306,8 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
         carrier: candidate.carrier,
         schema: candidate.schema,
       });
-      if (!reopened) continue;
+      if (!reopened || (candidate.sourceKind === 'authorized_external_mcp'
+        && reopened.manifest.providerKind !== 'native_mcp')) continue;
       const descriptor = hostDescriptorFromRegistered(reopened.entry);
       const providerDefinition = stagedProviderDefinitionFromRegistered(reopened.entry);
       if (

@@ -25,6 +25,9 @@ const { recordCatalogWindow } = await import('./model-window-observations.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { armHostCallAuthority } = await import('./accepted-turn-call-authority.js');
+const callAuthority = await import('./accepted-turn-call-authority.js');
+const hostBindings = await import('./host-call-capability-binding.js');
+const { durableLogicalCallContract } = await import('./logical-call-contract.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
@@ -72,14 +75,33 @@ function settledHostRead(identity: ReturnType<typeof accepted>) {
       0,'settle',0,0,0,0,0,0,?,'agents_runner',?,?,0,0,1,2)`)
     .run(identity.sessionId, identity.sourceUserSeq, callId, digest, digest, settlementEvent.id, now);
 }
-function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false) {
+function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false, hostOwned = false) {
   const task = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq) };
-  assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
+  if (!hostOwned) assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
   const logicalToolCallId = `read:${name}`;
-  const opened = dispatch.beginPhysicalDispatch({
+  const begin = () => dispatch.beginPhysicalDispatch({
     identity: { ...task, logicalToolCallId, physicalDispatchId: `dispatch:${name}`, ordinal: 0 },
     tool: name, args: {}, executionSite: 'host',
   });
+  const opened = hostOwned ? (() => {
+    const root = callAuthority.acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
+    assert.equal(root.status, 'ok');
+    if (root.status !== 'ok') throw new Error(root.reason);
+    const contract = durableLogicalCallContract(task.acceptedTaskId, name, {})!;
+    const base = {
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedTaskId: task.acceptedTaskId,
+      sourceEventId: root.authority.sourceEventId, sourceEventDigest: root.authority.sourceEventDigest,
+      logicalToolCallId, toolName: contract.toolName, argumentDigest: contract.argumentDigest,
+      effect: 'read' as const, bindingKind: 'local_envelope' as const, capabilityId: name,
+      schemaFingerprint: 'a'.repeat(64), accountId: '', invokePortId: 'fixture:read', operationId: name,
+      manifestId: '', manifestDigest: '', engineVersion: root.authority.engineVersion,
+      surfaceVersion: root.authority.surfaceVersion, authorityDigest: root.authority.authorityDigest,
+      authorityRevision: root.authority.revision, surfaceDigest: root.authority.surfaceDigest,
+      catalogRevisionDigest: root.authority.catalogRevisionDigest!, bindingRevisionDigest: root.authority.bindingRevisionDigest!,
+    };
+    return callAuthority.withHostCallAttestation({ ...base,
+      bindingDigest: hostBindings.hostCallAttestationBindingDigest(base) }, begin);
+  })() : begin();
   assert.equal(opened.status, 'inserted', JSON.stringify(opened));
   if (opened.status !== 'inserted') throw new Error('Fixture dispatch did not open');
   assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: name, outcome: 'returned' }).status, 'inserted');
@@ -350,7 +372,7 @@ test('large file and all Space components reach the actual completion request wi
   assert.equal(host.settledSourceArtifacts({ ...identity, sourceUserSeq: identity.sourceUserSeq + 1 }).count, 0);
 });
 
-async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; afterCapture?: () => void }) {
+async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void }) {
   const identity = accepted(options.text);
   if (options.policyData) {
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_policy_captured',
@@ -371,6 +393,9 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
   const model = {
     async getResponse() {
       calls += 1;
+      if (calls === 1 && options.readResult !== undefined) {
+        retainedRead(identity, 'read_file', options.readResult, false, true);
+      }
       const text = options.reply ?? (calls === 1 ? promise : 'The lookup returned no accessible posts. No report data was changed.');
       return { responseId: `reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] };
     },
@@ -409,6 +434,25 @@ test('host reviews the exact refresh objective and curly-apostrophe promise, the
   const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
   assert.equal(verdicts.length, 2);
   assert.equal(verdicts[0]?.data.continuation, true);
+});
+
+test('the host sends decisive middle records to the judge, not just the evidence collector', async () => {
+  for (const decision of ['Approval is required today.', 'Approval is not required today.']) {
+    const payload = { records: [
+      { text: 'First record '.repeat(3_000) },
+      { text: decision, nested: { customer: 'The decisive middle record' } },
+      { text: 'Final record '.repeat(3_000) },
+    ] };
+    const result = await runHost({ captured: true, incoming: true,
+      text: 'Check whether an approval is due today.',
+      readResult: payload });
+    assert.ok(result.judged.length > 0);
+    for (const review of result.judged) {
+      assert.ok(review.evidence?.includes(JSON.stringify(payload)), 'every record reaches the real host judge boundary');
+      assert.ok(review.evidence?.includes(decision), 'opposite middle facts must remain distinguishable');
+      assert.doesNotMatch(review.evidence ?? '', /characters of retained results elided/);
+    }
+  }
 });
 
 test('captured OFF makes zero judge calls despite incoming ON', async () => {

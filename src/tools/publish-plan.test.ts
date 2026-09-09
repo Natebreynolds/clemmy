@@ -29,18 +29,51 @@ function outline(capabilityRef: string | null, args: Record<string, unknown>): a
   steps: [{ id: 'create_workflow', action: 'Create the reviewed workflow.', effect: 'local_write', capabilityRef, staticArguments: args, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Durable native commit receipt.' }],
   successCriteria: ['The exact native workflow is saved.'], subagents: [] };
 }
-async function fixture() {
+async function fixture(name = 'workflow_create') {
   log.resetEventLog(); catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory()); manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
   const session = log.createSession({ id: 'workflow-preparation', kind: 'chat' });
   const source = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Create a workflow with a single compute step.', taskMode: { version: 1, kind: 'plan' } } });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq };
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) throw new Error(primed.reason);
-  const candidate = await local.issueAuthorizedLocalPlanningDisclosureCandidate({ name: 'workflow_create', carrier: 'work_call', configuredNames: new Set(runtime.getLocalToolSchemas().keys()) });
+  const { getCoreTools } = await import('./registry.js');
+  const candidate = await local.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'work_call', configuredNames: new Set(getCoreTools().map(tool => tool.name)) });
   assert.ok(candidate && !('refused' in candidate)); if (!candidate || 'refused' in candidate) throw new Error('no native candidate');
   const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates: [candidate] });
-  return { ...identity, planning: primed.planning, capabilityRef: refs.workflow_create! };
+  return { ...identity, planning: primed.planning, capabilityRef: refs[name]! };
 }
+
+test('core file schema survives discovered Plan publication and exact Execute reopen without a deferred registry row', async () => {
+  const f = await fixture('write_file');
+  assert.equal(runtime.getLocalToolSchemas().has('write_file'), false, 'the actual carrier mismatch remains in the fixture');
+  const raw = outline(f.capabilityRef, { path: path.join(home, 'review.md'), content: 'Acorn: 60%\nCedar: 110%\n' });
+  raw.executionDraft.destination.family = 'file';
+  raw.executionDraft.deliverables = [{ id: 'brief', kind: 'file' }];
+  const prepared = await publisher.preparePlanOutline({ ...f, raw, ready: true });
+  assert.ok((prepared.preparedBindings as any[])[0].inputSchema.properties.content);
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const reviewed = await import('../runtime/harness/reviewed-plan-runtime.js');
+  const artifact = plans.publishPlanRevision({ ...f, principalId: f.sessionId, fullText: 'Write the reviewed brief.', structuredPlan: prepared, readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const source = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute the reviewed brief.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  plans.claimPlanExecution({ sessionId: f.sessionId, sourceUserSeq: source.seq, principalId: f.sessionId, executeRef: ref });
+  log.closeEventLog();
+  const primed = await semantic.primePrimaryModelPlanningCatalog({ sessionId: f.sessionId, sourceUserSeq: source.seq });
+  assert.ok(primed.ok); if (!primed.ok) return;
+  await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0, 'publication and reopen never execute the file write');
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw: { ...raw, steps: [{ ...raw.steps[0], staticArguments: { path: 42 } }] }, ready: true }), /static arguments/);
+});
+
+test('the real publication failure emits the machine code consumed by settlement', async () => {
+  const { executionDraft, ...publicOutline } = outline(null, {});
+  publicOutline.steps = publicOutline.steps.map(({ staticArguments: _args, ...step }: any) => ({ ...step, staticArgumentsJson: '{}' }));
+  const result = await publisher.buildPublishPlanTool().invoke(new RunContext(), JSON.stringify({ execution_draft: executionDraft,
+    full_text: 'A plan with no accepted foreground context.', structured_plan: publicOutline, readiness: 'needs_input', missing_prerequisites: [], base_ref_json: null }));
+  const refusal = JSON.parse(String(result));
+  assert.equal(refusal.error, 'plan_preparation_failed');
+  assert.equal(refusal.code, 'plan_preparation_failed', 'the producer must supply the exact machine code; the test must not invent it');
+});
 test('ready workflow plan records real native schema/ref/effect and canonical reopen preserves identity', async () => {
   const f = await fixture();
   assert.equal(f.capabilityRef, 'cap:local:workflow_create:reversible');

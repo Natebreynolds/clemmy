@@ -890,14 +890,15 @@ test('run_worker invokes the host Worker on the routed intent model (offline pro
     };
     const input = JSON.stringify(packet);
     const anchor = anchorAcceptedTask(session.id, 'Generate one design variation for the landing page hero.');
-    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
+    const { runWithToolAbortSignal } = await import('../runtime/tool-abort-context.js');
+    const result = await runWithToolAbortSignal(new AbortController().signal, () => withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
       input,
       {
         parentRunConfig: { modelProvider: stubProvider },
         toolCall: { name: 'run_worker', callId: 'call_worker_design', arguments: input },
       },
-    ));
+    )), Date.now() + 300_000);
 
     assert.equal(result, 'worker finished on routed model');
     assert.ok(requestedModels.includes('minimax-01'), `expected nested Worker to request minimax-01, got ${requestedModels.join(', ')}`);
@@ -907,6 +908,7 @@ test('run_worker invokes the host Worker on the routed intent model (offline pro
     assert.equal((routed[0].data as { seam?: string }).seam, 'chat');
     const results = listEvents(session.id, { types: ['worker_result'] });
     assert.equal(results.length, 1);
+    assert.equal(typeof results[0].data.batchKey, 'string', 'the one-item live path uses the durable batch deadline owner');
     assert.equal((results[0].data as { item?: string }).item, 'landing page hero');
     assert.equal((results[0].data as { ok?: boolean }).ok, true);
     assert.equal((results[0].data as { model?: string }).model, 'minimax-01');

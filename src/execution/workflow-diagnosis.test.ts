@@ -205,6 +205,25 @@ test('humanizeStepOutput surfaces human content, not raw JSON', () => {
   assert.equal(humanizeStepOutput('already a string'), 'already a string');
 });
 
+test('workflow report preserves numeric answers and arbitrary business fields from the live Grok result', () => {
+  for (const answer of [437, '437']) {
+    const body = renderSuccessBody({ steps: [{ id: 'calculate' }], stepOutputs: {
+      calculate: { answer, phrase: 'Harbor check complete' },
+    }, finalOutput: '', hasSynthesis: false });
+    assert.match(body, /437/);
+    assert.match(body, /Harbor check complete/);
+    assert.notEqual(body, '✓ completed');
+  }
+  const body = humanizeStepOutput({ summary: 'Review complete.', accounts: [{ name: 'Acorn', revenue: 0, eligible: false }], markets: ['West', 'East'] });
+  for (const expected of ['Review complete.', 'Acorn', 'revenue: 0', 'eligible: false', 'West', 'East']) assert.ok(body.includes(expected), body);
+});
+
+test('long structured reports disclose retained content instead of silently replacing it with a status', () => {
+  const body = humanizeStepOutput({ rows: Array.from({ length: 20 }, (_, i) => `Account ${i}`) });
+  assert.match(body, /Account 0/);
+  assert.match(body, /Additional result content is retained in the workflow run/);
+});
+
 test('humanizeStepOutput renders bookkeeping as a terse status line, not JSON', () => {
   const out = humanizeStepOutput({ ok: true, source: 'sf', recordsFound: 100, digestShown: 10, readOnly: true });
   assert.match(out, /✓ done/);

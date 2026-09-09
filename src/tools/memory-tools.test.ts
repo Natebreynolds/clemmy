@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { z } from 'zod';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-memory-tools-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -18,7 +19,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { reviewForgetRequest, registerMemoryTools } = await import('./memory-tools.js');
 const { LOCAL_MCP_TOOL_NAMES } = await import('./catalog.js');
-const { openMemoryDb, resetMemoryDb } = await import('../memory/db.js');
+const { openMemoryDb, resetMemoryDb, closeMemoryDb } = await import('../memory/db.js');
 const { rememberFact, getFact } = await import('../memory/facts.js');
 const { loadFactEntityEdges } = await import('../memory/relations.js');
 const { appendFactRecallTrace } = await import('../memory/recall-trace.js');
@@ -141,6 +142,24 @@ function registeredToolHandlers(): Map<string, (args: Record<string, unknown>) =
   registerMemoryTools(server as never);
   return handlers;
 }
+
+test('a long project decision survives the public remember schema, storage and recall', async () => {
+  let remember: ((input: Record<string, unknown>) => Promise<unknown>) | undefined;
+  registerMemoryTools({ tool(name: string, _description: string, shape: z.ZodRawShape, handler: (input: unknown) => Promise<unknown>) {
+    if (name === 'memory_remember') remember = (input) => handler(z.object(shape).parse(input));
+  } } as never);
+  assert.ok(remember);
+  const content = 'Juniper & Clay is a fictional pottery-studio prototype. '
+    + 'Its selected visual direction is Kiln Journal, with cream backgrounds and copper accents. '.repeat(12)
+    + 'The final agreed audience is private groups; the CTA is Plan a private workshop. Deployment remains pending.';
+  assert.ok(content.length > 800);
+  await remember({ kind: 'project', content });
+  closeMemoryDb();
+  const row = openMemoryDb().prepare('SELECT id, content FROM consolidated_facts WHERE active = 1').get() as { id: number; content: string };
+  assert.equal(row.content, content);
+  const recalled = await registeredToolHandlers().get('memory_read')!({ target: `fact:${row.id}` });
+  assert.ok(recalled.content[0].text.includes(content));
+});
 
 test('memory_remember rejects one-off task requests but accepts explicit standing rules', async () => {
   const previous = process.env.CLEMMY_REMEMBER_RECONCILE;

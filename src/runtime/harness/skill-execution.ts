@@ -410,11 +410,12 @@ export function skillBodyExecutionShortfall(skillName: string, skillBody: string
  *  was actually done — e.g. that no image-generation tool fired against a skill
  *  that prescribes generating imagery, or that a skill's mandatory bundled script
  *  (e.g. `generate-html.js`) never ran. Fail-open → ''. */
-export function summarizeToolCallsForJudge(sessionId: string): string {
+export function summarizeToolCallsForJudge(sessionId: string, options: { sourceUserSeq?: number | null } = {}): string {
   try {
     const counts = new Map<string, number>();
     for (const e of projectCanonicalTopLevelToolEvents(
-      listEvents(sessionId, { types: ['tool_called'] }),
+      listEvents(sessionId, { types: ['tool_called'] }).filter((event) =>
+        options.sourceUserSeq == null || event.data.sourceUserSeq === options.sourceUserSeq),
       'tool_called',
     )) {
       const tool = typeof e.data?.tool === 'string' ? e.data.tool : 'unknown';

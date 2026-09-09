@@ -125,7 +125,7 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok((data.firstClassCount ?? 0) > 0, 'firstClassCount recorded');
   assert.ok((data.catalogCount ?? 0) > 0, 'catalogCount recorded');
   assert.ok((data.estCatalogTokens ?? 0) > 0, 'estCatalogTokens recorded');
-  assert.ok((data.firstClassCount ?? 999) <= 12, 'benign turns keep a bounded schema-loaded surface');
+  assert.ok((data.firstClassCount ?? 999) <= 15, 'the small schema kernel includes the three native filesystem readers');
 });
 
 test('ON: an excluded tool is absent from both first-class and deferred reachability', async () => {
@@ -365,4 +365,26 @@ test('schema-on-demand defers broad MCP fail-open but preserves concrete provide
     precise,
     'an intent-matched server remains directly attached for one-hop execution',
   );
+});
+
+test('fresh native work shows exact file-reader schemas and native authoring names within its configured scope', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const userInput = 'Please inspect and revise my local project draft.';
+  const source = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: userInput } });
+  const options = { sessionId: sess.id, sourceUserSeq: source.seq, userInput, allowToolJit: true,
+    hostFreshPlanning: { authority: { scope: 'primary_model_planning_catalog_v1' },
+      identity: { sessionId: sess.id, sourceUserSeq: source.seq }, capabilities: [], digest: '0'.repeat(64) } as never };
+  const agent = await withFlag('on', () => buildOrchestratorAgent(options));
+  const tools = agent.tools as Array<{ name?: string; parameters?: { properties?: Record<string, unknown> } }>;
+  for (const name of ['workspace_roots', 'list_files', 'read_file']) assert.ok(namesOf(agent).has(name), name);
+  const schema = tools.find(tool => tool.name === 'list_files')?.parameters;
+  assert.ok(schema?.properties?.directory, 'publish the actual directory field before the first call');
+  assert.equal(schema?.properties?.path, undefined, 'do not silently alias arguments');
+  const instructions = await renderInstructions(agent);
+  assert.match(instructions, /\[native-authoring-catalog\][\s\S]*\bwrite_file\b/);
+  assert.ok(!namesOf(agent).has('write_file'), 'authoring retains its existing work_call authority');
+  const scoped = await withFlag('on', () => buildOrchestratorAgent({ ...options,
+    allowedToolNames: ['tool_search', 'read_file', 'list_files'], excludeToolNames: ['list_files', 'write_file'] }));
+  assert.ok(!namesOf(scoped).has('list_files'));
+  assert.doesNotMatch(await renderInstructions(scoped), /\[native-authoring-catalog\]/);
 });

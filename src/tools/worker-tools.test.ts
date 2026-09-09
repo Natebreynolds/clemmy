@@ -826,6 +826,20 @@ test('P0 gate: cap-6 252/253 deadline boundary parks the remainder without orpha
         }
       },
       async () => {
+        const one = runBatch(1, 'sess-deadline-single', new AbortController());
+        await waitUntil(() => started === 1 && inFlight === 1, 'one supervised worker');
+        logicalNowMs = 298_000;
+        for (const timer of logicalTimers) if (timer.active && timer.at <= logicalNowMs) { timer.active = false; timer.fn(); }
+        let parkedSingle: Awaited<typeof one> | undefined;
+        void one.then((value) => { parkedSingle = value; });
+        await waitUntil(() => parkedSingle !== undefined, 'single-worker cancellation and drain');
+        assert.equal(inFlight, 0, 'the singleton body must be drained before the parent receives a remainder');
+        assert.match(parkedSingle!.content[0].text, /0\/1 settled; 0 failed; 0 in_flight; 1 pending/);
+        // Remove the rejected controllable wait; it cannot complete later.
+        waits.splice(0, waits.length);
+        logicalNowMs = 0;
+        started = 0;
+        peak = 0;
         const at252 = new AbortController();
         const completes252 = runBatch(252, 'sess-deadline-252', at252);
         await waitUntil(() => started === 6, 'the first cap-6 wave for 252');

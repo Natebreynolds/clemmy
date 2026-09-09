@@ -129,12 +129,23 @@ export function rearmedWatcherCadence(input: WatcherGateInput): WatcherGateInput
  * first worker) for the session. Returns the unsubscribe; callers scope it to
  * the tool invocation so nothing outlives the parent call.
  */
-export function observeWorkerFanoutStart(sessionId: string, onStart: (event: EventRow) => void): () => void {
+/** A late worker from an older request cannot become evidence for a new goal.
+ * Unattributed legacy events remain available only to explicitly session-wide readers. */
+export function watcherEventMatchesSource(event: EventRow, sourceUserSeq?: number | null): boolean {
+  if (sourceUserSeq == null) return true;
+  const { sourceUserSeq: source, parentSourceUserSeq: parentSource } = event.data;
+  if (source != null && source !== sourceUserSeq) return false;
+  if (parentSource != null && parentSource !== sourceUserSeq) return false;
+  return source === sourceUserSeq || parentSource === sourceUserSeq;
+}
+
+export function observeWorkerFanoutStart(sessionId: string, onStart: (event: EventRow) => void, sourceUserSeq?: number): () => void {
   const seen = new Set<string>();
   return actionBus.subscribe((bus) => {
     if (bus.kind !== 'harness.event') return;
     const event = bus.event as EventRow;
-    if (event.sessionId !== sessionId || event.type !== 'worker_started') return;
+    if (event.sessionId !== sessionId || event.type !== 'worker_started'
+      || !watcherEventMatchesSource(event, sourceUserSeq)) return;
     const data = (event.data ?? {}) as Record<string, unknown>;
     const batch = String(data.batchKey ?? data.parentLogicalCallId ?? '') || `event:${event.seq}`;
     if (seen.has(batch)) return;
@@ -149,9 +160,10 @@ export function observeWorkerFanoutStart(sessionId: string, onStart: (event: Eve
  * '' when the session has no worker events (a run without a fan-out sends the
  * judge exactly the prompt it always did).
  */
-export function summarizeWorkerProgressForWatcher(sessionId: string): string {
+export function summarizeWorkerProgressForWatcher(sessionId: string, options: { sourceUserSeq?: number | null } = {}): string {
   try {
-    const events = listEvents(sessionId, { types: ['worker_started', 'worker_result', 'work_item_checkpoint'] });
+    const events = listEvents(sessionId, { types: ['worker_started', 'worker_result', 'work_item_checkpoint'] })
+      .filter((event) => watcherEventMatchesSource(event, options.sourceUserSeq));
     if (events.length === 0) return '';
     const started: string[] = [];
     let ok = 0;

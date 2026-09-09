@@ -8,7 +8,7 @@ process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 process.env.CLEMMY_EMBED_AT_WRITE = 'off';
 delete process.env.OPENAI_API_KEY;
 
-const { openMemoryDb, resetMemoryDb } = await import('./db.js');
+const { openMemoryDb, closeMemoryDb, resetMemoryDb } = await import('./db.js');
 const {
   drainDurableConsolidationCandidates,
   enqueueAutoCaptureCandidates,
@@ -665,4 +665,39 @@ test('an explicit correction does not collapse an unrelated cross-kind fact', as
   assert.equal(active.length, 2);
   assert.ok(active.some((row) => row.content.includes('Project Atlas')));
   assert.ok(active.some((row) => row.content.includes('Project Beacon')));
+});
+
+
+test('an explicitly taught reporting procedure retains its late conditions through durable replay and reopen', async () => {
+  const procedure = [
+    'My reusable daily social report procedure uses fresh figures for today and yesterday.',
+    'The total engagements and comparison always indicate that today is only a partial day.',
+    'The best post is accompanied by the measured interactions contributing to that result.',
+    'Missing records are distinct from a measured zero, with any incomplete date disclosed.',
+    'The account timezone determines date boundaries and the report names the observation time.',
+    'Comparable periods are preferred whenever the connector supplies them; otherwise their differences are explained.',
+    'Every total is attributed to its source with underlying post identifiers retained for follow-up.',
+    'Another requested day uses a fresh read with the established account and reporting procedure.',
+    'Remembered preferences remain separate from changing analytics so a previous total never substitutes for a fresh read.',
+    'The report ends with one practical next step based on observations without claiming causation from engagement alone.',
+    'The format is three short bullets. Publishing requires a separate request from me.',
+  ].join(' ');
+  assert.ok(procedure.length > 900);
+  const message = `Please remember this: ${procedure}`;
+  const candidates = extractAutoMemoryCandidates(message);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]!.content, procedure);
+  const queued = enqueueAutoCaptureCandidates({ message, sessionId: 'chat-long-procedure',
+    sourceEventId: 'turn:long-procedure', candidates });
+  closeMemoryDb();
+  assert.equal((await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }) })).promoted, 1);
+  closeMemoryDb();
+  const fact = openMemoryDb().prepare('SELECT content FROM consolidated_facts WHERE active = 1').get() as { content: string };
+  assert.equal(fact.content, procedure);
+  const episode = openMemoryDb().prepare('SELECT evidence_excerpt FROM memory_episodes WHERE id = ?')
+    .get(queued.episodeId) as { evidence_excerpt: string };
+  assert.equal(episode.evidence_excerpt, message);
+  assert.deepEqual(extractAutoMemoryCandidates(`${message} Do not save any of this.`), [],
+    'a late privacy instruction must not disappear behind an input preview limit');
 });

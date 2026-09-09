@@ -414,6 +414,19 @@ export interface ModelUsageAttributionContext {
  */
 export const modelUsageAttributionStorage = new AsyncLocalStorage<ModelUsageAttributionContext>();
 
+const modelUsageRecordingObservation = new AsyncLocalStorage<{ recorded: boolean }>();
+
+/** Observe one tool-less completion's actual adapter accounting. This is a
+ * producer receipt, not token-count or timestamp deduplication. Separate async
+ * calls have separate scopes; a failed route cannot vouch for its fallback. */
+export async function observeModelUsageRecording<T>(work: () => Promise<T>): Promise<{ value: T; recorded: boolean }> {
+  const observation = { recorded: false };
+  return modelUsageRecordingObservation.run(observation, async () => {
+    const value = await work();
+    return { value, recorded: observation.recorded };
+  });
+}
+
 export function withModelUsageAttribution<T>(
   context: ModelUsageAttributionContext,
   work: () => T,
@@ -542,6 +555,8 @@ export function recordModelUsage(args: {
     ...parseWorkflowSource(source),
   };
   recordUsage(event);
+  const observation = modelUsageRecordingObservation.getStore();
+  if (observation && args.inputTokens + args.outputTokens > 0) observation.recorded = true;
   // Stage 4 (aggregate run budget): durable, restart/midnight-proof per-session
   // accumulator (fills the previously-dead sessions.tokens_used column). The
   // unit is UNCACHED tokens — counting the full prompt every turn would let

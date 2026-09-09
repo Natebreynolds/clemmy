@@ -2,7 +2,7 @@ import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
 import { retainedResultWayThrough } from './retained-result-routes.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
-import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, listEvents, openEventLog, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
 import type { ConversationPreambleDeliveryCallback, TaskContinuationContext } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import {
@@ -205,6 +205,10 @@ import {
 import { logicalCallAuthorityState } from './dispatch-ledger.js';
 import { durableLogicalCallContract, logicalCallArgumentsAreContractible } from './logical-call-contract.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import {
+  hostCallCapabilityBindingMatchesAttestation,
+  loadHostCallCapabilityBinding,
+} from './host-call-capability-binding.js';
 import {
   isPlainOrClementineLocalTool,
   isTrustedComposioGateway,
@@ -2607,18 +2611,36 @@ function settlementCallIsMutating(toolName: string, args: unknown): boolean {
   const context = harnessRunContextStorage.getStore();
   const contract = attestation ? durableLogicalCallContract(attestation.acceptedTaskId, toolName, args) : null;
   if (attestation?.bindingKind === 'local_envelope'
+    && contract && identity
     && attestation.sessionId === context?.sessionId
     && attestation.sourceUserSeq === context?.sourceUserSeq
     && attestation.acceptedTaskId === identity?.acceptedTaskId
     && attestation.logicalToolCallId === identity?.logicalToolCallId
-    && attestation.toolName === contract?.toolName
-    && attestation.argumentDigest === contract?.argumentDigest) {
+    && attestation.toolName === contract?.toolName) {
     // The exact host effect also governs configured coordinators carried by
     // call_tool. Their capability is the configured envelope rather than a
     // cap:local authoring nomination; that spelling cannot downgrade an
     // admitted local write to a non-mutating settlement. This preserves the
     // already admitted contract, and grants no new dispatch permission.
-    return attestation.effect === 'local_write';
+    if (attestation.argumentDigest === contract.argumentDigest) {
+      return attestation.effect === 'local_write';
+    }
+    // call_tool materializes schema defaults before the inner bracket runs.
+    // That trusted refinement already has a durable owner; comparing only
+    // with the original args loses the admitted effect and makes the host
+    // reject the result after execution. Reopen the existing binding against
+    // this exact effective contract instead of reclassifying the operation.
+    const loaded = loadHostCallCapabilityBinding({
+      db: openEventLog(),
+      sessionId: attestation.sessionId,
+      sourceUserSeq: attestation.sourceUserSeq,
+      logicalToolCallId: attestation.logicalToolCallId,
+    });
+    if (loaded.status === 'ok'
+      && hostCallCapabilityBindingMatchesAttestation(loaded.binding, attestation)
+      && loaded.binding.effectiveArgumentDigest === contract.argumentDigest) {
+      return loaded.binding.effect === 'local_write';
+    }
   }
   return isMutatingExternalWrite(toolName, args);
 }

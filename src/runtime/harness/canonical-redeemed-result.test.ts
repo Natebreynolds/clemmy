@@ -181,6 +181,20 @@ for (const [label, payload] of [
   });
 }
 
+test('a redeemed worker coordination receipt does not invent a missing file', async () => {
+  const built = await persistCanonicalLocalResult({
+    label: 'worker-acknowledgement', toolName: 'run_worker', args: { item: 'research' },
+    rawPayload: 'Batch complete: 1/1 items succeeded. Source facts returned.',
+  });
+  eventlog.closeEventLog();
+  const evidence = runner.settledSourceArtifacts(built.identity);
+  assert.equal(evidence.count, 1, 'coordination remains visible in the settled-effects ledger');
+  assert.equal(evidence.artifacts[0]!.evidenceContract, 'none');
+  assert.equal(evidence.artifacts[0]!.unresolvedReason, undefined);
+  assert.equal(evidence.artifacts[0]!.handle, '');
+  assert.doesNotMatch(evidence.summary, /missing|undeclared/i);
+});
+
 test('a valid dataset receipt in another operation carrier cannot change that operation evidence contract', async () => {
   const slug = 'collector-wrong-carrier';
   spaces.spaceStore.save({ id: slug, title: 'Wrong carrier fixture', viewContent: '<html>Owned data</html>' });
