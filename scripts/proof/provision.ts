@@ -440,6 +440,9 @@ export interface ProvisionOptions {
   /** True only when at least one selected scenario proves an exact worker
    * route. Cross-family worker auth is not copied for brain-only scenarios. */
   requireWorkerProvider?: boolean;
+  /** Seed the judge/fusion-checker's provider too (a cross-family judge on a
+   * BYO brain needs its own credential in the isolated home). */
+  requireJudgeProvider?: boolean;
   /** Test/diagnostic override. Production uses the conservative derived floor. */
   codexAccessMinValidityMs?: number;
   /** Provider-neutral test/diagnostic override for access-only subscription
@@ -468,10 +471,11 @@ export interface ProofProviderRequirements {
  * selected those behaviors. API-key Codex plans do not need an OAuth snapshot. */
 export function proofProviderRequirements(
   plan: BrainPlan,
-  opts: Pick<ProvisionOptions, 'fusionMode' | 'requireWorkerProvider'> = {},
+  opts: Pick<ProvisionOptions, 'fusionMode' | 'requireWorkerProvider' | 'requireJudgeProvider'> = {},
 ): ProofProviderRequirements {
   const providers = new Set<ProofModelProvider>([plan.expectedBrain.provider]);
   if (opts.requireWorkerProvider) providers.add(plan.expectedWorker.provider);
+  if (opts.requireJudgeProvider) providers.add(plan.expectedFusionChecker.provider);
   if (opts.fusionMode && opts.fusionMode !== 'off') {
     providers.add(plan.expectedFusionChecker.provider);
   }
