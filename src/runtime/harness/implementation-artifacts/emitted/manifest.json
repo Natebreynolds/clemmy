@@ -2400,7 +2400,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 693794
+          "bytes": 693642
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2511,7 +2511,7 @@
           "bytes": 6949
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 86980
+          "bytes": 88324
         },
         "src/runtime/harness/turn-control.ts": {
           "bytes": 81583
@@ -5025,7 +5025,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 693794
+          "bytes": 693642
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -5136,7 +5136,7 @@
           "bytes": 6949
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 86980
+          "bytes": 88324
         },
         "src/runtime/harness/turn-control.ts": {
           "bytes": 81583

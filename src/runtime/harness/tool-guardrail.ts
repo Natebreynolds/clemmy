@@ -36,6 +36,8 @@ import {
   deriveGuardrailReadMutators,
 } from '../../tools/tool-registry.js';
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
+import { isDestructiveToolInvocation } from '../../agents/tool-invocation.js';
+import { classifyExternalWrite } from './confirm-first-gate.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { getRuntimeEnv } from '../../config.js';
 import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
@@ -562,6 +564,10 @@ export interface GuardrailDecision {
    *  same-mut halt demotes back to warn (approve-once-then-run). Computed
    *  only on halt decisions. */
   scopeApproved?: boolean;
+  /** Positive irreversibility (send/publish) from the external-write classifier; undefined = unknown. */
+  irreversible?: boolean;
+  /** A delete-class invocation; correctable writes are never destructive. */
+  destructive?: boolean;
   /** Slug-aware mutating verdict for THIS call (composio_execute_tool is
    *  classified by its inner slug; native tools by set membership). Carried
    *  on the decision so `applyMode` can demote a looping READ to warn even
@@ -1427,6 +1433,12 @@ export function evaluateToolCall(
           scopeApproved = isAutoApprovedByScope(options?.authoritySessionId ?? trackerScopeId, toolName, args);
         } catch { scopeApproved = false; }
       }
+      let irreversible: boolean | undefined;
+      let destructive: boolean | undefined;
+      try {
+        irreversible = classifyExternalWrite(toolName, args).irreversible;
+        destructive = isDestructiveToolInvocation(toolName, args);
+      } catch { irreversible = undefined; destructive = undefined; }
       return {
         action: 'halt',
         signature,
@@ -1438,6 +1450,8 @@ export function evaluateToolCall(
         effect: classified.effect,
         dangerousWrite,
         scopeApproved,
+        ...(irreversible !== undefined ? { irreversible } : {}),
+        ...(destructive !== undefined ? { destructive } : {}),
         // Carry fanoutBlock so the recoverable refusal wins over a mutating-halt
         // for a fanout-keyed read (2026-07-12). With the isMutatingCall fix a read
         // no longer reaches here, but keep the belt-and-suspenders.
@@ -1606,11 +1620,18 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
   // mutation is at least as dangerous as identical repeats, and until 2026-07-06
   // it demoted to warn-only, so a real 45-send runaway went out unchecked.
   // Kill-switch CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE=off restores warn-only.
+  // THE GATE IS THE IRREVERSIBLE BOUNDARY, NOT "EXTERNAL". Fifty drafts, fifty
+  // sheet rows, fifty CRM updates are correctable work the owner asked for; a
+  // static halt at the eighth distinct one only forced the batch toward Plan
+  // mode (2026-09-09). Sends/publishes (positively irreversible) and deletes
+  // keep the enforced halt; an invocation the classifier cannot grade at all
+  // (irreversible undefined) also keeps it, fail-closed.
   if (
     decision.action === 'halt'
     && decision.rule === 'same_mut_tool_repeat'
     && decision.dangerousWrite === true // explicit external effect only; local shell/build/file work never mass-halts
     && decision.scopeApproved !== true // an approved batch is deliberate work — approve-once-then-run wins
+    && (decision.irreversible !== false || decision.destructive === true)
     && sameMutHaltEnforcedInWarn()
   ) {
     return decision;

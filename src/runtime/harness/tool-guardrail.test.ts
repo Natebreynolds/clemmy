@@ -1327,3 +1327,28 @@ test('changed plan consequence and successful progress reset the semantic refusa
   assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 4 }, JSON.stringify({ ok: true })), undefined);
   assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 5 }, refusal('first issue')), undefined);
 });
+
+test('the same-tool halt enforces only at the irreversible boundary or for a delete (reversible batches warn)', async () => {
+  const { applyMode, evaluateToolCall, _resetGuardrailStateForTests } = await import('./tool-guardrail.js');
+  const base = { signature: 's', toolName: 'composio_execute_tool', reason: 'runaway', rule: 'same_mut_tool_repeat' as const,
+    count: 8, mutating: true, effect: 'external_write' as const, dangerousWrite: true, scopeApproved: false, action: 'halt' as const };
+  assert.equal(applyMode({ ...base, irreversible: true }, 'warn').action, 'halt', 'a send batch still halts');
+  assert.equal(applyMode({ ...base, irreversible: false, destructive: true }, 'warn').action, 'halt', 'a delete batch still halts');
+  assert.equal(applyMode({ ...base }, 'warn').action, 'halt', 'an ungraded external write fails closed');
+  assert.equal(applyMode({ ...base, irreversible: false, destructive: false }, 'warn').action, 'warn', 'fifty drafts are correctable work, not a runaway');
+  // Through the real evaluator: eight distinct Outlook drafts warn; eight distinct sends halt.
+  if (typeof _resetGuardrailStateForTests === 'function') _resetGuardrailStateForTests();
+  const scope = `halt-boundary-${Date.now()}`;
+  let last;
+  for (let i = 1; i <= 8; i += 1) {
+    last = applyMode(evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: `d${i}` } }, `draft-${i}`), 'warn');
+  }
+  assert.equal(last?.rule, 'same_mut_tool_repeat');
+  assert.equal(last?.action, 'warn', JSON.stringify(last));
+  const sendScope = `halt-boundary-send-${Date.now()}`;
+  for (let i = 1; i <= 8; i += 1) {
+    last = applyMode(evaluateToolCall(sendScope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: { subject: `s${i}` } }, `send-${i}`), 'warn');
+  }
+  assert.equal(last?.action, 'halt', JSON.stringify(last));
+});
+

@@ -9702,7 +9702,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const turn = nextTurnNumber(row);
   let persistedRecoveryState: HostRecoveryState | undefined;
   let adoptedCheckpointContinuation = false;
-  let preflightBlockSteer: string | undefined;
   let adoptedRecoveryState: HostRecoveryState | undefined;
   const recoveryBlob = session.loadRecoveryState();
   if (recoveryBlob) {
@@ -10473,18 +10472,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       }
       if (verdict.status === 'block') {
         if (sessionKind === 'chat') {
-          // Deliver the F1-rewritten block message as model-call steer, NEVER
-          // as an accepted-history item: unshifting it into `items` changed
-          // the pre-history digest the accepted-batch chain verifies, so a
-          // resumed source that tripped this gate was refused at every
-          // admission and died at exact_checkpoint_admission_exhausted (live
-          // 2026-09-09, after a fifty-worker fan-out). The steer joins the
-          // context packet at request time, outside the durable history.
-          preflightBlockSteer = buildPreflightBlockMessage({
-            predictedTokens: verdict.predictedTokens,
-            blockFraction: verdict.blockFraction,
-            effectiveLimit: verdict.effectiveLimit,
-          });
+          // The prediction is recorded above; the turn PROCEEDS. Context size
+          // is owned by compaction (Layer 1 + in-flight), which already ran
+          // upstream of this gate — the same posture the workflow branch has
+          // held. A "route through plan-mode" steer here was a hard cap in
+          // disguise: it never freed a token, it changed the work's routing,
+          // and (as a history item) it broke the accepted-batch chain on a
+          // resumed source (live 2026-09-09, after a fifty-worker fan-out).
+          // A model response that still overflows is handled at the window
+          // by the response-window retry, not predicted away here.
         } else if ((process.env.CLEMMY_PREFLIGHT_WORKFLOW ?? 'on').toLowerCase() !== 'off') {
           // Workflow / execution / agent path — no user to consult,
           // no propose_plan interlude available. Emit a loud event
@@ -10896,7 +10892,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           ? `[pre-execution opening already delivered for this exact request]\n${sameTurnPreamble}\nContinue the requested work now; do not repeat this opening or ask for generic permission.`
           : '',
         options.continuationSteer,
-        preflightBlockSteer,
       ]
         .filter(Boolean).join('\n\n');
       if (contextPacketText) {
