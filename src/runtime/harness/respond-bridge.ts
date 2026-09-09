@@ -38,7 +38,8 @@ import { acceptedTaskMode } from './accepted-task-mode.js';
  *     richer event log instead. `onToolActivity` / `onReasoning` are relayed
  *     best-effort from harness events for legacy progress surfaces.
  */
-import { runConversation, verifiedWorkflowRunDispatchReceipts, type RunConversationOptions } from './loop.js';
+import { runConversation,
+  runConversationContinuingPastToolCallsLimit, verifiedWorkflowRunDispatchReceipts, type RunConversationOptions } from './loop.js';
 import { currentAcceptedReadAuthority } from '../read-path/accepted-read-authority.js';
 import {
   resolveTurnCapabilityCandidates,
@@ -535,7 +536,10 @@ type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 type RecoveryListEventsFn = typeof listEvents;
 type CommitTurnOutcomeFn = typeof commitTurnOutcome;
 type ResolveTurnCandidatesFn = typeof resolveTurnCapabilityCandidates;
-let runConversationImpl: RunConversationFn = runConversation;
+// Interactive surfaces enter through this bridge, so this is where the
+// per-activation tool ceiling becomes a checkpoint cadence instead of a park
+// (NEVER-RESTING; see runConversationContinuingPastToolCallsLimit).
+let runConversationImpl: RunConversationFn = runConversationContinuingPastToolCallsLimit;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
@@ -559,7 +563,7 @@ export function _setBridgeImplsForTests(impls: {
   completedAnswerReplayProtection?: CompletedAnswerReplayProtectionReader | null;
   resolveTurnCandidates?: ResolveTurnCandidatesFn | null;
 }): void {
-  runConversationImpl = impls.runConversation ?? runConversation;
+  runConversationImpl = impls.runConversation ?? runConversationContinuingPastToolCallsLimit;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
   configureImpl = impls.configure ?? configureHarnessRuntime;
   claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
