@@ -6511,6 +6511,30 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     throw new Error('Invalid agent toolUseBehavior.');
   };
 
+  /** A PLAN TURN ENDS WHEN ITS PLAN IS PUBLISHED. The deliverable of an
+   * explicit Plan turn is the reviewed revision; once publish_plan returns
+   * ok:true the owner has it, and giving the model another round only invites
+   * republishing (live 2026-09-09: a published revision was followed by four
+   * more publish_plan calls — immutable-bytes refusals — until the driver's
+   * deadline, never a terminal). The reply is the plan text the model itself
+   * wrote (full_text), so the turn still speaks in the model's voice. */
+  const publishedPlanTerminal = (
+    results: Awaited<ReturnType<typeof executeCall>>[],
+  ): string | undefined => {
+    for (const result of results) {
+      if (result.tool?.name !== 'publish_plan') continue;
+      let output: unknown;
+      try { output = JSON.parse(resultText(result.output)); } catch { continue; }
+      if (!output || typeof output !== 'object' || (output as { ok?: unknown }).ok !== true) continue;
+      if (!(output as { planArtifactRef?: unknown }).planArtifactRef) continue;
+      const args = 'argumentsJson' in result && typeof result.argumentsJson === 'string' ? parsedArgs(result.argumentsJson) : null;
+      const fullText = args && typeof args.full_text === 'string' && args.full_text.trim() ? args.full_text.trim() : '';
+      const message = typeof (output as { message?: unknown }).message === 'string' ? (output as { message: string }).message : '';
+      return fullText || message || 'The plan is published for review.';
+    }
+    return undefined;
+  };
+
   const terminalBehaviorEligibleMixedResults = (
     results: readonly ExecutedHostCall[],
   ): boolean => results.length > 0 && results.every(
@@ -8596,6 +8620,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       // A frame that executed is progress: the refusal streak ends here.
       consecutiveFrameRefusals = 0;
+      const publishedPlan = publishedPlanTerminal(frame.returned);
+      if (publishedPlan !== undefined) return await completedOutcome(publishedPlan);
       const finalOutput = await finalOutputFromToolBehavior(frame.returned);
       if (finalOutput !== undefined) return await completedOutcome(finalOutput);
       continue;
@@ -9022,6 +9048,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       continue;
     }
+    const publishedPlan = publishedPlanTerminal(frame.returned);
+    if (publishedPlan !== undefined) return await completedOutcome(publishedPlan);
     const finalOutput = await finalOutputFromToolBehavior(frame.returned);
     if (finalOutput !== undefined) return await completedOutcome(finalOutput);
   }

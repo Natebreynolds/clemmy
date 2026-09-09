@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { parseTaskMode } from '../../src/runtime/harness/task-mode.js';
 
 export const LiveTurnExpectationSchema = z.object({
+  maxArgumentRepairs: z.number().int().min(0).optional(),
   /** Fixture-only intermediate outcomes. Completion remains the default. */
   terminalStatuses: z.array(z.enum(['done', 'needs_input'])).nonempty().optional(),
   replyIncludes: z.array(z.string().min(1)).optional(),
@@ -90,7 +91,18 @@ export function checkLiveTurn(expect: z.infer<typeof LiveTurnExpectationSchema>,
   const boundaryStopped = facts.settlements.filter((row) => row.mutating === 1
     && row.execution_kind === 'refused_pre_dispatch'
     && /activation_budget_stopped_before_dispatch/.test(row.outcome_detail ?? ''));
-  const mutations = facts.settlements.filter((row) => row.mutating === 1 && !boundaryStopped.includes(row));
+  // A model argument slip the host refused before dispatch (zero crossings,
+  // typed invalid_arguments) is a correctable repair, not an effect. It is
+  // counted and bounded separately (maxArgumentRepairs, default 0), never
+  // silently ignored, so a clean-attempt fixture stays strict.
+  const argumentRepairs = facts.settlements.filter((row) => row.mutating === 1
+    && row.execution_kind === 'refused_pre_dispatch' && row.outcome_kind === 'invalid_arguments'
+    && row.physical_crossing_count + row.host_crossing_count === 0 && row.requires_reconciliation === 0);
+  if (argumentRepairs.length > (expect.maxArgumentRepairs ?? 0)) {
+    failures.push(`argument repairs: ${argumentRepairs.length} exceeds ${expect.maxArgumentRepairs ?? 0}`);
+  }
+  const mutations = facts.settlements.filter((row) => row.mutating === 1 && !boundaryStopped.includes(row)
+    && !(argumentRepairs.includes(row) && argumentRepairs.length <= (expect.maxArgumentRepairs ?? 0)));
   if (expect.successfulMutations !== undefined) {
     const successful = mutations.filter((row) => row.outcome_kind === 'succeeded'
       && row.requires_reconciliation === 0 && row.physical_crossing_count + row.host_crossing_count > 0);

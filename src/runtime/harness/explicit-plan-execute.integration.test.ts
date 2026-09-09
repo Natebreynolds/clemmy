@@ -293,13 +293,15 @@ test('explicit Plan prepares native Space schema without effects; Execute activa
       [{ type: 'message', role: 'user', content: 'Create one simple Workspace called Inline Proof.' }] as never,
       { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
   assert.equal(planOutcome.terminal, undefined, JSON.stringify(planOutcome));
-  assert.equal(planOutcome.finalOutput, 'The full plan is ready for review.');
+  // A Plan turn ends when its plan is published; the reply is the plan text
+  // the model wrote, not a further model round.
+  assert.equal(planOutcome.finalOutput, planArtifactText);
   const artifact = plans.getPlanRevisionForSource({ ...identity, principalId: session.id });
   assert.ok(artifact, JSON.stringify(planOutcome.history));
   if (!artifact) return;
   assert.equal(artifact.fullText, planArtifactText);
   const planTerminal = delivery.commitTurnOutcome({ version: 2, id: turnOutcomes.turnOutcomeId(identity), identity,
-    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'The full plan is ready for review.' } });
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: planArtifactText } });
   assert.equal(planTerminal.presentation.status, 'done');
   assert.deepEqual(planTerminal.event.data.planArtifactRef, { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest });
   assert.equal(store.spaceStore.get('inline-proof'), undefined, 'Plan must not create the Workspace');

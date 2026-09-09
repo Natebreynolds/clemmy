@@ -109,10 +109,20 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
       const op = draft.topology.operations.find(op => op.id === step.id);
       const binding = draft.bindings.find(binding => binding.operationId === step.id);
       const equalSet = (a: string[], b: string[]) => JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort());
-      if (!op || !binding || binding.capabilityRef !== step.capabilityRef || op.effect !== step.effect
-        || op.cardinality.kind !== 'once' || !equalSet(op.dependsOn, step.dependsOn)
-        || !equalSet(op.dataFrom, step.dynamicBindings.map(binding => binding.producerStepId))) {
-        throw new Error(`Step ${step.id}: execution draft disagrees with the reviewed capability, effect, dependencies, or result bindings. Keep step.effect and its matching execution_draft topology operation.effect identical.`);
+      // Name the exact disagreement. Live 2026-09-09: five identical refusals
+      // that only listed the four candidate fields cost a Plan turn ten
+      // minutes; the actual mismatch was cardinality, which the message never
+      // mentioned.
+      const disagreements: string[] = [];
+      if (!op) disagreements.push(`no execution_draft.topology operation with id ${JSON.stringify(step.id)}`);
+      if (!binding) disagreements.push(`no execution_draft binding with operationId ${JSON.stringify(step.id)}`);
+      if (binding && binding.capabilityRef !== step.capabilityRef) disagreements.push(`binding.capabilityRef ${JSON.stringify(binding.capabilityRef)} != step.capabilityRef ${JSON.stringify(step.capabilityRef)}`);
+      if (op && op.effect !== step.effect) disagreements.push(`operation.effect ${JSON.stringify(op.effect)} != step.effect ${JSON.stringify(step.effect)}`);
+      if (op && op.cardinality.kind !== 'once') disagreements.push(`operation.cardinality must be {kind:"once"}: a reviewed Plan step executes exactly one call with its exact reviewed arguments; per-item fan-out ("one call per record") is not expressible in explicit Plan mode yet — describe the batch as one step per item, or run it in Act mode where the host binds each item`);
+      if (op && !equalSet(op.dependsOn, step.dependsOn)) disagreements.push(`operation.dependsOn ${JSON.stringify(op.dependsOn)} != step.dependsOn ${JSON.stringify(step.dependsOn)}`);
+      if (op && !equalSet(op.dataFrom, step.dynamicBindings.map(binding => binding.producerStepId))) disagreements.push(`operation.dataFrom ${JSON.stringify(op.dataFrom)} != the producerStepIds of step.dynamicBindings ${JSON.stringify(step.dynamicBindings.map(binding => binding.producerStepId))}`);
+      if (disagreements.length > 0) {
+        throw new Error(`Step ${step.id}: execution draft disagrees with the reviewed outline — ${disagreements.join('; ')}.`);
       }
     }
   }
