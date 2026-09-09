@@ -1477,6 +1477,100 @@ export function hostAccountQuestionForExhaustedTurn(
   return { ...rest, status: 'awaiting_user_input', finalOutput: question };
 }
 
+/** Shared with the ceiling loop's no-progress stop: one voice for "I am stuck". */
+export const NO_PROGRESS_CHECK_IN_STEER = [
+  'You have stopped making progress on this request: your recent tool calls were refused or returned nothing new, and repeating them will not change that.',
+  'Do not call tools now. In your own voice, tell the user what you completed and what stopped you. If a specific missing fact or decision from them would let you continue, ask for exactly that in one question. If nothing from them would help, say plainly that you have stopped and what would need to change. Keep it short.',
+].join('\n\n');
+
+/**
+ * NO PROGRESS IS A CONVERSATION, NOT A PARK.
+ *
+ * When the no-progress governor exhausts a turn and the host does NOT hold the
+ * question itself (see hostAccountQuestionForExhaustedTurn), the turn must
+ * still not end on the engine's typed stop ("Stopped at: repeated_refused_frame.
+ * Next: use the available discovery or read tools…"). The person asked for
+ * work and got a machine sentence (owner 2026-09-09: "why would Clem ever get
+ * anywhere without progress and not check back in with the user?").
+ *
+ * One more activation under the SAME accepted source — before the frame is
+ * sealed, which is why this lives at the turn seam and not above the
+ * conversation — with a one-call ceiling and a steer to explain and, only if a
+ * real missing fact or decision blocks her, to ask for exactly that. A reply
+ * that asks becomes the typed needs_input terminal (awaiting_user_input, with
+ * its own awaiting row so the next human answer is adjacent and consumable);
+ * a reply that does not ask keeps the truthful blocked typing and its retained
+ * work, but in her words. Asked at most once per source. A check-in that does
+ * not complete leaves the original stop untouched.
+ */
+export async function modelCheckInForExhaustedTurn(
+  turnResult: RunTurnResult,
+  input: {
+    sessionId: string;
+    sourceUserSeq: number | undefined;
+    run: (steer: string) => Promise<RunTurnResult>;
+  },
+): Promise<RunTurnResult> {
+  if (turnResult.blockedReason !== 'control_no_progress_exhausted') return turnResult;
+  if (turnResult.status !== 'blocked') return turnResult;
+  const sourceUserSeq = input.sourceUserSeq;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return turnResult;
+  const alreadyAsked = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
+    .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
+  if (alreadyAsked) return turnResult;
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: turnResult.turn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: { kind: 'no_progress_check_in', sourceUserSeq, why: 'governor_exhausted', blockedDetail: turnResult.blockedDetail ?? null },
+  });
+  let checkIn: RunTurnResult;
+  try {
+    checkIn = await input.run(NO_PROGRESS_CHECK_IN_STEER);
+  } catch (error) {
+    logger.warn({ err: error, sessionId: input.sessionId, sourceUserSeq }, 'no-progress check-in: activation threw — typed stop stands');
+    return turnResult;
+  }
+  // The human text, not the decision envelope a brain may wrap it in.
+  const reply = publicReplyText(checkIn.finalOutput, '').trim();
+  const asks = /\?/.test(reply);
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: checkIn.turn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: {
+      kind: 'no_progress_check_in_result',
+      sourceUserSeq,
+      status: checkIn.status,
+      replyBytes: reply.length,
+      asks,
+      ...(checkIn.blockedReason ? { blockedReason: checkIn.blockedReason } : {}),
+    },
+  });
+  if (checkIn.status !== 'completed' || reply.length === 0) return turnResult;
+  const { blockedReason: _reason, blockedDetail: _detail, blockedResumable: _resumable, error: _error, ...rest } = turnResult;
+  if (!asks) {
+    // She explained the stop in her own words; the typed stop (and its retained
+    // work) stands so recovery stays honest.
+    return { ...turnResult, finalOutput: reply };
+  }
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: turnResult.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: reply,
+      purpose: 'clarification',
+      source: 'no_progress_check_in',
+      sourceUserSeq,
+    },
+  });
+  return { ...rest, status: 'awaiting_user_input', finalOutput: reply };
+}
+
 export function reofferUnresolvedAcceptedSourceClarification(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -3594,6 +3688,63 @@ function settledExecutedCallCount(sessionId: string, sourceUserSeq: number | und
 }
 
 /**
+ * The ceiling loop's own no-progress stop (resumes that settle nothing) checks
+ * in the same way modelCheckInForExhaustedTurn does at the turn seam: one
+ * host-owned activation under the same accepted source, one-call ceiling, the
+ * shared steer, asked at most once per source. The deferred checkpoint is not
+ * sealed yet, so the ordinary conversation door admits it. A check-in that
+ * does not complete leaves the typed park to finalize as before.
+ */
+async function checkInAfterNoProgressResume(
+  options: RunConversationOptions,
+  result: RunConversationResult,
+  sourceUserSeq: number | undefined,
+): Promise<RunConversationResult> {
+  if (!sourceUserSeq || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return result;
+  const alreadyAsked = listEvents(options.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
+    .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
+  if (alreadyAsked) return result;
+  let accepted: ReturnType<typeof acceptedUserEvent>;
+  try {
+    accepted = acceptedUserEvent(options.sessionId, sourceUserSeq);
+  } catch {
+    return result;
+  }
+  safeAppend({
+    sessionId: options.sessionId,
+    turn: result.lastTurn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: { kind: 'no_progress_check_in', sourceUserSeq, why: 'no_progress_resume', priorStatus: result.status },
+  });
+  const { taskContinuation: _p, continuationSteer: _s, memoryPrimerQuery: _m, ...stable } = options;
+  const checkIn = await runConversation({
+    ...stable,
+    input: typeof accepted.data.text === 'string' ? accepted.data.text : options.input,
+    continuationSteer: NO_PROGRESS_CHECK_IN_STEER,
+    hostOwnedContinuation: true,
+    sourceUserSeq,
+    reuseRecordedUserInput: true,
+    suppressMemoryCapture: true,
+    suppressAutomaticMemoryForRequest: true,
+    toolCallsPerTurn: 1,
+  });
+  safeAppend({
+    sessionId: options.sessionId,
+    turn: checkIn.lastTurn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: {
+      kind: 'no_progress_check_in_result',
+      sourceUserSeq,
+      status: checkIn.status,
+      replyBytes: String(checkIn.lastDecision?.reply ?? checkIn.lastDecision?.summary ?? '').length,
+    },
+  });
+  return checkIn.status === 'completed' || checkIn.status === 'awaiting_user_input' ? checkIn : result;
+}
+
+/**
  * NEVER-RESTING for interactive lanes: run a conversation and keep going past
  * the per-activation tool ceiling, the way the workflow runner's
  * continuePastToolCallsLimit already does. The ceiling is a checkpoint
@@ -3668,7 +3819,12 @@ export async function runConversationContinuingPastToolCallsLimit(
         ...(decision.resume ? {} : { reason: decision.reason }),
       },
     });
-    if (!decision.resume) break;
+    if (!decision.resume) {
+      if (decision.reason === 'no_progress') {
+        result = await checkInAfterNoProgressResume(options, result, deferredToolCallsLimitSourceUserSeq(result) ?? sourceUserSeq);
+      }
+      break;
+    }
     const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
     if (!checkpointSourceUserSeq) break;
     attempts += 1;
@@ -5861,7 +6017,7 @@ async function runConversationWithinRuntimeConfig(
       }
       await resolveCapability?.();
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
-      const turnResult = await runTurn({
+      const hostTurnOptions: RunTurnOptions = {
         agent: activeAgent,
         sessionId: options.sessionId,
         input: options.input,
@@ -5896,11 +6052,21 @@ async function runConversationWithinRuntimeConfig(
               plainConversationSurface: true as const,
             }
           : {}),
-      });
-      const result = hostActivationConversationResult(
-        hostAccountQuestionForExhaustedTurn(turnResult, { sessionId: options.sessionId, sourceUserSeq }),
-        sourceUserSeq,
+      };
+      const turnResult = await modelCheckInForExhaustedTurn(
+        hostAccountQuestionForExhaustedTurn(await runTurn(hostTurnOptions), { sessionId: options.sessionId, sourceUserSeq }),
+        {
+          sessionId: options.sessionId,
+          sourceUserSeq,
+          run: (steer) => runTurn({
+            ...hostTurnOptions,
+            continuationSteer: steer,
+            hostOwnedContinuation: true as const,
+            toolCallsPerTurn: 1,
+          }),
+        },
       );
+      const result = hostActivationConversationResult(turnResult, sourceUserSeq);
       if (result.status === 'held') {
         scheduleHostCheckpointRecovery(options, sourceUserSeq);
         return result;

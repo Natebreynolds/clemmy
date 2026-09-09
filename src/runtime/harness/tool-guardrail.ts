@@ -566,6 +566,10 @@ export interface GuardrailDecision {
   scopeApproved?: boolean;
   /** Positive irreversibility (send/publish) from the external-write classifier; undefined = unknown. */
   irreversible?: boolean;
+  /** True only when the canonical classifier actually graded this action's
+   * reversibility; an ungraded action reports irreversible:false and must not
+   * be mistaken for a declared-reversible one. */
+  reversibilityKnown?: boolean;
   /** A delete-class invocation; correctable writes are never destructive. */
   destructive?: boolean;
   /** Slug-aware mutating verdict for THIS call (composio_execute_tool is
@@ -1434,11 +1438,16 @@ export function evaluateToolCall(
         } catch { scopeApproved = false; }
       }
       let irreversible: boolean | undefined;
+      let reversibilityKnown: boolean | undefined;
       let destructive: boolean | undefined;
       try {
-        irreversible = classifyExternalWrite(toolName, args).irreversible;
+        const shape = classifyExternalWrite(toolName, args);
+        irreversible = shape.irreversible;
+        // The classifier answers `irreversible:false` for an action it has
+        // never graded (classificationKnown:false). Unknown is not reversible.
+        reversibilityKnown = shape.classificationKnown === true;
         destructive = isDestructiveToolInvocation(toolName, args);
-      } catch { irreversible = undefined; destructive = undefined; }
+      } catch { irreversible = undefined; reversibilityKnown = undefined; destructive = undefined; }
       return {
         action: 'halt',
         signature,
@@ -1451,6 +1460,7 @@ export function evaluateToolCall(
         dangerousWrite,
         scopeApproved,
         ...(irreversible !== undefined ? { irreversible } : {}),
+        ...(reversibilityKnown !== undefined ? { reversibilityKnown } : {}),
         ...(destructive !== undefined ? { destructive } : {}),
         // Carry fanoutBlock so the recoverable refusal wins over a mutating-halt
         // for a fanout-keyed read (2026-07-12). With the isMutatingCall fix a read
@@ -1623,15 +1633,21 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
   // THE GATE IS THE IRREVERSIBLE BOUNDARY, NOT "EXTERNAL". Fifty drafts, fifty
   // sheet rows, fifty CRM updates are correctable work the owner asked for; a
   // static halt at the eighth distinct one only forced the batch toward Plan
-  // mode (2026-09-09). Sends/publishes (positively irreversible) and deletes
-  // keep the enforced halt; an invocation the classifier cannot grade at all
-  // (irreversible undefined) also keeps it, fail-closed.
+  // mode (2026-09-09). Only a DECLARED reversible action (the canonical
+  // classifier graded it and says irreversible:false) is exempt. Sends and
+  // publishes (positively irreversible), deletes, and any action the
+  // classifier never graded — it reports irreversible:false with
+  // classificationKnown:false for an opaque provider action — keep the
+  // enforced halt, fail-closed. Unknown is not reversible.
+  const declaredReversible = decision.irreversible === false
+    && decision.reversibilityKnown === true
+    && decision.destructive !== true;
   if (
     decision.action === 'halt'
     && decision.rule === 'same_mut_tool_repeat'
     && decision.dangerousWrite === true // explicit external effect only; local shell/build/file work never mass-halts
     && decision.scopeApproved !== true // an approved batch is deliberate work — approve-once-then-run wins
-    && (decision.irreversible !== false || decision.destructive === true)
+    && !declaredReversible
     && sameMutHaltEnforcedInWarn()
   ) {
     return decision;

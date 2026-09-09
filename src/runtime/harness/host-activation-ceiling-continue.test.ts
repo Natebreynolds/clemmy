@@ -216,3 +216,48 @@ test('a ceiling made only of pre-dispatch refusals resumes so the model can repa
   assert.ok(Number(resumes[0]!.refusedThisActivation) >= 3, JSON.stringify({ resume: resumes[0], returned: returned.slice(0, 4) }));
 });
 
+test('when repair-only resumes stop making progress, she checks in with the user in her own words', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const { saved, saveNote } = fixture();
+  const stuck = 'I finished nothing yet: the local note tool keeps refusing my calls. Should I save the notes as files in your workspace instead?';
+  const model = recordingModel([
+    [1, 2, 3, 4].map((n) => functionCall(`bad-a${n}`, 'save_note', { id: `n${n}` })),
+    [1, 2, 3, 4].map((n) => functionCall(`bad-b${n}`, 'save_note', { id: `n${n}` })),
+    [1, 2, 3, 4].map((n) => functionCall(`bad-c${n}`, 'save_note', { id: `n${n}` })),
+    // The host-owned check-in activation: no tools, one question.
+    [done(stuck)],
+  ]);
+  const agent = { model, instructions: 'Use the exact configured tool.', tools: [saveNote] };
+  bindSurface(session.id, agent, [saveNote]);
+  const result = await runConversation({
+    sessionId: session.id,
+    input: 'Save notes n1 through n4.',
+    turnEngine: 'host_v1',
+    judgeCompletion: false,
+    agent: agent as never,
+    makeRunner: () => throwingRunner() as never,
+    maxTurns: 6,
+    toolCallsPerTurn: 3,
+    suppressMemoryCapture: true,
+  });
+  assert.equal(saved.length, 0);
+  const resumes = guides(session.id).filter((row) => row.kind === 'budget_checkpoint_auto_resume');
+  // Two repair-only resumes, then the governor stops the third activation
+  // (repeated_refused_frame); the stop becomes a check-in, not a typed park.
+  assert.deepEqual(resumes.map((row) => row.resume), [true, true], JSON.stringify(resumes));
+  const checkIns = guides(session.id).filter((row) => row.kind === 'no_progress_check_in');
+  assert.equal(checkIns.length, 1, JSON.stringify(checkIns));
+  assert.equal(checkIns[0]!.why, 'governor_exhausted');
+  // Her reply asks a real question, so the terminal is the typed pending
+  // question (not "done", not the engine's typed stop) and the next human
+  // answer is adjacent to it.
+  assert.equal(result.status, 'awaiting_user_input', JSON.stringify(result).slice(0, 400));
+  assert.match(String(result.lastDecision?.reply ?? ''), /refusing my calls/);
+  const asked = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0]!.data.source, 'no_progress_check_in');
+  assert.match(String(asked[0]!.data.question), /save the notes as files/);
+  assert.equal(eventlog.listEvents(session.id, { types: ['user_input_received'] }).length, 1, 'the check-in is host-owned');
+  assert.equal(model.calls(), 4, 'exactly one check-in activation');
+});
+

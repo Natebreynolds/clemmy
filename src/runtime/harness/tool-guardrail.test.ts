@@ -14,6 +14,8 @@
 process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
+const capabilityManifests = await import('./capability-manifest.js');
 import {
   hashToolCall,
   evaluateToolCall,
@@ -1328,6 +1330,52 @@ test('changed plan consequence and successful progress reset the semantic refusa
   assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 5 }, refusal('first issue')), undefined);
 });
 
+/** One exact, current manifest declaring OUTLOOK_CREATE_DRAFT a reversible
+ * external write — the same positive authority production consumes at the
+ * effect boundary (see installFixtureOperationContracts in call-tool.test). */
+function installReversibleDraftContract(): () => void {
+  const previous = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:fixture:tool-guardrail:outlook_create_draft',
+    providerKind: 'composio',
+    operationId: 'OUTLOOK_CREATE_DRAFT',
+    providerIdentity: 'fixture:tool-guardrail:configured-provider',
+    providerVersion: '2026-09-09',
+    operationVersion: '1',
+    definitionFingerprint: 'd'.repeat(64),
+    effect: 'external_write',
+    operationSemantics: { version: 1 as const, reversibility: 'reversible' as const },
+    accountId: 'account:fixture:tool-guardrail',
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_provider_readback' },
+    outputContract: { kind: 'provider_acknowledgement' },
+    evidenceContract: { kinds: ['receipt'], readbackRequired: true },
+    purpose: 'persist_collection',
+    provenance: { issuer: 'tool-guardrail:test-fixture', issuedAt: '2026-09-09T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+  });
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => {
+      throw new Error('fixture catalog invoke must remain unreachable');
+    },
+  });
+  assert.equal(capabilityCatalogs.isCurrentCallableCatalogEntry(factory.get(manifest.manifestId)!), true);
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  return () => capabilityCatalogs.installHostCapabilityCatalogFactory(previous);
+}
+
 test('the same-tool halt enforces only at the irreversible boundary or for a delete (reversible batches warn)', async () => {
   const { applyMode, evaluateToolCall, _resetGuardrailStateForTests } = await import('./tool-guardrail.js');
   const base = { signature: 's', toolName: 'composio_execute_tool', reason: 'runaway', rule: 'same_mut_tool_repeat' as const,
@@ -1335,20 +1383,52 @@ test('the same-tool halt enforces only at the irreversible boundary or for a del
   assert.equal(applyMode({ ...base, irreversible: true }, 'warn').action, 'halt', 'a send batch still halts');
   assert.equal(applyMode({ ...base, irreversible: false, destructive: true }, 'warn').action, 'halt', 'a delete batch still halts');
   assert.equal(applyMode({ ...base }, 'warn').action, 'halt', 'an ungraded external write fails closed');
-  assert.equal(applyMode({ ...base, irreversible: false, destructive: false }, 'warn').action, 'warn', 'fifty drafts are correctable work, not a runaway');
-  // Through the real evaluator: eight distinct Outlook drafts warn; eight distinct sends halt.
+  // The classifier reports irreversible:false for an action it never graded
+  // (classificationKnown:false). Unknown is not reversible — only a DECLARED
+  // reversible action is exempt.
+  assert.equal(applyMode({ ...base, irreversible: false, reversibilityKnown: false, destructive: false }, 'warn').action, 'halt', 'unknown reversibility fails closed');
+  assert.equal(applyMode({ ...base, irreversible: false, destructive: false }, 'warn').action, 'halt', 'irreversible:false without a graded classification fails closed');
+  assert.equal(applyMode({ ...base, irreversible: false, reversibilityKnown: true, destructive: false }, 'warn').action, 'warn', 'fifty drafts are correctable work, not a runaway');
+  // Through the real classifier -> evaluator -> mode path. Reversibility is a
+  // POSITIVE fact the canonical manifest declares; with no current contract
+  // the classifier grades nothing and eight distinct drafts still halt.
   if (typeof _resetGuardrailStateForTests === 'function') _resetGuardrailStateForTests();
-  const scope = `halt-boundary-${Date.now()}`;
+  const ungradedScope = `halt-boundary-ungraded-${Date.now()}`;
   let last;
   for (let i = 1; i <= 8; i += 1) {
-    last = applyMode(evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: `d${i}` } }, `draft-${i}`), 'warn');
+    last = applyMode(evaluateToolCall(ungradedScope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: `u${i}` } }, `ungraded-${i}`), 'warn');
   }
-  assert.equal(last?.rule, 'same_mut_tool_repeat');
-  assert.equal(last?.action, 'warn', JSON.stringify(last));
+  assert.equal(last?.rule, 'same_mut_tool_repeat', JSON.stringify(last));
+  assert.equal(last?.reversibilityKnown, false, JSON.stringify(last));
+  assert.equal(last?.action, 'halt', 'an ungraded draft create fails closed');
+  // With the current manifest declaring the draft create reversible, eight
+  // distinct drafts are correctable work and warn.
+  const restoreCatalog = installReversibleDraftContract();
+  try {
+    const scope = `halt-boundary-${Date.now()}`;
+    for (let i = 1; i <= 8; i += 1) {
+      last = applyMode(evaluateToolCall(scope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: `d${i}` } }, `draft-${i}`), 'warn');
+    }
+    assert.equal(last?.rule, 'same_mut_tool_repeat', JSON.stringify(last));
+    assert.equal(last?.reversibilityKnown, true, JSON.stringify(last));
+    assert.equal(last?.irreversible, false, JSON.stringify(last));
+    assert.equal(last?.action, 'warn', JSON.stringify(last));
+  } finally {
+    restoreCatalog();
+  }
   const sendScope = `halt-boundary-send-${Date.now()}`;
   for (let i = 1; i <= 8; i += 1) {
     last = applyMode(evaluateToolCall(sendScope, 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: { subject: `s${i}` } }, `send-${i}`), 'warn');
   }
+  assert.equal(last?.action, 'halt', JSON.stringify(last));
+  // An opaque provider action the canonical classifier has never graded runs
+  // through the real classifier -> evaluator -> mode path and keeps the halt.
+  const opaqueScope = `halt-boundary-opaque-${Date.now()}`;
+  for (let i = 1; i <= 8; i += 1) {
+    last = applyMode(evaluateToolCall(opaqueScope, 'mcp__new-provider__opaque_action', { id: `o${i}` }, `opaque-${i}`), 'warn');
+  }
+  assert.equal(last?.rule, 'same_mut_tool_repeat', JSON.stringify(last));
+  assert.equal(last?.reversibilityKnown, false, JSON.stringify(last));
   assert.equal(last?.action, 'halt', JSON.stringify(last));
 });
 
