@@ -123,7 +123,7 @@ after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('standard spine activates exact action authority before building its sole business carrier', async () => {
+test('standard spine activates exact action authority while keeping registered reads directly callable', async () => {
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'action activation' });
   let buildCount = 0;
   let capturedNames: string[] = [];
@@ -155,8 +155,9 @@ test('standard spine activates exact action authority before building its sole b
   assert.equal(buildCount, 1);
   assert.ok(capturedNames.includes('work_call'));
   assert.ok(capturedNames.includes('call_tool'), 'action preserves its read/control carrier through the explicit allowlist');
-  assert.equal(capturedNames.includes('user_profile_read'), false, 'business tools stay behind work_call');
-  assert.equal(capturedNames.includes('workspace_roots'), false, 'business tools stay behind work_call');
+  assert.equal(capturedNames.includes('user_profile_read'), false, 'a reader without a loaded schema stays deferred until acquired');
+  assert.ok(capturedNames.includes('workspace_roots'), 'the registered filesystem reader carries its actual schema');
+  assert.equal(capturedNames.includes('write_file'), false, 'authoring still crosses work_call with exact authority');
   assert.ok(capturedNames.includes('tool_search'), 'control discovery remains directly callable');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.kind, 'blocked', 'a zero-call action done claim must fail closed');

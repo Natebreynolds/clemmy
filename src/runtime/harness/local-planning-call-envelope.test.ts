@@ -161,13 +161,13 @@ test('production local call envelope projects each exact write_file mode without
 
   for (const [label, args, expectedRisk] of [
     ['overwrite', { path: 'existing.txt', content: 'replace', mode: 'overwrite' as const, append: null }, {
-      reversibility: 'irreversible', consequence: 'update', destructive: true,
+      reversibility: 'reversible', consequence: 'update', destructive: false,
     }],
     ['append-override', { path: 'existing.txt', content: 'add', mode: 'create' as const, append: true }, {
-      reversibility: 'irreversible', consequence: 'update', destructive: false,
+      reversibility: 'reversible', consequence: 'update', destructive: false,
     }],
     ['overwrite-override', { path: 'existing.txt', content: 'replace', mode: null, append: false }, {
-      reversibility: 'irreversible', consequence: 'update', destructive: true,
+      reversibility: 'reversible', consequence: 'update', destructive: false,
     }],
   ] as const) {
     const projected = await evaluateWriteEnvelope(label, args);
@@ -177,11 +177,11 @@ test('production local call envelope projects each exact write_file mode without
   }
 });
 
-test('exact accepted coverage auto-runs create and emits one canonical approval for append or overwrite', async () => {
-  for (const [label, args, expectedKind] of [
-    ['create', { path: 'new.txt', content: 'new', mode: 'create' as const, append: null }, 'proceed'],
-    ['append', { path: 'existing.txt', content: 'add', mode: 'append' as const, append: null }, 'needs_user'],
-    ['overwrite', { path: 'existing.txt', content: 'replace', mode: 'overwrite' as const, append: null }, 'needs_user'],
+test('exact accepted coverage proceeds for create and recoverable append or overwrite without an extra approval', async () => {
+  for (const [label, args] of [
+    ['create', { path: 'new.txt', content: 'new', mode: 'create' as const, append: null }],
+    ['append', { path: 'existing.txt', content: 'add', mode: 'append' as const, append: null }],
+    ['overwrite', { path: 'existing.txt', content: 'replace', mode: 'overwrite' as const, append: null }],
   ] as const) {
     const projected = await evaluateWriteEnvelope(`policy-${label}`, args);
     assert.equal(projected.status, 'decided', JSON.stringify(projected));
@@ -218,17 +218,8 @@ test('exact accepted coverage auto-runs create and emits one canonical approval 
       crossing: 'not_started',
       reservationAlreadyClaimed: false,
     });
-    assert.equal(decision.kind, expectedKind, JSON.stringify(decision));
-    if (expectedKind === 'proceed') {
-      assert.equal(decision.kind === 'proceed' ? decision.basis : null, 'exact_reversible_work');
-    } else {
-      assert.equal(decision.kind === 'needs_user' ? decision.need : null, 'approval');
-      assert.equal(
-        decision.kind === 'needs_user' ? decision.subjectDigest : null,
-        call.bindingDigest,
-        'the approval is bound to this one exact logical call',
-      );
-    }
+    assert.equal(decision.kind, 'proceed', JSON.stringify(decision));
+    assert.equal(decision.kind === 'proceed' ? decision.basis : null, 'exact_reversible_work');
   }
 });
 

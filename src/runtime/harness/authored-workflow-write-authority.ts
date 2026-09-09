@@ -1051,8 +1051,8 @@ interface AuthoredLocalWriteRisk {
  * Two legible sources, no tool names:
  *  - a row that DECLARES local planning semantics (write_file, workspace
  *    definition writes) must match exactly one declared, non-destructive,
- *    reversible/create-only definition for THESE arguments — an overwrite or
- *    append mode therefore stays uncovered;
+ *    reversible/create-only definition for THESE arguments. File revisions
+ *    qualify because the file writer preserves prior bytes; deletion does not;
  *  - a row with no declared semantics is covered only when the registry
  *    classifies it as a CONTROL-plane operation: Clementine's own ledgers
  *    (tasks, goals, spaces, execution bookkeeping). Business-role local

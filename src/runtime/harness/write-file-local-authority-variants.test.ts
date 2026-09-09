@@ -100,14 +100,14 @@ test('write_file declares three split local authority refs with truthful risk', 
     },
     {
       capabilityRef: 'cap:local:write_file:append',
-      reversibility: 'irreversible',
+      reversibility: 'reversible',
       destructive: false,
       destinationPosture: 'named_existing',
     },
     {
       capabilityRef: 'cap:local:write_file:overwrite',
-      reversibility: 'irreversible',
-      destructive: true,
+      reversibility: 'reversible',
+      destructive: false,
       destinationPosture: 'named_existing',
     },
   ]);
