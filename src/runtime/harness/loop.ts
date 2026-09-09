@@ -9702,6 +9702,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const turn = nextTurnNumber(row);
   let persistedRecoveryState: HostRecoveryState | undefined;
   let adoptedCheckpointContinuation = false;
+  let preflightBlockSteer: string | undefined;
   let adoptedRecoveryState: HostRecoveryState | undefined;
   const recoveryBlob = session.loadRecoveryState();
   if (recoveryBlob) {
@@ -10416,11 +10417,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       const STATIC_AVG_TOOL_RETURN = 2_000;
       const EXPECTED_OUTPUT_PRIOR = 1_500;
       const ADAPTIVE_SAFETY_FACTOR = 1.2;
-      const { plannedToolCallCount, avgToolReturnTokens } = inferTurnPriors(
+      const inferredPriors = inferTurnPriors(
         options.sessionId,
         turn,
         { fallbackToolCount: STATIC_PLANNED_TOOL_CALLS, fallbackAvgReturn: STATIC_AVG_TOOL_RETURN, safetyFactor: ADAPTIVE_SAFETY_FACTOR },
       );
+      // The per-activation tool ceiling bounds what any single activation can
+      // call; a prior above it predicts work this activation cannot do. After
+      // a fifty-item batch the inferred prior was 120 calls × 2000 tokens and
+      // the gate blocked the follow-up step at a predicted 131% of the window.
+      const plannedToolCallCount = Math.min(inferredPriors.plannedToolCallCount, Math.max(1, toolCounter.limit));
+      const avgToolReturnTokens = inferredPriors.avgToolReturnTokens;
       const modelId = typeof (options.agent as { model?: unknown })?.model === 'string'
         ? (options.agent as { model: string }).model
         : MODELS.primary;
@@ -10466,16 +10473,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       }
       if (verdict.status === 'block') {
         if (sessionKind === 'chat') {
-          // Inject the F1-rewritten block message pointing at real tools.
-          const blockMessage = buildPreflightBlockMessage({
+          // Deliver the F1-rewritten block message as model-call steer, NEVER
+          // as an accepted-history item: unshifting it into `items` changed
+          // the pre-history digest the accepted-batch chain verifies, so a
+          // resumed source that tripped this gate was refused at every
+          // admission and died at exact_checkpoint_admission_exhausted (live
+          // 2026-09-09, after a fifty-worker fan-out). The steer joins the
+          // context packet at request time, outside the durable history.
+          preflightBlockSteer = buildPreflightBlockMessage({
             predictedTokens: verdict.predictedTokens,
             blockFraction: verdict.blockFraction,
             effectiveLimit: verdict.effectiveLimit,
           });
-          items.unshift({
-            role: 'system',
-            content: blockMessage,
-          } as AgentInputItem);
         } else if ((process.env.CLEMMY_PREFLIGHT_WORKFLOW ?? 'on').toLowerCase() !== 'off') {
           // Workflow / execution / agent path — no user to consult,
           // no propose_plan interlude available. Emit a loud event
@@ -10887,6 +10896,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           ? `[pre-execution opening already delivered for this exact request]\n${sameTurnPreamble}\nContinue the requested work now; do not repeat this opening or ask for generic permission.`
           : '',
         options.continuationSteer,
+        preflightBlockSteer,
       ]
         .filter(Boolean).join('\n\n');
       if (contextPacketText) {

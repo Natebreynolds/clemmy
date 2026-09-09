@@ -154,8 +154,10 @@ export async function runClaudeAgentSdkWorker(
         abortSignal,
         shouldCancel: () => abortSignal.aborted,
         // Cancellation must interrupt a quiet worker stream promptly enough to
-        // drain before run_worker's unchanged outer deadline.
-        livenessHeartbeatMs: 50,
+        // drain before run_worker's unchanged outer deadline. This is the
+        // runtime TICK, not the heartbeat cadence: used as the heartbeat it
+        // wrote ~100 progress rows a second per worker (live 2026-09-09).
+        cancellationTickMs: 50,
       } : {}),
       ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
     };

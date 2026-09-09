@@ -1437,6 +1437,8 @@ export interface ClaudeAgentSdkRunOptions {
   toolEconomyState?: ToolEconomyState;
   /** Test/embedding override; production defaults to one visible tick/minute. */
   livenessHeartbeatMs?: number;
+  /** Runtime tick for cancellation checks, independent of heartbeat pacing. */
+  cancellationTickMs?: number;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -3296,11 +3298,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
       while (true) {
         const heartbeatIntervalMs = Math.max(1, options.livenessHeartbeatMs ?? 60_000);
+        // A caller may need a much faster runtime tick than its heartbeat
+        // cadence (a worker polls cancellation every 50 ms). The tick and the
+        // durable heartbeat EVENT are paced separately: live 2026-09-09, fifty
+        // workers using the tick as their heartbeat wrote 11,275
+        // progress_check_in rows in 110 s into the parent session's log.
+        const runtimeTickMs = Math.max(1, Math.min(heartbeatIntervalMs, options.cancellationTickMs ?? heartbeatIntervalMs));
         const next = await nextSdkMessageWithRuntimeTicks(
           iterator,
           options,
           firstByteMs === null ? toolSurfaceFirstMessageMs() : 0,
-          heartbeatIntervalMs,
+          runtimeTickMs,
           async () => {
             if (effectiveShouldCancel && await effectiveShouldCancel()) {
               await interruptQuery();
