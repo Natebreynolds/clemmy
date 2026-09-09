@@ -1823,7 +1823,7 @@ export function buildAuthorizedToolSearchCandidateSources(
             score: 1,
           }];
           return planningIdentity
-            ? prepareExternalMcpCandidates({ candidates, query, signal, deadlineAt: deadlineAt ?? Infinity })
+            ? prepareExternalMcpCandidates({ candidates, query, reuseSearchPreparation: false, signal, deadlineAt: deadlineAt ?? Infinity })
             : candidates;
         }
       }
