@@ -49,6 +49,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import {
   runConversation,
+  runConversationContinuingPastToolCallsLimit,
   runConversationFromResume,
   verifiedWorkflowRunDispatchReceipts,
 } from '../runtime/harness/loop.js';
@@ -4609,7 +4610,7 @@ export async function runDiscordHarnessConversation(opts: {
       // tool calls, approvals, continuation, and terminal ownership stay on the
       // same harness path as Codex.
       const runSharedHarnessPath = async (): Promise<void> => {
-        await runConversation({
+        await runConversationContinuingPastToolCallsLimit({
           buildAgent: (identity) => buildOrchestratorAgent({
             userInput: effectiveInput,
             sessionId: session.id,

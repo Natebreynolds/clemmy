@@ -410,7 +410,7 @@ import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-au
 import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
 import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
-import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { runConversation, runConversationContinuingPastToolCallsLimit, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from '../runtime/harness/restart-recovery.js';
 import { acceptedSourceOutcome, workflowOwnedUnfinishedAttemptIds } from '../runtime/harness/accepted-source-outcome.js';
@@ -17074,7 +17074,7 @@ export function registerConsoleRoutes(
             userId: reviewedPlanOwnerControl?.conversationPrincipalId ?? 'desktop',
           },
           async (req) => {
-            const result = await runConversation({
+            const result = await runConversationContinuingPastToolCallsLimit({
               buildAgent: (identity) => buildOrchestratorAgent({
                 userInput: req.message,
                 sessionId,

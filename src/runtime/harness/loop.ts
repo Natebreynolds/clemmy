@@ -3547,21 +3547,117 @@ export interface RunConversationResult {
  * Project that one activation into the shared conversation terminal algebra;
  * never feed it through the legacy outer continuation/judge loop.
  */
-/** Settled business calls for one accepted source, read from the ledger. The
- * host-lane ceiling loop measures progress here rather than trusting a step
- * count; null when the ledger is unreadable (the loop then assumes progress
- * once and lets the attempt cap bound it). */
-function settledBusinessCallCount(sessionId: string, sourceUserSeq: number | undefined): number | null {
+/** Calls that actually executed for one accepted source, read from the
+ * ledger. The host-lane ceiling loop measures progress here rather than
+ * trusting a step count. Pre-dispatch refusals (including the siblings an
+ * activation boundary closes as stopped-before-dispatch) are not progress.
+ * null when the ledger is unreadable: the loop then assumes progress once and
+ * lets the attempt cap bound it. */
+function settledExecutedCallCount(sessionId: string, sourceUserSeq: number | undefined): number | null {
   if (!sourceUserSeq) return null;
   try {
     const row = openEventLog().prepare(`
       SELECT COUNT(*) AS n FROM logical_call_settlements
-       WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
+       WHERE session_id = ? AND source_user_seq = ?
+         AND execution_kind <> 'refused_pre_dispatch'
     `).get(sessionId, sourceUserSeq) as { n: number } | undefined;
     return row?.n ?? 0;
   } catch {
     return null;
   }
+}
+
+/**
+ * NEVER-RESTING for interactive lanes: run a conversation and keep going past
+ * the per-activation tool ceiling, the way the workflow runner's
+ * continuePastToolCallsLimit already does. The ceiling is a checkpoint
+ * cadence, not an ending. Chat parked to a person instead, so a 50-item job
+ * stopped at the 64-call activation with "progress is checkpointed" and
+ * waited for the next message (live 2026-09-09).
+ *
+ * Policy mirrors the workflow lane byte-for-byte: resume only on the typed
+ * tool-calls checkpoint, only while the budget preset opts in, only while the
+ * parked activation executed new calls (read from the ledger, never assumed),
+ * and under the attempt cap. Each resume is a fresh activation under the SAME
+ * accepted source through the ordinary runConversation door — sequential,
+ * never nested (a nested call for the same source joins its own in-flight
+ * promise) — so plan/expected-work authority and the committed partial frame
+ * carry over and nothing is replayed. A park that survives the loop is
+ * published as the ordinary continue-shaped terminal, exactly as before.
+ */
+export async function runConversationContinuingPastToolCallsLimit(
+  options: RunConversationOptions,
+): Promise<RunConversationResult> {
+  // Measured before the first activation when the accepted source is already
+  // known (interactive routes pass it), so that activation's own settlements
+  // count. Otherwise the parked activation is progress by construction: the
+  // ceiling only trips after the limit's worth of admitted calls.
+  let settledBefore: number | null = settledExecutedCallCount(options.sessionId, options.sourceUserSeq);
+  let result = await runConversation({ ...options, deferToolCallsLimitTerminal: true });
+  if (result.status !== 'limit_exceeded' || result.limitKind !== 'tool_calls') return result;
+  const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
+    await import('./continue-directive.js');
+  const cap = chatAutoContinueCap();
+  const sourceUserSeq = deferredToolCallsLimitSourceUserSeq(result) ?? options.sourceUserSeq;
+  let attempts = 0;
+  while (result.status === 'limit_exceeded' && result.limitKind === 'tool_calls') {
+    const settledAfter = settledExecutedCallCount(options.sessionId, sourceUserSeq);
+    const settledThisActivation = settledBefore === null || settledAfter === null
+      ? 1
+      : settledAfter - settledBefore;
+    const decision = chatAutoContinueDecision({
+      autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
+      attempts,
+      cap,
+      stepsThisActivation: settledThisActivation,
+    });
+    safeAppend({
+      sessionId: options.sessionId,
+      turn: result.lastTurn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'budget_checkpoint_auto_resume',
+        sourceUserSeq: sourceUserSeq ?? null,
+        attempt: attempts + 1,
+        cap,
+        settledThisActivation,
+        resume: decision.resume,
+        ...(decision.resume ? {} : { reason: decision.reason }),
+      },
+    });
+    if (!decision.resume) break;
+    const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
+    if (!checkpointSourceUserSeq) break;
+    attempts += 1;
+    settledBefore = settledAfter;
+    const {
+      taskContinuation: _noPacket,
+      continuationSteer: _noSteer,
+      memoryPrimerQuery: _noPrimer,
+      ...stableOptions
+    } = options;
+    result = await runConversation({
+      ...stableOptions,
+      input: buildContinueInput(result.lastDecision?.summary, { auto: true }),
+      sourceUserSeq: checkpointSourceUserSeq,
+      reuseRecordedUserInput: true,
+      deferToolCallsLimitTerminal: true,
+      suppressMemoryCapture: true,
+      suppressAutomaticMemoryForRequest: true,
+    });
+  }
+  if (result.status === 'limit_exceeded' && result.limitKind === 'tool_calls' && !result.publicPresentation) {
+    const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
+    if (checkpointSourceUserSeq) {
+      result = finalizeDeferredToolCallsLimitTerminal({
+        checkpoint: result,
+        sourceUserSeq: checkpointSourceUserSeq,
+        outcome: { kind: 'limit_exceeded' },
+      });
+    }
+  }
+  return result;
 }
 
 function hostActivationConversationResult(
@@ -5715,25 +5811,14 @@ async function runConversationWithinRuntimeConfig(
       }
       await resolveCapability?.();
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
-      // NEVER-RESTING on the host lane. The per-activation tool ceiling is a
-      // checkpoint cadence, not an ending: the workflow lane already loops
-      // past it under the same accepted source (continuePastToolCallsLimit);
-      // chat parked to a person instead, so a 50-item job stopped at the
-      // 64-call activation with "progress is checkpointed" and waited (live
-      // 2026-09-09). Same policy here: resume while the budget preset opts in,
-      // the activation settled new work, and the attempt cap holds. Every
-      // resume is a fresh activation (new counter) under the SAME source, so
-      // plan/expected-work authority and the partial frame history carry over
-      // and nothing is replayed. Zero progress or the cap parks as before.
-      const interactiveCeilingContinuation = !options.deferToolCallsLimitTerminal;
-      const hostActivationTurn = (activation: { input: string; continuation: boolean }) => runTurn({
-        agent: activeAgent!,
+      const turnResult = await runTurn({
+        agent: activeAgent,
         sessionId: options.sessionId,
-        input: activation.input,
+        input: options.input,
         judgeCompletion: options.judgeCompletion,
         sourceUserSeq,
         runAttemptId: options.runAttemptId,
-        ...(options.deferToolCallsLimitTerminal || interactiveCeilingContinuation
+        ...(options.deferToolCallsLimitTerminal
           ? { deferToolCallsLimitTerminal: true as const }
           : {}),
         turnEngine: frozenTurnEngine,
@@ -5745,17 +5830,15 @@ async function runConversationWithinRuntimeConfig(
         onConversationPreamble: options.onConversationPreamble,
         mcpToolScope: options.mcpToolScope,
         ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
-        ...(options.continuationSteer && !activation.continuation ? { continuationSteer: options.continuationSteer } : {}),
+        ...(options.continuationSteer ? { continuationSteer: options.continuationSteer } : {}),
         ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
-        ...(activation.continuation
-          || options.suppressAutomaticMemoryForRequest === true
+        ...(options.suppressAutomaticMemoryForRequest === true
           || explicitlyOptsOutOfAutomaticMemoryRecall(options.semanticTaskInput ?? options.input)
           ? { suppressAutomaticMemoryForRequest: true as const }
           : {}),
         ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
-        ...(options.suppressMemoryCapture || activation.continuation ? { suppressMemoryCapture: true as const } : {}),
-        ...(activation.continuation ? { internalContinuation: true as const } : {}),
-        ...(contextWarmedAtNode || activation.continuation ? { contextWarmedAtNode: true } : {}),
+        ...(options.suppressMemoryCapture ? { suppressMemoryCapture: true as const } : {}),
+        ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
         ...(hostPlainConversation
           ? {
               skipAutomaticMemoryPrimer: true as const,
@@ -5763,53 +5846,6 @@ async function runConversationWithinRuntimeConfig(
             }
           : {}),
       });
-      let turnResult = await hostActivationTurn({ input: options.input, continuation: false });
-      if (interactiveCeilingContinuation) {
-        const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
-          await import('./continue-directive.js');
-        const cap = chatAutoContinueCap();
-        let continueAttempts = 0;
-        let settledBefore = settledBusinessCallCount(options.sessionId, sourceUserSeq);
-        while (turnResult.status === 'limit_exceeded' && turnResult.limitKind === 'tool_calls') {
-          const settledAfter = settledBusinessCallCount(options.sessionId, sourceUserSeq);
-          const decision = chatAutoContinueDecision({
-            autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
-            attempts: continueAttempts,
-            cap,
-            // Progress is measured in the ledger, never assumed: an activation
-            // that settled no new business call since the last checkpoint is
-            // spinning on its ceiling and parks to a person.
-            stepsThisActivation: settledAfter === null || settledBefore === null ? 1 : settledAfter - settledBefore,
-          });
-          safeAppend({
-            sessionId: options.sessionId,
-            turn: turnResult.turn,
-            role: 'system',
-            type: 'guardrail_tripped',
-            data: {
-              kind: 'budget_checkpoint_auto_resume',
-              sourceUserSeq: sourceUserSeq ?? null,
-              attempt: continueAttempts + 1,
-              cap,
-              settledThisActivation: settledAfter === null || settledBefore === null ? null : settledAfter - settledBefore,
-              resume: decision.resume,
-              ...(decision.resume ? {} : { reason: decision.reason }),
-            },
-          });
-          if (!decision.resume) break;
-          continueAttempts += 1;
-          settledBefore = settledAfter;
-          turnResult = await hostActivationTurn({
-            input: buildContinueInput(undefined, { auto: true }),
-            continuation: true,
-          });
-        }
-        if (turnResult.status === 'limit_exceeded' && turnResult.limitKind === 'tool_calls') {
-          // Parked for real: the standard continue-shaped terminal below owns
-          // the public presentation, exactly as before this loop existed.
-          HarnessSession.load(options.sessionId)?.markStatus('failed');
-        }
-      }
       const result = hostActivationConversationResult(
         hostAccountQuestionForExhaustedTurn(turnResult, { sessionId: options.sessionId, sourceUserSeq }),
         sourceUserSeq,
