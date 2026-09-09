@@ -10,6 +10,7 @@ import { cn } from '@/lib/cn';
 import { forgetFact, pinFact, restoreFact, updateFact, type MemoryHit } from '@/lib/memory';
 import { KIND_LABEL, displayTitle, hitSourceLine, memoryKind } from '@/lib/memory-why';
 import { MemoryKindIcon } from './MemoryKindIcon';
+import { Constellation } from './Constellation';
 
 const NIGHT = { bg: '#14131A', pane: '#1D1B26', line: '#2B2937', ink: '#EDE9F6', ink2: '#9B96AE', glow: '#8B7CF6', glow2: '#4FC3C9' };
 
@@ -75,6 +76,12 @@ export function MemoryDetail({ hit, pinned, onChanged, className }: { hit: Memor
             <div className="rounded-md border px-2.5 py-2" style={{ background: NIGHT.pane, borderColor: NIGHT.line }}><div className="font-mono text-body" style={{ color: NIGHT.ink }}>{hit.evidence.length}</div><div className="text-caption" style={{ color: NIGHT.ink2 }}>{hit.evidence.length === 1 ? 'source' : 'sources'}</div></div>
             <div className="rounded-md border px-2.5 py-2" style={{ background: NIGHT.pane, borderColor: NIGHT.line }}><div className="font-mono text-body" style={{ color: NIGHT.ink }}>{when || '—'}</div><div className="text-caption" style={{ color: NIGHT.ink2 }}>{hit.validTo ? 'until ' + new Date(hit.validTo).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'since'}</div></div>
           </div>
+          {['fact', 'entity', 'resource', 'episode', 'policy'].includes(hit.ref.type) && (
+            <section className="mb-1">
+              <h4 className="mb-2 text-caption font-semibold uppercase tracking-wide" style={{ color: NIGHT.ink2 }}>What it connects to</h4>
+              <Constellation seedId={`${hit.ref.type}:${hit.ref.id}`} />
+            </section>
+          )}
           {hit.evidence.length > 0 && (
             <section className="mb-4">
               <h4 className="mb-2 text-caption font-semibold uppercase tracking-wide" style={{ color: NIGHT.ink2 }}>Where it came from</h4>
