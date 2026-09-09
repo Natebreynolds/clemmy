@@ -254,12 +254,18 @@ test('nested dispatch context never inherits the model-lane recall budget; per-r
       recallBudget: new RecallBudget(3, 60_000),
       behaviorScopeId: 'scope-x',
       sourceUserSeq: 42,
+      hostOwnsToolAccounting: true,
     },
     async () => {
       const nested = inheritedNestedHarnessContext(sess);
       assert.equal('recallBudget' in nested, false, 'nested recalls read a lossless local store — no model-context cost, no budget');
       assert.equal(nested.behaviorScopeId, 'scope-x', 'per-run accounting still inherited');
       assert.equal(nested.sourceUserSeq, 42, 'attempt authority still inherited');
+      assert.equal(nested.hostOwnsToolAccounting, undefined, 'ambient parent accounting cannot exempt new nested work');
+      assert.equal(inheritedNestedHarnessContext(sess, true).hostOwnsToolAccounting, true,
+        'only the exact host-admitted mirror retains its existing charge');
+      assert.deepEqual(inheritedNestedHarnessContext('foreign-session', true), {},
+        'an exact token never imports another session context');
     },
   );
 });

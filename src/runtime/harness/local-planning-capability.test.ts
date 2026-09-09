@@ -708,6 +708,58 @@ test('ordinary Workspace creation compiles to exactly one semantic space_save mu
   }]);
 });
 
+test('a conversational count uses its exact admitted topology when the legacy collection field is absent', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const objective = 'Lets do 50 today continue';
+  const run = await createPlanningSource('conversational-fifty', objective);
+  const body = await searchExact(run.planning, new Set(['write_file']), 'write_file');
+  const ref = body.results.find(entry => entry.name === 'write_file')?.capabilityVariants
+    ?.find(variant => variant.capabilityRef.endsWith(':create'))?.capabilityRef;
+  assert.ok(ref);
+  const base = proposalFor({ objective, capabilityRef: ref, operationId: 'draft_email', deliverableKind: 'file' });
+  const workTopology = { version: 1 as const,
+    operations: [{ id: 'draft_email', effect: 'local_write' as const, coverage: null, dependsOn: [], dataFrom: [],
+      cardinality: { kind: 'each' as const, universeId: 'accounts' } }],
+    universes: [{ id: 'accounts', seal: 'accepted_input' as const,
+      members: Array.from({ length: 50 }, (_, i) => `account-${i+1}`) }],
+  };
+  const admitted = await semantic.admitAndCompilePrimaryModelProposal({ identity: run.identity, surface: 'direct',
+    proposal: { ...base, work: { ...base.work, construct: 'fanout', topology: workTopology,
+      topologyHash: topology.workTopologyDigest(workTopology) } },
+    planningCatalogAuthority: run.planning.authority });
+  assert.ok(admitted.ok, admitted.ok ? '' : admitted.reason);
+  if (!admitted.ok) return;
+  assert.equal(admitted.compiled.graph.classification.goalConstraints?.collection, undefined,
+    'pin the live shape: a typed work universe, no duplicate classifier count');
+  const frozen = contracts.freezePrimaryModelExpectedWorkContract(run.identity);
+  assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
+  const activation = expectedWork.activateActionExpectedWork(run.identity);
+  assert.ok(activation.status === 'activated' || activation.status === 'replayed');
+  eventlog.closeEventLog();
+  const cases = [
+    { member: 'account-1', target: 'account-1', status: 'bound' },
+    { member: 'account-50', target: 'account-50', status: 'bound' },
+    { member: 'account-51', target: 'account-51', status: 'refused' },
+    { member: 'account-2', target: 'account-1', status: 'refused' },
+  ];
+  for (const [index, { member, target, status }] of cases.entries()) {
+    const args = { path: path.join(HOME, `${target}.eml`), content: `To: ${member}@example.test\nSubject: Monday\n`, mode: 'create' };
+    const logicalToolCallId = `fifty-draft-${index}`;
+    assert.equal(dispatch.admitLogicalCall({ identity: { ...run.identity,
+      acceptedTaskId: identities.acceptedTaskIdFor(run.identity.sessionId, run.identity.sourceUserSeq), logicalToolCallId },
+      tool: 'write_file', args }).status, 'inserted');
+    const binding = expectedWork.admitExpectedWorkInvocation({ ...run.identity, logicalToolCallId, proposal: null,
+      requirementId: 'draft_email', universeItemId: member, tool: 'write_file', args, inputSchema: body.schemas.write_file });
+    assert.equal(binding.status, status, JSON.stringify(binding));
+    if (index === 3 && binding.status === 'refused') {
+      assert.match(JSON.stringify(binding), /already bound to count-only slot account-1/,
+        'changing content recipients cannot make the same file a second work item');
+    }
+  }
+});
+
 test('write_file freezes append authority before work_call arguments exist', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());

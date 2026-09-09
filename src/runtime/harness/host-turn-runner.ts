@@ -794,7 +794,7 @@ export function aggregateHostPreparationRefusalProgress(
  * terminal presentation authority.
  */
 export const HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT =
-  'I stopped before doing anything external: this step was not set up with permission to use its tool. That is a setup problem on my side, not a missing login or a disconnected account. Nothing was sent or changed. Run it again and I will retry; if it repeats, tell me and I will dig in.';
+  'I could not admit the next tool step because of a harness setup problem. Earlier work may already be saved. I need to inspect the retained results and current state before continuing.';
 
 export const HOST_MODEL_LIMIT_BLOCKED_TEXT =
   'I reached the bounded model-response limit before I could complete this task. I stopped at the durable checkpoint instead of asking you to manufacture a continuation.';
@@ -934,7 +934,7 @@ export const HOST_PROGRESS_PROJECTION_BLOCKED_TEXT =
   'I couldn\'t verify whether this task made progress, so I stopped before another model or tool step. Please retry this turn.';
 
 export const HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT =
-  'I kept coming back to the same saved checkpoint and it would not reopen, so I stopped instead of retrying it forever. Nothing was sent or changed, and the work I already did is kept. Ask me again and I will start this step fresh.';
+  'I could not reopen the saved checkpoint to finish this task. Earlier actions may already have completed. I need to check the retained results and current state, then continue only the unfinished work.';
 
 export const HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT =
   'The model repeated an already-committed tool call identifier. I kept the first durable result and stopped before preparing or executing the duplicate. Retry this request from the saved checkpoint; no second effect was started.';
@@ -2008,6 +2008,11 @@ export async function mapHostCallAttemptsWithBarriersInOrder<T, R>(
       attempt.status !== 'returned'
       || (attempt.status === 'returned' && stopAfterReturned?.(attempt.value) === true)
     ) stopped = true;
+    // Native tools can settle synchronously. Awaiting their already-resolved
+    // promises only drains microtasks, starving chat HTTP, Stop and progress
+    // timers for the entire batch. Yield between calls without changing its
+    // size, order, concurrency or effect authority.
+    if (!stopped && values.length > 1) await new Promise<void>(resolve => setImmediate(resolve));
   };
 
   const flushParallelWave = async (): Promise<void> => {
@@ -7865,10 +7870,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // no rollback to get wrong: the commit simply has not happened yet.
     const admission = admitModelStep(step);
     if (!admission.admitted) {
+      if (admission.reason === 'provider_limit_hit') {
+        // A response window limits one emission, not the accepted job. None
+        // of this rejected frame's text or calls entered history or executed.
+        // Ask the same brain for a smaller complete piece from the accepted
+        // checkpoint; never replay partial arguments or ask the owner to type
+        // "continue". The existing activation budget still owns a brain that
+        // repeatedly produces no admissible frame.
+        pendingHostModelDirective = [
+          'Your last response exceeded its output window. That response was not accepted and none of its tool calls executed.',
+          'Continue the same task from the accepted history. Previously settled writes remain complete.',
+          'Return a smaller complete piece now: the next complete tool call or a small batch, then continue with the remaining items after its results. Do not try to fit the whole job into one response.',
+        ].join('\n');
+        journalHostGuide('model_output_window_continue', { stepIndex, rejectedFrameExecuted: false });
+        continue;
+      }
       return blockedOutcome(
-        admission.reason === 'provider_limit_hit'
-          ? HOST_MODEL_LIMIT_BLOCKED_TEXT
-          : HOST_MODEL_INCOMPLETE_BLOCKED_TEXT,
+        HOST_MODEL_INCOMPLETE_BLOCKED_TEXT,
         admission.reason,
       );
     }
@@ -8551,6 +8569,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     >();
     let preApprovalRefused = false;
     for (const [callIndex, call] of canonicalCalls.entries()) {
+      // Exact admission can do substantial synchronous SQLite work. Let chat
+      // and heartbeat I/O run between candidates as well as between bodies.
+      // Every candidate still reopens its authority after this yield.
+      if (callIndex > 0) await new Promise<void>(resolve => setImmediate(resolve));
       try {
       const tool = toolByName.get(call.name);
       const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);

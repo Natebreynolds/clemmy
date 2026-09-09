@@ -238,7 +238,7 @@ export function conformsToJsonSchemaShape(
 }
 
 /** How a stored tool output's JSON value was recovered. */
-export type StoredToolOutputJsonVia = 'exact' | 'shell_stdout' | 'shell_embedded' | 'embedded' | 'shell_objects';
+export type StoredToolOutputJsonVia = 'exact' | 'shell_stdout' | 'shell_embedded' | 'embedded' | 'shell_objects' | 'host_cli_stdout';
 
 export interface StoredToolOutputJson {
   value: unknown;
@@ -250,6 +250,35 @@ export interface StoredToolOutputJson {
 export interface StoredToolOutputShell {
   stdout: string;
   stdout_json?: unknown;
+}
+
+/** The host CLI adapter stores its typed execution envelope, including argv,
+ * separately from the provider's JSON in stdout. Decode only a complete,
+ * successful host-shaped envelope; arbitrary stdout fields and partial or
+ * failed executions keep their original shape. This is data extraction, not
+ * evidence authority: each reader still applies its own occurrence/settlement
+ * checks before using the result to authorize a later action. */
+function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredToolOutputJson {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { value, via };
+  const outer = value as Record<string, unknown>;
+  const wrapped = outer.result && typeof outer.result === 'object' && !Array.isArray(outer.result)
+    ? outer.result as Record<string, unknown> : null;
+  const envelope = wrapped ?? outer;
+  if (
+    (wrapped !== null && outer.complete !== true)
+    || envelope.version !== 1 || envelope.status !== 'exited'
+    || typeof envelope.operationId !== 'string' || !envelope.operationId
+    || typeof envelope.executableRealpath !== 'string' || !envelope.executableRealpath
+    || !Array.isArray(envelope.argv) || !envelope.argv.every(arg => typeof arg === 'string')
+    || envelope.exitCode !== 0 || envelope.stdoutTruncated !== false
+    || typeof envelope.stdout !== 'string'
+  ) return { value, via };
+  try {
+    const stdout: unknown = JSON.parse(envelope.stdout);
+    return { value: stdout, via: 'host_cli_stdout' };
+  } catch {
+    return { value, via };
+  }
 }
 
 /**
@@ -278,7 +307,7 @@ export function parseStoredToolOutputJson(
 ): StoredToolOutputJson | null {
   if (typeof raw !== 'string' || raw.trim() === '') return null;
   try {
-    return { value: JSON.parse(raw) as unknown, via: 'exact' };
+    return storedJsonValue(JSON.parse(raw) as unknown, 'exact');
   } catch { /* fall through to recovery */ }
 
   const shell = options.shell?.(raw) ?? null;
@@ -302,7 +331,7 @@ export function parseStoredToolOutputJson(
   const embedded = extractJsonCandidate(raw);
   if (embedded !== null) {
     try {
-      return { value: JSON.parse(embedded) as unknown, via: 'embedded' };
+      return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');
     } catch { /* keep looking */ }
   }
 

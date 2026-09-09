@@ -18,6 +18,7 @@ const {
   resetEventLog,
   createSession,
   writeToolOutput,
+  appendEvent,
 } = await import('../runtime/harness/eventlog.js');
 const {
   RecallBudget,
@@ -26,6 +27,39 @@ const {
 } = await import('../runtime/harness/brackets.js');
 
 type RecallHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
+
+test('queries of a recall call recover the original data, not the JSON example in its preamble', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'original-cli', tool: 'work_call', output: JSON.stringify({
+    result: { version: 1, status: 'exited', operationId: 'salesforce_sf_soql_query', executableRealpath: '/usr/local/bin/sf',
+      argv: ['data', 'query', '--json'], exitCode: 0, stdoutTruncated: false,
+      stdout: JSON.stringify({ result: { records: [{ Name: 'Fictional Acorn', Email: 'acorn@example.test' }] } }) }, complete: true,
+  }) });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+    callId: 'recall-slice', tool: 'recall_tool_result', arguments: JSON.stringify({ call_id: 'original-cli', offset: 300 }),
+  } });
+  writeToolOutput({ sessionId: session.id, callId: 'recall-slice', tool: 'recall_tool_result',
+    output: 'Recalled chars 300–400 of 1000 (more remains — recall_tool_result {"call_id":"original-cli","offset":400})\n\nclipped fragment' });
+  const query = captureToolOutputQueryHandler();
+  const result = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+    () => query({ call_id: 'recall-slice', fields: ['Name', 'Email'] }));
+  assert.match(result.content[0].text, /Fictional Acorn/);
+  assert.match(result.content[0].text, /acorn@example\.test/);
+  assert.doesNotMatch(result.content[0].text, /None of|No tool output/);
+});
+
+test('old or failed projections do not permanently exhaust a retained result for later turns', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'long-lived-result', tool: 'work_call',
+    output: JSON.stringify([{ Name: 'Still readable' }]) });
+  for (let i = 0; i < 16; i++) appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+    callId: `old-query-${i}`, tool: 'tool_output_query', arguments: JSON.stringify({ call_id: 'long-lived-result', fields: ['wrong'] }),
+  } });
+  const result = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+    () => captureToolOutputQueryHandler()({ call_id: 'long-lived-result', fields: ['Name'] }));
+  assert.match(result.content[0].text, /Still readable/);
+  assert.doesNotMatch(result.content[0].text, /budget.*spent|seen every record/);
+});
 
 function captureRecallHandler(): RecallHandler {
   // registerRecallTools now registers BOTH recall_tool_result and

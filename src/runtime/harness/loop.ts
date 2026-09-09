@@ -6,6 +6,7 @@ import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
+import { composeRunProgressLine } from './run-progress.js';
 import { applySessionMountPrimers, composeSession } from './session-composition.js';
 import {
   clearRunInFlightAfterTerminal,
@@ -9342,6 +9343,7 @@ function emitLimitExceededWithContinuePrompt(opts: {
 async function withActiveTurnHeartbeat<T>(
   opts: {
     sessionId: string;
+    sourceUserSeq?: number;
     turn: number;
     budget: ReturnType<typeof getHarnessBudgetSettings>;
     checkInMs: number;
@@ -9364,23 +9366,29 @@ async function withActiveTurnHeartbeat<T>(
     let thinking: string | undefined;
     try { thinking = opts.thinking?.(); } catch { thinking = undefined; }
     const working = typeof thinking === 'string' ? thinking.replace(/\s+/gu, ' ').trim() : '';
+    const durableProgress = composeRunProgressLine({
+      sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, fallback: '',
+    });
     safeAppend({
       sessionId: opts.sessionId,
       turn: opts.turn,
       role: 'system',
       type: 'heartbeat',
       data: {
-        kind: 'active_turn_check_in',
+        kind: durableProgress ? 'progress_check_in' : 'active_turn_check_in',
+        ...(opts.sourceUserSeq ? { sourceUserSeq: opts.sourceUserSeq } : {}),
         stage: opts.stage,
         preset: opts.budget.preset,
         unlimited: opts.budget.unlimited,
         ...(working ? { thinking: working.slice(-280) } : {}),
-        message: working
+        message: durableProgress || (working
           ? `Still working inside turn ${opts.turn} — ${working.slice(-160)}`
-          : `Still working inside turn ${opts.turn}.`,
+          : 'Still working on your request.'),
       },
     });
-  }, opts.checkInMs);
+  // This is a UI keep-alive, not a model call or a request to the owner. A
+  // multi-minute check-in preference must not make active chat look idle.
+  }, Math.min(opts.checkInMs, 20_000));
   timer.unref?.();
   try {
     return await work();
@@ -10952,6 +10960,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     const outcome = await withActiveTurnHeartbeat(
       {
         sessionId: options.sessionId,
+        sourceUserSeq,
         turn,
         budget: heartbeatBudget,
         checkInMs: heartbeatMs,
@@ -11796,6 +11805,7 @@ export async function resumePendingApproval(
     const outcome = await withActiveTurnHeartbeat(
       {
         sessionId: options.sessionId,
+        sourceUserSeq: resumeSourceUserSeq,
         turn,
         budget: heartbeatBudget,
         checkInMs: heartbeatMs,

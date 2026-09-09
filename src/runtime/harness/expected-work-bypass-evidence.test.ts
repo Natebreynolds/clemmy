@@ -324,6 +324,9 @@ test('heartbeat progress projects the plan oracle instead of "Still working."', 
   assert.equal(first.status, 'refused');
   const before = composeRunProgressLine({ sessionId: task.sessionId, fallback: 'Still working.' });
   assert.match(before, /plan 0\/3 steps done/, before);
+  assert.match(before, /next step:/);
+  assert.doesNotMatch(before, /now:|writes? completed/,
+    'an unsatisfied plan is not evidence that a write is running or saved');
   for (const id of ['n5:retrieve', 'n6:retrieve']) {
     settleUnboundRead({
       task,
@@ -340,6 +343,8 @@ test('heartbeat progress projects the plan oracle instead of "Still working."', 
   assert.match(after, /evidence in/, after);
   assert.match(after, /steps underway/, 'evidence must advance the projected plan');
   assert.match(after, /writing the deliverable|collecting/, after);
+  assert.match(after, /2 results collected/);
+  assert.doesNotMatch(after, /writes? completed/);
 });
 
 test('approval acknowledgements preserve original progress while a new real source replaces it', async () => {

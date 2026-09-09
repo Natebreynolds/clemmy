@@ -17089,33 +17089,28 @@ export function registerConsoleRoutes(
               judgeCompletion: completionReviewEnabled(),
               reuseRecordedUserInput: true,
             });
-            // The held/recovery status was being discarded here: only text and
-            // session travelled out, so the `finally` below finished a turn
-            // that had not stopped working.
-            if (result.hold) {
-              // Continuation RESPONSIBILITY, not the checkpoint blob. Adoption
-              // deliberately removes the blob while the work continues, so
-              // sampling it reported that a live turn had stopped. An
-              // unreadable read is not evidence of stopping either, so it also
-              // retains the owner.
-              try {
-                const state = HarnessSession.load(sessionId)?.continuationOwnerState({
-                  sourceUserSeq: requestSourceUserSeq,
-                  attemptId: requestAttempt.attemptId,
-                });
-                heldByArmedRecoveryOwner = state === 'ours' || state === 'unreadable';
-                heldOwnerEvidence = state ?? 'unreadable';
-              } catch {
-                heldByArmedRecoveryOwner = true;
-                heldOwnerEvidence = 'unreadable';
-              }
-            }
             const replyText = (result.lastDecision?.reply && result.lastDecision.reply.trim())
               ? result.lastDecision.reply
               : (result.lastDecision?.summary ?? '');
             return { text: replyText, sessionId };
           },
         );
+        // The active bridge owns runConversation; its legacy callback above is
+        // not invoked. Read the typed bridge outcome here so a held activation
+        // keeps its exact continuation owner and remains visible as active.
+        if (response.stoppedReason === 'in-progress') {
+          try {
+            const state = HarnessSession.load(sessionId)?.continuationOwnerState({
+              sourceUserSeq: requestSourceUserSeq,
+              attemptId: requestAttempt.attemptId,
+            });
+            heldByArmedRecoveryOwner = state === 'ours' || state === 'unreadable';
+            heldOwnerEvidence = state ?? 'unreadable';
+          } catch {
+            heldByArmedRecoveryOwner = true;
+            heldOwnerEvidence = 'unreadable';
+          }
+        }
         if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
       } catch (err) {
         requestAttemptStatus = 'failed';

@@ -1337,11 +1337,12 @@ export const RUN_SHELL_COMMAND_PARAMS = {
 } satisfies z.ZodRawShape;
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
-  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string): string =>
+  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string, maxChars?: number): string =>
     formatRecallableToolText(redactSensitiveText(output), {
       toolName,
       sessionId: sessionIdFromRunContext(runContext),
       callId: callIdFromToolDetails(details),
+      maxChars,
     });
 
   const workspace_roots = tool({
@@ -1371,26 +1372,16 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     ),
   });
 
-  // Clip read output to the char cap, but when the FULL content exceeds the
-  // cap append a self-describing note with the true length + how to widen. The
-  // slice happens BEFORE the result is parked, so without this note a clipped
-  // large file (multi-page brief, extracted PDF, audit log) reads as complete
-  // with no recovery path — confident wrong/incomplete answers. (~30-60 tokens,
-  // only on oversized reads; net token-negative, it prevents blind re-reads.)
-  const clipReadWithWidenNote = (content: string, cap: number, label: string): string =>
-    content.length <= cap
-      ? content
-      : `${content.slice(0, cap)}\n\n…[${label} is ${content.length} chars; showing the first ${cap}. Re-call with a larger max_chars (up to 50000) to read more.]`;
-
   const read_file = tool({
     name: 'read_file',
     description: [
       'Read a file from an allowed workspace path.',
+      'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
       'UTF-8 text is returned as-is. Other formats are transparently extracted to Markdown: PDF/Word/Excel/PowerPoint/EPub via the bundled markitdown runtime, images via vision OCR, and audio via transcription. The first markitdown conversion may take ~30-60s while the runtime warms.',
     ].join('\n'),
     parameters: z.object({
       path: z.string().min(1),
-      max_chars: z.number().min(1).max(50000).nullable(),
+      max_chars: z.number().int().min(1).nullable(),
     }),
     needsApproval: needsApprovalForReadFile(),
     execute: async (input, runContext, details) => {
@@ -1420,14 +1411,16 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           'read_file',
           runContext,
           details,
-          clipReadWithWidenNote(ingested.markdown ?? '', input.max_chars ?? 20000, path.basename(filePath)),
+          ingested.markdown ?? '',
+          input.max_chars ?? undefined,
         );
       }
       return formatToolOutput(
         'read_file',
         runContext,
         details,
-        clipReadWithWidenNote(readFileSync(filePath, 'utf-8'), input.max_chars ?? 20000, path.basename(filePath)),
+        readFileSync(filePath, 'utf-8'),
+        input.max_chars ?? undefined,
       );
     },
   });
@@ -1437,11 +1430,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     description: [
       'Extract a non-text file (PDF, Word/Excel/PowerPoint, EPub, image, audio, …) into Markdown you can read.',
       'Use for any binary/Office document, image (OCR), or audio (transcript) the user references. (read_file also auto-routes these formats here.)',
+      'The complete extracted content is retained for recall. max_chars controls only the visible preview; null uses the normal result preview.',
       'Docs use the bundled markitdown runtime (first run ~30-60s to warm); images use vision OCR; audio uses transcription.',
     ].join('\n'),
     parameters: z.object({
       path: z.string().min(1),
-      max_chars: z.number().min(1).max(50000).nullable(),
+      max_chars: z.number().int().min(1).nullable(),
     }),
     needsApproval: needsApprovalForReadFile(),
     execute: async (input, runContext, details) => {
@@ -1459,7 +1453,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         'convert_to_markdown',
         runContext,
         details,
-        clipReadWithWidenNote(ingested.markdown ?? '', input.max_chars ?? 20000, path.basename(filePath)),
+        ingested.markdown ?? '',
+        input.max_chars ?? undefined,
       );
     },
   });

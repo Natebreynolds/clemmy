@@ -4324,7 +4324,36 @@ test('FunctionTool errors remain model-visible and post-invocation control error
   }
 });
 
-test('provider truncation becomes one typed blocked checkpoint and never auto-continues', async () => {
+test('a response-window limit retries a smaller piece without accepting or executing the truncated frame', async () => {
+  let calls = 0;
+  const dispatched: string[] = [];
+  const model = {
+    async getResponse(request: { input?: unknown }) {
+      calls += 1;
+      if (calls === 1) return { usage: {}, output: [textMsg('partial private draft'), toolCall('truncated-call', 'ping', { q: 'discarded' })],
+        providerData: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } };
+      if (calls === 2) {
+        const input = JSON.stringify(request.input);
+        assert.match(input, /smaller complete piece/);
+        assert.doesNotMatch(input, /partial private draft|truncated-call|discarded/);
+        return { usage: {}, output: [toolCall('complete-call', 'ping', { q: 'complete' })] };
+      }
+      return { usage: {}, output: [textMsg('all done')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [{
+    type: 'function', name: 'ping', description: 'test', parameters: { type: 'object', properties: {} },
+    invoke: async (_context: unknown, input: string) => { dispatched.push(input); return 'pong'; }, needsApproval: async () => false,
+  }] } as never, [] as never, { maxTurns: 8 });
+  assert.equal(calls, 3);
+  assert.equal(dispatched.length, 1);
+  assert.match(dispatched[0]!, /complete/);
+  assert.equal(outcome.finalOutput, 'all done');
+  assert.doesNotMatch(JSON.stringify(outcome.history), /partial private draft|truncated-call|smaller complete piece/);
+});
+
+test('a brain that repeatedly truncates remains subject to the existing activation budget', async () => {
   let calls = 0;
   const model = {
     async getResponse() {
@@ -4343,9 +4372,9 @@ test('provider truncation becomes one typed blocked checkpoint and never auto-co
     [] as never,
     { maxTurns: 8 },
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 8);
   assert.equal(outcome.terminal?.status, 'blocked');
-  assert.equal(outcome.terminal?.reason, 'provider_limit_hit');
+  assert.equal(outcome.terminal?.reason, 'max_turns');
   assert.doesNotMatch(String(outcome.finalOutput), /partial private draft|say continue/i);
 });
 
@@ -4485,7 +4514,7 @@ test('runTurn consumes a host terminal before run_completed or success hooks', a
     runRunner: productionHostRunRunner,
     maxTurns: 3,
   });
-  assert.equal(calls, 1);
+  assert.equal(calls, 3, 'response-window recovery uses the activation budget before the typed stop');
   assert.equal(result.status, 'blocked');
   assert.doesNotMatch(result.error ?? '', /private partial answer|say continue/i);
   assert.equal(
@@ -8378,6 +8407,18 @@ test('a committed-write verification hold tells the exact truth and never asks t
   assert.match(userAction, /Reconnect or refresh the exact readback capability/);
   assert.match(userAction, /the write will not repeat/i);
   assert.doesNotMatch(userAction, /ask.*approval/i);
+});
+
+test('a synchronous write batch lets the event loop service chat between writes', async () => {
+  const serviced: number[] = [];
+  const attempts = await mapHostCallAttemptsWithBarriersInOrder(
+    [0, 1, 2], 8, () => 'barrier', async index => {
+      if (index > 0) assert.ok(serviced.includes(index - 1), 'chat I/O must not wait until the entire batch settles');
+      setImmediate(() => serviced.push(index));
+      return { status: 'returned' as const, value: index, invocationEntered: true };
+    },
+  );
+  assert.ok(attempts.every(attempt => attempt?.status === 'returned'));
 });
 
 test('a write whose verifier holds is a scheduling barrier: no later sibling write starts', async () => {

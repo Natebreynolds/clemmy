@@ -5,6 +5,7 @@ import {
   appendEvent,
   getToolOutput,
   listEvents,
+  openEventLog,
   type EventRow,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
@@ -12,6 +13,8 @@ import { estimateInputTokens } from './token-estimator.js';
 import { effectiveContextWindow, windowScaleForModel } from './model-window-observations.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import { toolCallHint } from './tool-call-hint.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
 
 /**
  * Auto-compact for the harness loop. See plan v0.5.10.
@@ -675,7 +678,50 @@ function collapsedPairLine(pair: CompletedToolPair): string {
   return `- ${pair.name} [${pair.callId}] args: ${args}; result: ${result || '(empty)'} [clipped: ${toolCallHint('recall_tool_result', { call_id: pair.callId })}]`;
 }
 
-function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputItem {
+function completedWriteLines(pairs: CompletedToolPair[], sessionId?: string): string[] {
+  if (!sessionId) return [];
+  try {
+    const settled = openEventLog().prepare(`
+      SELECT s.logical_tool_call_id, s.result_handle_id, s.outcome_kind, s.mutating,
+             l.accepted_task_id, l.argument_digest, l.tool_name
+        FROM logical_call_settlements s JOIN logical_tool_calls l
+          ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ?
+    `).all(sessionId) as Array<{ logical_tool_call_id: string; result_handle_id: string | null; outcome_kind: string;
+      mutating: number; accepted_task_id: string; argument_digest: string; tool_name: string }>;
+    const byCall = new Map<string, typeof settled>();
+    for (const row of settled) byCall.set(row.logical_tool_call_id, [...(byCall.get(row.logical_tool_call_id) ?? []), row]);
+    return pairs.flatMap(pair => {
+      const matches = byCall.get(pair.callId);
+      if (matches?.length !== 1) return [];
+      const settlement = matches[0]!;
+      if (settlement.mutating !== 1 || !['succeeded', 'empty_result'].includes(settlement.outcome_kind)) return [];
+      let args: unknown = pair.args;
+      try { args = JSON.parse(pair.args); } catch { /* retain the exact input */ }
+      const contract = durableLogicalCallContract(settlement.accepted_task_id, pair.name, args);
+      if (!contract || contract.toolName !== settlement.tool_name || contract.argumentDigest !== settlement.argument_digest) return [];
+      const effective = args && typeof args === 'object' && !Array.isArray(args)
+        ? unwrapRuntimeEffectiveToolIdentity(pair.name, args as Record<string, unknown>) : null;
+      // Full completed-call arguments are the work inventory. A 180-character
+      // carrier prefix often contains no recipient/target at all. Keep every
+      // settled write here, outside the generic history prose budget; only
+      // its verbose provider response is parked in the existing result store.
+      return [JSON.stringify({
+        callId: pair.callId,
+        tool: effective?.toolName ?? pair.name,
+        outcome: settlement.outcome_kind,
+        arguments: effective?.args ?? args,
+        resultHandle: settlement.result_handle_id,
+      })];
+    });
+  } catch {
+    // Never replace an unreadable ledger with an invented success claim.
+    return [];
+  }
+}
+
+function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[], sessionId?: string): AgentInputItem {
   const completeCallIdIndex = `[complete collapsed call-id index JSON] ${JSON.stringify(pairs.map((pair) => pair.callId))}`;
   const lines: string[] = [
     '[summary of older completed tool activity]',
@@ -696,6 +742,12 @@ function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[]): AgentInputI
   }
   if (omitted > 0) {
     lines.push(`- ${omitted} additional older completed tool calls were also collapsed; use the visible recent context first, then ask for a specific recall if needed.`);
+  }
+  const writes = completedWriteLines(pairs, sessionId);
+  if (writes.length > 0) {
+    lines.push('', '[Durable completed writes — already done]',
+      'These exact calls settled successfully. Use this inventory to continue unfinished work; do not recreate these outputs because their full provider responses were compacted. Read the original call_id to recover an object ID or verify its current state.',
+      ...writes);
   }
 
   return {
@@ -745,7 +797,7 @@ export function collapseOldCompletedToolPairs(
   if (pairs.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const collapseIds = new Set(pairs.map((pair) => pair.callId));
-  const summary = buildCollapsedToolPairsSummary(pairs);
+  const summary = buildCollapsedToolPairsSummary(pairs, sessionId);
   const nextItems: AgentInputItem[] = [];
   let desiredIndex = -1;
 

@@ -60,7 +60,8 @@ function stepLabel(line: ExpectedWorkPlanLine): string {
 }
 
 /** One human-readable progress line derived only from durable run state.
- *  Returns `fallback` untouched when no frozen plan exists for the turn. */
+ * Normal work has no frozen plan; its exact source settlements still show
+ * completed operations. These are operation counts, never unique-item claims. */
 export function composeRunProgressLine(input: {
   sessionId: string;
   sourceUserSeq?: number;
@@ -70,7 +71,20 @@ export function composeRunProgressLine(input: {
     const sourceUserSeq = input.sourceUserSeq ?? latestUserSeq(input.sessionId) ?? undefined;
     if (!sourceUserSeq) return input.fallback;
     const lines = expectedWorkPlanLines({ sessionId: input.sessionId, sourceUserSeq });
-    if (lines.length === 0) return input.fallback;
+    const counts = openEventLog().prepare(`
+        SELECT SUM(CASE WHEN mutating = 1 THEN 1 ELSE 0 END) AS writes,
+               SUM(CASE WHEN mutating = 0 THEN 1 ELSE 0 END) AS reads
+          FROM logical_call_settlements
+         WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
+           AND outcome_kind IN ('succeeded', 'empty_result')
+      `).get(input.sessionId, sourceUserSeq) as { writes: number | null; reads: number | null };
+    const completedOperations = [
+        counts.writes ? `${counts.writes} write${counts.writes === 1 ? '' : 's'} completed` : '',
+        counts.reads ? `${counts.reads} result${counts.reads === 1 ? '' : 's'} collected` : '',
+    ].filter(Boolean);
+    if (lines.length === 0) {
+      return completedOperations.length ? `Still working — ${completedOperations.join(' · ')}.` : input.fallback;
+    }
     const satisfied = lines.filter((line) => line.state === 'satisfied').length;
     const evidenceIn = lines.filter((line) => line.state === 'data_in').length;
     const next = lines.find((line) => line.state !== 'satisfied');
@@ -80,6 +94,7 @@ export function composeRunProgressLine(input: {
     // as a stall while two steps had data in.
     const underway = Math.min(lines.length, satisfied + evidenceIn);
     const parts: string[] = [
+      ...completedOperations,
       evidenceIn > 0 && satisfied < lines.length
         ? `plan ${underway}/${lines.length} steps underway (${satisfied} done)`
         : `plan ${satisfied}/${lines.length} steps done`,
@@ -88,7 +103,9 @@ export function composeRunProgressLine(input: {
     if (facts && facts.itemCount >= 2) {
       parts.push(`${facts.itemCount}-item collection${facts.destinationFamily ? ` → ${facts.destinationFamily.replace(/_/g, ' ')}` : ''}`);
     }
-    if (next) parts.push(`now: ${stepLabel(next)}${next.state === 'blocked_on_dependency' ? ' (waiting on a predecessor)' : ''}`);
+    // An unsatisfied requirement is the next target, not proof that its tool
+    // is executing. Live discovery/reads must not be labelled as active writes.
+    if (next) parts.push(`next step: ${stepLabel(next)}${next.state === 'blocked_on_dependency' ? ' (waiting on a predecessor)' : ''}`);
     return `Still working — ${parts.join(' · ')}.`;
   } catch {
     return input.fallback;

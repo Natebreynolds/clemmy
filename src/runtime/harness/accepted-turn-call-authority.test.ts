@@ -423,7 +423,7 @@ test('a direct host-ledger bypass has zero body and crossing without the exact c
   }
 });
 
-test('host root fails closed on writes, call ceilings, unsettled closure, and source drift', () => {
+test('host root checks writes, unsettled closure, and source drift without a queued or lifetime call cap', () => {
   const writeTask = acceptedSource('Update the workflow.');
   assert.equal(armHost(writeTask).status, 'armed');
   const write = dispatch.admitLogicalCall({
@@ -455,8 +455,11 @@ test('host root fails closed on writes, call ceilings, unsettled closure, and so
       tool: 'session_history',
       args: {},
     }));
-  assert.equal(second.status, 'closed');
-  assert.match('reason' in second ? second.reason : '', /parallel-call ceiling/);
+  assert.equal(second.status, 'inserted', 'prepared calls can wait for the host execution queue');
+  const third = withHostAttestation(cappedTask, 'continued-3', 'session_history', {}, () =>
+    dispatch.admitLogicalCall({ identity: { ...cappedTask, logicalToolCallId: 'continued-3' },
+      tool: 'session_history', args: {} }));
+  assert.equal(third.status, 'inserted', 'a source outlives its first activation budget');
   assert.equal(authority.closeHostReadOnlyCallAuthority({
     sessionId: cappedTask.sessionId,
     sourceUserSeq: cappedTask.sourceUserSeq,

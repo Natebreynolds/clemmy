@@ -22,6 +22,7 @@ import { compileAtomicInputContentContract } from './atomic-input-content-contra
 import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { extractDuplicateIdentityKeys } from './grounding-gate.js';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import {
   canonicalExpectedWorkJson,
@@ -42,7 +43,7 @@ import {
   resolveExpectedWorkUniverseMembers,
   type ExpectedWorkUniverseSealCache,
 } from './expected-work-universe-seal.js';
-import { appendEvent, getSession, getTurnGraphEventForSource, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, getEvent, getSession, getTurnGraphEventForSource, listEvents, openEventLog } from './eventlog.js';
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { computeResultHasSubstance } from './expected-work-matcher.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
@@ -739,7 +740,7 @@ function sourceWitness(
     };
   }
 
-  if (durableAcceptedLoopBound(contract) !== proposedMembers.length) {
+  if (durableAcceptedLoopBound(contract, universe.id) !== proposedMembers.length) {
     return {
       ok: false,
       reason: 'the accepted count does not match this count-only work bound',
@@ -826,16 +827,27 @@ const HOST_DERIVED_CALL_TARGET_SELECTOR: ExpectedWorkUniverseSelectorV1 = {
   memberIdPointer: null,
 };
 
-function durableAcceptedLoopBound(contract: AcceptedTaskWorkContractV1): number | null {
+function durableAcceptedLoopBound(contract: AcceptedTaskWorkContractV1, universeId?: string): number | null {
   try {
-    const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(
-      contract.identity.sessionId,
-      contract.identity.sourceUserSeq,
-    ));
+    const graph = turnGraphFromShadowEvent(getEvent(contract.graphEventId));
+    if (!graph || graph.identity.sessionId !== contract.identity.sessionId
+      || graph.identity.sourceUserSeq !== contract.identity.sourceUserSeq
+      || graph.compiler.graphHash !== contract.graphHash) return null;
     const count = graph?.classification.goalConstraints?.collection?.count;
-    return typeof count === 'number' && Number.isSafeInteger(count) && count > 0
-      ? count
-      : null;
+    if (typeof count === 'number' && Number.isSafeInteger(count) && count > 0) return count;
+    // The primary model's admitted topology already owns the finite work set.
+    // It need not also populate the legacy single-collection classifier. A
+    // conversational "do 50" produced a frozen 50-member topology while that
+    // classifier held no count, so the first write contradicted its own plan.
+    // Read only this contract's exact graph and topology, never a newer plan
+    // or the proposed call's member count. Known legacy counts still win above.
+    if (!graph.workTopology || !contract.topologyHash
+      || graph.workTopology.topologyHash !== contract.topologyHash) return null;
+    const universes = graph.workTopology.topology.universes;
+    const universe = universeId ? universes.find(entry => entry.id === universeId)
+      : universes.length === 1 ? universes[0] : undefined;
+    return universe?.seal === 'accepted_input' && universe.members.length > 0
+      ? universe.members.length : null;
   } catch {
     return null;
   }
@@ -847,6 +859,7 @@ function callTargetWitness(input: {
   universe: ExpectedWorkUniverseV1;
   logicalToolCallId: string;
   universeItemId: string;
+  tool: string;
   args: unknown;
 }): { ok: true; kind: string; ref: string; digest: string } | { ok: false; reason: string } {
   const source = input.db.prepare(`
@@ -864,12 +877,20 @@ function callTargetWitness(input: {
   if (
     !source
     || input.universe.seal !== 'accepted_input'
-    || durableAcceptedLoopBound(input.contract) !== input.universe.members.length
+    || durableAcceptedLoopBound(input.contract, input.universe.id) !== input.universe.members.length
   ) {
     return { ok: false, reason: 'call-target membership does not match one count-only accepted request' };
   }
+  const nativeTargetArgument = TOOL_REGISTRY.find(entry => entry.name === input.tool)?.resourceIdentityArgument;
+  const nativeTarget = nativeTargetArgument && input.args && typeof input.args === 'object'
+    ? (input.args as Record<string, unknown>)[nativeTargetArgument] : undefined;
+  // A local file's target is its registry-declared path, not an email found
+  // inside its content. Recipient extraction remains the provider fallback.
+  const targetKeys = nativeTargetArgument
+    ? typeof nativeTarget === 'string' && nativeTarget.trim() ? [`${nativeTargetArgument}:${nativeTarget}`] : []
+    : extractDuplicateIdentityKeys(input.args);
   const targets = [...new Set(
-    extractDuplicateIdentityKeys(input.args)
+    targetKeys
       .map((target) => target.normalize('NFKC').trim())
       .filter(Boolean),
   )].sort();
@@ -2909,6 +2930,7 @@ export function admitExpectedWorkInvocation(input: {
                   universe,
                   logicalToolCallId: input.logicalToolCallId,
                   universeItemId: input.universeItemId as string,
+                  tool: input.tool,
                   args: evidenceArgs,
                 })
               : witness;

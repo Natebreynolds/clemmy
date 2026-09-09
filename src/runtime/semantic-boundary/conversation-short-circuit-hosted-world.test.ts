@@ -62,3 +62,16 @@ test('closed-world arithmetic still is a zero-tool conversation surface', () => 
     true,
   );
 });
+
+test('a follow-up after real hosted work keeps its tools even when Normal work created no graph', () => {
+  const sessionId = 'drafts-without-plan';
+  const first = acceptedSource(sessionId, 'Create the requested drafts.');
+  appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_called', data: {
+    sourceUserSeq: first.seq, callId: 'draft-call', tool: 'work_call', effectiveTool: 'outlook_create_draft', effect: 'external_write',
+  } });
+  for (const text of ['Hows it looking?', 'Okay']) {
+    const source = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text } });
+    assert.equal(freshHostConversationSurfaceOnly({ sessionId, sourceUserSeq: source.seq }), false,
+      'a prior real tool attempt is hosted context without requiring a plan graph');
+  }
+});

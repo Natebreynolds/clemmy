@@ -82,24 +82,29 @@ export function sessionHasPriorRetrieveOrAct(sessionId: string, beforeSourceUser
   if (!sessionId.trim() || !Number.isSafeInteger(beforeSourceUserSeq) || beforeSourceUserSeq <= 0) {
     return false;
   }
-  // Ordinary foreground work no longer needs a graph. Its durable business
-  // settlements carry the same conversational lineage after restart. This is
-  // only evidence to keep the model's tool surface available, never authority
-  // to repeat an effect. Discovery/control rows cannot establish business work.
+  // Ordinary foreground work need not create a plan/graph. Two durable signals
+  // establish hosted context: a settled business call (survives restart and
+  // event-log compaction) and any real tool attempt, including a failed one a
+  // later short follow-up may ask us to verify. This is only evidence to keep
+  // the model's tool surface available, never authority to repeat an effect.
+  // Discovery/control rows cannot establish business work.
   if (openEventLog().prepare(`
     SELECT 1 FROM logical_call_settlements
      WHERE session_id = ? AND source_user_seq > 0
        AND source_user_seq < ? AND business_call = 1
      LIMIT 1
   `).get(sessionId, beforeSourceUserSeq)) return true;
-  return listEvents(sessionId, { types: ['turn_graph_compiled'] }).some((event) => {
+  return listEvents(sessionId, { types: ['turn_graph_compiled', 'tool_called'] }).some((event) => {
     const source = event.data?.sourceUserSeq;
     const route = event.data?.route;
-    return typeof source === 'number'
+    return event.seq < beforeSourceUserSeq
+      && typeof source === 'number'
       && Number.isSafeInteger(source)
       && source > 0
       && source < beforeSourceUserSeq
-      && (route === 'retrieve' || route === 'act');
+      && (event.type === 'turn_graph_compiled'
+        ? route === 'retrieve' || route === 'act'
+        : ['read', 'compute', 'local_write', 'external_write', 'admin'].includes(String(event.data.effect)));
   });
 }
 

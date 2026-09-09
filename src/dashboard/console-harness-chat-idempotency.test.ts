@@ -1375,6 +1375,43 @@ async function appendDesktopWorkflowDispatch(
   });
 }
 
+test('desktop preserves a recovery owner returned by the real bridge rather than its unused legacy callback', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  const { HarnessSession } = await import('../runtime/harness/session.js');
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId: string; sourceUserSeq: number; runAttemptId: string }) => {
+      HarnessSession.load(request.sessionId)!.claimContinuationOwner({
+        sourceUserSeq: request.sourceUserSeq, attemptId: request.runAttemptId,
+      });
+      return { sessionId: request.sessionId, status: 'held', steps: 1, lastTurn: 1,
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' } };
+    }) as never,
+  });
+  const harness = await boot();
+  try {
+    const response = await fetch(`${harness.url}/api/harness/chat`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'Continue the remaining drafts.', clientRequestId: 'desktop-retained-recovery' }) });
+    assert.equal(response.status, 202);
+    const accepted = await response.json() as { sessionId: string; runId: string };
+    await waitUntil(() => Boolean(getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt)
+      || listEvents(accepted.sessionId, { types: ['restart_recovery_decision'] })
+        .some(e => e.data.decision === 'attempt_retained_for_recovery_owner'), 'route did not finish its request callback');
+    assert.equal(getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt, null,
+      'finishing the HTTP callback must not finish work still owned by recovery');
+    assert.equal(listEvents(accepted.sessionId, { types: ['conversation_completed'] }).length, 0);
+    closeEventLog();
+    const source = listEvents(accepted.sessionId, { types: ['user_input_received'] })[0]!;
+    const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+    commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+      presentation: { kind: 'answer', text: 'All remaining drafts are saved.' } });
+    assert.ok(getLatestRunAttemptByRunId(accepted.sessionId, accepted.runId)?.finishedAt,
+      'the actual terminal still closes the attempt after SQLite reopen');
+  } finally { _setBridgeImplsForTests({}); await harness.close(); }
+});
+
 for (const variant of ['verified', 'naked-status', 'fast-terminal'] as const) {
   test(`desktop workflow handoff retains only exact ownership: ${variant}`, async () => {
     resetEventLog(); resetHarnessRuntimeConfig();

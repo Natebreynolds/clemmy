@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
-import { getToolOutput, getToolOutputSlice , listEvents } from '../runtime/harness/eventlog.js';
+import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import { textResult } from './shared.js';
@@ -10,27 +10,7 @@ import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
-
-/** Slices of one retained result a single session may request before the host
- *  stops re-projecting it. Generous for real paging (a 500-row result at 50 per
- *  page is 10 slices); a loop re-projecting 22 records by field set hits it fast. */
-export const RETAINED_RESULT_QUERY_CAP = 12;
-
-function countRetainedResultQueries(sessionId: string, callId: string): number {
-  try {
-    let n = 0;
-    for (const event of listEvents(sessionId, { types: ['tool_called'], desc: true, limit: 400 })) {
-      const tool = event.data.tool;
-      if (tool !== 'tool_output_query' && tool !== 'recall_tool_result') continue;
-      const raw = event.data.arguments;
-      const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
-      if (text.includes(callId)) n += 1;
-    }
-    return n;
-  } catch {
-    return 0;
-  }
-}
+import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -93,7 +73,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
   call_id: z
     .string()
     .min(1)
-    .describe('The call_id from the [clipped: ...] stub, e.g. "call_abc123".'),
+    .describe('The original call_id from a clip/digest, or an rh_ receipt handle shown in a saved checkpoint.'),
   offset: z
     .number()
     .int()
@@ -110,7 +90,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
-  call_id: z.string().min(1).describe('The call_id from the digest/clip footer.'),
+  call_id: z.string().min(1).describe('The original call_id from a digest/clip, or an rh_ receipt handle shown in a saved checkpoint.'),
   // Accepts BOTH an array and a comma-separated string. The array is the
   // documented form; the string form is deliberate boundary tolerance — a
   // near-miss models actually produce (`"fields": "subject,start"`), and a
@@ -205,7 +185,7 @@ export function registerRecallTools(server: McpServer): void {
     ].join(' '),
     RECALL_TOOL_RESULT_SHAPE,
     async (input: Record<string, unknown>) => {
-      const callId = String(input.call_id ?? '');
+      let callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
       const sliceCeiling = recallSliceCeiling(ctx?.routedModelId);
       const maxChars = Number.isFinite(input.max_chars as number)
@@ -220,14 +200,13 @@ export function registerRecallTools(server: McpServer): void {
         );
       }
 
-      const recallQueries = countRetainedResultQueries(ctx.sessionId, callId);
-      if (recallQueries >= RETAINED_RESULT_QUERY_CAP) {
-        return textResult(
-          `Query budget for result "${callId}" is spent: ${recallQueries} slices of the same result have already been returned in this turn. `
-          + 'You have seen every record it holds. Do not query it again — write the deliverable from what you have, or tell the user exactly what is missing.',
-        );
-      }
-      const row = getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
+      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
+      callId = resolved.callId;
+      const start = resolved.receipt ? Math.min(offset, resolved.receipt.output.length) : 0;
+      const row = resolved.receipt
+        ? { ...resolved.receipt, start, end: Math.min(start + maxChars, resolved.receipt.output.length),
+            totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
+        : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
       if (!row) {
         return textResult(
           `No tool output found for call_id "${callId}" in this session. Check the [clipped: ...] stub for the correct call_id, or proceed with the summary.`,
@@ -243,7 +222,7 @@ export function registerRecallTools(server: McpServer): void {
       // intersecting this page; it does not rebuild/hash an unrelated 100MB
       // tail on every 30KB recall call.
       const total = row.totalChars;
-      const start = row.start;
+      const sliceStart = row.start;
       const slice = row.output;
       const sliceBytes = Buffer.byteLength(slice, 'utf8');
 
@@ -257,7 +236,7 @@ export function registerRecallTools(server: McpServer): void {
 
       const end = row.end;
       const header = [
-        `Recalled chars ${start}–${end} of ${total} (${row.contentBytes} total bytes)`,
+        `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,
         row.tool ? `tool=${row.tool}` : null,
         `recorded at ${row.createdAt}`,
         end < total
@@ -298,25 +277,17 @@ export function registerRecallTools(server: McpServer): void {
     ].join(' '),
     TOOL_OUTPUT_QUERY_SHAPE,
     async (input: Record<string, unknown>) => {
-      const callId = String(input.call_id ?? '');
+      let callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
       if (!ctx?.sessionId) {
         return textResult('tool_output_query is only available within a harness-managed turn. (No active session context.)');
       }
-      // A retained result is not a database to be re-projected forever. Live
-      // 2026-09-08 (Opus): 47 tool_output_query + 13 recall_tool_result calls
-      // over ONE 22-record calendar result — a new field set or subject filter
-      // each time — until the turn budget parked with nothing written. After
-      // the cap, the caller has already seen every record several times over:
-      // say so once, hand back the records, and refuse further slices.
-      const retainedQueries = countRetainedResultQueries(ctx.sessionId, callId);
-      if (retainedQueries >= RETAINED_RESULT_QUERY_CAP) {
-        return textResult(
-          `Query budget for result "${callId}" is spent: ${retainedQueries} slices of the same result have already been returned in this turn. `
-          + 'You have seen every record it holds. Do not query it again — write the deliverable from what you have, or tell the user exactly what is missing.',
-        );
-      }
-      const row = getToolOutput(ctx.sessionId, callId);
+      // Counting historical queries cannot prove that every record was seen.
+      // Keep the existing run/read budgets, but do not deny a valid projection
+      // just because a different turn or failed field lookup used this result.
+      const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
+      callId = resolved.callId;
+      const row = resolved.receipt ?? getToolOutput(ctx.sessionId, callId);
       if (!row) {
         const suggestion = nearestToolOutputCallId(callId, listToolOutputCallIds(ctx.sessionId));
         return textResult(
@@ -431,7 +402,7 @@ export function registerRecallTools(server: McpServer): void {
         // field → a precise path.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
-        const refHint = `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const refHint = resolved.receipt ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }
@@ -449,7 +420,7 @@ export function registerRecallTools(server: McpServer): void {
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
-        const refHint = `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
+        const refHint = resolved.receipt ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
         const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }

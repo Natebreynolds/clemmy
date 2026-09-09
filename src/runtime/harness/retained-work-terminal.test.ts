@@ -19,6 +19,9 @@ const settlements = await import('./logical-call-settlement-store.js');
 const delivery = await import('./delivery-committer.js');
 const turnOutcomes = await import('./turn-outcome.js');
 const retained = await import('./retained-work-terminal.js');
+const hostRunner = await import('./host-turn-runner.js');
+const { collapseOldCompletedToolPairs } = await import('./compaction.js');
+const { resolveRetainedOutputRead } = await import('./retained-output-read.js');
 type TurnOutcome = import('./turn-outcome.js').TurnOutcome;
 
 test.after(() => {
@@ -210,6 +213,109 @@ test('a successful read survives a later local failure as exact retained termina
   });
   assert.equal(fakeClaim, committed.presentation.text,
     'matching model prose cannot suppress or replace the host-derived inventory');
+});
+
+test('a spent checkpoint after successful writes never denies those writes or invites a fresh replay', () => {
+  const task = accept();
+  settleWrite(task, 'succeeded');
+  const committed = delivery.commitTurnOutcome(blockedOutcome(task, hostRunner.HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT));
+  assert.match(committed.presentation.text, /succeeded/);
+  assert.doesNotMatch(committed.presentation.text, /Nothing was sent or changed|start this step fresh/i);
+});
+
+test('ordinary work has durable progress without a Plan and cannot borrow another source progress', async () => {
+  const { composeRunProgressLine } = await import('./run-progress.js');
+  const task = accept();
+  settleRead(task, 50);
+  settleWrite(task, 'succeeded');
+  settleWrite(task, 'failed');
+  const fallback = 'Still working on your request.';
+  assert.equal(composeRunProgressLine({ ...task, fallback }), 'Still working — 1 write completed · 1 result collected.');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const { reduceActivity } = await import('../../../packages/chat-engine/src/reduce-activity.js');
+  const { liveActivityHeadline, narrateActivity } = await import('../../../packages/chat-engine/src/activity-presentation.js');
+  const progress = eventlog.appendEvent({ sessionId: task.sessionId, turn: 1, role: 'system', type: 'heartbeat',
+    data: { kind: 'progress_check_in', sourceUserSeq: task.sourceUserSeq,
+      message: composeRunProgressLine({ ...task, fallback: '' }), thinking: 'private reasoning is not progress' } });
+  const publicProgress = projectHarnessEventForPublic(progress)!;
+  assert.doesNotMatch(JSON.stringify(publicProgress), /private reasoning/);
+  assert.equal(liveActivityHeadline(narrateActivity(reduceActivity([], publicProgress), { live: true })),
+    'Still working — 1 write completed · 1 result collected.');
+  const next = eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user',
+    type: 'user_input_received', data: { text: 'Hows it looking?' } });
+  assert.equal(composeRunProgressLine({ sessionId: task.sessionId, sourceUserSeq: next.seq, fallback }), fallback);
+  eventlog.closeEventLog();
+  assert.equal(composeRunProgressLine({ ...task, fallback }), 'Still working — 1 write completed · 1 result collected.');
+});
+
+test('the receipt handles shown in a checkpoint reopen exact records only in their owning session', async () => {
+  const task = accept();
+  const handleId = settleRead(task, 50);
+  const read = resolveRetainedOutputRead(task.sessionId, handleId);
+  assert.equal(read.receipt?.truncatedAtWrite, false);
+  assert.equal(JSON.parse(read.receipt!.output).data.records.length, 50);
+  const foreign = accept();
+  assert.equal(resolveRetainedOutputRead(foreign.sessionId, handleId).receipt, undefined);
+  assert.equal(resolveRetainedOutputRead(task.sessionId, 'rh_missing').receipt, undefined);
+  // Exercise the shipped public tools after SQLite closes, not just the resolver.
+  eventlog.closeEventLog();
+  const { registerRecallTools } = await import('../../tools/recall-tools.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
+  const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>>();
+  registerRecallTools({ tool(name: string, _description: string, _schema: unknown, handler: never) {
+    handlers.set(name, handler);
+  } } as never);
+  const query = (sessionId: string, callId: string) => withHarnessRunContext({ sessionId, turn: 2,
+    counter: new ToolCallsCounter(10) }, () => handlers.get('tool_output_query')!({ call_id: callId, fields: ['id'], limit: 50 }));
+  const visible = (await query(task.sessionId, handleId)).content[0]!.text;
+  assert.match(visible, /person-50/);
+  assert.doesNotMatch(visible, /\$fromToolOutput/, 'reading a receipt grants no copy-by-reference authority');
+  const recalled = await withHarnessRunContext({ sessionId: task.sessionId, turn: 2, counter: new ToolCallsCounter(10) },
+    () => handlers.get('recall_tool_result')!({ call_id: handleId, max_chars: 10_000 }));
+  assert.match(recalled.content[0]!.text, /person-50/);
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'tool', type: 'tool_called', data: {
+    tool: 'recall_tool_result', callId: 'receipt-recall', arguments: JSON.stringify({ call_id: handleId }),
+  } });
+  assert.match((await query(task.sessionId, 'receipt-recall')).content[0]!.text, /person-50/);
+  assert.match((await query(foreign.sessionId, handleId)).content[0]!.text, /No tool output/);
+  const db = eventlog.openEventLog();
+  assert.throws(() => db.prepare('UPDATE durable_result_handles SET raw_payload_json = ? WHERE handle_id = ?')
+    .run('{"invented":"corrupt"}', handleId), /immutable/);
+  // Simulate damaged storage beyond the normal immutable writer in this isolated fixture.
+  const trigger = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'trg_durable_result_identity_immutable'").get() as { sql: string };
+  db.exec('DROP TRIGGER trg_durable_result_identity_immutable');
+  try { db.prepare('UPDATE durable_result_handles SET raw_payload_json = ? WHERE handle_id = ?').run('{"invented":"corrupt"}', handleId); }
+  finally { db.exec(trigger.sql); }
+  assert.equal(resolveRetainedOutputRead(task.sessionId, handleId).receipt, undefined, 'damaged bytes cannot become source data');
+});
+
+test('compaction retains exact completed-write arguments past the generic summary cap', () => {
+  const task = accept();
+  settleWrite(task, 'succeeded');
+  const callId = `logical:sheet-write-succeeded-${task.sourceUserSeq}`;
+  const items: any[] = [];
+  const add = (id: string, name: string, args: unknown, output: string) => {
+    items.push({ type: 'function_call', callId: id, name, arguments: JSON.stringify(args) },
+      { type: 'function_call_result', callId: id, output: { type: 'text', text: output } });
+    eventlog.writeToolOutput({ sessionId: task.sessionId, callId: id, tool: name, output });
+  };
+  for (let i = 0; i < 80; i++) add(`source-${i}`, 'read_file', { path: `source-${i}` }, 'Background result '.repeat(60));
+  add(callId, 'work_call', { requirement_id: 'cap:resolved:googlesheets_batch_update', universe_item_id: null,
+    universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null,
+    name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_UPDATE',
+      arguments: JSON.stringify({ spreadsheet_id: 'sheet-1', rows: [['Ada']] }) }) }, '{"successful":true}');
+  add('recent-read', 'read_file', { path: 'recent' }, 'latest');
+  const visible = collapseOldCompletedToolPairs(items, 1, task.sessionId).nextItems.map(item => (item as any).content ?? '').join('\n');
+  assert.match(visible, /Durable completed writes/);
+  const inventory = visible.split('[Durable completed writes — already done]')[1]!;
+  assert.match(inventory, /sheet-1/);
+  assert.match(inventory, /Ada/);
+  assert.match(inventory, /"outcome":"succeeded"/);
+  assert.doesNotMatch(inventory, /source-79/, 'reads are not promoted to successful writes');
+  const writeCall = items.find(item => item.type === 'function_call' && item.callId === callId);
+  writeCall.arguments = JSON.stringify({ spreadsheet_id: 'a-different-sheet', rows: [['Wrong']] });
+  const mismatched = JSON.stringify(collapseOldCompletedToolPairs(items, 1, task.sessionId).nextItems);
+  assert.doesNotMatch(mismatched, /Durable completed writes/, 'a reused ID cannot label different arguments as already committed');
 });
 
 test('a retained read distinguishes a known failed write from an uncertain write', () => {

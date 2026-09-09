@@ -261,7 +261,7 @@ export function _innerDispatchLegacyMcpTestResolverActive(): boolean {
   return isolatedTestContractActive() && externalMcpResolverForTest !== null;
 }
 
-export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
+export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmission = false): Partial<Pick<
   NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
   | 'sourceUserSeq'
   | 'behaviorScopeId'
@@ -272,6 +272,7 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
   | 'mcpToolScope'
   | 'dispatchLease'
   | 'runAttemptId'
+  | 'hostOwnsToolAccounting'
 >> {
   const parent = harnessRunContextStorage.getStore();
   if (!parent || parent.sessionId !== sessionId) return {};
@@ -286,6 +287,11 @@ export function inheritedNestedHarnessContext(sessionId: string): Partial<Pick<
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
     ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
+    // A one-shot exact admission mirrors the logical call already charged by
+    // the host. Ordinary nested/batch calls remain separately accounted: an
+    // ambient parent flag cannot exempt arbitrary child work.
+    ...(exactHostAdmission && parent.hostOwnsToolAccounting === true
+      ? { hostOwnsToolAccounting: true } : {}),
     // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
     // protects the MODEL's context window, but an inner recall never enters
     // model context — only the carrier's clipped output does. Inheriting
@@ -367,7 +373,7 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
-  const inheritedContext = inheritedNestedHarnessContext(sessionId);
+  const inheritedContext = inheritedNestedHarnessContext(sessionId, exactHostAdmission);
   // Local SDK adapters reopen source identity from RunContext, not just ALS.
   // Carry the same accepted source into both contexts; otherwise the adapter
   // overwrites the exact bracket context with sourceUserSeq:undefined and a

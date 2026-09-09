@@ -196,6 +196,24 @@ test('shape: a non-object value against an object schema is flagged', () => {
 });
 
 // ── parseStoredToolOutputJson ────────────────────────────────────────────────
+
+test('stored host CLI results expose complete stdout JSON to every structured reader', () => {
+  const payload = { status: 0, result: { records: [{ Name: 'Fictional Acorn', Contacts: { records: [{ Email: 'acorn@example.test' }] } }] } };
+  const result = { version: 1, status: 'exited', operationId: 'salesforce_sf_soql_query', executableRealpath: '/usr/local/lib/sf/bin/sf', argv: ['data', 'query', '--json'], exitCode: 0, signal: null, stdout: JSON.stringify(payload), stderr: '', stdoutTruncated: false };
+  for (const envelope of [result, { result, complete: true }]) {
+    assert.deepEqual(parseStoredToolOutputJson(JSON.stringify(envelope))?.value, payload);
+  }
+  for (const envelope of [
+    { result: { ...result, stdoutTruncated: true }, complete: true },
+    { result, complete: false },
+    { result: { ...result, exitCode: 1 }, complete: true },
+    { result: { ...result, stdout: '{malformed' }, complete: true },
+    { stdout: JSON.stringify(payload) },
+  ]) {
+    assert.deepEqual(parseStoredToolOutputJson(JSON.stringify(envelope))?.value, envelope,
+      'partial, failed, malformed, or ordinary user objects do not become complete CLI data');
+  }
+});
 // A parked tool output is the provider payload PLUS whatever prose the harness
 // appended on the way in. Every shape below is verbatim from platform-49 run 6
 // (2026-09-03, Sonnet 5), where a bare JSON.parse made tool_output_query tell

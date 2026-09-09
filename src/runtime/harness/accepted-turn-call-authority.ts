@@ -4285,18 +4285,16 @@ export function admitHostLogicalCallInTransaction(
     };
   }
   if (!input.isNew) return { status: 'ok', authority };
-  const counts = db.prepare(`
-    SELECT COUNT(*) AS total,
-           SUM(CASE WHEN state = 'open' THEN 1 ELSE 0 END) AS open_count
-      FROM logical_tool_calls
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(input.sessionId, input.sourceUserSeq) as { total: number; open_count: number | null };
-  if (counts.total >= (authority.maxLogicalCalls ?? 0)) {
-    return { status: 'closed', reason: 'host logical-call ceiling reached' };
-  }
-  if ((counts.open_count ?? 0) >= (authority.maxParallelCalls ?? 0)) {
-    return { status: 'closed', reason: 'host parallel-call ceiling reached' };
-  }
+  // A logical admission reserves an exact call; it is not an executing slot.
+  // The host prepares the whole frame before consent, then its execution queue
+  // bounds concurrent reads and serializes writes. Counting these reservations
+  // as running work rejected every 9+ draft frame before any draft could run.
+  // Keep all source, capability, effect and consent checks; queue size is not
+  // execution authority and must not force the model to re-author the batch.
+  // Likewise, the per-activation counter is a scheduling budget, not a lifetime
+  // cap on this accepted source. The source survives checkpoint continuations;
+  // counting every historical admission here made a fresh activation unable to
+  // finish a large job even though it had its own execution budget remaining.
   return { status: 'ok', authority };
 }
 
