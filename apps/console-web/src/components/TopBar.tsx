@@ -96,7 +96,18 @@ export function TopBar({
           <SlidersHorizontal className="h-5 w-5" aria-hidden />
         </Button>
 
-        <Button size="sm" onClick={openVoice} className="gap-2">
+        {/* Peer weight, deliberately. As a FILLED primary button this was the
+            loudest control in the whole shell, which made the console's
+            standing call to action "start a conversation" rather than "show me
+            the work". The voice overlay is unchanged — only its volume is. */}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={openVoice}
+          aria-label="Talk to Clementine"
+          title="Talk to Clementine"
+          className="gap-2"
+        >
           <Mic className="h-4 w-4" aria-hidden />
           <span className="hidden md:inline">Talk</span>
         </Button>

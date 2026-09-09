@@ -218,7 +218,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
         <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <div className="rounded-md border border-border bg-surface p-3">
             <div className="mb-2 flex items-center justify-between gap-3">
-              <div className="text-caption font-semibold uppercase tracking-wide text-faint">Agent-system trend</div>
+              <div className="text-caption font-semibold text-faint">Agent-system trend</div>
               <StatusPill tone={trendTone(trend.status)}>{trend.status}</StatusPill>
             </div>
             <p className="text-small text-muted">{trend.recommendation}</p>
@@ -236,7 +236,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
           </div>
           <div className="rounded-md border border-border bg-surface p-3">
             <div className="mb-2 flex items-center justify-between gap-3">
-              <div className="text-caption font-semibold uppercase tracking-wide text-faint">Coordination policy</div>
+              <div className="text-caption font-semibold text-faint">Coordination policy</div>
               <StatusPill tone={coordinationTone(coordination.status)}>{coordination.status}</StatusPill>
               <StatusPill tone={fanoutPostureTone(coordination.fanoutPosture)}>fanout {coordination.fanoutPosture}</StatusPill>
               <StatusPill tone={coordination.recommendedWorkerWaveSize >= 8 ? 'success' : coordination.recommendedWorkerWaveSize > 0 ? 'info' : 'danger'}>
@@ -257,7 +257,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
           </div>
           {scorecards.length > 0 && (
             <div className="rounded-md border border-border bg-surface p-3">
-              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Weakest agents</div>
+              <div className="mb-2 text-caption font-semibold text-faint">Weakest agents</div>
               <div className="space-y-2">
                 {scorecards.map((scorecard) => (
                   <div key={scorecard.slug} className="flex items-center justify-between gap-3">
@@ -273,7 +273,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
           )}
           {issueCauses.length > 0 && (
             <div className="rounded-md border border-border bg-surface p-3">
-              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Loop causes</div>
+              <div className="mb-2 text-caption font-semibold text-faint">Loop causes</div>
               <div className="space-y-2">
                 {issueCauses.map((cause) => (
                   <div key={cause.key} className="flex items-center justify-between gap-3">
@@ -290,7 +290,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
           {(learning.topPatterns.length > 0 || learning.risks.length > 0 || learning.strengths.length > 0) && (
             <div className="rounded-md border border-border bg-surface p-3">
               <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="text-caption font-semibold uppercase tracking-wide text-faint">Workflow learning</div>
+                <div className="text-caption font-semibold text-faint">Workflow learning</div>
                 <StatusPill tone={workflowLearningTone(learning.status)}>{learning.status}</StatusPill>
               </div>
               <div className="grid gap-2 sm:grid-cols-3">
@@ -322,7 +322,7 @@ function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
           )}
           {interventions.risks.length > 0 && (
             <div className="rounded-md border border-border bg-surface p-3">
-              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Intervention risks</div>
+              <div className="mb-2 text-caption font-semibold text-faint">Intervention risks</div>
               <div className="space-y-2">
                 {interventions.risks.slice(0, 3).map((risk) => (
                   <div key={risk} className="flex items-center justify-between gap-3">

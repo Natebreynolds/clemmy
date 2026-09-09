@@ -19,6 +19,8 @@ test.after(() => {
 
 const {
   checkAttempt,
+  reserveAttempt,
+  resetInFlightAttempts,
   recordFailure,
   recordSuccess,
   readGlobalBucket,
@@ -144,4 +146,111 @@ test('state survives a restart within a scope', async () => {
   }
   // A fresh read is exactly what a restarted daemon does.
   assert.equal(checkAttempt('4.4.4.4', opts).allowed, false);
+});
+
+
+/**
+ * ── The burst, which the durable buckets alone never bounded ────────────────
+ *
+ * checkAttempt records nothing, so every request that arrived while the caller
+ * was hashing was judged against the same pre-burst counter. These pin the
+ * reservation that closes that window.
+ */
+
+test('a concurrent burst is admitted only up to the budget, not all at once', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir, scope: 'pin' as const };
+  resetInFlightAttempts();
+
+  // Nothing recorded yet: checkAttempt says yes to every one of these, which is
+  // exactly the defect. reserveAttempt must not.
+  const budget = SCOPE_POLICIES.pin.maxFailures;
+  const held = [];
+  let admitted = 0;
+  for (let i = 0; i < budget + 20; i += 1) {
+    const r = reserveAttempt('9.9.9.9', opts);
+    if (r.allowed) { admitted += 1; held.push(r); }
+    assert.equal(checkAttempt('9.9.9.9', opts).allowed, true,
+      'the durable counter is still untouched — that is the window being closed');
+  }
+  assert.equal(admitted, budget,
+    `a ${budget}-attempt budget must admit ${budget} concurrent attempts, not ${admitted}`);
+
+  // The slot frees as each attempt settles.
+  held[0].release();
+  assert.equal(reserveAttempt('9.9.9.9', opts).allowed, true, 'a released slot is reusable');
+});
+
+test('release is idempotent and cannot inflate the budget', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir, scope: 'pin' as const };
+  resetInFlightAttempts();
+
+  const first = reserveAttempt('8.8.8.8', opts);
+  assert.equal(first.allowed, true);
+  first.release();
+  first.release();
+  first.release();
+
+  // Three releases of one slot must not leave room for budget + 2.
+  let admitted = 0;
+  for (let i = 0; i < SCOPE_POLICIES.pin.maxFailures + 5; i += 1) {
+    if (reserveAttempt('8.8.8.8', opts).allowed) admitted += 1;
+  }
+  assert.equal(admitted, SCOPE_POLICIES.pin.maxFailures);
+});
+
+test('a refused reservation holds no slot', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir, scope: 'pin' as const };
+  resetInFlightAttempts();
+
+  const budget = SCOPE_POLICIES.pin.maxFailures;
+  const held = [];
+  for (let i = 0; i < budget; i += 1) held.push(reserveAttempt('7.7.7.7', opts));
+
+  const refused = reserveAttempt('7.7.7.7', opts);
+  assert.equal(refused.allowed, false);
+  refused.release();  // the handler's `finally` / res close runs on this path too
+
+  // Releasing a refusal must not have decremented someone else's slot.
+  assert.equal(reserveAttempt('7.7.7.7', opts).allowed, false,
+    'the budget is still fully held by the live attempts');
+  held[0].release();
+  assert.equal(reserveAttempt('7.7.7.7', opts).allowed, true);
+});
+
+test('reservations do not leak across IPs, and a durable lockout still wins', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir, scope: 'pin' as const };
+  resetInFlightAttempts();
+
+  const mine = reserveAttempt('1.1.1.1', opts);
+  assert.equal(mine.allowed, true);
+  assert.equal(reserveAttempt('2.2.2.2', opts).allowed, true,
+    'one caller in flight must not close the door on a different IP');
+
+  // A durably locked-out IP is refused regardless of how quiet the in-flight
+  // map is — the reservation narrows the gate, it never widens it.
+  for (let i = 0; i < SCOPE_POLICIES.pin.maxFailures; i += 1) {
+    await recordFailure('3.3.3.3', opts);
+  }
+  resetInFlightAttempts();
+  assert.equal(reserveAttempt('3.3.3.3', opts).allowed, false);
+});
+
+test('the global budget is held in flight too, so a distributed burst is bounded', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir, scope: 'pin' as const };
+  resetInFlightAttempts();
+
+  // One attempt per IP never trips the per-IP budget, which is the whole point
+  // of the global bucket — and in flight it must behave the same way.
+  const globalBudget = SCOPE_POLICIES.pin.globalMaxFailures;
+  let admitted = 0;
+  for (let i = 0; i < globalBudget + 10; i += 1) {
+    if (reserveAttempt(`10.0.0.${i}`, opts).allowed) admitted += 1;
+  }
+  assert.equal(admitted, globalBudget,
+    `a distributed burst must stop at the global budget (${globalBudget}), got ${admitted}`);
 });

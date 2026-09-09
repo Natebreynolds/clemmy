@@ -271,6 +271,55 @@ export function activityTerminalOutcomeFromHarnessEvents(
 // for any other entry. Elapsed time is the distance between two SERVER
 // timestamps (startedAt → the snapshot's observedAt) — the client clock never
 // enters.
+//
+// AND MEMBERSHIP OBEYS THE SAME HONESTY (2026-09-06). The certificate governed
+// the animation but not who was in the room: this function kept every entry
+// that was `!terminal` and let every surface call that population "running".
+// On the owner's own machine that read as six rows of "Pre-tag Sonnet batch
+// verifier V24…V30" under the phone's Running heading — runs BLOCKED SINCE TWO
+// DAYS AGO, with nothing actually running at all. "Not terminal" is not a
+// synonym for "happening now"; it only means nobody wrote the ending down.
+//
+// So every row is now one of three things, decided from data it already
+// carries and never from a guess:
+//
+//   RUNNING — non-terminal and not known to have stopped. Certified live
+//             (`liveness === 'live'`) pulses; honestly-unknown liveness still
+//             counts, it just does not claim a heartbeat nobody took.
+//   STALLED — a row that is NOT executing (a person is the blocker, or the
+//             lease is lost) and has been in that state long enough that
+//             calling it current would be a lie. A blocked run from Tuesday
+//             is here.
+//   SETTLED — terminal. Out of "current" entirely. Read from the typed
+//             `terminal` when the DTO carries one AND from the lifecycle when
+//             it does not: the strict foreground DTO the phone receives has no
+//             `terminal` field at all. (Belt and braces, not the headline fix:
+//             the server already drops every typed-terminal row before either
+//             surface sees it — src/dashboard/activity-projection.ts
+//             `shouldSurfaceInWorkingNow`, `if (entry.terminal) return false` —
+//             and every settled lifecycle is minted together with a terminal.
+//             This is the guard for a DTO that loses the field in transit, and
+//             for the board feed, whose Done cards DO arrive here.)
+//
+// AND AGE IS NOT DEATH (the second half of the same honesty). Demoting a row
+// on silence alone was itself a lie in the opposite direction: for a WORKFLOW
+// run the server pins `lastEvidenceAt = finishedAt ?? startedAt ?? createdAt`
+// (src/dashboard/activity-projection.ts:217) and mid-run progress is stamped
+// only as `currentStepId` / `stepsCompleted`, never as a timestamp
+// (src/execution/workflow-events.ts, `stampRunStepProgress`). So a workflow
+// that is genuinely executing right now reports `lastEvidenceAt ===
+// startedAt` for its whole life, and "measure the silence" would have called
+// every real multi-hour run "Stopped". Silence may therefore only END a claim
+// of running when the row is either
+//   · already known not to be executing (a person is the blocker, or the
+//     server says the lease went stale), or
+//   · carrying an evidence clock that demonstrably TICKS (`lastEvidenceAt`
+//     strictly after `startedAt` — background tasks stamp `updatedAt`,
+//     fan-out plans stamp the plan's, a settled chat attempt its finish).
+// A row that is neither stays RUNNING and is flagged `quiet`, which says the
+// only true thing left: nothing has landed for a long time, and we cannot
+// prove it either way. The fix that makes such a row provable is a server
+// one — stamp a progress timestamp where the step boundary already writes.
 
 /** The structural slice of a projection entry the presenter needs. Both the
  *  operational Activity DTO and the strict foreground DTO satisfy it. */

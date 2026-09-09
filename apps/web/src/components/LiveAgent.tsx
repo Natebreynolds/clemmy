@@ -11,6 +11,7 @@ import {
   Sparkles,
   Cpu,
   Video,
+  Check,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 
@@ -132,7 +133,7 @@ export function LiveAgent() {
       <div className="grid gap-8 lg:grid-cols-[1.1fr_1fr] items-stretch">
         {/* Console or real demo */}
         {hasVideo ? (
-          <div className="relative overflow-hidden rounded-2xl bg-[#0d0907] ring-1 ring-white/10 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]">
+          <div className="relative overflow-hidden rounded-2xl bg-[var(--panel)] ring-1 ring-white/10 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]">
             <div className="flex items-center gap-2 border-b border-white/5 px-4 py-3">
               <span className="size-2.5 rounded-full bg-red-400/70" />
               <span className="size-2.5 rounded-full bg-yellow-400/70" />
@@ -158,7 +159,7 @@ export function LiveAgent() {
         ) : (
           <div
             key={tick}
-            className="relative overflow-hidden rounded-2xl bg-[#0d0907] ring-1 ring-white/10 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]"
+            className="relative overflow-hidden rounded-2xl bg-[var(--panel)] ring-1 ring-white/10 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]"
           >
             <div className="flex items-center gap-2 border-b border-white/5 px-4 py-3">
               <span className="size-2.5 rounded-full bg-red-400/70" />
@@ -315,8 +316,8 @@ function BeatRow({ beat, active }: { beat: Beat; active: boolean }) {
         </div>
         <div className="mt-1 text-white/90">{beat.label}</div>
         <div className="mt-2 flex gap-2">
-          <span className="rounded-md bg-emerald-400/15 text-emerald-200 px-2 py-0.5 text-[11px] ring-1 ring-emerald-400/30">
-            approve ✓
+          <span className="inline-flex items-center gap-1 rounded-md bg-emerald-400/15 text-emerald-200 px-2 py-0.5 text-[11px] ring-1 ring-emerald-400/30">
+            approve <Check className="h-3 w-3" strokeWidth={3} />
           </span>
           <span className="rounded-md bg-white/[0.04] text-white/50 px-2 py-0.5 text-[11px] ring-1 ring-white/10">
             deny
@@ -343,7 +344,7 @@ function BeatRow({ beat, active }: { beat: Beat; active: boolean }) {
   }
   // reply
   return (
-    <Row label="✓" labelClass="text-clem-300">
+    <Row label={<Check className="inline h-3.5 w-3.5" />} labelClass="text-clem-300">
       <span className="text-white">{active ? typed : beat.text}</span>
     </Row>
   );
@@ -354,7 +355,9 @@ function Row({
   labelClass,
   children,
 }: {
-  label: string;
+  // A ReactNode, not a string: the "done" marker is a real icon, not a
+  // dingbat character borrowed from the font.
+  label: React.ReactNode;
   labelClass?: string;
   children: React.ReactNode;
 }) {

@@ -80,7 +80,7 @@ function Tools() {
   const rows = (tools.data?.tools ?? []).filter((t) => `${t.name} ${t.description ?? ''}`.toLowerCase().includes(q.toLowerCase()));
   return (
     <Page title="Tools" subtitle="Everything Clementine can do (read-only)">
-      <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
+      <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
         <Search className="h-4 w-4 text-faint" aria-hidden />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search tools…" aria-label="Search tools"
           className="h-11 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint" />

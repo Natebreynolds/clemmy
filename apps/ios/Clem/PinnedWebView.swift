@@ -762,6 +762,49 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    /// The microphone, for the paired origin only.
+    ///
+    /// WKWebView denies every getUserMedia request by default when no delegate
+    /// answers, so hold-to-talk was not "unimplemented" on the phone — it was
+    /// impossible, and it failed the way the worst permission bugs fail: with
+    /// no prompt, no error the page can act on, and nothing in the log.
+    ///
+    /// Three narrowings, in order:
+    ///  - Only `.microphone`. The camera is used natively for the pairing QR
+    ///    and nothing in `/m` has a camera feature, so granting it here would
+    ///    hand the web layer a capability the product does not use.
+    ///  - Only the PAIRED origin, judged by the same predicate the navigation
+    ///    lock uses (isPairedOrigin fails closed when no certificate
+    ///    fingerprint is stored, so an unpinned app grants nothing).
+    ///  - Only the main frame. A grant to a subframe would extend the
+    ///    microphone to embedded content that the origin check alone would
+    ///    wave through.
+    ///
+    /// `.grant` here means "the web layer may ask", NOT "capture may begin":
+    /// iOS still gates the recording itself behind the system microphone
+    /// prompt backed by NSMicrophoneUsageDescription, so this does not bypass
+    /// the user's consent — it only stops WKWebView refusing before the user
+    /// is ever asked.
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        guard type == .microphone, frame.isMainFrame else {
+            decisionHandler(.deny)
+            return
+        }
+        let paired = PinnedWebNavigationPolicy.isPairedOrigin(
+            scheme: origin.protocol,
+            host: origin.host,
+            port: origin.port,
+            pairing: pairing
+        )
+        decisionHandler(paired ? .grant : .deny)
+    }
+
     /// WKWebView has no second-window UI. Keep paired `/m` links in the pinned
     /// view, send an explicit user-tapped external link to the system, and drop
     /// script-created/untrusted popups instead of silently loading them here.

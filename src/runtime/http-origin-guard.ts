@@ -19,6 +19,7 @@
  * WEBHOOK_ALLOW_LAN daemon by address.
  */
 import net from 'node:net';
+import { networkInterfaces } from 'node:os';
 import type { Request, Response, NextFunction } from 'express';
 import { WEBHOOK_HOST } from '../config.js';
 
@@ -79,6 +80,58 @@ export function isAllowedHost(host: string): boolean {
 }
 
 /**
+ * The addresses this machine actually answers on.
+ *
+ * Read fresh per call rather than cached: a laptop changes networks constantly,
+ * and a stale list would refuse a legitimate LAN origin after a DHCP move.
+ */
+function localAddresses(): Set<string> {
+  const out = new Set<string>(['127.0.0.1', '::1']);
+  try {
+    for (const entries of Object.values(networkInterfaces())) {
+      for (const entry of entries ?? []) {
+        // Node reports link-local v6 with a zone suffix (fe80::1%en0) that a
+        // browser never puts in an Origin, so compare on the bare address.
+        out.add(entry.address.toLowerCase().split('%')[0]);
+      }
+    }
+  } catch {
+    /* an interface enumeration failure must not open the door, only narrow it */
+  }
+  return out;
+}
+
+/**
+ * Whether an ORIGIN header names an origin this daemon serves.
+ *
+ * THE DEFECT THIS EXISTS TO FIX. `isAllowedHost` answers "could this Host
+ * header be a rebinding attack?", and its IP-literal shortcut is right for that
+ * question: a name is what rebinding changes. The CSRF check reused the same
+ * predicate to answer a DIFFERENT question — "did this request come from a page
+ * I serve?" — and there the shortcut is a hole. Any page on any bare IP
+ * (`http://198.51.100.7/`) sends `Origin: http://198.51.100.7`, passes, and the
+ * one explicit CSRF layer under a SameSite=Lax cookie is gone.
+ *
+ * So an IP origin is admitted only when it is an address this machine is
+ * actually reachable at. Two consequences worth naming: the old predicate also
+ * REFUSED every IPv6 literal by accident (URL.hostname keeps the brackets, so
+ * net.isIP saw `[::1]` and returned 0), which broke legitimate v6 LAN clients —
+ * normalizing here fixes that in the same move.
+ */
+export function isAllowedOrigin(originHost: string): boolean {
+  if (!originHost) return false;
+  // A BARE IPv6 literal must be recognised before normalizing. normalizeHostHeader
+  // strips a trailing `:<digits>` as a port, which is right for a Host header
+  // (where IPv6 is always bracketed) and wrong for `::1`, whose last group it
+  // eats. Test the raw value first so both spellings reach the same answer.
+  const raw = originHost.trim().toLowerCase();
+  const host = net.isIP(raw) !== 0 ? raw : normalizeHostHeader(originHost);
+  if (!host) return false;
+  if (net.isIP(host) !== 0) return localAddresses().has(host);
+  return buildAllowedHostNames().has(host);
+}
+
+/**
  * Rejects requests whose Host header names a host we do not serve.
  *
  * 421 Misdirected Request is the semantically correct status: the request
@@ -119,11 +172,13 @@ export function requireSameOriginForMutations(req: Request, res: Response, next:
   if (typeof origin === 'string' && origin && origin !== 'null') {
     let originHost = '';
     try {
-      originHost = new URL(origin).hostname.toLowerCase();
+      // URL.hostname keeps IPv6 brackets; normalizeHostHeader strips them, so
+      // `http://[::1]:8520` is judged on `::1` rather than being refused.
+      originHost = normalizeHostHeader(new URL(origin).hostname);
     } catch {
       originHost = '';
     }
-    if (!originHost || !isAllowedHost(originHost)) {
+    if (!originHost || !isAllowedOrigin(originHost)) {
       res.status(403).type('text/plain').send('Cross-origin request refused');
       return;
     }

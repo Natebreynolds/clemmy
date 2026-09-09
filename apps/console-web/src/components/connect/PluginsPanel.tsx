@@ -154,7 +154,7 @@ export function PluginsPanel() {
           </div>
           {catalog.isLoading && <span className="text-caption text-faint">Loading…</span>}
         </div>
-        <div className="mb-3 flex items-center gap-2 rounded-md border border-border bg-canvas px-3">
+        <div className="mb-3 flex items-center gap-2 rounded-md border border-border bg-canvas px-3 focus-within:ring-2 focus-within:ring-primary">
           <Search className="h-4 w-4 shrink-0 text-faint" aria-hidden />
           <input
             value={catalogQuery}
@@ -229,7 +229,7 @@ export function PluginsPanel() {
               type="url" value={url} placeholder="https://…/my-plugin.clemplug"
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') submitUrl(); }}
-              className="h-9 w-full rounded-md border border-border bg-canvas pl-8 pr-3 text-body text-fg placeholder:text-faint focus:border-ring focus:outline-none"
+              className="h-9 w-full rounded-md border border-border bg-canvas pl-8 pr-3 text-body text-fg placeholder:text-faint focus:border-primary focus-visible:ring-2 focus-visible:ring-primary"
               aria-label="Plugin URL"
             />
           </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { CircleCheck, TriangleAlert, ArrowDownToLine } from 'lucide-react';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 
 /**
@@ -108,7 +109,11 @@ export function UpdaterBanner() {
     return null;
   }
 
-  const icon = tone === 'ready' ? '✓' : tone === 'error' ? '⚠' : '↓';
+  // Real icons, sized and coloured with the chip. A text glyph inherits the
+  // font's own idea of weight and baseline, which is why the tick used to sit
+  // low against its label.
+  const Icon = tone === 'ready' ? CircleCheck : tone === 'error' ? TriangleAlert : ArrowDownToLine;
+  const iconInk = tone === 'ready' ? 'text-primary' : tone === 'error' ? 'text-warning' : 'text-muted';
   const cardBg = tone === 'ready' ? 'bg-primary-tint' : 'bg-surface';
   const btnClass = tone === 'ready'
     ? 'bg-primary text-primary-fg hover:bg-primary-hover'
@@ -124,7 +129,7 @@ export function UpdaterBanner() {
       title={text}
       className={`fixed bottom-4 left-4 z-50 flex max-w-xs items-center gap-2 rounded-xl border border-border px-3 py-2 text-sm text-fg shadow-warm-halo ${cardBg}`}
     >
-      <span aria-hidden className="shrink-0">{icon}</span>
+      <Icon className={`h-4 w-4 shrink-0 ${iconInk}`} aria-hidden />
       <span className="min-w-0 truncate">{text}</span>
       {action && (
         <button

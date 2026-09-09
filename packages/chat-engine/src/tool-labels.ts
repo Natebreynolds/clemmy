@@ -131,3 +131,22 @@ export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unk
   const stripped = tool.replace(/^mcp__/, '');
   return stripped.split('__').map((part) => part.replace(/_/g, ' ')).filter(Boolean).join(' · ');
 }
+
+/**
+ * The provider, as a WORD.
+ *
+ * Both surfaces carried an identical hex map keying provider identity to a
+ * colour, painted as an 8px aria-hidden dot. Colour alone as the sole carrier
+ * of information fails WCAG 1.4.1, and a screen reader got nothing at all — so
+ * the one fact the row was trying to convey was the one fact it withheld.
+ * The name is legible, translatable, and needs no legend.
+ */
+export function providerLabel(provider: string | undefined): string {
+  switch (provider) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex';
+    case 'glm': return 'GLM';
+    case 'byo': return 'BYO';
+    default: return 'Agent';
+  }
+}

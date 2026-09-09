@@ -189,7 +189,7 @@ export function Automate() {
           const active = tab === t.key;
           return (
             <button key={t.key} type="button" onClick={() => setTab(t.key)}
-              className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+              className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                 active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
               <Icon className="h-4 w-4" aria-hidden /> {t.label}
             </button>
@@ -327,7 +327,7 @@ export function Automate() {
                 onChange={(e) => setSkillUrl(e.target.value)}
                 placeholder="https://github.com/owner/skill"
                 aria-label="GitHub repo URL"
-                className="h-11 flex-1 rounded-md border border-border bg-canvas px-3 text-body text-fg outline-none focus:border-primary"
+                className="h-11 flex-1 rounded-md border border-border bg-canvas px-3 text-body text-fg outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-primary"
               />
               <Button onClick={install} disabled={installing || !skillUrl.trim()}>
                 {installing ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add
@@ -432,7 +432,7 @@ function RunWorkspaceDrawer({
 
   return (
     <div className="fixed inset-0 z-[120] flex justify-end bg-black/30 animate-fade-in" onMouseDown={onClose}>
-      <div className="flex h-full w-full max-w-5xl flex-col bg-surface shadow-lg" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="flex h-full w-full max-w-5xl flex-col bg-surface shadow-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-3 border-b border-border px-5 py-4">
           <Radio className="h-5 w-5 shrink-0 text-live" aria-hidden />
           <div className="min-w-0 flex-1">

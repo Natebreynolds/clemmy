@@ -46,6 +46,42 @@ export interface RelayFrame {
   payload: Buffer;
 }
 
+/**
+ * The client address the relay reports, reduced to something safe to key a
+ * rate-limit bucket on.
+ *
+ * The relay observes the phone's socket and writes that address into the OPEN
+ * frame; this daemon then hands it to registerRelayStreamPeer, and every
+ * attempt budget on the phone door is keyed on the result. The value was taken
+ * verbatim. A relay that is buggy, compromised, or simply behind another proxy
+ * could therefore hand over one constant string — collapsing every remote
+ * caller into a single bucket, where one attacker locks the owner out — or a
+ * fresh unique string per request, which mints a new budget every time and
+ * makes the limiter unenforceable in the other direction.
+ *
+ * The relay leg is pinned and authenticated, so this is defence in depth rather
+ * than a broken trust boundary — and the value can never be VERIFIED here, only
+ * constrained. The constraint that carries the weight is shape: it must parse as
+ * an IP address. That is what stops an arbitrary string ('unknown', a per-request
+ * nonce, a path) from becoming a bucket key, which is the mint-a-fresh-budget
+ * direction and the one that makes the limiter stop existing.
+ *
+ * Loopback is deliberately ALLOWED. A relay running on the same machine as the
+ * daemon reports 127.0.0.1 honestly, and refusing it would break that topology
+ * while buying nothing: a hostile relay would simply name a public address
+ * instead, so the refusal filters an honest deployment rather than an attack.
+ *
+ * IPv4-mapped v6 is normalized so one phone is one bucket however it connected.
+ * An unusable value returns '' and the caller leaves the peer unregistered, so
+ * the stream falls back to the socket's own address rather than to one of the
+ * relay's choosing.
+ */
+export function sanitizeRelayClientIp(raw: string): string {
+  const value = raw.trim().toLowerCase().replace(/^::ffff:/, '');
+  if (!value || net.isIP(value) === 0) return '';
+  return value;
+}
+
 export function encodeFrame(type: number, streamId: number, payload: Buffer | string = Buffer.alloc(0)): Buffer {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   const header = Buffer.alloc(HEADER_LEN);
@@ -322,7 +358,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
         try {
           clientIp = String((JSON.parse(frame.payload.toString('utf8')) as { ip?: string }).ip ?? '');
         } catch { /* ip stays unknown */ }
-        openStream(frame.streamId, clientIp);
+        openStream(frame.streamId, sanitizeRelayClientIp(clientIp));
         return;
       }
       const local = streams.get(frame.streamId);

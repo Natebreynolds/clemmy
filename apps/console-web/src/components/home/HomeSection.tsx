@@ -3,8 +3,9 @@ import { AlertCircle, CheckCircle2, Info, X } from 'lucide-react';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
 
-/** The small section label the mockups use — "NEEDS YOU", "RUNNING" — with
- *  an optional count and a right-aligned aside. */
+/** The section label — "Needs you", "Running" — with an optional count and a
+ *  right-aligned aside. Sentence case: an uppercase tracked-out micro-label is
+ *  harder to read at exactly the size where legibility is already thinnest. */
 export function SectionHeader({
   label,
   count,
@@ -20,7 +21,7 @@ export function SectionHeader({
 }) {
   return (
     <div className="flex min-h-5 items-center gap-2">
-      <h2 id={id} className="text-label uppercase tracking-[0.02em] text-faint">{label}</h2>
+      <h2 id={id} className="text-small font-semibold text-muted">{label}</h2>
       {typeof count === 'number' && count > 0 && (
         <span
           className={cn(
@@ -39,7 +40,8 @@ export function SectionHeader({
 export function PaneCard({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn('flex flex-col overflow-hidden rounded-md border border-border bg-surface shadow-sm', className)}
+      // Elevation = a hairline plus a lighter surface than the canvas.
+      className={cn('flex flex-col overflow-hidden rounded-md border border-border bg-surface', className)}
       {...props}
     />
   );

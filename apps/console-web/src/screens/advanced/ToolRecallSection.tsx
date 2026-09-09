@@ -3,7 +3,7 @@
  * audit): canonical procedure slugs, intent aliases, and quarantine counts are
  * operator telemetry, the same class as the Evolution metrics, not user memory.
  */
-import { Wrench, CheckCircle2, XCircle } from 'lucide-react';
+import { Wrench, CheckCircle2, XCircle, CornerDownRight } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -50,7 +50,7 @@ function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
             {c ? <StatusPill tone="neutral">{c.kind}</StatusPill> : <StatusPill tone="warning">needs rediscovery</StatusPill>}
             {score != null && <span className="shrink-0 text-caption text-faint">{score}%</span>}
           </div>
-          {c && <p className="mt-0.5 font-mono text-small text-muted">→ {c.identifier}</p>}
+          {c && <p className="mt-0.5 flex items-center gap-1.5 font-mono text-small text-muted"><CornerDownRight className="h-3.5 w-3.5 shrink-0" aria-hidden />{c.identifier}</p>}
           {rec.description && <p className="mt-0.5 text-small text-muted">{rec.description}</p>}
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
             {(success > 0 || failure > 0) && (

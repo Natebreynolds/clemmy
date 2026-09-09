@@ -80,7 +80,7 @@ function StatCell({
         <span aria-hidden className="text-5xl sm:text-6xl text-[var(--ink-strong)]">
           {count}
         </span>
-        <span aria-hidden className="text-3xl sm:text-4xl text-clem-600">{suffix}</span>
+        <span aria-hidden className="text-3xl sm:text-4xl text-clem-700">{suffix}</span>
       </div>
       <div className="mt-2 text-sm font-medium text-[var(--ink-strong)]">{label}</div>
       <div className="mt-1.5 text-[12px] leading-relaxed text-[var(--ink-dim)]">{sub}</div>

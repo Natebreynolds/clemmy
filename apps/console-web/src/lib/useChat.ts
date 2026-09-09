@@ -733,6 +733,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     // describeExternalWrite (work-report.ts) so chat, the drawer feed, and the
     // report-back message all speak in ONE vocabulary. A failed/orphaned write
     // is the same line with an honest tail.
+    // ONE row per call, addressed by the id below, so a reservation and its
+    // terminal update the same line instead of listing the same draft twice.
+    // The disposition comes from the SHARED ledger — the same function the
+    // phone runs — because `external_write` alone is a PRE-DISPATCH
+    // reservation and was being stamped green here before the call had left
+    // the machine. See packages/chat-engine/src/write-ledger.ts.
     case 'external_write':
     case 'external_write_succeeded':
     case 'external_write_failed':

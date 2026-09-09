@@ -87,9 +87,13 @@ To activate push, drop an APNs signing key into the daemon:
 3. Restart the daemon. Already-registered phones start receiving pushes
    immediately — registration is accepted before the key exists.
 
-Environment defaults to `sandbox`, which matches Xcode-installed builds
-(`aps-environment: development`). For TestFlight/App Store builds set
-`"environment": "production"`.
+The DAEMON's environment defaults to `sandbox`. The APP no longer needs a
+manual flip: `aps-environment` is `$(APS_ENVIRONMENT)`, which project.yml binds
+to `development` in Debug and `production` in Release, so an Xcode-installed
+build and a TestFlight build each get the right token without anyone
+remembering. The daemon side is still yours to match — a TestFlight build needs
+`"environment": "production"`, and a mismatch fails silently (Apple answers
+BadDeviceToken and nothing arrives).
 
 ## Current scope / known gaps
 

@@ -1,0 +1,58 @@
+# Friday dashboard and current Sheet run: execution, evidence and accuracy
+
+**Subsequent Plan outcome:** Source 146537 has now terminated blocked without publishing a cleanup plan. Its earlier sixteen-read snapshot below is superseded for outcome purposes by the [consolidated beta handoff](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-beta-release-handoff.md), which records the complete failure chain and the owner's SDK architecture question. The Sheet and dashboard findings here remain scoped to their own sources.
+
+Owner-requested targeted review on September 7. Read-only inspection of the live ledger, retained provider results, saved dashboard data and source. No new LLM turn, provider call, write replay, daemon change or settings change was made by the reviewer. Implementation retains ownership; this does not reopen the recurring reviewer monitor or create a release gate waiting on the reviewer.
+
+## Current Sheet run: real execution progress, incomplete content qualification
+
+Source **146393**, session `sess-desktop-9708b93af44472978062f8a6`, ran **14:05:21.705–14:08:35.216 UTC**, or **193.511 seconds**. The preceding daemon build record names source fingerprint `efc1d203251ee0b20d8f71074c0cd181c1af91937d9cc12af358184c3cb5714e`, git `9cdf31fc39523eadeeb15e9be18dfa54165d58a9` dirty, PID 73639. Source inspection during review is not a fresh frozen-build qualification.
+
+The owner asked for a new Google Sheet containing ten of Tim's prospect accounts untouched for fifteen days, including domains, last communication and account activity summaries.
+
+Observed execution:
+
+- Eleven top-level calls: two discovery calls, seven Salesforce reads, Sheet creation and a cell update. All eleven settled succeeded. Zero `plan_task`, zero refused attempts. Two carrier completions were handled by the host without a refused model round trip.
+- The two successful mutations are expected distinct operations: creating a spreadsheet and populating it. They are not duplicate writes; do not impose a universal one-write assertion on this journey.
+- Creation receipt identifies spreadsheet `12W3kUi4ckQZeFPwZyYxUwAcq8OJNBdP-Tv6RA_jZx1Y`. Update receipt confirms `Sheet1!A1:H11`, 11 rows, 8 columns, 88 cells. No subsequent cell readback occurred in this run. This proves provider-acknowledged writing, not independently reopened final cell content.
+- Ten distinct submitted accounts map to the returned Salesforce accounts. All ten submitted domains, activity dates and calculated stale-day counts match those results. Six have Type=Prospect; four were selected by a Type=NULL query with a website, stale LastActivityDate and no open opportunity.
+- Completion judge and primary model both routed to `claude-opus-5`; policy was captured enabled with an owner-selected judge. Event 146513 accepted; terminal 146518 reports done/reviewed/verified. This is a live same-model review example, not independent cross-model review.
+
+This is materially better execution than the previous blocked journeys, but those runs used different counts/models/builds. It is not a controlled latency comparison or proof that their recovery defects are fixed.
+
+### Next correctness work
+
+**Preserve selection meaning.** The model disclosed in its final reply that it added four untyped accounts to reach ten. The Sheet itself has no column identifying confirmed versus inferred prospects, and its title labels the whole set prospects. Business meaning may legitimately differ from Salesforce's Type field, but the source does not establish that these four meet the owner's definition. Retain useful confirmed results, label inferred candidates and their basis in the artifact, and use the owner's learned definition where available. Do not silently certify quota completion through a new interpretation. Do not add a universal approval or Plan requirement.
+
+**Qualify activity coverage and negative claims.** Both Task queries use a global LIMIT across multiple accounts (60 and 40), not a per-account complete history. They do not select or filter the activity actor, and this run has no separate Event/EmailMessage query. LastActivityDate is the stated staleness proxy; these reads do not independently establish Tim-specific communication history across all channels. The Sheet makes claims such as "no meeting ever booked", "no reply logged" and "no follow-up of any kind since". The retained subsets do not establish those exhaustive negatives. A successful `done:true` response to a LIMIT query means that query completed, not that all account history was searched. Preserve fetched data; retrieve missing evidence only where needed or scope prose to "in the returned activity records". Do not fabricate communications or turn an open task into a completed touch.
+
+**Include external effects in completion evidence.** Logical settlements and events 146493/146506 record two successful mutations. Yet judge event 146513 has `settledEffectCount:0`; terminal 146518 has `artifactCoverage:[]`, `artifacts:[]`, `artifactsMatch:true`, `verified:true`. `settledSourceArtifacts` in `src/runtime/harness/host-turn-runner.ts` enumerates successful mutating settlements but then skips tools whose `registeredToolSideEffect(...)` is not `write`. That helper consults the local registry; these external Google Sheets names are absent. Thus this collector drops both effects. Empty host-file coverage is not itself wrong for an external Sheet, but it must not imply that external effects were collected or final cells independently verified.
+
+Extend authenticated source-scoped evidence to external resource receipts using their actual operation/result contracts. Preserve spreadsheet identity, updated range/counts and exact retained result, with explicit acknowledgement-versus-readback semantics. Do not force a Google Sheet to produce a local-file receipt, widen local host provenance checks to provider operations indiscriminately, or repeat writes to create proof. The judge must evaluate selection and summary accuracy as well as the existence of ten rows. Use a targeted readback when the claim requires final cell content; receipt acknowledgement alone supports a narrower claim.
+
+## Friday dashboard: saved successfully, blocked by a misplaced replay criterion
+
+Latest scheduled run `trigger-2633cc9bc238a5db365670e4dd5e8c5d`, workflow `friday-dashboard-daily-refresh`, completed all eight steps at 7 AM PDT on September 7 in 23.805 seconds. Six Salesforce reads, packaging and one `space_set_data` succeeded. It nevertheless reports `terminalOutcome:blocked`, no blocked steps, and a fourth consecutive failure warning.
+
+Its third success criterion combines a single content-addressed observation with proof that replay adds no second write. The judge accepted the six reads, all required record sets and absence of Salesforce writes, but rejected missing replay evidence. `runUnsafeToRepursue` treats a completed write without `loopSafe:true` as unsafe, and `decideGoalRunOutcome` escalates with "performed an irreversible action ... re-running could double it". That warning is generic policy wording, not evidence this dataset update is intrinsically irreversible.
+
+Independent local readback confirms the saved `data.json` **dashboard member** hashes to receipt digest `6d7ec3cd7a2a9f9d4d39bfb02f1c3bd5e7773981bf481d3fec8fde0804f2399f`, 59,627 canonical UTF-8 bytes, observation `6849cbb9-cf9d-4993-936d-299ece634779`. `_meta.dashboard.refreshedAt` is `2026-09-07T14:00:20.507Z`. Do not hash the whole wrapper file against a source-member receipt. The view loads this dashboard member; the old legacy fallback data does not itself prove a stale display. Rendered desktop/mobile behavior was not checked.
+
+Move replay/idempotency qualification to a controlled integration case; normal refresh success should use the actual business objective, correct current dataset and receipt. Preserve duplicate-effect protection. Distinguish refresh performed with incomplete verification from refresh not performed, and do not allow verification-only misses to masquerade as execution failure streaks. Do not merely set `loopSafe:true` to make the warning disappear or replay the production update for the judge.
+
+## Suggested next batch and proof
+
+### Owner clarification: Plan means investigate before proposing the cleanup
+
+The owner explicitly expects the Platform 49 Sheet cleanup Plan to read the Sheet, relevant prior data/context and source evidence before explaining the correction. Reading and inspecting are authorized in Plan; changing the Sheet or running its writing workflow waits for Execute. The plan should identify observed errors separately from hypotheses, show representative current→proposed corrections and source references, describe the affected tabs/rows/columns and preservation of team formatting/formulas, and say how the result will be checked. Discover the needed operations and inspect their contracts during planning; identify arguments that depend on later reads rather than inventing them. On Execute, use the latest owner-approved plan and retained evidence, checking for intervening Sheet changes instead of restarting discovery or executing a stale revision.
+
+Live source 146537 (`sess-desktop-e7a0e3e14590509a2a0dedb9`) is explicitly Plan. Snapshot through event 146710 at 14:15:35.892 UTC has sixteen top-level reads, all settled succeeded: workflow definition, memory, Sheet metadata, two cell-range reads, two Slack history reads and nine Slack user lookups. Zero business writes and no terminal yet. This establishes permitted investigation so far, not a finished-plan or Execute pass. Memory describes an old fourteen-column Log layout while the workflow and fetched live headers describe nine columns; current structure must govern the proposed edits. Slack thread replies, sufficient range coverage and actual discrepancies still need qualification before claims of a complete audit. Evidence snapshot: `output/reviewer-monitor/2026-09-07-plan-sheet-validation/events.json`.
+
+1. Correct external completion evidence and add the real provider-shaped create→populate case. Assert two actual effects, receipt/resource identity and honest review strength. With a missing/corrupt receipt, retain an unresolved effect rather than dropping it to zero.
+2. Qualify this exact business task for six confirmed plus four inferred candidates, bounded activity coverage and preserved source facts. Test a shortfall without padding the requested category and a valid owner-defined broader prospect category without another gate.
+3. Correct the dashboard criterion/reporting and prove replay separately on controlled data. Show a routine scheduled refresh completes with one commit and truthful verification status.
+4. Run a follow-up edit on the existing test Sheet plus a corrected-query recovery case. Reuse its identity and prior results; verify only the requested cells change. Preserve first attempts and failures. Test Normal and explicit Plan separately; this successful Normal run does not qualify Plan recovery.
+
+Use one clear distinction throughout: **what the owner asked, what actually changed, and what the evidence establishes**. Friday currently overstates failure; the Sheet terminal overstates the scope of structured verification. Neither is solved by giving Clem more instructions to satisfy the harness.
+
+Evidence retained at `/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/2026-09-07-current-sheets-review/`: events, submitted Sheet values, row comparisons and full retained results for both Task queries. These contain private business data; keep them local. No new live tests are claimed by this review.

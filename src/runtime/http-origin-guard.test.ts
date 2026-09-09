@@ -48,6 +48,7 @@ const {
   hostAllowlistMiddleware,
   requireSameOriginForMutations,
   isAllowedHost,
+  isAllowedOrigin,
   normalizeHostHeader,
   allowHostName,
 } = await import('./http-origin-guard.js');
@@ -165,4 +166,54 @@ test('allowHostName registers a runtime host — the relay hostname must not 421
   allowHostName('de9334b0f70862c5.r.example.com:53028');
   assert.equal(isAllowedHost('de9334b0f70862c5.r.example.com'), true, 'port must be normalized away');
   assert.equal(isAllowedHost('other.r.example.com'), false, 'only the exact registered host is allowed');
+});
+
+
+/**
+ * ── Host and Origin are two different questions ─────────────────────────────
+ *
+ * isAllowedHost answers "could this Host header be a rebinding attack?", where
+ * the IP-literal shortcut is correct — rebinding works by changing what a NAME
+ * resolves to. The CSRF backstop reused it to answer "did this come from a page
+ * I serve?", and there the same shortcut admitted every bare IP on the internet.
+ */
+
+test('an Origin on a foreign bare IP is refused, though the same Host would pass', () => {
+  // The Host question: an IP literal is not a rebinding vector, so it passes.
+  assert.equal(isAllowedHost('198.51.100.7'), true);
+  // The Origin question: this machine does not answer at that address, so a
+  // page served from it is cross-origin and its mutations must be refused.
+  assert.equal(isAllowedOrigin('198.51.100.7'), false,
+    'any page on any bare IP could otherwise defeat the one explicit CSRF layer');
+  assert.equal(isAllowedOrigin('203.0.113.99'), false);
+});
+
+test('loopback origins pass in both address families', () => {
+  assert.equal(isAllowedOrigin('127.0.0.1'), true);
+  assert.equal(isAllowedOrigin('::1'), true);
+  // URL.hostname hands back the brackets; judging on the bracketed form used to
+  // refuse every legitimate IPv6 LAN client by accident.
+  assert.equal(isAllowedOrigin('[::1]'), true);
+  assert.equal(isAllowedOrigin('localhost'), true);
+});
+
+test('an origin on one of this machine\'s own addresses passes', () => {
+  const local = Object.values(os.networkInterfaces())
+    .flatMap((entries) => entries ?? [])
+    .find((entry) => entry.family === 'IPv4' && !entry.internal);
+  if (!local) return; // no LAN interface on this runner — nothing to assert
+  assert.equal(isAllowedOrigin(local.address), true,
+    'the LAN address the daemon is reachable at must stay same-origin');
+});
+
+test('a runtime-registered name is an allowed origin, an unregistered one is not', () => {
+  assert.equal(isAllowedOrigin('abc123.relay.example'), false);
+  allowHostName('abc123.relay.example');
+  assert.equal(isAllowedOrigin('abc123.relay.example'), true,
+    'the relay hostname the daemon answers for is a real origin of this app');
+});
+
+test('an empty or unparseable origin host is refused', () => {
+  assert.equal(isAllowedOrigin(''), false);
+  assert.equal(isAllowedOrigin('   '), false);
 });

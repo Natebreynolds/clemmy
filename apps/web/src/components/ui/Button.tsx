@@ -11,10 +11,10 @@ export function PrimaryButton({
       {...props}
       className={clsx(
         "group relative inline-flex items-center gap-2 rounded-full px-7 py-4",
-        "bg-gradient-to-b from-clem-400 to-clem-600 text-white",
-        "font-medium tracking-tight shadow-[0_12px_36px_-10px_rgba(249,115,22,0.55)]",
-        "ring-1 ring-clem-600/40 hover:from-clem-300 hover:to-clem-500",
-        "transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_18px_60px_-12px_rgba(249,115,22,0.7)]",
+        "bg-gradient-to-b from-clem-400 to-clem-600 text-clem-fg",
+        "font-semibold tracking-tight shadow-[0_12px_36px_-10px_rgba(242,100,25,0.45)]",
+        "ring-1 ring-clem-700/30 hover:from-clem-300 hover:to-clem-500",
+        "transition-all duration-slow ease-clem hover:-translate-y-0.5 hover:shadow-[0_18px_60px_-12px_rgba(242,100,25,0.55)]",
         "text-[15px]",
         className,
       )}

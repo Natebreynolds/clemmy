@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { X, Play, Trash2, Check, Loader2, Activity, AlertTriangle, Code2, Database, FileText, Fingerprint, Gauge, GitBranch, KeyRound, Layers2, Radio, Send, ShieldCheck, Wrench, type LucideIcon } from 'lucide-react';
+import { X, Play, Trash2, Check, Loader2, Activity, AlertTriangle, Bot, Code2, Database, FileText, Fingerprint, Gauge, GitBranch, KeyRound, Layers2, Lock, PenLine, Puzzle, Radio, ScrollText, Send, ShieldCheck, Wrench, Zap, type LucideIcon } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
@@ -347,15 +347,15 @@ export function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
 
   const runBadge = (t?: DryRunTraceStep) => {
     const ex = t?.executor ?? 'model';
-    if (ex === 'call') return <StatusPill tone="success">⚡ direct call{t?.touches?.tools?.[0] ? ` · ${t.touches.tools[0]}` : ''}</StatusPill>;
-    if (ex === 'deterministic') return <StatusPill tone="success">📜 script</StatusPill>;
-    if (ex === 'skill') return <StatusPill tone="info">🧩 skill</StatusPill>;
-    return <StatusPill tone="info">🤖 AI · {shortModel(t?.model)}</StatusPill>;
+    if (ex === 'call') return <StatusPill tone="success" icon={Zap}>Direct call{t?.touches?.tools?.[0] ? ` · ${t.touches.tools[0]}` : ''}</StatusPill>;
+    if (ex === 'deterministic') return <StatusPill tone="success" icon={ScrollText}>Script</StatusPill>;
+    if (ex === 'skill') return <StatusPill tone="info" icon={Puzzle}>Skill</StatusPill>;
+    return <StatusPill tone="info" icon={Bot}>AI · {shortModel(t?.model)}</StatusPill>;
   };
   const effectBadge = (t?: DryRunTraceStep) => {
     if (!t) return null;
-    if (t.effect === 'external_send') return <StatusPill tone="warning">⚠️ sends externally</StatusPill>;
-    if (t.effect === 'external_write') return <StatusPill tone="info">✍️ writes</StatusPill>;
+    if (t.effect === 'external_send') return <StatusPill tone="warning" icon={Send}>Sends externally</StatusPill>;
+    if (t.effect === 'external_write') return <StatusPill tone="info" icon={PenLine}>Writes</StatusPill>;
     return null;
   };
 
@@ -365,9 +365,9 @@ export function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
       {fx && (fx.sends + fx.writes + fx.approvals) > 0 && (
         <div className="mb-3 flex flex-wrap items-center gap-1.5">
           <span className="text-caption text-muted">Real-world impact:</span>
-          {fx.writes > 0 && <StatusPill tone="info">✍️ writes to {fx.writes} place{fx.writes === 1 ? '' : 's'}</StatusPill>}
-          {fx.sends > 0 && <StatusPill tone="warning">⚠️ sends {fx.sends} externally</StatusPill>}
-          {fx.approvals > 0 && <StatusPill tone="warning">🔒 {fx.approvals} approval{fx.approvals === 1 ? '' : 's'}</StatusPill>}
+          {fx.writes > 0 && <StatusPill tone="info" icon={PenLine}>Writes to {fx.writes} place{fx.writes === 1 ? '' : 's'}</StatusPill>}
+          {fx.sends > 0 && <StatusPill tone="warning" icon={Send}>Sends {fx.sends} externally</StatusPill>}
+          {fx.approvals > 0 && <StatusPill tone="warning" icon={Lock}>{fx.approvals} approval{fx.approvals === 1 ? '' : 's'}</StatusPill>}
         </div>
       )}
       <ol>
@@ -386,7 +386,7 @@ export function WorkflowHowItWorks({ wf }: { wf: WorkflowDetail }) {
                       <span className="text-body font-medium text-fg">{s.name || s.id || `Step ${i + 1}`}</span>
                       {runBadge(t)}
                       {effectBadge(t)}
-                      {t?.gated && <StatusPill tone="warning">🔒 needs approval</StatusPill>}
+                      {t?.gated && <StatusPill tone="warning" icon={Lock}>Needs approval</StatusPill>}
                     </div>
                     {purpose && <p className="mt-1 text-small text-muted">{purpose}</p>}
                     {(uses || produces) && (
@@ -485,7 +485,7 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
 
   return (
     <div className="fixed inset-0 z-[110] flex justify-end bg-black/30 animate-fade-in" onMouseDown={onClose}>
-      <div className="flex h-full w-full max-w-xl flex-col bg-surface shadow-lg" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="flex h-full w-full max-w-xl flex-col bg-surface shadow-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-3 border-b border-border px-5 py-4">
           <h2 className="min-w-0 flex-1 truncate text-h2 text-fg">{name}</h2>
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close"><X className="h-5 w-5" aria-hidden /></Button>

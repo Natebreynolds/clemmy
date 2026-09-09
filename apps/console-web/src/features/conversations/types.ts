@@ -64,5 +64,9 @@ export interface SessionFilters {
   tag?: string;
   source?: string;
   includeArchived?: boolean;
+  /** Rows to ask the server for. Runs share the page with chats now, so the
+   *  route's default of 100 would let a busy morning of workflow runs push
+   *  yesterday's conversations off the end of the list. Capped at 500 server
+   *  side (sessions-api.ts buildUnifiedSessionList). */
   limit?: number;
 }

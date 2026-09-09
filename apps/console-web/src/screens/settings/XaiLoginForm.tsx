@@ -49,7 +49,7 @@ export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: (
         try {
           const res = await xaiDevicePoll(loginId);
           if (res.status === 'complete') {
-            setStatus('Connected ✓'); onDone();
+            setStatus('Connected'); onDone();
             setTimeout(() => { setDevice(null); setStatus(''); setBusy(false); }, 2500);
             return;
           }
@@ -151,7 +151,7 @@ export function XaiLoginForm({ embedded = false }: { embedded?: boolean } = {}) 
       </div>
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
         {connected
-          ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Connected · subscription billing ✓</span>
+          ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Connected · subscription billing</span>
           : <span className="text-muted">Not connected. Sign in with your xAI account to use Grok as a brain, worker, or judge.</span>}
       </div>
       <XaiSignIn connected={connected} onDone={refetch} />

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph3D, { type ForceGraphMethods } from 'react-force-graph-3d';
 import { Vector2 } from 'three';
+import { sentence } from '@/lib/sentence-case';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { X, RotateCcw, Maximize2, Search, Sparkles, Layers3 } from 'lucide-react';
 import { getGraph, getGraphNeighborhood, type GraphNode, type GraphEdge } from '@/lib/memory';
@@ -445,7 +446,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
                 showOverlays ? 'border-violet-300/50 bg-violet-400/20 text-violet-100' : 'border-white/15 bg-black/50 text-white/80')}>
               <Layers3 className="h-3.5 w-3.5" aria-hidden /> {showOverlays ? 'Augmented view' : 'Stored truth'}
             </button>
-            <div className="ml-1 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-2.5 py-1 backdrop-blur">
+            <div className="ml-1 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-2.5 py-1 backdrop-blur focus-within:ring-2 focus-within:ring-primary">
               <Search className="h-3.5 w-3.5 text-white/50" aria-hidden />
               <input value={query} onChange={(e) => setQuery(e.target.value.trim().toLowerCase())} placeholder="Find…" aria-label="Find in graph"
                 className="w-24 bg-transparent text-caption text-white outline-none placeholder:text-white/40" />
@@ -486,9 +487,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
       {status === 'nowebgl' && <Overlay>This view needs WebGL / hardware acceleration — enable it to see the constellation.</Overlay>}
 
       {sel && (
-        <div className="absolute bottom-3 right-3 w-72 rounded-lg border border-white/15 bg-black/70 p-3 text-white shadow-lg backdrop-blur">
+        <div className="absolute bottom-3 right-3 w-72 rounded-lg border border-white/15 bg-black/70 p-3 text-white shadow-popover backdrop-blur">
           <div className="mb-1 flex items-start justify-between gap-2">
-            <span className="text-caption font-semibold uppercase tracking-wide" style={{ color: sel.type === 'fact' ? KIND_COLOR[(sel.data?.kind as string)] || '#FBE9D6' : sel.type === 'relationship' ? COLOR.entity : (COLOR as Record<string, string>)[sel.type] }}>
+            <span className="text-caption font-semibold" style={{ color: sel.type === 'fact' ? KIND_COLOR[(sel.data?.kind as string)] || '#FBE9D6' : sel.type === 'relationship' ? COLOR.entity : (COLOR as Record<string, string>)[sel.type] }}>
               {sel.type === 'fact' ? (KIND_LABEL[(sel.data?.kind as string)] || 'Fact') : sel.type === 'relationship' ? 'Stored relationship' : (NODE_TYPE_LABEL[sel.type] ?? 'Topic')}
             </span>
             <button type="button" onClick={clearFocus} aria-label="Close" className="cursor-pointer text-white/50 hover:text-white"><X className="h-4 w-4" aria-hidden /></button>
@@ -501,9 +502,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           {sel.type === 'relationship' && (
             <div className="mt-2 space-y-2">
               <div className="flex flex-wrap gap-1.5">
-                <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-100">{String(sel.data?.truth ?? 'stored')} truth</span>
-                {typeof sel.data?.confidence === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{Math.round((sel.data.confidence as number) * 100)}% confidence</span>}
-                {typeof sel.data?.evidenceCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.evidenceCount as number} evidence {sel.data.evidenceCount === 1 ? 'source' : 'sources'}</span>}
+                <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-caption text-emerald-100">{String(sel.data?.truth ?? 'stored')} truth</span>
+                {typeof sel.data?.confidence === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{Math.round((sel.data.confidence as number) * 100)}% confidence</span>}
+                {typeof sel.data?.evidenceCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.evidenceCount as number} evidence {sel.data.evidenceCount === 1 ? 'source' : 'sources'}</span>}
               </div>
               {(typeof sel.data?.validFrom === 'string' || typeof sel.data?.validTo === 'string') && (
                 <p className="text-caption text-white/50">
@@ -514,19 +515,19 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
                 <div className="rounded-md border border-violet-300/20 bg-violet-400/10 p-2 text-caption text-violet-100">
                   Exact source observation{typeof sel.data?.sourceKind === 'string' ? ` · ${(sel.data.sourceKind as string).replace(/_/g, ' ')}` : ''}
                   {typeof sel.data?.observedAt === 'string' ? ` · ${new Date(sel.data.observedAt as string).toLocaleDateString()}` : ''}
-                  {typeof sel.data?.sourceUri === 'string' && <p className="mt-1 truncate text-[10px] text-violet-100/60" title={sel.data.sourceUri as string}>{sel.data.sourceUri as string}</p>}
+                  {typeof sel.data?.sourceUri === 'string' && <p className="mt-1 truncate text-caption text-violet-100/60" title={sel.data.sourceUri as string}>{sel.data.sourceUri as string}</p>}
                 </div>
               ) : Array.isArray(sel.data?.evidence) && (sel.data.evidence as RelationshipEvidence[]).length > 0 ? (
                 <div className="max-h-44 space-y-2 overflow-auto border-t border-white/10 pt-2">
                   {(sel.data.evidence as RelationshipEvidence[]).map((evidence, index) => (
                     <div key={`${evidence.episodeId}:${index}`} className="rounded-md border border-white/10 bg-white/5 p-2">
                       <p className="text-caption leading-relaxed text-white/75">“{evidence.excerpt}”</p>
-                      <p className="mt-1 text-[10px] text-white/40">
+                      <p className="mt-1 text-caption text-white/40">
                         {evidence.extractionMethod?.replace(/_/g, ' ') ?? 'source evidence'}
                         {evidence.episodeStatus ? ` · ${evidence.episodeStatus}` : ''}
                         {evidence.observedAt ? ` · ${new Date(evidence.observedAt).toLocaleDateString()}` : ''}
                       </p>
-                      {evidence.sourceUri && <p className="mt-0.5 truncate text-[10px] text-white/35" title={evidence.sourceUri}>{evidence.sourceUri}</p>}
+                      {evidence.sourceUri && <p className="mt-0.5 truncate text-caption text-white/35" title={evidence.sourceUri}>{evidence.sourceUri}</p>}
                     </div>
                   ))}
                 </div>
@@ -536,18 +537,18 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
             </div>
           )}
           <div className="mt-2 flex flex-wrap gap-1.5">
-            {sel.data?.pinned === true && <span className="rounded-full bg-amber-400/90 px-2 py-0.5 text-[10px] font-semibold text-amber-950">pinned</span>}
-            {typeof sel.data?.importance === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">importance {sel.data.importance as number}/10</span>}
-            {sel.type === 'tool-recall' && typeof sel.data?.chosenTool === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">→ {sel.data.chosenTool as string}</span>}
-            {sel.type === 'tool-recall' && typeof sel.data?.score === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{Math.round((sel.data.score as number) * 100)}% success</span>}
-            {sel.type === 'skill' && typeof sel.data?.tier === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.tier as string}</span>}
-            {(sel.type === 'goal' || sel.type === 'focus') && typeof sel.data?.status === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.status as string}</span>}
-            {sel.type === 'workflow' && typeof sel.data?.steps === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.steps as number} steps</span>}
-            {sel.type === 'entity' && typeof sel.data?.factCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.factCount as number} facts</span>}
-            {sel.type === 'entity' && typeof sel.data?.mention_count === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.mention_count as number} mentions</span>}
-            {sel.type === 'entity' && typeof sel.data?.observationCount === 'number' && (sel.data.observationCount as number) > 0 && <span className="rounded-full border border-violet-300/30 bg-violet-400/10 px-2 py-0.5 text-[10px] text-violet-100">{sel.data.observationCount as number} source episodes</span>}
-            {sel.type === 'entity' && typeof sel.data?.identifierCount === 'number' && (sel.data.identifierCount as number) > 0 && <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-100">{sel.data.identifierCount as number} stable IDs</span>}
-            {sel.connected > 0 && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.connected} connected</span>}
+            {sel.data?.pinned === true && <span className="rounded-full bg-amber-400/90 px-2 py-0.5 text-caption font-semibold text-amber-950">pinned</span>}
+            {typeof sel.data?.importance === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">importance {sel.data.importance as number}/10</span>}
+            {sel.type === 'tool-recall' && typeof sel.data?.chosenTool === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">→ {sel.data.chosenTool as string}</span>}
+            {sel.type === 'tool-recall' && typeof sel.data?.score === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{Math.round((sel.data.score as number) * 100)}% success</span>}
+            {sel.type === 'skill' && typeof sel.data?.tier === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.tier as string}</span>}
+            {(sel.type === 'goal' || sel.type === 'focus') && typeof sel.data?.status === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.status as string}</span>}
+            {sel.type === 'workflow' && typeof sel.data?.steps === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.steps as number} steps</span>}
+            {sel.type === 'entity' && typeof sel.data?.factCount === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.factCount as number} facts</span>}
+            {sel.type === 'entity' && typeof sel.data?.mention_count === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.data.mention_count as number} mentions</span>}
+            {sel.type === 'entity' && typeof sel.data?.observationCount === 'number' && (sel.data.observationCount as number) > 0 && <span className="rounded-full border border-violet-300/30 bg-violet-400/10 px-2 py-0.5 text-caption text-violet-100">{sel.data.observationCount as number} source episodes</span>}
+            {sel.type === 'entity' && typeof sel.data?.identifierCount === 'number' && (sel.data.identifierCount as number) > 0 && <span className="rounded-full border border-emerald-300/30 bg-emerald-400/10 px-2 py-0.5 text-caption text-emerald-100">{sel.data.identifierCount as number} stable IDs</span>}
+            {sel.connected > 0 && <span className="rounded-full border border-white/20 px-2 py-0.5 text-caption text-white/70">{sel.connected} connected</span>}
           </div>
           {sel.type !== 'relationship' && <button type="button" onClick={() => void expandNeighborhood()} disabled={expanding}
             className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-white/20 px-2.5 py-1.5 text-caption text-white/80 hover:bg-white/10 disabled:opacity-50">
@@ -565,7 +566,7 @@ function labelHtml(n: GNode): string {
     : n.type === 'file' ? 'file' : (NODE_TYPE_LABEL[n.type] ?? 'topic');
   const txt = n.type === 'fact' ? ((n.data?.content as string) || n.label) : n.label;
   const esc = String(txt).slice(0, 180).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m] as string));
-  return `<div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:12px;color:#F6EEE6;background:rgba(16,11,18,0.92);border:1px solid rgba(255,180,120,0.16);padding:7px 10px;border-radius:9px;max-width:280px;box-shadow:0 8px 24px rgba(0,0,0,0.5)"><div style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.07em;opacity:0.7;margin-bottom:2px">${kind}</div>${esc}</div>`;
+  return `<div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;line-height:1.45;color:#F6EEE6;background:rgba(16,11,18,0.92);border:1px solid rgba(255,180,120,0.16);padding:7px 10px;border-radius:9px;max-width:280px;box-shadow:0 8px 24px rgba(0,0,0,0.5)"><div style="font-size:11px;font-weight:600;opacity:0.75;margin-bottom:3px">${sentence(kind)}</div>${esc}</div>`;
 }
 
 function Overlay({ children }: { children: React.ReactNode }) {

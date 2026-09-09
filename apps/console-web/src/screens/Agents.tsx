@@ -48,7 +48,7 @@ function AgentCard({ agent, onOpen }: { agent: AgentSummary; onOpen: () => void 
     <button
       type="button"
       onClick={onOpen}
-      className="flex flex-col gap-2 rounded-2xl border border-border bg-surface p-4 text-left shadow-xs transition-all duration-fast hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md"
+      className="flex flex-col gap-2 rounded-2xl border border-border-raised bg-raised p-4 text-left transition-colors duration-base hover:border-border-strong hover:bg-hover"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
@@ -272,7 +272,7 @@ function AgentProposals({
   return (
     <section className="mb-5">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+        <div className="flex items-center gap-2 text-caption font-semibold text-faint">
           <Sparkles className="h-3.5 w-3.5" aria-hidden /> Agent drafts
         </div>
         <StatusPill tone="info">{proposals.length} pending</StatusPill>
@@ -336,7 +336,7 @@ function CoordinationPolicyCard({ policy, trend }: { policy?: CoordinationPolicy
     <Card className="mb-5 p-4">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="flex items-center gap-2 text-caption font-semibold text-faint">
             <Route className="h-3.5 w-3.5" aria-hidden /> Coordination policy
           </div>
           <p className="mt-1 text-small text-muted">{policy.nextAction}</p>
@@ -364,7 +364,7 @@ function CoordinationPolicyCard({ policy, trend }: { policy?: CoordinationPolicy
       )}
       <div className="grid gap-3 lg:grid-cols-2">
         <div className="rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Why</div>
+          <div className="mb-2 text-caption font-semibold text-faint">Why</div>
           {reasons.length > 0 ? (
             <ul className="space-y-1">
               {reasons.map((reason) => <li key={reason} className="text-small text-muted">{reason}</li>)}
@@ -374,7 +374,7 @@ function CoordinationPolicyCard({ policy, trend }: { policy?: CoordinationPolicy
           )}
         </div>
         <div className="rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Guardrails</div>
+          <div className="mb-2 text-caption font-semibold text-faint">Guardrails</div>
           {guardrails.length > 0 ? (
             <ul className="space-y-1">
               {guardrails.map((guardrail) => <li key={guardrail} className="text-small text-warning">{guardrail}</li>)}
@@ -392,7 +392,7 @@ function SwarmGuidance({ recommendations }: { recommendations: AgentSystemRecomm
   if (recommendations.length === 0) return null;
   return (
     <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+      <div className="mb-2 flex items-center gap-2 text-caption font-semibold text-faint">
         <Users className="h-3.5 w-3.5" aria-hidden /> Swarm guidance
       </div>
       <div className="grid gap-3 lg:grid-cols-2">
@@ -426,7 +426,7 @@ function SwarmReadiness({ readiness }: { readiness?: SwarmReadinessSnapshot }) {
     <Card className="mb-5 p-4">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="flex items-center gap-2 text-caption font-semibold text-faint">
             <Users className="h-3.5 w-3.5" aria-hidden /> Swarm readiness
           </div>
           <p className="mt-1 text-small text-muted">{readiness.recommendation}</p>
@@ -435,7 +435,7 @@ function SwarmReadiness({ readiness }: { readiness?: SwarmReadinessSnapshot }) {
       </div>
       <div className="grid gap-3 lg:grid-cols-2">
         <div className="rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Risks</div>
+          <div className="mb-2 text-caption font-semibold text-faint">Risks</div>
           {risks.length > 0 ? (
             <ul className="space-y-1">
               {risks.map((risk) => <li key={risk} className="text-small text-warning">{risk}</li>)}
@@ -445,7 +445,7 @@ function SwarmReadiness({ readiness }: { readiness?: SwarmReadinessSnapshot }) {
           )}
         </div>
         <div className="rounded-md border border-border bg-surface p-3">
-          <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Strengths</div>
+          <div className="mb-2 text-caption font-semibold text-faint">Strengths</div>
           {strengths.length > 0 ? (
             <ul className="space-y-1">
               {strengths.map((strength) => <li key={strength} className="text-small text-success">{strength}</li>)}
@@ -463,7 +463,7 @@ function AgentScorecards({ scorecards, onOpen }: { scorecards: AgentScorecard[];
   if (scorecards.length === 0) return null;
   return (
     <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+      <div className="mb-2 flex items-center gap-2 text-caption font-semibold text-faint">
         <Users className="h-3.5 w-3.5" aria-hidden /> Agent scorecards
       </div>
       <div className="grid gap-3 lg:grid-cols-2">
@@ -504,7 +504,7 @@ function FanoutEffectiveness({ effectiveness }: { effectiveness?: SwarmEffective
     <Card className="mb-5 p-4">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="flex items-center gap-2 text-caption font-semibold text-faint">
             <Route className="h-3.5 w-3.5" aria-hidden /> Fanout effectiveness
           </div>
           <p className="mt-1 text-small text-muted">{effectiveness.recommendation}</p>
@@ -587,7 +587,7 @@ function TopologyHealth({ topology }: { topology?: SwarmTopologySnapshot }) {
     <Card className="mb-5 p-4">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="flex items-center gap-2 text-caption font-semibold text-faint">
             <Share2 className="h-3.5 w-3.5" aria-hidden /> Topology health
           </div>
           <p className="mt-1 text-small text-muted">{topology.recommendation}</p>
@@ -751,7 +751,7 @@ export function Agents() {
         <div className="space-y-6">
           {/* Graph */}
           <section>
-            <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+            <div className="mb-2 flex items-center gap-2 text-caption font-semibold text-faint">
               <Users className="h-3.5 w-3.5" aria-hidden /> Team map
               <span className="font-normal normal-case text-faint">· arrows show who can message whom · edges pulse on a live message</span>
             </div>
@@ -763,7 +763,7 @@ export function Agents() {
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             {/* Roster */}
             <section className="lg:col-span-2">
-              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Roster</div>
+              <div className="mb-2 text-caption font-semibold text-faint">Roster</div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {agents.map((agent) => (
                   <AgentCard key={agent.slug} agent={agent} onOpen={() => setOpenSlug(agent.slug)} />
@@ -773,7 +773,7 @@ export function Agents() {
 
             {/* Comms timeline */}
             <section>
-              <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+              <div className="mb-2 flex items-center gap-2 text-caption font-semibold text-faint">
                 <MessageSquare className="h-3.5 w-3.5" aria-hidden /> Activity
               </div>
               <div className="rounded-2xl border border-border bg-surface p-3">

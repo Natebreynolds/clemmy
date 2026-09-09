@@ -78,7 +78,7 @@ export function Hero() {
       <div className="relative z-10 flex min-h-screen flex-col">
         <header className="flex items-center justify-between px-6 py-5 sm:px-10 z-30">
           <a href="/" className="flex items-center gap-2.5 group">
-            <Logo className="h-9 w-9 drop-shadow-[0_2px_8px_rgba(249,115,22,0.25)] transition-transform group-hover:scale-105" />
+            <Logo className="h-9 w-9 drop-shadow-[0_2px_8px_rgba(242,100,25,0.25)] transition-transform group-hover:scale-105" />
             <span className="font-semibold text-[15px] tracking-tight text-[var(--ink-strong)]">Clementine</span>
           </a>
           <nav className="hidden sm:flex items-center gap-8 text-sm text-[var(--ink-dim)]">
@@ -247,7 +247,11 @@ function RevealText({
         className={
           "inline-block " +
           (gradient
-            ? "bg-gradient-to-r from-clem-500 via-clem-600 to-clem-700 bg-clip-text text-transparent"
+            // The hero word is READ, so the gradient runs through the ink half of
+              // the ramp: 3.52 → 5.08 → 7.05 on --bg. It used to start at
+              // clem-500 (2.97:1), under the 3:1 floor for large text even at
+              // 64px, which is the one place on the page that cannot afford it.
+              ? "bg-gradient-to-r from-clem-600 via-clem-700 to-clem-800 bg-clip-text text-transparent"
             : "")
         }
       >

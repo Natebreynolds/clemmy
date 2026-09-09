@@ -140,7 +140,7 @@ function AuthReveal({ command, authCommand, authDocsUrl, catalogId }: { command:
       <div className="mb-1 text-caption text-muted">Or run it yourself{authCommand ? '' : ' (edit if the command differs)'}:</div>
       <div className="flex items-center gap-2">
         <input value={cmd} onChange={(e) => setCmd(e.target.value)} aria-label="Login command"
-          className="min-w-0 flex-1 rounded bg-canvas px-2 py-1 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
+          className="min-w-0 flex-1 rounded bg-canvas px-2 py-1 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
         <button type="button" onClick={copy} aria-label="Copy command" title="Copy" className="cursor-pointer text-faint hover:text-fg">{copied ? <Check className="h-4 w-4 text-success" aria-hidden /> : <Copy className="h-4 w-4" aria-hidden />}</button>
         <a href={docs} target="_blank" rel="noopener noreferrer" aria-label={authDocsUrl ? 'Auth docs' : 'Search the web for the login command'} title={authDocsUrl ? 'Docs' : 'Find the login command'} className="text-faint hover:text-fg"><ExternalLink className="h-4 w-4" aria-hidden /></a>
       </div>
@@ -317,7 +317,7 @@ function CatalogTools() {
       )}
 
       {/* One search: catalog (install/connect) + your PATH (save) */}
-      <div className="mb-3 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
+      <div className="mb-3 flex items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
         <Search className="h-4 w-4 text-faint" aria-hidden />
         <input value={query} onChange={(e) => { setQuery(e.target.value); setError(''); }}
           placeholder="Search to install or save a CLI (netlify, vercel, sf, jq…)" aria-label="Search CLIs"
@@ -432,7 +432,7 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
       <div className="mb-2 flex items-center gap-2">
         <input value={command} onChange={(e) => { setCommand(e.target.value); setError(''); }}
           placeholder="npm install -g some-cli   ·   brew install some-tool" aria-label="Install command"
-          className="min-w-0 flex-1 rounded border border-border bg-canvas px-2.5 py-1.5 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
+          className="min-w-0 flex-1 rounded border border-border bg-canvas px-2.5 py-1.5 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
         <Button size="sm" disabled={!command.trim() || submitting} onClick={() => void submit()}>
           {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Download className="h-3.5 w-3.5" aria-hidden />} Install
         </Button>
@@ -444,7 +444,7 @@ function CustomInstall({ onJob }: { onJob: (jobId: string) => void }) {
         {remember && (
           <input value={saveAs} onChange={(e) => setSaveAs(e.target.value)} placeholder={guessedName || 'binary name'}
             aria-label="CLI name to remember"
-            className="w-32 rounded border border-border bg-canvas px-2 py-0.5 font-mono text-caption text-fg outline-none focus:ring-1 focus:ring-primary" />
+            className="w-32 rounded border border-border bg-canvas px-2 py-0.5 font-mono text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-primary" />
         )}
       </label>
       <p className="mt-1.5 text-caption text-faint">Allowed forms: npm install -g · brew install · uv tool install · pipx install · pip install --user · git clone https. Anything else is refused.</p>

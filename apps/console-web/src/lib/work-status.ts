@@ -90,7 +90,7 @@ export function evidenceChips(snapshot?: TaskOutcomeSnapshot | null): string[] {
   if (summary.artifactsTotal > 0) {
     chips.push(
       summary.artifactsVerified === summary.artifactsTotal
-        ? `${summary.artifactsTotal} artifact${summary.artifactsTotal === 1 ? '' : 's'} ✓`
+        ? `${summary.artifactsTotal} artifact${summary.artifactsTotal === 1 ? '' : 's'} verified`
         : `${summary.artifactsVerified}/${summary.artifactsTotal} artifacts verified`,
     );
   }

@@ -238,16 +238,34 @@ export function activityTerminalOutcomeFromHarnessEvents(
 
 // ─── Working Now: the ONE presenter, consolidated in the shared package ──────
 // The desktop badge and drawer render Working-Now counts from the SAME
-// function the mobile PWA uses. (/tasks is the separate board feed and does
-// NOT render from this presenter yet — unifying it is its own slice.) It lives in @clem/chat-engine
+// function the mobile PWA uses — and so does /tasks, which used to derive its
+// own Running column straight from the board feed. That split meant the badge
+// that sends you to /tasks and the board you land on gave two answers to one
+// question; lib/board.ts (presentBoardWorkingNow) now routes the board's live
+// rows through this function too. It lives in @clem/chat-engine
 // (packages/chat-engine/src/activity-presentation.ts); the console re-exports
 // it here rather than keeping a private copy — a second derivation is exactly
 // how five surfaces came to disagree about one question.
+//
+// Membership is part of that one truth as of 2026-09-06: the presenter
+// separates RUNNING from STALLED (a row that is not executing and has stayed
+// that way past WORKING_NOW_STALL_MS) and drops SETTLED rows by lifecycle as
+// well as by the typed terminal. `view.running` therefore counts only work
+// nothing has disproved, and `presented.stalled` / `presented.silence` give a
+// surface the honest words for a row that stopped days ago.
+//
+// So are the WORDS. workingNowStatusLabel is the one status line every row
+// renders — the chip said "21 stalled" over a list whose rows each said "Needs
+// review", because two files were wording the same fact.
 export {
   presentWorkingNow,
   workingNowElapsedLabel,
+  workingNowLifecycleLabel,
+  workingNowStatusLabel,
+  WORKING_NOW_STALL_MS,
   type PresentedWorkingNowEntry,
   type WorkingNowEntryLike,
+  type WorkingNowMembership,
   type WorkingNowPresentation,
   type WorkingNowView,
 } from '../../../../packages/chat-engine/src/activity-presentation';

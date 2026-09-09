@@ -398,6 +398,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     // "Created a record", "Saved a file" rows. Phrasing mirrors the server's
     // describeExternalWrite (work-report.ts) so every surface speaks ONE
     // vocabulary. A failed/orphaned write is the same line with an honest tail.
+    // Real effects on the outside world. ONE row per call, addressed by the id
+    // below, so a reservation and its terminal update the same line instead of
+    // listing the same draft twice. The disposition comes from the shared
+    // ledger, which is the only thing that decides whether a write may read as
+    // done -- `external_write` alone is a PRE-DISPATCH reservation and used to
+    // be stamped green here before the call had left the machine.
     case 'external_write':
     case 'external_write_succeeded':
     case 'external_write_failed':

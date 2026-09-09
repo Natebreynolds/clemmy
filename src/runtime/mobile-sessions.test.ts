@@ -29,7 +29,11 @@ const {
   bindDeviceKey,
   needsDeviceUpgrade,
   shouldRotate,
+  revokeSession,
   revokeSessionByDeviceId,
+  revokeAllSessions,
+  onDeviceRevoked,
+  resetDeviceRevocationClosers,
   listSessions,
   markPushSubscribed,
   ABSOLUTE_TTL_MS,
@@ -355,4 +359,110 @@ test('private key material is never accepted or stored', async () => {
 
   const persisted = readFileSync(path.join(stateDir, 'mobile-sessions.json'), 'utf-8');
   assert.equal(persisted.includes(String(privateJwk.d)), false, 'private material must never hit disk');
+});
+
+
+/**
+ * ── Revocation reaches what is already open ─────────────────────────────────
+ *
+ * Removing the row only stops the NEXT request. Authorization is checked once,
+ * at attach, so an SSE stream and a push subscription both outlived every
+ * revoke path. These pin the event that cuts them.
+ */
+
+test('revoking by device id fires the closer for that device only', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir };
+  resetDeviceRevocationClosers();
+
+  const mine = await createSession({ deviceLabel: 'mine' }, opts);
+  const other = await createSession({ deviceLabel: 'other' }, opts);
+
+  const cut: string[] = [];
+  const drop = onDeviceRevoked((deviceId) => { cut.push(deviceId); });
+
+  await revokeSessionByDeviceId(mine.record.deviceId, opts);
+  assert.deepEqual(cut, [mine.record.deviceId]);
+  assert.equal(
+    (await validateSession(other.token, opts)) !== null, true,
+    'the untouched device keeps working',
+  );
+  drop();
+});
+
+test('revoking by token fires the closer for the device that held it', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir };
+  resetDeviceRevocationClosers();
+
+  const session = await createSession({ deviceLabel: 'phone' }, opts);
+  const cut: string[] = [];
+  onDeviceRevoked((deviceId) => { cut.push(deviceId); });
+
+  await revokeSession(session.token, opts);
+  assert.deepEqual(cut, [session.record.deviceId],
+    'a phone signing itself out must also drop its own stream and push rows');
+});
+
+test('revoke-all fires a closer for every device', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir };
+  resetDeviceRevocationClosers();
+
+  const a = await createSession({ deviceLabel: 'a' }, opts);
+  const b = await createSession({ deviceLabel: 'b' }, opts);
+  const c = await createSession({ deviceLabel: 'c' }, opts);
+
+  const cut = new Set<string>();
+  onDeviceRevoked((deviceId) => { cut.add(deviceId); });
+
+  const count = await revokeAllSessions(opts);
+  assert.equal(count, 3);
+  assert.deepEqual(
+    [...cut].sort(),
+    [a.record.deviceId, b.record.deviceId, c.record.deviceId].sort(),
+  );
+});
+
+test('a closer that throws does not strand the others', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir };
+  resetDeviceRevocationClosers();
+
+  const session = await createSession({ deviceLabel: 'phone' }, opts);
+  let reached = false;
+  onDeviceRevoked(() => { throw new Error('the stream closer blew up'); });
+  onDeviceRevoked(() => { reached = true; });
+
+  await revokeSessionByDeviceId(session.record.deviceId, opts);
+  assert.equal(reached, true,
+    'a half-executed revoke is the exact failure this mechanism exists to prevent');
+});
+
+test('an already-expired row still fires — the open stream is what needs cutting', async () => {
+  const stateDir = freshDir();
+  resetDeviceRevocationClosers();
+
+  const cut: string[] = [];
+  onDeviceRevoked((deviceId) => { cut.push(deviceId); });
+
+  // No such row was ever written: revokeSessionByDeviceId returns false, but a
+  // stream attached before the session expired may still be delivering.
+  const removed = await revokeSessionByDeviceId('dev-that-expired', { stateDir });
+  assert.equal(removed, false);
+  assert.deepEqual(cut, ['dev-that-expired']);
+});
+
+test('unsubscribing a closer detaches it', async () => {
+  const stateDir = freshDir();
+  const opts = { stateDir };
+  resetDeviceRevocationClosers();
+
+  const session = await createSession({ deviceLabel: 'phone' }, opts);
+  let calls = 0;
+  const drop = onDeviceRevoked(() => { calls += 1; });
+  drop();
+
+  await revokeSessionByDeviceId(session.record.deviceId, opts);
+  assert.equal(calls, 0, 'a closed stream must not keep a closer alive');
 });

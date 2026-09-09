@@ -7,11 +7,15 @@
  * results feed. The screen composes; this file decides copy and targets.
  */
 import type { ActivityEntry } from '@/lib/activity';
+import type { HomePaneId } from '@/lib/home-prefs';
 import type { CommandCenterItem } from '@/lib/types';
 import type { SpaceRecord } from '@/lib/spaces';
-import { humanizeCron } from '@/lib/cron';
-import { relativeTime } from '@/lib/inbox';
-import { unifiedChatSessionId } from '@/lib/last-session';
+// Relative for VALUES, `@/` for types. The alias is a bundler/tsconfig path,
+// so a type import is erased before Node ever sees it while a value import is
+// not — which is why this module had no unit test until now.
+import { humanizeCron } from '../../lib/cron';
+import { relativeTime } from '../../lib/inbox';
+import { unifiedChatSessionId } from '../../lib/last-session';
 
 /** The command-center DTO is deliberately loose; these are the extra,
  *  server-owned fields a home row may carry (all optional). */
@@ -22,6 +26,57 @@ export interface HomeFeedItem extends CommandCenterItem {
   runId?: string;
   taskId?: string;
   targetRunId?: string;
+}
+
+// ─── The shape of the window ───────────────────────────────────────────────
+
+/** A thing the home stacks: one of the user's panes, or the composer. */
+export type HomeBlockId = HomePaneId | 'composer';
+
+/**
+ * WORK LEADS — and the order is the user's, not this function's.
+ *
+ * The home used to open with a greeting and a text box: on an operations
+ * console the first thing on screen was an invitation to type, and the panes
+ * that actually answer "what are my employees doing" started underneath it.
+ * The composer is still on the page and its send -> thread handoff is
+ * untouched; it is simply no longer the hero.
+ *
+ * ONE rule: the composer goes last, after every pane the user kept. The
+ * composer is the only block the Customize sheet does not list, so it is the
+ * only block this function may place.
+ *
+ * WHAT WAS HERE AND WHY IT IS GONE. This used to also sink `quick_actions`
+ * whenever it preceded every work pane, on the theory that the chips are the
+ * other half of "talk to Clementine" and belong beside the composer. But that
+ * condition cannot tell a shipped default from a deliberate choice — it is
+ * exactly the state produced by dragging "Quick actions" to slot 1 in the
+ * Customize sheet. So the sheet rendered the chips in position 1, the drag
+ * saved, and the home went on rendering them last: a preference the UI offered
+ * and silently discarded. Where the chips SIT by default is a question for the
+ * default order (DEFAULT_HOME_PANE_ORDER), which is data the user can see and
+ * change; it is not a question for the renderer.
+ */
+export function homeBlocks(visible: readonly HomePaneId[]): HomeBlockId[] {
+  return [...visible, 'composer'];
+}
+
+/** Needs you and Running share one row when the user keeps them adjacent.
+ *  Rows, not a flat list, so the screen never re-derives the pairing. */
+export function homeRows(blocks: readonly HomeBlockId[]): HomeBlockId[][] {
+  const rows: HomeBlockId[][] = [];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const id = blocks[i];
+    const next = blocks[i + 1];
+    const paired = (id === 'needs_you' && next === 'running') || (id === 'running' && next === 'needs_you');
+    if (paired && next) {
+      rows.push([id, next]);
+      i += 1;
+      continue;
+    }
+    rows.push([id]);
+  }
+  return rows;
 }
 
 export interface PresenceCounts {
@@ -136,13 +191,23 @@ export function steerTarget(entry: ActivityEntry): string | null {
   return `/chat/${encodeURIComponent(unifiedChatSessionId(entry.sessionId))}`;
 }
 
-/** The Tasks board deep link for an activity row. Mirrors the drawer's
- *  select rule (session, then run, then task id); the attempt is pinned only
- *  for chat turns, where one reusable session mints an attempt per turn. */
+/**
+ * Where "Open run" goes.
+ *
+ * A run with a session now has a real ADDRESS — /chat/:sessionId renders it as
+ * a run, and that page can be bookmarked, pinned, renamed, tagged and searched.
+ * This used to hand every row to the /tasks drawer, which was right when the
+ * drawer was the only run detail there was; sending a row there now would put
+ * the owner in front of transient overlay state when a durable page exists.
+ *
+ * A row with no session is genuinely still board-shaped — a queued task or a
+ * run scope that never minted a harness session has nothing to render at a
+ * session address — so it keeps the deep link it had, attempt and all.
+ */
 export function runningOpenTarget(entry: ActivityEntry): string {
-  const select = entry.taskId ?? entry.sessionId ?? entry.runId ?? entry.runKey;
+  if (entry.sessionId) return `/chat/${encodeURIComponent(unifiedChatSessionId(entry.sessionId))}`;
+  const select = entry.taskId ?? entry.runId ?? entry.runKey;
   const params = new URLSearchParams({ select });
-  if (entry.kind === 'chat' && entry.attemptId) params.set('attemptId', entry.attemptId);
   return `/tasks?${params.toString()}`;
 }
 

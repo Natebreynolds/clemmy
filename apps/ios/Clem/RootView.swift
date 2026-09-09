@@ -125,6 +125,10 @@ private struct CommandCenterView: View {
     @State private var reconnectGate = ReconnectAttemptGate()
     @State private var initialNavigationStarted = false
     @State private var relayRetryAttempt = 0
+    /// Set ONLY from a known-denied status. An unanswered query leaves this
+    /// false, so the app never tells the user they turned something off before
+    /// it has actually looked.
+    @State private var notificationsBlocked = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -150,6 +154,17 @@ private struct CommandCenterView: View {
                     }
                     .padding(20)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+            }
+            // Shown only once the app is genuinely usable, and only on a
+            // KNOWN denial — a notice that appears over a loading shell, or on
+            // a status nobody has read yet, teaches the owner to ignore it.
+            .safeAreaInset(edge: .bottom) {
+                if notificationsBlocked && model.hasLoadedOnce {
+                    NotificationsOffNotice(
+                        onOpenSettings: { AppDelegate.openSystemNotificationSettings() },
+                        onDismiss: { notificationsBlocked = false }
+                    )
                 }
             }
             .confirmationDialog(
@@ -204,14 +219,21 @@ private struct CommandCenterView: View {
                 reconnect(preferRelay: false)
             }
             .onChange(of: scenePhase) { _, phase in
+                guard phase == .active else { return }
+                // Permission can be revoked in Settings while this process is
+                // suspended, and nothing tells the app when it happens. Every
+                // foreground is the only honest moment to re-read it.
+                AppDelegate.refreshAuthorizationStatus()
                 // A cached web shell can resume successfully while still
                 // pointing at yesterday's LAN address. Foregrounding is a
                 // transport boundary, so re-probe instead of waiting for an
                 // unbounded fetch timeout to notice.
-                guard phase == .active,
-                      let kind = connectionCoordinator.currentKind,
+                guard let kind = connectionCoordinator.currentKind,
                       kind.isReachable else { return }
                 reconnect(preferRelay: kind.prefersRelay)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: AppDelegate.authorizationChanged)) { _ in
+                notificationsBlocked = AppDelegate.notificationsBlocked
             }
             .onReceive(NotificationCenter.default.publisher(for: AppDelegate.tokenNotification)) { note in
                 if let token = note.userInfo?["token"] as? String {
@@ -362,6 +384,47 @@ private enum InitialConnectionState {
     case looking
     case offline
     case safetyCheckChanged
+}
+
+/// "Clem can't reach you" — the one state the pocket surface must never hide.
+///
+/// A denied notification permission is invisible by nature: the app looks fine
+/// and simply never speaks again, which reads as "Clem had nothing to say"
+/// rather than "Clem was not allowed to say it". The only real recovery is the
+/// system Settings page, so the notice offers exactly that and nothing else.
+private struct NotificationsOffNotice: View {
+    let onOpenSettings: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: "bell.slash")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Notifications are off")
+                    .font(.footnote.weight(.semibold))
+                Text("Clem can't tell you when something needs you.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button("Turn on", action: onOpenSettings)
+                .font(.footnote.weight(.semibold))
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.footnote)
+            }
+            .accessibilityLabel("Dismiss")
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) { Divider() }
+    }
 }
 
 private struct InitialConnectionCover: View {

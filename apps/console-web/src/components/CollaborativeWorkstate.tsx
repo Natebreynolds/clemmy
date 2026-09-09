@@ -108,7 +108,7 @@ export function CollaborativeWorkstate({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="text-caption font-semibold uppercase tracking-wide text-muted">Working together</p>
+            <p className="text-caption font-semibold text-muted">Working together</p>
             {mode && <StatusPill tone={MODE_TONE[mode]}>{MODE_LABEL[mode]}</StatusPill>}
             {snapshot?.needsConfirm && <StatusPill tone="warning">Check context</StatusPill>}
             {/* A context check must be ANSWERABLE where it is asked — the pill

@@ -663,9 +663,13 @@ test('reduceActivity: a throttled batch_progress flips the meter into backing-of
   assert.deepEqual(a[0].batch, { done: 5, total: 10, failed: 0 });
 });
 
-test('reduceActivity: external_write folds into a plain-human effect row, mirroring the server phrasing', () => {
+test('reduceActivity: a RESERVATION is live work, not a receipt', () => {
+  // This test used to assert the opposite -- that `external_write` alone
+  // rendered "Sent a message", status done, tone success. That event is
+  // appended with preDispatch:true BEFORE the call leaves the machine, so the
+  // old expectation was the defect written down as a contract.
   let a: ActivityItem[] = [];
-  a = reduceActivity(a, ev('external_write', { shapeKey: 'GMAIL_SEND_EMAIL', toolName: 'gmail_send_email', targets: ['paul@example.com'], callId: 'w1' }));
+  a = reduceActivity(a, ev('external_write', { shapeKey: 'GMAIL_SEND_EMAIL', toolName: 'gmail_send_email', targets: ['paul@example.com'], callId: 'w1', preDispatch: true }));
   assert.equal(a.length, 1);
   assert.equal(a[0].kind, 'event');
   assert.equal(a[0].variant, 'write');
@@ -677,6 +681,7 @@ test('reduceActivity: external_write folds into a plain-human effect row, mirror
   assert.equal(a[0].label, 'Sent a message to paul@example.com');
   assert.equal(a[0].status, 'done');
   assert.equal(a[0].tone, 'success');
+  assert.equal(a[0].write?.disposition, 'confirmed');
 
   // A create shape reads as a record; targets beyond 3 collapse to a "+N more".
   a = reduceActivity(a, ev('external_write', { shapeKey: 'HUBSPOT_CREATE_CONTACT', targets: ['a', 'b', 'c', 'd', 'e'], callId: 'w2' }));

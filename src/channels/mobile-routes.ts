@@ -47,6 +47,7 @@ import {
   detectTokenReuse,
   bindDeviceKey,
   needsDeviceUpgrade,
+  onDeviceRevoked,
   shouldRotate,
   type MobileSessionRecord,
 } from '../runtime/mobile-sessions.js';
@@ -56,11 +57,14 @@ import {
   isSupportedDeviceKey,
 } from '../runtime/mobile-device-proof.js';
 import {
-  checkAttempt,
+  reserveAttempt,
   recordFailure,
   recordSuccess,
+  type AttemptReservation,
   type MobileAttemptScope,
+  type MobileRateLimitOptions,
 } from '../runtime/mobile-rate-limit.js';
+import { classifyNotification } from '../runtime/notification-intent.js';
 import {
   addNotification,
   getNotification,
@@ -68,6 +72,7 @@ import {
   loadNotifications,
   listNotifications,
   markNotificationRead,
+  markNotificationsRead,
   removeWebPushDestinationByEndpoint,
   removeWebPushDestinationsByDeviceId,
   upsertApnsDestination,
@@ -507,6 +512,8 @@ interface MobileInboxNotification {
     relatedApprovalIds: string[];
     questionId: string | null;
     sessionId: string | null;
+    /** The harness session the run itself used; see the serializer's note. */
+    runSessionId: string | null;
     runId: string | null;
     stepId: string | null;
     workflow: string | null;
@@ -575,6 +582,13 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
       relatedApprovalIds,
       questionId: questionId ?? checkInId,
       sessionId: notificationMetadataString(row.metadata, 'sessionId', 'targetSessionId'),
+      // The session the WORK ran in, which for a background task is not the
+      // conversation that started it (background-tasks.ts sets sessionId to
+      // the origin chat and runSessionId to `background:<id>`). Without this
+      // the phone's "Open run" opened the originating transcript while the
+      // push for the same notification opened the run — one notification,
+      // two destinations. See pushTargetUrl in notification-delivery.ts.
+      runSessionId: notificationMetadataString(row.metadata, 'runSessionId'),
       runId,
       stepId,
       workflow: notificationMetadataString(row.metadata, 'workflow'),
@@ -830,6 +844,35 @@ function clientIp(req: express.Request): string {
     if (restored) return restored;
   }
   return req.socket.remoteAddress || req.ip || 'unknown';
+}
+
+/**
+ * Reserve an attempt slot for the lifetime of this response.
+ *
+ * THE DEFECT THIS EXISTS TO FIX. Every credential route here had the same
+ * shape: read the limiter, spend real time verifying (~50ms of scrypt for a
+ * PIN, a file-locked single-use consume for a pairing token), then record the
+ * failure. Nothing was written in between, so a concurrent burst was judged
+ * against one pre-burst counter and every request in it was admitted — a
+ * 5-attempt budget that bounded sequential guessing and nothing else.
+ *
+ * `reserveAttempt` counts an in-flight attempt as a failure that has not landed
+ * yet. The slot must then be held until the outcome is DURABLE, not merely
+ * known — releasing between the hash and `recordFailure` just moves the same
+ * window one level down. Binding the release to `res` 'close' gets that for
+ * free on every path a handler can take: a normal reply, an early return, a
+ * thrown error, or a client that hangs up mid-verification.
+ */
+function reserveForRequest(
+  res: express.Response,
+  ip: string,
+  opts?: MobileRateLimitOptions,
+): AttemptReservation {
+  const reservation = reserveAttempt(ip, opts);
+  // release() is idempotent, and a refused reservation holds nothing — so
+  // registering unconditionally is safe and keeps every call site one line.
+  res.on('close', () => reservation.release());
+  return reservation;
 }
 
 /**
@@ -1399,6 +1442,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   const router = express.Router();
   const stateOpts = deps.stateDir ? { stateDir: deps.stateDir } : undefined;
 
+  // A revoked device must stop RECEIVING, not merely stop asking. Push
+  // subscriptions outlived every revoke path, so a phone the owner had signed
+  // out kept getting notification content — the body of a banner is real
+  // information about the owner's work, delivered to a device they cut off.
+  // (removeWebPushDestinationsByDeviceId drops the APNs rows for the device
+  // too; the name is narrower than the behaviour.) Registered once per router
+  // rather than per request, because the destination store is process-wide.
+  onDeviceRevoked((deviceId) => {
+    const removed = removeWebPushDestinationsByDeviceId(deviceId);
+    if (removed > 0) {
+      mobileDoorLog.info({ deviceId, removed }, 'revoked device: push destinations removed');
+    }
+  });
+
   // Every request through the phone's door, with the reason it was refused.
   //
   // A live pairing (2026-08-22) minted a session and the phone then went
@@ -1736,9 +1793,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   router.get('/auth/status', async (req, res) => {
     const token = readSessionCookie(req);
     const record = token ? await validateSession(token, stateOpts) : undefined;
+    // PIN posture is told to callers that can ACT on it, and to nobody else.
+    //
+    // This route has no session middleware, so it answered an anonymous
+    // internet caller who knew the relay origin — and told them whether a PIN
+    // was set and when it last changed. That is reconnaissance with no
+    // corresponding use: the PIN box and the pairing consumer are both deleted
+    // from the relay (RELAY_FORBIDDEN_PATHS), so a relay caller has nothing to
+    // do with the answer. The LAN login screen genuinely needs pinConfigured to
+    // choose between the PIN box and "scan the QR", so that stays where the
+    // login screen actually runs. pinUpdatedAt has no client at all.
+    const canSeePinPosture = Boolean(record) || req.clemIngress !== 'relay';
     res.json({
-      pinConfigured: hasPin(stateOpts),
-      pinUpdatedAt: readPinMeta(stateOpts)?.updatedAt ?? null,
+      pinConfigured: canSeePinPosture ? hasPin(stateOpts) : false,
+      pinUpdatedAt: record ? readPinMeta(stateOpts)?.updatedAt ?? null : null,
       authenticated: Boolean(record),
       deviceId: record?.deviceId ?? null,
       deviceLabel: record?.deviceLabel ?? null,
@@ -1763,7 +1831,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
 
-    const gate = checkAttempt(ip, stateOpts);
+    const gate = reserveForRequest(res, ip, stateOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -1842,7 +1910,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // shoulder-surfed QR noisy instead of silent. Budgeted separately from
     // 'pin' so PIN failures can never lock out the pairing recovery path.
     const pairOpts = { ...stateOpts, scope: 'pair' as const };
-    const gate = checkAttempt(ip, pairOpts);
+    const gate = reserveForRequest(res, ip, pairOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -2002,7 +2070,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     const adoptOpts = { ...stateOpts, scope: 'pair' as const };
-    const gate = checkAttempt(ip, adoptOpts);
+    const gate = reserveForRequest(res, ip, adoptOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -2035,6 +2103,37 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(401).json({ error: 'INVALID_HANDOFF' });
       return;
     }
+    // Device binding must not be CLIENT-ELECTIVE on the relay door.
+    //
+    // readDeviceKeyFromBody returns undefined for any body that simply omits
+    // devicePublicKeyJwk, and prepareSession then issues a plain 14-day bearer
+    // cookie — which is exactly what the binding exists to prevent. On this
+    // route that is a downgrade attack with a free upgrade window attached:
+    // adopt is reachable over the relay, so anyone holding a handoff bearer
+    // could trade a key-bound phone's identity for a copyable cookie.
+    //
+    // The rule is no DOWNGRADE, rather than a flat requirement: a legacy
+    // cookie-bound phone still inside its upgrade grace has no key to send yet,
+    // and refusing it here would log out the devices the grace was written to
+    // protect. Once a device has proven it holds a key, it never gets to stop.
+    // A device with NO live row is not this check's business: the store refuses
+    // to mint for it and the handoff is answered INVALID_HANDOFF, which is the
+    // stronger and more specific refusal. Answering DEVICE_KEY_REQUIRED first
+    // would swap a "you are revoked" for a "try again with a key".
+    const adoptingKey = readDeviceKeyFromBody(req);
+    if (!adoptingKey) {
+      const keyBound = listSessions(stateOpts)
+        .some((row) => row.deviceId === handoff.deviceId && row.binding === 'key');
+      if (keyBound) {
+        mobileDoorLog.warn(
+          { deviceId: handoff.deviceId },
+          'origin-adopt refused: device key omitted for a key-bound device',
+        );
+        res.status(400).json({ error: 'DEVICE_KEY_REQUIRED' });
+        return;
+      }
+    }
+
     let adopted: Awaited<ReturnType<typeof createOrReuseSessionForExistingDevice>>;
     try {
       // The handoff bearer becomes the exact session bearer. If the response
@@ -2043,7 +2142,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       adopted = await createOrReuseSessionForExistingDevice(
         {
           deviceLabel: handoff.deviceLabel,
-          devicePublicKeyJwk: readDeviceKeyFromBody(req),
+          devicePublicKeyJwk: adoptingKey,
           ip,
           // Same device identity as the LAN session: one phone, one row in the
           // device list, revocable as one thing.
@@ -2163,7 +2262,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     const ip = clientIp(req);
-    const gate = checkAttempt(ip, stateOpts);
+    const gate = reserveForRequest(res, ip, stateOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -2546,6 +2645,72 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     });
   });
 
+  /**
+   * Clear a NAMED SET of notifications in one tap.
+   *
+   * Nobody clears 176 history rows one at a time, so before this route the
+   * phone's only clearing verb was unusable at the size the store actually
+   * reaches — measured live: 200 of 200 unread, none ever marked read.
+   *
+   * The client sends exact ids, never a filter, so a bulk action can always
+   * name its own scope to the person tapping it and can never widen past what
+   * was on screen. CLEARING IS NOT DECIDING: markNotificationsRead holds back
+   * anything still awaiting an answer and returns those ids, so the response
+   * can say what was left alone rather than silently swallowing it.
+   */
+  router.post('/api/inbox/notifications/read', requireMobileSession, (req, res) => {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    const raw = Array.isArray(body.ids) ? body.ids : null;
+    if (!raw || raw.length === 0) {
+      res.status(400).json({ error: 'IDS_REQUIRED', detail: 'Send the exact notification ids to clear.' });
+      return;
+    }
+    if (raw.length > 500) {
+      res.status(400).json({ error: 'TOO_MANY_IDS', detail: 'Clear at most 500 notifications per request.' });
+      return;
+    }
+    const ids = raw
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.length <= 200);
+    if (ids.length === 0) {
+      res.status(400).json({ error: 'IDS_REQUIRED', detail: 'Send the exact notification ids to clear.' });
+      return;
+    }
+    try {
+      // THE FLOOR IS HERE, not in the client. markNotificationsRead can only
+      // tell a live proposal from a settled one if this route says which are
+      // pending — the same three sets /api/inbox/summary passes — and without
+      // them it holds every proposal-bearing row back rather than clearing it.
+      // The phone also pre-filters those rows, but a pre-filter is one
+      // client's habit; this is the rule for every caller of the route.
+      const pendingApprovalIds = new Set(
+        approvalRegistry.listPending({ status: 'pending' })
+          .filter((row) => !approvalRegistry.isExpired(row))
+          .filter((row) => approvalRegistry.isFormalApprovalSurface(row))
+          .map((row) => row.approvalId),
+      );
+      const pendingPlanIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
+      const pendingTrustIds = new Set(listTrustProposals('pending').map((row) => row.id));
+      const result = markNotificationsRead(ids, {
+        approvalPending: (id) => pendingApprovalIds.has(id),
+        planPending: (id) => pendingPlanIds.has(id),
+        trustPending: (id) => pendingTrustIds.has(id),
+      });
+      res.json({
+        ok: true,
+        cleared: result.cleared,
+        clearedCount: result.cleared.length,
+        held: result.held,
+        heldCount: result.held.length,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.get('/api/inbox/summary', requireMobileSession, async (_req, res) => {
     try {
       const approvalRows = approvalRegistry.listPending({ status: 'pending' })
@@ -2575,7 +2740,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         if (trustProposalId && trustIds.has(trustProposalId)) continue;
         if (relatedApprovalIds.length > 0 && relatedApprovalIds.every((id) => approvalIds.has(id))) continue;
         if (actionItemId && questionActionIds.has(actionItemId)) continue;
-        if (!isNeedsAttentionNotification(notification)) {
+        // Rule (1) vs rule (2), decided in ONE place. The old predicate ended
+        // in a regex over the TITLE, so "Chat run blocked: …" — a past-tense
+        // report of something that already stopped — counted as a decision
+        // forever, because nothing ever edits that word out. Measured on the
+        // owner's store: a badge of 86 against ZERO pending approvals.
+        // classifyNotification asks instead whether there is something to
+        // ANSWER, and reads a terminal status before any flag stamped earlier.
+        const intent = classifyNotification(notification, {
+          approvalPending: (id) => approvalIds.has(id),
+          planPending: (id) => planIds.has(id),
+          trustPending: (id) => trustIds.has(id),
+        });
+        if (intent !== 'awaiting_you') {
+          // A finished run is worth telling someone about once; it is not an
+          // obligation, so it never enters the count that shapes the badge.
           unreadUpdates += 1;
           continue;
         }
@@ -3465,6 +3644,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    */
   router.get('/api/chat/sessions/:sessionId/stream', requireMobileSession, (req, res) => {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const streamDeviceId = req.mobileSession!.record.deviceId;
     const session = harnessGetSession(sessionId);
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
     // SSE resume: when the browser reconnects after a drop, it sends
@@ -3558,7 +3738,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       clearInterval(heartbeat);
       detachViewer();
       unsubscribe();
+      dropRevocationCloser();
     };
+    // Authorization was checked ONCE, at attach. Without this the stream keeps
+    // writing turn content to a phone the owner has already revoked, until the
+    // socket happens to close — so Revoke did not revoke, it only stopped the
+    // NEXT request. Cutting the socket is what makes the button honest.
+    const dropRevocationCloser = onDeviceRevoked((deviceId) => {
+      if (deviceId !== streamDeviceId) return;
+      cleanup();
+      res.end();
+      res.destroy();
+    });
     res.on('close', cleanup);
     res.on('error', cleanup);
   });

@@ -416,7 +416,7 @@ export function Inbox() {
               type="button"
               onClick={() => { setTab(t.key); setSelected(null); }}
               className={cn(
-                'inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+                'inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                 active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg',
               )}
             >
@@ -590,7 +590,7 @@ export function Inbox() {
 
         {/* Reading pane — only rendered when the tab has selectable rows. */}
         {hasRows && (
-          <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
+          <div className="rounded-lg border border-border-raised bg-raised p-5">
             {selApproval && (
               <ApprovalDetail
                 row={selApproval}
@@ -726,7 +726,7 @@ function InboxQuestionCard({ row, selected, answer, busy, globallyBusy, onSelect
             disabled={disabled}
             onChange={(event) => onAnswerChange(event.target.value)}
             placeholder={row.answerable ? 'Type the answer Clem needs…' : 'Open the authorized origin to answer'}
-            className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none focus:border-primary disabled:opacity-60"
+            className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60"
           />
         </label>
         <Button disabled={disabled || !answer.trim()} onClick={() => onSubmit()}>

@@ -228,7 +228,7 @@ export function Connect() {
           />
         )}
         {/* Search to find + connect a new app from the full catalog. */}
-        {!appsUnavailable && <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3">
+        {!appsUnavailable && <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
           <Search className="h-4 w-4 text-faint" aria-hidden />
           <input
             value={appQuery}
@@ -372,7 +372,7 @@ function ComposioCredentialsModal({
       onMouseDown={() => { if (!busy) onClose(); }}
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-lg"
+        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-modal"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="flex items-start gap-3 border-b border-border px-5 py-4">

@@ -1028,8 +1028,8 @@ function EpisodesTab() {
           <Card className={cn('h-full p-3.5 transition-colors', pendingUniqueClaims > 0 && 'border-warning/40 bg-warning/5', review === 'pending' && 'ring-2 ring-warning/30')}>
             <div className="text-h2 text-fg">{pendingUniqueClaims.toLocaleString()}</div>
             <div className="text-caption text-muted">Unique claims awaiting review</div>
-            {pendingObservations !== pendingUniqueClaims && <div className="mt-1 text-[10px] leading-tight text-faint">{pendingObservations.toLocaleString()} source observations</div>}
-            {pendingBreakdown && <div className="mt-1 text-[10px] leading-tight text-faint">{pendingBreakdown}</div>}
+            {pendingObservations !== pendingUniqueClaims && <div className="mt-1 text-caption leading-tight text-faint">{pendingObservations.toLocaleString()} source observations</div>}
+            {pendingBreakdown && <div className="mt-1 text-caption leading-tight text-faint">{pendingBreakdown}</div>}
           </Card>
         </button>
         <Card className="p-3.5"><div className="text-h2 text-fg">{visiblePeople.toLocaleString()}</div><div className="text-caption text-muted">People/things observed in view</div></Card>

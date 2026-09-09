@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   boardCardFromRunDetail,
+  boardDropHighlight,
+  boardLaneId,
+  boardLanes,
+  boardNeedsYouGroup,
+  presentBoardWorkingNow,
   boardTraceSinceSeq,
   canStopCanonicalRunFromDrawer,
   findBoardCardForRun,
@@ -317,4 +322,173 @@ test('cardTone: parked/awaiting runs in the Running column read as waiting, not 
   assert.equal(cardTone(capability).label, 'Waiting for a connection');
   const doneOdd = card({ id: 'bg-int', column: 'done', status: 'interrupted' });
   assert.equal(cardTone(doneOdd).label, 'Interrupted — resumable');
+});
+
+// ─── "Needs you" is two different asks ───────────────────────────────────────
+// BLOCKED cannot be cleared by deciding anything — a fact, an auth or a
+// reconciliation is missing. READY FOR REVIEW is one approve from carrying on.
+// Nine unread approvals and one run stuck on missing auth are not one backlog.
+
+test('needs-you splits on what the human actually has to do, not on the offered buttons', () => {
+  // The trap: the board route gives a BLOCKED background task the same
+  // ['resume','cancel'] allowlist as an awaiting_continue one, so the actions
+  // cannot separate them — the status word has to lead.
+  const blockedTask = card({
+    id: 'bg-blocked', sourceKind: 'background', column: 'needs_you',
+    status: 'blocked', actions: ['resume', 'cancel'],
+  });
+  const continuable = card({
+    id: 'bg-continue', sourceKind: 'background', column: 'needs_you',
+    status: 'awaiting_continue', actions: ['resume', 'cancel'],
+  });
+  assert.equal(boardNeedsYouGroup(blockedTask), 'blocked');
+  assert.equal(boardNeedsYouGroup(continuable), 'review');
+
+  // A question needs an answer typed, not a decision clicked.
+  assert.equal(boardNeedsYouGroup(card({
+    id: 'bg-ask', sourceKind: 'background', column: 'needs_you',
+    status: 'awaiting_input', actions: ['cancel'],
+  })), 'blocked');
+
+  // Gates and bindings stopped the work before anything was sent.
+  for (const status of ['blocked_capability', 'blocked_mutation', 'needs_binding']) {
+    assert.equal(
+      boardNeedsYouGroup(card({ id: `wf-${status}`, sourceKind: 'workflow', column: 'needs_you', status, actions: [] })),
+      'blocked',
+      `${status} is a wall, not a review`,
+    );
+  }
+
+  // A standalone approval is the review case.
+  assert.equal(boardNeedsYouGroup(card({
+    id: 'approval:a1', sourceKind: 'approval', column: 'needs_you',
+    status: 'awaiting_approval', actions: ['approve', 'reject'], approvalId: 'a1',
+  })), 'review');
+
+  // A flagged run that still carries its approval is reviewable: the offered
+  // approve outranks the status word.
+  assert.equal(boardNeedsYouGroup(card({
+    id: 'run-attn', column: 'needs_you', status: 'needs_attention',
+    actions: ['approve', 'reject'], raw: { pendingApprovalId: 'a2' },
+  })), 'review');
+
+  // An unrecognised wait fails closed — under-promising is survivable, calling
+  // a wall "ready for review" is not.
+  assert.equal(boardNeedsYouGroup(card({
+    id: 'run-unknown', column: 'needs_you', status: 'awaiting_something_new', actions: [],
+  })), 'blocked');
+});
+
+test('a held missed schedule is a decision to review, not a wall', () => {
+  const held = card({
+    id: 'catchup:run-9', sourceKind: 'schedule', column: 'needs_you',
+    status: 'missed_schedule', actions: ['resume', 'cancel', 'skip'],
+    raw: { workflowSlug: 'weekly-review', runId: 'run-9' },
+  });
+  assert.equal(boardNeedsYouGroup(held), 'review');
+});
+
+// ─── One answer to "what is running" ─────────────────────────────────────────
+// The badge that sends you to /tasks and the board you land on used to be two
+// answers to the same question: the badge asked the shared Working-Now
+// presenter, /tasks read the server column raw.
+
+/** The card the board route actually emits for a workflow parked on approval
+ *  consumption (console-routes.ts): the server calls it Running, its status is
+ *  `parked`, and its actions carry NO approve — the approve lives on the
+ *  separate `approval:` card. Every assertion below is against this shape. */
+const parkedWorkflowCard = () => card({
+  id: 'wf:prospects:run-7', sourceKind: 'workflow', column: 'running', status: 'parked',
+  progressHint: 'Waiting for your approval on step send-1', sessionId: null,
+  actions: ['cancel'], primaryAction: 'none',
+  raw: { workflowSlug: 'prospects', runId: 'run-7' },
+});
+
+/** The card that DOES carry the approve — its own row, in Needs you. */
+const approvalCard = () => card({
+  id: 'approval:apr-7', sourceKind: 'approval', column: 'needs_you', status: 'awaiting_approval',
+  actions: ['approve', 'reject'], primaryAction: 'approve', approvalId: 'apr-7',
+});
+
+test('the board routes its live rows through the ONE Working-Now presenter', () => {
+  const generatedAt = '2026-07-16T12:05:00.000Z';
+  const live = card({ id: 'run-live', column: 'running', status: 'running', ageMs: 180_000 });
+  const parked = parkedWorkflowCard();
+  const queued = card({ id: 'bg-queued', column: 'queued', status: 'pending' });
+  const finished = card({ id: 'run-done', column: 'done', status: 'completed' });
+
+  const view = presentBoardWorkingNow([live, parked, queued, finished], generatedAt);
+  assert.equal(view.total, 2, 'queued has not started and done is history');
+  assert.equal(view.running, 1);
+  assert.equal(view.needsYou, 1, 'a parked run is waiting on a person, not working');
+  assert.equal(view.label, '1 running · 1 needs you');
+
+  const [presentedLive, presentedParked] = view.entries;
+  // The board feed carries no lease, so it may not mint the pulse certificate:
+  // its Running column is a step id, which says a step was STARTED, not that
+  // anything is still holding it. The card is still current work — it just does
+  // not claim a heartbeat nobody took.
+  assert.equal(presentedLive.presentation, 'waiting');
+  assert.equal(presentedLive.pulse, false, 'the board never manufactures the pulse certificate');
+  // And it carries no start time either: `ageMs` is time since the card was
+  // last TOUCHED (pending.lastEventAt / updatedAt / guestUpdatedAt), so a run
+  // three hours in whose last event was 30s ago would read '<1m'. No elapsed is
+  // the honest answer.
+  assert.equal(presentedLive.elapsed, '', 'an unknown start is rendered as unknown, not as "just now"');
+  assert.equal(presentedParked.presentation, 'needs_you');
+  assert.equal(presentedParked.pulse, false);
+});
+
+test('a parked run leaves Running for the review lane, and dropping it back on Running says nothing', () => {
+  const parked = parkedWorkflowCard();
+  assert.equal(boardLaneId(parked), 'needs_you_review');
+  // The real parked card offers cancel and nothing else, so there is no intent
+  // to fire — but the drop moves it NOWHERE (the server already has it in
+  // Running), and a no-op must stay silent. Before the lanes split, target ===
+  // card.column made this silent; a red "Nothing to start or resume here" toast
+  // on a gesture that changes nothing is a regression, not a rejection.
+  assert.equal(intentForDrop(parked, 'running'), null);
+  assert.equal(rejectReason(parked, 'running'), '', 'a drop onto the column the server already has it in is a no-op');
+  assert.equal(boardDropHighlight(parked, 'running'), 'none', 'and the lane must not flash reject for it');
+  assert.equal(intentForDrop(parked, 'needs_you_review'), null, 'a drop back into its own lane is a no-op');
+  assert.equal(rejectReason(parked, 'needs_you_review'), '');
+  assert.equal(boardDropHighlight(parked, 'needs_you_review'), 'none', "a card's own rendered lane never flashes red");
+  assert.equal(rejectReason(parked, 'needs_you_blocked'), '', 'sliding between the two needs-you lanes says nothing');
+  // Cancel is the one thing it does offer, and the drag still reaches it.
+  assert.equal(intentForDrop(parked, 'done'), 'cancel');
+  assert.equal(boardDropHighlight(parked, 'done'), 'accept');
+
+  // The approve-by-drag gesture lives on the card that actually carries the
+  // approve, and comparing against the RENDERED lane is what keeps it alive.
+  const approval = approvalCard();
+  assert.equal(boardLaneId(approval), 'needs_you_review');
+  assert.equal(intentForDrop(approval, 'running'), 'approve');
+  assert.equal(boardDropHighlight(approval, 'running'), 'accept');
+
+  assert.equal(boardLaneId(card({ id: 'run-live', column: 'running', status: 'running' })), 'running');
+  assert.equal(boardLaneId(card({ id: 'bg-queued', column: 'queued', status: 'pending' })), 'queued');
+  assert.equal(boardLaneId(card({ id: 'run-done', column: 'done', status: 'completed' })), 'done');
+  assert.equal(
+    boardLaneId(card({ id: 'bg-ask', column: 'needs_you', status: 'awaiting_input', actions: ['cancel'] })),
+    'needs_you_blocked',
+  );
+});
+
+test('the whole-board lane pass and the single-card one cannot give different answers', () => {
+  const cards = [
+    card({ id: 'run-live', column: 'running', status: 'running' }),
+    parkedWorkflowCard(),
+    card({ id: 'bg-queued', column: 'queued', status: 'pending' }),
+    card({ id: 'run-done', column: 'done', status: 'completed' }),
+    card({ id: 'bg-ask', column: 'needs_you', status: 'awaiting_input', actions: ['cancel'] }),
+    approvalCard(),
+  ];
+  const { laneOf } = boardLanes(cards, '2026-07-16T12:05:00.000Z');
+  assert.equal(laneOf.size, cards.length, 'every card lands in exactly one lane');
+  for (const one of cards) {
+    assert.equal(laneOf.get(one.id), boardLaneId(one), `${one.id} lanes the same both ways`);
+  }
+  assert.deepEqual([...laneOf.values()].sort(), [
+    'done', 'needs_you_blocked', 'needs_you_review', 'needs_you_review', 'queued', 'running',
+  ]);
 });

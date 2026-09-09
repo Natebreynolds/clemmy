@@ -518,6 +518,35 @@ export async function markInboxNotificationRead(id: string): Promise<{
   return api(`/m/api/inbox/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' });
 }
 
+/** Why the daemon left one row alone during a bulk clear. */
+export type InboxReadHeldReason = 'awaiting_you' | 'capability_gate' | 'not_found';
+
+export interface InboxBulkReadResult {
+  ok: boolean;
+  /** Exactly the ids that are read now. */
+  cleared: string[];
+  clearedCount: number;
+  /** Rows the daemon refused to clear, and why. Reported, never hidden. */
+  held: Array<{ id: string; reason: InboxReadHeldReason }>;
+  heldCount: number;
+}
+
+/**
+ * Clear a named set of updates in one request.
+ *
+ * The ids are always the exact rows the screen was showing, so the button can
+ * say how many it clears. Clearing never decides anything: the daemon holds
+ * back any row still awaiting an answer and names it in `held`.
+ */
+export async function markInboxNotificationsRead(
+  ids: readonly string[],
+): Promise<InboxBulkReadResult> {
+  return api('/m/api/inbox/notifications/read', {
+    method: 'POST',
+    body: JSON.stringify({ ids: [...ids] }),
+  });
+}
+
 /** The ONE spelling of the summary path — the stamp registry is keyed by it. */
 export const INBOX_SUMMARY_PATH = '/m/api/inbox/summary';
 

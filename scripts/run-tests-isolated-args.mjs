@@ -25,6 +25,18 @@ export const DEFAULT_TEST_TARGETS = Object.freeze([
   'src/tasks/**/*.test.ts',
   'src/tools/**/*.test.ts',
   'apps/**/*.test.ts',
+  // The relay is the one first-party app written in plain .mjs — zero
+  // dependencies, in no tsconfig, deliberately. Without this line its suite
+  // exists and never runs, which is worse than having none: a green `npm test`
+  // would report coverage this gate is not actually applying.
+  //
+  // Named exactly rather than globbed as apps/**/*.test.mjs, which would also
+  // sweep in apps/desktop/scripts/{mac-native-deps,vendor-recall-native}.test.mjs
+  // — release-asset suites that `npm run test:release-assets` already owns and
+  // that need a build environment this gate does not promise. Same rule as the
+  // rest of this list: adding a source area is a decision about which gate owns
+  // it, not a wildcard.
+  'apps/relay/*.test.mjs',
 ]);
 
 const TEST_OPTIONS_WITH_SEPARATE_VALUE = new Set([

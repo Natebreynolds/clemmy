@@ -4970,4 +4970,225 @@ test('mobile origin raw pages preserve terminals across private rows and bridged
       assert.equal((await fetch(`${h.url}/m/api/chat/sessions/${origin.id}/events/recent?${query}`, { headers: { cookie } })).status, 400);
     }
   } finally { await h.close(); }
+
+/**
+ * ── Device binding is not client-elective on the relay door ────────────────
+ *
+ * readDeviceKeyFromBody returns undefined for any body that simply OMITS
+ * devicePublicKeyJwk, and prepareSession then issues a plain bearer cookie with
+ * a 14-day upgrade grace — exactly what the binding exists to prevent. On
+ * origin-adopt, which is reachable over the relay, that is a downgrade: trade a
+ * key-bound phone for a copyable cookie.
+ */
+test('origin-adopt refuses a keyless adopt for a key-bound device', async () => {
+  const h = await startHarness();
+  try {
+    // Pair with a device key so the session is genuinely key-bound.
+    const { pair, publicJwk } = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+    });
+    assert.equal(paired.status, 200);
+    const pairedBody = await paired.json() as { binding: string; sessionFingerprint: string };
+    assert.equal(pairedBody.binding, 'key', 'precondition: the device is key-bound');
+    const cookie = cookieFrom(paired);
+
+    // A key-bound session signs every request, mint included.
+    const mintProof = await deviceProof(pair, 'POST', '/m/auth/origin-handoff', pairedBody.sessionFingerprint);
+    const mint = await fetch(`${h.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie, 'x-clem-device-proof': mintProof },
+    });
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as {
+      token: string; handoffId: string; generation: number;
+    };
+
+    const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+        // devicePublicKeyJwk deliberately omitted — the downgrade attempt.
+      }),
+    });
+    assert.equal(adopt.status, 400);
+    assert.equal((await adopt.json() as { error: string }).error, 'DEVICE_KEY_REQUIRED');
+
+    // The same handoff still adopts when the key IS presented, so the refusal
+    // narrows the door rather than closing it.
+    const withKey = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+        devicePublicKeyJwk: publicJwk,
+      }),
+    });
+    assert.equal(withKey.status, 200);
+    assert.equal((await withKey.json() as { binding: string }).binding, 'key');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a legacy cookie-bound device may still adopt without a key', async () => {
+  const h = await startHarness();
+  try {
+    // loginMobile sends no device key, so this session is cookie-bound and
+    // inside its upgrade grace. Refusing it here would log out exactly the
+    // devices the grace was written to protect.
+    const cookie = await loginMobile(h, 'Legacy phone');
+    const mint = await fetch(`${h.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as {
+      token: string; handoffId: string; generation: number;
+    };
+    const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(adopt.status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+test('auth/status withholds PIN posture from an unauthenticated caller it cannot serve', async () => {
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+
+    // The LAN login screen genuinely needs pinConfigured to choose between the
+    // PIN box and "scan the QR", so a LAN caller still gets it.
+    const lan = await fetch(`${h.url}/m/auth/status`);
+    const lanBody = await lan.json() as { pinConfigured: boolean; pinUpdatedAt: string | null };
+    assert.equal(lanBody.pinConfigured, true);
+    // pinUpdatedAt has no client at all and is pure reconnaissance.
+    assert.equal(lanBody.pinUpdatedAt, null,
+      'the change time is told only to a caller that already holds a session');
+
+    // An authenticated caller sees the full posture.
+    const cookie = await loginMobile(h, 'Status phone');
+    const authed = await fetch(`${h.url}/m/auth/status`, { headers: { cookie } });
+    const authedBody = await authed.json() as {
+      authenticated: boolean; pinConfigured: boolean; pinUpdatedAt: string | null;
+    };
+    assert.equal(authedBody.authenticated, true);
+    assert.equal(authedBody.pinConfigured, true);
+    assert.ok(authedBody.pinUpdatedAt, 'a paired device may read its own PIN posture');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a bulk clear reads the named updates and refuses to decide anything', async () => {
+  // 200 of 200 unread on the owner's machine, and no verb that scaled: the
+  // phone could only ever mark one row at a time, so 176 history items were
+  // unclearable in practice. The bulk route exists for exactly that, and it
+  // must be structurally unable to resolve a decision on the way.
+  const stamp = Date.now();
+  const doneId = `bulk-done-${stamp}`;
+  const blockedId = `bulk-blocked-${stamp}`;
+  const questionId = `bulk-question-${stamp}`;
+  addNotification({
+    id: doneId,
+    kind: 'execution',
+    title: 'Renewal digest finished',
+    body: 'Sent to the sheet.',
+    createdAt: '2099-01-01T00:00:00.000Z',
+    read: false,
+    metadata: { status: 'done', needsAttention: true },
+  });
+  addNotification({
+    id: blockedId,
+    kind: 'execution',
+    title: 'Chat run blocked: pre-tag verifier',
+    body: 'It stopped two days ago.',
+    createdAt: '2099-01-01T00:00:01.000Z',
+    read: false,
+    metadata: { status: 'blocked' },
+  });
+  addNotification({
+    id: questionId,
+    kind: 'workflow',
+    title: 'Which quarter should I use?',
+    body: 'Waiting on you.',
+    createdAt: '2099-01-01T00:00:02.000Z',
+    read: false,
+    metadata: { status: 'awaiting_input', questionId: `q-${stamp}`, needsAttention: true },
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Bulk clear phone');
+    const cleared = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [doneId, blockedId, questionId] }),
+    });
+    assert.equal(cleared.status, 200);
+    const body = await cleared.json() as {
+      cleared: string[];
+      clearedCount: number;
+      held: Array<{ id: string; reason: string }>;
+    };
+    assert.deepEqual(body.cleared.sort(), [blockedId, doneId].sort(),
+      'finished and dead-stopped reports are history and clear');
+    assert.equal(body.clearedCount, 2);
+    assert.deepEqual(body.held, [{ id: questionId, reason: 'awaiting_you' }],
+      'an unanswered question is held back and NAMED, never silently swallowed');
+
+    const still = await fetch(`${h.url}/m/api/inbox/notifications/${encodeURIComponent(questionId)}`, {
+      headers: { cookie },
+    });
+    assert.equal((await still.json() as { notification: { read: boolean } }).notification.read, false);
+
+    // An empty or oversized ask is a 400, not a silent no-op the phone would
+    // report as a successful clear.
+    const empty = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [] }),
+    });
+    assert.equal(empty.status, 400);
+    const oversized = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from({ length: 501 }, (_, i) => `x-${i}`) }),
+    });
+    assert.equal(oversized.status, 400);
+
+    // Unauthenticated callers cannot clear anyone's inbox.
+    const anonymous = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [doneId] }),
+    });
+    assert.equal(anonymous.status, 401);
+  } finally {
+    await h.close();
+    markNotificationRead(doneId);
+    markNotificationRead(blockedId);
+    markNotificationRead(questionId);
+  }
 });

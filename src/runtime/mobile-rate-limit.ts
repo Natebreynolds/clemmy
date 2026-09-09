@@ -461,6 +461,107 @@ export async function recordSuccess(
 }
 
 /**
+ * ── In-flight reservations ──────────────────────────────────────────────────
+ *
+ * THE DEFECT THIS EXISTS TO FIX. `checkAttempt` reads the counter and records
+ * nothing; the caller then spends ~50ms hashing and only calls `recordFailure`
+ * afterwards. Every request that arrives inside that window is therefore judged
+ * against the same pre-burst counter, so 200 simultaneous PIN guesses are all
+ * admitted against a 5-attempt budget. The budget bounded sequential guessing
+ * and nothing else.
+ *
+ * A reservation closes the window by counting an attempt the moment it is
+ * admitted rather than when it fails: an in-flight attempt is treated as a
+ * failure that has not landed yet. Release it after the outcome is recorded and
+ * the pessimism costs a legitimate user nothing.
+ *
+ * In-memory is the right home for this and not a shortcut. These counts must be
+ * consistent with the durable file at the instant of the decision, and only
+ * this process serves the phone door — a second daemon on the same home is
+ * already prevented by the home lock. Crashing loses the reservations, which is
+ * correct: nothing is in flight after a crash.
+ */
+const inFlight = new Map<string, number>();
+
+function inFlightCount(key: string): number {
+  return inFlight.get(key) ?? 0;
+}
+
+function acquireInFlight(key: string): void {
+  inFlight.set(key, inFlightCount(key) + 1);
+}
+
+function releaseInFlight(key: string): void {
+  const next = inFlightCount(key) - 1;
+  if (next <= 0) inFlight.delete(key);
+  else inFlight.set(key, next);
+}
+
+export interface AttemptReservation extends AttemptDecision {
+  /**
+   * Release the slot. Idempotent, and safe to call from a `finally` — an
+   * abandoned reservation would hold the budget closed against its own user.
+   */
+  release: () => void;
+}
+
+/**
+ * Admit an attempt and hold its slot until the outcome is recorded.
+ *
+ * Same decision as `checkAttempt`, plus the attempts already in flight counted
+ * against both the per-IP and the global budget. Callers must release in a
+ * `finally` and still record the real outcome (`recordFailure` / `recordSuccess`)
+ * — the reservation bounds concurrency, the durable buckets bound history.
+ */
+export function reserveAttempt(
+  ip: string,
+  opts?: MobileRateLimitOptions,
+): AttemptReservation {
+  const scope = scopeOf(opts);
+  const policy = policyFor(opts);
+  const key = bucketKey(scope, ip);
+  const globalKey = bucketKey(scope, '*');
+
+  const decision = checkAttempt(ip, opts);
+  const pendingIp = inFlightCount(key);
+  const pendingGlobal = inFlightCount(globalKey);
+
+  const wouldExceedIp = decision.failures + pendingIp >= policy.maxFailures;
+  const wouldExceedGlobal = decision.globalFailures + pendingGlobal >= policy.globalMaxFailures;
+
+  if (!decision.allowed || wouldExceedIp || wouldExceedGlobal) {
+    return {
+      ...decision,
+      allowed: false,
+      // A concurrency refusal is not a lockout: the slot frees as soon as the
+      // attempts ahead of it settle, so promise the caller the shortest honest
+      // wait rather than a full lockout window it does not have to serve.
+      retryAfterMs: decision.allowed ? 0 : decision.retryAfterMs,
+      globalLocked: decision.globalLocked || (wouldExceedGlobal && !decision.allowed),
+      release: () => {},
+    };
+  }
+
+  acquireInFlight(key);
+  acquireInFlight(globalKey);
+  let released = false;
+  return {
+    ...decision,
+    release: () => {
+      if (released) return;
+      released = true;
+      releaseInFlight(key);
+      releaseInFlight(globalKey);
+    },
+  };
+}
+
+/** Test seam: forget every in-flight slot. Never called by the daemon. */
+export function resetInFlightAttempts(): void {
+  inFlight.clear();
+}
+
+/**
  * atomicJsonMutate hands back whatever is on disk, which may still be a v1/v2
  * shape on the first write after upgrade. Normalizing inside the mutation keeps
  * the migration atomic with the write rather than depending on a prior read.

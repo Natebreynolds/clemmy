@@ -107,7 +107,7 @@ export function BoardCard({
       ref={setNodeRef}
       style={{ transform: CSS.Translate.toString(transform) }}
       className={cn(
-        'group rounded-md border border-border bg-surface p-3 shadow-xs',
+        'group rounded-md border border-border-raised bg-raised p-3',
         isDragging && 'opacity-50',
         draggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer',
       )}

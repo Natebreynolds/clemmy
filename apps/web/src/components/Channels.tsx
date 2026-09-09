@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Image from "next/image";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
-import { Monitor, Mic, MessageSquare, Webhook, Smartphone } from "lucide-react";
+import { Monitor, Mic, MessageSquare, Webhook, Smartphone, Inbox } from "lucide-react";
 import { Section } from "./ui/Section";
 
 type ChannelId = "dashboard" | "voice" | "discord" | "mobile" | "api";
@@ -145,7 +145,7 @@ function DashboardMockup() {
 function MobileMockup() {
   const reducedMotion = useReducedMotion();
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-[#0d0907]">
+    <div className="absolute inset-0 flex items-center justify-center bg-[var(--panel)]">
       <div className="absolute inset-0 opacity-25">
         <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-[70%] w-[55%] rounded-full bg-clem-500/30 blur-[70px]" />
       </div>
@@ -190,7 +190,7 @@ function MobileMockup() {
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               transition={{ duration: 0.4, delay: 0.55 }}
-              className="max-w-[88%] rounded-xl border-l-2 border-clem-500 bg-white ring-1 ring-black/5 px-2.5 py-2 shadow-sm"
+              className="max-w-[88%] rounded-xl border-l-2 border-clem-700 bg-white ring-1 ring-black/5 px-2.5 py-2 shadow-sm"
             >
               <div className="font-mono text-[8px] uppercase tracking-wider text-clem-700">Approval</div>
               <div className="mt-0.5 text-[var(--ink-strong)]">Send the report to the team channel?</div>
@@ -228,7 +228,7 @@ function VoiceMockup() {
   }, [reducedMotion]);
 
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0d0907] px-8 text-center">
+    <div className="absolute inset-0 flex flex-col items-center justify-center bg-[var(--panel)] px-8 text-center">
       <div className="absolute inset-0 opacity-30">
         <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-[60%] w-[60%] rounded-full bg-clem-500/30 blur-[60px]" />
       </div>
@@ -247,8 +247,8 @@ function VoiceMockup() {
         className="relative z-10 mb-6"
       >
         <div className="absolute inset-0 rounded-full bg-clem-500/40 blur-2xl scale-150" />
-        <div className="relative h-20 w-20 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 ring-2 ring-clem-200/60 shadow-[0_0_60px_rgba(249,115,22,0.6)] flex items-center justify-center">
-          <Mic className="h-7 w-7 text-clem-950" strokeWidth={2.5} />
+        <div className="relative h-20 w-20 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 ring-2 ring-clem-200/60 shadow-[0_0_60px_rgba(242,100,25,0.6)] flex items-center justify-center">
+          <Mic className="h-7 w-7 text-clem-fg" strokeWidth={2.5} />
         </div>
       </motion.div>
 
@@ -354,7 +354,7 @@ function DiscordMockup() {
           </DiscordMsg>
           <DiscordMsg isClementine author="Clementine" time="10:42 AM">
             <p style={{ color: DISCORD_TEXT }}>3 worth eyes. Pulling now…</p>
-            <ToolCall icon="📥" name="gmail.search" args='"unread is:important"' result="3 results" />
+            <ToolCall icon={Inbox} name="gmail.search" args='"unread is:important"' result="3 results" />
             <ApprovalCard />
           </DiscordMsg>
         </div>
@@ -387,7 +387,7 @@ function DiscordMsg({
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-2">
-          <span className="font-semibold text-[14px]" style={{ color: isClementine ? "#fdba74" : "#fff" }}>
+          <span className="font-semibold text-[14px]" style={{ color: isClementine ? "#ffa471" : "#fff" }}>
             {author}
           </span>
           {isClementine && (
@@ -401,10 +401,10 @@ function DiscordMsg({
   );
 }
 
-function ToolCall({ icon, name, args, result }: { icon: string; name: string; args: string; result: string }) {
+function ToolCall({ icon: Icon, name, args, result }: { icon: typeof Monitor; name: string; args: string; result: string }) {
   return (
     <div className="inline-flex items-center gap-2 rounded-md bg-black/30 px-2 py-1 text-[12px] font-mono">
-      <span>{icon}</span>
+      <Icon className="h-3.5 w-3.5 text-clem-300" />
       <span className="text-white">{name}</span>
       <span style={{ color: DISCORD_MUTED }}>·</span>
       <span style={{ color: DISCORD_MUTED }}>{args}</span>
@@ -421,9 +421,9 @@ function ApprovalCard() {
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.2 }}
       className="mt-2 rounded-md border-l-4 px-3 py-2.5"
-      style={{ background: "#2b2d31", borderColor: "#fdba74" }}
+      style={{ background: "#2b2d31", borderColor: "#ffa471" }}
     >
-      <div className="text-[11px] uppercase tracking-wider font-mono" style={{ color: "#fdba74" }}>
+      <div className="text-[11px] uppercase tracking-wider font-mono" style={{ color: "#ffa471" }}>
         Approval requested
       </div>
       <div className="mt-1 text-white text-[13px]">
@@ -485,7 +485,7 @@ function WebhookMockup() {
   :                  "text-white/85";
 
   return (
-    <div className="absolute inset-0 flex flex-col bg-[#0a0806] font-mono text-[11.5px] leading-[1.5]">
+    <div className="absolute inset-0 flex flex-col bg-[var(--panel)] font-mono text-[11.5px] leading-[1.5]">
       <div className="flex items-center gap-2 border-b border-white/5 px-4 py-2.5 text-white/55">
         <span className="size-2.5 rounded-full bg-red-400/70" />
         <span className="size-2.5 rounded-full bg-yellow-400/70" />

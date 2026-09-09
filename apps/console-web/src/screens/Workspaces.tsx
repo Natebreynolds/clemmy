@@ -40,7 +40,7 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
   const health = space.health;
   const healthStatus = healthLabel(space);
   return (
-    <article className="group relative flex flex-col overflow-hidden rounded-2xl border border-border bg-surface text-left shadow-xs transition-all duration-fast hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
+    <article className="group relative flex flex-col overflow-hidden rounded-2xl border border-border-raised bg-raised text-left transition-colors duration-base hover:border-border-strong hover:bg-hover">
       <button
         type="button"
         onClick={onOpen}

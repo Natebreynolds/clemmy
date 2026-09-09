@@ -58,7 +58,7 @@ test('a complete snapshot reads complete; an empty one renders nothing', () => {
     },
   };
   assert.equal(evidenceSummary(done)!.complete, true);
-  assert.deepEqual(evidenceChips(done), ['12/12 items', '1 artifact ✓']);
+  assert.deepEqual(evidenceChips(done), ['12/12 items', '1 artifact verified']);
 
   assert.equal(evidenceSummary(undefined), null);
   assert.equal(evidenceSummary({ version: 1, capturedAt: 'x' } as TaskOutcomeSnapshot), null);

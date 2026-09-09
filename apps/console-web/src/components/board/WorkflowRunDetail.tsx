@@ -110,7 +110,7 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
 
       {detail.verdicts.length > 0 && (
         <div className="rounded-md border border-border px-3 py-2.5">
-          <div className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-faint">Run verdicts</div>
+          <div className="mb-1.5 text-caption font-semibold text-faint">Run verdicts</div>
           <ul className="space-y-1.5">
             {detail.verdicts.map((v, i) => (
               <li key={`verdict-${i}`} className="flex items-start gap-2 text-small">
@@ -136,7 +136,7 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
 
       {detail.watcherSteers.length > 0 && (
         <div className="rounded-md border border-border border-l-2 border-l-primary px-3 py-2.5">
-          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold text-faint">
             <Radio className="h-3.5 w-3.5" aria-hidden /> Watcher steered mid-run
           </div>
           <ul className="space-y-1.5">
@@ -153,7 +153,7 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
 
       {detail.reshapes.length > 0 && (
         <div className="rounded-md border border-border border-l-2 border-l-info px-3 py-2.5">
-          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
+          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold text-faint">
             <GitBranch className="h-3.5 w-3.5" aria-hidden /> Clementine reshaped this run
           </div>
           <ul className="space-y-1.5">
@@ -214,7 +214,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
           aria-hidden
         />
         <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">{step.stepId}</span>
-        <span className="text-caption uppercase tracking-wide text-faint">
+        <span className="text-caption text-faint">
           {step.status === 'awaiting_approval'
             ? 'needs your approval'
             : step.status === 'awaiting_input'
@@ -267,7 +267,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
 
       {step.advisories.length > 0 && (
         <div className="mt-2 border-t border-border pt-2">
-          <div className="mb-1 text-caption font-semibold uppercase tracking-wide text-faint">Judge / quality verdicts</div>
+          <div className="mb-1 text-caption font-semibold text-faint">Judge / quality verdicts</div>
           <ul className="space-y-1.5">
             {step.advisories.map((a, i) => (
               <li
@@ -294,7 +294,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
 
       {step.attempts.length > 0 && (
         <div className="mt-2 border-t border-border pt-2">
-          <div className="mb-1 text-caption font-semibold uppercase tracking-wide text-faint">Attempts</div>
+          <div className="mb-1 text-caption font-semibold text-faint">Attempts</div>
           <ul className="space-y-1.5">
             {step.attempts.map((a, i) => {
               const bits = [

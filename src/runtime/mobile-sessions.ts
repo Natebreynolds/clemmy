@@ -510,6 +510,61 @@ export function shouldRotate(record: MobileSessionRecord, now: number): boolean 
   return now - last >= ROTATE_AFTER_MS;
 }
 
+/**
+ * ── Revocation reaches what is already open ─────────────────────────────────
+ *
+ * THE DEFECT THIS EXISTS TO FIX. Every revoke path removed the durable row and
+ * stopped there, but authorization is checked ONCE, at attach. An SSE stream
+ * that was already running kept writing frames to a revoked phone until the
+ * socket happened to close, and its push subscriptions kept delivering
+ * notification CONTENT indefinitely. Rotating the PIN and restarting the daemon
+ * was the only certain cut — which is not a revoke button, it is an outage.
+ *
+ * So revocation is an EVENT, not just a deletion. Anything holding live state
+ * for a device registers a closer here, and every revoke path fires them after
+ * the durable removal lands. Registering lives with the thing being closed (the
+ * stream handler, the push routes), so this file never learns what a stream or
+ * a push destination is.
+ *
+ * Order matters: the row is removed FIRST, so a closer that races a reconnect
+ * finds no session to attach to.
+ */
+type DeviceRevocationCloser = (deviceId: string) => void;
+
+const revocationClosers = new Set<DeviceRevocationCloser>();
+
+/**
+ * Register a teardown to run when a device is revoked. Returns an unsubscribe
+ * so a caller with a lifetime (a request, a test) can detach cleanly.
+ *
+ * A closer must never throw and must be safe to call for a device it knows
+ * nothing about — every closer is offered every revoked device.
+ */
+export function onDeviceRevoked(close: DeviceRevocationCloser): () => void {
+  revocationClosers.add(close);
+  return () => revocationClosers.delete(close);
+}
+
+function fireRevoked(deviceIds: Iterable<string>): void {
+  for (const deviceId of deviceIds) {
+    if (!deviceId) continue;
+    for (const close of revocationClosers) {
+      // One bad closer must not strand the rest: a half-executed revoke is the
+      // failure this whole mechanism exists to prevent.
+      try {
+        close(deviceId);
+      } catch {
+        /* a closer that throws has already failed; keep cutting the others */
+      }
+    }
+  }
+}
+
+/** Test seam: forget every registered closer. Never called by the daemon. */
+export function resetDeviceRevocationClosers(): void {
+  revocationClosers.clear();
+}
+
 export async function revokeSession(
   token: string,
   opts?: MobileSessionStoreOptions,
@@ -517,6 +572,7 @@ export async function revokeSession(
   if (!token) return false;
   const tokenHash = hashToken(token);
   let removed = false;
+  const revokedDeviceIds = new Set<string>();
   const file = sessionsFile(opts);
   ensureParentDir(file);
   await atomicJsonMutate<MobileSessionsFileV2>(
@@ -525,6 +581,7 @@ export async function revokeSession(
       const next = (current.sessions ?? []).filter((row) => {
         if (row.tokenHash === tokenHash || row.previousTokenHash === tokenHash) {
           removed = true;
+          revokedDeviceIds.add(row.deviceId);
           return false;
         }
         return true;
@@ -533,6 +590,7 @@ export async function revokeSession(
     },
     emptyFile(),
   );
+  fireRevoked(revokedDeviceIds);
   return removed;
 }
 
@@ -558,21 +616,29 @@ export async function revokeSessionByDeviceId(
     },
     emptyFile(),
   );
+  // Fired even when no row remained: the durable session may already have
+  // expired while a stream attached to it is still open, and that stream is
+  // exactly what this call is meant to cut.
+  fireRevoked([deviceId]);
   return removed;
 }
 
 export async function revokeAllSessions(opts?: MobileSessionStoreOptions): Promise<number> {
   let count = 0;
+  const revokedDeviceIds = new Set<string>();
   const file = sessionsFile(opts);
   ensureParentDir(file);
   await atomicJsonMutate<MobileSessionsFileV2>(
     file,
     (current) => {
-      count = (current.sessions ?? []).length;
+      const rows = current.sessions ?? [];
+      count = rows.length;
+      for (const row of rows) revokedDeviceIds.add(row.deviceId);
       return { version: 2, sessions: [] };
     },
     emptyFile(),
   );
+  fireRevoked(revokedDeviceIds);
   return count;
 }
 
