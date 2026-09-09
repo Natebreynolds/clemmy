@@ -2,7 +2,7 @@
  * canary evidence from a stopped snapshot rather than copying it into git. */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -22,8 +22,16 @@ process.env.COMPOSIO_API_KEY = 'fixture-key';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'p3-retained-draft-fixture\n');
 
-const snapshot = new Database(process.env.P3_DRAFT_SNAPSHOT
-  ?? '/private/tmp/clem-p3-draft-canary-evidence.GhAH2o/harness.snapshot.db', { readonly: true });
+// This replay reads a live-evidence snapshot captured on one machine. Where
+// the snapshot is absent (CI, another checkout) the file registers ONE skipped
+// test instead of failing at import — the evidence path is still honored via
+// P3_DRAFT_SNAPSHOT wherever the capture exists.
+const SNAPSHOT_PATH = process.env.P3_DRAFT_SNAPSHOT
+  ?? '/private/tmp/clem-p3-draft-canary-evidence.GhAH2o/harness.snapshot.db';
+if (!existsSync(SNAPSHOT_PATH)) {
+  test('p3 retained draft replay needs its evidence snapshot', { skip: `snapshot not present: ${SNAPSHOT_PATH} (set P3_DRAFT_SNAPSHOT)` }, () => {});
+} else {
+const snapshot = new Database(SNAPSHOT_PATH, { readonly: true });
 const frame = (ordinal: number): any[] => JSON.parse((snapshot.prepare(
   'SELECT frame_history_json FROM accepted_model_batch_admissions WHERE source_user_seq=442 AND batch_ordinal=?',
 ).get(ordinal) as { frame_history_json: string }).frame_history_json);
@@ -172,3 +180,4 @@ test('retained batch6 corrected singleton crosses real host preparation and cons
   console.error(JSON.stringify({ step, bodies: bodies.length, correctedOutput: corrected.output.text }));
   assert.equal(bodies.length, 1, 'the corrected exact draft must dispatch once; captured five-each completion is intentionally not asserted');
 });
+}
