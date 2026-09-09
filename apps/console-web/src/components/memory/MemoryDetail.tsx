@@ -19,14 +19,17 @@ export function MemoryDetail({ hit, pinned, onChanged, className }: { hit: Memor
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [forgotten, setForgotten] = useState(false);
+  // The undo bar hides on its own; the forgotten state does not — a forgotten
+  // memory stays struck through with Restore until it is actually restored.
+  const [toast, setToast] = useState(false);
   const [isPinned, setIsPinned] = useState(Boolean(pinned));
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => { setForgotten(false); setEditing(false); setError(null); setIsPinned(Boolean(pinned)); setDraft(hit?.text ?? ''); }, [hit?.ref.id, hit?.ref.type, pinned, hit?.text]);
+  useEffect(() => { setForgotten(false); setToast(false); setEditing(false); setError(null); setIsPinned(Boolean(pinned)); setDraft(hit?.text ?? ''); }, [hit?.ref.id, hit?.ref.type, pinned, hit?.text]);
   useEffect(() => {
-    if (!forgotten) return;
-    const t = setTimeout(() => setForgotten(false), 8000);
+    if (!toast) return;
+    const t = setTimeout(() => setToast(false), 10_000);
     return () => clearTimeout(t);
-  }, [forgotten]);
+  }, [toast]);
   const isFact = hit?.ref.type === 'fact';
   const factId = isFact ? Number(hit?.ref.id) : NaN;
   const refresh = () => { onChanged?.(); void qc.invalidateQueries({ queryKey: ['facts'] }); void qc.invalidateQueries({ queryKey: ['mem-search'] }); };
@@ -88,14 +91,16 @@ export function MemoryDetail({ hit, pinned, onChanged, className }: { hit: Memor
           {isFact && (
             <div className="mt-1 flex items-center gap-1.5 pt-2">
               <button type="button" disabled={busy || forgotten} onClick={() => { setEditing(true); setDraft(hit.text); }} className="rounded-md bg-primary px-3 py-1.5 text-small font-semibold text-primary-fg disabled:opacity-50">Correct</button>
-              <button type="button" disabled={busy || forgotten} onClick={() => run(async () => { await forgetFact(factId); setForgotten(true); })} className="ml-auto px-1 py-1.5 text-small font-semibold" style={{ color: NIGHT.ink2 }}>Forget</button>
+              {forgotten
+                ? <button type="button" disabled={busy} onClick={() => run(async () => { await restoreFact(factId); setForgotten(false); setToast(false); })} className="ml-auto rounded-md border px-3 py-1.5 text-small font-semibold" style={{ borderColor: NIGHT.line, color: NIGHT.glow2 }}>Restore</button>
+                : <button type="button" disabled={busy} onClick={() => run(async () => { await forgetFact(factId); setForgotten(true); setToast(true); })} className="ml-auto px-1 py-1.5 text-small font-semibold" style={{ color: NIGHT.ink2 }}>Forget</button>}
             </div>
           )}
           {error && <p className="mt-2 text-caption text-danger">{error}</p>}
-          {forgotten && (
+          {forgotten && toast && (
             <div role="status" className="sticky bottom-0 -mx-5 -mb-5 mt-3 flex items-center gap-3 border-t px-5 py-2.5 text-small" style={{ background: NIGHT.pane, borderColor: NIGHT.line }}>
               Forgotten. She won't use it again.
-              <button type="button" onClick={() => run(async () => { await restoreFact(factId); setForgotten(false); })} className="ml-auto font-semibold" style={{ color: NIGHT.glow2 }}>Undo</button>
+              <button type="button" onClick={() => run(async () => { await restoreFact(factId); setForgotten(false); setToast(false); })} className="ml-auto font-semibold" style={{ color: NIGHT.glow2 }}>Undo</button>
             </div>
           )}
         </>
