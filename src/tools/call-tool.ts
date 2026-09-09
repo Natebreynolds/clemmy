@@ -398,9 +398,9 @@ const DESCRIPTION = [
 ].join(' ');
 
 const CONTROL_ONLY_DESCRIPTION = [
-  'Invoke one deferred built-in control, recovery, or READ tool returned by tool_search: exact `name` plus `args_json` (a JSON object string).',
+  'Invoke an available native control, recovery, or READ tool: exact `name` plus `args_json` (a JSON object string). Prefer a tool\'s direct callable when its schema is already loaded.',
   'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
-  'Invalid arguments dispatch nothing — retry once with the exact schema from tool_search.',
+  'Invalid arguments dispatch nothing and return the exact schema. Correct the arguments using that schema; use tool_search only when the capability or schema is still missing.',
 ].join(' ');
 
 /** Lazily-built, memoized name → Zod schema map for local runtime tools. Dynamic

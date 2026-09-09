@@ -2,6 +2,8 @@
 
 ## Candidate and ownership
 
+The subsequent speed/refinement pass is tracked in [2026-09-08-harness-latency.md](2026-09-08-harness-latency.md), including native schema exposure and duplicate usage ownership. Preserve the candidate-specific evidence below as historical results.
+
 The other agent stopped at `8d5ca856bc279b881dc522560b8938c61e5edee3`. This pass owns the refinements below. No release version was changed and no tag or push was performed.
 
 The authoritative refinement candidate is `/Users/nathan.reynolds/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`. The baseline refinement/full-suite commits were `9ae684ef19e1954a228f531a8fe64021f9c4c116` and `c1a7dd1e`; later memory, native-call and file-revision commits and their exact live evidence are recorded below. The original `/Users/nathan.reynolds/clementine-next` checkout is unrelated dirty work and was left untouched.

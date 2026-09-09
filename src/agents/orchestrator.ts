@@ -3451,7 +3451,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ]);
       const visibleFirstClassNames = carrierWork
         ? new Set([...firstClassNames].filter((name) => (
-            actionControlNames.has(name)
+            (actionControlNames.has(name) || isRegistryDeclaredRead(name))
             && actionControlContextFor(name) !== 'task_recovery'
             // Planning binds BUSINESS work. Hot-set controls stay first-class:
             // a uniquely named saved workflow is invoked with workflow_run, not
@@ -3624,11 +3624,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           )))
         : discoverableNames;
       const catalogText = buildCompactToolCatalog({ allowedNames: catalogNames });
+      const nativeAuthoringNames = hostFreshPlanning
+        ? new Set([...localPlanningCapabilityNames].filter(name => workCallBuiltinNames.has(name)
+          && !isRegistryDeclaredRead(name)))
+        : new Set<string>();
+      const nativeAuthoringCatalog = nativeAuthoringNames.size > 0
+        ? '[native-authoring-catalog] Available native authoring tools. If an exact tool fits, use its known work_call contract or look up that exact name with tool_search for its schema and callable example. An exact native lookup stays local; describing it as a broad app search can return unrelated connectors.\n'
+          + buildCompactToolCatalog({ allowedNames: nativeAuthoringNames })
+        : '';
       catalogBlock = hostFreshPlanning
-        ? catalogNames.size > 0 ? [
-            '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: "<one JSON object string>"}). If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
-            catalogText,
-          ].join('\n') : null
+        ? [catalogNames.size > 0 ? [
+              '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: "<one JSON object string>"}). If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
+              catalogText,
+            ].join('\n') : '', nativeAuthoringCatalog].filter(Boolean).join('\n') || null
         : [
         // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
         // read the name-only listing as evidence it had NO tool access and
@@ -3641,7 +3649,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
       ].join('\n');
-      searchCatalogCount = catalogBlock ? catalogNames.size : 0;
+      searchCatalogCount = catalogBlock ? catalogNames.size + nativeAuthoringNames.size : 0;
       searchCatalogBytes = Buffer.byteLength(catalogBlock ?? '', 'utf8');
       searchCatalogTokens = Math.round((catalogBlock?.length ?? 0) / 4);
     } catch (err) {

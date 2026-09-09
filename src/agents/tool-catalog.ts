@@ -57,6 +57,12 @@ export interface CatalogEntry {
  * results — first-class on every lane, every turn, never behind a search.
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
+  // Local inspection is an acquisition primitive too. A names-only catalog
+  // made list_files(directory) repeatedly arrive as list_files(path), costing
+  // a refused call and another model step. Expose the actual small schemas.
+  'workspace_roots',
+  'list_files',
+  'read_file',
   'ask_user_question',
   // Asking and TELLING are the same channel, and only half of it was
   // first-class: she could interrupt with a question on any turn, but keeping

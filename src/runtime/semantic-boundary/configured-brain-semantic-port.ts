@@ -9,6 +9,7 @@ import { resolveRoleModel } from '../harness/model-roles.js';
 import type { ModelRole } from '../harness/model-roles.js';
 import {
   modelUsageAttributionStorage,
+  observeModelUsageRecording,
   recordModelUsage,
 } from '../usage-log.js';
 import {
@@ -43,6 +44,8 @@ export interface ConfiguredBrainSemanticComplete {
     inputTokens: number;
     outputTokens: number;
     latencyMs: number;
+    /** The model adapter already persisted usage and debited the run budget. */
+    usageRecorded?: boolean;
   }>;
 }
 
@@ -120,6 +123,7 @@ async function completeStructured(input: {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  usageRecorded?: boolean;
 }> {
   // Interpretation follows the configured brain. Consequential source/effect
   // review follows the configured judge role, which is cross-family when the
@@ -157,7 +161,9 @@ async function completeStructured(input: {
     outputType: input.schema as typeof TurnSemanticProposalV1WireSchema,
   }) as unknown as Agent;
   const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
-  const result = await runner.run(agent, input.user, { maxTurns: 1 });
+  const { value: result, recorded: usageRecorded } = await observeModelUsageRecording(
+    () => runner.run(agent, input.user, { maxTurns: 1 }),
+  );
   const tokens = tokensFromAgentRun(result);
   const latencyMs = Date.now() - started;
   const final = result.finalOutput;
@@ -168,6 +174,7 @@ async function completeStructured(input: {
       inputTokens: tokens.inputTokens,
       outputTokens: tokens.outputTokens,
       latencyMs,
+      usageRecorded,
     };
   }
   const text = typeof final === 'string' ? final : JSON.stringify(final ?? null);
@@ -182,6 +189,7 @@ async function completeStructured(input: {
     inputTokens: tokens.inputTokens,
     outputTokens: tokens.outputTokens,
     latencyMs,
+    usageRecorded,
   };
   }
 }
@@ -280,7 +288,9 @@ function recordSemanticModelUsage(input: {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  usageRecorded?: boolean;
 }): void {
+  if (input.usageRecorded) return;
   if (input.inputTokens + input.outputTokens <= 0) return;
   const attribution = modelUsageAttributionStorage.getStore();
   recordModelUsage({
@@ -308,6 +318,7 @@ export async function completeViaConfiguredBrain(input: {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  usageRecorded?: boolean;
 }> {
   return completeStructured({
     purpose: input.purpose,
@@ -389,6 +400,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.host.source.sessionId,
         sourceUserSeq: call.host.source.sourceUserSeq,
+        usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
@@ -423,6 +435,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.sessionId,
         sourceUserSeq: call.sourceUserSeq,
+        usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
@@ -459,6 +472,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.sessionId,
         sourceUserSeq: call.sourceUserSeq,
+        usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,

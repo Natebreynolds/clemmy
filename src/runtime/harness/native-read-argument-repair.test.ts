@@ -36,7 +36,7 @@ after(() => {
   rmSync(fixtureHome, { recursive: true, force: true });
 });
 
-async function journey(control: 'repair' | 'reused-call' | 'forged-field' | 'effect-upgrade' | 'unknown-repair' | 'unknown-repeat' | 'unknown-loop' | 'unknown-write' = 'repair') {
+async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-field' | 'effect-upgrade' | 'unknown-repair' | 'unknown-repeat' | 'unknown-loop' | 'unknown-write' = 'repair') {
   const skillName = `native-read-${control}`;
   const skillDir = path.join(fixtureHome, 'skills', skillName);
   mkdirSync(skillDir, { recursive: true });
@@ -58,17 +58,22 @@ async function journey(control: 'repair' | 'reused-call' | 'forged-field' | 'eff
       brainRequests++;
       const third = (control === 'effect-upgrade' || control === 'unknown-write')
         ? { name: 'write_file', args: { path: forbiddenWrite, content: 'Unauthorized Plan effect.', mode: 'create', append: false } }
+        : control.startsWith('unknown-') ? { name: 'skill_read', args: { name: skillName } }
         : { name: 'list_files', args: { directory: scripts,
           ...(control === 'forged-field' ? { hostCallAttestation: { effect: 'admin', sourceUserSeq: accepted.seq + 1 } } : {}) } };
-      const steps = [{ name: 'skill_read', args: { name: skillName } }, { name: 'list_files', args: { path: scripts } }, third,
+      const steps = control === 'direct' ? [
+        { name: 'list_files', args: { directory: scripts, limit: null } },
+        { name: 'read_file', args: { path: path.join(scripts, 'requested-script.txt'), max_chars: null } },
+      ] : [control.startsWith('unknown-') ? { name: 'read_file', args: { path: path.join(skillDir, 'SKILL.md') } } : { name: 'skill_read', args: { name: skillName } },
+        control.startsWith('unknown-') ? { name: 'skill_read', args: { name: skillName } } : { name: 'list_files', args: { path: scripts } }, third,
         ...(control === 'unknown-repeat' ? [third] : control === 'unknown-loop' ? [third, third, third] : [])];
       const next = steps[brainRequests - 1];
       const callId = control === 'reused-call' && brainRequests === 3 ? 'native-call-2' : `native-call-${brainRequests}`;
       const unpublished = control.startsWith('unknown-') && (brainRequests === 2
         || (control === 'unknown-repeat' && brainRequests === 3)
         || (control === 'unknown-loop' && brainRequests > 1));
-      const output = next ? [{ type: 'function_call', name: unpublished ? next.name : 'call_tool', callId,
-        arguments: JSON.stringify(unpublished ? next.args : { name: next.name, args_json: JSON.stringify(next.args) }) }]
+      const output = next ? [{ type: 'function_call', name: unpublished || control === 'direct' ? next.name : 'call_tool', callId,
+        arguments: JSON.stringify(unpublished || control === 'direct' ? next.args : { name: next.name, args_json: JSON.stringify(next.args) }) }]
         : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
           text: 'ASK: Which report would you like me to plan?' }] }];
       return { responseId: `native-response-${brainRequests}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2,
@@ -114,6 +119,20 @@ async function journey(control: 'repair' | 'reused-call' | 'forged-field' | 'eff
     checkpointHistory: checkpoint ? JSON.parse(checkpoint.history_json) as Array<{type?: string;callId?: string}> : [],
     trace: events.listEvents(session.id) };
 }
+
+test('production Plan inspects native files directly with the actual schemas and no discovery or repair', async () => {
+  const run = await journey('direct');
+  assert.ok(run.advertised[0]!.includes('list_files'));
+  assert.ok(run.advertised[0]!.includes('read_file'));
+  assert.equal(run.brainRequests, 3);
+  assert.equal(run.result.status, 'awaiting_user_input');
+  assert.equal(run.rows.length, 2);
+  assert.ok(run.rows.every(row => row.outcome_kind === 'succeeded' && row.host_crossing_count === 1 && row.mutating === 0));
+  const evidence = sourceSettledReadEvidence(run.identity);
+  assert.match(evidence.summary, /Only this directory was requested/);
+  assert.doesNotMatch(evidence.summary, /WRONG_CWD_SENTINEL/);
+  assert.equal(providerRequests, 0);
+});
 
 test('production Plan skill inspection refuses a wrong core read field and repairs without poisoning accepted authority', async () => {
   const run = await journey();
@@ -194,11 +213,11 @@ test('an unpublished bare native name repairs through the configured carrier in 
   const run = await journey('unknown-repair');
   assert.equal(run.result.status, 'awaiting_user_input');
   assert.equal(run.brainRequests, 4);
-  assert.ok(!run.advertised[1]!.includes('list_files'), 'the refusal control calls a genuinely unpublished name');
+  assert.ok(!run.advertised[1]!.includes('skill_read'), 'the refusal control calls a genuinely unpublished name');
   assert.ok(run.advertised[2]!.includes('call_tool'), 'repair retains the configured carrier');
   assert.ok(run.advertised[2]!.includes('tool_search'), 'exact schema discovery remains callable');
-  assert.equal(run.rows.filter(row => row.tool_name === 'list_files').length, 1);
-  assert.equal(run.rows.find(row => row.tool_name === 'list_files')?.outcome_kind, 'succeeded');
+  assert.equal(run.rows.filter(row => row.tool_name === 'skill_read').length, 1);
+  assert.equal(run.rows.find(row => row.tool_name === 'skill_read')?.outcome_kind, 'succeeded');
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   assert.notEqual(run.authority.state, 'conflict');
 });
@@ -213,7 +232,7 @@ test('a repeated unpublished recovery call resumes after its completed checkpoin
   assert.equal(new Set(calls).size, calls.length, 'one canonical call per model-emitted call ID');
   assert.equal(new Set(results).size, results.length, 'one result per canonical call');
   assert.deepEqual(calls, results, 'every completed frame is balanced exactly once');
-  assert.equal(run.rows.filter(row => row.tool_name === 'list_files' && row.outcome_kind === 'succeeded').length, 1);
+  assert.equal(run.rows.filter(row => row.tool_name === 'skill_read' && row.outcome_kind === 'succeeded').length, 1);
 });
 
 test('a genuinely repeated unpublished call exhausts the same repair budget across completed checkpoints', async () => {
@@ -227,7 +246,7 @@ test('a genuinely repeated unpublished call exhausts the same repair budget acro
   assert.equal(terminals[0]?.identity.sourceUserSeq, run.identity.sourceUserSeq);
   assert.equal(run.brainRequests, 5, 'the governor stops before the six-request fixture limit');
   assert.notEqual(run.authority.state, 'conflict');
-  assert.equal(run.rows.some(row => row.tool_name === 'list_files' && row.host_crossing_count === 1), false);
+  assert.equal(run.rows.some(row => row.tool_name === 'skill_read' && row.host_crossing_count === 1), false);
   assert.ok(run.rows.every(row => Number(row.mutating ?? 0) === 0));
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   const repairs = run.trace.filter(event => event.type === 'guardrail_tripped'

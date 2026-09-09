@@ -1358,7 +1358,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
 
   const list_files = tool({
     name: 'list_files',
-    description: 'List files in an allowed workspace directory. Use before reading or modifying project files.',
+    description: 'List files in an allowed workspace directory when you need to locate a file. A known file path can be read directly.',
     parameters: z.object({
       directory: z.string().nullable(),
       limit: z.number().min(1).max(500).nullable(),

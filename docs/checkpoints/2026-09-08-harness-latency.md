@@ -1,0 +1,36 @@
+# Harness latency refinements — September 8, 2026 Pacific
+
+Harness ownership remains `/Users/nathan.reynolds/clementine-next-post-3161-review`, branch `codex/post-3161-refinements`. UI work belongs to the other agent. No version bump, tag, push or UI edit is part of this pass.
+
+## Evidence behind the changes
+
+The preceding clean live local edit, source 166393 on `bd9b6693`, took 44.5 seconds: five brain requests, four tool calls, one mutation, zero Plan and zero refusals. Its second call searched for “write or edit a local file, save text to disk.” Although a native write_file result was found, the search also resolved Google Drive and Slack writes and reviewed their accounts. That search occupied 13.3 seconds and grew the next prompt from roughly 17K to 29K input tokens. No provider write occurred; the extra discovery and reviews were preparation for unused alternatives.
+
+The same turn recorded two auxiliary responses twice. Provider records had response identities and cache evidence; semantic-port aggregate records repeated their tokens anonymously a few milliseconds later. Both producers charged `sessions.tokens_used`. The duplicate account review rows were 2,435 input / 115 output and 2,463 input / 99 output. Raw evidence remains in `output/post-3161-live/argument-repair-live-usage-summary.json` and the exact live report. Recorded row counts and token totals from that earlier report must not be presented as distinct requests or a clean cost benchmark.
+
+Earlier website turns repeatedly guessed list_files(path), whereas its actual schema requires directory. The schema was deferred and the prompt carried names only. These were recoverable refusals, but each consumed a model step.
+
+## Refinements
+
+1. **Native file inspection carries its actual schema.** workspace_roots, list_files and read_file join the existing acquisition tools. The orchestrator no longer strips an already-hot registered read merely because it is classified as business work. It still intersects with the configured tool scope, exclusions, current source, actual schema and Plan execution contract. Writes retain work_call. The directory-listing description no longer requires a preflight listing before reading a known path.
+
+2. **Native authoring tools are visible by name.** Fresh planning contexts previously showed a native-read inventory while omitting the corresponding authoring inventory. The new catalog derives the available native authoring names from the configured registry surface. It explains exact native schema lookup so a local file edit need not be described as a broad connected-app search. This is presentation, not permission, a provider blacklist or task-keyword routing. Existing provider discovery remains available for work that needs it. The call_tool description now points repairs at the schema already returned instead of requiring another search.
+
+3. **One completion has one usage producer.** Each tool-less semantic role attempt observes whether its actual model adapter recorded usage. If it did, the semantic wrapper keeps the adapter's receipt and does not append/debit an aggregate copy. An adapter without accounting retains the existing aggregate fallback. Observation is scoped to the individual async role attempt, so parallel calls and failed-role fallback cannot inherit a sibling's recording fact. This does not suppress model calls, alter verdicts or increase a budget ceiling.
+
+## Controlled validation
+
+- The actual production Plan journey lists and reads fixture files directly with no discovery or refused call, then asks the requested question. Wrong-field, forbidden-write, repeated-recovery, and accepted-source controls remain. The intentionally unpublished-reader fixture now uses skill_read, because list_files is deliberately published; the test still asserts that the chosen control is absent from the advertised surface.
+- Surface tests verify the real directory schema, native write_file inventory, and exclusion/allowlist behavior. The schema-count fixture accounts for the three newly visible readers; this is a test expectation, not a changed runtime cap.
+- The real semantic Runner plus raw Claude accounting wrapper persists one usage record and debits 110 uncached tokens for 100 input / 10 output. Its adapter-free control still records once. Temporarily disabling the consumption of the adapter receipt reproduces two rows and fails the test. Parallel and failed-scope controls preserve independent recording ownership.
+- Related host, native, semantic, usage, budget and catalog batch: 353 passed, zero failed; typechecking passed. The subsequent wording-only tool descriptions are included in the final full run.
+
+The final full suite, builds and live cases are recorded under `output/post-3161-live/latency-*`. Read completed reports and the final qualification record for exact candidate fingerprints and results; this checkpoint does not claim an unfinished run passed. The prior 15,459-test suite predates these refinements.
+
+## Live qualification and remaining limits
+
+The live comparison uses natural requests with expectations declared before submission: a cold native read, a local draft revision, a same-session follow-up revision, a saved manual workflow run, and read-only connected-capability inspection. No outbound message, provider file write, paid generation or public deployment is authorized by these cases. File revisions are checked against captured prior bytes and current artifact receipts.
+
+Sequential timings are observations, not randomized benchmarks: cache warmth, context and provider latency vary. Compare brain requests, actual tool searches, refused calls and useful effects alongside elapsed time. Accounting corrections are not API latency savings.
+
+Earlier open issues remain in `2026-09-08-post-3161-refinements.md`, including focus pause lifecycle, stale capability claims, prompt/cache duplication, and cancelled-worker/async ownership. Full combined UI/release qualification still needs the final merged candidate; a harness-only pass cannot stand in for it.
