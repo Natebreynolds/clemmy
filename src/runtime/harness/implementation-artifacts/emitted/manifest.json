@@ -105,7 +105,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 93786
+          "bytes": 93768
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -362,8 +362,11 @@
         "src/spaces/workspace-snapshot.ts": {
           "bytes": 11138
         },
+        "src/runtime/harness/local-file-revision.ts": {
+          "bytes": 8573
+        },
         "src/runtime/harness/host-local-write-commit.ts": {
-          "bytes": 43636
+          "bytes": 43955
         },
         "src/memory/temporal-memory.ts": {
           "bytes": 22986
@@ -945,7 +948,7 @@
           "bytes": 14164
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 82943
+          "bytes": 81818
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 13337
@@ -1284,7 +1287,7 @@
           "bytes": 103870
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 58509
+          "bytes": 59366
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 27857
@@ -1577,11 +1580,14 @@
         "src/runtime/harness/local-work-completion.ts": {
           "bytes": 7572
         },
+        "src/runtime/harness/host-local-call-preparation.ts": {
+          "bytes": 2861
+        },
         "src/execution/workflow-live-call-compiler.ts": {
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 434247
+          "bytes": 434380
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -1704,7 +1710,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 208506
+          "bytes": 208872
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -2553,7 +2559,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 166273
+          "bytes": 166287
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -2703,7 +2709,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 93786
+          "bytes": 93768
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -2960,8 +2966,11 @@
         "src/spaces/workspace-snapshot.ts": {
           "bytes": 11138
         },
+        "src/runtime/harness/local-file-revision.ts": {
+          "bytes": 8573
+        },
         "src/runtime/harness/host-local-write-commit.ts": {
-          "bytes": 43636
+          "bytes": 43955
         },
         "src/memory/temporal-memory.ts": {
           "bytes": 22986
@@ -3543,7 +3552,7 @@
           "bytes": 14164
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 82943
+          "bytes": 81818
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 13337
@@ -3882,7 +3891,7 @@
           "bytes": 103870
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 58509
+          "bytes": 59366
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 27857
@@ -4175,11 +4184,14 @@
         "src/runtime/harness/local-work-completion.ts": {
           "bytes": 7572
         },
+        "src/runtime/harness/host-local-call-preparation.ts": {
+          "bytes": 2861
+        },
         "src/execution/workflow-live-call-compiler.ts": {
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 434247
+          "bytes": 434380
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -4302,7 +4314,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 208506
+          "bytes": 208872
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -5151,7 +5163,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 166273
+          "bytes": 166287
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -5216,8 +5228,8 @@
       }
     },
     "transport": {
-      "file": "transport-10b82127b608f0e6700012229fcb07d8751738eb04a4c48349da208bc7004b66.cjs",
-      "sha256": "10b82127b608f0e6700012229fcb07d8751738eb04a4c48349da208bc7004b66",
+      "file": "transport-c3c29ecbff4b3e745cedb109840a506ff4e293a5d595d50d4909c05f2a47438e.cjs",
+      "sha256": "c3c29ecbff4b3e745cedb109840a506ff4e293a5d595d50d4909c05f2a47438e",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5259,7 +5271,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 93786
+          "bytes": 93768
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -5333,5 +5345,5 @@
       }
     }
   },
-  "manifestDigest": "ea8867b1cd3872b471fcc8674934358083a32b8980566d8c9ef2e604896e595c"
+  "manifestDigest": "3a6b5427f5ec3ce817008aeee6fd4b438cd1c49ef7fbbb0a4d66b087e9d2a45d"
 }
