@@ -312,7 +312,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
           </div>
           <div className="border-t border-border p-2.5">
             <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-            <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask for a change — “add a bar per rep”, “hide closed-lost”" />
+            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask for a change — “add a bar per rep”, “hide closed-lost”" />
           </div>
         </aside>
       )}

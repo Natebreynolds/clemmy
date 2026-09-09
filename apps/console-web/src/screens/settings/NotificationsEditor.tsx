@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, CheckCircle2, Clock3, Hash, Loader2, MessageCircle, PencilLine, Plus, RefreshCw, Send, ShieldCheck, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Clock3, Hash, Loader2, MessageCircle, PencilLine, Plus, RefreshCw, Send, ShieldCheck, Trash2, ChevronRight } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
@@ -81,18 +81,8 @@ export function NotificationsEditor() {
 
   return (
     <Card className="p-5">
-      <h3 className="mb-1 text-h3 text-fg">Connection command center</h3>
-      <p className="mb-4 text-small text-muted">Slack, Discord, and result delivery routes.</p>
-
-      <DeliveryDoctor
-        data={doctor.data}
-        loading={doctor.isLoading}
-        acceptance={acceptance}
-        acceptanceBusy={busy === 'acceptance'}
-        acceptanceError={acceptanceError}
-        onRefresh={refresh}
-        onRunAcceptance={() => void runAcceptance()}
-      />
+      <h2 className="mb-1 text-h2 text-fg">Notifications</h2>
+      <p className="mb-4 text-small text-muted">Only when she needs an answer to continue, or finished something. Where those land:</p>
 
       {dests.isLoading ? <Skeleton className="h-20 w-full" /> : rows.length > 0 && (
         <div className="mb-5 mt-5 space-y-4">
@@ -139,10 +129,27 @@ export function NotificationsEditor() {
       </div>
       <div className="mt-3 flex items-center gap-3">
         <Button size="sm" onClick={add} disabled={busy === 'add' || !name.trim()}>
-          {busy === 'add' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add result route
+          {busy === 'add' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add destination
         </Button>
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
+      <details className="group mt-4 border-t border-border pt-3">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-small text-muted hover:text-fg">
+          <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
+          Delivery doctor, acceptance run, recent receipts
+        </summary>
+        <div className="mt-3">
+          <DeliveryDoctor
+            data={doctor.data}
+            loading={doctor.isLoading}
+            acceptance={acceptance}
+            acceptanceBusy={busy === 'acceptance'}
+            acceptanceError={acceptanceError}
+            onRefresh={refresh}
+            onRunAcceptance={() => void runAcceptance()}
+          />
+        </div>
+      </details>
     </Card>
   );
 }

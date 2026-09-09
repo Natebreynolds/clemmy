@@ -1,4 +1,5 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
+import { ModelPicker } from '@/components/chat/ModelPicker';
 import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type RefObject } from 'react';
 import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -30,10 +31,13 @@ export function Composer({
   onBackground,
   inputRef,
   placeholder = 'Ask Clementine anything…',
+  sessionId,
 }: {
   busy: boolean;
   mode?: ComposerMode;
   onModeChange?: (mode: ComposerMode) => void;
+  /** The conversation this composer feeds — a brain switch from the chip re-pins it. */
+  sessionId?: string;
   activeTaskMode?: TaskMode;
   pendingPost?: { input: string; taskMode?: TaskMode } | null;
   onRetryPending?: () => Promise<void>;
@@ -167,6 +171,7 @@ export function Composer({
         <span className="text-caption text-muted" role="status">
           {busy && activeTaskMode?.kind === 'execute' ? 'Executing the reviewed plan' : planning ? (busy ? 'Planning · investigating with read-only tools' : 'Plan · shows you the steps first, then you say go') : 'Act · does it now'}
         </span>
+        <ModelPicker sessionId={sessionId} className="ml-auto" />
       </div>
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2 border-b border-border p-2.5">

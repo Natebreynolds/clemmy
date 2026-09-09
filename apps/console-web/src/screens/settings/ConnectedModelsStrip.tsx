@@ -7,7 +7,7 @@ import { Field, Input, Select } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getSettings, addModelProvider, removeModelProvider, listProviderModels, type DiscoveredModel } from '@/lib/settings';
-import { PROVIDER_PRESETS } from './ModelBackendForm';
+import { PROVIDER_PRESETS } from '@/lib/model-provider-presets';
 
 /**
  * The connected API-key models, as a flat strip — add GLM/Z.ai, DeepSeek,

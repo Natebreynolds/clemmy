@@ -1,4 +1,5 @@
 import { Page } from '@/components/Page';
+import { StartupDoctorCard } from '@/screens/settings/StartupDoctorCard';
 import { Card } from '@/components/ui/Card';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -51,6 +52,7 @@ export function DiagnosticsView() {
 
   return (
     <Page title="Diagnostics" subtitle="Health, logs, and storage">
+      <div className="mb-4"><StartupDoctorCard /></div>
       {diag.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-32 w-full" />)}</div>
       ) : entries.length === 0 ? (
