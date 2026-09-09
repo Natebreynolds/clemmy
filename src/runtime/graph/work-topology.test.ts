@@ -62,3 +62,18 @@ test('every id the host mints is an id the host accepts: a 154-character reacqui
   assert.equal(WorkTopologyIdSchema.safeParse('x'.repeat(WORK_ID_MAX_CHARS + 1)).success, false, 'the bound is still a bound');
   assert.equal(WorkTopologyIdSchema.safeParse('cap:bad ref').success, false, 'the alphabet is unchanged');
 });
+
+test('a universe sealed by a producer outside the topology is refused with the repair named', async () => {
+  const { validateWorkTopology } = await import('./work-topology.js');
+  const validated = validateWorkTopology({
+    version: 1,
+    operations: [{ id: 'write_each', effect: 'local_write', coverage: null, dependsOn: [], dataFrom: [],
+      cardinality: { kind: 'each', universeId: 'accounts' } }],
+    universes: [{ id: 'accounts', seal: 'complete_source_receipt', producedBy: 'toolu_from_an_earlier_turn', memberIdPointer: '/Id' }],
+  });
+  assert.equal(validated.ok, false);
+  const message = validated.ok ? '' : validated.errors.join('; ');
+  assert.match(message, /producedBy to a read operation in THIS topology/);
+  assert.match(message, /accepted_input/);
+  assert.match(message, /earlier turn is not an operation/);
+});

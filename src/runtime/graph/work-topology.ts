@@ -114,12 +114,16 @@ export const WorkTopologyUniverseSchema = z.discriminatedUnion('seal', [
   z.object({
     id: WorkTopologyIdSchema,
     seal: z.literal('accepted_input'),
-    members: z.array(WorkTopologyMemberSchema).min(1).max(WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS),
+    members: z.array(WorkTopologyMemberSchema).min(1).max(WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS).describe(
+      `The member ids inline (up to ${WORK_TOPOLOGY_MAX_INLINE_MODEL_MEMBERS}). Use this seal for a set you already hold — for example ids read in an earlier turn.`,
+    ),
   }).strict(),
   z.object({
     id: WorkTopologyIdSchema,
     seal: z.literal('complete_source_receipt'),
-    producedBy: WorkTopologyIdSchema,
+    producedBy: WorkTopologyIdSchema.describe(
+      'The id of a read operation IN THIS topology with coverage "complete_set" and cardinality once, whose receipt seals the set. A call id or result from an earlier turn is not an operation; either add that read here or use seal "accepted_input" with the ids inline.',
+    ),
     memberIdPointer: z.string().max(512).describe(
       'RFC 6901 pointer to one member id inside ONE producer record; empty string when the record is itself the id.',
     ),
@@ -474,7 +478,10 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
         || producer.coverage !== 'complete_set'
         || producer.cardinality.kind !== 'once'
       ) {
-        errors.push(`universe ${universe.id} requires one complete-set source-read producer`);
+        // Name the fix (live 2026-09-09, explicit Plan mode: the model named an
+        // earlier turn's call id as the producer, was refused twice with only
+        // the rule, and the turn died at the no-progress floor).
+        errors.push(`universe ${universe.id} requires one complete-set source-read producer: set producedBy to a read operation in THIS topology with coverage "complete_set" and cardinality once (a call id or result from an earlier turn is not an operation), or seal the set as "accepted_input" with its member ids inline (up to ${WORK_TOPOLOGY_MAX_INLINE_MODEL_MEMBERS})`);
       }
       if (consumers.some((consumer) => consumer.id === universe.producedBy)) {
         errors.push(`universe ${universe.id} cannot be produced by its own each-cardinality consumer`);
