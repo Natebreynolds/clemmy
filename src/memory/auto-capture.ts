@@ -546,7 +546,7 @@ export interface ExplicitMemoryInstructionParse {
  * and episode evidence. This module-level seam lets every brain share the same
  * memory/action boundary without importing runtime code into memory. */
 export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryInstructionParse | null {
-  const text = clean(message, 900);
+  const text = clean(message, Infinity);
   if (!text) return null;
   if (isExplicitDurableCorrectionRequest(text)) {
     const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(text));
@@ -572,7 +572,11 @@ function explicitRememberKind(content: string): ConsolidatedFactKind {
 }
 
 function addCandidate(candidates: AutoMemoryCandidate[], candidate: AutoMemoryCandidate): void {
-  const content = clean(candidate.content);
+  // Storage is not a prompt preview. Preserve every condition in an explicit
+  // user instruction or pinned rule; retrieval owns its presentation budget.
+  const lossless = candidate.reason === 'explicit remember request'
+    || candidate.reason === 'explicit durable correction' || candidate.pin === true;
+  const content = clean(candidate.content, lossless ? Infinity : 260);
   // Explicit store requests are user-authored memory intent, not a heuristic:
   // accept the same minimum as memory_remember so short labels/codewords are not
   // silently lost after removing the old long wrapper. Keep the higher floor for
@@ -625,7 +629,7 @@ export function extractProfilePatchFromMessage(message: string): Record<string, 
 }
 
 export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
-  const text = clean(message, 900);
+  const text = clean(message, Infinity);
   if (!text || LOW_SIGNAL.test(text)) return [];
   // Don't fold a pasted workflow definition into facts (it pollutes the store
   // and duplicates the workflow store).
