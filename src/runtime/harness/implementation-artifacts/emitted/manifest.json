@@ -1029,10 +1029,10 @@
           "bytes": 22244
         },
         "src/tools/memory-tools.ts": {
-          "bytes": 59579
+          "bytes": 59715
         },
         "src/tools/focus-tools.ts": {
-          "bytes": 14081
+          "bytes": 14266
         },
         "src/execution/scope.ts": {
           "bytes": 1345
@@ -3627,10 +3627,10 @@
           "bytes": 22244
         },
         "src/tools/memory-tools.ts": {
-          "bytes": 59579
+          "bytes": 59715
         },
         "src/tools/focus-tools.ts": {
-          "bytes": 14081
+          "bytes": 14266
         },
         "src/execution/scope.ts": {
           "bytes": 1345
