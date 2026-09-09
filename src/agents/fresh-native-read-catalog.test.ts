@@ -49,19 +49,25 @@ async function fixture(mode: 'normal' | 'plan', options: {
   const match = instructions.match(/\[native-read-catalog\][^\n]*\n(?:- [^\n]+(?:\n|$))+/);
   const block = match?.[0].trimEnd() ?? '';
   const names = block.split('\n').slice(1).flatMap(line => line.slice(2).split(', '));
+  const authoringBlock = instructions.match(/\[native-authoring-catalog\][^\n]*\n(?:- [^\n]+(?:\n|$))+/)?.[0].trimEnd() ?? '';
+  const authoringNames = authoringBlock.split('\n').slice(1).flatMap(line => line.slice(2).split(', '));
+  const entireCatalog = [block, authoringBlock].filter(Boolean).join('\n');
   assert.deepEqual({ envelope: JSON.stringify(boundAgentCapabilityEnvelope(agent)),
     revision: JSON.stringify(boundAgentCapabilityRevision(agent)),
     schemas: agent.tools.map(toolSchemaFingerprint) }, before, 'rendering the index cannot acquire tools or change authority/schema bytes');
   const scope = log.listEvents(session.id, { types: ['tool_search_scope'] }).at(-1)!.data;
-  assert.equal(scope.catalogCount, names.length);
-  assert.equal(scope.catalogBytes, Buffer.byteLength(block));
-  assert.equal(scope.estCatalogTokens, Math.round(block.length / 4));
-  return { agent, block, names, instructions };
+  assert.equal(scope.catalogCount, names.length + authoringNames.length);
+  assert.equal(scope.catalogBytes, Buffer.byteLength(entireCatalog));
+  assert.equal(scope.estCatalogTokens, Math.round(entireCatalog.length / 4));
+  return { agent, block, names, instructions, authoringNames };
 }
 
 for (const mode of ['normal', 'plan'] as const) {
   test(`${mode}: real fresh-host instructions expose deferred native readers without adding schemas or authority`, async () => {
     const f = await fixture(mode);
+    assert.ok(f.authoringNames.includes('workflow_create'));
+    assert.ok(f.authoringNames.includes('write_file'));
+    assert.equal(f.agent.tools.some(tool => tool.name === 'write_file'), false, 'native authoring stays behind its existing carrier');
     assert.ok(f.names.includes('workflow_get'));
     assert.ok(f.names.includes('space_get_view'));
     assert.match(f.block, /call_tool/);
@@ -102,6 +108,7 @@ test('an explicit allowlist cannot advertise denied or phantom deferred readers'
   const f = await fixture('normal', { allowedToolNames: ['tool_search', 'workflow_get', 'workflow_create'] });
   assert.equal(f.block, '', 'the only allowed read is already first-class');
   assert.deepEqual(f.names, []);
+  assert.deepEqual(f.authoringNames, ['workflow_create'], 'the authoring index obeys the same explicit allowlist');
   assert.ok(f.agent.tools.some(tool => tool.name === 'workflow_get'));
   assert.equal(f.agent.tools.some(tool => tool.name === 'space_get_view'), false);
 });

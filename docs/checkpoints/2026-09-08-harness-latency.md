@@ -25,6 +25,8 @@ Earlier website turns repeatedly guessed list_files(path), whereas its actual sc
 - The real semantic Runner plus raw Claude accounting wrapper persists one usage record and debits 110 uncached tokens for 100 input / 10 output. Its adapter-free control still records once. Temporarily disabling the consumption of the adapter receipt reproduces two rows and fails the test. Parallel and failed-scope controls preserve independent recording ownership.
 - Related host, native, semantic, usage, budget and catalog batch: 353 passed, zero failed; typechecking passed. The subsequent wording-only tool descriptions are included in the final full run.
 
+The first full attempt (`latency-full-suite.log`) was stopped after six stale presentation assertions: two expected the previous schema count, and four compared combined catalog telemetry with only the reader block. The corrected tests account for exactly the three added reader schemas and parse/count both inventories. They still check scope exclusions, unchanged authority when instructions render, no direct authoring exposure, and the existing schema-token bounds. All 11 cases in the two affected files passed (`latency-catalog-fixtures.log`). This stopped attempt is not a full-suite pass.
+
 The final full suite, builds and live cases are recorded under `output/post-3161-live/latency-*`. Read completed reports and the final qualification record for exact candidate fingerprints and results; this checkpoint does not claim an unfinished run passed. The prior 15,459-test suite predates these refinements.
 
 ## Live qualification and remaining limits

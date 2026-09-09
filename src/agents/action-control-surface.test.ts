@@ -151,7 +151,7 @@ test('fresh accepted action subtracts dormant controls without opening archaeolo
   assert.ok(names.has('call_tool'), 'deferred controls retain a same-turn carrier');
   assert.match(String(invokable(fixture.agent, 'call_tool').description ?? ''), /control/i);
   assert.match(String(invokable(fixture.agent, 'call_tool').description ?? ''), /business.*work_call/i);
-  assert.ok((scope?.firstClassCount ?? 999) <= 12, `action surface regrew to ${scope?.firstClassCount}`);
+  assert.ok((scope?.firstClassCount ?? 999) <= 15, `action surface regrew to ${scope?.firstClassCount}`);
   assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 6_000,
     `action schema proxy regrew to ${scope?.estFirstClassTokens} tokens`);
   assert.ok((scope?.catalogCount ?? 0) > 90, 'subtracted controls must remain in the same-turn catalog');
@@ -321,7 +321,7 @@ test('resolved control capabilities load directly without an extra discovery dec
     firstClassCount?: number;
     estFirstClassTokens?: number;
   } | undefined;
-  assert.ok((scope?.firstClassCount ?? 999) <= 13);
+  assert.ok((scope?.firstClassCount ?? 999) <= 16);
   assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 10_000);
 });
 
