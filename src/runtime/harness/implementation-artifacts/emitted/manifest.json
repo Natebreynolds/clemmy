@@ -597,7 +597,7 @@
           "bytes": 4749
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 37806
+          "bytes": 38616
         },
         "src/runtime/harness/model-window-observations.ts": {
           "bytes": 7601
@@ -654,7 +654,7 @@
           "bytes": 479
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 22727
+          "bytes": 23237
         },
         "src/runtime/harness/isolated-attested-transport.fixture.ts": {
           "bytes": 2169
@@ -948,7 +948,7 @@
           "bytes": 14164
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 81818
+          "bytes": 81842
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 13337
@@ -1149,7 +1149,7 @@
           "bytes": 4361
         },
         "src/agents/tool-catalog.ts": {
-          "bytes": 20404
+          "bytes": 20688
         },
         "src/tools/registry.ts": {
           "bytes": 2563
@@ -1302,7 +1302,7 @@
           "bytes": 18998
         },
         "src/tools/call-tool.ts": {
-          "bytes": 74293
+          "bytes": 74419
         },
         "src/execution/step-output-verify.ts": {
           "bytes": 11882
@@ -1710,7 +1710,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 208872
+          "bytes": 209698
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -3201,7 +3201,7 @@
           "bytes": 4749
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 37806
+          "bytes": 38616
         },
         "src/runtime/harness/model-window-observations.ts": {
           "bytes": 7601
@@ -3258,7 +3258,7 @@
           "bytes": 479
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 22727
+          "bytes": 23237
         },
         "src/runtime/harness/isolated-attested-transport.fixture.ts": {
           "bytes": 2169
@@ -3552,7 +3552,7 @@
           "bytes": 14164
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 81818
+          "bytes": 81842
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 13337
@@ -3753,7 +3753,7 @@
           "bytes": 4361
         },
         "src/agents/tool-catalog.ts": {
-          "bytes": 20404
+          "bytes": 20688
         },
         "src/tools/registry.ts": {
           "bytes": 2563
@@ -3906,7 +3906,7 @@
           "bytes": 18998
         },
         "src/tools/call-tool.ts": {
-          "bytes": 74293
+          "bytes": 74419
         },
         "src/execution/step-output-verify.ts": {
           "bytes": 11882
@@ -4314,7 +4314,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 208872
+          "bytes": 209698
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
