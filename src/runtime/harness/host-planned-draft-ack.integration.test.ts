@@ -155,7 +155,7 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   if (c6Collision) {
     const saved = JSON.parse(readFileSync(new URL('../../tools/fixtures/c6-saved-workflow-catalog.json', import.meta.url), 'utf8')) as Array<{ slug: string; name: string; enabled: boolean }>;
     assert.equal(saved.length, 29);
-    assert.ok(saved.some(entry => entry.name === 'Outlook Scorpion Inbox Read Canary'));
+    assert.ok(saved.some(entry => entry.name === 'Outlook Sampleteam Inbox Read Canary'));
     for (const entry of saved) writeWorkflow(entry.slug, { name: entry.name, enabled: entry.enabled,
       description: 'Metadata-only collision fixture; never execute.',
       trigger: { schedule: '0 0 1 1 *', timezone: 'UTC' }, steps: [{ id: 'never-execute', prompt: 'No provider operations.' }] });
@@ -169,7 +169,7 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
     priorHistory.push({ type: 'message', role: 'user', content: composeText }, { type: 'message', role: 'assistant', content: composeReply });
   }
   const prompt = c6Collision
-    ? 'Save those exact three drafts in the Outlook Drafts folder for my Scorpion mailbox. This is the live draft-write test. Keep To, Cc, and Bcc empty; preserve their subjects and bodies including punctuation and the line break; create each once. Do not send any email. Report each full subject and its full returned draft ID. Use plain-text bodies. Use a plan for these three saves, then execute it.'
+    ? 'Save those exact three drafts in the Outlook Drafts folder for my Sampleteam mailbox. This is the live draft-write test. Keep To, Cc, and Bcc empty; preserve their subjects and bodies including punctuation and the line break; create each once. Do not send any email. Report each full subject and its full returned draft ID. Use plain-text bodies. Use a plan for these three saves, then execute it.'
     : basePrompt;
   const source = eventlog.appendEvent({ sessionId: session.id, turn: c6Collision ? 2 : 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
