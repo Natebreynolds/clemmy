@@ -23,6 +23,8 @@ export function edgeLabel(type: string): string {
 export function starLabel(node: Pick<GraphNode, 'label' | 'type' | 'id'>, max = 18): string {
   let s = (node.label || node.id).trim();
   if (node.type === 'file') s = s.split('/').pop() ?? s;
+  // The graph's kind nodes shout in caps ("REFERENCE"); the sky speaks quietly.
+  if (node.type === 'kind' && s === s.toUpperCase()) s = s.charAt(0) + s.slice(1).toLowerCase();
   if (s.length > max) s = `${s.slice(0, max - 1).trimEnd()}…`;
   return s;
 }

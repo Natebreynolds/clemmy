@@ -33,6 +33,7 @@ test('labels stay short and files keep their basename', () => {
   assert.equal(starLabel({ id: 'file:x', label: 'vault/notes/pelta.md', type: 'file' }), 'pelta.md');
   assert.equal(starLabel({ id: 'fact:1', label: 'A very long memory text that goes on', type: 'fact' }), 'A very long memor…');
   assert.equal(edgeLabel('FACT_TO_RESOURCE'), 'resource');
+  assert.equal(starLabel({ id: 'kind:reference', label: 'REFERENCE', type: 'kind' }), 'Reference');
 });
 
 test('an unknown seed yields an empty constellation, never a throw', () => {
