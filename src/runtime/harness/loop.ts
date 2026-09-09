@@ -3561,6 +3561,24 @@ export interface RunConversationResult {
  * activation boundary closes as stopped-before-dispatch) are not progress.
  * null when the ledger is unreadable: the loop then assumes progress once and
  * lets the attempt cap bound it. */
+/** Pre-dispatch refusals delivered to the model for one accepted source (the
+ * host-authored "refused before dispatch" results). Each is a repair
+ * diagnostic the model can act on; see the ceiling loop. */
+function preDispatchRefusalCount(sessionId: string, sourceUserSeq: number | undefined): number | null {
+  if (!sourceUserSeq) return null;
+  try {
+    const row = openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM events
+       WHERE session_id = ? AND type = 'tool_returned'
+         AND json_extract(data_json, '$.sourceUserSeq') = ?
+         AND data_json LIKE '%refused before dispatch%'
+    `).get(sessionId, sourceUserSeq) as { n: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return null;
+  }
+}
+
 function settledExecutedCallCount(sessionId: string, sourceUserSeq: number | undefined): number | null {
   if (!sourceUserSeq) return null;
   try {
@@ -3601,6 +3619,8 @@ export async function runConversationContinuingPastToolCallsLimit(
   // count. Otherwise the parked activation is progress by construction: the
   // ceiling only trips after the limit's worth of admitted calls.
   let settledBefore: number | null = settledExecutedCallCount(options.sessionId, options.sourceUserSeq);
+  let refusedBefore: number | null = preDispatchRefusalCount(options.sessionId, options.sourceUserSeq);
+  let repairOnlyResumes = 0;
   let result = await runConversation({ ...options, deferToolCallsLimitTerminal: true });
   if (result.status !== 'limit_exceeded' || result.limitKind !== 'tool_calls') return result;
   const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
@@ -3610,9 +3630,22 @@ export async function runConversationContinuingPastToolCallsLimit(
   let attempts = 0;
   while (result.status === 'limit_exceeded' && result.limitKind === 'tool_calls') {
     const settledAfter = settledExecutedCallCount(options.sessionId, sourceUserSeq);
-    const settledThisActivation = settledBefore === null || settledAfter === null
+    const settledDelta = settledBefore === null || settledAfter === null
       ? 1
       : settledAfter - settledBefore;
+    // A ceiling that trips inside the model's FIRST frame of an activation
+    // can be made of nothing but pre-dispatch refusals (live 2026-09-09: 50
+    // direct write_file calls, 16 refused before the counter tripped, zero
+    // settlements). The model has not yet seen those refusals, so parking
+    // here is not "no progress" — it is no chance to repair. New refusal
+    // diagnostics count as progress for at most two consecutive resumes; a
+    // model that keeps repeating the same refused shape still parks.
+    const refusedAfter = preDispatchRefusalCount(options.sessionId, sourceUserSeq);
+    // A source known only after acceptance has no earlier count: every
+    // refusal so far belongs to this first activation.
+    const refusedDelta = refusedAfter === null ? 0 : refusedAfter - (refusedBefore ?? 0);
+    const repairInformation = settledDelta <= 0 && refusedDelta > 0 && repairOnlyResumes < 2;
+    const settledThisActivation = settledDelta > 0 ? settledDelta : repairInformation ? 1 : 0;
     const decision = chatAutoContinueDecision({
       autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
       attempts,
@@ -3630,6 +3663,7 @@ export async function runConversationContinuingPastToolCallsLimit(
         attempt: attempts + 1,
         cap,
         settledThisActivation,
+        refusedThisActivation: refusedDelta,
         resume: decision.resume,
         ...(decision.resume ? {} : { reason: decision.reason }),
       },
@@ -3638,7 +3672,9 @@ export async function runConversationContinuingPastToolCallsLimit(
     const checkpointSourceUserSeq = deferredToolCallsLimitSourceUserSeq(result);
     if (!checkpointSourceUserSeq) break;
     attempts += 1;
+    repairOnlyResumes = settledDelta > 0 ? 0 : repairOnlyResumes + 1;
     settledBefore = settledAfter;
+    refusedBefore = refusedAfter;
     const {
       taskContinuation: _noPacket,
       continuationSteer: _noSteer,

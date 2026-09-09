@@ -181,3 +181,38 @@ test('the attempt cap still parks a run that keeps tripping its ceiling', async 
   assert.deepEqual(resumes.map((row) => row.resume), [true, true, false]);
   assert.equal(resumes.at(-1)!.reason, 'cap_exhausted');
 });
+
+test('a ceiling made only of pre-dispatch refusals resumes so the model can repair, then finishes', async () => {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const { saved, saveNote } = fixture();
+  // Frame one: an unconfigured tool name, refused before dispatch for every
+  // call; the counter still charges them and trips at 3 with zero settlements.
+  const model = recordingModel([
+    [1, 2, 3, 4].map((n) => functionCall(`bad-${n}`, 'save_note', { id: `n${n}` })),
+    // The resumed activation has seen the refusals and repairs.
+    [1, 2].map((n) => functionCall(`good-${n}`, 'task_list', {})),
+    [done('Both listed.')],
+  ]);
+  const agent = { model, instructions: 'Use the exact configured tool.', tools: [saveNote] };
+  bindSurface(session.id, agent, [saveNote]);
+  const result = await runConversation({
+    sessionId: session.id,
+    input: 'List the local tasks twice.',
+    turnEngine: 'host_v1',
+    judgeCompletion: false,
+    agent: agent as never,
+    makeRunner: () => throwingRunner() as never,
+    maxTurns: 6,
+    toolCallsPerTurn: 3,
+    suppressMemoryCapture: true,
+  });
+  assert.equal(result.status, 'completed', JSON.stringify(result).slice(0, 600));
+  assert.deepEqual(saved, ['good-1', 'good-2']);
+  const resumes = guides(session.id).filter((row) => row.kind === 'budget_checkpoint_auto_resume');
+  assert.equal(resumes.length, 1);
+  assert.equal(resumes[0]!.resume, true);
+  assert.equal(resumes[0]!.settledThisActivation, 1, 'refusal diagnostics count as one repair step');
+  const returned = eventlog.listEvents(session.id, { types: ['tool_returned'] }).map((e) => JSON.stringify(e.data).slice(0, 220));
+  assert.ok(Number(resumes[0]!.refusedThisActivation) >= 3, JSON.stringify({ resume: resumes[0], returned: returned.slice(0, 4) }));
+});
+
