@@ -237,7 +237,7 @@ export interface SourceArtifactEvidence {
     /** Why an artifact could not be verified, retained rather than dropped. */
     unresolvedReason?: string;
     /** `file` promises a host-file receipt; `none` is a settled effect with a
-     *  different success contract (deletion, write_file); `unknown` is evidence
+     *  different success contract (such as deletion); `unknown` is evidence
      *  that could not be resolved at all. Only `file` can require content. */
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
   }>;
@@ -253,9 +253,8 @@ export interface SourceArtifactEvidence {
  * exactly backwards, and it hid the failure.
  *
  * `*_revision` output kinds are the committed-artifact contract (workflow and
- * workspace authoring). `deletion_receipt` is an acknowledgement, and
- * `local_artifact` is an ordinary file tool with its own contract; neither owes
- * a host-local-write-commit receipt.
+ * workspace and ordinary file authoring). `deletion_receipt` is an
+ * acknowledgement and owes no host-local-write-commit receipt.
  */
 type OperationResultContract = 'file' | 'acknowledgement' | 'other' | 'undeclared';
 
@@ -396,7 +395,7 @@ export function settledSourceArtifacts(input: {
         // The contract is decided by the REGISTRY, before the payload is
         // consulted. An operation that owes a receipt and did not produce a
         // usable one is UNRESOLVED — a real failure. One that never owed a file
-        // (a deletion acknowledgement, an ordinary file tool) is settled work
+        // (such as a deletion acknowledgement) is settled work
         // whose settlement is its evidence.
         // Reached only after redemption AND the full provenance conjunction
         // succeeded — the result is authenticated. Only here can a contract

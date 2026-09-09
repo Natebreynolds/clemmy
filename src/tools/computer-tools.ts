@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
+import { canonicalLocalFileTarget, commitLocalFileRevision } from '../runtime/harness/local-file-revision.js';
+import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENTS_DIR,
@@ -389,10 +391,6 @@ function resolveAllowedPath(input: string): string {
   return resolved;
 }
 
-function ensureTrailingNewline(content: string): string {
-  return content.endsWith('\n') ? content : `${content}\n`;
-}
-
 function workspaceAuthoringNotice(filePath: string): string | null {
   const root = path.resolve(SPACES_DIR);
   const rel = path.relative(root, filePath);
@@ -442,13 +440,13 @@ function typedClementineStateWriteNotice(filePath: string): string | null {
     { root: PENDING_ACTIONS_DIR, tool: 'pending_action_queue or pending_action_record_result' },
   ];
   for (const target of targets) {
-    const root = path.resolve(target.root);
-    const rel = path.relative(root, filePath);
+    const root = path.dirname(canonicalLocalFileTarget(path.join(target.root, 'anchor')));
+    const rel = path.relative(root, canonicalLocalFileTarget(filePath));
     if (rel === '' || (rel && !rel.startsWith('..') && !path.isAbsolute(rel))) {
       return `Refused raw write to typed Clementine state: ${filePath}. Use ${target.tool} so validation, permissions, and audit logs stay consistent.`;
     }
   }
-  if (path.resolve(filePath) === path.resolve(TEAM_COMMS_LOG)) {
+  if (canonicalLocalFileTarget(filePath) === canonicalLocalFileTarget(TEAM_COMMS_LOG)) {
     return `Refused raw write to Clementine team communication log: ${filePath}. Use team_message, team_request, team_reply, or delegate_task so the queue and audit trail stay consistent.`;
   }
   return null;
@@ -538,8 +536,8 @@ export function shellDestroysOwnStores(rawCommand: unknown): boolean {
 /** write_file twin of the shell guard: a RESOLVED target path inside the
  *  protected own-store set. Pure + exported for tests. */
 export function writeTargetsProtectedOwnStore(resolvedPath: string): boolean {
-  const base = path.resolve(BASE_DIR);
-  const target = path.resolve(resolvedPath);
+  const base = path.dirname(canonicalLocalFileTarget(path.join(BASE_DIR, 'anchor')));
+  const target = canonicalLocalFileTarget(resolvedPath);
   const rel = path.relative(base, target);
   const inBase = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
   if (inBase) {
@@ -556,15 +554,15 @@ export function writeTargetsProtectedOwnStore(resolvedPath: string): boolean {
  * approval graph/event DB and exact-once mutation receipts while leaving
  * ordinary workspace artifacts writable and authority files readable. */
 export function writeTargetsAuthorizationState(resolvedPath: string): boolean {
-  const target = path.resolve(resolvedPath);
+  const target = canonicalLocalFileTarget(resolvedPath);
   const protectedRoots = [
     path.resolve(PENDING_ACTIONS_DIR),
     path.resolve(BASE_DIR, 'state'),
     path.resolve(BASE_DIR, 'audit'),
-  ];
+  ].map(root => path.dirname(canonicalLocalFileTarget(path.join(root, 'anchor'))));
   if (protectedRoots.some((root) => isInside(root, target))) return true;
 
-  const rel = path.relative(path.resolve(BASE_DIR), target);
+  const rel = path.relative(path.dirname(canonicalLocalFileTarget(path.join(BASE_DIR, 'anchor'))), target);
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
   const segments = rel.split(path.sep);
   return segments.includes('call-mutations') || segments.includes('.trigger-receipts');
@@ -769,8 +767,8 @@ function installedSkillsRoot(): string {
 }
 
 function installedSkillPathParts(filePath: string): string[] | null {
-  const resolved = path.resolve(expandHome(filePath));
-  const root = path.resolve(installedSkillsRoot());
+  const resolved = canonicalLocalFileTarget(expandHome(filePath));
+  const root = path.dirname(canonicalLocalFileTarget(path.join(installedSkillsRoot(), 'anchor')));
   if (!isInside(root, resolved)) return null;
   const rel = path.relative(root, resolved);
   if (!rel) return [];
@@ -1320,12 +1318,6 @@ function listDirectory(dir: string, limit: number): string {
  *  run_shell_command. The tool() defs below build their `parameters` from these,
  *  and the gated MCP lane (gated-mutating-tools.ts) derives its Claude-facing
  *  schema from them too, so the two can never drift (TOOL-REGISTRY-PLAN C3). */
-/** Visible per-call content cap for write_file (UTF-8 bytes). Large artifacts must
- *  be produced in append-mode CHUNKS so a single giant emission never hits the model
- *  token cliff (the 2026-07-08 landing-page build died 3× on one-shot writes). Stated
- *  in the tool description (visible-limits doctrine). ~24KB. */
-export const WRITE_FILE_MAX_CONTENT_BYTES = 24_000;
-
 export const WRITE_FILE_PARAMS = {
   path: z.string().min(1),
   content: z.string(),
@@ -1479,33 +1471,29 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'mode=create or null creates a new file and refuses to replace an existing one.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
       'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
-      `SIZE LIMIT: content is capped at ${WRITE_FILE_MAX_CONTENT_BYTES} bytes (~24KB) PER CALL — a larger emission is REFUSED and nothing is written. To produce a big file (a full HTML page, a long report), write it in CHUNKS: send the first ~20KB with append:false (starts the file), then continue the rest with append:true calls (each ≤24KB) until it is complete. This keeps any single response well under the model token cliff.`,
-      'append:true appends this content (creating the file if absent) — the continuation call. append:false starts the file fresh (overwrite). Leave append null to use `mode`.',
+      'A successful write retains the prior bytes for recovery and returns a receipt for the committed file. Send the complete content when it fits your response budget; append is available when you need to continue a large file.',
+      'append:true appends content (creating the file if absent); append:false replaces it. Leave append null to use mode.',
       'Installed skill source files under ~/.clementine-next/skills/<skill>/ are read-only; generated artifacts belong under output/, outputs/, runs/, artifacts/, reports/, or tmp/.',
       'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
     ].join('\n'),
     parameters: z.object(WRITE_FILE_PARAMS),
     needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
-      // VISIBLE SIZE CAP (checked BEFORE any filesystem side effect → nothing is
-      // written on refusal). Forces large artifacts into append-mode chunks.
-      const contentBytes = Buffer.byteLength(input.content, 'utf8');
-      if (contentBytes > WRITE_FILE_MAX_CONTENT_BYTES) {
-        return [
-          `Refused: content is ${contentBytes} bytes, over the ${WRITE_FILE_MAX_CONTENT_BYTES}-byte (~24KB) per-call cap for write_file. NOTHING was written.`,
-          `Write this file in append-mode CHUNKS: send the first ~20KB with append:false (starts the file), then continue the remaining content with append:true calls (each ≤${WRITE_FILE_MAX_CONTENT_BYTES} bytes) until the file is complete. Split at a natural boundary (a tag, a line) — the chunks are concatenated verbatim.`,
-        ].join(' ');
-      }
       const filePath = resolveAllowedPath(input.path);
-      if (isProtectedInstalledSkillSourcePath(filePath)) {
+      const canonicalTarget = canonicalLocalFileTarget(filePath);
+      if (loadProactivityPolicy().autoApproveScope !== 'yolo'
+        && !workspaceRoots().some(root => isInside(path.dirname(canonicalLocalFileTarget(path.join(root, '.clem-path-check'))), canonicalTarget))) {
+        throw new Error(`Path is outside allowed workspace roots: ${canonicalTarget}.`);
+      }
+      if (isProtectedInstalledSkillSourcePath(filePath) || isProtectedInstalledSkillSourcePath(canonicalTarget)) {
         return [
           `Refused to write ${filePath}: installed skill source files are read-only during skill runs.`,
           'Write generated artifacts under the skill output/, outputs/, runs/, artifacts/, reports/, or tmp/ directory, or update the skill package through the skill install/update path.',
         ].join(' ');
       }
-      const teamNotice = typedClementineStateWriteNotice(filePath);
+      const teamNotice = typedClementineStateWriteNotice(filePath) ?? typedClementineStateWriteNotice(canonicalTarget);
       if (teamNotice) return teamNotice;
-      if (writeTargetsAuthorizationState(filePath)) {
+      if (writeTargetsAuthorizationState(filePath) || writeTargetsAuthorizationState(canonicalTarget)) {
         return `Refused to write ${filePath}: Clementine authorization state cannot be mutated through write_file. Use the purpose-built approval, pending-action, workflow, or settings tools instead.`;
       }
       // The explicit `append` flag wins over `mode`: true → append (create if
@@ -1516,38 +1504,22 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       // Protected own-stores (2026-07-21): write_file must not clobber the
       // databases/secrets that every other guard depends on. Path-resolved
       // check (the shell guard's regex twin).
-      if (writeTargetsProtectedOwnStore(filePath)) {
+      if (writeTargetsProtectedOwnStore(filePath) || writeTargetsProtectedOwnStore(canonicalTarget)) {
         return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
       }
-      mkdirSync(path.dirname(filePath), { recursive: true });
-      const exists = existsSync(filePath);
-      if (exists && !statSync(filePath).isFile()) return `Refused to write ${filePath}: target exists and is not a file.`;
-      const content = ensureTrailingNewline(input.content);
-
-      if (mode === 'append') {
-        const needsBoundary = exists && statSync(filePath).size > 0 && !readFileSync(filePath, 'utf-8').endsWith('\n');
-        appendFileSync(filePath, `${needsBoundary ? '\n' : ''}${content}`, 'utf-8');
-        teeFileDeliverable(filePath);
-        const notice = workspaceAuthoringNotice(filePath);
-        return [`Appended ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
+      let revision: ReturnType<typeof commitLocalFileRevision>;
+      try { revision = commitLocalFileRevision({ target: canonicalTarget, content: input.content, mode }); }
+      catch (error) {
+        if (error instanceof Error && error.message.startsWith('Refused to overwrite existing file:')) return error.message;
+        throw error;
       }
-
-      if (mode === 'create' && exists) {
-        return [
-          `Refused to overwrite existing file: ${filePath}.`,
-          'Use mode="append" to add content, or mode="overwrite" only after reading the file and preparing the full replacement.',
-        ].join(' ');
-      }
-
-      if (mode === 'overwrite' && exists && readFileSync(filePath, 'utf-8') === content) {
-        const notice = workspaceAuthoringNotice(filePath);
-        return [`No changes needed for ${filePath} (${input.content.length} chars already present).`, notice].filter(Boolean).join('\n\n');
-      }
-
-      writeFileSync(filePath, content, 'utf-8');
       teeFileDeliverable(filePath);
       const notice = workspaceAuthoringNotice(filePath);
-      return [`${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
+      const text = revision.unchanged
+        ? `No changes needed for ${filePath} (${input.content.length} chars already present).`
+        : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
+      return withHostLocalWriteCommitFromFile({ ...revision,
+        result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
     },
   });
 

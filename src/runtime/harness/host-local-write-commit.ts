@@ -23,6 +23,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
+import { isLocalFileRevisionHandle, readLocalFileRevisionContent } from './local-file-revision.js';
 
 export const HOST_LOCAL_WRITE_COMMIT_PREFIX = '[clementine:host-local-write-commit:v1]' as const;
 export const HOST_LOCAL_WORKSPACE_COMMIT_BASENAME = '.clementine-workspace-commit.json' as const;
@@ -154,6 +155,7 @@ export function parseHostLocalWriteCommitFacts(result: unknown): HostLocalWriteC
 export function hostLocalWriteCommitResultIsProven(result: unknown): boolean {
   const facts = parseHostLocalWriteCommitFacts(result);
   if (!facts) return false;
+  if (isLocalFileRevisionHandle(facts.handle)) return readCommittedArtifactContent(facts).verified;
   if (!facts.handle.endsWith(`/${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`)) return true;
   return workspaceCompoundReadbackIsProven(facts);
 }
@@ -994,6 +996,9 @@ function readCommittedArtifactContentUnlocked(
     }
     const file = safeCommittedFile(root, path.resolve(root, facts.handle));
     const verified = createHash('sha256').update(file.bytes).digest('hex') === facts.contentDigest;
+    if (isLocalFileRevisionHandle(facts.handle)) {
+      return readLocalFileRevisionContent(facts, file.bytes);
+    }
     return {
       parts: [{ handle: facts.handle, bytes: file.bytes, role: 'file' }],
       totalBytes: file.bytes.byteLength,

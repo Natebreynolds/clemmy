@@ -286,7 +286,7 @@ test('separate accepted Normal workflow create and edit use their own exact nati
 });
 
 
-test('an exact file overwrite reaches existing consent on its first call without a rediscovery refusal', async () => {
+test('an exact file overwrite commits once without rediscovery or a redundant approval', async () => {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
@@ -311,7 +311,7 @@ test('an exact file overwrite reaches existing consent on its first call without
     requirement_id: capabilityRef, source_call_ids: null, source_record_ids: null,
     universe_item_id: null, universe_selector: null, seal_amendment: null,
     name: 'write_file', args_json: JSON.stringify(args),
-  })], [textMessage('Unexpected extra model request.')]]);
+  })], [textMessage('The requested file revision is saved.')]]);
   const agent = { model, tools: [workCall] };
   localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set(['write_file']) });
   const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
@@ -325,16 +325,20 @@ test('an exact file overwrite reaches existing consent on its first call without
     behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
     [{ type: 'message', role: 'user', content: prompt }] as never,
     { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
-  assert.equal(model.calls(), 1, JSON.stringify(result.history));
+  assert.equal(model.calls(), 2, JSON.stringify(result.history));
   assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
   assert.ok(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef,
     operationId: 'write_file', effect: 'local_write', args }));
-  assert.equal(result.hasInterruptions, true);
-  assert.equal(result.interruptions.length, 1);
-  assert.deepEqual(result.interruptions[0]?.consentCall?.risk,
-    { reversibility: 'irreversible', consequence: 'update', destructive: true },
-    'the existing consent request, rather than a search refusal, owns the pause');
-  assert.equal(readFileSync(file, 'utf8'), 'Original draft\n', 'preparation itself never authorizes the write');
+  assert.equal(Boolean(result.hasInterruptions), false);
+  assert.equal(result.terminal, undefined);
+  assert.equal(readFileSync(file, 'utf8'), 'Revised draft\n');
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 1);
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?')
     .get(session.id) as { n: number }).n, 0);
+  const { settledSourceArtifacts } = await import('./host-turn-runner.js');
+  const evidence = settledSourceArtifacts(identity);
+  assert.equal(evidence.artifacts.length, 1, JSON.stringify(evidence));
+  assert.equal(evidence.artifacts[0]?.evidenceContract, 'file');
+  assert.equal(evidence.artifacts[0]?.digestMatches, true);
 });

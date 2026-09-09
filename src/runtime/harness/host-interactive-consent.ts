@@ -1,3 +1,7 @@
+import path from 'node:path';
+import os from 'node:os';
+import { isSensitivePath } from '../security.js';
+import { canonicalLocalFileTarget } from './local-file-revision.js';
 /**
  * Production-host adapter for the single provider-neutral consent reducer.
  *
@@ -657,7 +661,7 @@ function crossingFor(input: {
   }
 }
 
-function localRisk(definition: AuthorizedLocalPlanningDefinitionV1): {
+function localRisk(definition: AuthorizedLocalPlanningDefinitionV1, args: unknown): {
   reversibility: InteractiveConsentReversibility;
   consequence: InteractiveConsentConsequence;
   destructive: boolean;
@@ -668,6 +672,16 @@ function localRisk(definition: AuthorizedLocalPlanningDefinitionV1): {
       consequence: 'read',
       destructive: false,
     };
+  }
+  // File revisions make ordinary documents recoverable. The pre-existing
+  // sensitive-path approval still applies to credentials and configuration.
+  if (definition.name === 'write_file' && args && typeof args === 'object'
+    && typeof (args as { path?: unknown }).path === 'string') {
+    const raw = (args as { path: string }).path;
+    const target = path.resolve(raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw);
+    if (isSensitivePath(target) || isSensitivePath(canonicalLocalFileTarget(target))) {
+      return { reversibility: 'irreversible', consequence: 'update', destructive: true };
+    }
   }
   const posture = definition.descriptor.destinationPosture;
   return {
@@ -937,7 +951,7 @@ async function semanticBasisForExactCall(input: {
         binding,
         definition: local,
       }),
-      risk: localRisk(local),
+      risk: localRisk(local, input.prepared.targetArgs),
       semanticBasis: {
         kind: 'local_registry',
         digest: local.envelopeFingerprint,
@@ -1423,7 +1437,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     destination,
     cardinality: { kind: 'once' },
     risk: definition && safeMode
-      ? localRisk(definition)
+      ? localRisk(definition, input.args)
       : { reversibility: 'unknown', consequence: 'unknown', destructive: false },
     semanticBasis: {
       kind: definition ? 'local_registry' : 'documented_live_capability',
