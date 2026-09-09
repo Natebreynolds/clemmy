@@ -51,7 +51,12 @@ export function ConversationSidebar({
   // Which kinds the rail is showing. A view preference, not a query — it
   // persists per-machine the way the rail's own collapsed state does.
   const [kind, setKindState] = useState<ConversationKindFilter>(() => {
-    try { return parseConversationKindFilter(localStorage.getItem(KIND_PREF_KEY)); } catch { return 'all'; }
+    // Conversations by default; runs live under Running and on the Tasks
+    // board (owner 2026-09-08: the rail read as "all the sessions").
+    try {
+      const stored = localStorage.getItem(KIND_PREF_KEY);
+      return stored ? parseConversationKindFilter(stored) : 'chats';
+    } catch { return 'chats'; }
   });
   const setKind = (next: ConversationKindFilter) => {
     setKindState(next);

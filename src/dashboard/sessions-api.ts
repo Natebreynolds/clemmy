@@ -209,12 +209,19 @@ function listUserFacingHarnessRows(): HarnessSessionRow[] {
   const out: HarnessSessionRow[] = [];
   for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
     const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
-    out.push(...page.filter((row) => isUserFacingSession(row.id, row.channel ?? undefined)));
+    out.push(...page.filter((row) => isUserFacingSession(row.id, row.channel ?? undefined) && !isHelperSession(row)));
     if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
   }
   return out;
 }
 
+/** A helper a turn spawned (run_worker) runs under its own worker session.
+ *  It is not a conversation — its steps nest under the parent turn's card —
+ *  so it never gets a row of its own in the rail (owner 2026-09-08: the
+ *  sidebar showed "all the sessions"). */
+function isHelperSession(row: HarnessSessionRow): boolean {
+  return row.metadata?.workerScope === true || row.metadata?.source === 'delegated_worker';
+}
 function listHarnessRowsForWorkflowRun(workflowRunId: string, reference: HarnessSessionRow): HarnessSessionRow[] {
   if (!workflowRunId) return [];
   const out: HarnessSessionRow[] = [];

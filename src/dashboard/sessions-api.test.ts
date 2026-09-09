@@ -754,3 +754,13 @@ test('raw report-back titles heal at read time; synthetic first turns derive hum
   const synthetic = sessions.find((s) => s.id === 'desktop:chat-synthetic');
   assert.equal(synthetic?.title, 'Workflow run: Daily standup email', 'synthetic turn derives a human title');
 });
+
+test('a helper’s worker session never gets a rail row of its own', async () => {
+  const { createSession } = await import('../runtime/harness/eventlog.js');
+  createSession({
+    id: 'sess-worker-abcdefabcdefabcdefabcdefabcdefabcdefabcd', kind: 'agent', title: 'Worker: prospects',
+    metadata: { source: 'delegated_worker', workerScope: true, parentSessionId: 'console:parent', item: 'prospects' },
+  });
+  const sessions = buildUnifiedSessionList();
+  assert.equal(sessions.find((s) => s.id.includes('sess-worker-')), undefined, 'helpers nest under their turn, not the rail');
+});

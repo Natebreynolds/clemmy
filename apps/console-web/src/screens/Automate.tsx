@@ -35,6 +35,21 @@ type Tab = 'workflows' | 'skills';
 type WorkflowFilter = 'all' | 'scheduled' | 'manual';
 
 
+/** "Today 07:00 · scheduled" — when it ran and who started it, never the id. */
+function runRowTitle(run: { id: string; startedAt?: string; createdAt?: string; source?: string }): string {
+  const iso = run.startedAt ?? run.createdAt;
+  const t = iso ? Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(t)) return run.id.slice(0, 22);
+  const d = new Date(t);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  const day = sameDay ? 'Today' : d.toDateString() === yesterday.toDateString() ? 'Yesterday' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const who = run.source === 'console' || run.source === 'dashboard' ? 'you' : run.source === 'scheduler' || run.source === 'cron' ? 'scheduled' : run.source ?? '';
+  return `${day} ${time}${who ? ` · ${who}` : ''}`;
+}
+
 function relativeRunTime(iso?: string | null): string {
   if (!iso) return '';
   const t = Date.parse(iso);
@@ -443,7 +458,7 @@ function RunWorkspaceDrawer({
                     className={cn('mb-1 w-full rounded-md px-2.5 py-2 text-left transition-colors', selectedRunId === run.id ? 'bg-subtle' : 'hover:bg-subtle/60')}
                   >
                     <div className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate text-small font-medium text-fg">{run.id.slice(0, 22)}</span>
+                      <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={run.id}>{runRowTitle(run)}</span>
                       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
                     </div>
                     <div className="mt-1 truncate text-caption text-faint">
