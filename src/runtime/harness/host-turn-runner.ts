@@ -4813,6 +4813,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
   };
 
+  // Name the door. Live 2026-09-09: fifty direct write_file calls were refused
+  // with only the rule; the model never learned that the same arguments are
+  // admitted through the configured carrier, and the activation budget went
+  // to the refusals.
+  const unconfiguredToolCarrierHint = (name: string): string => {
+    const carrier = ['work_call', 'call_tool'].find((door) => toolByName.has(door));
+    return carrier
+      ? ` Repair: invoke it through the configured carrier ${carrier} with name ${JSON.stringify(name)} and args_json carrying these same arguments (one carrier call per item).`
+      : '';
+  };
   const readOnlyCanaryRefusal = (
     name: string,
     args: Record<string, unknown> | null,
@@ -4855,14 +4865,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && !provenTurnReadDescent(name, args, tool)
       )
     ) {
-      // Name the door. Live 2026-09-09: fifty direct write_file calls were
-      // refused with only the rule; the model never learned that the same
-      // arguments are admitted through the configured carrier, and the
-      // activation budget went to the refusals.
-      const carrier = ['work_call', 'call_tool'].find((door) => toolByName.has(door));
-      return `Tool '${name}' was refused before dispatch because the selected host engine only admits configured harness-bounded tools. No local or external mutation was attempted.${carrier
-        ? ` Repair: invoke it through the configured carrier ${carrier} with name ${JSON.stringify(name)} and args_json carrying these same arguments (one carrier call per item).`
-        : ''}`;
+      return `Tool '${name}' was refused before dispatch because the selected host engine only admits configured harness-bounded tools. No local or external mutation was attempted.${unconfiguredToolCarrierHint(name)}`;
     }
     if (hostProduction) {
       const exact = exactProductionHostCall(
