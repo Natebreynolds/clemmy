@@ -6,8 +6,10 @@
  * node --import tsx scripts/live-foreground-proof.mts --messages /absolute/messages.json
  *   [--home /absolute/clem-home] [--session existing-session] [--out /absolute/report.json]
  *
- * messages.json is an array of strings. A blocked/failed/needs-input turn stops
- * the sequence and remains a failed proof. Resubmit only after inspecting it.
+ * messages.json is an array of strings or messages with explicit expectations.
+ * Completion is the default. An intermediate clarification may explicitly
+ * accept needs_input; blocked/failed turns always stop the sequence. Inspect
+ * the actual question as well as these mechanical assertions.
  */
 import { createHash, createPrivateKey, randomUUID, sign } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -198,7 +200,7 @@ try {
     console.log(JSON.stringify({ phase: 'terminal', sessionId, sourceUserSeq: source.seq, status: measurement.terminalStatus,
       wallMs: measurement.turnWallMs, modelRequests: turn.modelRequests, toolCalls: measurement.canonicalTopLevelToolCalls,
       searches: measurement.topLevelToolSearches }));
-    if (measurement.terminalStatus !== 'done') throw new Error(`proof stopped on ${measurement.terminalStatus}; no next message submitted`);
+    if (!expect && measurement.terminalStatus !== 'done') throw new Error(`proof stopped on ${measurement.terminalStatus}; no next message submitted`);
     if (expect) {
       const data = turn.terminal as { presentation?: { text?: string }; reply?: string };
       const failures = checkLiveTurn(expect, {
