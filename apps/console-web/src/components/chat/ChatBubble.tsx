@@ -6,7 +6,7 @@ import { ArrowUpRight, Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
-import { TurnActivity } from '@/components/chat/TurnActivity';
+import { ActivityCard } from '@/components/chat/ActivityCard';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { cn } from '@/lib/cn';
@@ -109,19 +109,6 @@ function PayloadPreview({ value }: { value: unknown }) {
   );
 }
 
-function ThinkingDots() {
-  return (
-    <span className="inline-flex items-center gap-1" aria-label="Clementine is working">
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="h-1.5 w-1.5 rounded-full bg-primary"
-          style={{ animation: 'dot-pulse 1.2s ease-in-out infinite', animationDelay: `${i * 180}ms` }}
-        />
-      ))}
-    </span>
-  );
-}
 
 export function ChatBubble({
   message,
@@ -274,13 +261,25 @@ export function ChatBubble({
     <div className="flex gap-3">
       <DogMark size={28} className="mt-0.5 self-start" />
       <div className="min-w-0 max-w-[80%] flex-1">
+        {/* The build log rides ABOVE the reply: while the turn runs it is the
+            whole story (steps, helpers, the thinking line); once the reply
+            lands it settles to a results-first one-liner you can reopen. */}
+        {(live || (message.activity && message.activity.length > 0)) && (
+          <ActivityCard
+            items={message.activity ?? []}
+            live={live}
+            progress={message.progress}
+            terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
+            traceHref={traceHref}
+            className={cn(!live && 'mb-1.5 px-1', live && 'mb-2')}
+          />
+        )}
         <div className="rounded-lg rounded-tl-sm border border-border bg-surface px-4 py-3 shadow-xs">
           {message.taskMode?.kind === 'plan' && <div className="mb-2 text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
           {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
           {thinking && !message.text ? (
             <div className="flex items-center gap-2 text-body text-muted">
-              <ThinkingDots />
-              <span className="min-w-0 flex-1">{message.progress ?? 'Thinking…'}</span>
+              <span className="min-w-0 flex-1">{message.taskMode?.kind === 'plan' ? 'Working out the steps…' : 'Reply lands here as soon as it’s ready.'}</span>
               {onBackground && (
                 <button
                   type="button"
@@ -324,25 +323,6 @@ export function ChatBubble({
             <div className={cn('text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
               <Markdown text={message.text} />
             </div>
-          )}
-
-          {/* Premium activity strip: live tool calls + parallel agents (Claude/Codex/
-              GLM) with status — shown while working AND kept (collapsed) after. Falls
-              back to the single rolling line only before any activity has arrived. */}
-          {message.activity && message.activity.length > 0 ? (
-            <TurnActivity
-              items={message.activity}
-              live={live}
-              terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
-              traceHref={traceHref}
-            />
-          ) : (
-            live && message.text && message.progress && (
-              <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
-                <ThinkingDots />
-                <span>{message.progress}</span>
-              </div>
-            )
           )}
 
           {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (
@@ -539,7 +519,7 @@ function DelegatedWorkCard({ message, delegated }: {
             <p className="mt-1.5 text-body text-muted">{message.progress}</p>
           ) : null}
           {message.activity && message.activity.length > 0 && (
-            <TurnActivity items={message.activity} live />
+            <ActivityCard items={message.activity} live className="mt-2 border-0 shadow-none" />
           )}
           <div className="mt-2.5 flex items-center justify-between gap-3 border-t border-border/60 pt-2">
             <span className="min-w-0 truncate text-caption text-faint">

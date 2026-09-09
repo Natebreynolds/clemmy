@@ -3,10 +3,10 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   ArrowLeft, RefreshCw, Pause, Play, PanelRightOpen, X,
   MessageCircle, RotateCcw, AlertCircle, Database, Zap, History, FileCode2, CheckCircle2, Share2,
+  PanelLeftClose,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
-import { DogMark } from '@/components/DogMark';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { Composer } from '@/components/chat/Composer';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
@@ -26,8 +26,7 @@ import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
-import { BuildStage } from '@/components/workspaces/BuildStage';
-import { describeSpaceShape, spaceBuildProgress, spaceBuildState, spaceBuildSteps } from '@/lib/space-build';
+import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -67,7 +66,9 @@ function WorkspaceViewForId({ id }: { id: string }) {
     lastMtimeRef.current = viewMtime;
   }, [viewMtime]);
   const [busy, setBusy] = useState(false);
-  const [dockOpen, setDockOpen] = useState(false);
+  // The conversation is a COLUMN beside the canvas, open by default — the
+  // build is watched from it (owner-approved Spaces mockup, 2026-09-08).
+  const [dockOpen, setDockOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [tab, setTab] = useState<DetailTab>('health');
   const [error, setError] = useState<string | null>(null);
@@ -142,11 +143,8 @@ function WorkspaceViewForId({ id }: { id: string }) {
   // state are pure derivations over it (lib/space-build); the preview below
   // re-renders as revisions land (viewMtimeMs poll + the live action stream).
   const buildState = spaceBuildState(chat.messages);
-  const buildSteps = spaceBuildSteps(chat.messages);
-  const buildProgress = spaceBuildProgress(chat.messages);
-  const lastReply = [...chat.messages].reverse().find((m) => m.role === 'assistant')?.text;
-  const [stageDismissed, setStageDismissed] = useState(false);
-  useEffect(() => { if (buildState === 'building') setStageDismissed(false); }, [buildState]);
+  const threadEndRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { threadEndRef.current?.scrollIntoView({ block: 'end' }); }, [chat.messages]);
   // A placeholder Space whose build never started (the page was reloaded before
   // the dock sent it): the durable objective is the build request — offer to start.
   const routeBuild = (location.state as { build?: string } | null)?.build;
@@ -260,15 +258,77 @@ function WorkspaceViewForId({ id }: { id: string }) {
     }
   };
 
+  const building = buildState === 'building';
+  const firstVersionPending = building && (space.revisions?.length ?? 0) === 0;
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full">
+      {dockOpen && (
+        <aside className="flex w-[400px] shrink-0 flex-col border-r border-border bg-subtle" aria-label="Conversation with Clementine">
+          <div className="flex items-center gap-2 px-3 pb-2 pt-3">
+            <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
+              <ArrowLeft className="h-4 w-4" aria-hidden />
+            </Button>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-body font-semibold text-fg">{space.title}</p>
+              <p className="truncate text-caption text-faint">with Clementine · {describeSpaceShape(space)}</p>
+            </div>
+            <Button variant="ghost" size="icon" aria-label="Hide the conversation" onClick={() => setDockOpen(false)}>
+              <PanelLeftClose className="h-4 w-4" aria-hidden />
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3">
+            {chat.messages.length === 0 ? (
+              pendingObjective ? (
+                <div className="rounded-lg border border-border bg-surface p-4 shadow-xs">
+                  <p className="text-small font-semibold text-fg">Ready to build</p>
+                  <p className="mt-1 text-small text-muted">{pendingObjective}</p>
+                  <Button className="mt-3" size="sm" onClick={() => { void chat.send({ text: pendingObjective }); }}>Start building</Button>
+                </div>
+              ) : (
+                <p className="px-1 pt-6 text-center text-small text-muted">
+                  Ask for a change — “add a bar per rep”, “hide closed-lost” — or “what changed since the last refresh?”
+                </p>
+              )
+            ) : (
+              chat.messages.map((m) => (
+                <ChatBubble
+                  key={m.id}
+                  message={m}
+                  sessionId={chat.sessionId.current ?? undefined}
+                  executionBusy={chat.busy}
+                  onExecutePlan={chat.executePlan}
+                  onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
+                  onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
+                  onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
+                />
+              ))
+            )}
+            <div ref={threadEndRef} />
+          </div>
+          <div className="border-t border-border p-2.5">
+            <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
+            <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask for a change — “add a bar per rep”, “hide closed-lost”" />
+          </div>
+        </aside>
+      )}
+      <div className="flex min-w-0 flex-1 flex-col">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
-        <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
-          <ArrowLeft className="h-4 w-4" aria-hidden />
-        </Button>
+      <div className="relative flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
+        {!dockOpen && (
+          <>
+            <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
+              <ArrowLeft className="h-4 w-4" aria-hidden />
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => { setDockOpen(true); composerRef.current?.focus(); }}>
+              <MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem
+            </Button>
+          </>
+        )}
         <h2 className="truncate text-h3 text-fg">{space.title}</h2>
-        <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>
+        {building
+          ? <StatusPill tone="live">building</StatusPill>
+          : <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>}
+        {building && <span aria-hidden className="absolute inset-x-0 bottom-0 h-0.5 animate-pulse bg-primary/70" />}
         {openApprovals > 0 && <StatusPill tone="warning">{openApprovals} waiting</StatusPill>}
         {space.lastRefreshedAt && (
           <span className="hidden text-caption text-faint sm:inline">
@@ -366,19 +426,13 @@ function WorkspaceViewForId({ id }: { id: string }) {
           }}
         />
 
-        {!stageDismissed && (
-          <BuildStage
-            state={buildState}
-            steps={buildSteps}
-            progress={buildProgress}
-            reply={lastReply}
-            shape={space ? describeSpaceShape(space) : undefined}
-            version={space?.version}
-            pendingObjective={pendingObjective}
-            onStartBuild={() => { if (pendingObjective) void chat.send({ text: pendingObjective }); }}
-            onOpenChat={() => { setDockOpen(true); composerRef.current?.focus(); }}
-            onDismiss={() => setStageDismissed(true)}
-          />
+        {firstVersionPending && (
+          <div className="pointer-events-none absolute inset-0 grid place-items-center text-center" aria-live="polite">
+            <div>
+              <p className="text-h3 text-muted">Nothing here yet</p>
+              <p className="mt-1 text-body text-faint">Clementine is reading your data. The first version lands in a moment.</p>
+            </div>
+          </div>
         )}
 
         {/* Details drawer */}
@@ -522,53 +576,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
           </aside>
         )}
 
-        {/* Floating "Ask Clem" dock */}
-        {dockOpen ? (
-          <div className="absolute bottom-4 right-4 flex h-[480px] w-[360px] max-w-[calc(100%-2rem)] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-lg">
-            <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-              <DogMark className="h-6 w-6" />
-              <div className="min-w-0 flex-1">
-                <p className="text-small font-semibold text-fg">Ask Clem</p>
-                <p className="truncate text-caption text-faint">about “{space.title}”</p>
-              </div>
-              <button type="button" className="text-muted hover:text-fg cursor-pointer" onClick={() => setDockOpen(false)} aria-label="Close chat">
-                <X className="h-4 w-4" aria-hidden />
-              </button>
-            </div>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-              {chat.messages.length === 0 ? (
-                <p className="px-1 pt-6 text-center text-small text-muted">
-                  Ask about anything in this Space — “what changed since the last refresh?”, “draft a follow-up for the stalled deals”.
-                </p>
-              ) : (
-                chat.messages.map((m) => (
-                  <ChatBubble
-                    key={m.id}
-                    message={m}
-                    sessionId={chat.sessionId.current ?? undefined}
-                    executionBusy={chat.busy}
-                    onExecutePlan={chat.executePlan}
-                    onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
-                    onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
-                    onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
-                  />
-                ))
-              )}
-            </div>
-            <div className="border-t border-border p-2">
-              <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-              <Composer inputRef={composerRef} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask about this workspace…" />
-            </div>
-          </div>
-        ) : (
-          <button
-            type="button"
-            onClick={() => setDockOpen(true)}
-            className="absolute bottom-4 right-4 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-3 text-primary-fg shadow-lg transition-transform hover:scale-105 cursor-pointer"
-          >
-            <MessageCircle className="h-5 w-5" aria-hidden /> Ask Clem
-          </button>
-        )}
+      </div>
       </div>
     </div>
   );

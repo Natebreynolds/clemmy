@@ -42,6 +42,10 @@ export interface ActivityItem {
   status: 'running' | 'done' | 'failed' | 'interrupted';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
+  /** Client-clock settle, so a finished step keeps an honest duration. */
+  finishedAt?: number;
+  /** A step a helper reported: the agent row it nests under. */
+  parentId?: string;
   /** kind 'batch' only: live meter state from authoritative batch_progress events.
    *  `throttled` flips true while the runner is backing off a provider rate-limit. */
   batch?: { done: number; total: number; failed: number; throttled?: boolean };
@@ -417,6 +421,15 @@ const REUSED_RESULT_LABEL = 'Reused earlier result';
  *  correlated called→returned by callId when available, falling back to name for
  *  older events; agents (run_worker) are keyed by item; run_batch renders as ONE
  *  live meter row driven by authoritative batch_progress counts. */
+/** The helper a bridged frame belongs to — the stream tags a worker
+ *  session's frames with `worker: { sessionId, item }`; the agent row for that
+ *  helper is `a-<item>`. */
+function helperOf(ev: unknown): { sessionId: string; item: string } | null {
+  const w = (ev as { worker?: { sessionId?: unknown; item?: unknown } } | null)?.worker;
+  if (!w || typeof w.sessionId !== 'string' || typeof w.item !== 'string' || !w.item) return null;
+  return { sessionId: w.sessionId, item: w.item };
+}
+
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
   const d = (ev.data ?? {}) as Record<string, unknown>;
@@ -533,6 +546,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         ? {
             ...a,
             status: failed > 0 || halted ? 'failed' : 'done',
+            finishedAt: Date.now(),
             detail: undefined,
             batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
           }
@@ -579,8 +593,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       if (d.batchMode === true) return prev; // batch items render as ONE live meter row, not N tool rows
       const reused = d.reused === true;
       const detail = reused ? toolLabel : salientArgDetail(d.args);
+      // A helper's step (the stream tags frames bridged from a worker session
+      // with the helper they belong to) nests under that helper's agent row.
+      const helper = helperOf(ev);
       return [...prev, {
-        id: callId ? `t-${callId}` : `t${prev.length}-${tool}`,
+        id: callId ? `${helper ? `${helper.sessionId}:` : ''}t-${callId}` : `t${prev.length}-${tool}`,
+        ...(helper ? { parentId: `a-${helper.item}` } : {}),
         kind: 'tool',
         label: reused ? REUSED_RESULT_LABEL : toolLabel,
         ...(detail ? { detail } : {}),
@@ -611,6 +629,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         return {
           ...a,
           status,
+          finishedAt: Date.now(),
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
             ? { detail: glimpseDetail }
@@ -620,7 +639,8 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         };
       };
       if (callId) {
-        const id = `t-${callId}`;
+        const helper = helperOf(ev);
+      const id = `${helper ? `${helper.sessionId}:` : ''}t-${callId}`;
         if (prev.some((a) => a.kind === 'tool' && a.id === id)) {
           return prev.map((a) => (a.kind === 'tool' && a.id === id ? settle(a) : a));
         }
@@ -635,7 +655,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'worker_started': {
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running' }];
+      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running', startedAt: Date.now() }];
     }
     case 'worker_result': {
       // UPSERT: on non-Claude (orchestrator) lanes worker_started historically
@@ -652,6 +672,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
           ? {
               ...a,
               status,
+              finishedAt: Date.now(),
               // Keep the worker_started label (it carries the role); on failure
               // append the short reason so "<item> ✗ <reason>" reads by default.
               ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
@@ -662,10 +683,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const role = typeof d.role === 'string' ? d.role : '';
       const base = role ? `${role}: ${item}` : item;
       const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
-      return [...prev, { id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status }];
+      return [...prev, { id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: Date.now() }];
     }
     case 'worker_capped':
-      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
+      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed', finishedAt: Date.now() } : a));
     // Trust cockpit: judge verdicts + watcher steers appear as 'check' rows so
     // the strip shows not only what the agent DID but what verified it.
     case 'verdict_recorded': {
@@ -814,6 +835,15 @@ export function progressLabel(ev: HarnessEvent): string | null {
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
   const pretty = tool ? humanToolLabel(tool, d.args, d.publicSlug, d.innerTool) : '';
   switch (ev.type) {
+    case 'worker_started': {
+      const item = typeof (ev.data as { item?: unknown }).item === 'string' ? String((ev.data as { item: string }).item) : '';
+      return item ? `Handing ${item} to a helper…` : 'Spawning a helper…';
+    }
+    case 'worker_result': {
+      const item = typeof (ev.data as { item?: unknown }).item === 'string' ? String((ev.data as { item: string }).item) : '';
+      const ok = (ev.data as { ok?: unknown }).ok !== false;
+      return item ? `Helper ${ok ? 'finished' : 'could not finish'} ${item}` : (ok ? 'A helper finished' : 'A helper could not finish');
+    }
     case 'turn_started': return 'Thinking…';
     case 'turn_graph_compiled': {
       // Route/fast-path are compiled enums, not user text. Name the kind of

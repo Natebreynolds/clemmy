@@ -1050,3 +1050,37 @@ test('desktop reattach restores Plan and Execute from the exact active source', 
     assert.deepEqual(activeTurnTaskMode(events, source!), taskMode);
   }
 });
+
+test('a helper’s bridged steps nest under the helper row and keep honest durations', () => {
+  let activity = reduceActivity([], ev('worker_started', { item: 'prospects', role: 'researcher', model: 'glm-5.3', provider: 'glm' }));
+  const helper = activity.find((a) => a.kind === 'agent');
+  assert.ok(helper && helper.id === 'a-prospects' && typeof helper.startedAt === 'number', 'the spawn is a running helper row with a start anchor');
+
+  const tagged = (type: string, data: Record<string, unknown>): HarnessEvent =>
+    ({ ...ev(type, data), worker: { sessionId: 'sess-worker-abc', item: 'prospects' } }) as HarnessEvent;
+  activity = reduceActivity(activity, tagged('tool_called', { tool: 'web_search', callId: 'c1', args: { query: 'law firms in Boise' } }));
+  const step = activity.find((a) => a.kind === 'tool');
+  assert.ok(step, 'the helper’s tool call becomes a step');
+  assert.equal(step.parentId, 'a-prospects', 'the step nests under the helper that made it');
+  assert.equal(step.id, 'sess-worker-abc:t-c1', 'ids are scoped to the worker session so two helpers never collide');
+
+  activity = reduceActivity(activity, tagged('tool_returned', { tool: 'web_search', callId: 'c1', ok: true }));
+  const settled = activity.find((a) => a.id === 'sess-worker-abc:t-c1');
+  assert.equal(settled?.status, 'done');
+  assert.equal(typeof settled?.finishedAt, 'number', 'a settled step keeps its finish time for the per-step duration');
+
+  activity = reduceActivity(activity, ev('worker_result', { item: 'prospects', ok: true }));
+  const done = activity.find((a) => a.id === 'a-prospects');
+  assert.equal(done?.status, 'done');
+  assert.equal(typeof done?.finishedAt, 'number');
+
+  // An untagged tool call stays top-level.
+  activity = reduceActivity(activity, ev('tool_called', { tool: 'memory_search', callId: 'c2', args: {} }));
+  assert.equal(activity.find((a) => a.id === 't-c2')?.parentId, undefined);
+});
+
+test('the progress line says when a helper is handed work and when it finishes', () => {
+  assert.equal(progressLabel(ev('worker_started', { item: 'prospects' })), 'Handing prospects to a helper…');
+  assert.equal(progressLabel(ev('worker_result', { item: 'prospects', ok: true })), 'Helper finished prospects');
+  assert.equal(progressLabel(ev('worker_result', { item: 'prospects', ok: false })), 'Helper could not finish prospects');
+});

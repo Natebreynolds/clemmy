@@ -152,13 +152,20 @@ export function Composer({
       </div>}
       {deliveryError && <p role="alert" className="p-3 text-small text-danger">{deliveryError}</p>}
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-        <button type="button" aria-pressed={planning} disabled={busy}
-          onClick={() => changeMode(mode === 'plan' ? 'normal' : 'plan')}
-          className={cn('rounded-md border px-3 py-1 text-small font-semibold disabled:opacity-60', planning ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted hover:text-fg')}>
-          Plan
-        </button>
+        <div role="group" aria-label="Mode" className="inline-flex rounded-full bg-subtle p-0.5">
+          <button type="button" aria-pressed={!planning} disabled={busy}
+            onClick={() => changeMode('normal')}
+            className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', !planning ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}>
+            Act
+          </button>
+          <button type="button" aria-pressed={planning} disabled={busy}
+            onClick={() => changeMode('plan')}
+            className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', planning ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}>
+            Plan
+          </button>
+        </div>
         <span className="text-caption text-muted" role="status">
-          {busy && activeTaskMode?.kind === 'execute' ? 'Executing the reviewed plan' : planning ? (busy ? 'Planning · investigating with read-only tools' : 'Plan mode · investigate first, then review and Execute') : 'Normal · handle the task'}
+          {busy && activeTaskMode?.kind === 'execute' ? 'Executing the reviewed plan' : planning ? (busy ? 'Planning · investigating with read-only tools' : 'Plan · shows you the steps first, then you say go') : 'Act · does it now'}
         </span>
       </div>
       {attachments.length > 0 && (

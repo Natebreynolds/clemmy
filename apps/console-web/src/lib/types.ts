@@ -12,6 +12,9 @@ export interface HarnessEvent {
   /** Present on frames bridged from a session other than the subscribed one —
    * a background task this chat spawned mirroring its live activity here. */
   sessionId?: string;
+  /** Present on frames bridged from a helper's worker session — the helper
+   *  (`item`) whose agent row these steps nest under. */
+  worker?: { sessionId: string; item: string };
 }
 
 export interface ChatPostResult {

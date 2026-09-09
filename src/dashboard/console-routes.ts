@@ -14611,8 +14611,28 @@ export function registerConsoleRoutes(
       const ownEvents = listHarnessEvents(sessionId, { sinceSeq, limit: 500 });
       const workflowEvents = collectBridgedWorkflowReplay(sessionId, ownEvents)
         .filter((ev) => ev.seq > sinceSeq);
-      const merged = [...ownEvents, ...workflowEvents].sort((a, b) => a.seq - b.seq);
-      const replay = projectHarnessEventsForPublic(merged.slice(-500));
+      // Helpers this turn spawned: the raw worker_started carries the child
+      // session id, so a reconnect mid-run re-seeds the helper's steps too.
+      const workerItems = new Map<string, string>();
+      for (const ev of ownEvents) {
+        if (ev.type !== 'worker_started') continue;
+        const child = (ev.data as { childSessionId?: unknown }).childSessionId;
+        const item = (ev.data as { item?: unknown }).item;
+        if (typeof child === 'string' && child.startsWith('sess-worker-')) workerItems.set(child, typeof item === 'string' ? item : '');
+      }
+      const workerEvents: HarnessEventRow[] = [];
+      for (const child of workerItems.keys()) {
+        try {
+          for (const ev of listHarnessEvents(child, { sinceSeq, limit: 200 })) {
+            if (isCanonicalBridgedActivity(ev)) workerEvents.push(ev);
+          }
+        } catch { /* a missing worker session only costs its replay */ }
+      }
+      const merged = [...ownEvents, ...workflowEvents, ...workerEvents].sort((a, b) => a.seq - b.seq);
+      const replay = projectHarnessEventsForPublic(merged.slice(-500)).map((row) => {
+        const item = workerItems.get(row.sessionId);
+        return item === undefined ? row : { ...row, worker: { sessionId: row.sessionId, item } };
+      });
       writeEvent('replay', { sessionId, sessionStatus: session.status, events: replay });
     } catch (err) {
       console.error('desktop harness replay failed:', err);
@@ -14630,7 +14650,30 @@ export function registerConsoleRoutes(
     // sessionId so clients can tell delegated work from the foreground turn.
     const bridgeOriginCache = new Map<string, string | null>();
     const workflowOriginCache = new Map<string, string[]>();
+    // A spawned helper runs under its own worker session (`sess-worker-*`)
+    // whose metadata carries the lineage — parent session + the item it was
+    // handed. Its tool frames used to die here (the bubble showed "1 agent
+    // working" and nothing else; owner 2026-09-08: "seeing what Clem is doing
+    // while she's doing it is key"). Now they bridge into the parent stream
+    // tagged with the helper they belong to, so the card nests them.
+    const workerLineageCache = new Map<string, { parentSessionId: string; item: string } | null>();
+    const workerLineage = (eventSessionId: string): { parentSessionId: string; item: string } | null => {
+      let lineage = workerLineageCache.get(eventSessionId);
+      if (lineage === undefined) {
+        try {
+          const meta = getHarnessSession(eventSessionId)?.metadata ?? {};
+          const parent = typeof meta.parentSessionId === 'string' ? meta.parentSessionId : '';
+          const item = typeof meta.item === 'string' ? meta.item : '';
+          lineage = parent ? { parentSessionId: parent, item } : null;
+        } catch { lineage = null; }
+        workerLineageCache.set(eventSessionId, lineage);
+      }
+      return lineage;
+    };
     const bridgesToThisSession = (eventSessionId: string): boolean => {
+      if (eventSessionId.startsWith('sess-worker-')) {
+        return workerLineage(eventSessionId)?.parentSessionId === sessionId;
+      }
       if (eventSessionId.startsWith('background:')) {
         let origin = bridgeOriginCache.get(eventSessionId);
         if (origin === undefined) {
@@ -14659,6 +14702,11 @@ export function registerConsoleRoutes(
       if (event.sessionId !== sessionId) {
         if (!isCanonicalBridgedActivity(event.event)) return;
         if (!bridgesToThisSession(event.sessionId)) return;
+        if (event.sessionId.startsWith('sess-worker-')) {
+          const lineage = workerLineage(event.sessionId);
+          writeEvent('event', { ...event.event, worker: { sessionId: event.sessionId, item: lineage?.item ?? '' } });
+          return;
+        }
       }
       writeEvent('event', event.event);
     });
