@@ -8063,8 +8063,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
         if (!effective.toolName || args.name !== effective.toolName) continue;
         const identity = exactHostIdentity();
-        if (!nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef: args.requirement_id,
-          operationId: effective.toolName, effect: 'local_write', args: effective.args })) continue;
+        const localCall = { ...identity, capabilityRef: args.requirement_id,
+          operationId: effective.toolName, args: effective.args };
+        if (!nominateDisclosedLocalPlanningDefinition({ ...localCall, effect: 'local_write' })) {
+          const { prepareHostLocalCall } = await import('./host-local-call-preparation.js');
+          if (!await prepareHostLocalCall(agent, localCall)) continue;
+        }
         const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
         const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
         if (!prepared) continue;

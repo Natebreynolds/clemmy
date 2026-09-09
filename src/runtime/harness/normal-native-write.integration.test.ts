@@ -24,6 +24,8 @@ const capabilityEnvelopes = await import('../../agents/capability-envelope.js');
 const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifestStores = await import('./capability-manifest-store.js');
 const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+const localPreparation = await import('./host-local-call-preparation.js');
+const localDefinitions = await import('./local-planning-capability.js');
 const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
 const workCallTools = await import('../../tools/work-call.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
@@ -281,4 +283,58 @@ test('separate accepted Normal workflow create and edit use their own exact nati
   assert.equal(eventlog.listEvents(session.id, { types: ['approval_requested'] }).length, 0);
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
     .get(session.id) as { n: number }).n, 2, 'only create and edit cross; the saved workflow never executes');
+});
+
+
+test('an exact file overwrite reaches existing consent on its first call without a rediscovery refusal', async () => {
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'known-native-overwrite', kind: 'chat', userId: 'native-fixture-owner' });
+  const file = path.join(TEST_HOME, 'known-draft.html');
+  writeFileSync(file, 'Original draft\n');
+  const prompt = `Update ${file} to Revised draft.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, taskMode: { version: 1, kind: 'normal' } } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const args = { path: file, content: 'Revised draft', mode: 'overwrite', append: null };
+  const capabilityRef = 'cap:local:write_file:overwrite';
+  assert.equal(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef,
+    operationId: 'write_file', effect: 'local_write', args }), null);
+  const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
+    reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
+    settlementLane: 'byo', hostPlanningReady: () => true }) as never);
+  const model = stubModel([[toolCall('known-file-edit', 'work_call', {
+    requirement_id: capabilityRef, source_call_ids: null, source_record_ids: null,
+    universe_item_id: null, universe_selector: null, seal_amendment: null,
+    name: 'write_file', args_json: JSON.stringify(args),
+  })], [textMessage('Unexpected extra model request.')]]);
+  const agent = { model, tools: [workCall] };
+  localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set(['write_file']) });
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
+    universeTools: [workCall], activeToolNames: ['work_call'], policyHash: 'known-file-overwrite',
+    budget: { maxUncachedTokens: 20_000, maxModelCalls: 4, maxToolCalls: 4, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) throw new Error('native envelope unavailable');
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(4),
+    behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: prompt }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
+  assert.equal(model.calls(), 1, JSON.stringify(result.history));
+  assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
+  assert.ok(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef,
+    operationId: 'write_file', effect: 'local_write', args }));
+  assert.equal(result.hasInterruptions, true);
+  assert.equal(result.interruptions.length, 1);
+  assert.deepEqual(result.interruptions[0]?.consentCall?.risk,
+    { reversibility: 'irreversible', consequence: 'update', destructive: true },
+    'the existing consent request, rather than a search refusal, owns the pause');
+  assert.equal(readFileSync(file, 'utf8'), 'Original draft\n', 'preparation itself never authorizes the write');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0);
 });

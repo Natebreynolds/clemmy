@@ -2161,8 +2161,8 @@ export async function primePrimaryModelPlanningCatalog(input: {
   };
 }
 
-/** Monotonically disclose only exact operations returned by this source's
- * visible foreground tool_search. Existing live entries remain executable;
+/** Monotonically disclose exact operations from foreground tool_search or
+ * host preparation of a configured native call. Existing live entries remain executable;
  * novel provider entries are staged and cannot cross a business boundary
  * until plan_task publishes and revalidates the selected subset. */
 export async function disclosePrimaryModelPlanningCapabilities(input: {

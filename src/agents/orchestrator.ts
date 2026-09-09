@@ -34,6 +34,7 @@ import { detectMultiItemIntentFromConversation } from '../runtime/harness/contex
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { renderCapabilityCandidateCard, type TurnCapabilityCandidates } from '../runtime/read-path/capability-candidates.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
+import { bindHostLocalCallPreparation } from '../runtime/harness/host-local-call-preparation.js';
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
@@ -3947,6 +3948,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
+  if (hostFreshPlanning && workCallOptions?.reachableBuiltinNames) {
+    bindHostLocalCallPreparation(agent, {
+      planning: hostFreshPlanning,
+      configuredNames: workCallOptions.reachableBuiltinNames,
+      deniedNames: workCallOptions.deniedNames,
+    });
+  }
   // Clem 4, Stage 4 activation slice 2: seal the admitted CATALOG UNIVERSE —
   // the full scoped discovery set (every deferred tool with its real schema)
   // plus the structural/dispatcher tools — and record the active surface as
