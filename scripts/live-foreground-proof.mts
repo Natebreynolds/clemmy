@@ -88,11 +88,17 @@ async function api(url: string, body?: unknown, mobileRequestKey?: string): Prom
       'x-clem-device-proof': `${unsigned}.${signature}`,
       ...(mobileRequestKey ? { 'idempotency-key': mobileRequestKey } : {}) };
   }
+  const startedAt = Date.now();
   const response = await fetch(`${baseUrl}${url}`, {
     method, headers: requestHeaders,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(20_000),
+    // A slow daemon is evidence, not a driver failure: record the latency and
+    // let the assertions judge it (live 2026-09-09: the post-terminal
+    // build-info read exceeded 20 s after a 50-write turn).
+    signal: AbortSignal.timeout(90_000),
   });
+  const latencyMs = Date.now() - startedAt;
+  ((report as { requestLatencies?: unknown[] }).requestLatencies ??= []).push({ at: new Date(startedAt).toISOString(), url, latencyMs, status: response.status });
   return { status: response.status, body: await response.json() as Record<string, unknown> };
 }
 try {
