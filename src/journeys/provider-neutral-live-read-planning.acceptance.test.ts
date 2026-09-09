@@ -98,8 +98,8 @@ const handle = (request) => {
   if (request.method === 'ping') { send(request.id, {}); return; }
   if (request.method === 'tools/list') {
     bump(process.env.LR_LIST_COUNTER);
-    send(request.id, { tools: [{
-      name: process.env.LR_TOOL_NAME,
+    send(request.id, { tools: [process.env.LR_TOOL_NAME, process.env.LR_SECOND_TOOL_NAME].filter(Boolean).map(name => ({
+      name,
       description: 'Read generated records from the exact configured peer.',
       inputSchema: {
         type: 'object',
@@ -113,7 +113,7 @@ const handle = (request) => {
         idempotentHint: true,
         openWorldHint: true,
       },
-    }] });
+    })) });
     return;
   }
   if (request.method === 'tools/call') {
@@ -187,8 +187,8 @@ function liveReadSource(scope: Scope, identity: { sessionId: string; sourceUserS
   const sources = providerSources.buildAuthorizedToolSearchCandidateSources(scope, identity);
   assert.deepEqual(
     sources.map((source) => source.kind),
-    ['authorized_live_read_registry', 'authorized_composio'],
-    'planning callers mount one registry path and never the legacy MCP fallback',
+    ['authorized_live_read_registry', 'authorized_external_mcp', 'authorized_composio'],
+    'native MCP discovery and the reviewed CLI registry are disjoint sources',
   );
   const source = sources.find((candidate) => candidate.kind === 'authorized_live_read_registry');
   assert.ok(source);
@@ -319,7 +319,8 @@ async function citeAdmitAndBind(input: {
     unavailable: body.unavailable,
   }));
   assert.match(row?.capabilityRef ?? '', /^cap:live:/);
-  assert.equal(row?.planningProvenance, 'authorized_live_read_registry');
+  assert.equal(row?.planningProvenance, input.providerKind === 'native_mcp'
+    ? 'authorized_external_mcp' : 'authorized_live_read_registry');
   assert.equal(row?.planningRefStatus, undefined);
 
   const operationId = `read_${input.label}_${nonce}`;
@@ -389,7 +390,7 @@ test.after(async () => {
   rmSync(HOME, { recursive: true, force: true });
 });
 
-test('real reviewed CLI and native MCP enter planning only through the provider-neutral live-read registry', {
+test('disjoint CLI and native MCP discovery preserve exact provider-neutral read authority', {
   timeout: 120_000,
 }, async () => {
   writeFileSync(cliExecutable, [
@@ -463,7 +464,8 @@ test('real reviewed CLI and native MCP enter planning only through the provider-
     allowedToolNames: [],
     maxTools: 0,
   }, deniedRun.identity);
-  assert.deepEqual(await denied.source.search({ query: mcpOperation, limit: 8 }), []);
+  assert.deepEqual(await denied.sources.find(source => source.kind === 'authorized_external_mcp')!
+    .search({ query: mcpOperation, limit: 8 }), []);
   assert.equal(countLines(mcpStartupCounter), 0, 'scope-denied MCP discovery started its transport');
   assert.deepEqual(manifestStores.peekCapabilityManifestStore()?.list(), []);
   assert.deepEqual(catalogs.peekHostCapabilityCatalogFactory()?.snapshot(), []);
@@ -506,6 +508,34 @@ test('real reviewed CLI and native MCP enter planning only through the provider-
   await mcpServers.invalidateConfiguredMcpServers();
   mcpConfig.invalidateMcpServerDiscoveryCache();
 
+  // A search offers choices; it must not require one globally unique read or
+  // every word in the owner's request to occur in tool metadata.
+  const configPath = path.join(mcpDir, 'servers.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  const secondTool = `read_prior_records_${nonce}`;
+  config[mcpServerName].env.LR_SECOND_TOOL_NAME = secondTool;
+  writeFileSync(configPath, JSON.stringify(config), 'utf8');
+  mcpConfig.invalidateMcpServerDiscoveryCache();
+  resetAuthoritySurfaces();
+  const naturalQuery = 'read current and prior records for my business';
+  const choicesRun = await createPlanning('natural-choices', naturalQuery);
+  const choices = await ordinaryPlanningSearch({
+    objective: naturalQuery,
+    scope: { reason: 'owner-connected reader choices', authority: 'server_set',
+      allowedServerSlugs: [mcpServerName], maxTools: 8 },
+    ...choicesRun,
+  });
+  const choiceRows = choices.results.filter(row => [mcpOperation, `${mcpServerName}__${secondTool}`].includes(row.name));
+  assert.equal(choiceRows.length, 2, JSON.stringify(choices));
+  assert.ok(choiceRows.every(row => row.planningProvenance === 'authorized_external_mcp'
+    && /^cap:live:v1:/.test(row.capabilityRef ?? '')), JSON.stringify(choiceRows));
+  assert.equal(new Set(choiceRows.map(row => row.capabilityRef)).size, 2);
+  assert.equal(countLines(mcpBusinessCounter), 0, 'offering two choices executed a business read');
+  await mcpServers.invalidateConfiguredMcpServers();
+  delete config[mcpServerName].env.LR_SECOND_TOOL_NAME;
+  writeFileSync(configPath, JSON.stringify(config), 'utf8');
+  mcpConfig.invalidateMcpServerDiscoveryCache();
+
   // Tokens are source-bound, process-opaque nominations. Current host state,
   // not candidate JSON, decides whether disclosure can mint a ref.
   resetAuthoritySurfaces();
@@ -525,6 +555,11 @@ test('real reviewed CLI and native MCP enter planning only through the provider-
     ...candidate,
     sourceKind: 'authorized_live_read_registry' as const,
   };
+
+  assert.deepEqual(await semantic.disclosePrimaryModelPlanningCapabilities({
+    authority: tokenRun.planning.authority,
+    candidates: [{ ...disclosureCandidate, sourceKind: 'authorized_external_mcp' as const }],
+  }), {}, 'an MCP discovery label consumed an unrelated reviewed CLI proof');
 
   const otherRun = await createPlanning('other-source', cliOperation);
   assert.deepEqual(await semantic.disclosePrimaryModelPlanningCapabilities({

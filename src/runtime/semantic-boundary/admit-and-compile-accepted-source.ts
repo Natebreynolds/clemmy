@@ -2294,7 +2294,8 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       }
       continue;
     }
-    if (candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE) {
+    if (candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE
+      || (candidate.sourceKind === 'authorized_external_mcp' && candidate.planningAuthority)) {
       const reopened = inspectAuthorizedLiveReadPlanningAuthority({
         authority: candidate.planningAuthority,
         identity: {
@@ -2305,7 +2306,8 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
         carrier: candidate.carrier,
         schema: candidate.schema,
       });
-      if (!reopened) continue;
+      if (!reopened || (candidate.sourceKind === 'authorized_external_mcp'
+        && reopened.manifest.providerKind !== 'native_mcp')) continue;
       const descriptor = hostDescriptorFromRegistered(reopened.entry);
       const providerDefinition = stagedProviderDefinitionFromRegistered(reopened.entry);
       if (

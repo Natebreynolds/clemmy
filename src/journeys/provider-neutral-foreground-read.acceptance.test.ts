@@ -496,7 +496,9 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
         assert.ok(tools.includes('tool_search'));
         assert.equal(tools.includes('work_call'), false);
         output = [functionCall(generated(seed, 'search_call'), 'tool_search', {
-          query: `retrieve every page of ${objective}`,
+          // Natural discovery adds useful context that need not occur verbatim
+          // in a tools/list description. It must not hide a connected reader.
+          query: `retrieve current ${objective} measurements from my connected service`,
           role_key: 'clause-0:read',
           limit: 4,
           cursor: null,
