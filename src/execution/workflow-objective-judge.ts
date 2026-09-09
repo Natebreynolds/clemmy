@@ -42,7 +42,6 @@ export interface WorkflowTargetVerdict {
   unavailable?: boolean;
 }
 
-const MAX_OBJECTIVE_CHARS = 2000;
 // >= the binding judge cap (JUDGE_RESPONSE_MAX_CHARS) so this layer never
 // pre-starves the deliverable below what the judge can actually see; matches
 // DEFAULT_TOOL_RESULT_MAX_CHARS so a deliverable the model already saw in full
@@ -52,7 +51,6 @@ const MAX_DELIVERABLE_CHARS = 12000;
 // visible is an artifact of OUR length window, never a real target miss — a
 // genuine miss names a missing TARGET element. Suppressed when we windowed.
 const TRUNCATION_SHAPED_GAP = /truncat|cut ?off|incomplete (response|text|json|output|deliverable|data)|no complete verifiable|not fully (visible|shown|present)|appears? (to be )?(cut|incomplete)|omitted/i;
-const MAX_INPUT_SCALAR_CHARS = 200;
 const SEND_TARGET_RE = /\b(?:send|sent|emails?|e-?mails?|emailing|notify|notifies|notification|message|dm)\b/i;
 const SEND_EVIDENCE_RE = /(?:"(?:sent|notified|delivered)"\s*:\s*true\b|(?:^|[\s,{])(?:sent|notified|delivered)\s*[:=]\s*true\b)/i;
 const SEND_PROOF_RE = /"?(?:logId|messageId|notificationId|emailId|sentAt|sent_at|to|recipient|recipients|from|subject|summary)"?\s*[:=]/i;
@@ -61,7 +59,7 @@ const SEND_NEGATIVE_RE = /(?:"blocked"\s*:\s*true\b|status["']?\s*:\s*["']?block
 type WorkflowTargetFields = Pick<
   WorkflowDefinition,
   'name' | 'description' | 'description_body' | 'whenToUse' | 'synthesis'
->;
+> & { steps?: LegacyGoalStep[] };
 
 type LegacyGoalStep = {
   id?: string;
@@ -77,9 +75,9 @@ export interface LegacyWorkflowRunGoal {
   maxAttempts: 1;
 }
 
-function truncateScalar(v: unknown): string {
+function renderInput(v: unknown): string {
   const s = typeof v === 'string' ? v : safeJson(v);
-  return (s ?? '').slice(0, MAX_INPUT_SCALAR_CHARS);
+  return s ?? '';
 }
 
 function safeJson(v: unknown): string {
@@ -107,12 +105,19 @@ export function buildWorkflowObjective(
   if (workflow.synthesis?.prompt?.trim()) {
     pushUnique(`The final deliverable should satisfy: ${workflow.synthesis.prompt.trim()}`);
   }
+  // Descriptions explain intent, but the authored steps and output contracts
+  // define the actual work. Omitting them made an exact-response workflow
+  // fail review for not producing an invented report. Keep their complete
+  // content, including requirements beyond a long descriptive preamble.
+  if (workflow.steps?.length) {
+    parts.push(`Authored workflow steps and output contracts:\n${safeJson(workflow.steps)}`);
+  }
   const inputKeys = Object.keys(inputs ?? {});
   if (inputKeys.length) {
-    const rendered = inputKeys.map((k) => `${k}=${truncateScalar(inputs[k])}`).join(', ');
+    const rendered = inputKeys.map((k) => `${k}=${renderInput(inputs[k])}`).join(', ');
     parts.push(`This run's inputs: ${rendered}`);
   }
-  return parts.join('\n').slice(0, MAX_OBJECTIVE_CHARS).trim();
+  return parts.join('\n').trim();
 }
 
 function appendContractCriteria(out: string[], step: LegacyGoalStep): void {
@@ -183,7 +188,7 @@ function deterministicSendEvidence(objective: string, deliverable: string): stri
 }
 
 export interface JudgeWorkflowTargetInput {
-  workflow: WorkflowTargetFields & { steps?: unknown };
+  workflow: WorkflowTargetFields;
   inputs: Record<string, unknown>;
   finalOutput: unknown;
   /** Optional explicit/provisional goal. Legacy workflows pass a derived one. */
@@ -239,6 +244,7 @@ export async function judgeWorkflowTarget(
         ]
       : []),
     '',
+    'Judge the authored instructions and output contracts, using descriptions as context. Do not infer extra work from a workflow or step name. A requested literal response is itself the deliverable; do not demand reports, files, external actions or check results unless the workflow asks for them.',
     'The run is successful ONLY if the deliverable below fully reaches that target. Be CONSERVATIVE: report NOT done only when a SPECIFIC required part of the target is clearly missing or unfulfilled in the deliverable. If the deliverable plausibly satisfies the target, accept it (done=true).',
     ...(wasWindowedForJudge
       ? ['', 'NOTE: the deliverable is shown to you windowed to its head and tail for length. Judge ONLY the visible content; NEVER report NOT done merely because the deliverable looks cut off or an expected item might sit in the omitted middle.']
