@@ -50,6 +50,7 @@ import { readEmbeddingStats, readLiveFactEmbeddingCoverage, getEmbeddingHealth }
 import { countActiveFacts, FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
+import { listRecallUses, listSessionRecallRunIds, readRecallRun } from '../memory/recall-usage.js';
 import { MEMORY_DB_PATH, openMemoryDb, type FocusRow } from '../memory/db.js';
 import { auditMemoryReadiness } from '../memory/readiness.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
@@ -3805,12 +3806,26 @@ export function registerConsoleRoutes(
     const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '16', 10) || 16));
     const depthRaw = parseInt(typeof req.query.depth === 'string' ? req.query.depth : '1', 10);
     const graphDepth: 0 | 1 | 2 = depthRaw >= 2 ? 2 : depthRaw <= 0 ? 0 : 1;
+    // Facets the engine already understands (MemoryRecallContext) — the
+    // route used to forward only q/limit/depth, so the Memory tab could not
+    // narrow by kind or time (Memory redesign, 2026-09-08).
+    const STORE_NAMES = new Set(['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure', 'deliverable']);
+    const stores = typeof req.query.stores === 'string'
+      ? req.query.stores.split(',').map((v) => v.trim()).filter((v): v is 'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure' | 'deliverable' => STORE_NAMES.has(v))
+      : [];
+    const asOf = typeof req.query.asOf === 'string' && Number.isFinite(Date.parse(req.query.asOf)) ? req.query.asOf : undefined;
+    const purpose = req.query.purpose === 'ambient' ? 'ambient' as const : undefined;
     if (!query) {
       res.json({ query: '', hits: [], answerability: 'insufficient', diagnostics: { candidates: 0, stores: [], elapsedMs: 0 } });
       return;
     }
     try {
-      const result = await recallMemory(query, { limit, graphDepth });
+      const result = await recallMemory(query, {
+        limit, graphDepth,
+        ...(stores.length > 0 ? { stores } : {}),
+        ...(asOf ? { asOf } : {}),
+        ...(purpose ? { purpose } : {}),
+      });
       scheduleRecallShadow({ query, surface: 'console_search', limit, primary: result });
       res.json({ query, ...result });
     } catch (err) {
@@ -4346,6 +4361,76 @@ export function registerConsoleRoutes(
     }
   });
 
+  /** Bulk verbs over facts — forget / restore / pin / unpin many at once.
+   *  The Memory tab used to loop one POST per fact (an N+1 of up to a
+   *  thousand calls for "forget everything from this source"). */
+  app.post('/api/console/memory/facts/bulk', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { ids?: unknown; action?: unknown };
+    const action = body.action;
+    if (action !== 'forget' && action !== 'restore' && action !== 'pin' && action !== 'unpin') { res.status(400).json({ error: 'action must be forget, restore, pin or unpin' }); return; }
+    const ids = Array.isArray(body.ids)
+      ? [...new Set(body.ids.map((v) => (typeof v === 'number' ? v : parseInt(String(v), 10))).filter((n) => Number.isFinite(n) && n > 0))].slice(0, 500)
+      : [];
+    if (ids.length === 0) { res.status(400).json({ error: 'ids required' }); return; }
+    try {
+      const done: number[] = [];
+      const skipped: number[] = [];
+      for (const id of ids) {
+        const ok = action === 'forget' ? forgetFact(id)
+          : action === 'restore' ? reactivateFact(id)
+          : setFactPinned(id, action === 'pin');
+        (ok ? done : skipped).push(id);
+      }
+      if (done.length > 0) bumpStableContextGeneration();
+      res.json({ ok: true, action, done, skipped });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * What she remembered for a conversation: the recall runs recorded under
+   * this session (what was offered) joined with the uses (what was actually
+   * used or judged not useful). Purely a read; the data existed since v19 but
+   * nothing surfaced it (Memory redesign, 2026-09-08).
+   */
+  app.get('/api/console/sessions/:id/recall', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = String(req.params.id ?? '').trim();
+    const sinceRaw = typeof req.query.since === 'string' ? req.query.since : '';
+    const since = Number.isFinite(Date.parse(sinceRaw)) ? sinceRaw : new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    if (!sessionId) { res.status(400).json({ error: 'session id required' }); return; }
+    try {
+      const runIds = listSessionRecallRunIds(sessionId, since, { limit: 20 });
+      const runs = runIds.map((id) => {
+        const run = readRecallRun(id);
+        if (!run) return null;
+        const uses = listRecallUses(id);
+        const used = new Map(uses.map((u) => [`${u.type}:${u.id}`, u.outcome]));
+        const refs = run.candidateRefs.map((ref) => {
+          const key = `${ref.type}:${ref.id}`;
+          let text = typeof ref.snippet === 'string' ? ref.snippet : '';
+          let kind: string | undefined;
+          let source: string | undefined;
+          if (ref.type === 'fact') {
+            const n = parseInt(String(ref.id), 10);
+            const fact = Number.isFinite(n) ? getFact(n) : null;
+            if (fact) { text = text || fact.content; kind = fact.kind; source = fact.derivedFrom?.tool ?? undefined; }
+          }
+          return { type: ref.type, id: String(ref.id), text, ...(kind ? { kind } : {}), ...(source ? { source } : {}), outcome: used.get(key) ?? 'offered' };
+        });
+        return { id: run.id, objective: run.objective, surface: run.surface, answerability: run.answerability, createdAt: run.createdAt, refs };
+      }).filter((r): r is NonNullable<typeof r> => r !== null);
+      const usedRefs = runs.flatMap((r) => r.refs.filter((ref) => ref.outcome === 'used'));
+      const seen = new Set<string>();
+      const used = usedRefs.filter((ref) => { const k = `${ref.type}:${ref.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
+      res.json({ sessionId, since, runs, used });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Restore a soft-deleted (forgotten / auto-decayed) fact. The reversibility
    * half of forget — soft-delete keeps the row, this brings it back. Idempotent
@@ -4642,8 +4727,18 @@ export function registerConsoleRoutes(
       const promptContext = (() => {
         try { return readPromptContextHealth(30); } catch { return undefined; }
       })();
+      // "Last tidy": the newest hygiene audit entry (nightly decay/dedup/merge).
+      // The health payload never carried a timestamp, so the tab could not say
+      // when memory was last looked after.
+      const lastHygiene = (() => {
+        try {
+          const entry = readHygieneAudit(1)[0];
+          return entry ? { at: entry.at, kind: entry.kind, count: entry.ids.length } : null;
+        } catch { return null; }
+      })();
       res.json({
         facts: { active: facts, inactive: factsInactive, total: factsTotal, pinned },
+        lastHygiene,
         entities,
         entityIdentity: { canonical: entities, redirects: entityRedirects, conflicts: entityIdentityConflicts },
         episodicPointers: episodic,

@@ -79,6 +79,9 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   text: string;
   status?: MessageStatus;
+  /** Client clock when this reply's turn started — the recall receipts for the
+   *  turn are read back "since" this moment. */
+  startedAt?: number;
   /** The backend's typed terminal; see chat-engine TerminalFacts. */
   terminal?: TerminalFacts;
   progress?: string;
@@ -1506,7 +1509,7 @@ export function useChat(options?: UseChatOptions) {
     setMessages((prev) => [
       ...prev,
       { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode },
-      { id: assistantId, role: 'assistant', text: '', status: 'thinking', taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
+      { id: assistantId, role: 'assistant', text: '', status: 'thinking', startedAt: Date.now(), taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
     ]);
     setBusy(true);
 

@@ -248,6 +248,19 @@ export function listSessionRecallRunIds(
   }
 }
 
+/** The refs a run recorded as used or not useful — the receipt behind
+ *  "what she remembered for this answer". */
+export function listRecallUses(recallId: string): Array<{ type: string; id: string; outcome: 'used' | 'not_useful'; detail: string | null; recordedAt: string }> {
+  try {
+    const rows = openMemoryDb().prepare(`
+      SELECT ref_type, ref_id, outcome, detail, recorded_at FROM memory_recall_uses WHERE recall_id = ? ORDER BY recorded_at ASC
+    `).all(recallId) as Array<{ ref_type: string; ref_id: string; outcome: 'used' | 'not_useful'; detail: string | null; recorded_at: string }>;
+    return rows.map((row) => ({ type: row.ref_type, id: row.ref_id, outcome: row.outcome, detail: row.detail, recordedAt: row.recorded_at }));
+  } catch {
+    return [];
+  }
+}
+
 /** Load an unexpired recall run with its candidate refs (snippets included when
  *  the producer recorded them). Returns null for unknown or expired runs. */
 export function readRecallRun(recallId: string, nowIso = new Date().toISOString()): RecallRun | null {

@@ -124,8 +124,24 @@ export interface MemoryHit {
   validFrom?: string;
   validTo?: string;
 }
-export const searchMemory = (q: string) =>
-  apiGet<{ query: string; hits: MemoryHit[]; answerability: 'supported' | 'partial' | 'insufficient'; diagnostics: { candidates: number; stores: string[]; elapsedMs: number } }>(`/api/console/memory/search-all?q=${encodeURIComponent(q)}`);
+export type MemoryStore = 'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure' | 'deliverable';
+export interface MemorySearchResult { query: string; hits: MemoryHit[]; answerability: 'supported' | 'partial' | 'insufficient'; diagnostics: { candidates: number; stores: string[]; elapsedMs: number } }
+/** One search across every store, with the facets the engine understands. */
+export const searchMemory = (q: string, opts: { stores?: MemoryStore[]; asOf?: string; limit?: number } = {}) => {
+  const params = new URLSearchParams({ q });
+  if (opts.stores?.length) params.set('stores', opts.stores.join(','));
+  if (opts.asOf) params.set('asOf', opts.asOf);
+  if (opts.limit) params.set('limit', String(opts.limit));
+  return apiGet<MemorySearchResult>(`/api/console/memory/search-all?${params.toString()}`);
+};
+/** Forget / restore / pin / unpin many facts in one call. */
+export const bulkFacts = (ids: Array<number | string>, action: 'forget' | 'restore' | 'pin' | 'unpin') =>
+  apiPost<{ ok: boolean; action: string; done: number[]; skipped: number[] }>('/api/console/memory/facts/bulk', { ids: ids.map((v) => Number(v)), action });
+/** What she remembered for a conversation — recall runs joined with their uses. */
+export interface SessionRecallRef { type: string; id: string; text: string; kind?: string; source?: string; outcome: 'used' | 'not_useful' | 'offered' }
+export interface SessionRecall { sessionId: string; since: string; runs: Array<{ id: string; objective: string; surface: string; answerability: string; createdAt: string; refs: SessionRecallRef[] }>; used: SessionRecallRef[] }
+export const getSessionRecall = (sessionId: string, since?: string) =>
+  apiGet<SessionRecall>(`/api/console/sessions/${encodeURIComponent(sessionId)}/recall${since ? `?since=${encodeURIComponent(since)}` : ''}`);
 
 export type MemoryEpisodeKind = 'user_turn' | 'tool_result' | 'import' | 'manual' | 'reflection';
 export type MemoryEpisodeStatus = 'available' | 'partial' | 'missing' | 'pending' | 'expired';
@@ -270,6 +286,9 @@ export const getBrainHealth = () => apiGet<BrainHealth>('/api/console/brain/heal
  *  (no embedding key / circuit-broken) legible in the Memory screen. */
 export interface MemoryHealth {
   facts?: { active?: number; inactive?: number; total?: number; pinned?: number };
+  /** The newest hygiene audit entry — when memory was last tidied and what it did. */
+  lastHygiene?: { at: string; kind: string; count: number } | null;
+  entityIdentity?: { canonical?: number; redirects?: number; conflicts?: number };
   entities?: number;
   episodicPointers?: number;
   focusActive?: number;

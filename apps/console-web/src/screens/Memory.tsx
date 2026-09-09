@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
-  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
+  Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
   ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Layers,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -35,66 +35,147 @@ import {
   type MemoryEpisode, type MemoryEpisodeKind, type MemoryEpisodeStatus,
 } from '@/lib/memory';
 import { memoryAssuranceView, memoryClaimTemporalStatus } from '@/lib/memory-assurance';
+import { HitRow } from '@/components/memory/HitRow';
+import { HealthStrip } from '@/components/memory/HealthStrip';
+import { ReviewPane } from '@/components/memory/ReviewPane';
+import { LearnedPane } from '@/components/memory/LearnedPane';
+import { MemoryDetail } from '@/components/memory/MemoryDetail';
+import type { MemoryStore } from '@/lib/memory';
 
 type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
+
+const KIND_FACETS: Array<{ key: MemoryStore | 'all'; label: string }> = [
+  { key: 'all', label: 'All' }, { key: 'fact', label: 'Facts' }, { key: 'entity', label: 'People' }, { key: 'note', label: 'Notes' }, { key: 'procedure', label: 'How-tos' }, { key: 'episode', label: 'Moments' },
+];
+type Scope = 'all' | 'week' | 'meetings' | 'salesforce';
+const SCOPE_FACETS: Array<{ key: Scope; label: string }> = [
+  { key: 'week', label: 'This week' }, { key: 'meetings', label: 'From meetings' }, { key: 'salesforce', label: 'From Salesforce' },
+];
+function inScope(hit: MemoryHit, scope: Scope): boolean {
+  if (scope === 'all') return true;
+  if (scope === 'week') { const t = hit.validFrom ? Date.parse(hit.validFrom) : NaN; return Number.isFinite(t) && t >= Date.now() - 7 * 24 * 60 * 60 * 1000; }
+  const uris = hit.evidence.map((e) => e.sourceUri ?? '').join(' ');
+  if (scope === 'meetings') return /meeting|recall|transcript/i.test(uris) || hit.ref.type === 'episode';
+  return /salesforce/i.test(uris);
+}
+/** A fact from the Learned pane opens in the same detail panel a search hit does. */
+function factToHit(f: Fact): MemoryHit {
+  return {
+    ref: { type: 'fact', id: f.id }, text: f.content, score: 1, confidence: typeof f.confidence === 'number' ? f.confidence : 0.7,
+    evidence: (f.evidence ?? []).map((e) => ({ episodeId: e.episodeId, excerpt: e.excerpt, ...(e.sourceUri ? { sourceUri: e.sourceUri } : {}) })),
+    whyRecalled: [], ...(f.validFrom || f.createdAt ? { validFrom: (f.validFrom ?? f.createdAt) as string } : {}), ...(f.validTo ? { validTo: f.validTo } : {}),
+  };
+}
 
 export function Memory() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>('overview');
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
+  const [kind, setKind] = useState<MemoryStore | 'all'>('all');
+  const [scope, setScope] = useState<Scope>('all');
+  const [selected, setSelected] = useState<MemoryHit | null>(null);
+  const [selectedPinned, setSelectedPinned] = useState(false);
+  const [counts, setCounts] = useState({ review: 0, duplicates: 0 });
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
-  const search = useQuery({ queryKey: ['mem-search', debouncedQ], queryFn: () => searchMemory(debouncedQ), enabled: debouncedQ.length >= 2, staleTime: 30_000 });
   const searching = debouncedQ.length >= 2;
-
-  // Five tabs, one row. Short-term & Long-term merged into Overview; Import
-  // lives on Sources; profile/goals cards live on Sources (core context);
-  // Tool recall is operator telemetry → Advanced → Tools.
+  const search = useQuery({
+    queryKey: ['mem-search', debouncedQ, kind],
+    queryFn: () => searchMemory(debouncedQ, { limit: 30, ...(kind === 'all' ? {} : { stores: [kind] }) }),
+    enabled: searching, staleTime: 30_000,
+  });
+  const health = usePoll(['mem-health'], getMemoryHealth, 30_000);
+  const hits = (search.data?.hits ?? []).filter((h) => inScope(h, scope));
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); searchInputRef.current?.focus(); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
     { key: 'overview', label: 'Overview', icon: Brain },
     { key: 'facts', label: 'Facts', icon: BookOpen },
-    // Confidence wave (2026-07-31): which tools she has PROVEN is user-facing
-    // memory — success counts belong next to facts, not buried in Advanced.
     { key: 'tools', label: 'Learned tools', icon: Wrench },
     { key: 'episodes', label: 'Timeline', icon: History },
     { key: 'entities', label: 'People & things', icon: Users },
     { key: 'sources', label: 'Sources', icon: FileText },
   ];
-
+  const showDetail = Boolean(selected) || searching;
+  const total = (health.data?.facts?.active ?? 0) + (health.data?.entities ?? 0);
   return (
-    <Page title="Memory" subtitle="Everything Clementine knows — and where it comes from">
-      <div className="mb-5 flex items-center gap-2 rounded-lg border border-border bg-surface px-3 shadow-xs">
-        <Search className="h-4 w-4 text-faint" aria-hidden />
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything Clementine knows…" aria-label="Search memory"
-          className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
-        {q && <button type="button" onClick={() => setQ('')} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
-      </div>
-
-      {searching ? (
-        <SearchResults loading={search.isLoading} hits={search.data?.hits ?? []} query={debouncedQ} answerability={search.data?.answerability} stores={search.data?.diagnostics?.stores} />
-      ) : (
-        <>
-          <div className="mb-5 flex flex-wrap gap-1 border-b border-border">
-            {tabs.map((t) => {
-              const Icon = t.icon; const active = tab === t.key;
-              return (
-                <button key={t.key} type="button" onClick={() => setTab(t.key)}
-                  className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
-                    active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
-                  <Icon className="h-4 w-4" aria-hidden /> {t.label}
-                </button>
-              );
-            })}
+    <Page title="Memory" subtitle={total > 0 ? `${total.toLocaleString()} things she knows — and where each one came from` : 'Everything Clementine knows — and where it comes from'}>
+      <div className={cn('grid gap-5', showDetail && 'xl:grid-cols-[minmax(0,1fr)_400px]')}>
+        <div className="min-w-0">
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-border bg-surface px-3 shadow-md">
+            <Search className="h-4 w-4 text-faint" aria-hidden />
+            <input ref={searchInputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything she knows" aria-label="Search memory"
+              className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
+            {!q && <kbd className="rounded bg-subtle px-1.5 py-0.5 font-mono text-caption text-faint">⌘K</kbd>}
+            {q && <button type="button" onClick={() => { setQ(''); setSelected(null); }} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
           </div>
-          {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
-          {tab === 'facts' && <FactsTab qc={qc} />}
-          {tab === 'tools' && <ToolRecallSection />}
-          {tab === 'episodes' && <EpisodesTab />}
-          {tab === 'entities' && <EntitiesTab />}
-          {tab === 'sources' && <SourcesTab qc={qc} onNavigate={setTab} />}
-        </>
-      )}
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {KIND_FACETS.map((f) => (
+              <button key={f.key} type="button" aria-pressed={kind === f.key} onClick={() => setKind(f.key)}
+                className={cn('rounded-full px-3 py-1 text-caption font-semibold transition-colors', kind === f.key ? 'bg-fg text-canvas' : 'bg-subtle text-muted hover:text-fg')}>{f.label}</button>
+            ))}
+            {searching && <span className="ml-auto font-mono text-caption text-faint">{search.isLoading ? 'looking…' : `${hits.length} ${hits.length === 1 ? 'match' : 'matches'}${search.data?.diagnostics?.elapsedMs ? ` · ${(search.data.diagnostics.elapsedMs / 1000).toFixed(1)}s` : ''}`}</span>}
+          </div>
+          <div className="mb-5 flex flex-wrap items-center gap-1.5">
+            {SCOPE_FACETS.map((f) => (
+              <button key={f.key} type="button" aria-pressed={scope === f.key} onClick={() => setScope(scope === f.key ? 'all' : f.key)}
+                className={cn('rounded-full border px-3 py-1 text-caption font-semibold transition-colors', scope === f.key ? 'border-fg bg-fg text-canvas' : 'border-border text-muted hover:border-border-strong hover:text-fg')}>{f.label}</button>
+            ))}
+          </div>
+
+          {searching ? (
+            search.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
+            : hits.length === 0 ? (
+              <div className="rounded-lg border border-border bg-surface p-5 text-center shadow-xs">
+                <p className="text-body font-semibold text-fg">Nothing about “{debouncedQ}”{scope !== 'all' || kind !== 'all' ? ' with those filters' : ''}.</p>
+                <p className="mt-1 text-small text-muted">Try a shorter word{scope !== 'all' || kind !== 'all' ? ', clear a filter' : ''}, or ask her in chat — she can look further than this box.</p>
+                <Link to={`/chat?prompt=${encodeURIComponent(`What do you know about ${debouncedQ}?`)}`} className="mt-3 inline-flex rounded-md border border-border px-3 py-1.5 text-small font-semibold text-fg hover:border-border-strong">Ask Clementine</Link>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <h2 className="text-body font-semibold text-fg">Matches</h2>
+                {hits.map((hit, i) => (
+                  <HitRow key={`${hit.ref.type}:${hit.ref.id}`} hit={hit} index={i} selected={selected?.ref.type === hit.ref.type && String(selected?.ref.id) === String(hit.ref.id)} onSelect={() => { setSelected(hit); setSelectedPinned(false); }} />
+                ))}
+              </div>
+            )
+          ) : (
+            <div className="space-y-5">
+              <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} />
+              <div className="grid gap-4 lg:grid-cols-2">
+                <ReviewPane onCounts={(n) => { if (n.review !== counts.review || n.duplicates !== counts.duplicates) setCounts(n); }} />
+                <LearnedPane onPick={(f) => { setSelected(factToHit(f)); setSelectedPinned(Boolean(f.pinned)); }} />
+              </div>
+              <div className="flex flex-wrap gap-1 border-b border-border">
+                {tabs.map((t) => {
+                  const Icon = t.icon; const active = tab === t.key;
+                  return (
+                    <button key={t.key} type="button" onClick={() => setTab(t.key)}
+                      className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+                        active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
+                      <Icon className="h-4 w-4" aria-hidden /> {t.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
+              {tab === 'facts' && <FactsTab qc={qc} />}
+              {tab === 'tools' && <ToolRecallSection />}
+              {tab === 'episodes' && <EpisodesTab />}
+              {tab === 'entities' && <EntitiesTab />}
+              {tab === 'sources' && <SourcesTab qc={qc} onNavigate={setTab} />}
+            </div>
+          )}
+        </div>
+        {showDetail && (
+          <MemoryDetail hit={selected} pinned={selectedPinned} onChanged={() => { void qc.invalidateQueries({ queryKey: ['mem-search'] }); void qc.invalidateQueries({ queryKey: ['facts'] }); void qc.invalidateQueries({ queryKey: ['mem-health'] }); }} className="xl:sticky xl:top-4 xl:max-h-[calc(100vh-9rem)]" />
+        )}
+      </div>
     </Page>
   );
 }
@@ -574,37 +655,6 @@ function HealthMetric({ label, value, detail, warning = false }: { label: string
 }
 
 // ─────────── Search ───────────
-function SearchResults({ loading, hits, query, answerability, stores }: {
-  loading: boolean; hits: MemoryHit[]; query: string;
-  answerability?: 'supported' | 'partial' | 'insufficient'; stores?: string[];
-}) {
-  if (loading) return <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-20 w-full" />)}</div>;
-  if (hits.length === 0) return <EmptyState title="No matches" description={`Nothing in memory matches “${query}” yet.`} />;
-  return (
-    <div className="space-y-2">
-      <p className="mb-1 text-small text-muted">
-        {hits.length} result{hits.length === 1 ? '' : 's'} · {answerability ?? 'partial'}
-        {stores?.length ? ` · ${stores.join(', ')}` : ''}
-      </p>
-      {hits.map((hit, i) => (
-        <Card key={i} className="p-4">
-          <div className="mb-1 flex items-center gap-2">
-            <FileSearch className="h-4 w-4 shrink-0 text-primary" aria-hidden />
-            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{hit.title || String(hit.ref.id)}</span>
-            <StatusPill tone="neutral">{hit.ref.type}</StatusPill>
-            <span className="shrink-0 text-caption text-faint">{Math.round(hit.confidence * 100)}% confidence</span>
-          </div>
-          <p className="text-small text-muted">{hit.text}</p>
-          {hit.whyRecalled.length > 0 && <p className="mt-2 text-caption text-faint">Why: {hit.whyRecalled.join(' · ')}</p>}
-          {hit.evidence.length > 0 && <details className="mt-2 text-caption text-muted">
-            <summary className="cursor-pointer font-medium text-fg">{hit.evidence.length} supporting source{hit.evidence.length === 1 ? '' : 's'}</summary>
-            <div className="mt-1 space-y-1">{hit.evidence.slice(0, 3).map((evidence) => <div key={`${evidence.episodeId}:${evidence.excerpt}`} className="rounded bg-subtle p-2">{evidence.excerpt}{evidence.sourceUri ? <div className="mt-1 font-mono text-faint">{evidence.sourceUri}</div> : null}</div>)}</div>
-          </details>}
-        </Card>
-      ))}
-    </div>
-  );
-}
 
 // ─────────── Facts ───────────
 function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {

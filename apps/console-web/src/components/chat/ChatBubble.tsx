@@ -7,6 +7,7 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { ActivityCard } from '@/components/chat/ActivityCard';
+import { RememberedStrip } from '@/components/chat/RememberedStrip';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { cn } from '@/lib/cn';
@@ -273,6 +274,9 @@ export function ChatBubble({
             traceHref={traceHref}
             className={cn(!live && 'mb-1.5 px-1', live && 'mb-2')}
           />
+        )}
+        {!live && message.status === 'complete' && sessionId && message.startedAt && (
+          <RememberedStrip sessionId={sessionId} startedAt={message.startedAt} />
         )}
         <div className="rounded-lg rounded-tl-sm border border-border bg-surface px-4 py-3 shadow-xs">
           {message.taskMode?.kind === 'plan' && <div className="mb-2 text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
