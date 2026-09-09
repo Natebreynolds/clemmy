@@ -84,8 +84,20 @@ export function NotificationsEditor() {
       <h2 className="mb-1 text-h2 text-fg">Notifications</h2>
       <p className="mb-4 text-small text-muted">Only when she needs an answer to continue, or finished something. Where those land:</p>
 
+      {/* The desktop is always a loud surface: the durable store lives on this
+          machine and the app shell toasts loud unread items. There is no
+          setting to turn it off, so the row says so instead of faking a switch. */}
+      <ul className="mb-4 space-y-2">
+        <li className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-body font-medium text-fg">Desktop app</div>
+            <div className="truncate text-caption text-faint">This Mac · a toast when she needs you, or finished something while you were away</div>
+          </div>
+          <StatusPill tone="success">Always on</StatusPill>
+        </li>
+      </ul>
       {dests.isLoading ? <Skeleton className="h-20 w-full" /> : rows.length > 0 && (
-        <div className="mb-5 mt-5 space-y-4">
+        <div className="mb-5 space-y-4">
           {destinationGroups(rows).map((group) => (
             <div key={group.label}>
               <div className="mb-2 text-small font-semibold text-fg">{group.label}</div>

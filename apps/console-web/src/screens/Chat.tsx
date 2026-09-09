@@ -6,7 +6,12 @@ import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { getContext } from '@/lib/memory';
 import { greetingName, timeGreeting } from '@/lib/greeting';
-import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
+import { DEFAULT_HOME_PREFERENCES, useHomePreferences, visiblePanes, type HomePaneId } from '@/lib/home-prefs';
+import { ProjectsPane } from '@/components/home/ProjectsPane';
+import { SectionHeader } from '@/components/home/HomeSection';
+import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
+import { ModelStatusChips } from '@/components/ModelStatusChips';
+import { listSpaces } from '@/lib/spaces';
 import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
@@ -90,7 +95,10 @@ export function Chat() {
   // Quick actions are the user's own (HomePreferences) — the same chips the
   // Home screen renders, never a hardcoded list.
   const homePrefs = useHomePreferences();
-  const quickActions = (homePrefs.data ?? DEFAULT_HOME_PREFERENCES).quickActions;
+  const prefs = homePrefs.data ?? DEFAULT_HOME_PREFERENCES;
+  const quickActions = prefs.quickActions;
+  // Spaces feed the Projects pane when the user shows it; slow poll.
+  const spaces = usePoll(['spaces'], listSpaces, 60_000);
   const dismissCard = async (item: CommandCenterItem) => {
     if (!item.dismissKind || !item.dismissId) return;
     try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
@@ -211,20 +219,38 @@ export function Chat() {
                 {presence ?? (cc.data?.presence?.awayMessage ?? '')}
               </p>
             </div>
-            {(ccLoading || needsYou.length > 0) && (
-              <NeedsYouPane headingId="chat-needs-you" items={needsYou as HomeFeedItem[]} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
-            )}
-            {(workingNow.isLoading || workingView.running > 0 || workingView.entries.length > 0) && (
-              <RunningPane headingId="chat-running" view={workingView} loading={workingNow.isLoading} error={workingNow.isError && !workingNow.data} onRetry={() => { void workingNow.refetch(); }} />
-            )}
-            {(ccLoading || recent.length > 0) && (
-              <WhileAwayPane headingId="chat-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
-            )}
-            <QuickActions
-              actions={quickActions}
-              disabled={chat.busy}
-              onPrompt={(text) => { void chat.send({ text }); }}
-            />
+            {/* The panes are the user's Home layout (order + hidden), so the
+                briefing IS the home: /home lands here now. */}
+            {visiblePanes(prefs).map((id: HomePaneId) => {
+              switch (id) {
+                case 'needs_you':
+                  return (ccLoading || needsYou.length > 0)
+                    ? <NeedsYouPane key={id} headingId="chat-needs-you" items={needsYou as HomeFeedItem[]} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
+                    : null;
+                case 'running':
+                  return (workingNow.isLoading || workingView.entries.length > 0)
+                    ? <RunningPane key={id} headingId="chat-running" view={workingView} loading={workingNow.isLoading} error={workingNow.isError && !workingNow.data} onRetry={() => { void workingNow.refetch(); }} />
+                    : null;
+                case 'while_away':
+                  return (ccLoading || recent.length > 0)
+                    ? <WhileAwayPane key={id} headingId="chat-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
+                    : null;
+                case 'projects':
+                  return <ProjectsPane key={id} headingId="chat-projects" spaces={spaces.data ?? []} loading={spaces.isLoading} error={spaces.isError && !spaces.data} onRetry={() => { void spaces.refetch(); }} />;
+                case 'quick_actions':
+                  return <QuickActions key={id} actions={quickActions} disabled={chat.busy} onPrompt={(text) => { void chat.send({ text }); }} />;
+                case 'workstate':
+                  return (
+                    <section key={id} aria-labelledby="chat-workstate" className="flex flex-col gap-2.5">
+                      <SectionHeader id="chat-workstate" label="Working together" />
+                      <CollaborativeWorkstate snapshot={cc.data?.focus} compact />
+                      <ModelStatusChips />
+                    </section>
+                  );
+                default:
+                  return null;
+              }
+            })}
           </div>
         </div>
         <div className="border-t border-border bg-canvas/80 backdrop-blur">
