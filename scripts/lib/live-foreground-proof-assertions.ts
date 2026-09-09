@@ -91,12 +91,15 @@ export function checkLiveTurn(expect: z.infer<typeof LiveTurnExpectationSchema>,
   const boundaryStopped = facts.settlements.filter((row) => row.mutating === 1
     && row.execution_kind === 'refused_pre_dispatch'
     && /activation_budget_stopped_before_dispatch/.test(row.outcome_detail ?? ''));
-  // A model argument slip the host refused before dispatch (zero crossings,
-  // typed invalid_arguments) is a correctable repair, not an effect. It is
-  // counted and bounded separately (maxArgumentRepairs, default 0), never
-  // silently ignored, so a clean-attempt fixture stays strict.
+  // A model slip the host refused before dispatch (zero crossings, typed
+  // invalid_arguments, or a policy_denial such as a write attempted through
+  // the wrong door and then replanned — GLM 5.3 live 2026-09-09, 1 of 51) is
+  // a correctable repair, not an effect. It is counted and bounded separately
+  // (maxArgumentRepairs, default 0), never silently ignored, so a
+  // clean-attempt fixture stays strict.
   const argumentRepairs = facts.settlements.filter((row) => row.mutating === 1
-    && row.execution_kind === 'refused_pre_dispatch' && row.outcome_kind === 'invalid_arguments'
+    && row.execution_kind === 'refused_pre_dispatch'
+    && (row.outcome_kind === 'invalid_arguments' || row.outcome_kind === 'policy_denial')
     && row.physical_crossing_count + row.host_crossing_count === 0 && row.requires_reconciliation === 0);
   if (argumentRepairs.length > (expect.maxArgumentRepairs ?? 0)) {
     failures.push(`argument repairs: ${argumentRepairs.length} exceeds ${expect.maxArgumentRepairs ?? 0}`);
