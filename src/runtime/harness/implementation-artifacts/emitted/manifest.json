@@ -1587,7 +1587,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 434380
+          "bytes": 435325
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
@@ -4191,7 +4191,7 @@
           "bytes": 19797
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 434380
+          "bytes": 435325
         },
         "src/runtime/harness/run-conversation-disposition.ts": {
           "bytes": 2227
