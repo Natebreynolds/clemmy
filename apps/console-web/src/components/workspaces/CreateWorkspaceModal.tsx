@@ -30,15 +30,18 @@ export function CreateWorkspaceModal({
   open,
   onClose,
   onCreated,
+  initialDescription,
 }: {
   open: boolean;
   onClose: () => void;
   /** Called after the workspace is created; `build` is the description to seed
    *  Clem with (undefined when the user left it blank → a plain blank surface). */
   onCreated: (spaceId: string, build?: string) => void;
+  /** Seeds the build request (a starter recipe or the intro's example). */
+  initialDescription?: string;
 }) {
   const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
+  const [description, setDescription] = useState(initialDescription ?? '');
   const [titleWasManuallyEdited, setTitleWasManuallyEdited] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -89,14 +92,14 @@ export function CreateWorkspaceModal({
       onMouseDown={onClose}
       role="dialog"
       aria-modal="true"
-      aria-label="New workspace"
+      aria-label="New Space"
     >
       <div
         className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-lg"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="border-b border-border px-5 py-4">
-          <h2 className="text-h3 text-fg">New workspace</h2>
+          <h2 className="text-h3 text-fg">New Space</h2>
           <p className="mt-0.5 text-small text-muted">Tell Clem what you want and she’ll build it — a live surface that refreshes itself and can act on one click.</p>
         </div>
 

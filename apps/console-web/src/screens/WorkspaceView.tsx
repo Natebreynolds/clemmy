@@ -26,6 +26,8 @@ import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
+import { BuildStage } from '@/components/workspaces/BuildStage';
+import { describeSpaceShape, spaceBuildProgress, spaceBuildState, spaceBuildSteps } from '@/lib/space-build';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -136,6 +138,21 @@ function WorkspaceViewForId({ id }: { id: string }) {
   }, []);
 
   const space = detail.data?.space;
+  // WATCH HER BUILD: the Space's own chat stream is the build feed. Steps and
+  // state are pure derivations over it (lib/space-build); the preview below
+  // re-renders as revisions land (viewMtimeMs poll + the live action stream).
+  const buildState = spaceBuildState(chat.messages);
+  const buildSteps = spaceBuildSteps(chat.messages);
+  const buildProgress = spaceBuildProgress(chat.messages);
+  const lastReply = [...chat.messages].reverse().find((m) => m.role === 'assistant')?.text;
+  const [stageDismissed, setStageDismissed] = useState(false);
+  useEffect(() => { if (buildState === 'building') setStageDismissed(false); }, [buildState]);
+  // A placeholder Space whose build never started (the page was reloaded before
+  // the dock sent it): the durable objective is the build request — offer to start.
+  const routeBuild = (location.state as { build?: string } | null)?.build;
+  const pendingObjective = !routeBuild && chat.messages.length === 0 && space && (space.revisions?.length ?? 0) === 0
+    ? (space.contract?.objective ?? undefined)
+    : undefined;
 
   const loadMoreHistory = async () => {
     if (!historyCursor || historyPageBusy) return;
@@ -247,7 +264,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
     <div className="flex h-full flex-col">
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
-        <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Workspaces">
+        <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
           <ArrowLeft className="h-4 w-4" aria-hidden />
         </Button>
         <h2 className="truncate text-h3 text-fg">{space.title}</h2>
@@ -348,6 +365,21 @@ function WorkspaceViewForId({ id }: { id: string }) {
             if (/approval needed/i.test(message)) setDockOpen(true);
           }}
         />
+
+        {!stageDismissed && (
+          <BuildStage
+            state={buildState}
+            steps={buildSteps}
+            progress={buildProgress}
+            reply={lastReply}
+            shape={space ? describeSpaceShape(space) : undefined}
+            version={space?.version}
+            pendingObjective={pendingObjective}
+            onStartBuild={() => { if (pendingObjective) void chat.send({ text: pendingObjective }); }}
+            onOpenChat={() => { setDockOpen(true); composerRef.current?.focus(); }}
+            onDismiss={() => setStageDismissed(true)}
+          />
+        )}
 
         {/* Details drawer */}
         {detailsOpen && (
@@ -506,7 +538,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
               {chat.messages.length === 0 ? (
                 <p className="px-1 pt-6 text-center text-small text-muted">
-                  Ask about anything in this workspace — “what changed since the last refresh?”, “draft a follow-up for the stalled deals”.
+                  Ask about anything in this Space — “what changed since the last refresh?”, “draft a follow-up for the stalled deals”.
                 </p>
               ) : (
                 chat.messages.map((m) => (

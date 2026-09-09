@@ -79,7 +79,7 @@ export type ConsoleActionEvent =
   | { kind: 'approval.resolved'; approval: { id: string }; resolution: 'approved' | 'rejected' }
   | { kind: 'notification.created'; notification: { id: string } }
   | { kind: 'execution.transitioned'; executionId: string }
-  | { kind: 'harness.event' | 'harness.public_event'; event: { id: string; type: string } }
+  | { kind: 'harness.event' | 'harness.public_event'; event: { id: string; type: string }; sessionId?: string }
   | { kind: 'runtime.failed' | 'runtime.completed' }
   | { kind: 'focus.changed' }
   | { kind: 'operational.event' };
@@ -139,7 +139,7 @@ export function parseActionEvent(raw: unknown): ConsoleActionEvent | null {
     case 'harness.public_event': {
       const event = nested(frame, 'event');
       if (!str(event.id)) return null;
-      return { kind, event: { id: str(event.id), type: str(event.type) } };
+      return { kind, event: { id: str(event.id), type: str(event.type) }, ...(str(frame.sessionId) ? { sessionId: str(frame.sessionId) } : {}) };
     }
     // Nothing below carries an identity or a payload the routing table reads:
     // the kind alone decides what goes stale.
@@ -196,7 +196,7 @@ const HARNESS_DECISION_TYPES: ReadonlySet<string> = new Set([
 /** Harness event types that change only the PROGRESS line on an already-running
  *  card. They still refresh the board — a card whose hint is four seconds stale
  *  is the complaint — but they never touch the decision or history queries. */
-const HARNESS_PROGRESS_TYPES: ReadonlySet<string> = new Set([
+export const HARNESS_PROGRESS_TYPES: ReadonlySet<string> = new Set([
   'tool_called', 'tool_returned', 'heartbeat', 'step_started',
   'worker_started', 'worker_result', 'worker_capped',
   'batch_started', 'batch_progress', 'batch_completed',
@@ -208,6 +208,21 @@ const HARNESS_PROGRESS_TYPES: ReadonlySet<string> = new Set([
 const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set([
   'queued', 'received', 'running', 'awaiting_approval', 'awaiting_input',
 ]);
+
+/** The Space a session belongs to, when it is a Space session (`space-<slug>`). */
+export function spaceSlugForSession(sessionId: string | undefined): string | null {
+  if (!sessionId) return null;
+  const m = /^space-([a-z0-9][a-z0-9-]{1,62})$/.exec(sessionId);
+  return m ? m[1]! : null;
+}
+
+function baseHarnessKeys(type: string): readonly string[] {
+  if (HARNESS_DECISION_TYPES.has(type)) return DECISION_KEYS;
+  if (HARNESS_TERMINAL_TYPES.has(type)) return [...LIVE_WORK_KEYS, ...SETTLED_WORK_KEYS];
+  if (HARNESS_LIFECYCLE_TYPES.has(type)) return LIVE_WORK_KEYS;
+  if (HARNESS_PROGRESS_TYPES.has(type)) return ['board', 'working-now-badge'];
+  return [];
+}
 
 /**
  * The react-query keys one event invalidates. Pure: the routing table IS the
@@ -230,6 +245,13 @@ export function queryKeysForActionEvent(event: ConsoleActionEvent): readonly str
     case 'harness.event':
     case 'harness.public_event': {
       const type = event.event.type;
+      // A Space is built inside its own session (`space-<slug>`). Every tool
+      // call Clem makes there is a change the Space screens should show at once
+      // — the view, the data, the revision — not on the next 5–8s poll.
+      const spaceSlug = spaceSlugForSession(event.sessionId);
+      if (spaceSlug && (HARNESS_PROGRESS_TYPES.has(type) || HARNESS_TERMINAL_TYPES.has(type) || HARNESS_LIFECYCLE_TYPES.has(type))) {
+        return [...baseHarnessKeys(type), 'spaces', 'space'];
+      }
       if (HARNESS_DECISION_TYPES.has(type)) return DECISION_KEYS;
       if (HARNESS_TERMINAL_TYPES.has(type)) return [...LIVE_WORK_KEYS, ...SETTLED_WORK_KEYS];
       if (HARNESS_LIFECYCLE_TYPES.has(type)) return LIVE_WORK_KEYS;

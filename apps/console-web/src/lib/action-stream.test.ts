@@ -14,7 +14,8 @@ import {
   STREAM_SILENCE_LIMIT_MS,
   subscribeActionStream,
   actionStreamStatus,
-} from './action-stream';
+  HARNESS_PROGRESS_TYPES,
+  spaceSlugForSession, } from './action-stream';
 
 const runEvent = (runId: string, eventId: string, at: string, runStatus = 'running') => ({
   kind: 'run.event',
@@ -389,4 +390,16 @@ test('a live-but-silent channel stops calling itself live; traffic keeps it hone
   } finally {
     uninstallBrowser(stop);
   }
+});
+
+test('a Space session\'s progress refreshes the Space screens at once; other sessions do not', () => {
+  // A Space is built inside `space-<slug>`; every tool call there changes the
+  // view, data, or revision the Space screens show. Before, they polled (5–8s).
+  const progressType = [...HARNESS_PROGRESS_TYPES][0]!;
+  const inSpace = queryKeysForActionEvent({ kind: 'harness.event', event: { id: 'e1', type: progressType }, sessionId: 'space-deal-board' });
+  assert.ok(inSpace.includes('spaces') && inSpace.includes('space'), JSON.stringify(inSpace));
+  const elsewhere = queryKeysForActionEvent({ kind: 'harness.event', event: { id: 'e2', type: progressType }, sessionId: 'sess-desktop-abc' });
+  assert.ok(!elsewhere.includes('spaces') && !elsewhere.includes('space'), JSON.stringify(elsewhere));
+  assert.equal(spaceSlugForSession('space-deal-board'), 'deal-board');
+  assert.equal(spaceSlugForSession('sess-desktop-abc'), null);
 });

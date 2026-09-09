@@ -33,6 +33,9 @@ export interface ActivityEntry {
   origin?: string;
   nextAction?: string;
   owner?: string;
+  /** Where this work is mounted, when the daemon validated a mount — a Space
+   *  session (`space-<slug>`) reports `{ kind: 'workspace', workspaceSlug }`. */
+  validatedMount?: { kind: string; workspaceSlug?: string };
   startedAt: string;
   lastEvidenceAt: string;
   revision: number;
@@ -131,4 +134,15 @@ export function elapsedLabel(startedAt: string | undefined, nowMs: number): stri
   const hr = Math.round(min / 60);
   if (hr < 24) return `${hr}h`;
   return `${Math.round(hr / 24)}d`;
+}
+
+/** The Spaces Clementine is building right now, from the live activity projection. */
+export function buildingSpaceSlugs(entries: readonly ActivityEntry[]): ReadonlySet<string> {
+  const slugs = new Set<string>();
+  for (const entry of entries) {
+    if (entry.liveness !== 'live') continue;
+    const slug = entry.validatedMount?.kind === 'workspace' ? entry.validatedMount.workspaceSlug : undefined;
+    if (slug) slugs.add(slug);
+  }
+  return slugs;
 }

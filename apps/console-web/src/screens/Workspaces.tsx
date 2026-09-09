@@ -10,6 +10,8 @@ import { usePoll } from '@/lib/poll';
 import { listSpaces, type SpaceRecord } from '@/lib/spaces';
 import { humanizeCron } from '@/lib/cron';
 import { CreateWorkspaceModal } from '@/components/workspaces/CreateWorkspaceModal';
+import { SpacesIntro } from '@/components/workspaces/SpacesIntro';
+import { buildingSpaceSlugs, listWorkingNowSnapshot } from '@/lib/activity';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 
 function statusTone(status: SpaceRecord['status']): Tone {
@@ -33,7 +35,7 @@ function healthLabel(space: SpaceRecord): { tone: Tone; text: string } {
   return { tone: 'warning', text: health.freshness.state.replace('_', ' ') };
 }
 
-function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => void }) {
+function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen: () => void; building?: boolean }) {
   const sched = scheduleHint(space);
   const health = space.health;
   const healthStatus = healthLabel(space);
@@ -67,7 +69,9 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
       <div className="flex flex-1 flex-col gap-1 p-4">
         <div className="flex items-center justify-between gap-2">
           <h3 className="truncate text-h3 text-fg">{space.title}</h3>
-          <StatusPill tone={healthStatus.tone}>{healthStatus.text}</StatusPill>
+          {building
+            ? <StatusPill tone="live">Clementine is building</StatusPill>
+            : <StatusPill tone={healthStatus.tone}>{healthStatus.text}</StatusPill>}
         </div>
         <p className="text-caption text-faint">Updated {new Date(space.updatedAt).toLocaleDateString()}</p>
         {health && (
@@ -106,6 +110,10 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
 export function Workspaces() {
   const navigate = useNavigate();
   const spaces = usePoll(['spaces'], listSpaces, 8000);
+  // Which Spaces she is building right now — from the live activity projection.
+  const working = usePoll(['working-now-spaces'], listWorkingNowSnapshot, 4000);
+  const building = buildingSpaceSlugs(working.data?.entries ?? []);
+  const [prefill, setPrefill] = useState<string | undefined>(undefined);
   const [modalOpen, setModalOpen] = useState(false);
   // Home's 'New project' lands here with ?new=1: open the create dialog once,
   // then drop the flag so a refresh does not reopen it.
@@ -133,10 +141,11 @@ export function Workspaces() {
       subtitle="Live, interactive surfaces Clementine builds for you — reports, trackers, planners"
       actions={
         <Button onClick={() => setModalOpen(true)}>
-          <Plus className="h-4 w-4" aria-hidden /> New workspace
+          <Plus className="h-4 w-4" aria-hidden /> New Space
         </Button>
       }
     >
+      <SpacesIntro force={!spaces.isLoading && !spaces.isError && items.length === 0} onBuild={(buildPrompt) => { setPrefill(buildPrompt); setModalOpen(true); }} />
       {spaces.isLoading ? (
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2].map((i) => (
@@ -151,20 +160,20 @@ export function Workspaces() {
         />
       ) : items.length === 0 ? (
         <EmptyState
-          title="No workspaces yet"
+          title="No Spaces yet"
           description={
             <>Ask Clementine to build one — “make me a live dashboard for my pipeline” — or start a blank one and tell her what you want.</>
           }
-          action={<Button onClick={() => setModalOpen(true)}><Plus className="h-4 w-4" aria-hidden /> New workspace</Button>}
+          action={<Button onClick={() => setModalOpen(true)}><Plus className="h-4 w-4" aria-hidden /> New Space</Button>}
         />
       ) : (
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {items.map((space) => (
-            <WorkspaceCard key={space.id} space={space} onOpen={() => navigate(`/workspaces/${space.id}`)} />
+            <WorkspaceCard key={space.id} space={space} building={building.has(space.id)} onOpen={() => navigate(`/workspaces/${space.id}`)} />
           ))}
         </div>
       )}
-      <CreateWorkspaceModal open={modalOpen} onClose={() => setModalOpen(false)} onCreated={openCreated} />
+      <CreateWorkspaceModal key={prefill ?? ''} open={modalOpen} initialDescription={prefill} onClose={() => { setModalOpen(false); setPrefill(undefined); }} onCreated={openCreated} />
     </Page>
   );
 }
