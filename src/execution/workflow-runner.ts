@@ -5260,6 +5260,12 @@ async function runStepViaHarness(
           agent,
           sessionId: realSessionId,
           input: buildContinueInput(result.lastDecision?.summary),
+          // Same accepted source, same history chain: the host lane appends
+          // no new user item for a host-owned continuation (a new item changes
+          // the pre-history digest the accepted-batch chain verifies); the
+          // directive rides as a steer. See loop.ts hostOwnedContinuation.
+          hostOwnedContinuation: true,
+          continuationSteer: buildContinueInput(result.lastDecision?.summary),
           ...(workflowMemoryPrimerQuery ? { memoryPrimerQuery: workflowMemoryPrimerQuery } : {}),
           ...(suppressAutomaticMemoryForWorkflowRequest
             ? { suppressAutomaticMemoryForRequest: true as const }
