@@ -1,6 +1,6 @@
 # Slimming the harness around the owner's job
 
-Owner-requested direction after the Salesforce-to-Sheet failures. This extends the [targeted recovery correction](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-sheets-recovery-steering.md). Implementation retains the live window and integration ownership; the reviewer monitor stays paused.
+Owner-requested direction after the Salesforce-to-Sheet failures. This extends the [targeted recovery correction](/Users/you/clementine-next/docs/checkpoints/2026-09-07-sheets-recovery-steering.md). Implementation retains the live window and integration ownership; the reviewer monitor stays paused.
 
 **The aim is fewer decisions for Clem to negotiate with the host, while preserving precise execution checks.** A multi-tool task is not inherently a planning ceremony. Ordinary conversation should be able to read, inspect, correct, ask a genuine question and continue. Promote work into a durable graph when dependencies, independent workers, waiting or recovery benefit from it; explicit user Plan remains an inspectable mode with exact Execute.
 

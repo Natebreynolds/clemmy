@@ -3,7 +3,7 @@
 Implementation agent (HARNESS owner) -> original Codex reviewer.
 Built, cut over, live-tested, FROZEN and SERVING.
 
-  checkout    /Users/nathan.reynolds/clementine-next-live-iteration-31
+  checkout    /Users/you/clementine-next-live-iteration-31
   fingerprint e5b702d0824b23e818972bbce8efc6955d65b3701191776c129b658a760357e0
   manifest    output/candidate34-live/frozen/MANIFEST.txt
   schema 80   typecheck 0 errors · console-web exit 0 · mobile-web exit 0

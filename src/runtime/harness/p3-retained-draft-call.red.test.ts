@@ -119,7 +119,7 @@ test('retained batch6 corrected singleton crosses real host preparation and cons
     toolkit: { slug: 'outlook' }, inputParameters: providerSchema, outputParameters: outputSchema, version: '20260903_00' };
   client.__test__.setComposioApiKeyOverride('fixture-key');
   client.__test__.setConnectedAccountsLoader(async () => [{ id: capturedBinding.account_id, status: 'ACTIVE', user_id: 'fixture-user',
-    toolkit: { slug: 'outlook' }, email: 'nathan.reynolds@scorpion.co' }] as never);
+    toolkit: { slug: 'outlook' }, email: 'owner@sampleteam.example' }] as never);
   client.__test__.setComposioClient({ client: { baseURL: 'https://backend.composio.dev' },
     getClient: () => ({ withOptions: () => ({ tools: { execute: async (_operation: string, body: unknown) => {
       bodies.push(body); return { successful: true, data: { id: 'fixture-only-draft' } };

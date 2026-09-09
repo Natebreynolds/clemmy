@@ -1,6 +1,6 @@
 # Friday dashboard and current Sheet run: execution, evidence and accuracy
 
-**Subsequent Plan outcome:** Source 146537 has now terminated blocked without publishing a cleanup plan. Its earlier sixteen-read snapshot below is superseded for outcome purposes by the [consolidated beta handoff](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-beta-release-handoff.md), which records the complete failure chain and the owner's SDK architecture question. The Sheet and dashboard findings here remain scoped to their own sources.
+**Subsequent Plan outcome:** Source 146537 has now terminated blocked without publishing a cleanup plan. Its earlier sixteen-read snapshot below is superseded for outcome purposes by the [consolidated beta handoff](/Users/you/clementine-next/docs/checkpoints/2026-09-07-beta-release-handoff.md), which records the complete failure chain and the owner's SDK architecture question. The Sheet and dashboard findings here remain scoped to their own sources.
 
 Owner-requested targeted review on September 7. Read-only inspection of the live ledger, retained provider results, saved dashboard data and source. No new LLM turn, provider call, write replay, daemon change or settings change was made by the reviewer. Implementation retains ownership; this does not reopen the recurring reviewer monitor or create a release gate waiting on the reviewer.
 
@@ -55,4 +55,4 @@ Live source 146537 (`sess-desktop-e7a0e3e14590509a2a0dedb9`) is explicitly Plan.
 
 Use one clear distinction throughout: **what the owner asked, what actually changed, and what the evidence establishes**. Friday currently overstates failure; the Sheet terminal overstates the scope of structured verification. Neither is solved by giving Clem more instructions to satisfy the harness.
 
-Evidence retained at `/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/2026-09-07-current-sheets-review/`: events, submitted Sheet values, row comparisons and full retained results for both Task queries. These contain private business data; keep them local. No new live tests are claimed by this review.
+Evidence retained at `/Users/you/clementine-next/output/reviewer-monitor/2026-09-07-current-sheets-review/`: events, submitted Sheet values, row comparisons and full retained results for both Task queries. These contain private business data; keep them local. No new live tests are claimed by this review.

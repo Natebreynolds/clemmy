@@ -1,10 +1,10 @@
 NEXT ASSIGNMENT — BIND MUTATIONS TO THE ACCEPTED JOB; COMPLETE CONTINUATION OWNERSHIP
 
-**Final ownership transfer — September 7:** The owner has ended the reviewer role. The implementation agent owns qualification, checkpoint updates, UI integration and release preparation from here. No future reviewer response or live-window handoff is required. The recurring monitor is paused. Read the [final handoff](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-final-harness-handoff.md); it supersedes older coordination instructions below. Historical evidence remains scoped to its recorded build.
+**Final ownership transfer — September 7:** The owner has ended the reviewer role. The implementation agent owns qualification, checkpoint updates, UI integration and release preparation from here. No future reviewer response or live-window handoff is required. The recurring monitor is paused. Read the [final handoff](/Users/you/clementine-next/docs/checkpoints/2026-09-07-final-harness-handoff.md); it supersedes older coordination instructions below. Historical evidence remains scoped to its recorded build.
 
 Reread before changing anything and as work progresses:
-/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-05-harness-refinement-handoff.md
-/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/2026-09-07-c34-review.md
+/Users/you/clementine-next/docs/checkpoints/2026-09-05-harness-refinement-handoff.md
+/Users/you/clementine-next/output/reviewer-monitor/2026-09-07-c34-review.md
 
 C33/C34 review is complete. C34 e5b702d0… is serving, but no tag is qualified. The reviewer returns the window to implementation; no live campaign, cutover hold or permission question remains. Four implementation turns were audited; no additional reviewer live call was needed to establish the defects. Preserve the first-attempt reports and exact build/source/receipt identities.
 
@@ -61,11 +61,11 @@ After the connected correction and frozen handover, use Codex Terra gpt-5.6-terr
 Preserve original UI work, integrate actual intended harness/UI source, and render-qualify desktop/mobile Plan/Execute/Stop/rejoin/settings plus packaged install/upgrade on that combined identity. The Google Sheets→Salesforce→SCO journey is still unqualified; this local scope finding is not proof of a corresponding connector defect or of connector safety. The eventual business workflow must prove its own account/target/change authority and outcome.
 
 EVIDENCE
-/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/c34-review-0438/native/report.md
-/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/c34-review-0438/lifecycle/report.md
-/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/c34-review-0438/live/review.md
-/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-expanded-live-qualification.md
-/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-ui-integration-agent-prompt.md
-/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-business-owner-sheets-qualification.md
+/Users/you/clementine-next/output/reviewer-monitor/c34-review-0438/native/report.md
+/Users/you/clementine-next/output/reviewer-monitor/c34-review-0438/lifecycle/report.md
+/Users/you/clementine-next/output/reviewer-monitor/c34-review-0438/live/review.md
+/Users/you/clementine-next/docs/checkpoints/2026-09-06-expanded-live-qualification.md
+/Users/you/clementine-next/docs/checkpoints/2026-09-06-ui-integration-agent-prompt.md
+/Users/you/clementine-next/docs/checkpoints/2026-09-06-business-owner-sheets-qualification.md
 
 You maintain the checkpoint and independently audit each pass, using a separate bounded reviewer where useful. Reread it as changes land; no further Codex reviewer response is a prerequisite. Quality determines the tag; finite tests cannot promise universal perfection or comparative superiority.

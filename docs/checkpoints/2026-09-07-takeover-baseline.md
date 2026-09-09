@@ -1,11 +1,11 @@
 # Qualification takeover — September 7, evening
 
-**Handoff received; implementation and live qualification are active.** Read the [current takeover checkpoint](/Users/nathan.reynolds/clementine-next-live-iteration-31/docs/checkpoints/2026-09-07-takeover-qualification.md) for serving/source ownership, implemented changes, preserved live failures and subsequent proof. This document preserves the earlier read-only baseline; its old PIDs and pending-handoff state are historical. Codex now owns the work through release qualification. The older staged fixes remain a checklist to reconcile, not a declaration that later source lacks them.
+**Handoff received; implementation and live qualification are active.** Read the [current takeover checkpoint](/Users/you/clementine-next-live-iteration-31/docs/checkpoints/2026-09-07-takeover-qualification.md) for serving/source ownership, implemented changes, preserved live failures and subsequent proof. This document preserves the earlier read-only baseline; its old PIDs and pending-handoff state are historical. Codex now owns the work through release qualification. The older staged fixes remain a checklist to reconcile, not a declaration that later source lacks them.
 
 ## Source and live state
 
-- Root/UI checkout `/Users/nathan.reynolds/clementine-next`: HEAD `ced9a5e6`, extensive uncommitted harness changes.
-- Serving checkout `/Users/nathan.reynolds/clementine-next-live-iteration-31`: HEAD `9cdf31fc`, extensive uncommitted runtime and UI changes. The tracked diff spans 170 files; untracked additions require separate inventory.
+- Root/UI checkout `/Users/you/clementine-next`: HEAD `ced9a5e6`, extensive uncommitted harness changes.
+- Serving checkout `/Users/you/clementine-next-live-iteration-31`: HEAD `9cdf31fc`, extensive uncommitted runtime and UI changes. The tracked diff spans 170 files; untracked additions require separate inventory.
 - Observed daemon PID 23755, started September 7 at 18:25 Pacific, entry `src/index.ts` in the serving checkout. No restart performed by this reviewer.
 - Therefore “everything is on HEAD” is not established. Qualification must identify dirty source bytes and integration must preserve both checkouts' work.
 
@@ -21,6 +21,6 @@ The shared reader helper has since gained `authenticRetainedAlternatives`, so th
 
 ## Next work after the implementation handoff
 
-Identify owned edits and serving bytes; reconcile every claimed fix with its discriminating test and latest live evidence. Group remaining defects around usable retained reads, valid schema transport, truthful completion and lifecycle ownership. Then qualify connected Normal/Plan/Execute, provider/native workflows, review modes, restart/Stop, memory and combined UI behavior using the [staged master prompt](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-final-master-prompt.md). Preserve failures and measure business outcomes, not merely terminal `done` or broad timing bounds.
+Identify owned edits and serving bytes; reconcile every claimed fix with its discriminating test and latest live evidence. Group remaining defects around usable retained reads, valid schema transport, truthful completion and lifecycle ownership. Then qualify connected Normal/Plan/Execute, provider/native workflows, review modes, restart/Stop, memory and combined UI behavior using the [staged master prompt](/Users/you/clementine-next/docs/checkpoints/2026-09-07-final-master-prompt.md). Preserve failures and measure business outcomes, not merely terminal `done` or broad timing bounds.
 
-The database recommendation is separate: [storage direction and durability checks](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-database-direction.md). No database migration has been authorized or performed as a shortcut to fixing the harness.
+The database recommendation is separate: [storage direction and durability checks](/Users/you/clementine-next/docs/checkpoints/2026-09-07-database-direction.md). No database migration has been authorized or performed as a shortcut to fixing the harness.

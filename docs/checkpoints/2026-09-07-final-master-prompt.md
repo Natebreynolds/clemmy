@@ -1,6 +1,6 @@
 # Final implementation master prompt — September 7, 2026
 
-**Takeover active:** The implementation handoff has arrived. Read the [current implementation and live qualification checkpoint](/Users/nathan.reynolds/clementine-next-live-iteration-31/docs/checkpoints/2026-09-07-takeover-qualification.md) first. This document preserves the morning staged review; reconcile its source-specific findings against the current checkpoint rather than reimplementing completed fixes. Include the [database durability checks](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-database-direction.md) in lifecycle qualification; no engine migration is recommended for this tag.
+**Takeover active:** The implementation handoff has arrived. Read the [current implementation and live qualification checkpoint](/Users/you/clementine-next-live-iteration-31/docs/checkpoints/2026-09-07-takeover-qualification.md) first. This document preserves the morning staged review; reconcile its source-specific findings against the current checkpoint rather than reimplementing completed fixes. Include the [database durability checks](/Users/you/clementine-next/docs/checkpoints/2026-09-07-database-direction.md) in lifecycle qualification; no engine migration is recommended for this tag.
 
 Continue from your current work. You own implementation, live qualification, checkpoint updates, UI integration and release preparation. There is no further reviewer window to wait for. The reviewer monitor stays paused. This document supersedes earlier sequencing and coordination instructions; preserve their evidence and the owner's existing authorization. Reconcile changes made after this review before editing: do not reimplement a fix that already exists, or treat its old failure as current proof.
 
@@ -14,13 +14,13 @@ Work in the stages below. Prepare independent fixtures and UI integration while 
 
 ## Review baseline — credit the progress, keep the proof boundary
 
-The inspected implementation checkout is `/Users/nathan.reynolds/clementine-next-live-iteration-31`. The observed daemon boot at **2026-09-07 14:33:53 UTC** was PID 25696, source fingerprint `a4634bc0fbd13b7e260f273638f87b22448a7823582542ed31a4ab8d50422f6a`, Git `9cdf31fc39523eadeeb15e9be18dfa54165d58a9` with dirty source. Later disk edits do not inherit that live run's qualification. The separate root/UI checkout was at `ced9a5e6`; older UI findings require reconciliation against that newer work and the final combined build.
+The inspected implementation checkout is `/Users/you/clementine-next-live-iteration-31`. The observed daemon boot at **2026-09-07 14:33:53 UTC** was PID 25696, source fingerprint `a4634bc0fbd13b7e260f273638f87b22448a7823582542ed31a4ab8d50422f6a`, Git `9cdf31fc39523eadeeb15e9be18dfa54165d58a9` with dirty source. Later disk edits do not inherit that live run's qualification. The separate root/UI checkout was at `ced9a5e6`; older UI findings require reconciliation against that newer work and the final combined build.
 
 Current work adds top-level mirror selection, clearer single-occurrence failure classification and a shared retained-result routing helper wired through recall/loop paths. The reviewer ran **10 focused tests successfully** in `mirrored-call-identity.test.ts` and `retained-result-routes.test.ts`. These do not yet prove real retained bytes are usable or the recovery cycle is closed. The runner's home-isolation sentinel was not performed because the live daemon owned the home; do not report that separate check as passed.
 
 The latest captured Platform 49 Plan, source **147032**, still ended blocked at event **147313** after **321.607 seconds**, with **31 top-level calls**, no business writes and no published plan. It includes “reused by 1 invocations,” exhausted recall, a derived-result authority refusal and a final recovery-surface mismatch. Source **146537** previously failed after 334.112 seconds. These runs precede the newest disk patches: use them as exact replays, not evidence that the newest patch ran and failed.
 
-Current review artifacts, hashes and focused test output: [final review evidence](/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/2026-09-07-final-master-review/). Detailed prior diagnosis: [beta release handoff](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-beta-release-handoff.md).
+Current review artifacts, hashes and focused test output: [final review evidence](/Users/you/clementine-next/output/reviewer-monitor/2026-09-07-final-master-review/). Detailed prior diagnosis: [beta release handoff](/Users/you/clementine-next/docs/checkpoints/2026-09-07-beta-release-handoff.md).
 
 ## Stage 1 — Finish retained-result access and usable read recovery
 
@@ -48,7 +48,7 @@ Preserve completed upstream evidence and reconcile any already-started actor run
 
 **Exit proof:** open/closed/map schema controls; two different verified URLs flow through correctly; missing upstream evidence is explicit; workflow-only and host-only controls isolate the two repairs. Then live normal and honest fallback journeys produce supported reports with real source evidence and correct notification counts. Retain the original failed run.
 
-Evidence: [Facebook review](/Users/nathan.reynolds/clementine-next/output/reviewer-monitor/2026-09-07-facebook-review/), especially `apify-contract.json` and `pure-validator-repro.json`.
+Evidence: [Facebook review](/Users/you/clementine-next/output/reviewer-monitor/2026-09-07-facebook-review/), especially `apify-contract.json` and `pure-validator-repro.json`.
 
 ## Stage 3 — Complete Plan → revision → exact Execute, and preserve simple Normal work
 
@@ -58,7 +58,7 @@ Reconcile the existing native read/Plan exclusions and `projectEffect` fingerpri
 
 **Exit proof:** Plan investigates with zero mutations, revision changes the proposed work, Execute makes only the accepted changes, and readback verifies preservation. Normal workflow create/edit and Space create/targeted edit/readback remain direct, without `plan_task`. Test missing definition → exact discovery → valid invocation, and a malformed first attempt → useful repair without replaying an effect. Keep a clean-attempt case separately; do not relax its assertion to hide a regression.
 
-Design reference: [explicit Plan/Execute](/Users/nathan.reynolds/clementine-next/docs/EXPLICIT-PLAN-EXECUTE-DESIGN-2026-09-05.md). Broader rationale: [harness simplification](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-harness-simplification.md).
+Design reference: [explicit Plan/Execute](/Users/you/clementine-next/docs/EXPLICIT-PLAN-EXECUTE-DESIGN-2026-09-05.md). Broader rationale: [harness simplification](/Users/you/clementine-next/docs/checkpoints/2026-09-07-harness-simplification.md).
 
 ## Stage 4 — One execution owner through interruption, recovery and provider routing
 
@@ -80,7 +80,7 @@ Finish producer → settlement → persistence → reopen → learning proof. Ow
 
 **Exit proof:** dashboard status reflects the actual result; changed/missing evidence invalidates verification; external written cells and relevant business criteria are checked; each review mode behaves truthfully after settings changes/restart; learning consumes the real persisted producer chain and reuses the correction correctly.
 
-Evidence: [dashboard and Sheet review](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-dashboard-and-current-live-review.md) and [final lifecycle/authority handoff](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-07-final-harness-handoff.md).
+Evidence: [dashboard and Sheet review](/Users/you/clementine-next/docs/checkpoints/2026-09-07-dashboard-and-current-live-review.md) and [final lifecycle/authority handoff](/Users/you/clementine-next/docs/checkpoints/2026-09-07-final-harness-handoff.md).
 
 ## Stage 6 — Qualify the combined product and the real graph journey
 
@@ -90,11 +90,11 @@ Exercise the business-owner journey: inspect a Google Sheet; resolve the same ac
 
 **Exit proof:** connected desktop/mobile journeys complete with appropriate business assertions, and a dependent multi-tool/delegated journey survives one controlled failure or interruption without losing completed work. Measure model requests, searches, calls, refusals, successful effects, review identity, readback and elapsed time. Set scenario-specific bounds: create-and-populate can legitimately need two writes; Plan needs zero; repair tests allow a repair; clean-attempt tests still require a clean first attempt.
 
-Use the [expanded campaign](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-expanded-live-qualification.md), [business-owner Sheet qualification](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-business-owner-sheets-qualification.md) and [historical UI repros](/Users/nathan.reynolds/clementine-next/docs/checkpoints/2026-09-06-ui-integration-agent-prompt.md). The earlier 30–40 turn estimate is coverage guidance, not a quota or permission to replace meaningful tests with repetitions.
+Use the [expanded campaign](/Users/you/clementine-next/docs/checkpoints/2026-09-06-expanded-live-qualification.md), [business-owner Sheet qualification](/Users/you/clementine-next/docs/checkpoints/2026-09-06-business-owner-sheets-qualification.md) and [historical UI repros](/Users/you/clementine-next/docs/checkpoints/2026-09-06-ui-integration-agent-prompt.md). The earlier 30–40 turn estimate is coverage guidance, not a quota or permission to replace meaningful tests with repetitions.
 
 ## Stage 7 — Qualify the actual tag candidate
 
-Use one identified combined source/build for final acceptance. Record commit, dirty state, fingerprint, package version, daemon and test source identities. Rerun affected qualification after changes invalidate its evidence. Update [RELEASE-SCORECARD.md](/Users/nathan.reynolds/clementine-next/docs/checkpoints/RELEASE-SCORECARD.md) with concrete artifacts and unresolved limitations; do not carry forward stale pass labels.
+Use one identified combined source/build for final acceptance. Record commit, dirty state, fingerprint, package version, daemon and test source identities. Rerun affected qualification after changes invalidate its evidence. Update [RELEASE-SCORECARD.md](/Users/you/clementine-next/docs/checkpoints/RELEASE-SCORECARD.md) with concrete artifacts and unresolved limitations; do not carry forward stale pass labels.
 
 Inspect the current release workflow and run its required checks, including applicable type/unit/journey, measurement, proof, public-hygiene, release-asset/closure, packed-candidate, install/upgrade, benchmark and memory/pass-k gates. Verify the packaged product with independently installed dependencies; a dev checkout borrowing another checkout's modules is not package proof. Test rendered desktop/mobile on the integrated candidate and the supported release platforms. Preserve owner-agreed release scope; do not silently reduce it or invent a tag/version.
 
