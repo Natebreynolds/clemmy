@@ -341,6 +341,17 @@ export async function resolveSourceAccountRouting(input: {
     establishedSourceDigest: origin.digest,
     interveningAcceptedSources,
   };
+  // With one live connected identity there is no account choice to review.
+  // The accepted source and current connection revision still bind the read;
+  // writes continue through the existing account-review path below.
+  if (input.effect === 'read' && defaultMode) {
+    return { kind: 'resolved', connection, evidence: {
+      version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit, identity,
+      sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
+      checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
+      connectionRevision, judgeModelIdentity: 'host:read_single_account',
+    } };
+  }
   // READS DO NOT WAIT ON THE JUDGE. Reading the wrong calendar is visible and
   // correctable; sending from the wrong identity is not. Live 2026-09-08: a
   // one-call calendar read died because the judge role (a separate model with

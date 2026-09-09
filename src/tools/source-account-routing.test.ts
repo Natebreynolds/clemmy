@@ -584,6 +584,46 @@ test('a READ with a nominated identity routes without the judge; a write with th
   assert.equal(calls.length, 1, 'the write asked the judge once');
 });
 
+test('a fresh read with one connected identity needs no account judge; writes retain review', async () => {
+  const calls: SourceAccountJudgeCall[] = [];
+  registry.installTurnSemanticModelPort({
+    async interpret() { throw new Error('no hidden planning'); },
+    async judgeAccountSelection(call) { calls.push(call); throw new Error('reviewer unavailable'); },
+  });
+  const single = connections.slice(0, 1);
+  const identity = source('Show my calendar for today.');
+  const request = { ...identity, toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW',
+    connections: single, nomination: null, effect: 'read' as const };
+  const read = await routing.resolveSourceAccountRouting(request);
+  assert.equal(read.kind, 'resolved', JSON.stringify(read));
+  if (read.kind !== 'resolved') return;
+  assert.equal(read.connection.connectionId, single[0]!.connectionId);
+  assert.equal(read.evidence.version, 2);
+  assert.equal(read.evidence.sourceUserSeq, identity.sourceUserSeq);
+  assert.equal(read.evidence.checkedForSourceUserSeq, identity.sourceUserSeq);
+  assert.equal(read.evidence.judgeModelIdentity, 'host:read_single_account');
+  assert.equal(calls.length, 0);
+
+  const changed = await routing.resolveSourceAccountRouting({ ...request,
+    connections: single.map(c => ({ ...c, connectionId: 'fixture-reauthenticated' })) });
+  assert.equal(changed.kind, 'resolved');
+  if (changed.kind === 'resolved' && changed.evidence.version === 2 && read.evidence.version === 2) {
+    assert.notEqual(changed.evidence.connectionRevision, read.evidence.connectionRevision);
+  }
+  const foreign = source('Unrelated conversation.');
+  assert.equal((await routing.resolveSourceAccountRouting({ ...request, sessionId: foreign.sessionId })).kind,
+    'account_selection_required', 'a single account never repairs a mismatched accepted source');
+  assert.equal((await routing.resolveSourceAccountRouting({ ...request,
+    connections: single.map(c => ({ ...c, status: 'INACTIVE' })) })).kind, 'account_selection_required');
+  assert.equal(calls.length, 0);
+
+  const write = await routing.resolveSourceAccountRouting({ ...request,
+    operation: 'OUTLOOK_CREATE_DRAFT', effect: 'write' });
+  assert.equal(write.kind, 'account_selection_required');
+  if (write.kind === 'account_selection_required') assert.equal(write.reason, 'review_unavailable');
+  assert.equal(calls.length, 1, 'one connected identity does not bypass the write review');
+});
+
 test('an answered "which account?" becomes the toolkit\'s remembered read default; the question is never asked twice', async () => {
   const { rememberAccountAlias } = await import('../memory/account-alias-store.js');
   const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
