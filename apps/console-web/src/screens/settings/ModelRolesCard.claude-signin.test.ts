@@ -12,21 +12,23 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const CARD = readFileSync(new URL('./ModelRolesCard.tsx', import.meta.url), 'utf8');
+// The switch logic moved into the ONE picking model shared by Settings and the chat chip (2026-09-08).
+const HOOK = readFileSync(new URL('../../lib/model-roles.ts', import.meta.url), 'utf8');
 const OAUTH = readFileSync(new URL('../../../../../src/runtime/claude-oauth.ts', import.meta.url), 'utf8');
 
 test('a 409 on a Claude switch renders the Claude sign-in inline and remembers the attempted brain', () => {
-  assert.match(CARD, /setClaudeSignInFor\(value\)/, 'the attempted brain value is remembered on a needsLogin refusal');
-  assert.match(CARD, /claudeSignInFor && \(\s*<div[^>]*>\s*<ClaudeLoginForm embedded \/>/, 'the sign-in form renders inline under the refusal');
+  assert.match(HOOK, /setClaudeSignInFor\(value\)/, 'the attempted brain value is remembered on a needsLogin refusal');
+  assert.match(CARD, /claudeSignInFor && \(?\s*<div[^>]*>\s*<ClaudeLoginForm embedded \/>/, 'the sign-in form renders inline under the refusal');
 });
 
 test('the switch completes on its own once the sign-in lands', () => {
-  assert.match(CARD, /if \(claudeSignInFor && claudeAuth\?\.configured && !claudeAuth\.degraded\)/);
-  assert.match(CARD, /void onBrain\(value\);/);
+  assert.match(HOOK, /if \(claudeSignInFor && claudeAuth\?\.configured && !claudeAuth\.degraded\)/);
+  assert.match(HOOK, /void onBrain\(value\);/);
 });
 
 test('the Claude row says why it is unavailable, and the server copy is app-first', () => {
-  assert.match(CARD, /\(sign-in expired\)/);
-  assert.match(CARD, /\(via Claude Code\)/);
+  assert.match(HOOK, /'sign-in expired'/);
+  assert.match(HOOK, /'via Claude Code'/);
   assert.doesNotMatch(OAUTH, /Re-open Claude Code to refresh your login\./, 'app users are not sent to Claude Code as the only door');
   assert.match(OAUTH, /Settings → Models → Claude login/);
 });

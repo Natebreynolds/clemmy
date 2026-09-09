@@ -4970,6 +4970,7 @@ test('mobile origin raw pages preserve terminals across private rows and bridged
       assert.equal((await fetch(`${h.url}/m/api/chat/sessions/${origin.id}/events/recent?${query}`, { headers: { cookie } })).status, 400);
     }
   } finally { await h.close(); }
+});
 
 /**
  * ── Device binding is not client-elective on the relay door ────────────────
