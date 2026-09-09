@@ -702,7 +702,9 @@ export function registerMemoryTools(server: McpServer): void {
     'Record a durable fact in long-term memory. One-off commands, questions, and task requests are rejected; put those in task/focus/working memory instead. Use for user preferences (kind=user), project context (project), standing feedback (feedback), or external references (reference). Default to the small kind + content payload. Add entities/relationships only when a stable real-world identity relation itself matters (for example a person works at a company); omit graph annotations for codewords, secrets, labels, dates, and generic object-value pairs. Only controlled predicates and relationships supported verbatim by the durable fact are accepted. Include an alias, identifier, or time bound only when it is literally present in content; unsupported annotations are rejected. Use kind=constraint for an ENFORCEABLE standing rule that must HARD-GATE tool dispatch — a sender/account/destination routing rule ("always send Outlook mail from billing@acme-co.example", "only write Salesforce in the sandbox org") or a never-do guardrail ("never post to the prod channel"). A constraint is auto-pinned and is checked by the dispatch gate on every matching tool call, so reserve it for rules that should BLOCK a wrong action, not general preferences. Idempotent — re-recording the same fact bumps its score.',
     {
       kind: z.enum(FACT_KINDS as unknown as [string, ...string[]]),
-      content: z.string().min(3).max(800),
+      // Retain the fact as authored. A short prompt/display projection must
+      // not make a longer project decision impossible to remember.
+      content: z.string().min(3),
       sessionId: z.string().optional(),
       sourcePath: z.string().optional(),
       entities: z.array(z.object({

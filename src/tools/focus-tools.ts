@@ -112,7 +112,9 @@ export function registerFocusTools(server: McpServer): void {
     {
       resource_ref: z.string().min(1).max(500).describe('Most specific identifier: URL, doc id, session id, or a freeform "the X project" if no canonical id exists.'),
       title: z.string().min(1).max(120).describe('Short human-readable name shown in the dashboard + Discord status.'),
-      summary: z.string().min(3).max(500).describe('One-sentence statement of WHAT we are doing with the resource.'),
+      // This is durable working context, not a display-width constraint. The
+      // old 500-character cap rejected a real multi-turn project checkpoint.
+      summary: z.string().min(3).describe('Concise account of the current work, decisions, and pending next step. Preserve the details needed to resume.'),
       resource_kind: z.string().max(40).optional().describe('Optional kind hint: sheet, doc, repo, ticket, thread, project, other.'),
       related_session_id: z.string().optional(),
       related_goal_id: z.string().optional(),
@@ -143,7 +145,7 @@ export function registerFocusTools(server: McpServer): void {
     {
       id: z.number().int().positive(),
       title: z.string().min(1).max(120).optional(),
-      summary: z.string().min(3).max(500).optional(),
+      summary: z.string().min(3).optional(),
       resource_kind: z.string().max(40).optional(),
       workstate_patch: workstatePatchSchema.optional(),
     },
