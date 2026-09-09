@@ -2841,8 +2841,24 @@ export function admitExpectedWorkInvocation(input: {
       let inputSourceRef: string | null = null;
       let inputSourceDigest: string | null = null;
       let universeMembers: string[] | null = null;
+      // AN EXACT MEMBER ID IS AUTHORITATIVE FOR PER-ITEM WORK. `each` binding
+      // already requires universe_item_id and the write target is witnessed
+      // separately (callTargetWitness), so a universe_selector on such a call is
+      // redundant. A selector that contradicts the named member — live
+      // 2026-09-09: argument_pointer "/path" whose value is the draft's file
+      // path, not the account id — refused a whole ten-write frame as
+      // work_cardinality_mismatch with a repair hint that never mentioned the
+      // selector, and the model never recovered. Ignore it and bind the item.
+      const universeSelector = operation.cardinality.kind === 'each' && input.universeItemId != null
+        && input.universeSelector != null
+        && (() => {
+          const chosen = selectedMemberIds(evidenceArgs, input.universeSelector, 'each');
+          return !chosen.ok || chosen.ids.length !== 1 || chosen.ids[0] !== input.universeItemId;
+        })()
+        ? null
+        : input.universeSelector;
       if (operation.cardinality.kind === 'once') {
-        if (input.universeItemId != null || input.universeSelector != null) {
+        if (input.universeItemId != null || universeSelector != null) {
           return refusedWithPlan('work_cardinality_mismatch', 'once cardinality accepts neither an item nor universe selector');
         }
       } else {
@@ -2855,12 +2871,12 @@ export function admitExpectedWorkInvocation(input: {
         }
         const hostMayBindPerItemTarget = operation.cardinality.kind === 'each'
           && (operation.effect === 'external_write' || operation.effect === 'local_write')
-          && !input.universeSelector;
-        if (!input.universeSelector && !hostMayBindPerItemTarget) {
+          && !universeSelector;
+        if (!universeSelector && !hostMayBindPerItemTarget) {
           return refusedWithPlan('work_cardinality_mismatch', 'set/read cardinality requires an immutable argument selector');
         }
-        const selected = input.universeSelector
-          ? selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind)
+        const selected = universeSelector
+          ? selectedMemberIds(evidenceArgs, universeSelector, operation.cardinality.kind)
           : { ok: true as const, ids: [input.universeItemId as string] };
         if (!selected.ok) return refusedWithPlan('work_cardinality_mismatch', selected.reason);
         // A pointer frozen before the read that proves it may be corrected
@@ -2910,7 +2926,9 @@ export function admitExpectedWorkInvocation(input: {
           requiredMembers.length !== selected.ids.length
           || requiredMembers.some((member, index) => member !== selected.ids[index])
           || requiredMembers.some((member) => !expectedMembers.includes(member))
-        ) return refusedWithPlan('work_cardinality_mismatch', 'selected argument members do not match the accepted universe instance');
+        ) return refusedWithPlan('work_cardinality_mismatch', universeSelector
+          ? `selected argument members ${JSON.stringify(selected.ids)} (universe_selector ${JSON.stringify(universeSelector)}) do not match the accepted universe instance ${JSON.stringify(requiredMembers)}; for per-item work pass universe_item_id and universe_selector: null`
+          : 'selected argument members do not match the accepted universe instance');
         universeMembers = expectedMembers;
         if (resolvedUniverse.seal) {
           // The consumer binding carries the seal durably: which producer call
@@ -2968,7 +2986,7 @@ export function admitExpectedWorkInvocation(input: {
           inputSourceDigest = grounded.digest;
         }
         selectorJson = canonicalExpectedWorkJson(
-          input.universeSelector ?? HOST_DERIVED_CALL_TARGET_SELECTOR,
+          universeSelector ?? HOST_DERIVED_CALL_TARGET_SELECTOR,
         );
         memberDigest = expectedWorkDigest(canonicalExpectedWorkJson(selected.ids));
         memberCount = selected.ids.length;

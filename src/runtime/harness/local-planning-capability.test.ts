@@ -738,20 +738,24 @@ test('a conversational count uses its exact admitted topology when the legacy co
   const activation = expectedWork.activateActionExpectedWork(run.identity);
   assert.ok(activation.status === 'activated' || activation.status === 'replayed');
   eventlog.closeEventLog();
-  const cases = [
+  const cases: Array<{ member: string; target: string; status: string; selector?: { argumentPointer: string; memberIdPointer: string | null } }> = [
     { member: 'account-1', target: 'account-1', status: 'bound' },
     { member: 'account-50', target: 'account-50', status: 'bound' },
     { member: 'account-51', target: 'account-51', status: 'refused' },
     { member: 'account-2', target: 'account-1', status: 'refused' },
+    // A redundant selector pointing at the file path contradicts the named
+    // member; the exact universe_item_id wins (live 2026-09-09).
+    { member: 'account-3', target: 'account-3', status: 'bound', selector: { argumentPointer: '/path', memberIdPointer: null } },
   ];
-  for (const [index, { member, target, status }] of cases.entries()) {
+  for (const [index, { member, target, status, selector }] of cases.entries()) {
     const args = { path: path.join(HOME, `${target}.eml`), content: `To: ${member}@example.test\nSubject: Monday\n`, mode: 'create' };
     const logicalToolCallId = `fifty-draft-${index}`;
     assert.equal(dispatch.admitLogicalCall({ identity: { ...run.identity,
       acceptedTaskId: identities.acceptedTaskIdFor(run.identity.sessionId, run.identity.sourceUserSeq), logicalToolCallId },
       tool: 'write_file', args }).status, 'inserted');
     const binding = expectedWork.admitExpectedWorkInvocation({ ...run.identity, logicalToolCallId, proposal: null,
-      requirementId: 'draft_email', universeItemId: member, tool: 'write_file', args, inputSchema: body.schemas.write_file });
+      requirementId: 'draft_email', universeItemId: member, tool: 'write_file', args, inputSchema: body.schemas.write_file,
+      ...(selector ? { universeSelector: selector } : {}) });
     assert.equal(binding.status, status, JSON.stringify(binding));
     if (index === 3 && binding.status === 'refused') {
       assert.match(JSON.stringify(binding), /already bound to count-only slot account-1/,
