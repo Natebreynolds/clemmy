@@ -100,14 +100,27 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
       });
 
       const runtime = await new Promise<string | null>((resolve) => {
-        const timer = setTimeout(() => resolve(null), WORKER_BOOT_TIMEOUT_MS);
+        let settled = false;
+        const finish = (value: string | null) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const timer = setTimeout(() => finish(null), WORKER_BOOT_TIMEOUT_MS);
         timer.unref?.();
+        // A worker that cannot spawn at all (missing entry in a packaged
+        // layout, spawn refused) emits error/exit immediately. Without these
+        // two lines the boot promise would sit on the full timeout before
+        // falling back — turning a fast, correct degradation into a multi-
+        // minute stall on the first recall that needs an embedding.
+        worker.once('error', () => finish(null));
+        worker.once('exit', () => finish(null));
         worker.on('message', (msg: EmbeddingWorkerResponse) => {
-          if (msg.kind === 'ready') { clearTimeout(timer); resolve(msg.runtime); }
+          if (msg.kind === 'ready') finish(msg.runtime);
           else if (msg.kind === 'unavailable') {
-            clearTimeout(timer);
             logger.warn({ reason: msg.reason }, 'embedding worker reported the model unavailable');
-            resolve(null);
+            finish(null);
           }
         });
       });

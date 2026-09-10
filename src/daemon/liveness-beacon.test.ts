@@ -129,3 +129,11 @@ test('embedding inference is off the main thread by default, with an in-process 
   assert.match(source, /ON THE MAIN THREAD/,
     'falling back to the blocking path must be loud, not silent');
 });
+
+test('a worker that cannot spawn degrades immediately, not after the boot timeout', () => {
+  const source = readFileSync(new URL('../memory/embedding-worker.ts', import.meta.url), 'utf8');
+  const boot = source.slice(source.indexOf('const runtime = await new Promise'), source.indexOf('if (runtime === null'));
+  assert.match(boot, /worker\.once\('error'/, 'a failed spawn must settle the boot promise');
+  assert.match(boot, /worker\.once\('exit'/, 'an immediate exit must settle the boot promise');
+  assert.ok(boot.indexOf('WORKER_BOOT_TIMEOUT_MS') > 0, 'the timeout remains the backstop, not the only exit');
+});
