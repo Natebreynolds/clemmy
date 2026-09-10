@@ -107,7 +107,23 @@ function isByoWorker(opts?: WorkerSlotOptions): boolean {
 function effectiveSessionCap(opts?: WorkerSlotOptions): number {
   const base = maxConcurrency();
   if (!isByoWorker(opts) || envDisabled(process.env.CLEMMY_WORKER_MAX_CONCURRENCY_BYO)) return base;
-  return Math.min(base, positiveEnvInt('CLEMMY_WORKER_MAX_CONCURRENCY_BYO') ?? DEFAULT_BYO_MAX_CONCURRENCY);
+  const byoExplicit = positiveEnvInt('CLEMMY_WORKER_MAX_CONCURRENCY_BYO');
+  if (byoExplicit !== null) return Math.min(base, byoExplicit);
+  // THE HARNESS DOES NOT SQUEEZE A MODEL THE OWNER SIZED HIMSELF.
+  //
+  // The BYO default exists so an unknown provider is not stormed by default.
+  // It was applied with min(), so an EXPLICIT CLEMMY_WORKER_MAX_CONCURRENCY
+  // was silently reduced to it: a home configured for 12 still ran BYO
+  // fan-outs 3 wide. Live 2026-09-09 a 25-item fan-out on a BYO brain peaked
+  // at exactly 3 concurrent workers and took 21 minutes — the ceiling was
+  // ours, not the provider's.
+  //
+  // An explicit setting is an instruction, so it wins. The polite default
+  // still applies when nothing is configured, and the provider's own limits
+  // (and the global ceiling) still apply either way.
+  return positiveEnvInt('CLEMMY_WORKER_MAX_CONCURRENCY') !== null
+    ? base
+    : Math.min(base, DEFAULT_BYO_MAX_CONCURRENCY);
 }
 
 function effectiveGlobalCap(opts: WorkerSlotOptions | undefined, sessionCap: number): number {

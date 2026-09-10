@@ -1379,13 +1379,38 @@ export function commitTurnOutcome(
     const note = reviewReason ? `Verification note: ${reviewReason} This result remains unreviewed.`
       : NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
     const authored = effectiveOutcome.presentation.text.trim();
-    effectiveOutcome = unverifiedCompletionOutcome({
+    // A REVIEWER THAT CANNOT FIRE FOLLOWS THE BRAIN (owner decision 2026-09-09).
+    //
+    // Every other cause here is a real finding: a negative verdict, drifted
+    // artifacts, an unreadable inventory, a reply that does not match the work.
+    // "The reviewer could not sign in" is none of those. Live 2026-09-09 a
+    // 25-worker fan-out gathered 25 opportunities, created a Google Sheet,
+    // VERIFIED 26 rows x 11 columns and reported it in full — and because the
+    // boundary judge had no credential in that home, the user was handed a
+    // BLOCKED terminal on finished work. Blocking on the absence of a check
+    // teaches people to distrust the check, not the work.
+    //
+    // Honesty is kept where it belongs: the note still says the result is
+    // unreviewed, and the verdict record still carries verified:false with
+    // disposition enabled_unavailable, so nothing here ever CLAIMS a review
+    // happened. Only the terminal follows the brain. Any other cause — above
+    // all a review that ran and did not stand — still downgrades.
+    const reviewCouldNotFire = detail === 'completion_review_failed_open'
+      && publishedVerdict?.fulfills === true
+      && publishedVerdict.settledEvidenceAvailable !== false
+      && settledNow.evidenceAvailable
+      && replyMatches
+      && objectiveMatches
+      && artifactsMatch
+      && (!artifactsRequired || coverageComplete);
+    const withNote = {
       ...effectiveOutcome,
       presentation: {
         ...effectiveOutcome.presentation,
         text: authored ? `${authored}\n\n${note}` : note,
       },
-    }, true);
+    };
+    effectiveOutcome = reviewCouldNotFire ? withNote : unverifiedCompletionOutcome(withNote, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the

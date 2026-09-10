@@ -727,7 +727,15 @@ for (const [label, reason, expected] of [
   ['quota', 'The selected reviewer is rate-limited; no review was completed.', /reviewer is rate-limited/],
   ['retained-timeout', 'judge timed out — accepting completion', /judge timed out; no review was completed/],
 ] as const) {
-test(`publication keeps the ${label} reason and never calls a missing review an acceptance`, () => {
+// OWNER DECISION 2026-09-09: when the reviewer cannot fire, the terminal
+// FOLLOWS THE BRAIN. Blocking finished work because a check could not run
+// taught users to distrust the work (live: a verified 26-row sheet from a
+// 25-worker fan-out was presented as blocked because the judge had no
+// credential). The result therefore publishes as done — while still SAYING it
+// is unreviewed, and still recording verified:false / enabled_unavailable, so
+// nothing ever claims a review happened. A review that RAN and did not stand
+// still blocks.
+test(`publication follows the brain when the ${label} reviewer cannot fire, and still says it is unreviewed`, () => {
   const sessionId = `${label}-unreviewed-publication`;
   createSession({ id: sessionId, kind: 'chat' });
   const outcome = acceptedAnswer(sessionId, 'Here is the requested answer.');
@@ -742,7 +750,7 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
     replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
   } });
   const committed = commitTurnOutcome(outcome);
-  assert.equal(committed.presentation.status, 'blocked');
+  assert.equal(committed.presentation.status, 'done');
   assert.match(committed.presentation.text, expected);
   assert.match(committed.presentation.text, /remains unreviewed/);
   assert.doesNotMatch(committed.presentation.text, /accepting completion|accepted this result|without actually checking it/);
