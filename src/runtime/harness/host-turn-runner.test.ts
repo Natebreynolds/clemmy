@@ -9646,7 +9646,15 @@ test('named workflow dispatch seals before review and final child evidence owns 
         assert.ok(attemptState()?.finishedAt, 'the exact final terminal closes the parent attempt');
         const finishedAt = attemptState()?.finishedAt;
         assert.equal(finalJudges, variant === 'off' ? 0 : 1);
-        assert.equal(committed.presentation.status, variant === 'negative' || variant === 'unavailable' ? 'blocked' : 'done');
+        // OWNER DECISION 2026-09-09: a reviewer that CANNOT FIRE follows the
+        // brain, so 'unavailable' publishes done while still saying the result
+        // is unreviewed (see delivery-committer). A review that RAN and came
+        // back NEGATIVE still blocks.
+        assert.equal(committed.presentation.status, variant === 'negative' ? 'blocked' : 'done');
+        if (variant === 'unavailable') {
+          assert.match(committed.presentation.text, /unreviewed/i, 'an unfired review is still disclosed');
+          assert.equal((committed.event.data.completionVerdictRef as Record<string, unknown> | undefined)?.verified, false);
+        }
         const ref = committed.event.data.completionVerdictRef as Record<string, unknown> | undefined;
         if (variant === 'positive') {
           assert.equal(ref?.verified, true);

@@ -3235,6 +3235,10 @@ export function rewriteHistoryWithNativeCompaction(
 }
 
 export interface RunTurnOptions {
+  /** The host's own conversational check-in activation: one tool-free model
+   *  request whose PURPOSE is to speak about unfinished work and ask how to
+   *  finish. Only the host sets it; a model cannot. */
+  hostConversationalCheckIn?: true;
   agent: Agent<any, any>;
   sessionId: string;
   input: string;
@@ -6084,6 +6088,7 @@ async function runConversationWithinRuntimeConfig(
             // stop, it does not get a second budget to work in.
             maxTurns: 1,
             toolCallsPerTurn: 1,
+            hostConversationalCheckIn: true as const,
           }),
         },
       );
@@ -11304,6 +11309,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // enters — every live reply shipped unjudged).
       opts.hostJudgeCompletion = options.judgeCompletion === true;
       opts.hostPreviousResponseId = session.previousResponseId();
+      if (options.hostConversationalCheckIn === true) {
+        (opts as { hostConversationalCheckIn?: boolean }).hostConversationalCheckIn = true;
+      }
     }
     // Hoisted so the post-turn auto-credit hook can read the recall runs the
     // turn's tool handlers registered (turnRecallRunIds). Built lazily inside

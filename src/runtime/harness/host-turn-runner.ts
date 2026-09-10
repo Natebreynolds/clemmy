@@ -3682,7 +3682,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
 
   const completedOutcome = async (text: string): Promise<RunOutcome> => {
     const guarded = await runOutputGuardrails(text);
-    if (hostProduction) {
+    // THE CHECK-IN EXISTS BECAUSE THE WORK IS UNFINISHED.
+    //
+    // Refusing to publish a reply while local work is pending is right for an
+    // ordinary turn: it must not claim done over outstanding work. But the
+    // host's conversational check-in is the one turn whose entire purpose is
+    // to SAY that work is unfinished and ask how to finish it. Blocking it
+    // there meant the check-in returned zero bytes and the person was handed
+    // the engine's typed stop instead — live 2026-09-10, a 25-item fan-out
+    // where 23 items and the sheet had landed and 2 items failed read as
+    // total failure. Incomplete is not failed (owner, 2026-09-10).
+    //
+    // Only the host sets this flag, and that activation is bounded to one
+    // tool-free model request, so it cannot be used to dodge the gate for work.
+    const conversationalCheckIn = (opts as { hostConversationalCheckIn?: unknown }).hostConversationalCheckIn === true;
+    if (hostProduction && !conversationalCheckIn) {
       const { pendingAcceptedLocalWork } = await import('./local-work-completion.js');
       const pending = pendingAcceptedLocalWork(exactHostIdentity());
       if (pending) return blockedOutcome(guarded, 'local_work_incomplete');
