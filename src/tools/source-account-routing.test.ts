@@ -81,6 +81,30 @@ test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
+test('an account choice is labelled with something a person can answer, never a bare connection id', () => {
+  // Live 2026-09-09: asked to pick between three ca_******** ids for their own
+  // mailboxes, the user answered "the work one" in plain English and was asked
+  // the identical question again. A choice whose options are opaque ids cannot
+  // be answered, so the id is the LAST resort, not the first.
+  const labels = routing.accountChoiceLabels([
+    // the provider's own label wins over the email
+    { slug: 'outlook', connectionId: 'ca_aaaa', status: 'ACTIVE', accountEmail: 'a@x.invalid', accountLabel: 'Work mailbox' },
+    // no label: the email is answerable
+    { slug: 'gmail', connectionId: 'ca_bbbb', status: 'ACTIVE', accountEmail: 'b@x.invalid' },
+    // no label and no email: the provider's stable human handle still beats the id
+    { slug: 'slack', connectionId: 'ca_cccc', status: 'ACTIVE', wordId: 'slack_red-castle' },
+    // nothing human at all: only then the id
+    { slug: 'notion', connectionId: 'ca_dddd', status: 'ACTIVE' },
+  ] as Parameters<typeof routing.accountChoiceLabels>[0]);
+  const values = Object.values(labels);
+  assert.ok(values.includes('Work mailbox'), JSON.stringify(labels));
+  assert.ok(values.includes('b@x.invalid'), JSON.stringify(labels));
+  assert.ok(values.includes('slack_red-castle'), JSON.stringify(labels));
+  assert.ok(values.includes('ca_dddd'), 'the id remains the last resort');
+  assert.equal(values.filter((value) => value.startsWith('ca_')).length, 1,
+    `only the account with nothing human should fall back to its id: ${JSON.stringify(labels)}`);
+});
+
 test('original phone wording resolves through typed source evidence, without phrase grammar or a user question', async () => {
   const identity = source(ORIGINAL);
   const calls = installJudge();

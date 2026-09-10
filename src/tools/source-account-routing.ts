@@ -74,8 +74,24 @@ export function accountChoiceLabels(connections: readonly Connection[]): Readonl
     const identity = identityOf(connection);
     // A label the user gave this account (the alias store) beats the
     // provider's own; the provider's beats the email; the id is last.
+    // A CHOICE MUST BE ANSWERABLE. Precedence: the name Clem already
+    // remembered for this account, then the name the user gave the connection
+    // at the provider, then the provider's own label, then the email, then
+    // the provider's stable human handle. The raw connection id is LAST, and
+    // only when nothing else exists — live 2026-09-09 a user was asked to pick
+    // between three ca_******** ids for their own mailboxes, answered "the
+    // work one" in plain English, and was asked the same question again.
+    // First NON-EMPTY wins: `??` would stop at an empty-string email and fall
+    // straight to the id, which is exactly the unanswerable question.
     const label = aliasLabelFor(toolkit(connection), emailOf(connection) || undefined, connection.connectionId)
-      ?? (String(connection.accountLabel ?? connection.alias ?? emailOf(connection) ?? '').trim() || connection.connectionId);
+      ?? [
+        connection.accountLabel,
+        connection.alias,
+        emailOf(connection),
+        connection.accountName,
+        connection.wordId,
+      ].map((value) => String(value ?? '').trim()).find(Boolean)
+      ?? connection.connectionId;
     if (!labels[identity]) labels[identity] = label;
   }
   return Object.freeze(labels);
@@ -392,7 +408,9 @@ export async function resolveSourceAccountRouting(input: {
     toolkit,
     accountIdentity: identity,
     accountLabel: aliasLabelFor(toolkit, emailOf(connection) || undefined, connection.connectionId)
-      ?? connection.accountLabel ?? connection.alias ?? null,
+      ?? [connection.accountLabel, connection.alias, connection.accountName, connection.wordId]
+        .map((value) => String(value ?? '').trim()).find(Boolean)
+      ?? null,
     establishedSource: origin.seq !== input.sourceUserSeq
       ? { acceptedText: origin.text, sourceQuote: sourceQuote!, previouslyChecked: established !== null } : null,
     interveningAcceptedSources,
