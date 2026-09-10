@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { statusTone } from '@/lib/inbox';
@@ -220,6 +221,18 @@ export function Automate() {
       {tab === 'workflows' && (
         workflows.isLoading
           ? <CardGridSkeleton />
+          // A failed load is not an empty shelf. Reported 2026-09-10: a user
+          // whose Automate tab said "Let's automate something" had workflows on
+          // disk the whole time — an unavailable list renders as zero rows, and
+          // zero rows read as "you never made one". Say which it is, and keep
+          // the toggle/Run controls reachable behind Retry instead of inviting
+          // him to build a duplicate of what he already has.
+          : workflows.isError
+          ? <QueryUnavailable
+              title="Workflows are unavailable"
+              description="Clementine couldn’t load your workflows, so this is not an empty-automation state. Nothing has been deleted or turned off."
+              onRetry={() => { void workflows.refetch(); }}
+            />
           : wf.length === 0
             ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
             : (

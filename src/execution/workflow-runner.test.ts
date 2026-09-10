@@ -53,6 +53,7 @@ const {
   findContractViolationStep,
   tightenWorkflowContractsFromCleanRun,
   describeStepNonCompletion,
+  describeToolLimitContinuation,
   processWorkflowRuns,
   workflowAdvisoryRequiresAttention,
   workflowReportLaneForOutcome,
@@ -2678,6 +2679,41 @@ test('renderWorkflowOriginLineageBlock includes harness transcript/action ledger
 // behavioral throw is verified live; here we lock the message contract that
 // drives the report-back.)
 // ---------------------------------------------------------------------------
+
+// A ceiling is a checkpoint on this lane — the runner auto-resumes it. Live
+// 2026-09-10: a scheduled workflow failed NINE runs whose only explanation was
+// "tool calls per turn exceeded the limit of 64", so the ceiling looked like
+// the cause and the workflow was rebuilt around that number. The failure must
+// say what the harness did about it and why the resuming stopped.
+test('a tool-call ceiling reports what the harness did about it, not just the number', () => {
+  const wall = describeToolLimitContinuation({ limitKind: 'tool_calls', attempts: 3, stop: 'wall_clock' });
+  assert.match(wall, /auto-continued it 3/, 'the reader learns it WAS resumed');
+  assert.match(wall, /wall-clock/i, 'and what actually stopped it');
+  assert.match(wall, /CLEMENTINE_WORKFLOW_STEP_WALL_MS/, 'named so it can be changed');
+  assert.match(wall, /split it or raise/, 'points at the step, not the turn ceiling');
+
+  const never = describeToolLimitContinuation({ limitKind: 'tool_calls', attempts: 0, stop: 'preset_asks' });
+  assert.match(never, /did not resume/, 'no silent pretence that it tried');
+  assert.match(never, /HARNESS_AUTO_CONTINUE_ON_LIMIT/);
+
+  assert.match(
+    describeToolLimitContinuation({ limitKind: 'tool_calls', attempts: 12, stop: 'cap_exhausted' }),
+    /cap was spent/,
+  );
+  assert.match(
+    describeToolLimitContinuation({ limitKind: 'tool_calls', attempts: 1, stop: 'no_progress' }),
+    /no progress/,
+  );
+  assert.match(
+    describeToolLimitContinuation({ limitKind: 'tool_calls', attempts: 2, stop: null }),
+    /without recording a stop reason/,
+    'an unrecorded stop is said out loud rather than guessed at',
+  );
+
+  // Every other limit keeps its existing sentence untouched.
+  assert.equal(describeToolLimitContinuation({ limitKind: 'wall_clock', attempts: 0, stop: null }), '');
+  assert.equal(describeToolLimitContinuation({ attempts: 0, stop: null }), '');
+});
 
 test('describeStepNonCompletion: limit_exceeded explains the guardrail/budget stop', () => {
   const msg = describeStepNonCompletion('limit_exceeded');

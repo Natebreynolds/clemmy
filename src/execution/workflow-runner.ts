@@ -2099,6 +2099,46 @@ function throwIfWorkflowRunCancelled(runId: string): void {
  * finish its job and must be reported back honestly (north-star: reports back
  * without fail), never captured as prose-success. Exported for tests.
  */
+/**
+ * What the harness did about a per-turn tool-call ceiling, in the failure the
+ * reader actually sees.
+ *
+ * Live 2026-09-10: a scheduled workflow failed nine runs in a row, and every
+ * report said only `tool calls per turn exceeded the limit of 64`. That
+ * sentence is true and useless — the workflow lane auto-resumes a ceiling
+ * (NEVER-RESTING), so the ceiling is a checkpoint, and the thing worth naming
+ * is why the resuming STOPPED. Without it the ceiling looks like the cause,
+ * and the work gets redesigned around a number that was never the wall.
+ */
+export function describeToolLimitContinuation(input: {
+  limitKind?: string;
+  attempts: number;
+  stop: 'preset_asks' | 'cap_exhausted' | 'no_progress' | 'wall_clock' | null;
+}): string {
+  if (input.limitKind !== 'tool_calls') return '';
+  const resumed = input.attempts === 0
+    ? 'The harness did not resume it'
+    : `The harness auto-continued it ${input.attempts}\u00d7 and then stopped`;
+  const because = (() => {
+    switch (input.stop) {
+      case 'preset_asks':
+        return 'because auto-continue is off for this budget preset (HARNESS_AUTO_CONTINUE_ON_LIMIT)';
+      case 'cap_exhausted':
+        return 'because the auto-continue cap was spent (CLEMMY_CHAT_AUTO_CONTINUE_CAP)';
+      case 'no_progress':
+        return 'because the parked attempt made no progress, so resuming would only burn budget';
+      case 'wall_clock':
+        return "because the step's wall-clock budget ran out (CLEMENTINE_WORKFLOW_STEP_WALL_MS)";
+      default:
+        return 'without recording a stop reason';
+    }
+  })();
+  const advice = input.stop === 'wall_clock' || input.stop === 'cap_exhausted'
+    ? ' — the step is too big for one step, not too big for one turn: split it or raise that budget.'
+    : '.';
+  return ` ${resumed} ${because}${advice}`;
+}
+
 export function describeStepNonCompletion(status: string, error?: string): string {
   if (error && error.trim()) return error.trim();
   switch (status) {
@@ -5249,6 +5289,13 @@ async function runStepViaHarness(
       await import('../runtime/harness/continue-directive.js');
     const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
     let continueAttempts = 0;
+    // What the harness DID about the ceiling, so the failure can say it. A
+    // bare "tool calls per turn exceeded the limit of 64" reads as "the ceiling
+    // killed the run" whether the harness resumed 200 times or never resumed at
+    // all — live 2026-09-10, a user's workflow failed nine runs on that message
+    // and it was rebuilt around the ceiling without anyone knowing whether the
+    // ceiling was the thing that stopped it.
+    let continueStop: 'preset_asks' | 'cap_exhausted' | 'no_progress' | 'wall_clock' | null = null;
     const continuePastToolCallsLimit = async (): Promise<void> => {
       // Resume ONLY on the typed tool-calls marker, never on a step-count
       // heuristic: every live limit park arrives with steps >= 1 (stepIndex
@@ -5269,11 +5316,11 @@ async function runStepViaHarness(
           // parked before completing an orchestrator step.
           stepsThisActivation: Math.max(result.steps ?? 0, 1),
         });
-        if (!decision.resume) break;
+        if (!decision.resume) { continueStop = decision.reason; break; }
         continueAttempts += 1;
         if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
         const continuationWallClockMs = remainingStepWallClockMs();
-        if (continuationWallClockMs <= 0) break;
+        if (continuationWallClockMs <= 0) { continueStop = 'wall_clock'; break; }
         result = await runWorkflowConversationImpl({
           agent,
           sessionId: realSessionId,
@@ -5657,7 +5704,13 @@ async function runStepViaHarness(
     if (result.status !== 'completed') {
       finalizeDeferredToolLimit({ kind: 'limit_exceeded' });
       throw new Error(
-        `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
+        `workflow step "${step.id}" did not complete (status: ${result.status}): `
+        + `${describeStepNonCompletion(result.status, result.error)}`
+        + describeToolLimitContinuation({
+          limitKind: result.limitKind,
+          attempts: continueAttempts,
+          stop: continueStop,
+        }),
       );
     }
     if (looksLikeWorkflowStepStructuralResultMiss(prose)) {
