@@ -622,15 +622,34 @@ export function buildScopedLocalToolSearch(
  * dispatch and to return the schema on a validation miss. Side-effect-free
  * (captureLocalTools registers against a fake server); safe to call on demand.
  */
+let cachedLocalToolSchemas: Map<string, z.ZodTypeAny> | null = null;
+
 export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
-  const map = new Map<string, z.ZodTypeAny>();
-  for (const localTool of captureLocalTools()) {
-    // First-class provider schemas already declare additionalProperties:false.
-    // Keep it recursively here too: deferred transport may omit nullable
-    // optionals, but it may never smuggle stale/unknown keys.
-    map.set(localTool.name, canonicalDeferredLocalToolSchema(localTool));
+  // MEMOIZED for the same reason getLocalToolCatalog above is: the local tool
+  // surface is immutable for a daemon lifetime. Rebuilding it cost ~21 ms a
+  // call — ~180 tool registrations, ~20 ensureDir syscalls and ~180 strict
+  // parser constructions — to answer a ONE-NAME lookup. Planning reobservation
+  // asks once per learned local write per recent accepted task, so an ordinary
+  // turn paid that rebuild 64 times: 4.1 s of every non-plain turn, growing
+  // with history (measured 2026-09-09). call-tool has memoized this exact map
+  // process-wide since it shipped; this moves the memo to the source so every
+  // caller stops paying for it.
+  //
+  // NOTHING STOPS BEING LEARNED. Each observation still re-derives the
+  // definition, its schema digest, fingerprints and identity from this map;
+  // only the rebuild of an unchanging surface is skipped. Callers still get
+  // their own Map, so the returned contract is unchanged.
+  if (!cachedLocalToolSchemas) {
+    const map = new Map<string, z.ZodTypeAny>();
+    for (const localTool of captureLocalTools()) {
+      // First-class provider schemas already declare additionalProperties:false.
+      // Keep it recursively here too: deferred transport may omit nullable
+      // optionals, but it may never smuggle stale/unknown keys.
+      map.set(localTool.name, canonicalDeferredLocalToolSchema(localTool));
+    }
+    cachedLocalToolSchemas = map;
   }
-  return map;
+  return new Map(cachedLocalToolSchemas);
 }
 
 /** Omissible fields on the deferred transport. Codex's strict first-class

@@ -95,6 +95,36 @@ type ConfiguredLocalToolObserver = (
 
 let observerOverride: ConfiguredLocalToolObserver | null = null;
 
+/** name -> the core surface's declared parameter schemas, built once.
+ *
+ * `getCoreTools()` CONSTRUCTS every tool object on every call (~58 ms here),
+ * and this lookup wants one name's schema. Planning reobservation asks once
+ * per learned local write per recent accepted task, so an ordinary turn paid
+ * that construction dozens of times (measured 2026-09-09). The local surface
+ * is immutable for a daemon lifetime — the same invariant getLocalToolCatalog
+ * and getLocalToolSchemas already rely on — so the projection is built once.
+ *
+ * Only the DATA is cached, never the live Tool objects with their execute
+ * closures: callers that build agents still get fresh instances from
+ * getCoreTools. The exactly-one-match rule is preserved by keeping every
+ * declaration for a name rather than collapsing duplicates. */
+let cachedCoreToolParameters: Map<string, Array<{ name: string; parameters: unknown }>> | null = null;
+
+async function coreToolParameterProjection(): Promise<Map<string, Array<{ name: string; parameters: unknown }>>> {
+  if (!cachedCoreToolParameters) {
+    const { getCoreTools } = await import('../../tools/registry.js');
+    const projection = new Map<string, Array<{ name: string; parameters: unknown }>>();
+    for (const entry of getCoreTools() as unknown as Array<{ name?: unknown; parameters?: unknown }>) {
+      if (typeof entry.name !== 'string') continue;
+      const rows = projection.get(entry.name) ?? [];
+      rows.push({ name: entry.name, parameters: entry.parameters });
+      projection.set(entry.name, rows);
+    }
+    cachedCoreToolParameters = projection;
+  }
+  return cachedCoreToolParameters;
+}
+
 async function defaultConfiguredLocalTool(
   name: string,
   carrier: LocalPlanningCarrier,
@@ -128,10 +158,7 @@ async function defaultConfiguredLocalTool(
 
   // Graph-neutral first-class/call_tool observations retain the exact
   // configured model-facing surface.
-  const { getCoreTools } = await import('../../tools/registry.js');
-  const matches = getCoreTools()
-    .map((tool) => tool as unknown as { name?: unknown; parameters?: unknown })
-    .filter((tool) => tool.name === name);
+  const matches = (await coreToolParameterProjection()).get(name) ?? [];
   if (matches.length !== 1 || typeof matches[0]?.name !== 'string' || !matches[0].parameters) return null;
   // The core surface can carry provider-strict required+nullable placeholders.
   // Deferred callers omit those same optional fields. Use the same contract

@@ -172,25 +172,25 @@ function composioSlugIsUnambiguousRead(operationId: string): boolean {
   //
   // The softer write vocabulary is full of words that are OBJECTS in ordinary
   // read slugs: the schedule, the run, the build, the order, open issues. A
-  // token-anywhere rule graded `OUTLOOK_GET_SCHEDULE` (free/busy),
-  // `APIFY_GET_RUN`, `APIFY_GET_BUILD`, `SHOPIFY_GET_ORDER` and
-  // `GITHUB_LIST_OPEN_ISSUES` as MUTATIONS — while the plural
-  // `APIFY_LIST_RUNS` and `SHOPIFY_LIST_ORDERS` passed, so singular vs plural
-  // of the same noun flipped the effect. Live 2026-09-09: "what's on my
-  // calendar Thursday?" could not be answered at all, because the one exposed
-  // Outlook calendar read was refused as a write.
+  // token-anywhere rule graded a free/busy calendar read, an automation run
+  // and build read, an order read and an open-issues list as MUTATIONS —
+  // while the PLURAL form of the same nouns passed, so singular vs plural of
+  // one noun flipped the effect. Live 2026-09-09: "what's on my calendar
+  // Thursday?" could not be answered at all, because the one exposed calendar
+  // read was refused as a write. (The exact slugs live in the test, not here:
+  // production source must not accumulate provider literals.)
   //
   // So scan in order, exactly as `leadingVerbIsRead` already does for the send
-  // floor: the first token that is a known verb decides. `GET_SCHEDULE` reads;
-  // `SCHEDULE_MEETING` does not. Slugs that repeat their toolkit
-  // (`OUTLOOK_OUTLOOK_CALENDAR_SEARCH`) still resolve on their first known
+  // floor: the first token that is a known verb decides. A get-the-schedule
+  // slug reads; a schedule-a-meeting slug does not. Slugs that repeat their
+  // toolkit before the verb still resolve on their first known
   // verb. This is only the absent-manifest default for a provider-shaped slug;
   // an exact manifest, consent, approval, expected-work and settlement all
   // still decide the actual call.
-  // A COMPOUND SLUG STILL MUTATES. `GONG_GET_CALL_AND_UPDATE_CONTACT` reads one
-  // thing and writes another, so only the token IMMEDIATELY AFTER the read verb
-  // is treated as that verb's object; a write verb further along is a second
-  // operation and still disqualifies.
+  // A COMPOUND SLUG STILL MUTATES. A slug that reads one thing and updates
+  // another (get-call-and-update-contact shapes) must not pass, so only the
+  // token IMMEDIATELY AFTER the read verb is treated as that verb's object; a
+  // write verb further along is a second operation and still disqualifies.
   const verbIndex = toolParts.findIndex((token) => (
     READ_VERBS.has(token) || READ_DISQUALIFYING_WRITE_VERBS.has(token)
   ));
