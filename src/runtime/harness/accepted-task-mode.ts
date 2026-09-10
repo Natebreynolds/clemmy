@@ -3,6 +3,7 @@ import { getSession, listEvents } from './eventlog.js';
 import { parseTaskMode, taskModeDigest, type TaskMode } from './task-mode.js';
 import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { planFirstWorkRefusal } from './plan-first-contract.js';
 
 export function acceptedTaskMode(sessionId: string | undefined, sourceUserSeq: number | undefined): TaskMode | undefined {
   if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || Number(sourceUserSeq) <= 0) return undefined;
@@ -16,8 +17,28 @@ export function acceptedTaskModeIdentity(sessionId: string, sourceUserSeq: numbe
   if (!session) throw new Error('task mode source session missing');
   return { mode, digest: taskModeDigest(mode), principalId: session.userId || session.id };
 }
+function safeArgumentsJson(args: unknown): string {
+  try { return typeof args === 'string' ? args : JSON.stringify(args ?? {}); } catch { return ''; }
+}
+
+/** The owner's own words for this accepted source — what counts as an input he named. */
+function acceptedSourceRequestText(sessionId: string, sourceUserSeq: number): string {
+  try {
+    const source = listEvents(sessionId, { sinceSeq: sourceUserSeq - 1, types: ['user_input_received'], limit: 1 })
+      .find(row => row.seq === sourceUserSeq);
+    const display = typeof source?.data.displayText === 'string' ? source.data.displayText : '';
+    return display.trim() || (typeof source?.data.text === 'string' ? source.data.text : '');
+  } catch {
+    return '';
+  }
+}
+
 export function planModeCallRefusal(input: {
   mode: TaskMode | undefined; toolName: string; args: unknown; attestedEffect?: RuntimeToolEffect;
+  /** The accepted planning source. Present on the live host path; absent in
+   *  unit callers that only exercise the consequence ceiling. */
+  identity?: { sessionId: string; sourceUserSeq: number };
+  argumentsJson?: string;
 }): string | undefined {
   if (input.mode?.kind !== 'plan') return undefined;
   const identity = unwrapRuntimeEffectiveToolIdentity(input.toolName, input.args);
@@ -32,7 +53,24 @@ export function planModeCallRefusal(input: {
   // (`sf org list --json`, `gh pr list`) crosses none. Live 2026-09-08: a
   // planning turn needed the org list to plan its query and was refused as if
   // it were a write, then wandered until it died with a misleading stop.
-  if ((effect === 'read' || effect === 'compute') && name !== 'request_approval') return undefined;
+  if ((effect === 'read' || effect === 'compute') && name !== 'request_approval') {
+    // A read is still a read — but in a PLANNING turn the work itself is what
+    // the owner is waiting to approve. Reading the inputs he named stays free;
+    // going and doing the research before offering a plan is what this catches.
+    // Live 2026-09-10: seven Firecrawl searches, zero plans published.
+    if (input.identity && identity.composioCarrier) {
+      const refusal = planFirstWorkRefusal({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        toolName: name,
+        argumentsJson: input.argumentsJson ?? safeArgumentsJson(input.args),
+        requestText: acceptedSourceRequestText(input.identity.sessionId, input.identity.sourceUserSeq),
+        externalRead: true,
+      });
+      if (refusal) return refusal;
+    }
+    return undefined;
+  }
   // A PLANNING TURN MAY STILL TALK.
   //
   // Plan's ceiling is EXTERNAL CONSEQUENCE, not the absence of a read label.

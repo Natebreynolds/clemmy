@@ -4857,7 +4857,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const mode = acceptedTaskMode(taskIdentity.sessionId, taskIdentity.sourceUserSeq);
     if (mode?.kind === 'plan') {
       const attested = exactProductionHostCall(name, args, argumentsJson, tool, logicalToolCallId, runContext, details);
-      const refusal = planModeCallRefusal({ mode, toolName: name, args, attestedEffect: attested?.effect });
+      const refusal = planModeCallRefusal({
+        mode, toolName: name, args, attestedEffect: attested?.effect,
+        // The accepted planning source is what makes "the owner named this
+        // input" answerable, so the plan-first boundary can tell his document
+        // apart from the research it is supposed to be proposing.
+        identity: { sessionId: taskIdentity.sessionId, sourceUserSeq: taskIdentity.sourceUserSeq },
+        argumentsJson,
+      });
       if (refusal) return refusal;
     }
     if (mode?.kind === 'execute') {
@@ -9432,7 +9439,19 @@ export function acceptedObjectiveForSource(input: {
     if (!text.trim()) return null;
     const mode = acceptedTaskMode(input.sessionId, input.sourceUserSeq);
     const base = mode?.kind === 'plan'
-      ? `Investigate and prepare a complete plan for review without executing business changes. User's planning objective: ${text}`
+      // A Plan turn's DELIVERABLE is the plan. "Investigate" led this
+      // sentence until 2026-09-10, and a live run took it literally: it read
+      // the owner's brief, then spent the rest of the turn doing the research
+      // and published nothing. The objective now names the deliverable first,
+      // says the owner's own inputs are to be READ rather than proposed as
+      // steps, and points at the question instead of the fieldwork — this
+      // string is also what the completion judge measures "done" against.
+      ? `Produce a plan for review, BEFORE doing the work. Read every input the user named (documents, links, `
+        + `sheets they pointed you at) and use what you already know from memory and context — reading what the `
+        + `user handed you is not a plan step and must never appear as one. Then publish a plan of substance: what `
+        + `those inputs told you, the steps you intend to fan out, what each step produces, and in what order. Do `
+        + `not carry out the research in this turn. If you genuinely cannot plan without a fact you do not have, `
+        + `ask the user that exact question. The user decides when to execute. User's planning objective: ${text}`
       : acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq) ?? text;
     // The EFFECTIVE objective, not just the opening request. Steering the owner
     // sent mid-run is part of the job; a judge that never sees it rules against
