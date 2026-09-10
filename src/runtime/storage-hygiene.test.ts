@@ -121,3 +121,76 @@ test('a LIVE reap never touches canonical memory, vault, recordings, sessions, o
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// ── Pre-migration rollback images (2026-09-10) ──────────────────────────────
+// memory/db.ts writes one full VACUUM INTO copy every time the database crosses
+// a schema boundary and, unlike the nightly backups next door, these were never
+// pruned — so a long-lived install carries one whole-database copy per
+// migration, forever, each larger than the last.
+test('superseded pre-migration snapshots are reaped, newest few kept', () => {
+  const base = mkdtempSync(path.join(os.tmpdir(), 'clem-hygiene-snap-'));
+  const dir = path.join(base, 'state', 'pre-migration-backups');
+  mkdirSync(dir, { recursive: true });
+  const old = Date.now() - 200 * 24 * 60 * 60 * 1000;
+  const names = [
+    'memory-v30-to-v32-2026-01-01T00-00-00-000Z-p1-1.db',
+    'memory-v32-to-v33-2026-02-01T00-00-00-000Z-p1-1.db',
+    'memory-v33-to-v34-2026-03-01T00-00-00-000Z-p1-1.db',
+    'memory-v34-to-v35-2026-04-01T00-00-00-000Z-p1-1.db',
+    'memory-v35-to-v36-2026-05-01T00-00-00-000Z-p1-1.db',
+  ];
+  names.forEach((name, i) => {
+    const file = path.join(dir, name);
+    writeFileSync(file, 'x'.repeat(1024));
+    // Oldest first in the list -> oldest mtime.
+    utimesSync(file, new Date(old + i * 86_400_000), new Date(old + i * 86_400_000));
+  });
+
+  const result = reapDisposableRuntimeArtifacts({ baseDir: base });
+  const removed = result.removals
+    .filter((r) => r.kind === 'superseded_pre_migration_snapshot')
+    .map((r) => path.basename(r.path));
+
+  assert.equal(removed.length, 2, 'five snapshots, three retained');
+  assert.ok(removed.includes(names[0]) && removed.includes(names[1]),
+    'the two oldest boundaries go first');
+  for (const keep of names.slice(2)) {
+    assert.ok(existsSync(path.join(dir, keep)), `${keep} must be retained`);
+  }
+});
+
+test('a recent pre-migration snapshot is never swept, even beyond the retain count', () => {
+  const base = mkdtempSync(path.join(os.tmpdir(), 'clem-hygiene-snap-fresh-'));
+  const dir = path.join(base, 'state', 'pre-migration-backups');
+  mkdirSync(dir, { recursive: true });
+  // Ten snapshots, all written today: a migration that is still settling must
+  // never have its rollback image removed out from under it.
+  for (let i = 0; i < 10; i++) {
+    writeFileSync(path.join(dir, `memory-v${i + 30}-to-v${i + 31}-2026-09-10T00-00-0${i}-000Z-p1-1.db`), 'x');
+  }
+  const result = reapDisposableRuntimeArtifacts({ baseDir: base });
+  assert.equal(
+    result.removals.filter((r) => r.kind === 'superseded_pre_migration_snapshot').length,
+    0,
+    'nothing younger than the minimum age may be reaped',
+  );
+});
+
+test('database copies this code did not write are left alone', () => {
+  const base = mkdtempSync(path.join(os.tmpdir(), 'clem-hygiene-snap-foreign-'));
+  const dir = path.join(base, 'state', 'pre-migration-backups');
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 300 * 24 * 60 * 60 * 1000);
+  // Shapes observed in a real home, left by hand or by a script — not ours.
+  for (const name of ['pre-schema70-20260830.db', 'harness-preprune-20260907-160744.db', 'notes.txt']) {
+    const file = path.join(dir, name);
+    writeFileSync(file, 'x');
+    utimesSync(file, old, old);
+  }
+  const result = reapDisposableRuntimeArtifacts({ baseDir: base });
+  assert.equal(
+    result.removals.filter((r) => r.kind === 'superseded_pre_migration_snapshot').length,
+    0,
+    'reaping only what createPreMigrationMemorySnapshot writes keeps this sweep honest',
+  );
+});

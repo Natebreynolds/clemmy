@@ -15,7 +15,8 @@ export type StorageHygieneKind =
   | 'inactive_mcp_cache'
   | 'mcp_temp'
   | 'mcp_log'
-  | 'legacy_hotpatch_backup';
+  | 'legacy_hotpatch_backup'
+  | 'superseded_pre_migration_snapshot';
 
 export interface StorageHygieneRemoval {
   kind: StorageHygieneKind;
@@ -40,6 +41,9 @@ export interface StorageHygieneOptions {
   inactiveMcpCacheMaxAgeDays?: number;
   hotpatchBackupMaxAgeDays?: number;
   newestHotpatchBackupMaxAgeDays?: number;
+  /** How many pre-migration rollback images to keep, newest first. */
+  retainPreMigrationSnapshots?: number;
+  preMigrationSnapshotMinAgeDays?: number;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -107,6 +111,13 @@ export function reapDisposableRuntimeArtifacts(options: StorageHygieneOptions = 
   const inactiveMcpAge = boundedDays(options.inactiveMcpCacheMaxAgeDays, 30) * DAY_MS;
   const hotpatchAge = boundedDays(options.hotpatchBackupMaxAgeDays, 30) * DAY_MS;
   const newestHotpatchAge = boundedDays(options.newestHotpatchBackupMaxAgeDays, 90) * DAY_MS;
+  // Three rollback boundaries is already more depth than a rollback can use;
+  // 30 days keeps any snapshot near a recent migration untouched.
+  const retainSnapshots = Number.isFinite(options.retainPreMigrationSnapshots)
+    && Number(options.retainPreMigrationSnapshots) >= 1
+    ? Math.floor(Number(options.retainPreMigrationSnapshots))
+    : 3;
+  const snapshotMinAge = boundedDays(options.preMigrationSnapshotMinAgeDays, 30) * DAY_MS;
   const activeMcpCaches = new Set(
     [...(options.activeMcpServerNames ?? [])].map((name) => slugifyServerName(name)),
   );
@@ -172,6 +183,33 @@ export function reapDisposableRuntimeArtifacts(options: StorageHygieneOptions = 
     result.scanned += 1;
     const maxAge = index === 0 ? newestHotpatchAge : hotpatchAge;
     if (entryAgeMs(entry, nowMs) > maxAge) remove(entry, 'legacy_hotpatch_backup');
+  });
+
+  // Pre-migration rollback images. memory/db.ts writes one full VACUUM INTO
+  // copy of the database every time it crosses a schema boundary and, unlike
+  // the nightly backups next door (which pruneMemoryBackups retains by count),
+  // these were never pruned at all — so a long-lived install accumulates one
+  // whole-database copy per migration, forever, each larger than the last.
+  //
+  // The rollback guarantee only ever needed the RECENT boundary: you cannot
+  // roll a v36 database back across four superseded schemas anyway. So keep the
+  // newest few and age out the rest — and never touch a snapshot younger than
+  // the minimum age, so an image written moments before a migration that is
+  // still settling cannot be swept out from under it.
+  //
+  // Deliberately reaps only what THIS code writes: the `memory-v<n>-to-v<n>-`
+  // shape from createPreMigrationMemorySnapshot. Ad-hoc database copies a human
+  // or a script left in the home are not ours to delete.
+  const snapshots = collectFiles(path.join(baseDir, 'state', 'pre-migration-backups'))
+    .filter((file) => /(^|\/)memory-v\d+-to-v\d+-.*\.db$/.test(file))
+    .sort((a, b) => {
+      try { return statSync(b).mtimeMs - statSync(a).mtimeMs; } catch { return 0; }
+    });
+  snapshots.forEach((file, index) => {
+    result.scanned += 1;
+    if (index < retainSnapshots) return;
+    if (entryAgeMs(file, nowMs) < snapshotMinAge) return;
+    remove(file, 'superseded_pre_migration_snapshot');
   });
 
   // NOTE: logs/ is deliberately NOT reaped. daemon.log is append-only with no
