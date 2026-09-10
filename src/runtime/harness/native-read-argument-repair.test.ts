@@ -244,7 +244,16 @@ test('a genuinely repeated unpublished call exhausts the same repair budget acro
   assert.equal(terminals.length, 1);
   assert.equal(terminals[0]?.status, 'blocked');
   assert.equal(terminals[0]?.identity.sourceUserSeq, run.identity.sourceUserSeq);
-  assert.equal(run.brainRequests, 5, 'the governor stops before the six-request fixture limit');
+  // Five governed attempts, then exactly one host-owned check-in: a chat turn
+  // the no-progress governor exhausts no longer ends on the engine's typed
+  // stop, it spends one tool-free request telling the person what stopped it
+  // (loop.ts modelCheckInForExhaustedTurn, 2026-09-09). The governor proof is
+  // the repair ledger below, not this count.
+  assert.equal(run.brainRequests, 6, 'five governed attempts plus one check-in request');
+  const checkIns = run.trace.filter(event => event.type === 'guardrail_tripped'
+    && event.data.kind === 'no_progress_check_in');
+  assert.equal(checkIns.length, 1, 'the sixth request is the check-in, asked once');
+  assert.equal(checkIns[0]?.data.why, 'governor_exhausted');
   assert.notEqual(run.authority.state, 'conflict');
   assert.equal(run.rows.some(row => row.tool_name === 'skill_read' && row.host_crossing_count === 1), false);
   assert.ok(run.rows.every(row => Number(row.mutating ?? 0) === 0));

@@ -1515,6 +1515,16 @@ export async function modelCheckInForExhaustedTurn(
   if (turnResult.status !== 'blocked') return turnResult;
   const sourceUserSeq = input.sourceUserSeq;
   if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return turnResult;
+  // ONLY WHERE A PERSON IS ADJACENT. A workflow step, a delegated worker child
+  // and a background/cron run have no one to answer: spending a model request
+  // to ask them a question buys nothing and a worker must never address the
+  // user at all (its result goes to its parent). Those lanes keep the typed
+  // stop, which their own runner already reports.
+  try {
+    if (getSession(input.sessionId)?.kind !== 'chat') return turnResult;
+  } catch {
+    return turnResult;
+  }
   const alreadyAsked = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
     .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
   if (alreadyAsked) return turnResult;
@@ -1528,6 +1538,7 @@ export async function modelCheckInForExhaustedTurn(
   let checkIn: RunTurnResult;
   try {
     checkIn = await input.run(NO_PROGRESS_CHECK_IN_STEER);
+    // (the caller bounds this to exactly one model request and one tool call)
   } catch (error) {
     logger.warn({ err: error, sessionId: input.sessionId, sourceUserSeq }, 'no-progress check-in: activation threw — typed stop stands');
     return turnResult;
@@ -3701,6 +3712,13 @@ async function checkInAfterNoProgressResume(
   sourceUserSeq: number | undefined,
 ): Promise<RunConversationResult> {
   if (!sourceUserSeq || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return result;
+  // Same adjacency rule as the turn seam: only a conversational surface has
+  // someone to answer.
+  try {
+    if (getSession(options.sessionId)?.kind !== 'chat') return result;
+  } catch {
+    return result;
+  }
   const alreadyAsked = listEvents(options.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
     .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
   if (alreadyAsked) return result;
@@ -6062,6 +6080,9 @@ async function runConversationWithinRuntimeConfig(
             ...hostTurnOptions,
             continuationSteer: steer,
             hostOwnedContinuation: true as const,
+            // Exactly one model request, no tools: the check-in explains the
+            // stop, it does not get a second budget to work in.
+            maxTurns: 1,
             toolCallsPerTurn: 1,
           }),
         },

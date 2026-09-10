@@ -2503,9 +2503,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     toolByName = new Map(tools.map((tool) => [tool.name, tool]));
     schemas = serializedTools(tools);
     armExactHostSurface();
-    // A delegated worker child freezes its derived expected-work contract
-    // here: after the host owns the child's accepted source and graph, before
-    // the first model step (expected-work-delegation.ts, 2026-09-09).
+    // A delegated worker child prepares its own item here: after the host owns
+    // and arms the child's accepted source, before its first model step, the
+    // packet's parent-resolved local tools are disclosed to the child's own
+    // planning catalog so its plan_task can bind them
+    // (expected-work-delegation.ts, 2026-09-09). Called on every arm; the
+    // worker runner makes it idempotent.
     await (opts as { onHostArmed?: () => Promise<void> | void }).onHostArmed?.();
   };
   const signal = (opts as { signal?: AbortSignal }).signal;
