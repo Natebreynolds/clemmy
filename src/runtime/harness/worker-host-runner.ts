@@ -149,20 +149,37 @@ export async function runPacketWorkerWithHost(input: {
           }
         : undefined;
       const { hostRunRunner } = await import('./host-turn-runner.js');
-      const outcome = await hostRunRunner(new Runner({ groupId: input.parentSessionId }) as never,
-        agent, [{ type: 'message', role: 'user', content: prompt }] as never, {
-          maxTurns: input.maxTurns, hostTurnEngine: 'host_v1',
-          context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
-          ...(input.signal ? { signal: input.signal } : {}),
-          ...(onHostArmed ? { onHostArmed } : {}),
-        } as never);
-      if (delegation?.status === 'delegated') {
-        const credit = creditDelegatedExpectedWork({
-          parentSessionId: input.parentSessionId, parentSourceUserSeq: source.seq,
-          childSessionId: session.id, childSourceUserSeq: childSource.seq,
-          requirementId: delegation.requirementId, item: delegation.item, effect: delegable?.effect,
-        });
-        workerLogger.info({ childId: session.id, item: input.input.item, credit: credit.status }, 'delegated expected-work credit');
+      // A PROVEN WRITE IS CREDITED EVEN WHEN THE CHILD DIES AFTER IT.
+      // The child can settle its item and then trip its tool ceiling, be
+      // killed, or abort; hostRunRunner throws and the normal-return path
+      // never runs. Crediting only on clean return lost the completion and the
+      // parent re-dispatched the item, writing it twice (review 2026-09-09).
+      // The credit reads the child's OWN discharged binding, so it stays a
+      // proof, not an assumption — and it can never mask the child's error.
+      const creditDelegatedItem = (): void => {
+        if (delegation?.status !== 'delegated') return;
+        try {
+          const credit = creditDelegatedExpectedWork({
+            parentSessionId: input.parentSessionId, parentSourceUserSeq: source.seq,
+            childSessionId: session.id, childSourceUserSeq: childSource.seq,
+            requirementId: delegation.requirementId, item: delegation.item, effect: delegable?.effect,
+          });
+          workerLogger.info({ childId: session.id, item: input.input.item, credit: credit.status }, 'delegated expected-work credit');
+        } catch (error) {
+          workerLogger.warn({ err: error, childId: session.id, item: input.input.item }, 'delegated expected-work credit threw');
+        }
+      };
+      let outcome;
+      try {
+        outcome = await hostRunRunner(new Runner({ groupId: input.parentSessionId }) as never,
+          agent, [{ type: 'message', role: 'user', content: prompt }] as never, {
+            maxTurns: input.maxTurns, hostTurnEngine: 'host_v1',
+            context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
+            ...(input.signal ? { signal: input.signal } : {}),
+            ...(onHostArmed ? { onHostArmed } : {}),
+          } as never);
+      } finally {
+        creditDelegatedItem();
       }
       // Attribution is the EXECUTED route, never the plan: a rate-limit fallover
       // (`turn_model_routed` routeKind harness_fallover in the CHILD session) can

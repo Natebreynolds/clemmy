@@ -162,10 +162,41 @@ function composioSlugIsUnambiguousRead(operationId: string): boolean {
   if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(operationId)) return false;
   const toolParts = operationId.split(/[_.]+/).filter(Boolean).slice(1);
   if (!toolParts.some((token) => READ_VERBS.has(token))) return false;
-  return !toolParts.some((token) => (
-    IRREVERSIBLE_SEND_VERBS.has(token)
-    || DISPATCH_VERBS.has(token)
-    || READ_DISQUALIFYING_WRITE_VERBS.has(token)
+  // A SEND OR DISPATCH TOKEN ANYWHERE STILL FAILS CLOSED. These are the
+  // irreversible ones (SEND, PUBLISH, POST, REPLY, CREATE, MAKE); a slug that
+  // mentions one at all is never defaulted to a read.
+  if (toolParts.some((token) => (
+    IRREVERSIBLE_SEND_VERBS.has(token) || DISPATCH_VERBS.has(token)
+  ))) return false;
+  // THE VERB IS THE LEADING TOKEN; WHAT FOLLOWS IS THE OBJECT.
+  //
+  // The softer write vocabulary is full of words that are OBJECTS in ordinary
+  // read slugs: the schedule, the run, the build, the order, open issues. A
+  // token-anywhere rule graded `OUTLOOK_GET_SCHEDULE` (free/busy),
+  // `APIFY_GET_RUN`, `APIFY_GET_BUILD`, `SHOPIFY_GET_ORDER` and
+  // `GITHUB_LIST_OPEN_ISSUES` as MUTATIONS — while the plural
+  // `APIFY_LIST_RUNS` and `SHOPIFY_LIST_ORDERS` passed, so singular vs plural
+  // of the same noun flipped the effect. Live 2026-09-09: "what's on my
+  // calendar Thursday?" could not be answered at all, because the one exposed
+  // Outlook calendar read was refused as a write.
+  //
+  // So scan in order, exactly as `leadingVerbIsRead` already does for the send
+  // floor: the first token that is a known verb decides. `GET_SCHEDULE` reads;
+  // `SCHEDULE_MEETING` does not. Slugs that repeat their toolkit
+  // (`OUTLOOK_OUTLOOK_CALENDAR_SEARCH`) still resolve on their first known
+  // verb. This is only the absent-manifest default for a provider-shaped slug;
+  // an exact manifest, consent, approval, expected-work and settlement all
+  // still decide the actual call.
+  // A COMPOUND SLUG STILL MUTATES. `GONG_GET_CALL_AND_UPDATE_CONTACT` reads one
+  // thing and writes another, so only the token IMMEDIATELY AFTER the read verb
+  // is treated as that verb's object; a write verb further along is a second
+  // operation and still disqualifies.
+  const verbIndex = toolParts.findIndex((token) => (
+    READ_VERBS.has(token) || READ_DISQUALIFYING_WRITE_VERBS.has(token)
+  ));
+  if (verbIndex < 0 || !READ_VERBS.has(toolParts[verbIndex]!)) return false;
+  return !toolParts.some((token, index) => (
+    index > verbIndex + 1 && READ_DISQUALIFYING_WRITE_VERBS.has(token)
   ));
 }
 

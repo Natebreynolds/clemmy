@@ -165,3 +165,61 @@ async function run(parentKind: 'act' | 'execute'): Promise<void> {
   assert.deepEqual(rows.map((row) => row.universe_item_id), ['account-1']);
   assert.equal(rows[0]!.child_session_id, childId);
 }
+
+// NEGATIVE CONTROL. The credit must come from the child's OWN discharged
+// binding, never from the fact that a delegation happened. A child that plans
+// its item and then answers WITHOUT writing must credit nothing, or the
+// positive pin above proves only that delegation was recorded.
+test('a delegated child that never writes credits the parent nothing', async () => {
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  const session = eventlog.createSession({ id: 'worker-delegated-nowrite-parent', kind: 'chat', userId: 'fixture-owner' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: PARENT_ASK } });
+  const graph = recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn } });
+  assert.ok(graph);
+  const activated = admission.activateActionExpectedWork({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.ok(activated.status === 'activated' || activated.status === 'replayed', JSON.stringify(activated));
+  assert.equal(contracts.freezeActionExpectedWorkContract({ sessionId: session.id, sourceUserSeq: source.seq, proposal: parentProposal() }).status, 'fixed');
+  const targetPath = path.join(TEST_HOME, 'nowrite-account-1-note.txt');
+  const packet = {
+    objective: 'Save one local text file for one account.', item: 'account-1', resolvedTools: 'write_file',
+    externalMcpToolNames: null, context: `Account account-1. Save the file at ${targetPath}. Do not contact anyone.`,
+    instructions: 'Save the local file for this account.', expectedOutput: 'The saved path.', intent: 'writer',
+    expectedWork: { requirementId: 'write_note', universeId: 'accounts' },
+  };
+  let childId = '';
+  let modelCalls = 0;
+  await brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
+    counter: new brackets.ToolCallsCounter(8) }, () => withLogicalToolCall({
+      sessionId: session.id, sourceUserSeq: source.seq, logicalToolCallId: 'parent-nowrite-worker', tool: 'run_worker', args: packet,
+    }, () => runPacketWorkerWithHost({
+      parentSessionId: session.id, sourceUserSeq: source.seq, input: packet, modelId: 'gpt-5.6-terra', maxTurns: 4, mcpToolScope: null,
+      buildAgent: async (child) => {
+        childId = child.sessionId;
+        const built = await buildWorkerAgent({ sessionId: childId, sourceUserSeq: child.sourceUserSeq, workerInput: packet as never,
+          model: 'gpt-5.6-terra', mcpToolScope: null, delegatedExpectedWork: true,
+          ...(child.hostFreshPlanning ? { hostFreshPlanning: child.hostFreshPlanning } : {}) });
+        (built as unknown as { model: unknown }).model = {
+          async getResponse() {
+            modelCalls += 1;
+            // Claims the work in prose; never calls work_call.
+            return { responseId: `nowrite-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              output: [{ type: 'message', role: 'assistant', status: 'completed',
+                content: [{ type: 'output_text', text: `Saved the note for account-1 at ${targetPath}.` }] }] };
+          }, getStreamedResponse: modelStream,
+        };
+        return built as never;
+      },
+    })));
+  assert.equal(existsSync(targetPath), false, 'nothing was written');
+  assert.equal(eventlog.listEvents(session.id, { types: ['expected_work_delegated'] }).length, 1, 'the delegation still happened');
+  assert.equal(eventlog.listEvents(session.id, { types: ['expected_work_delegated_discharge'] }).length, 0,
+    'a worker\'s prose credits nothing');
+  const db = eventlog.openEventLog();
+  const rows = db.prepare('SELECT universe_item_id FROM expected_work_delegated_discharges WHERE session_id = ?').all(session.id);
+  assert.equal(rows.length, 0);
+  const line = admission.expectedWorkPlanLines({ sessionId: session.id, sourceUserSeq: source.seq })
+    .find((entry) => entry.requirementId === 'write_note');
+  assert.equal(line?.settledInstances, 0, 'the parent line is untouched');
+});
+

@@ -2265,7 +2265,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const workerAgentForPacket = async (
     input: WorkerToolInput,
     model: string,
-    child?: { sessionId: string; sourceUserSeq: number; delegatedExpectedWork?: { requirementId: string } },
+    child?: { sessionId: string; sourceUserSeq: number; hostFreshPlanning?: HostFreshPlanningContextV1; delegatedExpectedWork?: { requirementId: string } },
   ): Promise<{ agent: BuiltWorkerAgent; scope: McpToolScope | null | undefined }> => {
     const scope = workerPacketMcpToolScope({
       buildScope: mcpToolScope,
@@ -2278,7 +2278,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       : scope === null
         ? 'scope:deny'
         : `scope:exact:${JSON.stringify(scope)}`;
-    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}\0${child?.delegatedExpectedWork ? 'delegated' : ''}`;
+    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}\0${child?.delegatedExpectedWork ? 'delegated' : ''}\0${child?.hostFreshPlanning ? 'planning' : ''}`;
     let pending = workerAgentCache.get(key);
     if (!pending) {
       // The child owns its scoped catalog namespace; explicit packet lineage
@@ -2291,6 +2291,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ...(Number.isSafeInteger(child?.sourceUserSeq ?? options.sourceUserSeq) && ((child?.sourceUserSeq ?? options.sourceUserSeq) ?? 0) > 0
           ? { sourceUserSeq: child?.sourceUserSeq ?? options.sourceUserSeq }
           : {}),
+        // The child's own primed planning catalog. Without it a DELEGATED
+        // child gets no plan_task (sub-agents gates it on this), so it could
+        // not freeze the contract its work_call must bind — the delegated
+        // write silently never engaged on this lane (review 2026-09-09).
+        ...(child?.hostFreshPlanning ? { hostFreshPlanning: child.hostFreshPlanning } : {}),
         ...(child?.delegatedExpectedWork ? { delegatedExpectedWork: true } : {}),
       });
       workerAgentCache.set(key, pending);

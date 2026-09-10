@@ -23,6 +23,40 @@ test.after(() => {
   currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
 });
 
+// ─── the leading verb decides; the object does not ────────────────
+// Live 2026-09-09: "what's on my calendar Thursday?" could not be answered.
+// The one exposed Outlook calendar read, OUTLOOK_GET_SCHEDULE (free/busy), was
+// graded a MUTATION because SCHEDULE appears in the soft write vocabulary — as
+// a noun. The same rule blocked APIFY_GET_RUN and APIFY_GET_BUILD (the reads a
+// research task needs), SHOPIFY_GET_ORDER and GITHUB_LIST_OPEN_ISSUES, while
+// the PLURAL APIFY_LIST_RUNS and SHOPIFY_LIST_ORDERS passed — singular vs
+// plural of the same noun flipped the effect, which is a bug, not a policy.
+const mutatingSlug = (slug: string): boolean =>
+  classifyExternalWrite('composio_execute_tool', { tool_slug: slug, arguments: '{}' }).mutating;
+
+test('classifyExternalWrite: a read verb leading the slug reads, whatever object follows', () => {
+  for (const slug of [
+    'OUTLOOK_GET_SCHEDULE', 'APIFY_GET_RUN', 'APIFY_GET_BUILD', 'SHOPIFY_GET_ORDER',
+    'GITHUB_LIST_OPEN_ISSUES', 'APIFY_LIST_RUNS', 'SHOPIFY_LIST_ORDERS',
+    'OUTLOOK_GET_EVENT', 'OUTLOOK_OUTLOOK_CALENDAR_SEARCH',
+  ]) assert.equal(mutatingSlug(slug), false, `${slug} is a read`);
+});
+
+test('classifyExternalWrite: a write verb leading the slug still mutates', () => {
+  for (const slug of [
+    'OUTLOOK_SCHEDULE_MEETING', 'APIFY_RUN_ACTOR', 'OUTLOOK_CREATE_EVENT',
+    'OUTLOOK_UPDATE_EVENT', 'OUTLOOK_DELETE_EVENT', 'GOOGLESHEETS_BATCH_UPDATE',
+  ]) assert.equal(mutatingSlug(slug), true, `${slug} mutates`);
+});
+
+test('classifyExternalWrite: the irreversible send floor still fails closed anywhere in the slug', () => {
+  // SEND/PUBLISH/POST/REPLY/CREATE/MAKE are never defaulted to a read, even
+  // when a read verb leads — these are the ones that cannot be taken back.
+  for (const slug of [
+    'OUTLOOK_SEND_EMAIL', 'SLACK_SEND_MESSAGE', 'LINKEDIN_GET_POST', 'GMAIL_GET_REPLY',
+  ]) assert.equal(mutatingSlug(slug), true, `${slug} fails closed`);
+});
+
 // ─── classifyExternalWrite ────────────────────────────────────────
 
 test('classifyExternalWrite: a mutating composio write gets a shapeKey = slug', () => {

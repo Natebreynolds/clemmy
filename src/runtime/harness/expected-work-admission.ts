@@ -1969,6 +1969,33 @@ function priorRequirementAllowsAdmission(
   const relevant = operation.cardinality.kind === 'each'
     ? rows.filter((row) => row.universe_item_id === universeItemId)
     : rows;
+  // AN ITEM A DELEGATED CHILD ALREADY WROTE IS DISCHARGED, even though the
+  // parent holds no binding row for it — the write happened in the child's
+  // session (expected-work-delegation.ts). Without this the once-per-item
+  // guard saw nothing for that item and admitted a second write of work the
+  // ledger already counted as done (review 2026-09-09).
+  if (operation.cardinality.kind === 'each' && universeItemId) {
+    const delegated = db.prepare(`
+      SELECT child_logical_tool_call_id AS id, child_session_id
+        FROM expected_work_delegated_discharges
+       WHERE session_id = ? AND source_user_seq = ? AND contract_id = ?
+         AND requirement_id = ? AND universe_item_id = ?
+       LIMIT 1
+    `).get(
+      contract.identity.sessionId,
+      contract.identity.sourceUserSeq,
+      contract.contractId,
+      operation.id,
+      universeItemId,
+    ) as { id: string; child_session_id: string } | undefined;
+    if (delegated) {
+      return {
+        ok: false,
+        reason: 'this requirement instance was already discharged by a delegated worker',
+        satisfiedByLogicalToolCallId: delegated.id,
+      };
+    }
+  }
   if (relevant.length === 0) return { ok: true };
   if (relevant.some((row) => row.state === 'open' || row.outcome_kind === null)) {
     return { ok: false, reason: 'this requirement instance already has an open logical call' };
