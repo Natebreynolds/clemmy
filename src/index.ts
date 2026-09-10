@@ -582,8 +582,8 @@ async function main(): Promise<void> {
           // Same split as the service path: the bind is fatal, the outbound
           // channel sessions degrade and retry.
           if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
-          if (DISCORD_ENABLED) await startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
-          if (SLACK_ENABLED) await startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
+          if (DISCORD_ENABLED) void startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
+          if (SLACK_ENABLED) void startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
         },
       });
       return;
@@ -847,14 +847,25 @@ async function main(): Promise<void> {
         } else {
           logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
         }
-        // Outbound sessions to third parties: degrade + retry, never a boot gate.
+        // Outbound sessions to third parties: started in the BACKGROUND, never
+        // awaited. Measured on a live 3.18.1 boot: the listeners were bound and
+        // every reconciliation finished at 16.5s, then onReady sat here for
+        // minutes waiting on channel handshakes — so the readiness phase never
+        // advanced past daemon.boot.start, HTTP could not answer, and the
+        // watchdog killed a daemon that had been ready for four minutes.
+        //
+        // Awaiting these was never justified: the daemon serves the desktop app
+        // and the phone without them, and a channel that connects ten seconds
+        // later simply delivers its first message ten seconds later. They keep
+        // their own degrade-and-retry (startOptionalChannel), so a failure is
+        // still reported and still recovers on its own.
         if (DISCORD_ENABLED) {
-          await startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
+          void startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
         } else {
           logger.info('Skipping Discord bot (DISCORD_ENABLED=false)');
         }
         if (SLACK_ENABLED) {
-          await startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
+          void startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
         } else {
           logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
         }

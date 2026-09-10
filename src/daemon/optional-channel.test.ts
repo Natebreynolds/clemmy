@@ -111,6 +111,14 @@ test('every onReady routes Discord and Slack through the degrading start, and th
       'a bare awaited Slack socket-mode start inside onReady fails the readiness boundary on a third-party flake');
     assert.match(block, /startOptionalChannel\('Discord'/);
     assert.match(block, /startOptionalChannel\('Slack'/);
+    // ...and must NOT be awaited. A live 3.18.1 boot bound its listeners and
+    // finished every reconciliation at 16.5s, then sat in onReady for minutes
+    // on channel handshakes; the readiness phase never advanced and the
+    // watchdog killed a daemon that had been serving the whole time.
+    assert.match(block, /void startOptionalChannel\('Discord'/,
+      'a channel handshake must never gate the readiness boundary');
+    assert.match(block, /void startOptionalChannel\('Slack'/,
+      'a channel handshake must never gate the readiness boundary');
     // The bind must STAY fatal: a daemon that cannot open its own door must not
     // be reported healthy. Only the outbound legs degrade.
     assert.match(block, /await startWebhookServer\(assistant\)/,
