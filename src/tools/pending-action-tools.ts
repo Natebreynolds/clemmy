@@ -19,7 +19,6 @@ import {
   type PendingActionStatus,
 } from '../runtime/harness/pending-actions.js';
 import { textResult } from './shared.js';
-import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import {
   evaluateRecipientSetIntegrity,
@@ -405,87 +404,6 @@ export function registerPendingActionTools(server: McpServer): void {
       });
       if (records.length === 0) return textResult('No pending actions match.');
       return textResult(records.map((record) => formatPendingAction(record)).join('\n\n'));
-    },
-  );
-
-  // THE MODEL DECIDES WHETHER THE HUMAN APPROVED; THE HOST DECIDES WHAT THAT
-  // CAN TOUCH.
-  //
-  // A pending card used to be resolvable only by an exact typed command
-  // ("approve apr-wzuy") or a dashboard button. Anything else — "yes",
-  // "go ahead", "yep do it" — fell through to an ordinary turn, and the model,
-  // having no way to resolve the card, raised a SECOND one for the same
-  // action. Live 2026-09-09: two pending approvals, no work done.
-  //
-  // Widening a list of approval words in the harness is the same mistake one
-  // level up: "yes go ahead but make it 2pm" begins with "yes" and is NOT
-  // consent to the card as shown. Judgement about what a person meant belongs
-  // to the model, which can read the whole sentence. The host keeps what it
-  // is actually good at: this can only resolve a card THIS session raised and
-  // that is still actionable, it cannot alter the stored payload, and
-  // approving resumes the byte-identical call that was already shown. To
-  // change anything, reject and propose again.
-  server.tool(
-    'approval_decide',
-    [
-      'Record the user\'s decision on the approval card this session is waiting on, after they answered in their own words.',
-      'Use it when their reply means yes or no to the exact action on the card ("yes", "go ahead", "yep", "no, not that one").',
-      'If they approved something DIFFERENT from what the card says (a changed time, recipient, or amount), reject it and propose the new action instead — approving dispatches the exact stored payload and you cannot edit it.',
-      'Leave approval_id null when only one card is outstanding; pass it when you are choosing among several.',
-    ].join(' '),
-    {
-      approval_id: z.string().nullable(),
-      decision: z.enum(['approve', 'reject']),
-      because: z.string().min(1).describe('The user\'s own words that carried the decision.'),
-    },
-    async ({ approval_id, decision, because }) => {
-      const sessionId = filteredSessionId(null);
-      if (!sessionId) return textResult(JSON.stringify({ ok: false, error: 'no_active_session' }));
-      const actionable = approvalRegistry
-        .listPending({ sessionId, status: 'pending' })
-        .filter((entry) => approvalRegistry.isActionable(entry))
-        .filter(approvalRegistry.isFormalApprovalSurface);
-      if (actionable.length === 0) {
-        return textResult(JSON.stringify({
-          ok: false, error: 'no_outstanding_approval',
-          detail: 'Nothing is waiting on a decision in this session. Do not claim an action was approved.',
-        }));
-      }
-      const requested = approval_id?.trim();
-      const row = requested
-        ? actionable.find((entry) => entry.approvalId === requested)
-        : actionable.length === 1 ? actionable[0] : undefined;
-      if (!row) {
-        return textResult(JSON.stringify({
-          ok: false,
-          error: requested ? 'approval_not_outstanding' : 'approval_choice_required',
-          outstanding: actionable.map((entry) => ({ approval_id: entry.approvalId, subject: entry.subject })),
-          detail: requested
-            ? 'That card is not one of this session\'s outstanding approvals; nothing was decided.'
-            : 'More than one card is outstanding. Ask which one they meant, quoting each subject.',
-        }));
-      }
-      const result = approvalRegistry.resolve(
-        row.approvalId,
-        decision === 'approve' ? 'approved' : 'rejected',
-        'chat-model-relay',
-      );
-      if (!result.ok) {
-        return textResult(JSON.stringify({ ok: false, error: result.reason, approval_id: row.approvalId }));
-      }
-      appendEvent({
-        sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
-        data: {
-          kind: 'approval_decided_by_relay', approvalId: row.approvalId, decision,
-          subject: String(row.subject ?? '').slice(0, 200), because: because.slice(0, 300),
-        },
-      });
-      return textResult(JSON.stringify({
-        ok: true, approval_id: row.approvalId, decision, subject: row.subject,
-        next: decision === 'approve'
-          ? 'The approved call is resuming on its own. Report what it does when it settles; do not re-run it.'
-          : 'Nothing was executed. Say what you will do instead.',
-      }));
     },
   );
 

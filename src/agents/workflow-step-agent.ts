@@ -144,9 +144,6 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // conversational question: cannot be answered inside a background run
   // (would hang the run) — block cleanly via workflow_step_result instead
   'ask_user_question',
-  // recording a person's decision on an approval card belongs to the surface
-  // the person is actually talking to; a background step has nobody to read
-  'approval_decide',
 ]);
 
 /** Remove only the recursion/meta vectors; keep every work tool. */
