@@ -62,6 +62,14 @@ export interface NotificationRow {
   deliveryError?: string;
   needsAttention?: boolean;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
+  /** A workflow the system switched off that only a person can switch back on. */
+  workflowEnableGate?: WorkflowEnableInboxGate | null;
+}
+
+export interface WorkflowEnableInboxGate {
+  workflowName: string;
+  displayName: string;
+  reason: string;
 }
 
 export interface WorkflowCapabilityAccountChoice {

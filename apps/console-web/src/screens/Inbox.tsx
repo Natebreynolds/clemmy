@@ -8,6 +8,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { setWorkflowEnabled } from '@/lib/automate';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
@@ -1051,12 +1052,48 @@ function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pend
 
 function NotifDetail({ row, onRead, onRetry }: { row: NotificationRow; onRead: () => void; onRetry: () => void }) {
   const failed = notifFailed(row);
+  // A workflow the system switched off is a decision, and the decision is one
+  // switch. It belongs on the card that told the user about it — not in a
+  // settings screen they have to go find, and certainly not in a file.
+  const enableGate = row.workflowEnableGate ?? null;
+  const [enableState, setEnableState] = useState<'idle' | 'busy' | 'done'>('idle');
+  const [enableError, setEnableError] = useState<string | null>(null);
+  const qc = useQueryClient();
+  const onEnable = async () => {
+    if (!enableGate) return;
+    setEnableState('busy');
+    setEnableError(null);
+    try {
+      await setWorkflowEnabled(enableGate.workflowName, true);
+      setEnableState('done');
+      void qc.invalidateQueries({ queryKey: ['workflows'] });
+      void qc.invalidateQueries({ queryKey: ['notifications'] });
+      onRead();
+    } catch (error) {
+      setEnableState('idle');
+      setEnableError(actionError(error, 'Could not switch that workflow on.'));
+    }
+  };
   return (
     <div>
       <h3 className="mb-3 text-h3 text-fg">{row.title || 'Notification'}</h3>
       <Field label="When">{relativeTime(row.createdAt) || '—'}</Field>
       <Field label="Message"><span className="whitespace-pre-wrap">{row.body ? linkify(row.body) : '—'}</span></Field>
       {row.deliveryError && <Field label="Delivery error"><span className="text-danger">{row.deliveryError}</span></Field>}
+      {enableGate && (
+        <div className="mt-4 rounded-md border border-border bg-subtle px-3 py-3">
+          <p className="text-small text-fg">{enableGate.reason}</p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <Button size="sm" disabled={enableState !== 'idle'} onClick={() => { void onEnable(); }}>
+              {enableState === 'busy' ? 'Switching on…' : enableState === 'done' ? 'Switched on' : `Turn on ${enableGate.displayName}`}
+            </Button>
+            {enableState === 'done' && (
+              <span className="text-caption text-success">It runs on its schedule again.</span>
+            )}
+            {enableError && <span className="text-caption text-danger">{enableError}</span>}
+          </div>
+        </div>
+      )}
       <div className="mt-4 flex gap-2">
         {!row.read && <Button variant="secondary" size="sm" onClick={onRead}>Mark as read</Button>}
         {failed && <Button size="sm" onClick={onRetry}><RefreshCw className="h-4 w-4" aria-hidden /> Retry</Button>}

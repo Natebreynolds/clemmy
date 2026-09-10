@@ -88,6 +88,7 @@ import {
   upsertNotificationDestination,
 } from '../runtime/notifications.js';
 import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
+import { projectWorkflowEnableInboxGate } from '../execution/workflow-enable-inbox.js';
 import { buildNotificationDoctor } from '../runtime/notification-doctor.js';
 import { testNotificationDestination } from '../runtime/notification-delivery.js';
 import { runChannelAcceptance } from '../runtime/channel-acceptance.js';
@@ -1829,6 +1830,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         ...notification,
         needsAttention: isNeedsAttentionNotification(notification),
         workflowCapability: projectWorkflowCapabilityInboxGate(notification),
+        workflowEnableGate: projectWorkflowEnableInboxGate(notification),
       })),
     });
   });

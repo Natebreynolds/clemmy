@@ -95,6 +95,7 @@ import {
 import { uniqueEnabledWorkflowMatch } from './named-workflow-match.js';
 import { admitNamedWorkflowRunFromAcceptedSource } from './admit-named-workflow-run.js';
 import { addNotification } from '../runtime/notifications.js';
+import { notifyWorkflowAwaitingEnable } from '../execution/workflow-enable-inbox.js';
 import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
 import {
@@ -1655,6 +1656,13 @@ export function registerOrchestrationTools(server: McpServer): void {
           writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
           clearWorkflowFailures(entry.name);
           if (enableVerification.missing.length > 0) {
+            // The user asked for this ON and it is still OFF. That is a
+            // decision waiting on them, not a line of prose in one chat turn.
+            notifyWorkflowAwaitingEnable({
+              workflowName: entry.name,
+              displayName: name,
+              cause: 'verification_inputs_missing',
+            });
             return textResult(
               `Workflow "${name}" was NOT enabled. ${renderMissingSmokeInputs(name, enableVerification.missing)}`,
             );
@@ -1888,6 +1896,17 @@ export function registerOrchestrationTools(server: McpServer): void {
         if (updateVerification.needsTest) {
           savedNext.enabled = false;
           writeWorkflowAndSyncTriggers(entry.name, savedNext);
+          // This is the exact trap the second user hit on 2026-09-10: every
+          // repair to a broken scheduled workflow switched it off, and nothing
+          // outside that one chat reply ever said so.
+          notifyWorkflowAwaitingEnable({
+            workflowName: entry.name,
+            displayName: entry.data.name || entry.name,
+            cause: 'edit_needs_verification',
+            ...(updateVerification.missing.length > 0
+              ? { detail: 'Its own test needs an input before it can re-check itself.' }
+              : {}),
+          });
           reSmoke = updateVerification.missing.length > 0
             ? { message: renderMissingSmokeInputs(entry.name, updateVerification.missing) }
             : queueWorkflowCreationTest(entry.name, updateVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
@@ -2011,6 +2030,14 @@ export function registerOrchestrationTools(server: McpServer): void {
           const testInputs = workflowSmokeInputs(updated, {});
           const missingSmokeInputs = missingWorkflowRunInputs(updated, testInputs);
           writeWorkflowAndSyncTriggers(workflowSlug, { ...updated, enabled: false });
+          // It was RUNNING before this edit and it is not running now. Whoever
+          // owns it hears that from the product, not from whether they happened
+          // to read the reply.
+          notifyWorkflowAwaitingEnable({
+            workflowName: workflowSlug,
+            displayName,
+            cause: 'edit_needs_verification',
+          });
           reSmokeMsg = missingSmokeInputs.length > 0
             ? `\n\n${renderMissingSmokeInputs(workflowSlug, missingSmokeInputs)}`
             : `\n\n${displayMessage(queueWorkflowCreationTest(
