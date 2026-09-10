@@ -9696,6 +9696,22 @@ function emitLimitExceededWithContinuePrompt(opts: {
   });
 }
 
+/** Whether the active-turn beat should speak on this tick.
+ *
+ * Pure so the rule is testable without a timer: speak on the FIRST beat, speak
+ * whenever the run's progress signature CHANGED, and while nothing changes
+ * speak only once every `quietEvery` ticks so a stalled run is still
+ * distinguishable from a dead one without burying the change beats. */
+export function activeTurnBeatSpeaks(input: {
+  changed: boolean;
+  first: boolean;
+  unchangedTicks: number;
+  quietEvery: number;
+}): boolean {
+  if (input.first || input.changed) return true;
+  return input.quietEvery > 0 && input.unchangedTicks % input.quietEvery === 0;
+}
+
 async function withActiveTurnHeartbeat<T>(
   opts: {
     sessionId: string;
@@ -9713,6 +9729,24 @@ async function withActiveTurnHeartbeat<T>(
   },
   work: () => Promise<T>,
 ): Promise<T> {
+  // A CHECK-IN IS SOMETHING THAT HAPPENED, NOT A CLOCK TICK.
+  //
+  // This fired every 20 s and said roughly the same thing each time: one live
+  // 21-minute fan-out produced 64 beats, nearly all identical, while the run's
+  // real story (25 workers dispatched, 38 results, 50 item checkpoints) sat in
+  // the event stream where a person never saw it. Sixty-four "still working"
+  // lines are not visibility; they are wallpaper, and they train people to
+  // ignore the one beat that matters (owner, 2026-09-10).
+  //
+  // So the beat now speaks when the run's own progress line CHANGES, and stays
+  // quiet when it does not. Liveness is still answerable — telling "working"
+  // from "wedged" is the other half of trust — but an unchanged run says so
+  // rarely, and says how long it has been unchanged instead of pretending to
+  // be news. Continuous "what is happening right now" belongs to the event
+  // stream the UI subscribes to, not to this timer.
+  let lastProgress: string | null = null;
+  let unchangedTicks = 0;
+  const QUIET_TICKS_BETWEEN_UNCHANGED_BEATS = 6;
   const timer = setInterval(() => {
     // "Still working" every few minutes says nothing: it fires on its own timer
     // and reads no progress, so a person cannot tell thinking from wedged. When
@@ -9725,6 +9759,20 @@ async function withActiveTurnHeartbeat<T>(
     const durableProgress = composeRunProgressLine({
       sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, fallback: '',
     });
+    const signature = `${durableProgress}\u0000${working}`;
+    const changed = signature !== lastProgress;
+    unchangedTicks = changed ? 0 : unchangedTicks + 1;
+    // Speak on change, on the first beat, and rarely while nothing moves.
+    const speak = activeTurnBeatSpeaks({
+      changed, first: lastProgress === null, unchangedTicks,
+      quietEvery: QUIET_TICKS_BETWEEN_UNCHANGED_BEATS,
+    });
+    lastProgress = signature;
+    if (!speak) return;
+    const quietMs = unchangedTicks * Math.min(opts.checkInMs, 20_000);
+    const quietFor = quietMs >= 60_000
+      ? `${Math.round(quietMs / 60_000)} min`
+      : `${Math.round(quietMs / 1000)}s`;
     safeAppend({
       sessionId: opts.sessionId,
       turn: opts.turn,
@@ -9736,10 +9784,13 @@ async function withActiveTurnHeartbeat<T>(
         stage: opts.stage,
         preset: opts.budget.preset,
         unlimited: opts.budget.unlimited,
+        changed,
         ...(working ? { thinking: working.slice(-280) } : {}),
-        message: durableProgress || (working
-          ? `Still working inside turn ${opts.turn} — ${working.slice(-160)}`
-          : 'Still working on your request.'),
+        message: changed || lastProgress === null
+          ? (durableProgress || (working
+            ? `Still working inside turn ${opts.turn} — ${working.slice(-160)}`
+            : 'Still working on your request.'))
+          : `${durableProgress || 'Still working on your request.'} (no change for ${quietFor})`,
       },
     });
   // This is a UI keep-alive, not a model call or a request to the owner. A

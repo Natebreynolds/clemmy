@@ -69,3 +69,25 @@ test('active-turn heartbeat remains a kind-only public liveness signal', () => {
   const projected = projectHarnessEventForPublic(heartbeat);
   assert.deepEqual(projected?.data, { kind: 'active_turn_check_in' });
 });
+
+test('an active-turn beat speaks on change, not on the clock', async () => {
+  const { activeTurnBeatSpeaks } = await import('./loop.js');
+  const quietEvery = 6;
+  // The first beat always speaks: a person needs to know the turn is alive.
+  assert.equal(activeTurnBeatSpeaks({ changed: false, first: true, unchangedTicks: 0, quietEvery }), true);
+  // Any real change speaks.
+  assert.equal(activeTurnBeatSpeaks({ changed: true, first: false, unchangedTicks: 3, quietEvery }), true);
+  // While nothing moves it stays quiet — a live 21-minute fan-out emitted 64
+  // near-identical beats, which is wallpaper, not visibility (owner 2026-09-10).
+  for (const unchangedTicks of [1, 2, 3, 4, 5, 7, 8]) {
+    assert.equal(activeTurnBeatSpeaks({ changed: false, first: false, unchangedTicks, quietEvery }), false, `tick ${unchangedTicks}`);
+  }
+  // But a stalled run is still distinguishable from a dead one, rarely.
+  assert.equal(activeTurnBeatSpeaks({ changed: false, first: false, unchangedTicks: 6, quietEvery }), true);
+  assert.equal(activeTurnBeatSpeaks({ changed: false, first: false, unchangedTicks: 12, quietEvery }), true);
+  // Over the same 63 unchanged ticks: 10 beats instead of 63.
+  const spoke = Array.from({ length: 63 }, (_, i) => i + 1)
+    .filter((unchangedTicks) => activeTurnBeatSpeaks({ changed: false, first: false, unchangedTicks, quietEvery }));
+  assert.equal(spoke.length, 10, JSON.stringify(spoke));
+});
+
