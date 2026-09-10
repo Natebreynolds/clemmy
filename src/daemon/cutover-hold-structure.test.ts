@@ -117,6 +117,11 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/channels/cutover-hold-server.ts',
       'src/config.ts',
       'src/daemon/cutover-hold-entry.ts',
+      // A held parent is precisely the process a supervisor must not kill: it
+      // is mid-migration and cannot restart cheaply. phase.ts stamps liveness
+      // on every phase change, so the beacon rides along — a leaf whose only
+      // import is node:worker_threads, adding no package to this closure.
+      'src/daemon/liveness-beacon.ts',
       'src/daemon/phase.ts',
       'src/daemon/process.ts',
       'src/runtime/build-info.ts',
