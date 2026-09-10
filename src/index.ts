@@ -12,6 +12,7 @@ import { startWebhookServer } from './channels/webhook.js';
 import { startChatCli } from './cli/chat.js';
 import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
+import { startOptionalChannel } from './daemon/optional-channel.js';
 import { startCliHealthSweep } from './integrations/cli-catalog/auth-health.js';
 import { registerCliAuthRecoverySweep } from './execution/cli-auth-recovery.js';
 import { reconcileCatalogReviewedCliReads } from './runtime/harness/catalog-reviewed-cli-reconcile.js';
@@ -24,6 +25,7 @@ import {
   generateSystemdUnit,
   getDaemonStatus,
   isDaemonRunning,
+  isSurvivableSocketError,
   LOG_DIR,
   readDaemonPid,
   registerShutdownHandlers,
@@ -566,16 +568,22 @@ async function main(): Promise<void> {
         logger.info('Daemon shutting down...');
         await shutdownLocalTranscriptionRuntime();
       });
-      await prepareLocalTranscriptionRuntime();
+      try {
+        await prepareLocalTranscriptionRuntime();
+      } catch (err) {
+        logger.warn({ err }, 'local transcription runtime prune failed — continuing');
+      }
       await startConnectedCliSurfaces();
       registerCliAuthRecoverySweep();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
       await startDaemon(assistant, {
         onReady: async () => {
+          // Same split as the service path: the bind is fatal, the outbound
+          // channel sessions degrade and retry.
           if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
-          if (DISCORD_ENABLED) await startDiscordBot(assistant);
-          if (SLACK_ENABLED) await startSlackBot(assistant);
+          if (DISCORD_ENABLED) await startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
+          if (SLACK_ENABLED) await startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
         },
       });
       return;
@@ -602,7 +610,13 @@ async function main(): Promise<void> {
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });
-    await prepareLocalTranscriptionRuntime();
+    // A stale-artifact prune is disposable maintenance and must never be the
+    // reason a daemon fails to boot. (startConnectedCliSurfaces guards itself.)
+    try {
+      await prepareLocalTranscriptionRuntime();
+    } catch (err) {
+      logger.warn({ err }, 'local transcription runtime prune failed — continuing');
+    }
     await startConnectedCliSurfaces();
     registerCliAuthRecoverySweep();
     const assistant = new ClementineAssistant(createRuntimeFromConfig());
@@ -810,7 +824,13 @@ async function main(): Promise<void> {
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });
-    await prepareLocalTranscriptionRuntime();
+    // A stale-artifact prune is disposable maintenance and must never be the
+    // reason a daemon fails to boot. (startConnectedCliSurfaces guards itself.)
+    try {
+      await prepareLocalTranscriptionRuntime();
+    } catch (err) {
+      logger.warn({ err }, 'local transcription runtime prune failed — continuing');
+    }
     await startConnectedCliSurfaces();
     registerCliAuthRecoverySweep();
     // Warm the markitdown runtime in the background so a user's FIRST file
@@ -819,18 +839,22 @@ async function main(): Promise<void> {
     warmMarkitdownInBackground();
     await startDaemon(assistant, {
       onReady: async () => {
+        // Fatal on purpose: this BINDS the door the desktop app, the phone and
+        // every local caller come through. A daemon that cannot listen must not
+        // be reported healthy — see the release-boundary note in daemon/runner.
         if (WEBHOOK_ENABLED) {
           await startWebhookServer(assistant);
         } else {
           logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
         }
+        // Outbound sessions to third parties: degrade + retry, never a boot gate.
         if (DISCORD_ENABLED) {
-          await startDiscordBot(assistant);
+          await startOptionalChannel('Discord', 'Discord chat stays offline', () => startDiscordBot(assistant));
         } else {
           logger.info('Skipping Discord bot (DISCORD_ENABLED=false)');
         }
         if (SLACK_ENABLED) {
-          await startSlackBot(assistant);
+          await startOptionalChannel('Slack', 'Slack chat stays offline', () => startSlackBot(assistant));
         } else {
           logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
         }
@@ -844,7 +868,19 @@ async function main(): Promise<void> {
   console.log(`Quick start: clementine setup → clementine daemon start → clementine chat`);
 }
 
+// Backstop for the same class the crash guards already cover. registerCrashGuards
+// makes a transport flake survivable when it arrives as an uncaughtException or an
+// unhandledRejection — but an error AWAITED inside main() reaches neither handler,
+// it lands here. That third door is how the 2026-09-10 Discord handshake timeout
+// killed a fully-booted daemon while `isSurvivableSocketError` sat one call away,
+// green-tested and wired to only two of the three doors. Call sites should degrade
+// on their own (see startOptionalChannel); this makes sure a missed one downgrades
+// to a degraded daemon instead of a crash loop. Real bugs still exit.
 main().catch((err) => {
+  if (isSurvivableSocketError(err)) {
+    logger.error({ err }, 'Startup hit a survivable transport error — continuing degraded; the owning client will reconnect');
+    return;
+  }
   logger.error({ err }, 'Startup failed');
   process.exit(1);
 });
