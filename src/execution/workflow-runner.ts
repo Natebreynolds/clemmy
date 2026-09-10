@@ -835,6 +835,17 @@ export interface WorkflowRunGoalValidationV1 {
 export interface QueuedRunRecord {
   id: string;
   workflow: string;
+  /** How many times this run has been re-resumed by a daemon BOOT (crash,
+   *  hang-kill, or restart) rather than by its own progress. A crash loop
+   *  otherwise replays the same paid work every cycle — on 2026-09-10 one
+   *  workflow re-ran on nearly every boot of a five-restart storm, burning
+   *  484k input tokens in 18 frames on a single pass. */
+  bootResumeCount?: number;
+  /** The run's lastEventAt when bootResumeCount was last incremented. If the
+   *  run has progressed since, the count resets: the cap must catch a run that
+   *  restarts WITHOUT progressing, never punish a long job that legitimately
+   *  outlives a few daemon restarts. */
+  bootResumeMark?: string;
   /** Optional review only; captured before execution and immutable on resume. */
   targetReviewPolicy?: WorkflowTargetReviewPolicy;
   inputs?: Record<string, string>;
@@ -16064,8 +16075,85 @@ export function reconcilePendingWorkflowRuns(): void {
   }
   const pending = listPendingRuns();
   if (pending.length === 0) return;
+  // A restart storm must not replay paid work on every cycle. Each BOOT-driven
+  // resume is counted on the run record itself; past the cap the run parks and
+  // asks the user instead of silently re-running. Mirrors the resumeCount /
+  // automaticRetryCap contract background tasks already use.
+  const parked = parkRunsExceedingBootResumeCap(pending);
+  const resumable = pending.filter((p) => !parked.has(p.runId));
+  if (parked.size > 0) {
+    logger.warn(
+      { parked: [...parked] },
+      `Parked ${parked.size} workflow run${parked.size === 1 ? '' : 's'} that reached the boot-resume cap — a restart loop must not re-run paid work unattended`,
+    );
+  }
+  if (resumable.length === 0) return;
   logger.info(
-    { pending: pending.map((p) => ({ workflow: p.workflowName, runId: p.runId, at: p.lastEventAt })) },
-    `Resuming ${pending.length} in-flight workflow run${pending.length === 1 ? '' : 's'}`,
+    { pending: resumable.map((p) => ({ workflow: p.workflowName, runId: p.runId, at: p.lastEventAt })) },
+    `Resuming ${resumable.length} in-flight workflow run${resumable.length === 1 ? '' : 's'}`,
   );
+}
+
+/** Runs re-resumed by a daemon boot more than this many times stop resuming
+ *  automatically and wait for a person. Three tolerates ordinary restarts
+ *  (upgrade, manual quit, a one-off crash) while stopping a loop cold. */
+export const BOOT_RESUME_CAP = 3;
+
+/**
+ * Count this boot's resume against each pending run and park the ones past the
+ * cap. Returns the runIds that must NOT be resumed.
+ *
+ * Best-effort per run: a record that cannot be read or written is left alone
+ * and simply resumes as before — capping is a safeguard, never a new way for
+ * recovery to fail.
+ */
+export function parkRunsExceedingBootResumeCap(
+  pending: Array<{ runId: string; workflowName: string; lastEventAt?: string }>,
+  cap: number = BOOT_RESUME_CAP,
+): Set<string> {
+  const parked = new Set<string>();
+  for (const run of pending) {
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`);
+    try {
+      withWorkflowRunRecordLock(filePath, () => {
+        const record = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+        if (!record || isTerminalRunRecord(record)) return;
+        // Progress since we last counted means this run is not looping — it is
+        // simply long-lived across restarts. Start its budget over.
+        const mark = run.lastEventAt ?? null;
+        const progressed = mark !== null && record.bootResumeMark !== undefined && record.bootResumeMark !== mark;
+        const next = progressed ? 1 : (record.bootResumeCount ?? 0) + 1;
+        const overCap = next > cap;
+        writeWorkflowRunRecordDurablyUnlocked(filePath, {
+          ...record,
+          bootResumeCount: next,
+          ...(mark !== null ? { bootResumeMark: mark } : {}),
+          ...(overCap
+            ? {
+                status: 'parked',
+                error: `Paused after ${next} automatic restarts. Clementine stopped re-running this so a restart loop could not repeat its work. Resume it when you're ready.`,
+              }
+            : {}),
+        });
+        if (overCap) {
+          parked.add(run.runId);
+          addNotification({
+            id: `workflow-boot-resume-cap-${run.runId}`,
+            kind: 'system',
+            title: `Paused "${run.workflowName}" after repeated restarts`,
+            body: `This run restarted ${next} times without finishing, so Clementine stopped re-running it automatically. Open it to resume or cancel.`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            metadata: { source: 'workflow-boot-resume-cap', runId: run.runId, workflow: run.workflowName },
+          });
+        }
+      });
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), runId: run.runId },
+        'Boot-resume cap accounting failed for a run; leaving it resumable',
+      );
+    }
+  }
+  return parked;
 }

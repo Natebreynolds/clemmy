@@ -2,6 +2,7 @@ import { statSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'no
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
+import { shouldDeferDiscretionaryWork } from '../runtime/system-load.js';
 import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
@@ -610,8 +611,18 @@ export function finalizeGroundedResourceLinksOnBoot(): BootGroundedResourceFinal
   };
 }
 
+/**
+ * Discretionary maintenance stands down while the machine is busy — see
+ * runtime/system-load.ts. On 2026-09-10 a vault reindex and an embedding
+ * backfill competed with a Zoom call on a saturated CPU and the daemon was
+ * killed as hung. None of that work was urgent.
+ *
+ * What is NOT deferred, on purpose: every reaper, settlement drain and
+ * retention sweep below. Those are what keep the database bounded, and
+ * skipping them on a struggling machine makes the machine struggle more.
+ */
 export async function processMemoryMaintenance(tickCount: number): Promise<void> {
-  if (tickCount % REINDEX_EVERY_N_TICKS === 0) {
+  if (tickCount % REINDEX_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('vault-reindex')) {
     try {
       const stats = reindexVault();
       // Only log when something actually changed — keeps the log clean.
@@ -664,7 +675,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
-  if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && isEmbeddingsEnabled()) {
+  if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && isEmbeddingsEnabled() && !shouldDeferDiscretionaryWork('embedding-backfill')) {
     try {
       const stats = await embedMissingChunks({ maxChunks: BACKFILL_BATCH });
       if (stats.embedded > 0 || stats.failed > 0) {
@@ -686,7 +697,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
-  if (tickCount % BACKFILL_EVERY_N_TICKS === 0) {
+  if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('evidence-backfill')) {
     try {
       const evidence = backfillTemporalEvidence(BACKFILL_BATCH);
       if (evidence.linked > 0 || evidence.missing > 0) logger.info({ evidence }, 'temporal evidence backfill tick');
@@ -695,7 +706,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
-  if (tickCount % MEMORY_MD_EVERY_N_TICKS === 0) {
+  if (tickCount % MEMORY_MD_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('memory-md')) {
     // No-op if the rendered auto section matches what's already on
     // disk, so this is safe to fire every 30 min even on quiet days.
     tickMemoryMdRefresh();
@@ -711,7 +722,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // for human review. Pure read of trace data. Hot path: same file
   // exists and content unchanged → no-op (bounded by report dedupe
   // inside writeReport). Cold path: ~50-200ms for a busy day.
-  if (tickCount % AUTORESEARCH_EVERY_N_TICKS === 0) {
+  if (tickCount % AUTORESEARCH_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('autoresearch')) {
     tickAutoresearchObservatory();
   }
 
@@ -754,7 +765,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // tool-choice store for cross-service / async-task-post mis-bindings and
   // invalidates them (recoverable). Best-effort; no-ops without a known-toolkit
   // baseline so a Composio outage can't quarantine the store.
-  if (tickCount % TOOLCHOICE_AUDIT_EVERY_N_TICKS === 0) {
+  if (tickCount % TOOLCHOICE_AUDIT_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('toolchoice-audit')) {
     try {
       const { auditAndHealToolChoices, isToolChoiceAuditEnabled } = await import('./tool-choice-audit.js');
       if (isToolChoiceAuditEnabled()) {
@@ -864,7 +875,11 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // Skill update poll — periodic ~24h cadence so a machine that's never
   // up at the nightly hour still gets checked. Out-of-band + single
   // flighted; detection only.
-  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+  // One gate evaluation for the whole group: three call sites sharing a key
+  // would spend three deferrals per tick and reach the cap in a third the time.
+  const skipSkillUpdate = tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0
+    && shouldDeferDiscretionaryWork('skill-update');
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0 && !skipSkillUpdate) {
     runSkillUpdatePoll('cadence');
   }
 
@@ -872,14 +887,14 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // new-evidence gates do the real pacing. PROPOSAL ONLY: it drafts a
   // pending suggestion for the owner to review; only an explicit
   // approval ever writes IDENTITY.md/SOUL.md curated text.
-  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0 && !skipSkillUpdate) {
     await tickIdentityEvolution();
   }
 
   // Trust graduation — ~24h check for a stable pattern of clean approved
   // sends. PROPOSAL ONLY: it drafts a pending send-trust suggestion for the
   // owner; only an explicit approval ever calls grantSendTrust. Never throws.
-  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0) {
+  if (tickCount % SKILL_UPDATE_EVERY_N_TICKS === 0 && !skipSkillUpdate) {
     tickTrustGraduation();
   }
 
