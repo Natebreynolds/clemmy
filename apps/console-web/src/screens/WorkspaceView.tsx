@@ -52,21 +52,46 @@ function WorkspaceViewForId({ id }: { id: string }) {
   const chat = useChat({ initialSessionId: spaceSessionId(id) });
 
   const [iframeKey, setIframeKey] = useState(0);
-  const lastMtimeRef = useRef<number | null>(null);
+  const lastMtimeRef = useRef<string | null>(null);
+  const pendingReloadRef = useRef(false);
   const seededRef = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-reload the view when its file changes — keyed on the view's mtime so it
-  // catches ANY edit (Clem's space_edit_view, a write_file rewrite, a rollback).
-  // Polled via `detail` (5s), so an in-chat edit shows without hitting Refresh.
+  // Auto-reload the board when its file OR its data changes — keyed on both
+  // mtimes, so it catches ANY edit (Clem's space_edit_view, a write_file
+  // rewrite, a rollback) AND any data commit (space_set_data, space_refresh, a
+  // workflow's half-hourly pull), which rewrites data.json and leaves the view
+  // file alone. Watching the view alone left a board open on stale data until
+  // something happened to touch its HTML (live 2026-09-10, Scorpion triage).
+  // Polled via `detail` (5s), so a fresh pull shows without hitting Refresh.
   const viewMtime = detail.data?.viewMtimeMs ?? null;
+  const dataMtime = detail.data?.dataMtimeMs ?? null;
   useEffect(() => {
-    if (viewMtime == null) return;
-    if (lastMtimeRef.current != null && viewMtime !== lastMtimeRef.current) {
-      setIframeKey((k) => k + 1);
+    if (viewMtime == null && dataMtime == null) return;
+    const stamp = `${viewMtime ?? 0}:${dataMtime ?? 0}`;
+    if (lastMtimeRef.current != null && stamp !== lastMtimeRef.current) {
+      // Remounting the frame discards whatever the viewer was typing inside the
+      // board (a draft reply in a textarea). Hold the repaint while the frame
+      // has focus and flush it the moment focus leaves.
+      if (document.activeElement?.tagName === 'IFRAME') pendingReloadRef.current = true;
+      else setIframeKey((k) => k + 1);
     }
-    lastMtimeRef.current = viewMtime;
-  }, [viewMtime]);
+    lastMtimeRef.current = stamp;
+  }, [viewMtime, dataMtime]);
+  useEffect(() => {
+    const flush = () => {
+      if (!pendingReloadRef.current) return;
+      if (document.activeElement?.tagName === 'IFRAME') return;
+      pendingReloadRef.current = false;
+      setIframeKey((k) => k + 1);
+    };
+    window.addEventListener('focus', flush);
+    document.addEventListener('pointerdown', flush, true);
+    return () => {
+      window.removeEventListener('focus', flush);
+      document.removeEventListener('pointerdown', flush, true);
+    };
+  }, []);
   const [busy, setBusy] = useState(false);
   // The conversation is a COLUMN beside the canvas, open by default — the
   // build is watched from it (owner-approved Spaces mockup, 2026-09-08).

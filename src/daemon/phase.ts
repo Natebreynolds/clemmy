@@ -1,3 +1,5 @@
+import { startLivenessBeacon, stampLiveness } from './liveness-beacon.js';
+
 const SUPERVISOR_IPC_HEARTBEAT_TYPE = 'clementine.daemon.heartbeat';
 const DEFAULT_SUPERVISOR_IPC_HEARTBEAT_INTERVAL_MS = 5_000;
 const MAX_DETAIL_CHARS = 240;
@@ -84,6 +86,10 @@ export async function withDaemonRuntimePhase<T>(
 }
 
 export function sendSupervisorIpcHeartbeat(reason: 'heartbeat' | 'phase' | 'phase_restore' = 'heartbeat'): void {
+  // Stamp the loop-independent beacon FIRST and unconditionally. It is the
+  // signal that survives a blocked event loop, so it must not sit behind the
+  // IPC channel's availability check below.
+  stampLiveness({ name: currentPhase.name, detail: currentPhase.detail, startedAtMs: currentPhase.startedAtMs });
   const send = supervisorSend();
   if (typeof send !== 'function') return;
   try {
@@ -101,6 +107,10 @@ export function sendSupervisorIpcHeartbeat(reason: 'heartbeat' | 'phase' | 'phas
 }
 
 export function startSupervisorIpcHeartbeat(intervalMs = DEFAULT_SUPERVISOR_IPC_HEARTBEAT_INTERVAL_MS): void {
+  // The beacon is independent of the IPC channel AND of this interval — it is
+  // started even if the parent gave us no IPC, and it keeps reporting when the
+  // interval below can no longer fire because the loop is blocked.
+  startLivenessBeacon();
   if (typeof supervisorSend() !== 'function') return;
   sendSupervisorIpcHeartbeat();
   const timer = setInterval(() => sendSupervisorIpcHeartbeat(), intervalMs);

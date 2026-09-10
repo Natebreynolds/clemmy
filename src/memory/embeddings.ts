@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
+import { startEmbeddingWorker } from './embedding-worker.js';
 
 /**
  * Provider-backed embeddings for semantic recall rerank.
@@ -465,11 +466,23 @@ function localEmbeddingsAllowed(): boolean {
   return (getRuntimeEnv('CLEMMY_LOCAL_EMBEDDINGS', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
-async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
-  if (localProvider !== undefined) return localProvider;
-  if (localProbeInFlight) return localProbeInFlight;
-  localProbeInFlight = (async () => {
-    try {
+/** Build the Transformers feature-extraction pipeline.
+ *
+ * Split out of loadLocalProvider so the SAME construction serves both the
+ * worker thread (the default path) and the in-process fallback. Duplicating it
+ * would let the two drift on runtime selection, cache dir or wasm wiring, and a
+ * fallback that behaves differently from the primary is worse than none.
+ *
+ * Returns null when the optional dependency is absent or the model cannot load;
+ * callers degrade to lexical recall, exactly today's no-key behavior. */
+export type LocalExtractor = (
+  input: string[],
+  opts?: unknown,
+) => Promise<{ data: ArrayLike<number> }>;
+
+export async function createLocalExtractor(): Promise<{ extractor: LocalExtractor; runtime: string } | null> {
+  {
+    {
       // Lazy + optional: the package is an optionalDependency. If it isn't
       // installed (or the model can't load offline), we degrade to lexical —
       // never a crash, never a startup cost when unused.
@@ -533,6 +546,42 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
         LOCAL_EMBEDDING_MODEL,
         runtime === 'wasm' ? { device: 'wasm' } : undefined,
       );
+      return { extractor: extractor as LocalExtractor, runtime };
+    }
+  }
+}
+
+async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
+  if (localProvider !== undefined) return localProvider;
+  if (localProbeInFlight) return localProbeInFlight;
+  localProbeInFlight = (async () => {
+    try {
+      // Default path: inference on a worker thread. ONNX inference is
+      // synchronous native work — on the main thread it BLOCKS THE EVENT LOOP,
+      // which on 2026-09-10 took the daemon's HTTP listener and its supervisor
+      // heartbeat down together during a Zoom call and got it SIGKILLed as
+      // "hung" while it was merely CPU-starved. See embedding-worker.ts.
+      const worker = await startEmbeddingWorker();
+      if (worker) {
+        const provider: EmbeddingProvider = {
+          name: 'local',
+          model: LOCAL_EMBEDDING_MODEL,
+          dim: LOCAL_EMBEDDING_DIM,
+          embed: (texts) => worker.embed(texts),
+        };
+        localProvider = provider;
+        logger.info(
+          { model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM, runtime: worker.runtime, thread: 'worker' },
+          'local embedding provider loaded',
+        );
+        return provider;
+      }
+      // Fallback: the worker could not start (unsupported layout, spawn
+      // refused). Recall still works — it just costs the loop again, which is
+      // strictly better than no semantic recall at all.
+      const built = await createLocalExtractor();
+      if (!built) { localProvider = null; return null; }
+      const { extractor, runtime } = built;
       const provider: EmbeddingProvider = {
         name: 'local',
         model: LOCAL_EMBEDDING_MODEL,
@@ -547,9 +596,9 @@ async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
         },
       };
       localProvider = provider;
-      logger.info(
-        { model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM, runtime },
-        'local embedding provider loaded',
+      logger.warn(
+        { model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM, runtime, thread: 'main' },
+        'local embedding provider loaded ON THE MAIN THREAD — worker unavailable; inference will block the event loop',
       );
       return provider;
     } catch (err) {

@@ -889,3 +889,45 @@ test('view route rejects path traversal + archived workspaces', async () => {
   const escape = await fetch(`${base}/console/spaces/data-rt/view/..%2f..%2fspace.json`);
   assert.notEqual(escape.status, 200);
 });
+
+/**
+ * Live 2026-09-10 (Scorpion inbox triage): Clem committed a fresh 200-message
+ * pull into an open board and the owner said "I am just not seeing the emails
+ * I should see here". The UI repaints on the view file's mtime, and a data
+ * commit never touches the view file — so the board kept rendering the payload
+ * it was born with. The detail response must stamp the dataset separately.
+ */
+test('a data commit moves dataMtimeMs while the untouched view keeps its stamp', async () => {
+  const slug = 'data-stamp';
+  store.spaceStore.save({ id: slug, title: 'Data Stamp', viewEntry: 'view/index.html' });
+  mkdirSync(path.join(store.resolveSpaceDir(slug), 'view'), { recursive: true });
+  writeFileSync(
+    path.join(store.resolveSpaceDir(slug), 'view', 'index.html'),
+    '<html><body><script>var D=window.__SPACE_DATA__||{};</script></body></html>',
+    'utf-8',
+  );
+
+  const seed = await j(await fetch(`${base}/api/console/spaces/${slug}/data`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data: { emails: [{ id: 'a' }] } }),
+  }));
+  assert.equal(seed.status, 200);
+  const before = await j(await fetch(`${base}/api/console/spaces/${slug}`));
+  assert.equal(before.status, 200);
+  assert.ok(before.body.dataMtimeMs > 0, 'a workspace with a dataset carries a data stamp');
+  assert.ok(before.body.viewMtimeMs > 0, 'and its view stamp');
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const commit = await j(await fetch(`${base}/api/console/spaces/${slug}/data`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data: { emails: [{ id: 'a' }, { id: 'b' }] } }),
+  }));
+  assert.equal(commit.status, 200);
+
+  const after = await j(await fetch(`${base}/api/console/spaces/${slug}`));
+  assert.equal(after.status, 200);
+  assert.notEqual(after.body.dataMtimeMs, before.body.dataMtimeMs);
+  assert.equal(after.body.viewMtimeMs, before.body.viewMtimeMs);
+});

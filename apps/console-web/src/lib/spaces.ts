@@ -94,6 +94,9 @@ export interface SpaceDetail {
   viewSource: string;
   /** Last-modified of the view file — changes on ANY edit (write_file, space_edit_view, rollback). */
   viewMtimeMs?: number;
+  /** Last-modified of data.json — changes on ANY data commit (space_set_data,
+   *  space_refresh, a scheduled workflow) while the view file stays untouched. */
+  dataMtimeMs?: number;
   notes: SpaceNote[];
   audit: SpaceAudit[];
   health?: SpaceHealthSnapshot;

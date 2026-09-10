@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
-import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, renameSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, renameSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -85,6 +85,14 @@ const LIVENESS_GRACE_AFTER_READY_MS = 180_000;
 const SUPERVISOR_IPC_HEARTBEAT_TYPE = 'clementine.daemon.heartbeat';
 const SUPERVISOR_IPC_HEARTBEAT_FRESH_MS = 30_000;
 const LIVENESS_MAX_IPC_DEFERRALS = 2;
+// The beacon runs on its own thread, so it stays fresh while the main loop is
+// blocked; 20s is four missed 5s beats.
+const LIVENESS_BEACON_FRESH_MS = 20_000;
+const LIVENESS_MAX_BEACON_DEFERRALS = 6;
+// A single phase running longer than this is no longer "busy" — memory
+// maintenance, boot reconciliation and workflow steps all complete well inside
+// it even on a saturated machine.
+const LIVENESS_STUCK_PHASE_CEILING_MS = 10 * 60_000;
 
 interface DaemonIpcHeartbeatMessage {
   type: typeof SUPERVISOR_IPC_HEARTBEAT_TYPE;
@@ -199,6 +207,60 @@ export function formatHungRestartDiagnostic(input: {
     }
   }
   return `${lines.join('\n')}\n`;
+}
+
+/** A beacon written by the daemon's liveness WORKER thread — see
+ *  src/daemon/liveness.worker.ts. Its whole point is to survive a blocked main
+ *  loop, so it answers a question the IPC heartbeat cannot: is this process
+ *  alive-but-starved, or actually frozen? */
+export interface DaemonLivenessBeacon {
+  at?: string;
+  pid?: number;
+  beaconUptimeMs?: number;
+  mainStampAgeMs?: number | null;
+  phase?: { name?: string; detail?: string; activeMs?: number | null };
+}
+
+export function readLivenessBeacon(file: string, now = Date.now()): { beacon: DaemonLivenessBeacon; ageMs: number } | null {
+  try {
+    if (!existsSync(file)) return null;
+    const beacon = JSON.parse(readFileSync(file, 'utf8')) as DaemonLivenessBeacon;
+    const at = beacon.at ? Date.parse(beacon.at) : NaN;
+    if (!Number.isFinite(at)) return null;
+    return { beacon, ageMs: Math.max(0, now - at) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Should a hung-restart be deferred because the daemon is demonstrably ALIVE,
+ * just starved?
+ *
+ * The beacon proves the process still runs. But a live beacon alone is not
+ * enough — a genuinely deadlocked main thread would also keep its worker alive
+ * forever. So the main thread must additionally be inside a BOUNDED phase: if
+ * it has been stuck in one phase past the ceiling, that is a real freeze and
+ * the restart proceeds.
+ *
+ * Deliberately more generous than the IPC path (which allows 2): the beacon is
+ * strictly stronger evidence, and the failure it guards against — killing a
+ * daemon mid-work on a loaded machine, then paying a full boot reconciliation
+ * over a multi-GB eventlog — is expensive and self-reinforcing.
+ */
+export function shouldDeferHungRestartForLivenessBeacon(
+  read: { beacon: DaemonLivenessBeacon; ageMs: number } | null,
+  priorDeferrals = 0,
+  maxDeferrals = LIVENESS_MAX_BEACON_DEFERRALS,
+  phaseCeilingMs = LIVENESS_STUCK_PHASE_CEILING_MS,
+  beaconFreshMs = LIVENESS_BEACON_FRESH_MS,
+): boolean {
+  if (!read) return false;
+  if (read.ageMs > beaconFreshMs) return false;      // beacon itself is stale → the process is gone or wholly frozen
+  if (priorDeferrals >= maxDeferrals) return false;  // bounded: never defer forever
+  const activeMs = read.beacon.phase?.activeMs;
+  if (typeof activeMs === 'number' && activeMs > phaseCeilingMs) return false; // stuck in ONE phase too long → real freeze
+  return true;
 }
 
 export function shouldDeferHungRestartForIpcHeartbeat(
@@ -349,6 +411,13 @@ export class DaemonSupervisor {
   private livenessMisses = 0;
   private livenessProbeInFlight = false;
   private livenessIpcDeferrals = 0;
+  private livenessBeaconDeferrals = 0;
+
+  /** Sibling of supervisor.log, matching the hang-snapshot convention. The
+   *  daemon is told this exact path via CLEMMY_LIVENESS_BEACON_FILE. */
+  private livenessBeaconFile(): string {
+    return path.join(path.dirname(this.opts.logFile), 'daemon-liveness.json');
+  }
   private lastIpcHeartbeatAt = 0;
   private lastIpcHeartbeat: DaemonIpcHeartbeatSnapshot | null = null;
   private recentDaemonLogs: SupervisorLogTailEntry[] = [];
@@ -482,6 +551,10 @@ export class DaemonSupervisor {
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
       WEBHOOK_HOST,
+      // Where the daemon's liveness WORKER writes its loop-independent beacon.
+      // Supervisor-owned so both sides agree on the path without either
+      // guessing at the other's home resolution.
+      CLEMMY_LIVENESS_BEACON_FILE: this.livenessBeaconFile(),
       // Forward Electron's process.resourcesPath so the daemon can
       // resolve native modules (keytar) bundled in app.asar.unpacked.
       // Without this, the daemon's node_modules walk doesn't see the
@@ -526,6 +599,9 @@ export class DaemonSupervisor {
     }
 
     // Roll the log if it's grown past the cap BEFORE re-opening it for append.
+    // Drop any beacon the previous daemon left behind: a stale file must never
+    // vouch for the process replacing it.
+    try { rmSync(this.livenessBeaconFile(), { force: true }); } catch { /* best effort */ }
     rotateSupervisorLogIfNeeded(this.opts.logFile, supervisorLogMaxBytes());
     this.logStream = createWriteStream(this.opts.logFile, { flags: 'a' });
     this.logStream.write(`\n=== Daemon started ${new Date().toISOString()} on port ${this.chosenPort} ===\n`);
@@ -608,6 +684,7 @@ export class DaemonSupervisor {
           if (r.status === 200) {
             this.livenessMisses = 0;
             this.livenessIpcDeferrals = 0;
+            this.livenessBeaconDeferrals = 0;
           } else {
             this.livenessMisses += 1;
           }
@@ -627,6 +704,19 @@ export class DaemonSupervisor {
             this.livenessMisses = 0;
             this.emit({ type: 'liveness-deferred', misses, unresponsiveMs, ipcHeartbeatAgeMs, deferral, maxDeferrals: LIVENESS_MAX_IPC_DEFERRALS });
             this.logStream?.write(`=== Daemon HTTP liveness missed ${misses} probes (~${Math.round(unresponsiveMs / 1000)}s), but IPC heartbeat is fresh (${formatIpcHeartbeatAge(ipcHeartbeatAgeMs)} old) — deferring restart ${deferral}/${LIVENESS_MAX_IPC_DEFERRALS} at ${new Date().toISOString()} ===\n`);
+            return;
+          }
+          // The IPC heartbeat rides the daemon's main event loop, so a BLOCKED
+          // loop kills it and the deferral above along with it — which is
+          // exactly how a CPU-starved daemon got SIGKILLed mid-work on
+          // 2026-09-10. The beacon is written by a worker thread and survives
+          // that, so consult it before concluding "frozen".
+          const beaconRead = readLivenessBeacon(this.livenessBeaconFile());
+          if (shouldDeferHungRestartForLivenessBeacon(beaconRead, this.livenessBeaconDeferrals)) {
+            this.livenessBeaconDeferrals += 1;
+            this.livenessMisses = 0;
+            const phase = beaconRead?.beacon.phase;
+            this.logStream?.write(`=== Daemon HTTP liveness missed ${misses} probes (~${Math.round(unresponsiveMs / 1000)}s) and the IPC heartbeat is stale, but the liveness BEACON is fresh (${Math.round((beaconRead?.ageMs ?? 0) / 1000)}s old, phase=${phase?.name ?? 'unknown'} active=${Math.round((phase?.activeMs ?? 0) / 1000)}s) — the loop is starved, not frozen; deferring restart ${this.livenessBeaconDeferrals}/${LIVENESS_MAX_BEACON_DEFERRALS} at ${new Date().toISOString()} ===\n`);
             return;
           }
           const heartbeat = this.lastIpcHeartbeat;

@@ -459,11 +459,20 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       viewSource = readFileSync(vf, 'utf-8');
       viewMtimeMs = statSync(vf).mtimeMs; // lets the UI auto-reload on ANY view edit (incl. write_file)
     } catch { /* no view yet */ }
+    // A data commit (space_set_data, space_refresh, a scheduled workflow's
+    // half-hourly pull) rewrites data.json and never touches the view file, so
+    // a board left open would keep rendering the payload it was born with.
+    // Stamp the dataset too and the UI can repaint on fresh data alone.
+    let dataMtimeMs = 0;
+    try {
+      dataMtimeMs = statSync(resolveInSpace(slug, 'data.json')).mtimeMs;
+    } catch { /* no dataset yet */ }
     const health = buildSpaceHealthSnapshot(rec);
     res.json({
       space: { ...rec, health },
       viewSource,
       viewMtimeMs,
+      dataMtimeMs,
       notes: listNotes(slug, 50),
       audit: listAudit(slug, 50),
       health,
