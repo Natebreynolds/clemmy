@@ -3908,10 +3908,29 @@ async function runComposioExecute(
   } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
+  const attemptCtx = harnessRunContextStorage.getStore();
+  // COMPOSE -> COMMIT is decided BEFORE logical admission, not inside the
+  // gateway below it. Admission attests a call against the accepted turn's
+  // live capability authority; a worker child holds none, so a worker mutation
+  // that enters admission is refused as an opaque attestation conflict AND
+  // poisons the parent's authority for the remainder of the turn. Live
+  // 2026-09-10: ten worker sheet writes each poisoned the parent, the parent
+  // then died with `exact_checkpoint_admission_exhausted`, every item was
+  // still checkpointed `succeeded`, and the spreadsheet was never touched.
+  // The gateway's compose-only answer is the actionable one and is pure, so
+  // ask it first — nothing is admitted, nothing is poisoned, and the worker is
+  // told the exact payload to hand back. resolveComposioDispatch keeps the
+  // same guard for the dynamic cx_* and nested carriers that skip this path.
+  const workerBlock = workerComposeOnlyComposioBlock(toolSlug, runSid ?? attemptCtx?.sessionId);
+  if (workerBlock) {
+    return new ExternalWritePreDispatchResult(
+      `[provider-dispatch:not-started:${workerBlock.reason}] ${workerBlock.message}`,
+      `provider-dispatch:not-started:${workerBlock.reason}`,
+    ) as unknown as string;
+  }
   // Open the physical attempt BEFORE validation and before the gateway, so a
   // refusal that never crossed the boundary is still correlated to something.
   // Nested carriers inherit this rather than minting a second identity.
-  const attemptCtx = harnessRunContextStorage.getStore();
   if (attemptCtx?.sessionId && attemptCtx.sourceUserSeq) {
     return withLogicalToolCall(
       {
