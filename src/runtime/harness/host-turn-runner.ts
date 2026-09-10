@@ -2503,6 +2503,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     toolByName = new Map(tools.map((tool) => [tool.name, tool]));
     schemas = serializedTools(tools);
     armExactHostSurface();
+    // A delegated worker child freezes its derived expected-work contract
+    // here: after the host owns the child's accepted source and graph, before
+    // the first model step (expected-work-delegation.ts, 2026-09-09).
+    await (opts as { onHostArmed?: () => Promise<void> | void }).onHostArmed?.();
   };
   const signal = (opts as { signal?: AbortSignal }).signal;
   const requestedHostEngine = (opts as { hostTurnEngine?: unknown }).hostTurnEngine;

@@ -708,11 +708,42 @@ function sourceWitness(
     return { ok: false, reason: 'accepted user input witness is missing', callTargetFallback: false };
   }
   let text = '';
+  let delegated: { item?: unknown; authority?: unknown } | null = null;
   try {
-    const parsed = JSON.parse(row.data_json) as { text?: unknown };
+    const parsed = JSON.parse(row.data_json) as { text?: unknown; delegatedWorker?: unknown };
     text = typeof parsed.text === 'string' ? parsed.text : '';
+    delegated = parsed.delegatedWorker && typeof parsed.delegatedWorker === 'object'
+      ? parsed.delegatedWorker as { item?: unknown; authority?: unknown }
+      : null;
   } catch {
     return { ok: false, reason: 'accepted user input witness is unreadable', callTargetFallback: false };
+  }
+  // A DELEGATED WORKER CHILD's accepted input is a host-authored job packet
+  // whose item the host named from the parent's frozen contract
+  // (worker-host-runner, authority 'delegated_item'). That lineage is the
+  // witness for its one-member universe; the packet prose is not re-parsed
+  // for a count it never states (expected-work-delegation.ts, 2026-09-09).
+  if (
+    delegated?.authority === 'delegated_item'
+    && typeof delegated.item === 'string'
+    && universe.members.length === 1
+    && universe.members[0] === delegated.item
+  ) {
+    if (selectedIds.some((id) => id !== delegated!.item)) {
+      return {
+        ok: false,
+        reason: 'selected members are outside the delegated item',
+        callTargetFallback: false,
+      };
+    }
+    // The child's accepted input row (its host-authored packet) is the durable
+    // witness; the binding schema knows exactly that kind.
+    return {
+      ok: true,
+      kind: 'accepted_user_input',
+      ref: row.id,
+      digest: expectedWorkDigest(canonicalExpectedWorkJson([delegated.item])),
+    };
   }
   const detected = detectMultiItemIntent(text);
   const exactMembers = detected.exactMembers ? [...detected.exactMembers].sort() : null;
@@ -1075,10 +1106,41 @@ function dischargedRequirementSettlements(
       rawResult: redeemed.value.rawPayload,
     }).status === 'proved';
   });
-  return discharged.map((row) => ({
-    logical_tool_call_id: row.logical_tool_call_id,
-    universe_item_id: row.universe_item_id,
-  }));
+  // A per-item requirement discharged by a delegated worker child is credited
+  // from the child's PROVEN discharge (expected-work-delegation.ts records the
+  // row only after this same function, run over the child's own contract,
+  // reports the item discharged). The parent has no settlement of its own for
+  // that item; the discharge row is its evidence.
+  const delegated = db.prepare(`
+    SELECT child_logical_tool_call_id AS logical_tool_call_id, universe_item_id
+      FROM expected_work_delegated_discharges
+     WHERE session_id = ? AND source_user_seq = ? AND contract_id = ? AND requirement_id = ?
+  `).all(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.contractId,
+    requirementId,
+  ) as Array<{ logical_tool_call_id: string; universe_item_id: string | null }>;
+  return [
+    ...discharged.map((row) => ({
+      logical_tool_call_id: row.logical_tool_call_id,
+      universe_item_id: row.universe_item_id,
+    })),
+    ...delegated,
+  ];
+}
+
+/** The items a requirement has provably discharged under this source's own
+ * frozen contract — the exact proof the delegation credit reads from a child. */
+export function dischargedRequirementItems(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  requirementId: string;
+}): Array<{ logicalToolCallId: string; universeItemId: string | null }> {
+  const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (loaded.status !== 'ok') return [];
+  return dischargedRequirementSettlements(openEventLog(), loaded.contract, input.requirementId)
+    .map((row) => ({ logicalToolCallId: row.logical_tool_call_id, universeItemId: row.universe_item_id }));
 }
 
 /** Clean redeemable predecessor reads — data that has landed. Shared by the

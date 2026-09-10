@@ -2265,7 +2265,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const workerAgentForPacket = async (
     input: WorkerToolInput,
     model: string,
-    child?: { sessionId: string; sourceUserSeq: number },
+    child?: { sessionId: string; sourceUserSeq: number; delegatedExpectedWork?: { requirementId: string } },
   ): Promise<{ agent: BuiltWorkerAgent; scope: McpToolScope | null | undefined }> => {
     const scope = workerPacketMcpToolScope({
       buildScope: mcpToolScope,
@@ -2278,7 +2278,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       : scope === null
         ? 'scope:deny'
         : `scope:exact:${JSON.stringify(scope)}`;
-    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}`;
+    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}\0${child?.delegatedExpectedWork ? 'delegated' : ''}`;
     let pending = workerAgentCache.get(key);
     if (!pending) {
       // The child owns its scoped catalog namespace; explicit packet lineage
@@ -2291,6 +2291,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ...(Number.isSafeInteger(child?.sourceUserSeq ?? options.sourceUserSeq) && ((child?.sourceUserSeq ?? options.sourceUserSeq) ?? 0) > 0
           ? { sourceUserSeq: child?.sourceUserSeq ?? options.sourceUserSeq }
           : {}),
+        ...(child?.delegatedExpectedWork ? { delegatedExpectedWork: true } : {}),
       });
       workerAgentCache.set(key, pending);
     }

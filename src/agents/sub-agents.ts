@@ -8,6 +8,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildWorkCall } from '../tools/work-call.js';
+import { buildPlanTaskTool } from '../tools/plan-tools.js';
 import { actionExpectedWorkCarrierRequired } from '../runtime/harness/action-expected-work-boundary.js';
 import { actionTopologyRoleFor, deriveWorkerBlocked } from '../tools/tool-registry.js';
 import { buildCompactToolCatalog } from './tool-catalog.js';
@@ -179,6 +180,11 @@ export async function buildWorkerAgent(options: {
   /** The child's primed planning context; when present its tool_search can
    *  stage provider candidates and disclose executable refs. */
   hostFreshPlanning?: HostFreshPlanningContextV1;
+  /** The parent's PROVEN contract delegates this child's item (worker-host-
+   *  runner): the child carries work_call for it even before its own source
+   *  is activated — the host freezes the derived contract once it has armed
+   *  the child (expected-work-delegation.ts, 2026-09-09). */
+  delegatedExpectedWork?: boolean;
 } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const capabilityUniverseTools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
@@ -189,10 +195,11 @@ export async function buildWorkerAgent(options: {
   // first-class business tools the admission wall then refused — a wall with
   // no door (live 2026-08-11, count-only-drafts: five workers, five identical
   // ExpectedWorkBindingRequiredError deaths, zero drafts).
-  const actionWork = actionExpectedWorkCarrierRequired({
-    sessionId: options.sessionId,
-    sourceUserSeq: options.sourceUserSeq,
-  }) !== false;
+  const actionWork = options.delegatedExpectedWork === true
+    || actionExpectedWorkCarrierRequired({
+      sessionId: options.sessionId,
+      sourceUserSeq: options.sourceUserSeq,
+    }) !== false;
   const externalMcpScope = options.mcpToolScope !== undefined
     ? options.mcpToolScope
     : (options.workerInput
@@ -229,9 +236,25 @@ export async function buildWorkerAgent(options: {
       firstClassNames: controlNames,
       mcpToolScope: externalMcpScope,
       admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
+      // A delegated child's contract is frozen by the host from the parent's;
+      // it carries the same proposal-free carrier a planned parent turn does
+      // (the frame policy refuses a proposal-bearing lookalike for a write).
+      ...(options.delegatedExpectedWork === true ? { requireHostPlan: true } : {}),
     }) as Tool<RuntimeContextValue>);
+    if (options.delegatedExpectedWork === true && options.hostFreshPlanning) {
+      // The delegated child plans its one item itself, through the same
+      // control the parent used; its plan_task freezes the contract its
+      // work_call then binds (expected-work-delegation.ts, 2026-09-09).
+      tools.push(buildPlanTaskTool({ planning: options.hostFreshPlanning }) as Tool<RuntimeContextValue>);
+    }
     workerCatalogBlock = [
       '',
+      ...(options.delegatedExpectedWork === true
+        ? [
+            '## Your item is delegated to you: plan it, then write it',
+            'The parent\'s contract names your requirement and item in the job packet (CONTRACTED ITEM). Your accepted source has no contract yet, so: (1) call tool_search for the exact inner tool named in resolvedTools; (2) call plan_task with ONE operation whose id is that requirement id, effect local_write, cardinality {kind:"each", universeId:"<any id>"} over a universe with seal "accepted_input" and members [your item]; (3) call work_call with that requirement_id, universe_item_id = your item, the inner tool name and its args_json. Never write through any other door.',
+          ]
+        : []),
       '## Your item is part of an accepted action already under contract',
       'The work you were delegated is one instance of the parent\'s frozen work contract, so it dispatches through `work_call` — direct business tools are deliberately absent, and `call_tool` is not a second carrier.',
       'Bind the requirement and item the parent named in your job packet: work_call(requirement_id, universe_item_id, universe_selector, name, args_json), with proposal:null — the contract is already frozen, and re-proposing one is refused.',
@@ -419,8 +442,8 @@ export async function runCrossProviderWorker(
   const text = await runPacketWorkerWithHost({
     input, modelId, parentSessionId: sessionId, sourceUserSeq: sourceUserSeq!, maxTurns,
     mcpToolScope: effectiveMcpToolScope ?? null, dispatchLease, signal: abortSignal,
-    buildAgent: (child) => buildWorkerAgent({ model: modelId, workerInput: input,
-      mcpToolScope: effectiveMcpToolScope, ...child }),
+    buildAgent: ({ delegatedExpectedWork, ...child }) => buildWorkerAgent({ model: modelId, workerInput: input,
+      mcpToolScope: effectiveMcpToolScope, ...child, ...(delegatedExpectedWork ? { delegatedExpectedWork: true } : {}) }),
   });
   return { text, model: modelId, toolUses: [] };
 }

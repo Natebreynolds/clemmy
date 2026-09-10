@@ -544,6 +544,9 @@ export const EVENT_TYPES = [
   // {version, sourceUserSeq, lines[{id, effect, state, settled, observed,
   // required, dependsOn}]} — no model prose. The strip humanizes ids.
   'expected_work_progress',
+  'expected_work_delegated',
+  'expected_work_delegation_refused',
+  'expected_work_delegated_discharge',
   // Exact schema-backed capabilities surfaced by one governed discovery call.
   // This is restart-safe continuation evidence only: no query, arguments,
   // provider payload, or dispatch authority is stored. Carries

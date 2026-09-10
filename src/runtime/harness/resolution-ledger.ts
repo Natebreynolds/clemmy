@@ -174,6 +174,17 @@ function expectedWorkBinderPresent(
       && graph.source.sessionKind === 'execution'
       && (graph.source.surface === 'background' || graph.source.surface === 'cron')
     ) return true;
+    // A DELEGATED WORKER CHILD (worker-host-runner: kind 'agent', metadata
+    // source 'delegated_worker') runs under the same interactive host engine
+    // and mounts the same work_call carrier from its own activated source
+    // (sub-agents buildWorkerAgent). Its writes are the parent's per-item
+    // requirement delegated to it (expected-work-delegation.ts, 2026-09-09);
+    // the binding writer is present by construction, exactly as for chat.
+    if (
+      sessionKind === 'agent'
+      && (session.metadata as { source?: unknown } | undefined)?.source === 'delegated_worker'
+      && isHostTurnEngine(selectTurnEngine({ sessionKind: 'chat' }))
+    ) return true;
     return readSemanticDisposition(sessionId, sourceUserSeq)?.participation === 'participated';
   } catch {
     // An unreadable session store or unconfigurable engine cannot prove that

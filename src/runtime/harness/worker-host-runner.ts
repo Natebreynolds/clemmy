@@ -1,4 +1,5 @@
 import { parseTaskMode } from './task-mode.js';
+import { creditDelegatedExpectedWork, delegableExpectedWorkForItem, delegateExpectedWorkToChild, type DelegableExpectedWork } from './expected-work-delegation.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import { primePrimaryModelPlanningCatalog, type HostFreshPlanningContextV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
 /** Worker packets use the same host loop and exact call admission as the
@@ -25,7 +26,7 @@ import pino from 'pino';
 const workerLogger = pino({ name: 'worker-host-runner' });
 
 export async function runPacketWorkerWithHost(input: {
-  buildAgent: (child: { sessionId: string; sourceUserSeq: number; hostFreshPlanning?: HostFreshPlanningContextV1 }) => Promise<Agent<RuntimeContextValue>>;
+  buildAgent: (child: { sessionId: string; sourceUserSeq: number; hostFreshPlanning?: HostFreshPlanningContextV1; delegatedExpectedWork?: DelegableExpectedWork }) => Promise<Agent<RuntimeContextValue>>;
   input: WorkerToolInput;
   modelId: string;
   parentSessionId: string;
@@ -63,13 +64,26 @@ export async function runPacketWorkerWithHost(input: {
   // mutations are refused by the same tool edge before any consent card.
   // Execute grants remain parent-owned: children retain the exact parent mode
   // as provenance and receive an explicit investigation ceiling of their own.
+  // WORKERS WRITE THEIR ITEM. When the parent's frozen contract delegates
+  // this exact item (a per-item requirement whose sealed universe holds it),
+  // the child gets its own derived contract below and keeps the parent's
+  // execute authority for that one item; the plan ceiling stays for a plan
+  // parent and for a child the contract does not name (owner 2026-09-09).
+  const delegable = delegableExpectedWorkForItem({
+    parentSessionId: input.parentSessionId,
+    parentSourceUserSeq: source.seq,
+    expectedWork: input.input.expectedWork ?? null,
+    item: input.input.item,
+  });
+  const investigationOnly = inheritedMode?.kind === 'plan'
+    || (inheritedMode?.kind === 'execute' && !delegable);
   const childSource = recordRunAttemptUserInput(attempt, {
     turn: 1, role: 'user', parentEventId: source.id,
     data: {
       text: prompt,
-      ...(inheritedMode?.kind === 'plan' || inheritedMode?.kind === 'execute'
+      ...(investigationOnly
         ? { taskMode: { version: 1, kind: 'plan' }, delegatedWorker: { ...lineage, composeOnly: true, packet: input.input, parentTaskMode: inheritedMode, authority: 'investigation_only' } }
-        : { delegatedWorker: { ...lineage, composeOnly: true, packet: input.input } }),
+        : { delegatedWorker: { ...lineage, composeOnly: true, packet: input.input, ...(inheritedMode ? { parentTaskMode: inheritedMode } : {}), ...(delegable ? { authority: 'delegated_item', delegatedRequirementId: delegable.requirementId } : {}) } }),
     },
   });
   // A worker is an accepted task of its own. Without this baseline discovery
@@ -85,13 +99,16 @@ export async function runPacketWorkerWithHost(input: {
       knownCapability: false,
     });
   } catch { /* the live boundary fails closed if discovery is attempted anyway */ }
+  let delegation: Awaited<ReturnType<typeof delegateExpectedWorkToChild>> | null = null;
   appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_started',
     data: { ...lineage, model: input.modelId, provider: resolveEffectiveProviderForModel(input.modelId),
       role: input.input.intent, childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
   let completed = false;
   try {
     return await withHarnessRunContext({
-      sessionId: session.id, sourceUserSeq: childSource.seq, runAttemptId: attempt.attemptId,
+      // The child's own accepted turn: plan_task (a delegated child plans its
+      // item itself) requires the exact turn in the run context.
+      sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1, runAttemptId: attempt.attemptId,
       counter: new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), input.maxTurns * 4)),
       workerScope: true, mcpToolScope: input.mcpToolScope,
       guardrailScopeId: `${session.id}::worker`, behaviorScopeId: `${session.id}::turn:1`,
@@ -107,14 +124,46 @@ export async function runPacketWorkerWithHost(input: {
       } catch (err) {
         workerLogger.warn({ err, childId: session.id }, 'worker planning catalog priming threw');
       }
-      const agent = await input.buildAgent({ sessionId: session.id, sourceUserSeq: childSource.seq, ...(hostFreshPlanning ? { hostFreshPlanning } : {}) });
+      // The child's surface is built for the delegated item (work_call carrier)
+      // from the parent's PROVEN contract; the derived contract itself is
+      // frozen once the host has armed the child's source (onHostArmed below),
+      // because the host records the child's graph when it arms and refuses a
+      // graph that exists before it (preaccepted_graph_execution_owner).
+      const agent = await input.buildAgent({ sessionId: session.id, sourceUserSeq: childSource.seq, ...(hostFreshPlanning ? { hostFreshPlanning } : {}), ...(delegable ? { delegatedExpectedWork: delegable } : {}) });
+      const onHostArmed = delegable
+        ? async () => {
+            // The host re-arms its surface on every model step; delegate once.
+            if (delegation) return;
+            delegation = await delegateExpectedWorkToChild({
+              parentSessionId: input.parentSessionId, parentSourceUserSeq: source.seq,
+              childSessionId: session.id, childSourceUserSeq: childSource.seq, childTurn: 1,
+              item: input.input.item, delegable,
+              resolvedTools: String(input.input.resolvedTools ?? '').split(/[,\s]+/).map((name) => name.trim()).filter(Boolean),
+              ...(hostFreshPlanning ? { planning: hostFreshPlanning } : {}),
+            });
+            if (delegation.status !== 'delegated') {
+              workerLogger.warn({ childId: session.id, item: input.input.item, reason: delegation.reason }, 'expected-work delegation refused — the child\'s work_call will refuse without a contract');
+              appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'expected_work_delegation_refused',
+                data: { sourceUserSeq: source.seq, childSessionId: session.id, universeItemId: input.input.item, requirementId: delegable.requirementId, reason: delegation.reason } });
+            }
+          }
+        : undefined;
       const { hostRunRunner } = await import('./host-turn-runner.js');
       const outcome = await hostRunRunner(new Runner({ groupId: input.parentSessionId }) as never,
         agent, [{ type: 'message', role: 'user', content: prompt }] as never, {
           maxTurns: input.maxTurns, hostTurnEngine: 'host_v1',
           context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
           ...(input.signal ? { signal: input.signal } : {}),
+          ...(onHostArmed ? { onHostArmed } : {}),
         } as never);
+      if (delegation?.status === 'delegated') {
+        const credit = creditDelegatedExpectedWork({
+          parentSessionId: input.parentSessionId, parentSourceUserSeq: source.seq,
+          childSessionId: session.id, childSourceUserSeq: childSource.seq,
+          requirementId: delegation.requirementId, item: delegation.item, effect: delegable?.effect,
+        });
+        workerLogger.info({ childId: session.id, item: input.input.item, credit: credit.status }, 'delegated expected-work credit');
+      }
       // Attribution is the EXECUTED route, never the plan: a rate-limit fallover
       // (`turn_model_routed` routeKind harness_fallover in the CHILD session) can
       // move this worker to another family. Live 2026-09-05: Codex quota at

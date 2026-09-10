@@ -11199,6 +11199,38 @@ const MIGRATIONS: EventLogMigration[] = [
       db.exec(DISCOVERY_REQUEST_CALLS_SCHEMA_V1);
     },
   },
+  {
+    // v81: a parent's per-item expected-work requirement discharged by a
+    // DELEGATED worker child. The child settles the write in its own session
+    // under its own derived contract; the parent's plan line is credited only
+    // from that proven child settlement (expected-work-delegation.ts), never
+    // from a worker's prose result. One row per (parent contract, requirement,
+    // item); immutable.
+    version: 81,
+    sql: `
+      CREATE TABLE IF NOT EXISTS expected_work_delegated_discharges (
+        session_id                 TEXT NOT NULL,
+        source_user_seq            INTEGER NOT NULL CHECK (source_user_seq > 0),
+        contract_id                TEXT NOT NULL,
+        requirement_id             TEXT NOT NULL,
+        universe_item_id           TEXT NOT NULL,
+        child_session_id           TEXT NOT NULL,
+        child_source_user_seq      INTEGER NOT NULL CHECK (child_source_user_seq > 0),
+        child_contract_id          TEXT NOT NULL,
+        child_logical_tool_call_id TEXT NOT NULL,
+        child_result_handle_id     TEXT,
+        recorded_at                TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, contract_id, requirement_id, universe_item_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_expected_work_delegated_discharges_child
+        ON expected_work_delegated_discharges(child_session_id, child_source_user_seq);
+      CREATE TRIGGER IF NOT EXISTS trg_expected_work_delegated_discharges_immutable
+        BEFORE UPDATE ON expected_work_delegated_discharges
+      BEGIN
+        SELECT RAISE(ABORT, 'expected_work_delegated_discharges rows are immutable');
+      END;
+    `,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
