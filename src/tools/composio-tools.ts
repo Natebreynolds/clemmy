@@ -1974,7 +1974,7 @@ const PROFILE_SLUG_BY_TOOLKIT: Record<string, string> = {
   gmail: 'GMAIL_GET_PROFILE',
 };
 
-async function enrichToolkitIdentities(toolkit: string, candidates: ConnectedToolkit[]): Promise<number> {
+export async function enrichToolkitIdentities(toolkit: string, candidates: ConnectedToolkit[]): Promise<number> {
   const profileSlug = PROFILE_SLUG_BY_TOOLKIT[toolkit];
   if (!profileSlug) return 0;
   const targets = candidates

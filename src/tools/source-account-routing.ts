@@ -259,12 +259,48 @@ export async function resolveSourceAccountRouting(input: {
   effect?: 'read' | 'write';
 }): Promise<SourceAccountRoutingResolution> {
   const toolkit = input.toolkit.trim().toLowerCase();
-  const relevant = input.connections.filter((connection) => connection.slug.trim().toLowerCase() === toolkit
+  let relevant = input.connections.filter((connection) => connection.slug.trim().toLowerCase() === toolkit
     && /^(?:active|enabled|initiated)$/i.test(connection.status ?? ''));
+  // LEARN WHO THESE ACCOUNTS ARE BEFORE ASKING WHICH ONE.
+  //
+  // The provider's connection listing often carries no email at all, so a
+  // choice between several accounts was posed as raw connection ids — which
+  // nobody can answer about their own mailboxes (live 2026-09-09: the user
+  // replied "my work mailbox, the scorpion.co one" and was asked the same
+  // question again). The one-time identity probe already existed but only ran
+  // on the direct Composio execution path, and it is skipped for a PREPARED
+  // execution — which is the path a planned write takes, so a planned write
+  // could never learn the identities it was about to ask about.
+  //
+  // Probe here too: bounded to the unidentified candidates, attempted once per
+  // connection and cached durably, and entirely failure-tolerant — if the
+  // probe cannot run we simply ask with whatever label we already have.
+  if (relevant.length > 1 && relevant.some((connection) => !emailOf(connection))) {
+    try {
+      const [{ enrichToolkitIdentities }, { cachedIdentityEmail }] = await Promise.all([
+        import('./composio-tools.js'),
+        import('../integrations/composio/identity-cache.js'),
+      ]);
+      if (await enrichToolkitIdentities(toolkit, [...relevant] as never) > 0) {
+        relevant = relevant.map((connection) => (emailOf(connection)
+          ? connection
+          : { ...connection, accountEmail: cachedIdentityEmail(connection.connectionId) ?? connection.accountEmail }));
+      }
+    } catch {
+      // An unreachable provider must never turn a choice into a failed turn.
+    }
+  }
   const choices = [...new Set(relevant.map(identityOf))];
   const blocked = (
     reason?: 'not_entailed' | 'quote_not_in_source',
-  ): SourceAccountRoutingResolution => ({ kind: 'account_selection_required', choices, ...(reason ? { reason } : {}) });
+  ): SourceAccountRoutingResolution => ({
+    kind: 'account_selection_required',
+    choices,
+    // EVERY blocked path carries labels, not just the review-unavailable one
+    // below: an option list is only answerable if it says who each account is.
+    labels: accountChoiceLabels(relevant),
+    ...(reason ? { reason } : {}),
+  });
   const source = acceptedSource(input.sessionId, input.sourceUserSeq);
   const session = getSession(input.sessionId);
   if (!source || !session) return blocked();
