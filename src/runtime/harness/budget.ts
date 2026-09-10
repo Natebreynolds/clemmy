@@ -402,7 +402,14 @@ export function checkBudget(input: CheckBudgetInput): CheckBudgetResult {
     reason = `${(fractionUsed * 100).toFixed(0)}% of effective limit — crossed the ${(warnFraction * 100).toFixed(0)}% warn threshold; recommend preemptive compaction`;
   } else {
     status = 'block';
-    reason = `${(fractionUsed * 100).toFixed(0)}% of effective limit — exceeds the ${(blockFraction * 100).toFixed(0)}% block threshold; turn should be refused or routed through plan-mode`;
+    // Says what the harness DOES, not what an older design intended. The chat
+    // leg stopped injecting a "route through plan-mode" steer on 2026-09-09 —
+    // it never freed a token, it re-routed real work, and as a history item it
+    // broke the accepted-batch chain on a resumed source. This verdict is now
+    // telemetry: compaction owns context size and the turn proceeds. The stale
+    // wording cost a live misdiagnosis on 2026-09-10, when a Plan run was read
+    // as budget-blocked (it was not) because the event still said "refused".
+    reason = `${(fractionUsed * 100).toFixed(0)}% of effective limit — over the ${(blockFraction * 100).toFixed(0)}% block threshold; recorded only, the turn proceeds and compaction owns context size`;
   }
   return {
     status,
