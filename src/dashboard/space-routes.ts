@@ -285,6 +285,35 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
  *  clem.action() RESOLVES the E1 approval contract: a send/write returns
  *  {pending:true, approvalId} (the user approves in the inbox; it fires then),
  *  a read returns {ok:true, result}. */
+/**
+ * Seed the dataset the authored view is about to read as a synchronous global.
+ *
+ * Live 2026-09-10 (Scorpion inbox triage): every board Clem wrote reached for
+ * `window.__SPACE_DATA__` at the top of its render, and nothing in this runtime
+ * ever defined that name — only the async `clem.data()` existed. So the board
+ * rendered its empty state with 25 triaged emails sitting in data.json, and the
+ * owner said "I am just not seeing the emails I should see here". The bridge
+ * already hands this exact document its own dataset on request, so seeding it
+ * discloses nothing new, and it spares every view the first-paint round trip
+ * that forced hand-rolled `waitForClem` polls. `clem.data()` is unchanged and
+ * remains the way to read data that changed since load.
+ */
+const CLEM_VIEW_DATA_SEED = (slug: string): string => {
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(readData(slug));
+  } catch { /* an unserializable dataset simply does not seed */ }
+  if (typeof json !== 'string') return '';
+  // Same rule as the static snapshot: HTML parses classic-script contents
+  // before JavaScript does, so escape every "<" (a dataset containing
+  // "</script>" must not close this element) plus the line separators.
+  const literal = JSON.stringify(json)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+  return `<script>(function(){try{window.__SPACE_DATA__=JSON.parse(${literal});}catch(_){}})();</script>`;
+};
+
 const CLEM_VIEW_BRIDGE = (slug: string): string => {
   const S = JSON.stringify(slug);
   return `<script>(function(){'use strict';
@@ -400,7 +429,10 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // refresh action with no data source attached) and names the one-line
       // ask that has Clem repair it. Advisory: dismissible, never blocks.
       const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
-      res.send(appendWiringHealthBanner(injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug)), wiring));
+      res.send(appendWiringHealthBanner(
+        injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
+        wiring,
+      ));
       return;
     }
     res.send(readFileSync(target));

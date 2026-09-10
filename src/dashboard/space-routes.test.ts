@@ -931,3 +931,39 @@ test('a data commit moves dataMtimeMs while the untouched view keeps its stamp',
   assert.notEqual(after.body.dataMtimeMs, before.body.dataMtimeMs);
   assert.equal(after.body.viewMtimeMs, before.body.viewMtimeMs);
 });
+
+/**
+ * Live 2026-09-10: every board Clem authored rendered from
+ * `window.__SPACE_DATA__` and nothing in the runtime defined it, so a fully
+ * populated triage board showed its empty state. The served document must plant
+ * the dataset before the authored script runs — and no dataset string may close
+ * the seed's own script element.
+ */
+test('the served view is seeded with its dataset before authored script runs, script-safe', async () => {
+  const slug = 'data-seed';
+  store.spaceStore.save({ id: slug, title: 'Data Seed', viewEntry: 'view/index.html' });
+  mkdirSync(path.join(store.resolveSpaceDir(slug), 'view'), { recursive: true });
+  writeFileSync(
+    path.join(store.resolveSpaceDir(slug), 'view', 'index.html'),
+    '<html><body><script>window.__SEEN__=(window.__SPACE_DATA__||{}).emails;</script></body></html>',
+    'utf-8',
+  );
+  const put = await j(await fetch(`${base}/api/console/spaces/${slug}/data`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data: { emails: [{ subject: '</script><script>alert(1)</script>' }] } }),
+  }));
+  assert.equal(put.status, 200);
+
+  const html = await (await fetch(`${base}/console/spaces/${slug}/view/`)).text();
+  const seedAt = html.indexOf('window.__SPACE_DATA__=JSON.parse(');
+  assert.ok(seedAt > 0, 'the document plants the dataset as a synchronous global');
+  assert.ok(seedAt < html.indexOf('window.__SEEN__'), 'and plants it BEFORE the authored script');
+  assert.ok(
+    !html.slice(seedAt).startsWith('window.__SPACE_DATA__=JSON.parse("{\"emails\"'),
+    'the dataset is embedded as an escaped JSON string literal',
+  );
+  const seedScript = html.slice(seedAt, html.indexOf('</script>', seedAt));
+  assert.ok(!seedScript.includes('<'), 'no "<" survives inside the seed, so no dataset can close it');
+  assert.ok(seedScript.includes('\\u003c/script'), 'the hostile subject is escaped, not dropped');
+});

@@ -56,7 +56,9 @@ function staticClemBridge(slug: string, datasetJson: string, publishedAt: string
   const S = inlineJson(slug);
   const T = inlineJson(publishedAt);
   const D = inlineJson(datasetJson);
-  return `<script>(function(){var D=JSON.parse(${D});`
+  // `window.__SPACE_DATA__` is the synchronous seed the live route also plants,
+  // so a view that renders straight from the global keeps working once exported.
+  return `<script>(function(){var D=JSON.parse(${D});window.__SPACE_DATA__=D;`
     + `function frozen(name){return async function(){throw new Error('This is a published snapshot of the "'+${S}+'" workspace (exported '+${T}+') — '+name+' is disabled. Open the live workspace in Clementine to act.');};}`
     + `window.clem={slug:${S},snapshot:true,publishedAt:${T},`
     + `data:async function(){return D;},`
