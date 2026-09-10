@@ -2695,45 +2695,6 @@ function expectedWorkBindingCarriesExecutionAuthority(
   }
 }
 
-/**
- * COMPOSE -> COMMIT: a run_worker child never crosses an external commit, so it
- * must not enter logical admission for one.
- *
- * Admission attests a call against the accepted turn's live capability
- * authority. A worker child holds none, so an admitted worker mutation is
- * refused as `host call lacks exact live capability attestation` and, worse,
- * POISONS the parent's authority for the remainder of the turn. Measured live
- * 2026-09-10: ten workers each called GOOGLESHEETS_ADD_SHEET, each refusal
- * poisoned the parent, the parent died with
- * `exact_checkpoint_admission_exhausted`, all ten items were still checkpointed
- * `succeeded`, and the spreadsheet was never touched.
- *
- * The rule that should answer instead already exists and is correct (the
- * Composio gateway's compose-only block, reached through runComposioExecute).
- * It simply sits UNDER admission. Skipping admission — and only admission —
- * lets the body run and return that answer through the ordinary settlement
- * path, so the call settles as an honest never-started refusal and the worker
- * is told the exact payload to hand back to the parent.
- *
- * Skip admission, never the body: returning a refusal in place of the body
- * leaves the carrier unsettled and the host repairs it forever (observed:
- * 27 consecutive `carrier_repaired`, zero workers started). The no-admission
- * branch below is the same one used when a context has no accepted source, so
- * this reuses an existing supported path rather than inventing a channel.
- *
- * Provider-neutral by construction: the rule is "a worker does not cross an
- * external mutation", not "a worker does not call Composio".
- */
-function workerMustNotAdmitExternalCommit(
-  ctx: { workerScope?: boolean } | undefined,
-  toolName: string,
-  args: unknown,
-): boolean {
-  if (ctx?.workerScope !== true) return false;
-  const shape = classifyExternalWrite(toolName, args);
-  return shape.external && shape.mutating;
-}
-
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -4878,10 +4839,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (typeof value !== 'string' || ctx?.hostOwnsToolDeadlineAndSettlement || ctx?.nestedDispatch) return value;
         return `${value}${steerBlockForToolBoundary(ctx?.sessionId)}`;
       };
-      if (
-        ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0
-        && !workerMustNotAdmitExternalCommit(ctx, tool.name, logicalContractArgs)
-      ) {
+      if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
         return Promise.resolve(withLogicalToolCall(
           {
             sessionId: ctx.sessionId,
@@ -5232,10 +5190,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // loop-detection half of Primitive 6 (evaluateToolCall above)
     // stays — it's novel, not duplicative.
     };
-    if (
-      ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0
-      && !workerMustNotAdmitExternalCommit(ctx, tool.name, input)
-    ) {
+    if (ctx?.sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0) {
       return withLogicalToolCall(
         {
           sessionId: ctx.sessionId,
