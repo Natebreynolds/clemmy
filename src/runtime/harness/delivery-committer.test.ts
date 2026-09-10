@@ -742,7 +742,14 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
     replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
   } });
   const committed = commitTurnOutcome(outcome);
-  assert.equal(committed.presentation.status, 'blocked');
+  // OWNER DECISION 2026-09-09, landed with its pins 2026-09-10: a reviewer that
+  // COULD NOT FIRE — rate-limited, timed out, or not signed in — follows the
+  // brain, so finished work publishes rather than being held. Everything this
+  // test actually guards is asserted below and is unchanged: the reason survives
+  // verbatim, the text still says the result is unreviewed, it never reads as an
+  // acceptance, and the verdict still records verified:false /
+  // enabled_unavailable. A review that RAN and did not stand still blocks.
+  assert.equal(committed.presentation.status, 'done');
   assert.match(committed.presentation.text, expected);
   assert.match(committed.presentation.text, /remains unreviewed/);
   assert.doesNotMatch(committed.presentation.text, /accepting completion|accepted this result|without actually checking it/);

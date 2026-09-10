@@ -1118,6 +1118,23 @@ function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel, captured?: Ava
     brainFamily: brain.provider,
     transport: boundaryTransport(checker.provider),
     selfJudge: captured ? sameJudgeFamily(checker, brain, captured) : true,
+    // A SELF-JUDGE IS THE ONLY MODEL THERE IS, SO IT GETS THE DELIBERATE DEADLINE.
+    //
+    // The cheap-checker deadline exists to stop a heavyweight PINNED model riding
+    // every hot-path boundary call — that rule assumes there is a faster
+    // alternative worth protecting. A same-family judge IS the alternative: on a
+    // single-model install it is the only model configured, so cutting it off at
+    // the checker deadline does not fall back to something quicker. It just means
+    // nothing is ever reviewed.
+    //
+    // Live 2026-09-10, one BYO model and no judge pinned: routing was correct
+    // (glm-5.3, selfJudge true) and every completion review still came back
+    // "The completion reviewer timed out; no review was completed", because that
+    // model answers in ~50s against a 25s checker deadline. Every turn on that
+    // install was unreviewed. This is the same failure the 12s -> 25s raise
+    // addressed in July on a faster model; a one-model BYO install needs the
+    // deliberate deadline, which is the ceiling a review is already allowed.
+    timeoutMs: exactJudgeBoundaryTimeoutMs(),
     ...(captured?.byoProvider && checker.provider === 'byo' ? { judgeProviderId: captured.byoProvider.id } : {}),
   };
 }

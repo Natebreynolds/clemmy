@@ -986,6 +986,12 @@ export function commitTurnOutcome(
   assertExactAcceptedSource(requested.identity);
   let effectiveOutcome = outcome;
   let effectiveOptions = options;
+  /** The exact terminal to fall back to when an unavailable-reviewer `done`
+   * cannot close its accepted-task authority. Set only by that branch, so its
+   * failure lands on the unverified hold it replaced — note and verdict
+   * reference intact — rather than on the generic state-machine hold, which
+   * deliberately drops the verdict reference. */
+  let unverifiedHoldFallback: (() => TurnOutcome) | null = null;
   /** Set when a verification shortfall was DISCLOSED rather than held, so a
    * durable publication invariant can still send it back to the hold. */
   let disclosedInsteadOfHeld = false;
@@ -1379,13 +1385,52 @@ export function commitTurnOutcome(
     const note = reviewReason ? `Verification note: ${reviewReason} This result remains unreviewed.`
       : NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
     const authored = effectiveOutcome.presentation.text.trim();
-    effectiveOutcome = unverifiedCompletionOutcome({
+    const withNote = {
       ...effectiveOutcome,
       presentation: {
         ...effectiveOutcome.presentation,
         text: authored ? `${authored}\n\n${note}` : note,
       },
-    }, true);
+    };
+    // A REVIEWER THAT CANNOT FIRE FOLLOWS THE BRAIN (owner decision 2026-09-09).
+    //
+    // Every other cause in this block is a real finding: a negative verdict,
+    // drifted artifacts, an unreadable inventory, a reply that does not match
+    // the work. "The reviewer could not sign in" is none of those. Live
+    // 2026-09-10 on a BYO brain: Clementine created a sheet, wrote and READ BACK
+    // 12 cells, reported it accurately — and the person was handed
+    // `reason: blocked`, `delivered: false`, because the boundary judge had no
+    // Claude login in that home. Blocking finished work on the absence of a
+    // check teaches people to distrust the check, not the work.
+    //
+    // Honesty is kept exactly where it belongs. The note still says the result
+    // is unreviewed, and the verdict record still carries verified:false with
+    // disposition enabled_unavailable, so nothing here ever claims a review
+    // happened. Only the terminal follows the brain.
+    //
+    // WHY THIS IS CONDITIONAL ON THE PUBLISH SUCCEEDING (learned the hard way,
+    // 2026-09-10): a `done` terminal must CLOSE the accepted-task authority, and
+    // the durable state machine only allows that from `manifested_verifying`. A
+    // turn that manifested no verification at all — a plain read, say — is still
+    // `armed`, so this publish legitimately fails for it. The first attempt at
+    // this decision let that failure fall through to the generic
+    // state-machine-hold branch, which deliberately drops the verdict reference:
+    // the turn was held anyway AND lost its review record, strictly worse than
+    // doing nothing. So the fallback for THIS branch is the exact terminal this
+    // decision replaced — the unverified hold, with its note and its verdict
+    // reference intact — and never the generic hold.
+    const reviewCouldNotFire = detail === 'completion_review_failed_open'
+      && publishedVerdict?.fulfills === true
+      && publishedVerdict.settledEvidenceAvailable !== false
+      && settledNow.evidenceAvailable
+      && replyMatches
+      && objectiveMatches
+      && artifactsMatch
+      && (!artifactsRequired || coverageComplete);
+    unverifiedHoldFallback = reviewCouldNotFire
+      ? () => unverifiedCompletionOutcome(withNote, true)
+      : null;
+    effectiveOutcome = reviewCouldNotFire ? withNote : unverifiedCompletionOutcome(withNote, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the
@@ -1473,7 +1518,29 @@ export function commitTurnOutcome(
     // the disclosure rule, so the database stays authoritative here rather than
     // this module re-deriving the condition and drifting from it. A turn that
     // cannot legally complete is genuinely incomplete: fall back to the hold.
-    if (!disclosedInsteadOfHeld || !(error instanceof AcceptedTaskTerminalPublicationError)) throw error;
+    if (!(error instanceof AcceptedTaskTerminalPublicationError)) throw error;
+    // The unavailable-reviewer branch owns its own failure. Its `done` is an
+    // upgrade over the terminal it replaced, so when the authority cannot close
+    // — a turn that manifested no verification is still `armed` — it must land
+    // back on exactly that terminal, carrying the same note and the same verdict
+    // reference, and never on the generic hold below (which drops the verdict
+    // reference by design). Same `data` shape, so nothing else about the row
+    // changes; only the outcome does.
+    if (unverifiedHoldFallback) {
+      effectiveOutcome = unverifiedHoldFallback();
+      const heldPresentation = presentationEventForOutcome(effectiveOutcome);
+      data = {
+        ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
+        ...planMetadata, ...verdictMetadata, ...refusalMetadata,
+      };
+      terminal = appendTerminalEventOnce({
+        sessionId: heldPresentation.identity.sessionId,
+        turn: heldPresentation.identity.turn,
+        role: 'system',
+        data,
+      }, heldPresentation.outcomeId);
+    } else {
+    if (!disclosedInsteadOfHeld) throw error;
     effectiveOutcome = withRetainedWorkTerminal(
       unverifiedCompletionOutcome(
         withExactMutationPartialTruth(outcome as Extract<TurnOutcome, { status: 'done' }>),
@@ -1511,6 +1578,7 @@ export function commitTurnOutcome(
       role: 'system',
       data,
     }, heldPresentation.outcomeId);
+    }
   }
   // THE FENCE IS WRITTEN WHERE THE FOREGROUND ACTUALLY STOPS. Detach cannot
   // assert it: at that point the run is still executing and may yet complete an
