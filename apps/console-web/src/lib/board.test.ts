@@ -8,7 +8,7 @@ import {
   boardNeedsYouGroup,
   presentBoardWorkingNow,
   boardTraceSinceSeq,
-  canStopCanonicalRunFromDrawer,
+  canStopFromDrawer,
   findBoardCardForRun,
   cardTone,
   isWorkflowCatchupCard,
@@ -141,7 +141,7 @@ test('an exact out-of-page deep link can be materialized from authoritative run 
   }, selection), undefined, 'same session with a different current attempt fails closed');
 });
 
-test('the trace drawer offers Stop only for a canonical run with a safe projected endpoint', () => {
+test('the trace drawer offers Stop for anything the card itself says can be cancelled', () => {
   const endpoint = '/api/console/harness-sessions/sess-reused/cancel?attemptId=attempt-live';
   const canonical = card({
     id: 'harness:attempt-live',
@@ -150,13 +150,34 @@ test('the trace drawer offers Stop only for a canonical run with a safe projecte
     cancelEndpoint: endpoint,
   });
 
-  assert.equal(canStopCanonicalRunFromDrawer(canonical), true);
-  assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, cancelEndpoint: 'https://example.com/cancel' }), false);
-  assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, actions: [] }), false);
-  assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, sourceKind: 'background' }), false,
-    'background controls remain in the task cockpit');
-  assert.equal(canStopCanonicalRunFromDrawer({ ...canonical, sourceKind: 'approval' }), false,
-    'approval controls remain unchanged');
+  assert.equal(canStopFromDrawer(canonical), true);
+  assert.equal(canStopFromDrawer({ ...canonical, cancelEndpoint: 'https://example.com/cancel' }), false,
+    'a projected endpoint that is not ours is never called');
+  assert.equal(canStopFromDrawer({ ...canonical, actions: [] }), false,
+    'the card decides whether it can be cancelled at all');
+  assert.equal(canStopFromDrawer({ ...canonical, cancelEndpoint: undefined }), false,
+    'a run projects its endpoint only while live, so absence means there is nothing to stop');
+
+  // Reported 2026-09-10: a background task's only Cancel lived in the Task
+  // cockpit, which scrolls away under a live feed pinned to its newest row —
+  // the user watching the work could not reach the button that stops it.
+  assert.equal(
+    canStopFromDrawer({ ...canonical, sourceKind: 'background', cancelEndpoint: undefined }), true,
+    'a running background task is stoppable from the header while you watch it',
+  );
+  assert.equal(
+    canStopFromDrawer({ ...canonical, sourceKind: 'workflow', cancelEndpoint: undefined }), true,
+    'so is an in-flight workflow run',
+  );
+  assert.equal(
+    canStopFromDrawer({ ...canonical, sourceKind: 'execution', cancelEndpoint: undefined }), true,
+    'and tracked execution work',
+  );
+
+  assert.equal(canStopFromDrawer({ ...canonical, sourceKind: 'approval' }), false,
+    'an approval is approve/reject, not a stop');
+  assert.equal(canStopFromDrawer({ ...canonical, sourceKind: 'schedule' }), false,
+    'a missed schedule has not started; its choice is Resume or Skip');
 });
 
 test('Tasks approval review retains exact target, risk, preview, rollback, hash, and payload', () => {

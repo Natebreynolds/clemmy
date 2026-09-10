@@ -27,7 +27,7 @@ import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
   answerBackgroundTaskQuestion,
   boardTraceSinceSeq,
-  canStopCanonicalRunFromDrawer,
+  canStopFromDrawer,
   cardTone,
   getBackgroundTaskDetail,
   isWorkflowCatchupCard,
@@ -701,7 +701,7 @@ export function LiveTraceDrawer({
     || outcomeEvidence?.committedExternalActions
     || outcomeEvidence?.lastToolFailure,
   );
-  const canStopCanonicalRun = Boolean(onAction && canStopCanonicalRunFromDrawer(card));
+  const canStop = Boolean(onAction && canStopFromDrawer(card));
 
   return (
     <div
@@ -756,9 +756,20 @@ export function LiveTraceDrawer({
               </div>
               <p className="mt-1 text-body text-fg">{current || 'Waiting for activity…'}</p>
             </div>
-            {canStopCanonicalRun && (
-              <Button size="sm" variant="secondary" onClick={() => onAction?.(card, 'cancel')}>
-                <X className="h-4 w-4" aria-hidden /> Stop run
+            {canStop && (
+              // Fixed header, beside "Current" — the one control the viewer
+              // needs while watching stays put while the feed scrolls under it.
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={actionBusy !== null}
+                onClick={() => { void runCardAction('cancel'); }}
+                title={isBackground
+                  ? 'Requests a stop; the task ends at its next safe checkpoint.'
+                  : 'Stops this run.'}
+              >
+                <X className="h-4 w-4" aria-hidden />
+                {actionBusy === 'cancel' ? 'Stopping…' : 'Stop'}
               </Button>
             )}
           </div>
@@ -896,17 +907,6 @@ export function LiveTraceDrawer({
                     >
                       <Play className="h-4 w-4" aria-hidden />
                       {actionBusy === 'resume' ? 'Continuing…' : 'Continue'}
-                    </Button>
-                  )}
-                  {card.actions.includes('cancel') && (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={actionBusy !== null}
-                      onClick={() => { void runCardAction('cancel'); }}
-                    >
-                      <X className="h-4 w-4" aria-hidden />
-                      {actionBusy === 'cancel' ? 'Cancelling…' : 'Cancel'}
                     </Button>
                   )}
                 </div>

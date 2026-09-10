@@ -677,15 +677,41 @@ export function boardTraceSinceSeq(card: BoardCard): number | undefined {
   return Math.max(0, Math.floor(Number(card.sourceUserSeq)) - 1);
 }
 
-/** A canonical foreground run may expose Stop from its trace drawer only when
- * the backend projected both the action and an API-scoped endpoint. Background
- * tasks keep their existing cockpit controls, and approvals/workflows cannot
- * accidentally inherit foreground-run cancellation UI. */
-export function canStopCanonicalRunFromDrawer(card: BoardCard): boolean {
-  return card.sourceKind === 'run'
-    && card.actions.includes('cancel')
-    && typeof card.cancelEndpoint === 'string'
-    && card.cancelEndpoint.startsWith('/api/');
+/** Kinds whose stop is a DIFFERENT decision, made in its own block: a missed
+ * schedule has not started executing (its choice is Resume or Skip), and an
+ * approval's controls are approve/reject. */
+const NOT_A_STOP: ReadonlySet<BoardSourceKind> = new Set(['schedule', 'approval']);
+
+/** Kinds for which the server projects the cancel endpoint only while the work
+ * is actually live. For those, a missing endpoint means there is nothing to
+ * stop, so absence must keep the button away. Every other kind's cancel route
+ * is derived by `runBoardAction` from the card's identity, and the server
+ * answers a wrong-state stop with a reason the drawer shows. */
+const STOP_NEEDS_PROJECTED_ENDPOINT: ReadonlySet<BoardSourceKind> = new Set(['run', 'guest']);
+
+/**
+ * May this card be stopped from its trace drawer?
+ *
+ * Reported 2026-09-10 by a second user: "when a background task is running I
+ * can't actually see what's going on, or stop it either." Stop was gated on
+ * `sourceKind === 'run'`, so the persistent header button existed only for
+ * foreground runs. A background task did carry a Cancel — inside the Task
+ * cockpit, which shares the drawer's one scroll region with the live feed and
+ * is pinned to the newest row while the task works. So the control scrolled
+ * itself off-screen exactly while the thing it stops was running, and
+ * execution/workflow cards had no drawer stop at all.
+ *
+ * The card already declares whether it can be cancelled and the server decides
+ * the real transition, so ask the card instead of matching on its kind.
+ */
+export function canStopFromDrawer(card: BoardCard): boolean {
+  if (!card.actions.includes('cancel')) return false;
+  if (NOT_A_STOP.has(card.sourceKind)) return false;
+  const endpoint = typeof card.cancelEndpoint === 'string' ? card.cancelEndpoint : null;
+  // A projected endpoint is honored only when it is ours to call.
+  if (endpoint !== null && !endpoint.startsWith('/api/')) return false;
+  if (STOP_NEEDS_PROJECTED_ENDPOINT.has(card.sourceKind) && endpoint === null) return false;
+  return true;
 }
 
 /** A missed schedule is a decision card, not an executing workflow. Its
