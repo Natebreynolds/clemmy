@@ -51,6 +51,7 @@ const PANE_LABELS: Record<HomePaneId, string> = {
   needs_you: 'Needs you',
   running: 'Running',
   while_away: 'While you were away',
+  made: 'Made',
   projects: 'Spaces',
   workstate: 'Working together card',
 };

@@ -4832,6 +4832,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // Home preferences — the same per-user record the desktop console edits
   // (panes, nav, landing, quick actions, phone switcher). Read/write only;
   // no execution authority lives here.
+  router.get('/api/delivered', requireMobileSession, async (_req, res) => {
+    try {
+      const { listDeliveredGroups } = await import('../memory/deliverable-index.js');
+      const limitRaw = Number.parseInt(String(_req.query.limit ?? '24'), 10);
+      res.json({ groups: listDeliveredGroups(Number.isFinite(limitRaw) ? limitRaw : 24) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.get('/api/settings/home', requireMobileSession, async (_req, res) => {
     try {
       const { loadHomePreferences } = await import('../runtime/home-preferences.js');

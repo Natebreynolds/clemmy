@@ -25,6 +25,7 @@ import { NeedsYouPane } from '@/components/home/NeedsYouPane';
 import { RunningPane } from '@/components/home/RunningPane';
 import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
+import { MadePane } from '@/components/home/MadePane';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { awayCounts, presenceLine, type HomeFeedItem } from '@/components/home/home-model';
 
@@ -134,6 +135,8 @@ export function Home() {
             onRetry={retryCommandCenter}
           />
         );
+      case 'made':
+        return <MadePane key={id} headingId="home-made" />;
       case 'projects':
         return (
           <ProjectsPane

@@ -2,6 +2,7 @@ import {
   Home, MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
   Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
+  FolderOpen,
   type LucideIcon,
 } from 'lucide-react';
 import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
@@ -60,8 +61,13 @@ export const FOOTER_NAV: NavDest[] = [
   { path: '/help', label: 'Help', icon: HelpCircle, hint: 'Guides, shortcuts & version' },
 ];
 
+/** Reachable from Home, not a sidebar pin. Command palette and titles still resolve. */
+export const MADE_NAV: NavDest = {
+  path: '/made', label: 'Made', icon: FolderOpen, hint: 'Finished work — drafts, files, sheets',
+};
+
 /** Every destination the command palette can jump to and titles resolve from. */
-export const ALL_NAV: NavDest[] = [...PRIMARY_NAV, ...ADVANCED_NAV, ...FOOTER_NAV];
+export const ALL_NAV: NavDest[] = [...PRIMARY_NAV, MADE_NAV, ...ADVANCED_NAV, ...FOOTER_NAV];
 
 export interface SidebarNav {
   /** Always visible, in the user's order, above the fold. */

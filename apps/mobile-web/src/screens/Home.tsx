@@ -26,6 +26,7 @@ import {
   approvePlanProposal,
   getReminders,
   listApprovals,
+  listDelivered,
   listInboxNotifications,
   listInboxQuestions,
   listPlanProposals,
@@ -37,6 +38,7 @@ import {
   runWorkflow,
   type ActivityEntry,
   type ApprovalRow,
+  type DeliveredGroup,
   type InboxNotification,
   type InboxQuestion,
   type PlanProposalRow,
@@ -283,6 +285,7 @@ export function Home({
         </div>
       </section>
     ) : null),
+    made: () => <MadeSection />,
     while_away: () => (awayRows.length > 0 ? (
       <section class="home-section" aria-labelledby="home-away">
         <h2 id="home-away" class="section-head pane-head">While you were away</h2>
@@ -502,6 +505,45 @@ function QuickActions({ actions, onAsk }: {
       </div>
       {note ? <p class={`qa-note${note.tone === 'error' ? ' qa-note-error' : ''}`} role="status">{note.text}</p> : null}
     </div>
+  );
+}
+
+function MadeSection() {
+  const [groups, setGroups] = useState<DeliveredGroup[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void listDelivered(8).then((r) => {
+      if (!cancelled) setGroups(r.groups ?? []);
+    }).catch(() => { /* pane degrades on its own */ });
+    return () => { cancelled = true; };
+  }, []);
+  if (groups.length === 0) return null;
+  return (
+    <section class="home-section" aria-labelledby="home-made">
+      <h2 id="home-made" class="section-head pane-head">Made</h2>
+      <div class="home-card">
+        {groups.slice(0, 6).map((group) => {
+          const open = group.artifacts?.find((a) => a.openable && /^https?:/i.test(a.target))?.target ?? group.url;
+          const n = group.artifacts?.length || group.artifactCount;
+          return (
+            <button
+              key={group.id}
+              type="button"
+              class="home-row home-row-tap"
+              onClick={() => {
+                haptic('light');
+                if (open) window.open(open, '_blank', 'noopener,noreferrer');
+              }}
+            >
+              <div class="min-w-0">
+                <div class="home-row-title truncate">{group.title}</div>
+                <div class="home-row-note">{n === 1 ? '1 item' : `${n} items`}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

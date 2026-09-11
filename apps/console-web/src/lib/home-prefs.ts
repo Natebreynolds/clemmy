@@ -17,6 +17,7 @@ export type HomePaneId =
   | 'needs_you'
   | 'running'
   | 'while_away'
+  | 'made'
   | 'projects'
   | 'workstate';
 
@@ -59,14 +60,15 @@ export interface HomePreferences {
  * did nothing. The rule belongs here, in data the sheet displays and the user
  * can reorder, so that what the sheet says is what the home renders.
  *
- * NOTE for whoever owns src/runtime/home-preferences.ts:52 — the daemon ships
- * its own copy of this array, still chips-first, and it is the one a fresh
- * install actually receives. The two should match.
+ * NOTE for whoever owns src/runtime/home-preferences.ts:51 — the daemon ships
+ * its own copy of this array, and it is the one a fresh install actually
+ * receives. The two should match.
  */
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'needs_you',
   'running',
   'while_away',
+  'made',
   'projects',
   'quick_actions',
 ];
@@ -96,43 +98,40 @@ export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferen
 /** Only the server's explicit untouched-default marker changes the landing.
  * A saved last-conversation or current-project choice remains exactly that. */
 export function desktopHomePreferences(prefs: HomePreferences): HomePreferences {
+  const migrated = migrateHomePreferences(prefs);
   return {
-    ...prefs,
-    landing: prefs.updatedAt === '1970-01-01T00:00:00.000Z' ? 'home' : prefs.landing,
-    nav: primaryHomeNavigation(prefs.nav),
+    ...migrated,
+    landing: migrated.updatedAt === '1970-01-01T00:00:00.000Z' ? 'home' : migrated.landing,
+    nav: primaryHomeNavigation(migrated.nav),
   };
 }
 
 export const HOME_PREFS_KEY = ['settings', 'home'] as const;
 
-/** The order the daemon still ships (src/runtime/home-preferences.ts:52), and
- *  the one a fresh install receives over the wire. */
-const LEGACY_DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
-  'quick_actions',
-  'needs_you',
-  'running',
-  'while_away',
-  'projects',
+/** Untouched daemon defaults that still put chips first. A Customize save
+ *  always writes every known pane id (including `workstate`), so these arrays
+ *  can never be a user's choice. */
+const SHIPPED_CHIPS_FIRST_ORDERS: readonly HomePaneId[][] = [
+  ['quick_actions', 'needs_you', 'running', 'while_away', 'projects'],
+  ['quick_actions', 'needs_you', 'running', 'while_away', 'made', 'projects'],
 ];
 
 /**
- * Re-express the shipped chips-first default as chips-last, ONCE, at the
+ * Re-express a shipped chips-first default as chips-last, ONCE, at the
  * boundary — so the Customize sheet and the home read the same record.
  *
- * This fires only on a record whose order is byte-for-byte the legacy default,
- * and that shape cannot be a user's choice: every order the Customize sheet
- * writes has been through normalizePreferences(), which appends the full pane
- * id set, so a saved order always carries all six ids and never equals this
- * five-id array. And for any record where it DOES fire, the previous build
- * already drew the chips last (homeBlocks sank them), so nothing the user sees
- * moves — what changes is that the sheet now agrees with the screen, and a
- * user who drags "Quick actions" back to slot 1 keeps it there.
+ * Fires only when the order is byte-for-byte a shipped default. For any
+ * record where it does fire, the previous build already drew the chips last
+ * (homeBlocks sank them), so nothing the user sees moves — what changes is
+ * that the sheet now agrees with the screen, and a user who drags "Quick
+ * actions" back to slot 1 keeps it there. `made` rest-appends on existing
+ * saved orders that never named it.
  */
 export function migrateHomePreferences(prefs: HomePreferences): HomePreferences {
   const order = prefs.panes.order;
-  const isShippedDefault =
-    order.length === LEGACY_DEFAULT_HOME_PANE_ORDER.length
-    && order.every((id, i) => id === LEGACY_DEFAULT_HOME_PANE_ORDER[i]);
+  const isShippedDefault = SHIPPED_CHIPS_FIRST_ORDERS.some(
+    (shipped) => order.length === shipped.length && order.every((id, i) => id === shipped[i]),
+  );
   if (!isShippedDefault) return prefs;
   return { ...prefs, panes: { ...prefs.panes, order: [...DEFAULT_HOME_PANE_ORDER] } };
 }

@@ -10,12 +10,12 @@
  * one brief, which is exactly the noise this surface exists to prevent.
  */
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Copy, ExternalLink, FileText, Globe, MessageCircle, RotateCw, Table2 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
-import { listDelivered, type DeliveredGroup } from '@/lib/delivered';
+import { folderHref, listDelivered, type DeliveredGroup } from '@/lib/delivered';
 
 function groupIcon(group: DeliveredGroup) {
   if (group.url?.includes('docs.google.com/spreadsheets')) return Table2;
@@ -71,6 +71,9 @@ export function DeliveredShelf() {
       <div className="mb-3 flex items-baseline gap-2">
         <h3 className="text-h3 text-fg">Delivered</h3>
         <span className="text-caption text-muted">Finished work — it never gets lost from here.</span>
+        <Link to="/made" className="ml-auto rounded-sm font-semibold text-primary hover:underline">
+          All made
+        </Link>
       </div>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         {groups.map((g) => {
@@ -82,7 +85,13 @@ export function DeliveredShelf() {
                   <Icon className="h-4 w-4" aria-hidden />
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-body font-semibold text-fg" title={g.filePath ?? g.url ?? g.title}>{g.title}</p>
+                  <Link
+                    to={folderHref(g)}
+                    className="truncate text-body font-semibold text-fg hover:underline"
+                    title={g.filePath ?? g.url ?? g.title}
+                  >
+                    {g.title}
+                  </Link>
                   <p className="mt-0.5 line-clamp-2 text-caption text-muted" title={g.why}>“{g.why}”</p>
                 </div>
               </div>

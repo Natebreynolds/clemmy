@@ -25,6 +25,14 @@ test('only untouched server defaults change their desktop landing; explicit Chat
   }
 });
 
+test('a shipped chips-first home record is re-expressed before the desktop reads it', () => {
+  const chipsFirst = desktopHomePreferences({
+    ...DEFAULT_HOME_PREFERENCES,
+    panes: { order: ['quick_actions', 'needs_you', 'running', 'while_away', 'projects'], hidden: ['workstate'] },
+  });
+  assert.deepEqual(chipsFirst.panes.order, DEFAULT_HOME_PREFERENCES.panes.order);
+});
+
 test('making Home primary preserves other groups and is stable when preferences are normalized twice', () => {
   const nav = { pinned: ['/memory', '/home', '/chat'], shown: ['/tasks', '/home'], more: ['/connect', '/home'] };
   const result = primaryHomeNavigation(nav);

@@ -136,6 +136,16 @@ export function listRecentDeliverables(limit = 30): DeliverableHit[] {
   }
 }
 
+export interface DeliveredArtifact {
+  kind: string;
+  title: string;
+  target: string;
+  createdAt: string;
+  /** True when the target is an http(s) URL or a file that still exists. */
+  openable: boolean;
+  stillExists?: boolean;
+}
+
 export interface DeliveredGroup {
   /** Stable key (representative row id). */
   id: number;
@@ -155,6 +165,8 @@ export interface DeliveredGroup {
   artifactCount: number;
   /** True when the group is a re-runnable ask (guest/local produced work). */
   rerunnable: boolean;
+  /** The files / drafts / URLs inside this folder, newest first. */
+  artifacts: DeliveredArtifact[];
 }
 
 const SCRIPT_OR_DATA_RE = /\.(mjs|cjs|js|ts|json|map|lock)$/i;
@@ -178,6 +190,41 @@ function humanizeExternalTitle(row: DeliverableRecord): string {
 function humanizeWhy(why: string): string {
   const m = why.trim().match(/^([a-z0-9][a-z0-9-]{2,})::[a-z0-9_-]+$/i);
   return m ? `workflow ${m[1]}` : why;
+}
+
+function isHttpTarget(target: string): boolean {
+  return /^https?:\/\//i.test(target);
+}
+
+function artifactTitle(row: DeliverableRecord): string {
+  if (row.kind === 'file') return path.basename(row.target) || row.target;
+  if (isHttpTarget(row.target)) {
+    try {
+      const u = new URL(row.target);
+      if (u.hostname.includes('docs.google.com')) return 'Google Sheet';
+      if (u.hostname.includes('mail.google.com') || u.hostname.includes('gmail.com')) return 'Gmail draft';
+      if (u.hostname.includes('outlook.')) return 'Outlook item';
+      return u.hostname.replace(/^www\./, '');
+    } catch { return row.target.slice(0, 64); }
+  }
+  // Outlook/Gmail capture often stores the recipient, not a draft URL.
+  if ((row.kind === 'draft' || row.kind === 'send') && row.target.includes('@')) {
+    return row.target;
+  }
+  return humanizeExternalTitle(row);
+}
+
+function toArtifact(row: DeliverableRecord): DeliveredArtifact {
+  const stillExists = row.kind === 'file' ? existsSync(row.target) : undefined;
+  const openable = isHttpTarget(row.target) || (row.kind === 'file' && stillExists !== false);
+  return {
+    kind: row.kind,
+    title: artifactTitle(row),
+    target: row.target,
+    createdAt: row.createdAt,
+    openable,
+    ...(stillExists === undefined ? {} : { stillExists }),
+  };
 }
 
 function groupTitle(rep: DeliverableRecord, members: DeliverableRecord[]): string {
@@ -240,6 +287,9 @@ export function listDeliveredGroups(limit = 12): DeliveredGroup[] {
       const rep = doc ?? url ?? anyFile ?? members[0];
       const file = doc ?? (rep.kind === 'file' ? rep : undefined);
       const lane = rep.lane;
+      const artifacts = [...members]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map(toArtifact);
       groups.push({
         id: rep.id,
         createdAt: members[0].createdAt, // newest member leads
@@ -251,6 +301,7 @@ export function listDeliveredGroups(limit = 12): DeliveredGroup[] {
         ...(file ? { filePath: file.target, fileStillExists: existsSync(file.target) } : {}),
         artifactCount: members.length,
         rerunnable: lane === 'guest' || lane === 'local',
+        artifacts,
       });
     }
     groups.sort((a, b) => b.createdAt.localeCompare(a.createdAt));

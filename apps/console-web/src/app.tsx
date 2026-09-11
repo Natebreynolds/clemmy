@@ -36,6 +36,8 @@ const Agents = lazyNamed(() => import('./screens/Agents'), 'Agents');
 const Advanced = lazyNamed(() => import('./screens/Advanced'), 'Advanced');
 const Settings = lazyNamed(() => import('./screens/Settings'), 'Settings');
 const Help = lazyNamed(() => import('./screens/Help'), 'Help');
+const MadeArchive = lazyNamed(() => import('./screens/Made'), 'MadeArchive');
+const MadeFolder = lazyNamed(() => import('./screens/Made'), 'MadeFolder');
 
 const CHUNK_RELOAD_LATCH = 'clem-chunk-reload-at';
 
@@ -166,6 +168,8 @@ export function App() {
           <Route element={<AppShell />}>
             <Route index element={<LandingRedirect />} />
             <Route path="/home" element={<Home />} />
+            <Route path="/made" element={deferred(<MadeArchive />)} />
+            <Route path="/made/:groupId" element={deferred(<MadeFolder />)} />
 
             <Route path="/chat" element={<ChatScreen />}>
               <Route index element={<Chat />} />

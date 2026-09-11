@@ -24,6 +24,7 @@ export const HOME_PANE_IDS = [
   'needs_you',
   'running',
   'while_away',
+  'made',
   'projects',
   'workstate',
 ] as const;
@@ -49,7 +50,7 @@ const PREFS_FILE = path.join(BASE_DIR, 'state', 'home-preferences.json');
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',
-  panes: { order: ['quick_actions', 'needs_you', 'running', 'while_away', 'projects'], hidden: ['workstate'] },
+  panes: { order: ['needs_you', 'running', 'while_away', 'made', 'projects', 'quick_actions'], hidden: ['workstate'] },
   nav: {
     // Chat is the main feature; it is pinned, not folded. Spaces (/workspaces)
     // keep the product name the phone already uses.

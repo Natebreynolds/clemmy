@@ -20,6 +20,7 @@ export type HomePaneId =
   | 'needs_you'
   | 'running'
   | 'while_away'
+  | 'made'
   | 'projects'
   | 'workstate';
 
@@ -56,6 +57,7 @@ export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'needs_you',
   'running',
   'while_away',
+  'made',
   'projects',
 ];
 
@@ -97,6 +99,7 @@ export const PHONE_PANES: ReadonlyArray<{ id: HomePaneId; label: string }> = [
   // switch that turns it on names the pane, not one of its states.
   { id: 'running', label: 'Current work' },
   { id: 'while_away', label: 'While you were away' },
+  { id: 'made', label: 'Made' },
   { id: 'projects', label: 'Coming up · Projects' },
 ];
 const PHONE_PANE_IDS = new Set<HomePaneId>(PHONE_PANES.map((pane) => pane.id));

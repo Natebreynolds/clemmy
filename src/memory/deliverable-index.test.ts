@@ -252,4 +252,48 @@ test('Delivered groups: one card per piece of WORK, humanized — never a tool s
   assert.match(briefGroups[0].title, /example-brief · index\.html/, 'the html deliverable is the face, research/ climbs to the project dir');
   assert.equal(briefGroups[0].rerunnable, true, 'a guest-run ask can be run again');
   assert.equal(briefGroups[0].filePath, brief);
+  assert.equal(briefGroups[0].artifacts.length, 3, 'the folder lists every sibling file');
+  assert.ok(briefGroups[0].artifacts.every((a) => a.kind === 'file'));
+  assert.equal(sheetGroups[0].artifacts.length, 6, 'six sheet writes stay six rows inside the folder');
+});
+
+test('a batch of drafts is one folder with every openable target listed', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  const sessionId = 'sess-draft-batch';
+  for (let i = 0; i < 8; i++) {
+    recordDeliverable({
+      kind: 'draft',
+      target: `https://mail.google.com/mail/#drafts/${i}`,
+      title: 'GMAIL_CREATE_DRAFT',
+      why: 'draft the outreach emails',
+      sessionId,
+      lane: 'external',
+    });
+  }
+  const groups = listDeliveredGroups(50).filter((g) => g.sessionId === sessionId);
+  assert.equal(groups.length, 1, 'eight drafts collapse into one folder');
+  assert.equal(groups[0].title, 'Email drafted');
+  assert.equal(groups[0].artifacts.length, 8);
+  assert.ok(groups[0].artifacts.every((a) => a.openable && a.target.startsWith('https://')), 'each draft is clickable');
+});
+
+test('outlook drafts captured as recipient addresses are listed, even when not a URL', async () => {
+  const { listDeliveredGroups } = await import('./deliverable-index.js');
+  const sessionId = 'sess-outlook-recipients';
+  const recipients = ['alex@firm.test', 'jordan@firm.test', 'sam@firm.test'];
+  for (const target of recipients) {
+    recordDeliverable({
+      kind: 'draft',
+      target,
+      title: 'OUTLOOK_CREATE_DRAFT',
+      why: 'draft the outreach emails',
+      sessionId,
+      lane: 'external',
+    });
+  }
+  const groups = listDeliveredGroups(50).filter((g) => g.sessionId === sessionId);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].title, 'Email drafted');
+  assert.deepEqual(groups[0].artifacts.map((a) => a.title).sort(), recipients);
+  assert.ok(groups[0].artifacts.every((a) => !a.openable), 'an email address is not an openable draft URL');
 });

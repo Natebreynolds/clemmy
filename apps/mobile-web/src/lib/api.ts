@@ -499,6 +499,29 @@ export interface InboxTrustProposal {
   };
 }
 
+export interface DeliveredArtifact {
+  kind: string;
+  title: string;
+  target: string;
+  createdAt: string;
+  openable: boolean;
+  stillExists?: boolean;
+}
+
+export interface DeliveredGroup {
+  id: number;
+  createdAt: string;
+  title: string;
+  why: string;
+  artifactCount: number;
+  artifacts: DeliveredArtifact[];
+  url?: string;
+}
+
+export async function listDelivered(limit = 24): Promise<{ groups: DeliveredGroup[] }> {
+  return api(`/m/api/delivered?limit=${Math.max(1, Math.min(50, Math.trunc(limit)))}`);
+}
+
 export async function listInboxNotifications(limit = 100): Promise<{
   notifications: InboxNotification[];
   count: number;
