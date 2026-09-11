@@ -12211,7 +12211,12 @@ export function registerConsoleRoutes(
             ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
             : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
           sessionId: null,
-          ageMs: ageMs(pending.lastEventAt),
+          // Age is RUN DURATION, not time-since-last-touch. Keyed to
+          // lastEventAt, a run stuck since 15:00 rendered as 39 seconds old on
+          // every poll, so a ten-hour loop looked like a healthy fresh run and
+          // nobody could see the problem (live 2026-09-11). Same correction the
+          // background-task card already carries.
+          ageMs: ageMs(pending.startedAt ?? pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
           actions: mutationBlocked || capabilityBlocked
             ? ['cancel']
@@ -12386,8 +12391,23 @@ export function registerConsoleRoutes(
           .map((c) => (c.raw as { originSessionId?: string } | undefined)?.originSessionId)
           .filter((v): v is string => Boolean(v)),
       );
+      // ONE PIECE OF WORK, ONE CARD. A workflow run yields both a `workflow`
+      // card (steps, capability gates, retry) and a `run` card for the same
+      // execution, so the board showed the same job twice with two different
+      // cancel behaviours — and only one of them actually stopped the work
+      // (live 2026-09-11: the owner could not find the run that had been
+      // looping for ten hours among 67 cards, two of which were it). The
+      // workflow card is the richer view, so the duplicate run card collapses
+      // into it.
+      const workflowRunIds = new Set(
+        cards
+          .filter((c) => c.sourceKind === 'workflow')
+          .map((c) => (typeof c.raw?.runId === 'string' ? c.raw.runId : ''))
+          .filter(Boolean),
+      );
       const pipelineCollapsed = cards.filter(
-        (c) => !(c.sourceKind === 'run' && c.column === 'done' && bgOriginSessions.has(c.sessionId ?? '')),
+        (c) => !(c.sourceKind === 'run' && c.column === 'done' && bgOriginSessions.has(c.sessionId ?? ''))
+          && !(c.sourceKind === 'run' && workflowRunIds.has(c.id)),
       );
       cards.length = 0;
       cards.push(...pipelineCollapsed);

@@ -521,6 +521,7 @@ export interface ResumeState {
    *  step_started removed it) → the guard halts it instead of double-sending. */
   failedSteps: Set<string>;
   /** ISO timestamp of the most recent event. */
+  firstEventAt?: string;
   lastEventAt?: string;
   /** True when the log contains a terminal run_completed/run_failed. */
   terminal: boolean;
@@ -568,9 +569,16 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
   const inFlightStepIds = new Set<string>();
   let inFlightStepId: string | undefined;
   let lastEventAt: string | undefined;
+  // When the run actually BEGAN. lastEventAt was the only clock a pending run
+  // exposed, so the board's age reset on every event: a run stuck since 15:00
+  // displayed as 39 seconds old all night and nothing looked wrong with it
+  // (live 2026-09-11). A duration has to measure from the start or it is not a
+  // duration.
+  let firstEventAt: string | undefined;
   let terminal = false;
 
   for (const ev of events) {
+    if (!firstEventAt) firstEventAt = ev.t;
     lastEventAt = ev.t;
     if (ev.kind === 'run_completed' || ev.kind === 'run_blocked' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled') {
       terminal = true;
@@ -634,6 +642,7 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     failedSteps,
     inFlightStepIds,
     inFlightStepId,
+    firstEventAt,
     lastEventAt,
     terminal,
   };
@@ -759,6 +768,9 @@ export function reconstructWorkflowRunQueue(
 export interface PendingRun {
   workflowName: string;
   runId: string;
+  /** When the run BEGAN — the age a person reads. Keyed off the first event so
+   *  a long-stuck run reads as hours old instead of resetting on every tick. */
+  startedAt?: string;
   lastEventAt?: string;
   inFlightStepId?: string;
   /** The durable run-record status ('running' | 'parked' | 'queued' | …) so
@@ -842,6 +854,7 @@ export function listPendingRuns(): PendingRun[] {
       pending.push({
         workflowName: workflowDir,
         runId,
+        startedAt: state.firstEventAt,
         lastEventAt: state.lastEventAt,
         inFlightStepId: state.inFlightStepId,
         runStatus: readRunRecordStatus(runId),
