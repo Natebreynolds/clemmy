@@ -983,3 +983,24 @@ test('automatic preparation preserves explicit write contracts and rejects broke
   assert.equal(broken.ok, false);
   assert.match(broken.errors.join('\n'), /forEach|missing_source/);
 });
+
+// Live 2026-09-11: scorpion-inbox-triage was authored at 18:23 with
+// `allowedTools: [OUTLOOK_LIST_MESSAGES]`, enabled seven minutes later with no
+// verification, and then failed every scheduled run for six hours without once
+// executing a step. The creation gate exists to prevent exactly that. It missed
+// because it recognised a step as reaching outside only by CARRIER prefix
+// (composio*, mcp*, firecrawl*…) — and the author had named an OPERATION.
+test('a step naming a provider operation is a testable read, so it must be verified before it runs', () => {
+  const namedOperation = { prompt: 'Read the most recent 40 messages from the Scorpion inbox.', allowedTools: ['OUTLOOK_LIST_MESSAGES'] };
+  assert.equal(stepIsTestableRead(namedOperation), true,
+    'naming the operation reaches outside as surely as naming its carrier');
+  assert.equal(workflowNeedsCreationTest({ steps: [namedOperation] } as never), true,
+    'so the workflow cannot be enabled without a real creation test');
+
+  // The carrier spelling keeps working.
+  assert.equal(stepIsTestableRead({ prompt: 'Read the inbox.', allowedTools: ['composio_execute_tool'] }), true);
+  // And a genuinely local step still needs no external test.
+  assert.equal(stepIsTestableRead({ prompt: 'Summarise the text above.', allowedTools: ['read_file'] }), false,
+    'a local-only step has nothing to validate against real data');
+  assert.equal(workflowNeedsCreationTest({ steps: [{ prompt: 'Write a limerick.' }] } as never), false);
+});

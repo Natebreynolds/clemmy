@@ -255,6 +255,17 @@ function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: s
   const tools = step.allowedTools ?? [];
   return tools.some((t) =>
     t === '*'
+    // A provider OPERATION reaches outside as surely as its carrier does.
+    // OUTLOOK_LIST_MESSAGES, GOOGLESHEETS_BATCH_GET — UPPER_SNAKE slugs, which
+    // matched none of the carrier prefixes below, so a step that named one read
+    // as "reaches nothing external": not a testable read, no creation test
+    // needed, enable it directly. Live 2026-09-11: scorpion-inbox-triage was
+    // authored at 18:23 with `allowedTools: [OUTLOOK_LIST_MESSAGES]`, enabled
+    // seven minutes later with no verification, and failed every scheduled run
+    // for the next six hours without once executing a step. The gate exists to
+    // stop exactly that, and it was looking for a tool when the author had
+    // named an operation.
+    || /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(t)
     || /^(?:composio|run_shell_command|mcp|firecrawl|apify|fetch|web_|browser|recall_tool_result)/i.test(t));
 }
 
