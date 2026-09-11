@@ -1,11 +1,14 @@
 import { renderMarkdown } from '../../../../../packages/chat-engine/src/markdown';
 import { useEffect, useState } from 'react';
 import { apiGet } from '@/lib/api';
-import { checkedPlanArtifactResponse, samePlanRevision, canExecuteReviewedPlan, type PlanRevisionRef, type PlanArtifactResponse } from '@/lib/task-mode';
+import { checkedPlanArtifactResponse, samePlanRevision, canExecuteReviewedPlan, needsBindingPass, type PlanRevisionRef, type PlanArtifactResponse } from '@/lib/task-mode';
 
-export function PlanReview({ planRef, sessionId, busy, onExecute, onRevise }: {
+export function PlanReview({ planRef, sessionId, busy, onExecute, onPrepare, onRevise }: {
   planRef: PlanRevisionRef; sessionId?: string; busy?: boolean;
   onExecute?: (ref: PlanRevisionRef) => Promise<void> | void;
+  /** "The shape is approved — bind it." Offered only while the plan is readable
+   *  but unbound, which is exactly when Execute cannot be. */
+  onPrepare?: (ref: PlanRevisionRef) => Promise<void> | void;
   onRevise?: () => void;
 }) {
   const [selected, setSelected] = useState(planRef);
@@ -30,6 +33,14 @@ export function PlanReview({ planRef, sessionId, busy, onExecute, onRevise }: {
   const stale = Boolean(view && !samePlanRevision(view.latest, selected));
   const loaded = Boolean(view && samePlanRevision(view.artifact, selected));
   const canExecute = Boolean(canExecuteReviewedPlan(view, selected) && onExecute);
+  const canPrepare = Boolean(needsBindingPass(view, selected) && onPrepare && !canExecute);
+  const prepare = async () => {
+    if (!canPrepare || busy || acting) return;
+    setActing(true); setExecutionError('');
+    try { await onPrepare?.({ ...selected }); }
+    catch (error) { setExecutionError(error instanceof Error ? error.message : 'That approval was not accepted.'); }
+    finally { setActing(false); setReload(value => value + 1); }
+  };
   const execute = async () => {
     if (!canExecute || busy || acting) return;
     setActing(true); setExecutionError('');
@@ -48,6 +59,7 @@ export function PlanReview({ planRef, sessionId, busy, onExecute, onRevise }: {
       {view.execution && <p className="text-small text-muted">Execution has been requested for this revision. Follow its progress in the conversation.</p>}
       <div className="flex flex-wrap gap-2">
         {onExecute && <button type="button" disabled={!canExecute || busy || acting} onClick={() => void execute()} className="rounded-md bg-primary px-4 py-2 text-small font-semibold text-primary-fg disabled:opacity-50">{acting ? 'Submitting…' : 'Execute plan'}</button>}
+        {canPrepare && <button type="button" disabled={busy || acting} onClick={() => void prepare()} className="rounded-md bg-primary px-3 py-1.5 text-small font-medium text-on-primary disabled:opacity-50">{acting ? 'Preparing…' : 'Approve shape & prepare to run'}</button>}
         {onRevise && <button type="button" disabled={busy || acting} onClick={onRevise} className="rounded-md border border-border px-3 py-2 text-small disabled:opacity-50">Revise in Plan mode</button>}
       </div>
     </>}

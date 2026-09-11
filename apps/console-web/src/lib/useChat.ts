@@ -1703,7 +1703,18 @@ export function useChat(options?: UseChatOptions) {
   };
   const activeTaskMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
   const executePlan = (ref: PlanRevisionRef) => send({ text: `Execute the reviewed plan, revision ${ref.revision}.`, taskMode: { version: 1, kind: 'execute', executeRef: ref } });
-  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, pendingPost, retryPending, cancelPending };
+  // "The shape is right — go bind it." A plan published for review is
+  // deliberately unbound, so Execute stays hidden until the steps carry real
+  // capability refs, accounts and arguments. This is the owner saying the shape
+  // is approved; the binding lands as a revision of this same plan, so what he
+  // approved is what runs. Plan mode, not execute mode: nothing crosses yet.
+  const preparePlan = (ref: PlanRevisionRef) => send({
+    text: `The plan shape is approved — revision ${ref.revision}. Bind it into a ready revision of this same plan: `
+      + 'resolve the exact capability refs, schemas, accounts and arguments for each step, keep the steps and order I '
+      + 'approved, and publish it as the next revision. Ask me only about a prerequisite that genuinely needs my answer.',
+    taskMode: { version: 1, kind: 'plan' },
+  });
+  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending };
 }
 
 

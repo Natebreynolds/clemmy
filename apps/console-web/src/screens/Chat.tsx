@@ -277,6 +277,7 @@ export function Chat() {
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
+              onPreparePlan={chat.preparePlan}
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}

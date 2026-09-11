@@ -1,5 +1,5 @@
 import { createPendingMessageStore } from './pending-request.js';
-import { readTaskMode, checkedPlanArtifactResponse, canExecuteReviewedPlan, type TaskMode } from './task-mode.js';
+import { needsBindingPass, readTaskMode, checkedPlanArtifactResponse, canExecuteReviewedPlan, type TaskMode } from './task-mode.js';
 /**
  * Run: npx tsx --test packages/chat-engine/src/engine.test.ts
  *
@@ -603,4 +603,46 @@ test('review requires complete exact artifact; stale revision stays explicit and
   assert.equal(readTaskMode({ version: 1, kind: 'execute', executeRef: { ...ref, grant: 'all' } }), undefined);
   assert.equal(readTaskMode({ version: 1, kind: 'plan', approved: true }), undefined);
   assert.equal(readTaskMode('plan'), undefined);
+});
+
+// A plan the owner can READ but not RUN needs a way to say "the shape is right".
+// Live 2026-09-10: Plan mode now publishes the shape first, deliberately
+// unbound — so Execute is correctly hidden, and without this predicate there is
+// no button that means approval, leaving the readable plan and the runnable
+// plan as two different artifacts.
+test('an unbound plan offers a binding pass, and a ready one does not', () => {
+  const shapeRef = { planId: 'plan-shape', revision: 1, digest: 'a'.repeat(64) };
+  const shape = checkedPlanArtifactResponse({
+    artifact: {
+      ...shapeRef, version: 1, sessionId: 's',
+      fullText: 'Read the brief, then fan out four research legs.',
+      readiness: 'needs_input', missingPrerequisites: ['Which region leads?'], createdAt: 'now',
+    },
+    latest: shapeRef,
+  }, shapeRef);
+  assert.equal(canExecuteReviewedPlan(shape, shapeRef), false, 'a shape-only plan cannot execute');
+  assert.equal(needsBindingPass(shape, shapeRef), true, 'so it offers the approval that binds it');
+
+  const boundRef = { planId: 'plan-shape', revision: 2, digest: 'b'.repeat(64) };
+  const bound = checkedPlanArtifactResponse({
+    artifact: {
+      ...boundRef, version: 1, sessionId: 's',
+      fullText: 'Read the brief, then fan out four research legs.',
+      readiness: 'ready', missingPrerequisites: [], createdAt: 'now',
+    },
+    latest: boundRef,
+  }, boundRef);
+  assert.equal(needsBindingPass(bound, boundRef), false, 'a bound plan needs no second approval');
+  assert.equal(canExecuteReviewedPlan(bound, boundRef), true, 'it executes instead');
+
+  // A ready plan that still carries prerequisites is not runnable either, and
+  // asking for the binding pass is the honest offer.
+  const withGaps = { ...bound, artifact: { ...bound.artifact, missingPrerequisites: ['Confirm the mailbox'] } };
+  assert.equal(canExecuteReviewedPlan(withGaps, boundRef), false);
+  assert.equal(needsBindingPass(withGaps, boundRef), true);
+
+  // A plan already being executed never re-offers either action.
+  const running = { ...bound, execution: { executionRunId: 'run-1' } };
+  assert.equal(needsBindingPass(running, boundRef), false);
+  assert.equal(canExecuteReviewedPlan(running, boundRef), false);
 });

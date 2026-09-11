@@ -75,6 +75,27 @@ export function checkedPlanArtifactResponse(value: unknown, expected: PlanRevisi
   return { artifact, latest, ...(row?.execution ? { execution: row.execution } : {}) };
 }
 
+/**
+ * A plan the owner can READ but not yet RUN.
+ *
+ * Plan mode publishes the shape first (2026-09-10): what the inputs said, the
+ * steps to fan out, what each produces — with whatever could not be resolved
+ * named as a prerequisite. That plan is deliberately unbound, so Execute stays
+ * hidden: execution matches every effect against a bound step and a shape-only
+ * plan has none.
+ *
+ * Without this there is no way to say "the shape is right, go bind it" — the
+ * owner is left with a plan he approves of and no button that means so, which
+ * is the gap that made the readable plan and the runnable plan two different
+ * artifacts. Binding is a revision of this same plan, so the thing he approved
+ * is the thing that runs.
+ */
+export function needsBindingPass(view: PlanArtifactResponse | null, selected: PlanRevisionRef): boolean {
+  return Boolean(view && samePlanRevision(view.artifact, selected) && samePlanRevision(view.latest, selected)
+    && !view.execution
+    && (view.artifact.readiness === 'needs_input' || view.artifact.missingPrerequisites.length > 0));
+}
+
 /** Changing the selected revision never authorizes it using a previously loaded body. */
 export function canExecuteReviewedPlan(view: PlanArtifactResponse | null, selected: PlanRevisionRef): boolean {
   return Boolean(view && samePlanRevision(view.artifact, selected) && samePlanRevision(view.latest, selected)

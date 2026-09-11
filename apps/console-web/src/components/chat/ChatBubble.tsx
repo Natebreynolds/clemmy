@@ -117,12 +117,13 @@ export function ChatBubble({
   onReject,
   onBackground,
   traceHref,
-  sessionId, executionBusy, onExecutePlan, onRevisePlan,
+  sessionId, executionBusy, onExecutePlan, onPreparePlan, onRevisePlan,
 }: {
   message: ChatMessage;
   sessionId?: string;
   executionBusy?: boolean;
   onExecutePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
+  onPreparePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
   onRevisePlan?: () => void;
   onApprove: () => void | Promise<void>;
   onReject: () => void | Promise<void>;
@@ -280,7 +281,7 @@ export function ChatBubble({
         )}
         <div className="rounded-lg rounded-tl-sm border border-border bg-surface px-4 py-3 shadow-xs">
           {message.taskMode?.kind === 'plan' && <div className="mb-2 text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
-          {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
+          {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onPrepare={onPreparePlan} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
           {thinking && !message.text ? (
             <div className="flex items-center gap-2 text-body text-muted">
               <span className="min-w-0 flex-1">{message.taskMode?.kind === 'plan' ? 'Working out the steps…' : 'Reply lands here as soon as it’s ready.'}</span>
