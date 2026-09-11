@@ -1709,9 +1709,14 @@ export function useChat(options?: UseChatOptions) {
   // is approved; the binding lands as a revision of this same plan, so what he
   // approved is what runs. Plan mode, not execute mode: nothing crosses yet.
   const preparePlan = (ref: PlanRevisionRef) => send({
-    text: `The plan shape is approved — revision ${ref.revision}. Bind it into a ready revision of this same plan: `
-      + 'resolve the exact capability refs, schemas, accounts and arguments for each step, keep the steps and order I '
-      + 'approved, and publish it as the next revision. Ask me only about a prerequisite that genuinely needs my answer.',
+    // This is sent AS THE OWNER'S MESSAGE, so it has to sound like him. The
+    // first version read like a compiler directive written in his name
+    // ("resolve the exact capability refs, schemas, accounts and arguments") —
+    // a host composing in the owner's voice is the one place engine-speak is
+    // least excusable. Same contract, said the way a person says it.
+    text: `The shape is right — go bind revision ${ref.revision}. Keep these steps and this order, `
+      + 'fill in the exact tools, accounts and arguments for each one, and publish it as the next '
+      + 'revision. Only ask me about something that genuinely needs my answer.',
     taskMode: { version: 1, kind: 'plan' },
   });
   return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending };

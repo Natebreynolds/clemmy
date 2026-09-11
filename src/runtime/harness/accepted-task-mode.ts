@@ -46,7 +46,26 @@ export function planModeCallRefusal(input: {
   // These are bounded host operations, not business effects. Workers inherit
   // the same accepted source and therefore the same ceiling at their tool edge.
   if (['publish_plan', 'run_worker'].includes(name) && !identity.composioCarrier) return undefined;
-  const decision = classifyRuntimeToolEffect(input.toolName, input.args);
+  // CLASSIFY THE CALL THIS NAMES, NOT THE CARRIER AROUND IT.
+  //
+  // The name above is resolved through arbitrary nesting; the effect was read
+  // off the RAW outer call, which unwraps only one level. At depth two they
+  // disagree: a `call_tool` wrapping a `call_tool` classified `unknown`, which
+  // is neither read nor host_only, so a plain status read was refused — and
+  // the refusal then named the correctly-unwrapped tool, producing a message
+  // that could not be acted on ("composio_status cannot execute in Plan mode"
+  // about a call nothing had classified).
+  //
+  // Live 2026-09-11: a Plan turn was asked, in the user's own words, to "let me
+  // know what tools we can use". It reached for exactly that — a connection
+  // status check and two catalogue searches — double-wrapped them, and was
+  // refused as if reading the tool list were a business effect. The recovery
+  // then advised `call_tool`, which is what had just been refused.
+  //
+  // Unwrapping is strictly more accurate in both directions: a write nested at
+  // any depth now classifies as the write it is, rather than as `unknown`.
+  const effectiveArgs = identity.toolName ? identity.args : input.args;
+  const decision = classifyRuntimeToolEffect(identity.toolName ?? input.toolName, effectiveArgs);
   const effect = input.attestedEffect ?? decision.effect;
   // A READ IS A READ, whatever carries it. Plan's ceiling is external
   // consequence; a shell command the host itself classified read-only

@@ -9759,6 +9759,14 @@ async function withActiveTurnHeartbeat<T>(
     const durableProgress = composeRunProgressLine({
       sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, fallback: '',
     });
+    /** True when a model request is dispatched and has not returned:
+     *  prompt_composition is appended immediately before every request, so it
+     *  being the newest event for this session means one is outstanding. */
+    const modelRequestInFlight = (): boolean => {
+      try {
+        return listEvents(opts.sessionId, { desc: true, limit: 1 })[0]?.type === 'prompt_composition';
+      } catch { return false; }
+    };
     const signature = `${durableProgress}\u0000${working}`;
     const changed = signature !== lastProgress;
     unchangedTicks = changed ? 0 : unchangedTicks + 1;
@@ -9786,11 +9794,25 @@ async function withActiveTurnHeartbeat<T>(
         unlimited: opts.budget.unlimited,
         changed,
         ...(working ? { thinking: working.slice(-280) } : {}),
+        ...(modelRequestInFlight() ? { composing: true } : {}),
         message: changed || lastProgress === null
           ? (durableProgress || (working
             ? `Still working inside turn ${opts.turn} — ${working.slice(-160)}`
             : 'Still working on your request.'))
-          : `${durableProgress || 'Still working on your request.'} (no change for ${quietFor})`,
+          // "NO CHANGE" IS A CLAIM THE HOST CANNOT ALWAYS MAKE.
+          //
+          // The signature above only tracks DURABLE progress, which does not
+          // move while a model is generating. Live 2026-09-11: a Plan turn told
+          // its owner "no change for 2 min" twice while the brain was emitting
+          // ~3,000 tokens — 203s and 173s, measured — and the run looked hung
+          // to the one person who could not see inside it. A slow model and a
+          // stalled turn are different things and must not read the same.
+          //
+          // prompt_composition is written immediately before every model
+          // request, so it being the newest event means one is in flight.
+          : modelRequestInFlight()
+            ? `${durableProgress || 'Still working on your request.'} (composing a reply — ${quietFor} so far)`
+            : `${durableProgress || 'Still working on your request.'} (no change for ${quietFor})`,
       },
     });
   // This is a UI keep-alive, not a model call or a request to the owner. A

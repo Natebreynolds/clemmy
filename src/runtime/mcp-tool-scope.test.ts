@@ -827,3 +827,54 @@ test('a refusal governs its own clause, never the rest of a long prompt', () => 
   const named = compileMcpAccessConstraint('Never post to Slack for this task.', configured);
   assert.ok(named.deny.includes('slack'), 'a same-clause named refusal still binds');
 });
+
+
+// ─── A named server is not hidden by a relevance guess ──────────────────────
+//
+// Keyword families choose what to SHOW FIRST. They are a guess about which of
+// the owner's own connected systems is most relevant, and they were narrowing
+// the surface to only what they recognised.
+//
+// Live 2026-09-11: a Plan turn asked to use "all of our research tools: Apify
+// and Data for SEO". One family matched, the scope became that family's single
+// server, and the other system — named by the owner, in the request — was
+// invisible before the first model step. No amount of searching could have
+// found it.
+//
+// Matched against THIS install's connected server names, never a list here.
+
+test('a server the request names stays in scope when a keyword family narrows', () => {
+  const servers = ['dataforseo', 'apify', 'googledocs', 'firecrawl'];
+  const scope = resolveMcpToolScope({
+    userInput: 'help me come up with a research plan using all of our research tools: Apify and Data for SEO',
+    configuredServerNames: servers,
+  });
+  const allowed = scope.allowedServerSlugs ?? [];
+  assert.ok(allowed.includes('dataforseo'), 'the matched family still ranks first');
+  assert.ok(allowed.includes('apify'), 'the other system the owner named by name stays reachable');
+});
+
+test('ranking still narrows when the request names nothing else', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'run an seo audit and check keyword rankings',
+    configuredServerNames: ['dataforseo', 'apify', 'googledocs'],
+  });
+  assert.deepEqual(scope.allowedServerSlugs, ['dataforseo'], 'no widening when nothing else was named');
+});
+
+test('naming a server never overrides refusing it', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'run an seo audit but do not use apify',
+    configuredServerNames: ['dataforseo', 'apify'],
+  });
+  assert.ok(!(scope.allowedServerSlugs ?? []).includes('apify'));
+  assert.ok((scope.deniedServerSlugs ?? []).includes('apify'), 'a refusal still wins over a mention');
+});
+
+test('"only use X" stays exclusive', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'only use apify for this',
+    configuredServerNames: ['dataforseo', 'apify', 'googledocs'],
+  });
+  assert.deepEqual(scope.allowedServerSlugs, ['apify']);
+});

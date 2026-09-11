@@ -782,7 +782,32 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     };
   }
 
-  const allowedServerSlugs = Array.from(new Set(scopes.flatMap((scope) => scope.allowedServerSlugs ?? [])));
+  // A SERVER THE OWNER NAMED IS NEVER HIDDEN BY A RELEVANCE GUESS.
+  //
+  // `constraint.allow` already holds every configured server the request named
+  // affirmatively — matched against THIS install's connected server names, not
+  // any list in the harness. It was honoured only in `allow_only` mode ("use
+  // only X"); in the ordinary case, where someone simply names the systems they
+  // want, it was computed and dropped. A keyword family then narrowed the
+  // surface to whatever it recognised.
+  //
+  // Live 2026-09-11: a Plan turn was asked to use "all of our research tools:
+  // Apify and Data for SEO". One family matched, the scope resolved to that
+  // family's single server, and the other system the owner had named by name
+  // was invisible before the first model step. The turn could not have found it
+  // however well it searched.
+  //
+  // The comment below this has always said keyword families "choose what to
+  // SHOW first … never a narrowing of consent". This makes that true: families
+  // still rank and still cap payload; naming a connected system keeps it
+  // reachable. A denial still wins — refusals ride separately in `denied`.
+  const namedServerSlugs = constraint.allow.filter(
+    (slug) => !(denied.deniedServerSlugs ?? []).includes(slug),
+  );
+  const allowedServerSlugs = Array.from(new Set([
+    ...scopes.flatMap((scope) => scope.allowedServerSlugs ?? []),
+    ...namedServerSlugs,
+  ]));
   const toolPatterns = Array.from(new Set(scopes.flatMap((scope) => scope.toolPatterns ?? [])));
   const priorityKeywords = Array.from(new Set(scopes.flatMap((scope) => scope.priorityKeywords ?? [])));
   const maxTools = scopes.reduce((sum, scope) => sum + (scope.maxTools ?? 0), 0);
@@ -795,7 +820,12 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   }
 
   return {
-    reason: scopes.map((scope) => scope.reason).join(' + '),
+    reason: [
+      ...scopes.map((scope) => scope.reason),
+      ...(namedServerSlugs.length > 0
+        ? [`plus servers the request named: ${namedServerSlugs.join(', ')}`]
+        : []),
+    ].join(' + '),
     // Keyword families choose what to SHOW first. They are a relevance guess
     // about the user's own connected systems, never a narrowing of consent.
     authority: 'catalog',

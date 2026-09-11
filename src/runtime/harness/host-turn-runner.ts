@@ -17,6 +17,7 @@ import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
+import { ownerNamedInputsStillUnread } from './plan-first-contract.js';
 import { normalizeCallableArguments } from './callable-contract.js';
 /**
  * HOST-owned chat turn stepping — the Runner de-ownership cut.
@@ -904,6 +905,7 @@ export function hostNoProgressBlockedText(
    *  say it (live 2026-09-08: "Stopped at: authority_acquisition" while the
    *  row above read "No default environment found. Use --target-org"). */
   lastBlocker?: string | null,
+  planMode = false,
 ): string {
   const consequence = state?.lastConsequence;
   const summary = consequence?.effectState === 'known_terminal'
@@ -921,6 +923,15 @@ export function hostNoProgressBlockedText(
         const usable = admissible
           ? named.filter((name) => admissible.has(name) || admissible.has(bareTerminalToolName(name)))
           : named;
+        // A PLAN TURN HAS NO "NEXT EXECUTABLE STEP" — that is the point of it.
+        // Telling it to find one sent a turn that had already gathered what it
+        // needed back out to gather more, until the budget ran out (live
+        // 2026-09-11). What it owes the owner is the outline.
+        if (planMode) {
+          return usable.length
+            ? `Use ${usable.join(' or ')}, then publish_plan with what you have — name anything still missing as needs_input.`
+            : 'Publish the plan with what you already gathered, naming anything still missing as needs_input. Plan does not run the work.';
+        }
         return usable.length
           ? `Use ${usable.join(' or ')} to resolve this step, then resume this saved task from its retained results.`
           : 'Use the available discovery or read tools to resolve the next executable step, then resume this saved task from its retained results.';
@@ -938,6 +949,28 @@ export const HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT =
 
 export const HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT =
   'The model repeated an already-committed tool call identifier. I kept the first durable result and stopped before preparing or executing the duplicate. Retry this request from the saved checkpoint; no second effect was started.';
+
+/** Plan's variant, for a turn that has already READ what the owner named.
+ *  Discovery has stopped paying; the deliverable is the outline, and an unknown
+ *  is a publishable fact rather than a reason to keep searching. Live
+ *  2026-09-11: a Plan turn spent 50 calls and its whole budget on authority
+ *  acquisition and published nothing. */
+const PLAN_NO_PROGRESS_RECOVERY_DIRECTIVE = [
+  'BOUNDED PLAN RECOVERY — further discovery is not earning new ground.',
+  'Publish now with publish_plan using the inputs you already read and the exact capability identities you already found.',
+  'Anything still unresolved is published as needs_input, named exactly; do not run the work and do not keep searching for a way to run it.',
+].join(' ');
+
+/** Plan's variant BEFORE grounding. Publishing a plan about a brief nobody
+ *  opened is a guess with citations — the owner only finds out by reading it.
+ *  Live 2026-09-11: the publish nudge above fired after one unproductive
+ *  repair, before the linked Doc was read, and the turn published in 15 calls
+ *  with the source document listed as a missing prerequisite. Ground first. */
+const PLAN_UNGROUNDED_RECOVERY_DIRECTIVE = [
+  'BOUNDED PLAN RECOVERY — you have not yet read the input the owner named in this request.',
+  'Read it now: it is the request itself, not research, and it is free — no scoping allowance applies to it.',
+  'Do not publish a plan about a document you have not opened; publish only once it is read, or once reading it has provably failed.',
+].join(' ');
 
 const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
   'BOUNDED CONTROL RECOVERY — the prior fully settled control step did not establish a new executable path.',
@@ -960,6 +993,7 @@ export function hostNoProgressRecoveryToolNames(
   consequence: NoProgressGovernorState['lastConsequence'],
   toolNames: readonly string[],
   provenReads: readonly string[] = [],
+  planMode = false,
 ): Set<string> {
   if (!consequence) return new Set(toolNames);
   const exact = new Set(consequence.recoveryToolNames);
@@ -968,6 +1002,16 @@ export function hostNoProgressRecoveryToolNames(
     const bare = bareTerminalToolName(name);
     if (consequence.recovery === 'ask_user') return bare === 'ask_user_question';
     if (consequence.recovery === 'stop_factual' || consequence.recovery === 'reconcile') return false;
+    // PUBLISHING IS ALWAYS AVAILABLE ON A PLAN TURN.
+    //
+    // A Plan turn's deliverable is a published outline, and publish_plan is a
+    // host-checked artifact that executes nothing and crosses nothing — the
+    // same reasoning that makes retained-output readers always admissible.
+    // Live 2026-09-11: a Plan turn read the named Doc, inventoried both
+    // toolkits the owner asked for, spent 50 calls gathering, and then drained
+    // its budget on `authority_acquisition` because the recovery surface never
+    // contained the one control that ends the turn. Zero plans published.
+    if (planMode && bare === 'publish_plan') return true;
     if (exact.has(name)) return true;
     // READERS OF ALREADY-RETAINED EVIDENCE ARE ALWAYS PERMITTED IN RECOVERY.
     //
@@ -3335,8 +3379,29 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     } catch { /* advisory only */ }
     return null;
   };
+  /** Plan's deliverable is a published outline, so its recovery copy and its
+   *  recovery surface both differ from an Act turn's. Read once per turn. */
+  const turnIsPlanMode = (): boolean => {
+    try {
+      const identity = exactHostIdentity();
+      return acceptedTaskMode(identity.sessionId, identity.sourceUserSeq)?.kind === 'plan';
+    } catch { return false; }
+  };
+  /** The owner named a document/id and this turn has not read it yet. */
+  const turnHasUngroundedNamedInputs = (): boolean => {
+    try {
+      const identity = exactHostIdentity();
+      return ownerNamedInputsStillUnread(
+        identity.sessionId,
+        identity.sourceUserSeq,
+        acceptedObjectiveForSource(identity) ?? '',
+      );
+    } catch { return false; }
+  };
   const stopNoProgress = (stoppedOn?: string): RunOutcome => blockedOutcome(
-    hostNoProgressBlockedText(noProgressState, stoppedOn, admissibleRecoveryToolNames, lastConcreteToolError()),
+    hostNoProgressBlockedText(
+      noProgressState, stoppedOn, admissibleRecoveryToolNames, lastConcreteToolError(), turnIsPlanMode(),
+    ),
     'control_no_progress_exhausted',
     true,
     stoppedOn ?? noProgressState?.lastConsequence?.stage ?? 'no_new_evidence',
@@ -7901,14 +7966,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           consequence ?? null,
           tools.map((tool) => tool.name),
           provenReads,
+          turnIsPlanMode(),
         );
         admissibleRecoveryToolNames = permittedNoProgressRecoveryToolNames;
         const recoveryTools = tools.filter((tool) => permittedNoProgressRecoveryToolNames!.has(tool.name));
         modelStepSchemas = serializedTools(recoveryTools);
         if (!noProgressRecoveryDirectiveWritten) {
-          const recoveryDirective = noProgressState
-            ? hostNoProgressRecoveryDirective(noProgressState)
-            : HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
+          // The model-facing steer, like the owner-facing copy above, must not
+          // send a Plan turn hunting for another executable step. It owes an
+          // outline, and "I could not find X" is a legitimate line in one.
+          const recoveryDirective = turnIsPlanMode()
+            ? (turnHasUngroundedNamedInputs()
+              ? PLAN_UNGROUNDED_RECOVERY_DIRECTIVE
+              : PLAN_NO_PROGRESS_RECOVERY_DIRECTIVE)
+            : noProgressState
+              ? hostNoProgressRecoveryDirective(noProgressState)
+              : HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
           modelInputDirective = [modelInputDirective, recoveryDirective].filter(Boolean).join('\n');
           writingNoProgressRecoveryDirective = true;
         }

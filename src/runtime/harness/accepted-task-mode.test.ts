@@ -29,3 +29,59 @@ test('Normal and Execute retain native capabilities at this mode ceiling; Execut
     assert.equal(planModeCallRefusal({ mode, toolName, args: {} }), undefined, toolName);
   }
 });
+
+
+// ─── Plan's ceiling is the CALL, not the wrapper around it ──────────────────
+//
+// The refusal resolved the tool NAME through arbitrary nesting but read the
+// EFFECT off the raw outer carrier, which unwraps one level. At depth two they
+// disagreed: `call_tool` wrapping `call_tool` classified `unknown` — neither
+// read nor host_only — so a plain status read was refused, and the message then
+// named the correctly-unwrapped tool, so it could not be acted on.
+//
+// Live 2026-09-11: a Plan turn asked, in the user's words, to "let me know what
+// tools we can use" reached for a connection status check and two catalogue
+// searches, double-wrapped them, and was refused as if reading the tool list
+// were a business effect.
+
+const wrapCall = (inner: unknown) => ({ name: 'call_tool', args_json: JSON.stringify(inner) });
+const planRefusalFor = (args: unknown) => planModeCallRefusal({
+  mode: { kind: 'plan' } as never,
+  toolName: 'call_tool',
+  args,
+});
+
+test('a read stays readable at every nesting depth', () => {
+  const status = { name: 'composio_status', args_json: '{}' };
+  assert.equal(planRefusalFor(status), undefined, 'one wrapper');
+  assert.equal(planRefusalFor(wrapCall(status)), undefined, 'two wrappers');
+  assert.equal(planRefusalFor(wrapCall(wrapCall(status))), undefined, 'three wrappers');
+  assert.equal(
+    planRefusalFor(wrapCall({ name: 'composio_search_tools', args_json: '{"query":"x"}' })),
+    undefined,
+    'searching the catalogue is how Plan answers "what can we use"',
+  );
+});
+
+test('a write stays refused at every nesting depth', () => {
+  // The fix must be accurate in BOTH directions. Before it, a nested write
+  // classified `unknown` and was refused for the wrong reason; it must now be
+  // refused for the right one.
+  const write = { name: 'focus_set', args_json: '{}' };
+  assert.ok(planRefusalFor(write), 'one wrapper');
+  assert.ok(planRefusalFor(wrapCall(write)), 'two wrappers');
+  assert.ok(planRefusalFor(wrapCall(wrapCall(write))), 'three wrappers');
+  assert.ok(
+    planRefusalFor(wrapCall({ name: 'memory_remember', args_json: '{}' })),
+    'a host_only tool declared write is still a write when nested',
+  );
+});
+
+test('the refusal names the call it actually classified', () => {
+  // The message said "composio_status cannot execute in Plan mode" about a
+  // call nothing had classified as composio_status. Name and effect now come
+  // from one identity, so a refusal can always be acted on.
+  const refusal = planRefusalFor(wrapCall({ name: 'focus_set', args_json: '{}' }));
+  assert.ok(refusal);
+  assert.match(refusal, /focus_set/);
+});

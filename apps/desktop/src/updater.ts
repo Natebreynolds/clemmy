@@ -142,12 +142,39 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
   }
   const blocker = getInstallBlockerStatus();
   if (blocker.installBlocker) {
-    updateStatus({
-      state: 'error',
-      error: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
-      ...blocker,
-    });
-    return getUpdaterStatus();
+    // OFFER THE REPAIR WHERE THE FAILURE HAPPENS.
+    //
+    // Asking to check for updates IS the intent to update, so an admin prompt
+    // here is expected and explicable. Until now every path that met this
+    // blocker — this one and the update banner — only reported an error, and
+    // the one thing that could clear it lived in a tray menu whose label had
+    // quietly changed. The app knew exactly what was wrong, knew exactly how to
+    // fix it, and made the person find it.
+    //
+    // Live 2026-09-11: an owner sat on a version four releases behind with a
+    // successfully published build waiting, because a bundle installed under
+    // sudo was root-owned and every update action answered "no".
+    //
+    // Only ownership self-repairs. `move-to-applications` needs the person to
+    // decide where their app lives, and a failed repair keeps the honest error.
+    if (blocker.installBlocker === 'app-not-writable') {
+      const repair = await repairAppOwnership();
+      if (!repair.ok) {
+        updateStatus({
+          state: 'error',
+          error: repair.reason || blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
+          ...getInstallBlockerStatus(),
+        });
+        return getUpdaterStatus();
+      }
+    } else {
+      updateStatus({
+        state: 'error',
+        error: blocker.error || MOVE_TO_APPLICATIONS_MESSAGE,
+        ...blocker,
+      });
+      return getUpdaterStatus();
+    }
   }
   try {
     updateStatus({ state: 'checking', error: undefined });

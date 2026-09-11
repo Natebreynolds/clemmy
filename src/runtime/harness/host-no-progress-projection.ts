@@ -1356,12 +1356,37 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       // the cap, the governor constructor threw, and a projection exception
       // became a blocked run after two successful reads. A repair surface is
       // never wider than the distinct names anyway.
-      const refusedCarrierNames = [...new Set(refusedCalls.map((call) => call.name))]
+      // NAME THE CALL THAT WAS REFUSED, NOT THE ENVELOPE IT ARRIVED IN.
+      //
+      // `call.name` is the carrier. When a model wraps its calls — and some
+      // wrap routinely, sometimes twice — every refusal in the frame reported
+      // the same carrier, so the recovery surface came back as the wrapper
+      // itself. Live 2026-09-11 the host told a stuck turn, verbatim, "Use
+      // call_tool to resolve this step" — advising the loop that had just
+      // died, three times, while the owner watched.
+      //
+      // It also collapsed the STAGE. Three genuinely different refusals in that
+      // turn — a focus write, a connection status read, a document read — all
+      // stamped `host_disposition:refused_pre_dispatch`, so the governor
+      // metered three distinct problems as one repeated failure and terminated
+      // on strike three. Distinct inner calls are distinct problems and each
+      // deserves its own attempt.
+      const refusedInnerNames = [...new Set(refusedCalls.map((call) => (
+        unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments).toolName ?? call.name
+      )))].sort();
+      const refusedCarrierNames = refusedInnerNames
         .slice(0, NO_PROGRESS_RECOVERY_TOOL_NAME_CAP);
       return {
         status: 'ok',
         attemptClass: 'zero_crossing_repair',
         consequence: createNoProgressConsequence({
+          // The STAGE stays keyed on the host disposition, deliberately
+          // outranking the call names. A model that varies its tool name every
+          // attempt must not earn a fresh stage each time, or the governor
+          // never sees a repeat and never terminalizes — pinned by "host
+          // disposition result outranks varied call names". The host-authored
+          // repairKey is the one thing a model cannot vary at will, and that
+          // is what already splits genuine schema repairs above.
           stage: schemaKeyed
             ? schemaInvalidStage(repairKeys as string[])
             : 'host_disposition:refused_pre_dispatch',

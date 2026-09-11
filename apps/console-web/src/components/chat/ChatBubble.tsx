@@ -278,8 +278,23 @@ export function ChatBubble({
   const live = thinking || Boolean(message.workflowLive);
   const pendingAction = message.approval?.pendingAction;
   const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
-  const hasReplyText = Boolean(message.text.trim()) && !stoppedPlaceholder;
-  const showReplyCard = Boolean(message.planArtifactRef)
+  // THE PLAN CARD IS THE REPLY.
+  //
+  // publishedPlanTerminal returns the model's own `full_text` as the turn's
+  // reply, deliberately — on a surface with no card (Discord, CLI) that is the
+  // only way the plan reaches the person, in her voice rather than the
+  // engine's. This surface DOES render the artifact, and PlanReview already
+  // shows that same full_text. So the whole plan appeared twice, card then
+  // prose, with the second copy pushing the Execute/Approve controls off
+  // screen (live 2026-09-11, the first turn that ever published successfully).
+  //
+  // The harness is right to send both; a surface that renders one must not
+  // render the other.
+  const planCardCarriesTheReply = Boolean(message.planArtifactRef);
+  const hasReplyText = Boolean(message.text.trim())
+    && !stoppedPlaceholder
+    && !planCardCarriesTheReply;
+  const showReplyCard = planCardCarriesTheReply
     || message.status === 'awaiting-approval'
     || message.status === 'awaiting-plan'
     || Boolean(message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply'))

@@ -93,6 +93,44 @@ export function externalReadsSoFar(sessionId: string, sourceUserSeq: number): nu
 }
 
 /**
+ * Has this planning turn read the inputs the owner named, or not yet?
+ *
+ * Grounding comes BEFORE inventory and publishing. A plan written without the
+ * brief it was pointed at is a guess with citations, and the owner has to read
+ * it to discover that. Live 2026-09-11: a recovery nudge that urged publishing
+ * fired after one unproductive repair, before the linked Doc had been opened —
+ * the turn dutifully published in 15 calls with "Plaintext of source Google
+ * Doc" listed as a missing prerequisite, where the previous run had spent 50
+ * calls, read it, and published something real.
+ *
+ * Returns false when the owner named nothing identifiable (there is nothing to
+ * ground), and false on an unreadable history — an uncertain answer must not
+ * invent a constraint on a turn that may already have done the right thing.
+ */
+export function ownerNamedInputsStillUnread(
+  sessionId: string,
+  sourceUserSeq: number,
+  requestText: string,
+): boolean {
+  if (identifyingTokens(requestText).length === 0) return false;
+  try {
+    const settled = listEvents(sessionId, { types: ['tool_returned'] })
+      .filter((row) => row.data.sourceUserSeq === sourceUserSeq && row.data.ok === true);
+    for (const row of settled) {
+      const args = typeof row.data.arguments === 'string' ? row.data.arguments : '';
+      const result = typeof row.data.result === 'string' ? row.data.result : '';
+      // Either side can carry the identifier: the call names what it fetched,
+      // and a settled read echoes it back.
+      if (readsAnOwnerNamedInput(args, requestText)) return false;
+      if (result && readsAnOwnerNamedInput(result.slice(0, 4000), requestText)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Refuse the WORK inside a planning turn, once its scoping allowance is spent
  * and no plan has been offered. Returns undefined for everything else: owner
  * inputs, host-local calls, turns that already published, and the allowance.

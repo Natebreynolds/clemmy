@@ -43,8 +43,13 @@ function accepted(label: string) {
   return { sessionId: session.id, sourceUserSeq: source.seq };
 }
 
-function call(callId: string, name: string) {
-  return { type: 'function_call', callId, name, arguments: '{}' };
+function call(callId: string, name: string, args: unknown = '{}') {
+  return {
+    type: 'function_call',
+    callId,
+    name,
+    arguments: typeof args === 'string' ? args : JSON.stringify(args),
+  };
 }
 
 function result(callId: string, name: string, text = 'settled') {
@@ -2446,4 +2451,101 @@ test('a CONTROL call returning unknown still mints no recovery surface', () => {
   // read the task depended on. With no names, the surface resolver still
   // admits readers of already-retained output, so she can use what she fetched.
   assert.equal(consequence?.recovery, 'repair_model');
+});
+
+
+// ─── Recovery names the call that was refused, not its envelope ─────────────
+//
+// `call.name` is the carrier. Models that wrap their calls — some routinely,
+// sometimes twice — made every refusal in a frame report the same wrapper, so
+// the recovery surface came back as the wrapper itself. Live 2026-09-11 the
+// host told a stuck Plan turn, verbatim, "Use call_tool to resolve this step",
+// three times, advising the loop that had just died.
+//
+// The STAGE deliberately stays keyed on the host disposition — a model that
+// varies its tool name must not earn a fresh stage every attempt. Only the
+// recovery NAMES unwrap.
+
+test('a refused wrapped call names the inner tool as its recovery surface', () => {
+  const identity = accepted('refused-wrapped-inner');
+  const wrapped = {
+    name: 'call_tool',
+    args_json: JSON.stringify({ name: 'composio_status', args_json: '{}' }),
+  };
+  const refused = buildHostToolDispositionResult({
+    callId: 'call-wrapped',
+    toolName: 'call_tool',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'a'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: true,
+  });
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('call-wrapped', 'call_tool', wrapped), refused],
+  });
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') return;
+  const names = projected.consequence?.recoveryToolNames ?? [];
+  assert.ok(!names.includes('call_tool'), 'never advise retrying the wrapper that just failed');
+  assert.deepEqual(names, ['composio_status'], 'name the call the host actually refused');
+  assert.equal(
+    projected.consequence?.stage,
+    'host_disposition:refused_pre_dispatch',
+    'the stage still outranks varied call names',
+  );
+});
+
+
+// ─── A Plan turn is told to publish, not to keep hunting ────────────────────
+//
+// Live 2026-09-11, after the classification fixes landed: a Plan turn read the
+// Doc the owner named, inventoried both toolkits he asked for, made 50 calls
+// with real work retained — and drained its whole budget on
+// `authority_acquisition`, publishing nothing. The recovery copy had told it,
+// every time, to "resolve the next executable step".
+//
+// A Plan turn has no next executable step. It owes an outline, and "I could
+// not find X" is a publishable line in one.
+
+test('a Plan turn keeps publish_plan on its recovery surface', async () => {
+  const { hostNoProgressRecoveryToolNames } = await import('./host-turn-runner.js');
+  const consequence = {
+    stage: 'authority_acquisition:no_new_evidence',
+    recovery: 'repair_model' as const,
+    effectState: 'known_terminal' as const,
+    recoveryToolNames: [] as readonly string[],
+    key: 'k',
+  };
+  const tools = ['tool_search', 'publish_plan', 'work_call'];
+  const actTurn = hostNoProgressRecoveryToolNames(consequence as never, tools, [], false);
+  const planTurn = hostNoProgressRecoveryToolNames(consequence as never, tools, [], true);
+  assert.ok(
+    planTurn.has('publish_plan'),
+    'the one control that ends a Plan turn must be reachable from its recovery',
+  );
+  assert.ok(
+    !actTurn.has('publish_plan'),
+    'an Act turn is unchanged — this is scoped to Plan',
+  );
+});
+
+test('a Plan turn is told to publish what it has, not to find another step', async () => {
+  const { hostNoProgressBlockedText } = await import('./host-turn-runner.js');
+  const state = {
+    lastConsequence: {
+      stage: 'authority_acquisition:no_new_evidence',
+      recovery: 'repair_model' as const,
+      effectState: 'known_terminal' as const,
+      recoveryToolNames: [] as readonly string[],
+      key: 'k',
+    },
+  };
+  const act = hostNoProgressBlockedText(state as never, undefined, undefined, null, false);
+  const plan = hostNoProgressBlockedText(state as never, undefined, undefined, null, true);
+  assert.match(plan, /publish/i, 'Plan copy names publishing');
+  assert.match(plan, /needs_input/, 'and says an unknown is publishable, not a blocker');
+  assert.doesNotMatch(plan, /next executable step/, 'Plan has no next executable step');
+  assert.match(act, /next executable step/, 'an Act turn keeps its existing copy');
 });
