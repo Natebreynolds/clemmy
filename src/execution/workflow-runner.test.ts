@@ -8012,3 +8012,45 @@ test('a blocked JSON-text step finalizes as blocked and withholds its dependent 
   assert.deepEqual(skips.map(entry => entry.stepId), ['deliver']);
   assert.match(skips[0].output.reason, /write was refused/);
 });
+
+// Live 2026-09-11, 01:08 and 01:12: two workflows paused four minutes apart and
+// both told the owner to reconnect a toolkit. googlesheets had thrown on the
+// revalidation CALL (`selected_connection_refresh_unavailable`) and Composio
+// answered normally minutes later; outlook needed an ACCOUNT CHOSEN
+// (`operation_version_rebind:account_selection_required`) with a perfectly good
+// connection. He reconnected nothing, correctly, and asked why every workflow
+// had stopped. Settings could not have fixed either one.
+test('a capability pause says what actually happened instead of "go reconnect"', async () => {
+  const { workflowCapabilityNotificationPresentation } = await import('./workflow-runner.js');
+  const base = {
+    stepId: 'main', toolkit: 'googlesheets', tool: 'GOOGLESHEETS_BATCH_GET',
+    reason: 'not-connected' as const, retryCount: 1, retryAt: '2026-09-11T01:27:20.911Z',
+  };
+
+  const couldNotCheck = workflowCapabilityNotificationPresentation('platform-49-slack-channel-review', {
+    ...base,
+    message: 'Step "main" names GOOGLESHEETS_BATCH_GET but its exact definition could not be provisioned '
+      + '(selected_definition_revalidation_refused: selected_connection_refresh_unavailable).',
+  } as never);
+  assert.match(couldNotCheck.title, /could not reach googlesheets to check/);
+  assert.match(couldNotCheck.detail, /not a sign your connection is broken/);
+  assert.match(couldNotCheck.detail, /Nothing to do/);
+  assert.doesNotMatch(couldNotCheck.detail, /Open Settings/, 'never send someone to fix a connection that works');
+
+  const needsChoice = workflowCapabilityNotificationPresentation('daily-standup-email', {
+    ...base, toolkit: 'outlook', tool: 'OUTLOOK_LIST_EVENTS',
+    message: 'Step "main" names OUTLOOK_LIST_EVENTS but its exact definition could not be provisioned '
+      + '(exact_operation_provisioning_refused: operation_version_rebind:account_selection_required).',
+  } as never);
+  assert.match(needsChoice.title, /choose a outlook account/);
+  assert.match(needsChoice.detail, /did not say which outlook account/);
+  assert.match(needsChoice.detail, /connection is fine|not the problem/);
+  assert.doesNotMatch(needsChoice.detail, /Open Settings/);
+
+  // A genuinely dead toolkit still gets the reconnect instruction.
+  const reallyDead = workflowCapabilityNotificationPresentation('daily-standup-email', {
+    ...base, message: 'The saved GOOGLESHEETS connection is missing or belongs to a different Composio user.',
+  } as never);
+  assert.match(reallyDead.title, /connect googlesheets/);
+  assert.match(reallyDead.detail, /Open Settings/, 'a real disconnection keeps its real cure');
+});

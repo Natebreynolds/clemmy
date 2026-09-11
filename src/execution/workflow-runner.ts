@@ -1285,6 +1285,35 @@ export function catalogPreparationRefusalToCapabilityBlock(
   });
 }
 
+/**
+ * "We could not ask" is not "your connection is gone."
+ *
+ * Live 2026-09-11: two workflows paused four minutes apart — googlesheets with
+ * `selected_connection_refresh_unavailable` (the revalidation call THREW) and
+ * outlook with `operation_version_rebind:account_selection_required` (the
+ * connection was fine; the step needed an account chosen). Both printed the
+ * same sentence: "Either the toolkit is not connected or the operation name is
+ * wrong. Open Settings → Connections and connect X." The owner reconnected
+ * nothing and asked why every workflow had stopped.
+ *
+ * Neither is fixable in Settings. Composio answered normally minutes later, so
+ * the first was a blip the run already retries on its own; the second needs a
+ * choice, not a credential. Sending someone to reconnect a working connection
+ * costs them the one thing the pause was supposed to save.
+ *
+ * The distinction is already in the block's own message — the provisioning
+ * refusal codes are carried verbatim — so this reads what is there rather than
+ * inventing new state. `exact_schema_refresh_unavailable` has had its own
+ * honest branch for a while; this is the same courtesy for the others.
+ */
+function capabilityPauseCouldNotCheck(block: WorkflowCapabilityBlockState): boolean {
+  return typeof block.message === 'string' && /refresh_unavailable/.test(block.message);
+}
+
+function capabilityPauseNeedsAccountChoice(block: WorkflowCapabilityBlockState): boolean {
+  return typeof block.message === 'string' && /account_selection_required/.test(block.message);
+}
+
 function isExactSchemaCapabilityReason(
   reason: WorkflowCapabilityBlockReason,
 ): reason is Extract<WorkflowCapabilityBlockReason, `exact_schema_${string}`> {
@@ -13490,7 +13519,7 @@ export function resolveWorkflowDefinitionForRun(
  * main execution heartbeat (exact-schema preflight) and from the execution
  * catch (gateway/auth/boundary refusal), so every such refusal has the same
  * durable same-run recovery semantics. */
-function workflowCapabilityNotificationPresentation(
+export function workflowCapabilityNotificationPresentation(
   workflowName: string,
   block: WorkflowCapabilityBlockState,
 ): {
@@ -13502,6 +13531,10 @@ function workflowCapabilityNotificationPresentation(
   resolution: NonNullable<Extract<RunInputBlocker, { kind: 'capability_dependency' }>['resolution']>;
 } {
   const exactSchemaBlock = isExactSchemaCapabilityReason(block.reason);
+  // Read the refusal codes the block already carries, so a transient check
+  // failure and a missing account choice stop impersonating a dead connection.
+  const couldNotCheck = !exactSchemaBlock && capabilityPauseCouldNotCheck(block);
+  const needsAccountChoice = !exactSchemaBlock && !couldNotCheck && capabilityPauseNeedsAccountChoice(block);
   const accountChoiceBlock = block.reason === 'ambiguous-account'
     ? block.accountChoiceSet
     : undefined;
@@ -13545,14 +13578,22 @@ function workflowCapabilityNotificationPresentation(
       ? `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
       : exactSchemaBlock
         ? `I paused "${workflowName}" at step "${block.stepId}" because the exact action schema could not be proven at the provider boundary.`
-        : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
+        : couldNotCheck
+          ? `I paused "${workflowName}" at step "${block.stepId}" because I could not reach ${block.toolkit} to verify it before running. This is not a sign your connection is broken.`
+          : needsAccountChoice
+            ? `I paused "${workflowName}" at step "${block.stepId}" because the step did not say which ${block.toolkit} account to use. Your connection is fine.`
+            : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
     block.message,
     `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
     accountChoiceBlock
       ? choiceQuestion
       : exactSchemaBlock
         ? `Open Needs You to retry this exact metadata gate now, or I will retry safely after ${block.retryAt}; recovery performs no broader discovery or business action.`
-        : `Open Settings → Connections and connect ${block.toolkit}, then return to Needs You to retry this exact gate. It will also retry safely after ${block.retryAt}.`,
+        : couldNotCheck
+          ? `Nothing to do — I retry this automatically after ${block.retryAt}. Reconnecting ${block.toolkit} would not change it; if this keeps repeating, the provider is having trouble, not your account.`
+          : needsAccountChoice
+            ? `Pick the ${block.toolkit} account for this step in Needs You and I will resume this same run. Reconnecting ${block.toolkit} will not help — the connection is not the problem.`
+            : `Open Settings → Connections and connect ${block.toolkit}, then return to Needs You to retry this exact gate. It will also retry safely after ${block.retryAt}.`,
   ].join('\n\n');
   return {
     exactSchemaBlock,
@@ -13563,7 +13604,11 @@ function workflowCapabilityNotificationPresentation(
       ? `Workflow needs you — choose an account for ${block.toolkit}`
       : exactSchemaBlock
         ? 'Workflow paused — exact action metadata unavailable'
-        : `Workflow needs you — connect ${block.toolkit}`,
+        : couldNotCheck
+          ? `Workflow paused — could not reach ${block.toolkit} to check`
+          : needsAccountChoice
+            ? `Workflow needs you — choose a ${block.toolkit} account`
+            : `Workflow needs you — connect ${block.toolkit}`,
     resolution,
   };
 }
