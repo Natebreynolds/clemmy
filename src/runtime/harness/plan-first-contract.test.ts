@@ -7,6 +7,10 @@
  * don't start until I say execute. Plus the distinction that kills the naive
  * version of this: the Google Doc he handed her she MUST read — and a plan that
  * comes back saying "first I'll read your doc, then I'll plan" is not a plan.
+ *
+ * The document id below is a SYNTHETIC fixture, not the owner's real one: the
+ * public-hygiene gate rejects live provider resource ids in tracked files, and
+ * it caught the first version of this test before the v3.18.3 tag.
  */
 import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
@@ -22,19 +26,19 @@ const {
 } = await import('./plan-first-contract.js');
 
 const REQUEST = 'I need to run some extensive research. using firecrawl, data for seo, apify. any scraping tool '
-  + 'nessasary to accomplish this. https://docs.google.com/document/d/1oREggTuvL-oXTpOhi6g2QsMpXsaHFyhORy-rBfIHZWw/edit?tab=t.0';
+  + 'nessasary to accomplish this. https://docs.google.com/document/d/doc_synthetic-plan-first-fixture-0001/edit?tab=t.0';
 
 test('the document the owner handed her is an input, not the work', () => {
   // The exact call from the live run, which read the brief 95 seconds in.
   const readingTheBrief = JSON.stringify({
     tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-    arguments: { id: '1oREggTuvL-oXTpOhi6g2QsMpXsaHFyhORy-rBfIHZWw' },
+    arguments: { id: 'doc_synthetic-plan-first-fixture-0001' },
   });
   assert.equal(readsAnOwnerNamedInput(readingTheBrief, REQUEST), true, 'the doc id he pasted is his own input');
 
   // Same doc reached by URL, without the ?tab= and /edit he happened to paste.
   const byUrl = JSON.stringify({
-    url: 'https://docs.google.com/document/d/1oREggTuvL-oXTpOhi6g2QsMpXsaHFyhORy-rBfIHZWw',
+    url: 'https://docs.google.com/document/d/doc_synthetic-plan-first-fixture-0001',
   });
   assert.equal(readsAnOwnerNamedInput(byUrl, REQUEST), true, 'the identifying middle still matches');
 });
@@ -53,7 +57,7 @@ test('reading the owner\'s input is never refused, no matter how many reads came
     sessionId: 'sess-plan-1',
     sourceUserSeq: 10,
     toolName: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-    argumentsJson: JSON.stringify({ id: '1oREggTuvL-oXTpOhi6g2QsMpXsaHFyhORy-rBfIHZWw' }),
+    argumentsJson: JSON.stringify({ id: 'doc_synthetic-plan-first-fixture-0001' }),
     requestText: REQUEST,
     externalRead: true,
   });
