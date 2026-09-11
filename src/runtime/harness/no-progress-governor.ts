@@ -328,6 +328,10 @@ export type NoProgressContinueReason =
   | 'authority_progress'
   | 'unmetered_attempt'
   | 'retry_available'
+  /** The consequence carries a known terminal outcome for this path. The
+   *  consumer stops on it; the governor must SAY so rather than report a
+   *  retry the turn will never take. */
+  | 'factual_stop_required'
   | 'consequence_progress'
   | 'user_input_required';
 
@@ -758,13 +762,23 @@ export function observeNoProgress(
         state: next,
       });
     }
+    // A `stop_factual` consequence means exactly one thing: this path has a
+    // known terminal outcome and repeating it cannot change that. Folding it
+    // into `retry_available` made the governor's own journal say "continue,
+    // 2 retries left" on a turn that ended microseconds later, because the
+    // consumer reads `recovery` and stops. Live 2026-09-11 that contradiction
+    // was the single most misleading line in the diagnosis — the record of why
+    // a turn stopped claimed it had not. Name it, so the journal and the
+    // outcome agree.
     return Object.freeze({
       action: 'continue',
       reason: consequence.recovery === 'ask_user'
         ? 'user_input_required'
-        : firstConsequence && state.retriesRemaining > 0
-          ? 'retry_available'
-          : 'consequence_progress',
+        : consequence.recovery === 'stop_factual'
+          ? 'factual_stop_required'
+          : firstConsequence && state.retriesRemaining > 0
+            ? 'retry_available'
+            : 'consequence_progress',
       gained: Object.freeze([]) as readonly AuthorityProgressKind[],
       state: next,
     });

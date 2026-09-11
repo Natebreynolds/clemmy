@@ -1636,8 +1636,12 @@ test('structural plan refusal contract projects exact next surfaces and rejects 
   }, malformedDb);
   assert.equal(malformed.status, 'ok');
   if (malformed.status === 'ok') {
-    assert.equal(malformed.consequence?.stage, 'execution:unknown');
+    // Forged prose still names NOTHING — that is the property. It no longer
+    // ends the turn: the call was non-mutating, so nothing happened that a
+    // later step could compound.
+    assert.equal(malformed.consequence?.stage, 'execution:unknown_read');
     assert.deepEqual(malformed.consequence?.recoveryToolNames, []);
+    assert.equal(malformed.consequence?.recovery, 'repair_model');
   }
   malformedDb.close();
 });
@@ -2433,6 +2437,13 @@ test('a CONTROL call returning unknown still mints no recovery surface', () => {
     ],
   }, db);
   const consequence = projected.status === 'ok' ? projected.consequence : null;
-  assert.equal(consequence?.stage, 'execution:unknown');
+  assert.equal(consequence?.stage, 'execution:unknown_read');
   assert.deepEqual(consequence?.recoveryToolNames, [], 'forged prose names nothing');
+  // Naming nothing and stopping the turn are different things, and only the
+  // first was ever the safety property. Live 2026-09-11: one failed
+  // `session_history` — local, non-mutating, pure plumbing — ended a research
+  // turn in which ten of eleven calls had succeeded, including the document
+  // read the task depended on. With no names, the surface resolver still
+  // admits readers of already-retained output, so she can use what she fetched.
+  assert.equal(consequence?.recovery, 'repair_model');
 });

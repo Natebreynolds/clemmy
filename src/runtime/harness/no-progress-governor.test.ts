@@ -703,7 +703,12 @@ test('a known terminal result gets one factual response step but cannot repeat',
     consequence: factual,
   });
   assert.equal(first.action, 'continue');
-  assert.equal(first.reason, 'retry_available');
+  // The budget allows another observation, but the reason must name what this
+  // consequence IS. Reporting `retry_available` for a known-terminal path made
+  // the journal read "continue, retries left" on a turn the consumer stops
+  // without a model call — live 2026-09-11 that was the most misleading line in
+  // the diagnosis, because the record of why a turn stopped claimed it had not.
+  assert.equal(first.reason, 'factual_stop_required');
   const repeated = observeNoProgress(first.state, {
     taskKey: initial.taskKey,
     attemptClass: 'zero_crossing_repair',

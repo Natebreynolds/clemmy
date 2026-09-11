@@ -1190,16 +1190,44 @@ function settlementConsequence(input: {
       // prose, and naming tools from it is exactly the escalation the
       // malformed-plan-refusal contract forbids. `business_call` separates
       // real work from harness plumbing without reading any error text.
-      if (!settlement.mutating && settlement.business_call === 1) {
+      // The carve-out above was scoped to business calls, and the reason given
+      // was about the RECOVERY SURFACE: a control call's result may be locally
+      // forged prose, so tool names read out of it cannot be trusted. That is a
+      // correct constraint on what may be NAMED. It was never a reason to end
+      // the turn — and ending it is what the narrow gate did.
+      //
+      // Live 2026-09-11, the same shape as the incident above, through the
+      // branch its fix did not cover. A research turn made eleven calls after
+      // the user redirected it: TEN succeeded, including the document read the
+      // whole task depended on and three searches for the exact scraping and
+      // SERP tools the user had asked for. The eleventh was `session_history` —
+      // harness plumbing, local, non-mutating, nothing to do with the request —
+      // and it failed. That one control call mapped to stop_factual and ended
+      // the turn with two retries still on the budget, showing the person
+      // "Stopped at: execution:unknown" over work that had mostly landed.
+      //
+      // So split the two questions. "Did anything happen?" is answered by
+      // `mutating` alone: a non-mutating call that failed changed nothing,
+      // whoever made it. "What may the recovery NAME?" stays exactly as strict
+      // as before — a control call names nothing. With no names, the surface
+      // resolver still admits readers of already-retained output, which cross
+      // nothing and mutate nothing, so the turn can read what it already
+      // fetched and finish the thought. The governor remains the bound.
+      if (!settlement.mutating) {
         return createNoProgressConsequence({
           stage: 'execution:unknown_read',
           recovery: 'repair_model',
           effectState,
-          // The same carrier can be repaired; one bounded search can find an
-          // alternative read when the shape itself is unsupported.
-          recoveryToolNames: [call.name, 'tool_search'],
+          // Business read: its result is real provider data, so the carrier and
+          // one bounded search are legitimate names. Control call: forged prose
+          // names nothing — but the turn still continues.
+          recoveryToolNames: settlement.business_call === 1
+            ? [call.name, 'tool_search']
+            : [],
         });
       }
+      // A MUTATION whose fate we cannot observe keeps the factual stop. The one
+      // thing worse than failing is doing it twice.
       return createNoProgressConsequence({
         stage: `execution:${settlement.outcome_kind}`,
         recovery: 'stop_factual',

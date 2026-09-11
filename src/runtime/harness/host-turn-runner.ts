@@ -2469,7 +2469,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let toolByName = new Map<string, FunctionToolLike>();
   let configuredToolRefs = new Set<FunctionToolLike>();
   let schemas: unknown[] = [];
+  /** The host's conversational check-in is documented in three places as "one
+   *  tool-free model request" — on RunTurnOptions.hostConversationalCheckIn,
+   *  at the call site, and in the completion gate below, whose safety argument
+   *  ("it cannot be used to dodge the gate for work") depends on it. Nothing
+   *  enforced it. Live 2026-09-11: asked to explain a stop over retained work,
+   *  the model reached for `recall_tool_result` to read that work so it could
+   *  describe it — an entirely reasonable move — spent the single call the
+   *  activation is allowed, tripped `tool_calls_limit: 1`, and returned ZERO
+   *  reply bytes. The recovery then bailed and handed the person the engine's
+   *  raw `execution:unknown` card instead of Clem's words, which is the exact
+   *  outcome this activation exists to prevent.
+   *
+   *  A budget the model can spend elsewhere is not a reservation. The surface
+   *  is empty here, so the one request it gets can only be used to speak. */
+  const conversationalCheckInSurface = (): boolean => (
+    (opts as { hostConversationalCheckIn?: unknown }).hostConversationalCheckIn === true
+  );
   const refreshTools = async (): Promise<void> => {
+    if (conversationalCheckInSurface()) {
+      tools = [];
+      toolByName = new Map();
+      configuredToolRefs = new Set();
+      schemas = [];
+      armExactHostSurface();
+      return;
+    }
     const outputType = (agent as { outputType?: unknown }).outputType;
     if (outputType !== undefined && outputType !== 'text') {
       throw new UnsupportedHostCapabilityError('structured_output');
@@ -3245,6 +3270,37 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ...(site ? { site } : {}),
       ...(blockedDetail ? { blockedDetail } : {}),
     }, 'host blocked terminal');
+    // ...AND SOMEWHERE THE SHIPPED APP CAN BE READ FROM.
+    //
+    // `site` exists because seven branches share control_no_progress_exhausted
+    // and the reason alone cannot say which one fired — the comment above
+    // terminalCallerSite records that localizing one took a durable-ledger dig
+    // instead of a grep. It went only to the process log, and the packaged app
+    // does not persist that anywhere reachable: live 2026-09-11, a turn stopped
+    // on a user's research task and the one field naming the gate was gone by
+    // the time anyone looked. A diagnostic that survives only in development is
+    // not a diagnostic for the product.
+    //
+    // guardrail_tripped is a private event type, so this carries no machine
+    // detail onto the public bus.
+    try {
+      const identity = exactHostIdentity();
+      appendEvent({
+        sessionId: identity.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'host_blocked_terminal_site',
+          reason,
+          resumable,
+          sourceUserSeq: identity.sourceUserSeq ?? null,
+          ...(site ? { site } : {}),
+          ...(blockedDetail ? { blockedDetail } : {}),
+          ...(build.gitSha ? { gitSha: build.gitSha } : {}),
+        },
+      });
+    } catch { /* diagnostics must never change a terminal */ }
     const outcome: HostRunOutcome = {
       history,
       lastResponseId,
@@ -7756,6 +7812,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               decision.reason === 'retry_available'
               || decision.reason === 'consequence_progress'
               || decision.reason === 'user_input_required'
+              // A named factual stop routes exactly as it did when it was
+              // reported as `retry_available`: recovery-only, where the
+              // stop_factual check below ends the path. Naming it changed the
+              // journal, not the behaviour.
+              || decision.reason === 'factual_stop_required'
             ) {
               // A consequence-free dependency lookup is already-landed data,
               // not a new provider/execution path.  Keep the ordinary model
@@ -7804,6 +7865,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
 
       if (noProgressRecoveryOnly) {
         const consequence = noProgressState?.lastConsequence;
+        // A known-terminal result stops WITHOUT a model call, on purpose. The
+        // governor returns `continue` here — its budget accounting allows
+        // another observation — but granting the model a step on a dead path
+        // lets it invent an ask or an approval envelope for a retry the host
+        // has already ruled out, which is worse than saying nothing. Pinned by
+        // "a known result stops from retained state without a model call or
+        // invented approval". Clem's own account of the stop comes from the
+        // conversational check-in AFTER the terminal, which is bounded, asked
+        // at most once per source, and now genuinely tool-free.
         if (consequence?.recovery === 'stop_factual') return stopNoProgress();
         // WHAT THIS TASK ACTUALLY EXECUTED IS THE PROOF.
         //
