@@ -2545,7 +2545,11 @@ test('a Plan turn is told to publish what it has, not to find another step', asy
   const act = hostNoProgressBlockedText(state as never, undefined, undefined, null, false);
   const plan = hostNoProgressBlockedText(state as never, undefined, undefined, null, true);
   assert.match(plan, /publish/i, 'Plan copy names publishing');
-  assert.match(plan, /needs_input/, 'and says an unknown is publishable, not a blocker');
+  // The owner reads this line. It must offer THEM an action, not hand them the
+  // model's instruction about a tool they never call.
+  assert.match(plan, /^I stopped|Ask me/m, 'addressed to the owner, in the first person');
+  assert.doesNotMatch(plan, /needs_input/, 'no machine vocabulary in the owner-facing line');
+  assert.doesNotMatch(plan, /publish_plan/, 'the owner does not call the tool');
   assert.doesNotMatch(plan, /next executable step/, 'Plan has no next executable step');
   assert.match(act, /next executable step/, 'an Act turn keeps its existing copy');
 });

@@ -927,10 +927,18 @@ export function hostNoProgressBlockedText(
         // Telling it to find one sent a turn that had already gathered what it
         // needed back out to gather more, until the budget ran out (live
         // 2026-09-11). What it owes the owner is the outline.
+        // THIS LINE IS READ BY THE OWNER, NOT THE MODEL.
+        //
+        // The model gets its own steer (PLAN_*_RECOVERY_DIRECTIVE). Putting the
+        // model's instruction here told a person to "publish the plan with what
+        // you already gathered, naming anything still missing as needs_input" —
+        // an instruction they cannot act on, about a tool they do not call
+        // (live 2026-09-11). What the owner needs is what happened and what
+        // THEY can do next.
         if (planMode) {
           return usable.length
-            ? `Use ${usable.join(' or ')}, then publish_plan with what you have — name anything still missing as needs_input.`
-            : 'Publish the plan with what you already gathered, naming anything still missing as needs_input. Plan does not run the work.';
+            ? `I stopped before publishing. Ask me to publish the outline as it stands, or resolve ${usable.join(' or ')} and I will finish it.`
+            : 'I stopped before publishing an outline. Ask me to publish what I have and I will name the gaps, or answer the blocker above and I will keep going.';
         }
         return usable.length
           ? `Use ${usable.join(' or ')} to resolve this step, then resume this saved task from its retained results.`
