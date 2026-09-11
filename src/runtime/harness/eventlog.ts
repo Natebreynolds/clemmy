@@ -558,6 +558,15 @@ export const EVENT_TYPES = [
   // bytes and revalidates every named live definition; it never rebuilds the
   // displayed card from capabilities discovered later in the same turn.
   'primary_model_planning_card_snapshot',
+  // Planning-catalog priming REFUSED this source, so the turn ends before the
+  // first model request with no plan, no dispatch, and no other trace. Live
+  // 2026-09-10: one scheduled step re-dispatched every 15s for ten hours and
+  // died here on all 1,444 attempts, each writing nothing at all — the
+  // eventlog stopped at the card snapshot above and the reason string was
+  // discarded at the caller. A refusal is a typed stop, so it is durable:
+  // carries {sourceUserSeq, stage, reason}, where stage names which priming
+  // step refused and reason is the exact string the caller branches on.
+  'primary_model_planning_prime_refused',
   // Exact source-bound authority installed by the workflow runner after it
   // reopens the immutable run definition and revalidates every authored
   // external catalog binding. This grants only ordinary, non-destructive

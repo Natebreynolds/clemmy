@@ -95,7 +95,10 @@ export interface ConversationalApprovalPresentation {
   version: 1;
   kind: 'autonomous_send_consent';
   question: string;
-  actionLabel: 'email' | 'message' | 'post' | 'send';
+  /** The operation's own word for what is being written ("event", "record",
+   *  "email"). A closed enum here was a list of the services the harness had
+   *  heard of; a write to anything else could not be described at all. */
+  actionLabel: string;
   target: string;
   subject: string | null;
   bodyPreview: string | null;
@@ -242,7 +245,9 @@ function parseConversationalPresentation(json: string | null): ConversationalApp
       value.version !== 1
       || value.kind !== 'autonomous_send_consent'
       || typeof value.question !== 'string'
-      || !['email', 'message', 'post', 'send'].includes(String(value.actionLabel))
+      || typeof value.actionLabel !== 'string'
+      || !value.actionLabel.trim()
+      || value.actionLabel.length > 24
       || typeof value.target !== 'string'
       || !(value.subject === null || typeof value.subject === 'string')
       || !(value.bodyPreview === null || typeof value.bodyPreview === 'string')

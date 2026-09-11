@@ -1741,6 +1741,59 @@ function repackPlanningCardWithSameSourceDisclosures(input: {
   };
 }
 
+/** Which priming step refused. Priming is the last thing that runs before the
+ * first foreground model request, so the stage is what separates "this source
+ * was never readable" from "the frozen card no longer reopens" — the two have
+ * opposite repairs and the reason string alone does not distinguish them. */
+type PrimaryModelPlanningPrimeStage =
+  | 'accepted_source'
+  | 'accepted_source_continuation'
+  | 'durable_card_read'
+  | 'durable_card_install'
+  | 'durable_card_reopen'
+  | 'planning_catalog_snapshot';
+
+/**
+ * Record a priming refusal durably, then return it.
+ *
+ * Every `ok: false` exit of primePrimaryModelPlanningCatalog routes through
+ * here, so no refusal can end a turn without evidence. Before this, a refusal
+ * returned a reason string that both production callers discarded — the
+ * foreground lane turned it into one generic sentence and the worker lane into
+ * a process log line — and the session's durable trail simply stopped after the
+ * card snapshot. A scheduled step that refuses on every dispatch is only
+ * visible as a repeating shape if each dispatch leaves a row behind.
+ */
+function refusePrimaryModelPlanningPrime(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  stage: PrimaryModelPlanningPrimeStage;
+  reason: string;
+}): { ok: false; reason: string } {
+  try {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: input.turn,
+      role: 'system',
+      type: 'primary_model_planning_prime_refused',
+      data: {
+        sourceUserSeq: input.sourceUserSeq,
+        stage: input.stage,
+        reason: input.reason,
+      },
+    });
+  } catch (error) {
+    // Evidence is best effort in exactly one direction: the refusal still
+    // reaches the caller when the eventlog is itself the unavailable thing.
+    logger.warn(
+      { err: error, sessionId: input.sessionId, stage: input.stage },
+      'planning-catalog priming refusal could not be recorded',
+    );
+  }
+  return { ok: false, reason: input.reason };
+}
+
 /** Zero-model catalog preparation for the initial foreground model surface.
  * This is enumeration/ranking only. The exact bounded display card is frozen
  * here before the first model request; later foreground tool_search results
@@ -1758,7 +1811,22 @@ export async function primePrimaryModelPlanningCatalog(input: {
   const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText.trim() : '';
   const eventText = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
   const sourceText = display || eventText;
-  if (!sourceText || !accepted) return { ok: false, reason: 'durable accepted source is missing' };
+  if (!sourceText || !accepted) {
+    return refusePrimaryModelPlanningPrime({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      turn: accepted?.turn ?? 0,
+      stage: 'accepted_source',
+      reason: 'durable accepted source is missing',
+    });
+  }
+  const refuse = (stage: PrimaryModelPlanningPrimeStage, reason: string) => refusePrimaryModelPlanningPrime({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    turn: accepted.turn,
+    stage,
+    reason,
+  });
   let durableContinuation: TaskContinuationContext | null;
   try {
     const consumed = readConsumedTaskContinuityPacket({
@@ -1774,16 +1842,16 @@ export async function primePrimaryModelPlanningCatalog(input: {
       (consumed.status === 'consumed' && !durableContinuation)
       || (consumed.status !== 'consumed' && consumed.status !== 'none')
     ) {
-      return { ok: false, reason: 'durable accepted-source continuation is malformed or ambiguous' };
+      return refuse('accepted_source_continuation', 'durable accepted-source continuation is malformed or ambiguous');
     }
     if (!durableContinuation) {
       const pending = peekTaskContinuityPacket({ sessionId: input.sessionId });
       if (pending.status !== 'none') {
-        return { ok: false, reason: 'durable accepted-source continuation is unresolved' };
+        return refuse('accepted_source_continuation', 'durable accepted-source continuation is unresolved');
       }
     }
   } catch {
-    return { ok: false, reason: 'durable accepted-source continuation is unreadable' };
+    return refuse('accepted_source_continuation', 'durable accepted-source continuation is unreadable');
   }
   const objective = graphSemanticText(
     sourceText,
@@ -1800,10 +1868,10 @@ export async function primePrimaryModelPlanningCatalog(input: {
     sourceUserSeq: input.sourceUserSeq,
   });
   if (durableInitialCard.status === 'conflict' || durableInitialCard.status === 'storage_error') {
-    return {
-      ok: false,
-      reason: `durable initial planning card is unavailable: ${durableInitialCard.reason}`,
-    };
+    return refuse(
+      'durable_card_read',
+      `durable initial planning card is unavailable: ${durableInitialCard.reason}`,
+    );
   }
   const frozenSource = persistedCatalogSnapshotManifestIdsForSource(input);
   const withholdLegacyEvidencePolicy = durableInitialCard.status === 'missing'
@@ -2096,12 +2164,12 @@ export async function primePrimaryModelPlanningCatalog(input: {
         }),
       });
   if (installedInitialCard.status !== 'ready') {
-    return {
-      ok: false,
-      reason: installedInitialCard.status === 'missing'
+    return refuse(
+      'durable_card_install',
+      installedInitialCard.status === 'missing'
         ? 'durable initial planning card disappeared during installation'
         : `durable initial planning card is unavailable: ${installedInitialCard.reason}`,
-    };
+    );
   }
   // The card just installed (or reopened) may cite this source's own durable
   // disclosures: a staged row is never a live factory row until plan_task
@@ -2120,7 +2188,7 @@ export async function primePrimaryModelPlanningCatalog(input: {
     objective,
     currentById: currentPlanningById,
   });
-  if (!reopenedInitialCard.ok) return reopenedInitialCard;
+  if (!reopenedInitialCard.ok) return refuse('durable_card_reopen', reopenedInitialCard.reason);
   // New LIVE factory rows never repack the frozen initial card. This source's
   // own durable tool_search disclosures are the one lawful extension: the
   // in-process lane already grew the card the model saw, so a re-prime (a
@@ -2154,7 +2222,7 @@ export async function primePrimaryModelPlanningCatalog(input: {
     digest: card.digest,
   });
   const planning = snapshotPrimaryModelPlanningContext(authority);
-  if (!planning) return { ok: false, reason: 'host planning catalog snapshot was not installed' };
+  if (!planning) return refuse('planning_catalog_snapshot', 'host planning catalog snapshot was not installed');
   return {
     ok: true,
     planning,

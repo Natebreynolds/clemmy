@@ -8,6 +8,7 @@ import {
   exactOriginDeliveryTargetDigest,
   normalizeExactOriginDeliveryTarget,
 } from '../exact-origin-delivery.js';
+import { redactSensitiveText } from '../security.js';
 import type { EventRow } from './eventlog.js';
 import type { NewConversationalApprovalPresentation } from './approval-registry.js';
 
@@ -19,7 +20,11 @@ import type { NewConversationalApprovalPresentation } from './approval-registry.
  */
 export interface AutonomousSendConsent {
   question: string;
-  actionLabel: 'email' | 'message' | 'post' | 'send';
+  /** The operation's own word for what is being written ("event", "record",
+   *  "email"), derived at runtime. Deliberately NOT a closed enum: a fixed set
+   *  is a list of services the harness has heard of, and the point is that it
+   *  needs to have heard of none of them. */
+  actionLabel: string;
   target: string;
   subject: string | null;
   bodyPreview: string | null;
@@ -61,12 +66,30 @@ function normalizePayloadTextCandidate(value: string): string {
 
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 const URL_RE = /https?:\/\/[^\s<>"'\\]+/gi;
-const RECIPIENT_KEY_RE = /^(?:to|cc|bcc)(?:recipients?|emails?|addresses|list)?$|^recipients?(?:emails?|list)?$/;
+/**
+ * The people a write is addressed to. These are ROLE words — the generic names
+ * for "who receives this" — not the name of any product or channel. An invite
+ * addresses attendees, a thread addresses participants, a message addresses
+ * recipients; all three are the same question to a person reviewing it, and
+ * only the first of them used to count. Live 2026-09-11: a calendar invite
+ * naming exactly one attendee had, by this regex, no recipient at all, so it
+ * could not be described in one line no matter how simple it was.
+ */
+const RECIPIENT_KEY_RE = /^(?:to|cc|bcc)(?:recipients?|emails?|addresses|list)?$|^(?:recipients?|attendees?|participants?|invitees?|guests?|assignees?|members?)(?:info|emails?|addresses|list)?$/;
 const SENDER_KEY_RE = /^(?:from|sender|replyto|returnpath|onbehalfof)(?:email|emails|address|addresses)?$/;
 const SUBJECT_KEY_RE = /^(?:subject|emailsubject|messagesubject)$/;
 const BODY_KEY_RE = /^(?:body|htmlbody|textbody|emailbody|messagebody|content)$/;
 const BODY_OBJECT_VALUE_KEY_RE = /^(?:htmlbody|textbody|emailbody|messagebody|content)$/;
 const JSON_WRAPPER_KEY_RE = /^(?:arguments?|args|argsjson|payload|input|parameters?|request|data)$/;
+/**
+ * Keys that say WHERE a write lands, for operations that address a container
+ * rather than a person. These are data-model words — a thing with an id, a
+ * place with a path — not the name of any product: `*id`/`*key`/`*ref`
+ * covers whatever a given service calls its container, so a service nobody
+ * has heard of addresses its destination through the same door as one
+ * everybody has.
+ */
+const DESTINATION_KEY_RE = /^(?:destination|target|channel|folder|path|url|link|parent|location|calendar|list|board|collection|space|room|repository|table|database|sheet|document|file|page|record|item|thread|conversation|event|issue|task|ticket)(?:id|key|ref|name)?$|(?:id|key|ref)$/;
 
 interface PayloadDetails {
   recipients: string[];
@@ -76,6 +99,14 @@ interface PayloadDetails {
   invalidSubject: boolean;
   invalidBody: boolean;
   traversalUncertain: boolean;
+  /** Scalar arguments the call actually named, as `key=value`, in traversal
+   *  order. Shape-neutral: whatever fields this operation has are what a human
+   *  gets to review. This is what lets a record, an invite or a row be judged
+   *  in one line without the harness knowing any of those words. */
+  salient: string[];
+  /** Where the write lands when it addresses a container rather than a person.
+   *  A write with no recipient is not a write with no destination. */
+  destinations: string[];
 }
 
 function payloadDetails(value: unknown): PayloadDetails {
@@ -83,9 +114,32 @@ function payloadDetails(value: unknown): PayloadDetails {
   const subjects = new Set<string>();
   const bodies = new Set<string>();
   const urls = new Set<string>();
+  const destinations = new Map<string, string>();
+  const salient = new Map<string, string>();
+
+  const collectDestination = (key: string | null, rendered: string): void => {
+    const normalized = (key ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!normalized || destinations.size >= 4) return;
+    if (JSON_WRAPPER_KEY_RE.test(normalized) || !DESTINATION_KEY_RE.test(normalized)) return;
+    const value = cleanInline(rendered, 120);
+    if (!value) return;
+    if (!destinations.has(normalized)) destinations.set(normalized, value);
+  };
   let invalidSubject = false;
   let invalidBody = false;
   let traversalUncertain = false;
+
+  const collectSalient = (key: string | null, rendered: string): void => {
+    const name = (key ?? '').trim();
+    if (!name || salient.size >= 8) return;
+    // Structural plumbing is not review material, and a value long enough to
+    // hide something is not reviewable in one line either.
+    if (JSON_WRAPPER_KEY_RE.test(name.toLowerCase().replace(/[^a-z0-9]/g, ''))) return;
+    const value = cleanInline(rendered, 80);
+    if (!value) return;
+    const line = redactSensitiveText(`${name}=${value}`).slice(0, 96);
+    if (!salient.has(name)) salient.set(name, line);
+  };
 
   const collectUrls = (input: string): void => {
     for (const match of input.matchAll(URL_RE)) urls.add(match[0].replace(/[),.;]+$/g, ''));
@@ -162,6 +216,12 @@ function payloadDetails(value: unknown): PayloadDetails {
         }
       }
       collectUrls(input);
+      collectDestination(keyHint, input);
+      collectSalient(keyHint, input);
+      return;
+    }
+    if (typeof input === 'number' || typeof input === 'boolean') {
+      collectSalient(keyHint, String(input));
       return;
     }
     if (Array.isArray(input)) {
@@ -185,21 +245,49 @@ function payloadDetails(value: unknown): PayloadDetails {
     invalidSubject,
     invalidBody,
     traversalUncertain,
+    salient: [...salient.values()],
+    destinations: [...destinations.values()],
   };
 }
 
+/** The first URL the call itself produced. This used to rank a named vendor's
+ *  document hosts first — the same hardcoded-noun habit as the label above, and
+ *  just as wrong: it made one company's links "the result" and everyone else's
+ *  second. Order of appearance is the operation's own answer. */
 function preferredResultUrl(urls: string[]): string | null {
-  return urls.find((url) => /docs\.google\.com|drive\.google\.com|sheets?/i.test(url))
-    ?? urls[0]
-    ?? null;
+  return urls[0] ?? null;
 }
 
-function actionLabel(toolName: string, shapeKey: string | undefined): AutonomousSendConsent['actionLabel'] {
-  const action = `${shapeKey ?? ''} ${toolName}`;
-  if (/EMAIL/i.test(action)) return 'email';
-  if (/POST|PUBLISH|TWEET/i.test(action)) return 'post';
-  if (/MESSAGE|SLACK|\bDM\b/i.test(action)) return 'message';
-  return 'send';
+/** Verbs an operation name uses to say WHAT it does. They are the boundary of
+ *  the noun we want, never the noun itself. */
+const OPERATION_VERB_RE = /^(?:create|send|post|publish|add|insert|new|update|patch|put|delete|remove|upsert|write|invite|share|schedule|book|execute|run|submit|append)$/;
+/** Structural filler that carries no meaning for a human reading one line. */
+const OPERATION_FILLER_RE = /^(?:a|an|the|to|for|with|by|of|in|on|v\d+|api|tool|action|operation)$/;
+
+/**
+ * Name the thing being written, in the operation's OWN words.
+ *
+ * This used to ask which product the call belonged to, by matching a regex of
+ * vendor and channel nouns held in the harness. Every new service needed a new
+ * branch, and any service without one got no conversational consent at all. An operation
+ * already says what it acts on; read that instead. `*_CREATE_EVENT` is an
+ * "event", `*_CREATE_RECORD` a "record", `*_SEND_EMAIL` an "email" — with no
+ * vendor, verb list, or tool catalogue held in the harness.
+ *
+ * Falls back to the neutral 'send' when the operation names no object, so an
+ * unreadable name degrades to a correct generic word rather than a wrong one.
+ */
+export function actionLabel(toolName: string, shapeKey: string | undefined): string {
+  const source = `${shapeKey ?? ''} ${toolName}`;
+  const tokens = source
+    .split(/[^A-Za-z0-9]+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length > 1 && !OPERATION_FILLER_RE.test(token));
+  // The object is what trails the last verb: CREATE_CALENDAR_EVENT -> "event".
+  const lastVerb = tokens.map((token) => OPERATION_VERB_RE.test(token)).lastIndexOf(true);
+  const object = lastVerb >= 0 ? tokens.slice(lastVerb + 1) : [];
+  const noun = object.at(-1) ?? '';
+  return noun && noun.length <= 24 ? noun : 'send';
 }
 
 function suppliedPendingAction(
@@ -246,10 +334,16 @@ export function autonomousSendConsent(
   const details = payloadDetails(exactPayload);
   if (details.invalidSubject || details.invalidBody || details.traversalUncertain) return null;
   const label = actionLabel(exactTool, effect.shapeKey);
-  // Conversational consent is intentionally narrower than a formal card. A
-  // single canonical email recipient is reviewable in one sentence; multiple
-  // recipients, or an inferred targetSummary, keep the richer formal surface.
-  const target = details.recipients.length === 1 ? details.recipients[0] : '';
+  // Conversational consent is narrower than a formal card: it must name ONE
+  // unambiguous place the write lands. That is a single recipient where the
+  // operation addresses a person, and the single container it addresses
+  // otherwise — a write with no recipient is not a write with no destination.
+  // Several of either is genuinely a card, not a sentence.
+  const target = details.recipients.length === 1
+    ? details.recipients[0]
+    : details.recipients.length === 0 && details.destinations.length === 1
+      ? details.destinations[0]
+      : '';
   const exactSubject = details.subjects.length === 1 ? details.subjects[0] : null;
   const subject = exactSubject && exactSubject.length <= 180 ? exactSubject : null;
   const pendingPreview = typeof pending?.preview === 'string'
@@ -261,22 +355,69 @@ export function autonomousSendConsent(
       ? (pendingPreview || null)
       : null;
 
-  // An email question that cannot name its exact destination and subject is
-  // not reviewable enough for a bare yes/no reply. Keep the formal card.
-  if (label !== 'email' || !target || !subject || !bodyPreview) return null;
+  // REVIEWABILITY, not product identity.
+  //
+  // This gate used to read `label !== 'email'`, plus an email-shaped subject
+  // and body. Those three conditions meant only one kind of write could ever
+  // get a one-line ask: a record, a calendar invite, a row, a task — none of
+  // them carry a "body", so all of them fell to the formal card no matter how
+  // plainly describable they were. Extending that by noun would mean carrying
+  // a branch per service in a consent path, forever.
+  //
+  // The question a consent surface actually has to answer is not "which
+  // product is this?" — the effect classifier above already settled that this
+  // is an external, mutating, irreversible write, generically, by verb. It is
+  // "can a person judge this in one sentence?" That needs exactly two things:
+  // one unambiguous destination, and enough of the payload to recognise it.
+  // Both are read from whatever fields the operation actually has.
+  // AMBIGUITY fails closed, independently of shape. Several subject or body
+  // candidates in one payload means a nested decoy or a wrapper the traversal
+  // read twice, and there is no way to know which one a person would be saying
+  // yes to. The old gate caught this only as a side effect of requiring
+  // exactly one subject; that requirement is gone, so state the rule directly.
+  if (details.subjects.length > 1 || details.bodies.length > 1) return null;
+  // A COMPOSED MESSAGE must carry its header. This is a shape rule, not a
+  // product rule: a payload with a body is something written to be read, and
+  // "send this body" without naming what it is announces nothing a person can
+  // judge in one sentence. A write with no body — a record, an invite, a row —
+  // has no header to be missing and is described by what it does carry.
+  if (bodyPreview && !subject) return null;
+  const detail = describedPayload(subject, bodyPreview, details);
+  if (!target || !detail) return null;
 
   const resultUrl = preferredResultUrl(details.urls);
   const resultLine = resultUrl
     ? `I’ve got what you needed — here’s the result: ${resultUrl}`
     : 'I’ve finished the reversible work and prepared the last step.';
-  const subjectText = subject ? ` with subject **${subject}**` : '';
   const question = [
     resultLine,
-    `The exact email is ready for **${target}**${subjectText}. Do you want me to send it? Reply **yes** to send this exact version or **no** to leave it unsent.`,
-    `Preview: ${bodyPreview}`,
+    `The exact ${label} is ready for **${target}** — ${detail}. Do you want me to go ahead? `
+    + `Reply **yes** to send this exact version or **no** to leave it unsent.`,
   ].join('\n\n');
 
   return { question, actionLabel: label, target, subject, bodyPreview, resultUrl };
+}
+
+/**
+ * One human-readable line describing what is about to be written, from
+ * whichever fields this operation happens to carry.
+ *
+ * Prefers the operation's own subject/body when they exist (an email reads
+ * best that way), and otherwise falls back to the salient scalar arguments the
+ * call actually named. No field here is specific to a service: a record's
+ * fields, an event's time, a task's title all arrive through the same door.
+ * Returns null when nothing legible can be shown, which keeps the formal card.
+ */
+function describedPayload(
+  subject: string | null,
+  bodyPreview: string | null,
+  details: PayloadDetails,
+): string | null {
+  if (subject && bodyPreview) return `subject **${subject}** — ${bodyPreview}`;
+  if (subject) return `subject **${subject}**`;
+  if (bodyPreview) return bodyPreview;
+  const salient = details.salient.slice(0, 3);
+  return salient.length > 0 ? salient.join(' · ') : null;
 }
 
 /** Freeze a conversational surface only when exact origin and audience are

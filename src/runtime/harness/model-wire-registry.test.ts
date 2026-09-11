@@ -23,7 +23,12 @@ test('registry: live Claude brain (opus 4.8) resolves to anthropic effort + 4096
   assert.equal(cap.supportsEffort, true);
   assert.equal(cap.effortMap.high, 'high');
   assert.equal(cap.effortMap.medium, 'medium');
-  assert.equal(cap.effortMap.none, null, "tier 'none' omits effort (use the model's adaptive default)");
+  assert.equal(
+    cap.effortMap.none,
+    'low',
+    "tier 'none' must map to the enum floor, never null — omitting output_config.effort "
+    + "selects the wire DEFAULT, which is 'high', so omission is the most expensive option",
+  );
   assert.equal(cap.supportsPromptCache, true);
   assert.equal(cap.retryClass, 'anthropic');
 });
@@ -113,4 +118,65 @@ test('layered restore keeps legacy memory-first order and strips both transport 
 
 test('estimateTokens is roughly chars/4', () => {
   assert.equal(estimateTokens('a'.repeat(4000)), 1000);
+});
+
+
+// ─── The effort ladder must not invert ───────────────────────────────────────
+//
+// Live 2026-09-11: tier 'none' mapped to null, meaning "omit output_config".
+// The comment said that let the model use its adaptive default; on this wire
+// the default effort is 'high'. So the cheapest tier the harness can ask for
+// produced the most expensive request on the wire — 3,817 output tokens in
+// 45.6s to emit a 200-character clarifying question, while the SAME model in
+// the SAME session at tier 'medium' answered in 3.3-4.2s per call on larger
+// inputs. Omission is not a cheap default; it is an unasked-for maximum.
+
+const EFFORT_LADDER = ['none', 'minimal', 'low', 'medium', 'high'] as const;
+const WIRE_RANK: Record<string, number> = {
+  low: 1, medium: 2, high: 3, xhigh: 4, max: 5,
+};
+
+test('registry: an effort-capable model never maps a tier to null (omission = provider default)', () => {
+  for (const id of [
+    'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-4-6', 'claude-fable-5', 'claude-sonnet-4-6',
+  ]) {
+    const cap = resolveModelCapability(id);
+    if (!cap.supportsEffort || cap.thinkingMode !== 'effort') continue;
+    for (const tier of EFFORT_LADDER) {
+      assert.notEqual(
+        cap.effortMap[tier],
+        null,
+        `${id} tier '${tier}' omits effort — the wire then picks its own default, `
+        + 'which this harness has not chosen and cannot bound',
+      );
+    }
+  }
+});
+
+test('registry: mapped effort never decreases as the harness tier rises', () => {
+  for (const id of [
+    'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-4-6', 'claude-fable-5', 'claude-sonnet-4-6',
+  ]) {
+    const cap = resolveModelCapability(id);
+    if (!cap.supportsEffort || cap.thinkingMode !== 'effort') continue;
+    let previous = 0;
+    for (const tier of EFFORT_LADDER) {
+      const mapped = cap.effortMap[tier];
+      const rank = WIRE_RANK[String(mapped)] ?? -1;
+      assert.ok(rank > 0, `${id} tier '${tier}' maps to an unknown wire value: ${String(mapped)}`);
+      assert.ok(
+        rank >= previous,
+        `${id} tier '${tier}' maps DOWN the wire ladder — asking for more effort must never ask for less`,
+      );
+      previous = rank;
+    }
+  }
+});
+
+test('registry: a model with no effort knob still maps every tier to null', () => {
+  // The inverse guard. Haiku 4.5 400s on output_config.effort at every level,
+  // so omission is correct there and the null map is the point, not a bug.
+  const cap = resolveModelCapability('claude-haiku-4-5');
+  assert.equal(cap.supportsEffort, false);
+  for (const tier of EFFORT_LADDER) assert.equal(cap.effortMap[tier], null);
 });

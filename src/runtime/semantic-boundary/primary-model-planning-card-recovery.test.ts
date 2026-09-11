@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -495,4 +495,96 @@ test('a first prime whose only card rows are durable same-source disclosures reo
   );
   assert.equal(again.planning.digest, rePrimed.planning.digest);
   assert.equal(eventlog.listEvents(restarted.id, { types: [SNAPSHOT_TYPE] }).length, 1);
+});
+
+// ─── A refusal is evidence ───────────────────────────────────────────────────
+//
+// Live 2026-09-10: a scheduled step re-dispatched every 15s for ten hours and
+// refused priming on all 1,444 attempts. Each dispatch wrote nothing at all —
+// the session's durable trail stopped at the card snapshot and the reason
+// string died at the caller — so ten hours of failure had no shape to find.
+// Priming is the last thing before the first model request, so a refusal here
+// ends the turn with no plan and no dispatch; that is a typed stop, and a typed
+// stop is durable.
+
+const REFUSED_TYPE = 'primary_model_planning_prime_refused' as const;
+
+test('a refused prime records the stage and the exact reason it refused', async () => {
+  const factory = resetFixture();
+  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const { session, source } = freshSource('refusal-evidence');
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+
+  const first = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(first.ok, true, first.ok ? '' : first.reason);
+  assert.equal(eventlog.listEvents(session.id, { types: [REFUSED_TYPE] }).length, 0,
+    'a prime that succeeds records no refusal');
+
+  // Corrupt the frozen card the same way the recovery test above does, so the
+  // reopen refuses on a real durable condition rather than a synthetic one.
+  const db = eventlog.openEventLog();
+  const snapshot = db.prepare('SELECT * FROM events WHERE session_id = ? AND type = ?')
+    .get(session.id, SNAPSHOT_TYPE) as { id: string; data_json: string };
+  const envelope = JSON.parse(snapshot.data_json) as Record<string, unknown>;
+  const corruptedPayload = JSON.stringify({ version: 1 });
+  envelope.snapshotJson = corruptedPayload;
+  envelope.snapshotDigest = sha256(corruptedPayload);
+  db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(envelope), snapshot.id);
+
+  const refused = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(refused.ok, false);
+  if (refused.ok) return;
+
+  const recorded = eventlog.listEvents(session.id, { types: [REFUSED_TYPE] });
+  assert.equal(recorded.length, 1, 'the refusal left exactly one durable row');
+  assert.equal(recorded[0]!.data.sourceUserSeq, source.seq, 'the row names the source that refused');
+  assert.equal(recorded[0]!.data.stage, 'durable_card_reopen', 'the row names WHICH priming step refused');
+  assert.equal(recorded[0]!.data.reason, refused.reason,
+    'the recorded reason is the exact string the caller receives, not a summary');
+
+  // The point of the fix: a step that re-dispatches keeps leaving rows, so ten
+  // hours of the same refusal reads as ten hours of the same refusal.
+  const again = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(again.ok, false);
+  assert.equal(eventlog.listEvents(session.id, { types: [REFUSED_TYPE] }).length, 2,
+    'every refused dispatch is recorded — a repeating failure has to look repeating');
+});
+
+test('a source that was never readable refuses on its own stage', async () => {
+  resetFixture();
+  const session = eventlog.createSession({ id: 'primary-card-no-source', kind: 'chat' });
+  const refused = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: 1,
+  });
+  assert.equal(refused.ok, false);
+  if (refused.ok) return;
+  const recorded = eventlog.listEvents(session.id, { types: [REFUSED_TYPE] });
+  assert.equal(recorded.length, 1, 'a missing accepted source is still evidence, not silence');
+  assert.equal(recorded[0]!.data.stage, 'accepted_source');
+  assert.equal(recorded[0]!.data.reason, refused.reason);
+});
+
+test('every refusal exit of priming routes through the durable recorder (connection pin)', () => {
+  const source = readFileSync(
+    path.resolve('src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts'),
+    'utf8',
+  );
+  const start = source.indexOf('export async function primePrimaryModelPlanningCatalog(');
+  assert.ok(start > 0, 'the primed function still exists under this name');
+  const end = source.indexOf('export async function disclosePrimaryModelPlanningCapabilities(', start);
+  assert.ok(end > start, 'the function boundary is still findable');
+  // From the first statement, so the function's own `{ ok: false }` RETURN TYPE
+  // in the signature is not mistaken for a refusal that skipped the recorder.
+  const bodyStart = source.indexOf('const accepted = listEvents(', start);
+  assert.ok(bodyStart > start && bodyStart < end, 'the body still opens by reading the accepted source');
+  const body = source.slice(bodyStart, end);
+
+  // A bare `ok: false` return is a refusal that leaves no row behind. Route it
+  // through refusePrimaryModelPlanningPrime (or the local `refuse` closure)
+  // instead, and give it a stage.
+  assert.doesNotMatch(body, /ok:\s*false/,
+    'priming must not refuse without recording — use refuse(stage, reason)');
+  assert.match(body, /const refuse = \(stage: PrimaryModelPlanningPrimeStage/,
+    'the local recorder closure is still the one door for refusals');
 });

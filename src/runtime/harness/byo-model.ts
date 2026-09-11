@@ -119,6 +119,32 @@ const downgradedBodies = new WeakSet<object>();
 // records its schema here.
 const downgradedSchemas = new WeakMap<object, unknown>();
 
+/** Backends whose reasoning depth the harness can actually steer. Anything not
+ *  listed here silently runs at its own default once `reasoning_effort` is
+ *  stripped, and that is what gets reported. Keyed on the model id because the
+ *  control is a property of the model family, not of the transport. */
+const COMPAT_EFFORT_STEERABLE = /glm/i;
+
+/** Observed-once-per-body report that the harness chose an effort tier and this
+ *  wire had no way to carry it. Telemetry only — it never touches the body and
+ *  never blocks a turn. */
+function noteDroppedCompatEffort(
+  body: Record<string, unknown>,
+  effort: string | undefined,
+): void {
+  if (!effort) return;
+  const modelId = typeof body.model === 'string' ? body.model : '';
+  if (!modelId || COMPAT_EFFORT_STEERABLE.test(modelId)) return;
+  if (body.thinking != null) return;
+  try {
+    logger.debug(
+      { model: modelId, effort },
+      'harness reasoning-effort tier dropped: this compat backend exposes no reasoning control, so it runs at its own default depth',
+    );
+  } catch { /* telemetry must never block a turn */ }
+}
+
+
 /** Relax a Chat-Completions request body for a generic OpenAI-compatible
  *  backend: strip OpenAI-only fields and downgrade strict json_schema to
  *  json_object + schema-in-prompt. Pure — returns a new object. */
@@ -136,6 +162,17 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
 
   // GLM (Z.ai): drive its `thinking` switch from the (now-stripped) effort tier.
   applyGlmThinking(next, requestedEffort);
+  // Every OTHER compat backend has just had the harness's effort decision
+  // deleted with nothing put in its place, so the brain runs at whatever depth
+  // the backend defaults to. That is a real, invisible latency cost: live
+  // 2026-09-11 a grok-4.6 chat turn spent 130s — including one 77s gap — to
+  // emit 243 visible output tokens, which is the signature of backend-default
+  // reasoning nobody asked for. We do NOT guess a wire parameter here: an
+  // unknown field 400s these backends, and which control (if any) a given
+  // backend accepts has to be verified per provider. But a decision that is
+  // dropped has to SAY it was dropped, or the next person measures a two-minute
+  // turn with no way to see why.
+  noteDroppedCompatEffort(next, requestedEffort);
 
   // Strict compat backends (Moonshot/Kimi) reject ANY assistant message with
   // empty content: `400 Invalid request: the message at position N with role
@@ -352,11 +389,12 @@ async function reAskForJson(
   try {
     const messages = Array.isArray(relaxed.messages) ? [...(relaxed.messages as unknown[])] : [];
     messages.push({ role: 'system', content: instruction });
+    const reAskStartedAt = Date.now();
     const c = (await original({ ...relaxed, stream: false, stream_options: undefined, messages }, options)) as CompatCompletion;
     // This is a real second provider call, not a local repair. Charge it to the
     // same accepted turn so correction cost cannot disappear from efficiency
     // comparisons (and promote its response id into the exact trace).
-    recordByoUsage(c, relaxed.model);
+    recordByoUsage(c, relaxed.model, undefined, reAskStartedAt);
     return c?.choices?.[0]?.message?.content ?? null;
   } catch {
     return null;
@@ -658,8 +696,11 @@ async function wrappedCompletionsCreate(
         const streamOptions = relaxed.stream_options && typeof relaxed.stream_options === 'object' && !Array.isArray(relaxed.stream_options)
           ? relaxed.stream_options as Record<string, unknown>
           : {};
+        const streamStartedAt = Date.now();
         const stream = await original({ ...relaxed, stream_options: { ...streamOptions, include_usage: true } }, options);
-        return liftReasoningStream(stream, (usageChunk) => recordByoUsage(usageChunk, relaxed.model, harnessContext));
+        return liftReasoningStream(stream, (usageChunk) => recordByoUsage(
+          usageChunk, relaxed.model, harnessContext, streamStartedAt,
+        ));
       }
       // This adapter intentionally pays for a full non-streaming completion and
       // only then emits one synthetic SDK chunk. Tell the outer watchdog that a
@@ -692,7 +733,7 @@ async function wrappedCompletionsCreate(
         }
         liftReasoning(completion);
         promoteReasoningFinal(completion);
-        recordByoUsage(completion, relaxed.model);
+        recordByoUsage(completion, relaxed.model, undefined, bufferedRequest.startedAt);
         const msg = completion?.choices?.[0]?.message;
         if (isToolOrEmpty(msg)) {
           repairToolCallArguments(completion, relaxed.tools);
@@ -711,10 +752,11 @@ async function wrappedCompletionsCreate(
       }
     }
 
+    const plainStartedAt = Date.now();
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
     promoteReasoningFinal(completion);
-    recordByoUsage(completion, relaxed.model);
+    recordByoUsage(completion, relaxed.model, undefined, plainStartedAt);
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
       repairToolCallArguments(completion, relaxed.tools);
@@ -739,6 +781,7 @@ function recordByoUsage(
   completion: CompatCompletion,
   fallbackModel?: unknown,
   context: ReturnType<typeof harnessRunContextStorage.getStore> = harnessRunContextStorage.getStore(),
+  startedAt?: number,
 ): void {
   try {
     const u = (completion as { usage?: Record<string, unknown> })?.usage;
@@ -765,6 +808,14 @@ function recordByoUsage(
       outputTokens,
       totalTokens: n(u.total_tokens) || inputTokens + outputTokens,
       responseId: typeof completion.id === 'string' ? completion.id : undefined,
+      // Without this a BYO turn's latency is invisible in the ledger: live
+      // 2026-09-11, 139 calls on one brain recorded no duration at all, and a
+      // 130-second chat turn could only be measured by differencing eventlog
+      // timestamps. A brain whose slowness cannot be seen cannot be compared
+      // against the one it is meant to replace.
+      ...(typeof startedAt === 'number'
+        ? { durationMs: Math.max(0, Date.now() - startedAt) }
+        : {}),
       promptComponents: harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed

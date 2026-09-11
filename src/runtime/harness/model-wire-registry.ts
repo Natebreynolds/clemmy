@@ -228,9 +228,22 @@ export const DEFAULT_CAPABILITY: ModelCapability = {
 
 // Anthropic `output_config.effort` enum is low|medium|high|xhigh|max. We map the
 // harness tiers conservatively (high -> 'high', never xhigh/max, to avoid
-// runaway latency/spend); 'none' omits so the model uses its adaptive default.
+// runaway latency/spend).
+//
+// 'none' maps to 'low', NOT to null. Omitting output_config does not mean
+// "cheapest" on this wire: the parameter defaults to 'high', and on these
+// models thinking runs adaptively whether or not we ask for it. So an omitted
+// effort is the TOP of the range this map deliberately avoids, and the ladder
+// inverts — asking for less used to cost more than asking for 'low'.
+//
+// Measured live 2026-09-11, one mobile chat turn, same model, same session:
+//   tier 'none'   -> omitted  -> 3,817 output tokens in 45.6s (the whole reply
+//                               was a 200-character clarifying question)
+//   tier 'medium' -> 'medium' -> 227-432 output tokens per call, 3.3-4.2s each,
+//                               on LARGER inputs (44-53K vs 42K)
+// 'low' is the floor the enum actually has; there is no 'none' rung to reach.
 const ANTHROPIC_EFFORT_MAP: Record<ReasoningEffort, string | null> = {
-  none: null,
+  none: 'low',
   minimal: 'low',
   low: 'low',
   medium: 'medium',

@@ -433,12 +433,32 @@ export function sessionEstablishedConnectedAccountEmail(input: {
   sessionId: string;
   sourceUserSeq: number;
   connectedEmails: ReadonlySet<string>;
+  /** identity -> the answerable label already shown for that account. */
+  connectedLabels?: Readonly<Record<string, string>>;
 }): string | undefined {
   if (input.connectedEmails.size === 0) return undefined;
+  /** A person naming an ADDRESS is choosing. Only exact addresses count here. */
   const selectedIn = (text: string): string | undefined => (
     connectedAccountExplicitlySelectedInCurrentText({
       text,
       choices: [...input.connectedEmails],
+    })
+  );
+  /**
+   * Clem's own prior reply may name the account by its LABEL, and there it is
+   * a record of which account she actually used — she wrote it after doing the
+   * work. Deliberately NOT applied to the user's prose: an address appearing
+   * in a sentence is nearly always a choice, but a label is an ordinary word.
+   * Over a long conversation "the Scorpion deal" or "Scorpion's numbers" would
+   * accumulate incidental mentions, and one of those must never silently
+   * become the account a write lands in.
+   */
+  const establishedIn = (text: string): string | undefined => (
+    selectedIn(text)
+    ?? uniqueConnectedAccountFromLabel({
+      text,
+      choices: [...input.connectedEmails],
+      labels: input.connectedLabels,
     })
   );
   try {
@@ -466,13 +486,52 @@ export function sessionEstablishedConnectedAccountEmail(input: {
       const presentation = event.data.presentation as { text?: unknown } | undefined;
       const reply = typeof event.data.reply === 'string' ? event.data.reply : '';
       const text = typeof presentation?.text === 'string' ? presentation.text : reply;
-      const selected = selectedIn(text);
+      const selected = establishedIn(text);
       if (selected) fromReplies.add(selected);
     }
     return fromReplies.size === 1 ? [...fromReplies][0] : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * An account named by the LABEL it is known by, rather than by its address.
+ *
+ * Live 2026-09-11: turn 1 answered "your Scorpion calendar" — the label this
+ * account is offered under — and turn 2 asking to book an hour on it could not
+ * use that, because only an exact address counted as established. The user was
+ * asked which of two calendars to use, a question turn 1 had already answered,
+ * and the round trip cost a model call, a question, a reply and a whole extra
+ * turn. Labels are what a person actually says; requiring the address means
+ * requiring people to talk like a database.
+ *
+ * Deliberately strict, because binding the wrong account writes to the wrong
+ * place: the label must be one the host itself offered for a currently
+ * connected identity, it must be distinctive rather than a common word, and
+ * exactly one identity's label may match. Anything else stays unresolved and
+ * the user is asked — which is the behaviour this had before.
+ */
+export function uniqueConnectedAccountFromLabel(input: {
+  text: string;
+  choices: readonly string[];
+  labels?: Readonly<Record<string, string>>;
+}): string | undefined {
+  const labels = input.labels;
+  if (!labels || input.choices.length < 2) return undefined;
+  const text = input.text.toLowerCase();
+  if (!text.trim()) return undefined;
+  const hits = new Set<string>();
+  for (const choice of input.choices) {
+    const identity = normalizedAccountEmail(choice) || choice.trim().toLowerCase();
+    const label = String(labels[identity] ?? labels[choice] ?? '').trim().toLowerCase();
+    // A short label is a word that collides with ordinary prose; an address-
+    // shaped label is already handled by the exact matcher above.
+    if (label.length < 4 || label.includes('@')) continue;
+    const bounded = new RegExp(`(?:^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^a-z0-9]|$)`);
+    if (bounded.test(text)) hits.add(identity);
+  }
+  return hits.size === 1 ? [...hits][0] : undefined;
 }
 
 /** A reply to an offered mailbox list may name the address, or uniquely name
@@ -959,6 +1018,7 @@ export function planningConnectionForOperation(
         sessionId: sessionContext.sessionId,
         sourceUserSeq: sessionContext.sourceUserSeq,
         connectedEmails,
+        connectedLabels: accountChoiceLabels(relevantLiveConnections),
       })
     : undefined;
   const identityHint = currentSelectionHint

@@ -12891,7 +12891,7 @@ async function runConversationFromResumeCore(opts: {
   };
 
   // Step 1: resume the paused approval.
-  const firstResult = await resumePendingApproval({
+  let firstResult = await resumePendingApproval({
     agent: opts.agent,
     sessionId: opts.sessionId,
     runAttemptId: opts.runAttemptId,
@@ -12950,7 +12950,83 @@ async function runConversationFromResumeCore(opts: {
     };
   }
 
+  // A committed 'continue' checkpoint is adopted by the NEXT activation, never
+  // re-run in place. runConversation takes that hop itself
+  // (checkpointContinuationIsReady) "so a committed recovered frame does not
+  // wait for the next restart tick" — but the approval resume is a SEPARATE
+  // entry point that never passes through runConversation, so its held frame
+  // waited for exactly that restart tick.
+  //
+  // Live 2026-09-11, reproduced on two different brains an hour apart: the user
+  // approved a calendar write, the resume held with a ready checkpoint, and the
+  // run emitted `run_paused` and then nothing at all — 36 minutes on one brain,
+  // 5+ on the other, with the approval already consumed and no event explaining
+  // the silence. The approval is spent exactly once, so the hop has to happen
+  // here or the approved work is simply lost.
+  //
+  // Bounded to ONE re-entry, exactly like runConversation's.
+  if (
+    firstResult.status === 'held'
+    && activeSourceUserSeq
+    && checkpointContinuationIsReady(
+      { status: 'held', hold: firstResult.hold },
+      { sessionId: opts.sessionId, sourceUserSeq: activeSourceUserSeq },
+    )
+  ) {
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: lastTurn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'approval_resume_checkpoint_continued',
+        reason: 'committed continue checkpoint adopted by the next activation',
+        approvalId: opts.approvalId ?? null,
+        sourceUserSeq: activeSourceUserSeq,
+        path: 'approval_resume',
+      },
+    });
+    const continued = await runTurn({
+      agent: opts.agent,
+      sessionId: opts.sessionId,
+      input: resumeContinuationInput,
+      suppressMemoryCapture: true,
+      internalContinuation: true,
+      sourceUserSeq: activeSourceUserSeq,
+      runAttemptId: opts.runAttemptId,
+      ...(opts.deferToolCallsLimitTerminal
+        ? { deferToolCallsLimitTerminal: true as const }
+        : {}),
+      maxTurns,
+      toolCallsPerTurn,
+      makeRunner: opts.makeRunner,
+      runRunner: opts.runRunner,
+    });
+    lastTurn = continued.turn;
+    firstResult = continued;
+  }
+
   if (firstResult.status !== 'completed') {
+    // A hold that reaches here owns no further wake on this path. Say so
+    // durably: the approval was consumed, and a silent park is how an approved
+    // write disappears without anyone being able to see that it did.
+    if (firstResult.status === 'held') {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'approval_resume_held_without_wake',
+          reason: firstResult.hold?.reason ?? 'unknown',
+          wake: firstResult.hold?.wake ?? null,
+          approvalId: opts.approvalId ?? null,
+          sourceUserSeq: activeSourceUserSeq ?? null,
+          checkpointReady: false,
+          path: 'approval_resume',
+        },
+      });
+    }
     return {
       sessionId: opts.sessionId,
       status: firstResult.status,

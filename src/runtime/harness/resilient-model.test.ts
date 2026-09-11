@@ -79,8 +79,22 @@ test('translateSettings: anthropic effort tier -> providerOptions.anthropic.effo
   assert.equal(pd.providerOptions.anthropic.effort, 'high');
 });
 
-test("translateSettings: tier 'none' omits effort (no key written)", () => {
+test("translateSettings: tier 'none' writes the enum floor, it does not omit", () => {
+  // Omitting output_config.effort does not mean "cheapest" — the wire default
+  // is 'high'. Live 2026-09-11 that made the harness's most common interactive
+  // tier the most expensive request it could send (3,817 output tokens / 45.6s
+  // for a 200-character question). 'low' is the floor the enum actually has.
   const r = translateSettings(req({ modelSettings: { reasoning: { effort: 'none' } } }), CLAUDE_CAP);
+  const pd = (r.modelSettings as { providerData?: any }).providerData ?? {};
+  assert.equal(pd?.providerOptions?.anthropic?.effort, 'low');
+});
+
+test('translateSettings: a cap with no effort knob still writes no key', () => {
+  // The function-level guarantee: a null mapping omits. That is correct for a
+  // model that 400s on output_config.effort at every level — it is only wrong
+  // when a model HAS the knob and we decline to use it.
+  const haiku = resolveModelCapability('claude-haiku-4-5');
+  const r = translateSettings(req({ modelSettings: { reasoning: { effort: 'none' } } }), haiku);
   const pd = (r.modelSettings as { providerData?: any }).providerData ?? {};
   assert.equal(pd?.providerOptions?.anthropic?.effort, undefined);
 });

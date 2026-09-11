@@ -143,9 +143,14 @@ test('the body carries the model, bounded max_tokens, system, tools and stream',
 });
 
 test('effort rides output_config only when the wire takes it', () => {
-  // The classifier rates most turns 'simple', which maps to null and omits the
-  // knob — that omission is what left thinking invisible on the ai-sdk path.
-  assert.equal(anthropicOutputConfig(request({ modelSettings: { reasoning: { effort: 'none' } } as never }), SONNET), undefined);
+  // The classifier rates most turns 'simple'. That tier used to map to null and
+  // omit the knob; omission selects the wire DEFAULT ('high'), so the cheapest
+  // thing the harness could ask for produced the most expensive request it
+  // could send. It now maps to the enum floor instead.
+  assert.deepEqual(
+    anthropicOutputConfig(request({ modelSettings: { reasoning: { effort: 'none' } } as never }), SONNET),
+    { effort: 'low' },
+  );
   assert.deepEqual(anthropicOutputConfig(request({ modelSettings: { reasoning: { effort: 'medium' } } as never }), SONNET), { effort: 'medium' });
   // translateSettings speaks provider-level; that wins.
   assert.deepEqual(

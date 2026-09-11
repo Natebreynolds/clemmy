@@ -316,6 +316,51 @@ interface AcceptedGatewayTurn {
  * key: a transport retry reuses the exact accepted source rather than creating
  * a second logical turn and repeating its side effect.
  */
+/**
+ * Who is being asked, and in which conversation — stamped on every accepted
+ * gateway source.
+ *
+ * Anything that needs to address a person durably (the conversational consent
+ * surface is the one that bit us) requires both. Until now exactly one channel
+ * stamped them: the one that happened to build them inline. Every other
+ * surface produced sources with no audience at all, so a capability that reads
+ * them silently degraded to its fallback there and looked broken in a way no
+ * error ever named. Live 2026-09-11: a one-line consent ask was unreachable
+ * from mobile for this reason alone.
+ *
+ * Identity is a property of the SESSION, which every surface already
+ * populates, so it is read from there rather than asked of each channel. The
+ * request may override when a caller knows better (authenticated owner
+ * control); nothing is invented when neither knows.
+ */
+function gatewayAudienceIdentity(request: GatewayRequest): {
+  userId?: string;
+  conversationKey?: string;
+} {
+  const session = getHarnessSession(request.sessionId);
+  const userId = (
+    request.reviewedPlanOwnerControl?.conversationPrincipalId
+    ?? request.userId
+    ?? session?.userId
+    ?? ''
+  ).trim();
+  const channel = (request.channel ?? session?.channel ?? request.source ?? '').trim();
+  const channelId = typeof session?.metadata?.channelId === 'string'
+    ? session.metadata.channelId.trim()
+    : '';
+  // The conversation, not the turn: a key that changed per message would make
+  // every ask a different conversation and match nothing.
+  const conversationKey = channel && channelId
+    ? `${channel}:${channelId}`
+    : channel
+      ? `${channel}:${request.sessionId}`
+      : '';
+  return {
+    ...(userId ? { userId } : {}),
+    ...(conversationKey ? { conversationKey } : {}),
+  };
+}
+
 function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGatewayTurn {
   ensureGatewayHarnessSession(request);
   const previous = getLatestRunAttemptByRunId(request.sessionId, runId);
@@ -344,6 +389,7 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
 
   const admit = (): AcceptedGatewayTurn => {
     const attempt = beginRunAttempt(request.sessionId, { runId });
+    const audience = gatewayAudienceIdentity(request);
     const source = recordRunAttemptUserInput(attempt, {
       turn: 1,
       role: 'user',
@@ -352,8 +398,10 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
         displayText: request.message,
         ...taskModeFields(request.taskMode),
         runId,
-        ...(request.reviewedPlanOwnerControl ? { reviewedPlanOwnerControl: request.reviewedPlanOwnerControl,
-          userId: request.reviewedPlanOwnerControl.conversationPrincipalId } : {}),
+        ...(request.reviewedPlanOwnerControl
+          ? { reviewedPlanOwnerControl: request.reviewedPlanOwnerControl }
+          : {}),
+        ...audience,
         attemptId: attempt.attemptId,
         source: `gateway:${request.source ?? 'gateway'}`,
       },
