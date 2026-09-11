@@ -673,3 +673,87 @@ test('an answered "which account?" becomes the toolkit\'s remembered read defaul
   });
   assert.equal(write.kind, 'account_selection_required', 'a remembered READ default never routes a write');
 });
+
+test('a model-invented identity that matches NO connected account is discarded, not promoted into "that account is gone"', async () => {
+  // Live 2026-09-11: googledocs had exactly ONE active connection carrying no
+  // email identity at all, so no address could ever have matched it. The model
+  // nominated an address it had invented, quoting only the pasted document
+  // URL. The owner's own document went unread behind an account question whose
+  // single option was an opaque connection id.
+  //
+  // Provenance is the distinction. A guess that names nothing live must land
+  // exactly where a null nomination lands — never on a false claim about what
+  // the owner has connected.
+  const single = [
+    { slug: 'googledocs', connectionId: 'ca_fixture_docs', status: 'ACTIVE', accountEmail: undefined },
+  ] as typeof connections;
+  const calls = installJudge();
+  const read = await routing.resolveSourceAccountRouting({
+    ...source('Read https://docs.example.invalid/document/d/FIXTURE/edit and plan from it'),
+    toolkit: 'googledocs',
+    operation: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+    connections: single,
+    nomination: { toolkit: 'googledocs', identity: 'invented@nobody.invalid', source_quote: 'https://docs.example.invalid/document/d/FIXTURE/edit' },
+    effect: 'read',
+  });
+  assert.equal(read.kind, 'resolved', `a guess matching nothing must fall back to ordinary resolution: ${JSON.stringify(read)}`);
+  if (read.kind === 'resolved') {
+    assert.equal(read.connection.connectionId, 'ca_fixture_docs');
+    assert.equal(read.evidence.judgeModelIdentity, 'host:read_single_account',
+      'it resolves on the single connected account, exactly as a null nomination would');
+  }
+  assert.equal(calls.length, 0, 'discarding a guess must not spend a judge call');
+
+  // THE ENTAILMENT CHECK IS NOT LOOSENED. A nomination that DOES name a live
+  // identity still earns its full review, and an unentailed quote still blocks.
+  const unentailed = installJudge(() => ({ verdict: 'not_entailed' as const }));
+  const write = await routing.resolveSourceAccountRouting({
+    ...source('Put these in my Outlook straps folder'),
+    toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'Put these in my Outlook straps folder' },
+    effect: 'write',
+  });
+  assert.equal(write.kind, 'account_selection_required');
+  if (write.kind === 'account_selection_required') assert.equal(write.reason, 'not_entailed');
+  assert.equal(unentailed.length, 1, 'a nomination naming a LIVE identity is still reviewed');
+
+  // And a guess among SEVERAL accounts still asks — discarding never invents a pick.
+  const ambiguous = await routing.resolveSourceAccountRouting({
+    ...source('Draft that reply'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: 'invented@nobody.invalid', source_quote: 'Draft that reply' },
+    effect: 'write',
+  });
+  assert.equal(ambiguous.kind, 'account_selection_required',
+    'two connected mailboxes and no real selection: the host still asks');
+});
+
+test('an account the OWNER named that is no longer connected still asks — it is not a guess to discard', async () => {
+  // The line between the two. A model invention that matches nothing is
+  // discarded because the owner never said it. An account the owner DID name,
+  // which has since been disconnected, is still their choice: silently using
+  // whatever else is connected would act as a different identity than the one
+  // they asked for. That is the wrong-account mistake, not a recovery from it.
+  installJudge();
+  const soleSurvivor = [
+    { slug: 'outlook', connectionId: 'fixture-personal', status: 'ACTIVE', accountEmail: PERSONAL },
+  ] as typeof connections;
+  const removed = await routing.resolveSourceAccountRouting({
+    ...source(`Read the calendar on ${SCORPION} please`),
+    toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW', connections: soleSurvivor,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: `Read the calendar on ${SCORPION}` },
+    effect: 'read',
+  });
+  assert.equal(removed.kind, 'account_selection_required',
+    'the owner named this mailbox; its absence is a real question, never a sole-account default');
+
+  // Same shape, but the identity appears nowhere in the owner's words: a guess.
+  const invented = await routing.resolveSourceAccountRouting({
+    ...source('Read my calendar please'),
+    toolkit: 'outlook', operation: 'OUTLOOK_GET_CALENDAR_VIEW', connections: soleSurvivor,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'Read my calendar please' },
+    effect: 'read',
+  });
+  assert.equal(invented.kind, 'resolved',
+    'the same absent identity, never spoken by the owner, is discarded rather than reported gone');
+  if (invented.kind === 'resolved') assert.equal(invented.connection.connectionId, 'fixture-personal');
+});

@@ -309,7 +309,50 @@ export async function resolveSourceAccountRouting(input: {
     ? SourceAccountNominationSchema.safeParse(input.nomination)
     : null;
   if (supplied && !supplied.success) return blocked();
-  const nomination = supplied?.success ? supplied.data : null;
+  // A MODEL-SUPPLIED IDENTITY IS A HINT, NOT EVIDENCE.
+  //
+  // Provenance is the whole distinction. A durable alias, the owner's own
+  // words, a reply to an offered choice, and Tool Memory are all things the
+  // OWNER established. `account_selection.identity` invented by the model
+  // in-turn is none of them — and when it names no live connected identity for
+  // this toolkit, it is a guess about the owner's connections that the owner
+  // never made. Promoting it into a blocked selection converts "the model
+  // guessed wrong" into "the account this action expects is gone", which is a
+  // false claim about what is connected AND an unanswerable question when
+  // there was no choice to make in the first place.
+  //
+  // Live 2026-09-11: googledocs had exactly ONE active connection
+  // (`ca_P57D3YdQqviX`) carrying no email identity at all, so no email could
+  // ever have matched it. The model nominated an address it had invented,
+  // quoting only the pasted document URL, and the owner's own document went
+  // unread behind an account question with a single opaque option.
+  //
+  // So: discard the guess and resolve exactly as if none had been offered —
+  // one connected account resolves, several still ask. This loosens NOTHING.
+  // The entailment check below is untouched and still refuses to bind an
+  // account the accepted wording does not name; a nomination that MATCHES a
+  // live identity still earns its full review. Discarding only ever lands on
+  // the same route a null nomination would have taken.
+  // Two things have to be true before a nomination is discarded, and the
+  // second is what keeps a REMOVED account honest. An account the owner named
+  // that has since been disconnected is still the owner's choice: falling back
+  // to whatever else is connected would operate as a different identity than
+  // the one they asked for, which is the whole mistake this guard prevents.
+  // So a nomination is discarded ONLY when it names nothing live AND the
+  // owner's own words never named it either — model invention with no
+  // counterpart in the conversation and none among the connections.
+  const nominatedIdentity = supplied?.success ? supplied.data.identity.trim() : '';
+  const nominationNamesALiveIdentity = supplied?.success
+    && relevant.some((connection) => connection.connectionId === nominatedIdentity
+      || emailOf(connection) === nominatedIdentity.toLowerCase());
+  const ownersWordsNameTheIdentity = supplied?.success
+    && nominatedIdentity.length > 0
+    && (source.text.toLowerCase().includes(nominatedIdentity.toLowerCase())
+      || supplied.data.source_quote.toLowerCase().includes(nominatedIdentity.toLowerCase()));
+  const nomination = supplied?.success
+    && (nominationNamesALiveIdentity || ownersWordsNameTheIdentity)
+    ? supplied.data
+    : null;
   const latest = newestEstablishedRoute({ ...input, principalId, toolkit });
   if (!nomination && latest === 'conflict') return blocked();
   let established = !nomination && latest !== 'conflict' ? latest : null;
