@@ -189,10 +189,10 @@ export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
 }
 
 /**
- * A provider OPERATION, not a tool: OUTLOOK_LIST_MESSAGES, GOOGLESHEETS_BATCH_GET.
- * Spelled UPPER_SNAKE everywhere in this codebase, and reached THROUGH the
- * composio gateway rather than preloaded as its own tool object — which is
- * exactly what the blocklist comment above says.
+ * A provider OPERATION, not a tool. Operation names are spelled UPPER_SNAKE
+ * everywhere in this codebase, and are reached THROUGH the composio gateway
+ * rather than preloaded as their own tool object — which is exactly what the
+ * blocklist comment above says. Matched by SHAPE: no service is pinned here.
  */
 function namesAProviderOperation(entry: string): boolean {
   return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(entry);
@@ -203,12 +203,12 @@ function namesAProviderOperation(entry: string): boolean {
  * operations must keep it, or the step is left holding a list of things it
  * cannot call.
  *
- * Live 2026-09-11: Clem authored scorpion-inbox-triage with
- * `allowedTools: [OUTLOOK_LIST_MESSAGES]` — the honest, obvious thing to write —
- * and the lock filtered by TOOL NAME, so composio_execute_tool was stripped and
- * the step was left with the six structural baseline channels and no way to
- * reach Outlook. It failed twelve consecutive scheduled runs, every thirty
- * minutes, never having been able to run at all. The blocklist above warns
+ * Live 2026-09-11: a scheduled inbox triage was authored naming its read
+ * operation in allowedTools — the honest, obvious thing to write — and the lock
+ * filtered by TOOL NAME, so the composio gateway was stripped and the step was
+ * left with the six structural baseline channels and no way to reach the
+ * mailbox. It failed twelve consecutive scheduled runs, every thirty minutes,
+ * never having been able to run at all. The blocklist above warns
  * about this in its own words ("it broke outlook-triage-hourly by removing
  * composio_status"); the per-step lock reintroduced the same anti-pattern one
  * level down. Naming what you want must never remove what performs it.

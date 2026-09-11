@@ -181,8 +181,15 @@ test('a step settled unsupported_capability cannot project a succeeded run, what
   assert.deepEqual(row, { state: 'settled', outcome_kind: 'unsupported_capability' });
 
   const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as TerminalRunRecord;
-  assert.equal(terminal.status && ['completed', 'completed_with_errors', 'error'].includes(terminal.status), true,
-    `fixture precondition: the run reached a business terminal, got ${terminal.status}`);
+  // 'blocked' joined this list on 2026-09-11: a run whose required work was
+  // blocked now reports blocked instead of completed. It is still a business
+  // terminal (TERMINAL_RUN_RECORD_STATUSES), and it satisfies this test's real
+  // target more strongly — the point is that the run may not project SUCCEEDED.
+  assert.equal(
+    terminal.status && ['completed', 'completed_with_errors', 'error', 'blocked'].includes(terminal.status),
+    true,
+    `fixture precondition: the run reached a business terminal, got ${terminal.status}`,
+  );
 
   // TARGET — the projected run outcome may not be 'succeeded' while the only
   // settled call of its only step is unsupported_capability.
@@ -625,7 +632,11 @@ test('a settlement-audit downgrade still converges the shared RunRecord to termi
   }
 
   const durable = JSON.parse(readFileSync(runFile, 'utf-8')) as TerminalRunRecord;
-  assert.equal(durable.status, 'completed', 'fixture precondition: the workflow file published a business terminal');
+  assert.equal(
+    ['completed', 'blocked'].includes(String(durable.status)),
+    true,
+    `fixture precondition: the workflow file published a business terminal, got ${durable.status}`,
+  );
   assert.equal(durable.needsAttention, true, 'the unresolved write must downgrade clean completion');
   const shared = getRun(runId);
   assert.equal(
