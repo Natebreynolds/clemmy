@@ -8,7 +8,7 @@
  * inside the card while live, and a results-first one-liner once settled.
  * Batch meters and the read-result peek keep the shared row primitives.
  */
-import { useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, X, AlertCircle, Send, Zap, Users } from 'lucide-react';
 import { cn } from '@/lib/cn';
@@ -42,15 +42,17 @@ function StepIcon({ a, live }: { a: ActivityItem; live: boolean }) {
 function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live: boolean; nested?: boolean }) {
   const running = live && a.status === 'running';
   const [peek, setPeek] = useState<boolean | null>(null);
-  const showExcerpt = Boolean(a.excerpt) && (peek ?? live);
+  // While live, only the current step opens its excerpt — auto-opening every
+  // peek produced a stack of empty boxes and hid the work.
+  const showExcerpt = Boolean(a.excerpt) && (peek ?? running);
   const elapsed = stepElapsed(a, now, live);
   const right = elapsed || (a.repeats && a.repeats > 1 ? `×${a.repeats}` : '');
   return (
     <li className={cn('grid grid-cols-[18px_1fr_auto] items-start gap-x-2.5 py-1.5', nested && 'ml-7')}>
       <StepIcon a={a} live={live} />
       <span className="min-w-0">
-        <span className={cn('block truncate text-body', running ? 'font-semibold text-fg' : a.kind === 'agent' ? 'font-medium text-fg' : 'text-muted')}>{a.label}</span>
-        {a.detail && <span className="block truncate font-mono text-caption text-faint">{a.detail}</span>}
+        <span className={cn('block text-body', running ? 'font-semibold text-fg' : a.kind === 'agent' ? 'truncate font-medium text-fg' : 'truncate text-muted')}>{a.label}</span>
+        {a.detail && <span className={cn('block font-mono text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.detail}</span>}
         {showExcerpt && (
           <pre className="mt-1 max-h-36 overflow-y-auto whitespace-pre-wrap rounded-sm bg-subtle px-2.5 py-2 font-sans text-caption leading-relaxed text-muted">{a.excerpt}</pre>
         )}
@@ -62,6 +64,34 @@ function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live:
         {right}
       </span>
     </li>
+  );
+}
+
+/** While live, stay pinned to the newest step so the current action never
+ *  sits below the fold. Scroll up to inspect history; returning to the
+ *  bottom re-engages the pin. */
+function LiveStepList({ live, children }: { live: boolean; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const pinnedRef = useRef(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !live || !pinnedRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [children, live]);
+  return (
+    <div
+      ref={ref}
+      role={live ? 'log' : undefined}
+      aria-live={live ? 'polite' : undefined}
+      aria-relevant={live ? 'additions text' : undefined}
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+      }}
+      className={cn(live && 'max-h-[min(22rem,50vh)] overflow-y-auto')}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -133,24 +163,26 @@ export function ActivityCard({
         {clock && <span className="shrink-0 font-mono text-caption tabular-nums text-faint">{clock}</span>}
       </header>
       {view.length > 0 && (
-        <ol className="relative mx-4 mb-1 list-none p-0 before:absolute before:bottom-3 before:left-[8.5px] before:top-2 before:w-px before:bg-border-strong/60">
-          {top.map((a) => (
-            a.kind === 'batch'
-              ? <BatchRow key={a.id} a={a} now={now} live={live} />
-              : (
-                <li key={a.id} className="list-none">
-                  <ol className="list-none p-0"><StepRow a={a} now={now} live={live} /></ol>
-                  {children.get(a.id) && (
-                    <ol className="list-none p-0">
-                      {children.get(a.id)!.map((c) => <StepRow key={c.id} a={c} now={now} live={live} nested />)}
-                    </ol>
-                  )}
-                </li>
-              )
-          ))}
-        </ol>
+        <LiveStepList live={live}>
+          <ol className="relative mx-4 mb-1 list-none p-0 before:absolute before:bottom-3 before:left-[8.5px] before:top-2 before:w-px before:bg-border-strong/60">
+            {top.map((a) => (
+              a.kind === 'batch'
+                ? <BatchRow key={a.id} a={a} now={now} live={live} />
+                : (
+                  <li key={a.id} className="list-none">
+                    <ol className="list-none p-0"><StepRow a={a} now={now} live={live} /></ol>
+                    {children.get(a.id) && (
+                      <ol className="list-none p-0">
+                        {children.get(a.id)!.map((c) => <StepRow key={c.id} a={c} now={now} live={live} nested />)}
+                      </ol>
+                    )}
+                  </li>
+                )
+            ))}
+          </ol>
+        </LiveStepList>
       )}
-      {live && (progress || view.length === 0) && (
+      {live && !anyRunning && (
         <p className="flex items-start gap-2.5 px-4 pb-3 pt-1 text-body italic text-muted">
           <Spinner className="mt-1.5" />
           <span className="min-w-0">{progress ?? 'Thinking…'}</span>

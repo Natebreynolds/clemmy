@@ -5,16 +5,23 @@ import type { ActivityItem } from './useChat.js';
 
 const row = (over: Partial<ActivityItem>): ActivityItem => ({ id: 't1', kind: 'tool', label: 'Read Salesforce', status: 'done', ...over });
 
-test('live head says what is happening and names running helpers', () => {
-  const head = activityCardHead([
+test('live head names the current step, then helpers if nothing is in flight', () => {
+  const current = activityCardHead([
+    row({ id: 'a', status: 'done', startedAt: 1000, finishedAt: 2400 }),
+    row({ id: 't', label: 'Reading the inbox', status: 'running', startedAt: 2500 }),
+  ], true, 5000);
+  assert.equal(current.title, 'Reading the inbox');
+  assert.equal(current.running, 1);
+
+  const helpers = activityCardHead([
     row({ id: 'a', status: 'done', startedAt: 1000, finishedAt: 2400 }),
     row({ id: 'h', kind: 'agent', label: 'Researcher', status: 'running', startedAt: 2000 }),
   ], true, 5000);
-  assert.equal(head.title, 'Working with 1 helper');
-  assert.equal(head.running, 1);
-  assert.equal(head.helpers, 1);
-  assert.equal(head.startedAt, 1000);
-  assert.equal(head.totalMs, undefined, 'a live turn has no total yet');
+  assert.equal(helpers.title, 'Researcher');
+  assert.equal(helpers.running, 1);
+  assert.equal(helpers.helpers, 1);
+  assert.equal(helpers.startedAt, 1000);
+  assert.equal(helpers.totalMs, undefined, 'a live turn has no total yet');
 });
 
 test('a settled head leads with results and carries the total elapsed', () => {

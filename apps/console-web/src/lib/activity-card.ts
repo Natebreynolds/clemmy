@@ -55,10 +55,14 @@ export function activityCardHead(view: readonly ActivityItem[], live: boolean, n
   const ends = view.map((row) => row.finishedAt).filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
   const settled = !live && startedAt !== undefined && ends.length > 0;
   const totalMs = settled ? Math.max(0, Math.max(...ends) - startedAt) : undefined;
+  const current = live
+    ? [...view].reverse().find((row) => row.status === 'running')
+    : undefined;
   const title = live
-    ? (runningHelpers > 0
-      ? `Working with ${runningHelpers} helper${runningHelpers > 1 ? 's' : ''}`
-      : 'Working on it')
+    ? (current?.label
+      || (runningHelpers > 0
+        ? `Working with ${runningHelpers} helper${runningHelpers > 1 ? 's' : ''}`
+        : 'Working on it'))
     : summarizeActivity(view);
   void now;
   return { title, running, helpers, startedAt, totalMs };

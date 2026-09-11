@@ -2,6 +2,8 @@ import { Link } from 'react-router-dom';
 import type { ActivityEntry } from '@/lib/activity';
 import { workingNowStatusLabel, type WorkingNowView } from '@/lib/activity-presentation';
 import { cn } from '@/lib/cn';
+import { ActivityCard } from '@/components/chat/ActivityCard';
+import { sessionActivityLive, useSessionActivity, useWorkflowRunActivity } from '@/lib/session-activity';
 import {
   runningKindLabel,
   runningMeta,
@@ -12,6 +14,24 @@ import {
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
 const MAX_ROWS = 4;
+
+/** The lead in-flight run streams into the same ActivityCard chat uses, so
+ *  a workflow on Home is not a headline with no work underneath. */
+function LiveRunFeed({ entry }: { entry: ActivityEntry }) {
+  const workflow = useWorkflowRunActivity(entry.kind === 'workflow' ? (entry.runId ?? null) : null);
+  const session = useSessionActivity(entry.kind === 'workflow' ? null : (entry.sessionId ?? null));
+  const state = entry.kind === 'workflow' ? workflow : session;
+  const live = sessionActivityLive(state, entry.liveness === 'live');
+  if (state.items.length === 0 && !state.progress) return null;
+  return (
+    <ActivityCard
+      items={state.items}
+      live={live}
+      progress={state.progress}
+      className="border-0 bg-subtle/70 shadow-none"
+    />
+  );
+}
 
 const ACTION =
   'inline-flex h-8 items-center rounded-md px-3 text-small font-semibold transition-colors';
@@ -48,6 +68,7 @@ export function RunningPane({
   const rows = [...inFlight, ...stalled];
   const visible = rows.slice(0, MAX_ROWS);
   const overflow = rows.length - visible.length;
+  const leadLiveKey = inFlight[0]?.entry.runKey;
 
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
@@ -115,6 +136,7 @@ export function RunningPane({
                       <div className="h-full rounded-full bg-primary transition-[width] duration-slow" style={{ width: `${percent}%` }} />
                     </div>
                   )}
+                  {entry.runKey === leadLiveKey && <LiveRunFeed entry={entry} />}
                   <div className="flex flex-wrap items-center gap-2">
                     {/* Steering means typing into a live conversation. A run
                         that stopped days ago has nothing to steer, so the
