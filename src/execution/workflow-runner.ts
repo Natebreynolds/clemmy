@@ -15201,7 +15201,20 @@ async function processOneRunFile(
       }
       const terminalProjection: QueuedRunRecord = {
         ...run,
-        status: hasForEachFailures ? 'completed_with_errors' : 'completed',
+        // A run whose required work was BLOCKED is not completed. blockedSteps
+        // exists for exactly this ("prevents a mechanically-finished completed
+        // run from masquerading as successful when required work blocked") but
+        // the status ignored it, so a run where every step was blocked wrote
+        // status: 'completed' and summarised itself as "completed 3 steps".
+        // Live 2026-09-11: scorpion-inbox-triage failed twelve consecutive runs
+        // this way — the ledger and the owner's Slack/Discord notices were the
+        // only honest channels, while the record, the board, the API and a
+        // reviewing agent all read "completed" and concluded the engine was
+        // healthy. Every downstream judgement inherits this field; it has to be
+        // the truth before anything else can be trusted.
+        status: blockedSteps.length > 0
+          ? 'blocked'
+          : hasForEachFailures ? 'completed_with_errors' : 'completed',
         finishedAt: terminalFinishedAt,
         stepOutputs: runRecordStepOutputs,
         output: finalOutput,
@@ -15372,7 +15385,15 @@ async function processOneRunFile(
         ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
         : (targetVerdict?.judged && targetVerdict.reached)
           ? 'reached the workflow target'
-          : `completed ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}`;
+          : (() => {
+          // Count what RAN, not what was scheduled: a skipped-upstream step is
+          // not a step this run completed.
+          const executed = publicExecutionSteps.length - blockedSteps.length;
+          return blockedSteps.length > 0
+            ? `completed ${Math.max(0, executed)} of ${publicExecutionSteps.length} steps — `
+              + `${blockedSteps.length} blocked (${blockedSteps.map((b) => b.stepId).join(', ')})`
+            : `completed ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}`;
+        })();
       const producedItems = [
         runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
         ...runArtifacts.files,

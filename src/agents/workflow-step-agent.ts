@@ -188,21 +188,58 @@ export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
   return !allowed.some((a) => typeof a === 'string' && (a === '*' || a === '**' || a.trim() === ''));
 }
 
+/**
+ * A provider OPERATION, not a tool: OUTLOOK_LIST_MESSAGES, GOOGLESHEETS_BATCH_GET.
+ * Spelled UPPER_SNAKE everywhere in this codebase, and reached THROUGH the
+ * composio gateway rather than preloaded as its own tool object — which is
+ * exactly what the blocklist comment above says.
+ */
+function namesAProviderOperation(entry: string): boolean {
+  return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(entry);
+}
+
+/**
+ * The gateway an operation is actually executed through. A lock that names
+ * operations must keep it, or the step is left holding a list of things it
+ * cannot call.
+ *
+ * Live 2026-09-11: Clem authored scorpion-inbox-triage with
+ * `allowedTools: [OUTLOOK_LIST_MESSAGES]` — the honest, obvious thing to write —
+ * and the lock filtered by TOOL NAME, so composio_execute_tool was stripped and
+ * the step was left with the six structural baseline channels and no way to
+ * reach Outlook. It failed twelve consecutive scheduled runs, every thirty
+ * minutes, never having been able to run at all. The blocklist above warns
+ * about this in its own words ("it broke outlook-triage-hourly by removing
+ * composio_status"); the per-step lock reintroduced the same anti-pattern one
+ * level down. Naming what you want must never remove what performs it.
+ */
+const PROVIDER_OPERATION_CARRIERS: readonly string[] = Object.freeze([
+  'composio_execute_tool',
+  'composio_status',
+]);
+
 /** Build a name predicate from an explicit allowedTools list: an entry ending
  *  in '*' is a prefix family (e.g. 'composio_*'); otherwise an exact name. The
- *  structural baseline is always allowed. */
+ *  structural baseline is always allowed, and so is the carrier for any
+ *  provider operation the list names. */
 export function makeStepToolAllow(
   allowed: string[],
   includeLegacyStructuralBaseline = true,
 ): (name: string) => boolean {
   const exact = new Set<string>();
   const prefixes: string[] = [];
+  let namesAnOperation = false;
   for (const a of allowed) {
     const t = typeof a === 'string' ? a.trim() : '';
     if (!t || t === '*') continue;
     if (t.endsWith('*')) prefixes.push(t.slice(0, -1));
-    else exact.add(t);
+    else {
+      exact.add(t);
+      if (namesAProviderOperation(t)) namesAnOperation = true;
+    }
   }
+  // Keep the carrier for whatever operations were named.
+  if (namesAnOperation) for (const carrier of PROVIDER_OPERATION_CARRIERS) exact.add(carrier);
   return (name: string) =>
     (includeLegacyStructuralBaseline && STEP_STRUCTURAL_BASELINE_TOOLS.has(name)) ||
     exact.has(name) ||

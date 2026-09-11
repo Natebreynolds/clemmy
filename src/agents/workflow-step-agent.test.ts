@@ -490,3 +490,34 @@ test('an explicitly locked step seals an envelope covering exactly its surface a
   assert.deepEqual([...revision!.bound].sort(), activeNames, 'the revision binds exactly the locked surface');
   assert.deepEqual(envelope!.capabilities.map((capability) => capability.name).sort(), activeNames, 'the universe is the locked surface, nothing wider');
 });
+
+// Live 2026-09-11: Clem authored scorpion-inbox-triage with
+// `allowedTools: [OUTLOOK_LIST_MESSAGES]` and it failed twelve consecutive
+// scheduled runs, having never been able to run once. The lock filtered by TOOL
+// NAME, so the composio gateway — the only thing that can execute a provider
+// operation — was stripped, leaving the step the six structural baseline
+// channels and a list of operations it could not call. Her Slack notice named
+// them exactly: "only workflow_step_result, notify_user, recall_tool_result,
+// tool_output_query, workspace_artifact_query, read_file".
+test('naming a provider operation keeps the carrier that executes it', async () => {
+  const { makeStepToolAllow } = await import('./workflow-step-agent.js');
+  const allow = makeStepToolAllow(['OUTLOOK_LIST_MESSAGES']);
+
+  assert.equal(allow('OUTLOOK_LIST_MESSAGES'), true, 'the operation the author named');
+  assert.equal(allow('composio_execute_tool'), true, 'and the gateway it is reached through');
+  assert.equal(allow('composio_status'), true, 'plus the status channel the blocklist keeps for the same reason');
+  assert.equal(allow('workflow_step_result'), true, 'structural baseline is untouched');
+
+  // The lock still locks: naming an operation does not open the whole surface.
+  assert.equal(allow('run_shell_command'), false);
+  assert.equal(allow('workflow_create'), false);
+  assert.equal(allow('GOOGLESHEETS_BATCH_GET'), false, 'only the operations actually named');
+});
+
+test('a lock of ordinary tool names does not drag the gateway in', async () => {
+  const { makeStepToolAllow } = await import('./workflow-step-agent.js');
+  const allow = makeStepToolAllow(['read_file', 'memory_search']);
+  assert.equal(allow('read_file'), true);
+  assert.equal(allow('composio_execute_tool'), false,
+    'a step that named no provider operation gets no provider carrier');
+});
