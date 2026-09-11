@@ -11,7 +11,7 @@
  *
  * Isolated via per-test CLEMENTINE_HOME.
  */
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -763,4 +763,44 @@ test('a helper’s worker session never gets a rail row of its own', async () =>
   });
   const sessions = buildUnifiedSessionList();
   assert.equal(sessions.find((s) => s.id.includes('sess-worker-')), undefined, 'helpers nest under their turn, not the rail');
+});
+
+// ── The sessions list must not re-scan the session table per row ────────────
+// 2026-09-10, owner: "the UI is still really slow". /api/console/sessions took
+// 14.6s to return 65KB. listHarnessRowsForWorkflowRun paged through the WHOLE
+// session table on every call, and the list calls it once per workflow row —
+// 45 of 100 rows against 1,469 sessions. Cost scaled with the PAGE, not the
+// table: limit=1 0.69s, limit=100 14.7s, limit=500 54.5s. Reusing the one scan
+// collectHarnessSummaries already pays took limit=100 to 460ms, with output
+// verified byte-identical against the old path.
+test('the workflow-run row lookup can reuse a caller snapshot instead of re-scanning', () => {
+  const source = readFileSync(new URL('./sessions-api.ts', import.meta.url), 'utf8');
+
+  const lookup = source.slice(
+    source.indexOf('function listHarnessRowsForWorkflowRun'),
+    source.indexOf('function summarizeWorkflowRun'),
+  );
+  assert.ok(lookup.length > 0, 'failed to locate listHarnessRowsForWorkflowRun');
+  assert.match(lookup, /allRows\?: HarnessSessionRow\[\]/,
+    'callers that already hold a snapshot must be able to pass it in');
+  assert.doesNotMatch(lookup, /for \(let offset = 0/,
+    'a per-row full-table page loop is what made the sessions list quadratic');
+
+  // And the list path must actually pass it — an unused parameter fixes nothing.
+  const build = source.slice(source.indexOf('export function buildUnifiedSessionList'));
+  assert.match(build, /fillHarnessPreviewAndCount\(summary, harnessCollection\.allRows\)/,
+    'the page loop must hand down the snapshot collectHarnessSummaries already paid for');
+});
+
+test('the shared snapshot is taken exactly once per list build', () => {
+  const source = readFileSync(new URL('./sessions-api.ts', import.meta.url), 'utf8');
+  const collect = source.slice(
+    source.indexOf('function collectHarnessSummaries'),
+    source.indexOf('function desktopSearchText'),
+  );
+  assert.match(collect, /const allRows = listAllHarnessRows\(\);/);
+  assert.match(collect, /userFacingHarnessRows\(allRows\)/,
+    'the user-facing filter must reuse the same scan, not start a second one');
+  assert.match(collect, /return \{ summaries: out, rawIds, allRows \}/,
+    'the snapshot must be handed back so per-row fills can reuse it');
 });

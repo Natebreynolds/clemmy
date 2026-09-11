@@ -205,14 +205,25 @@ function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): Unifi
  */
 const HARNESS_SESSION_PAGE_SIZE = 500;
 
-function listUserFacingHarnessRows(): HarnessSessionRow[] {
+/** Every harness row, unfiltered. The session table is paged through exactly
+ *  once and the result is shared by everything that needs it in the same
+ *  request — see listHarnessRowsForWorkflowRun for why that matters. */
+function listAllHarnessRows(): HarnessSessionRow[] {
   const out: HarnessSessionRow[] = [];
   for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
     const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
-    out.push(...page.filter((row) => isUserFacingSession(row.id, row.channel ?? undefined) && !isHelperSession(row)));
+    out.push(...page);
     if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
   }
   return out;
+}
+
+function userFacingHarnessRows(all: HarnessSessionRow[]): HarnessSessionRow[] {
+  return all.filter((row) => isUserFacingSession(row.id, row.channel ?? undefined) && !isHelperSession(row));
+}
+
+function listUserFacingHarnessRows(): HarnessSessionRow[] {
+  return userFacingHarnessRows(listAllHarnessRows());
 }
 
 /** A helper a turn spawned (run_worker) runs under its own worker session.
@@ -222,16 +233,26 @@ function listUserFacingHarnessRows(): HarnessSessionRow[] {
 function isHelperSession(row: HarnessSessionRow): boolean {
   return row.metadata?.workerScope === true || row.metadata?.source === 'delegated_worker';
 }
-function listHarnessRowsForWorkflowRun(workflowRunId: string, reference: HarnessSessionRow): HarnessSessionRow[] {
+/**
+ * Rows belonging to one workflow run.
+ *
+ * 2026-09-10: this paged through the WHOLE session table on every call, and
+ * the sessions list calls it once per workflow row in the page. With 1,469
+ * sessions and 45 workflow rows in a 100-row page that is ~66,000 redundant
+ * row reads, and /api/console/sessions took 14.6s to produce 65KB — measured
+ * at ~110ms per returned row, scaling linearly with the page size (limit=500
+ * took 54s). Callers that already hold a snapshot now pass it in; the filter
+ * is unchanged, so the result is identical.
+ */
+function listHarnessRowsForWorkflowRun(
+  workflowRunId: string,
+  reference: HarnessSessionRow,
+  allRows?: HarnessSessionRow[],
+): HarnessSessionRow[] {
   if (!workflowRunId) return [];
-  const out: HarnessSessionRow[] = [];
-  for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
-    const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
-    out.push(...page.filter((row) => workflowRunIdFor(row) === workflowRunId
-      && row.userId === reference.userId));
-    if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
-  }
-  return out;
+  const source = allRows ?? listAllHarnessRows();
+  return source.filter((row) => workflowRunIdFor(row) === workflowRunId
+    && row.userId === reference.userId);
 }
 
 function workflowRunIdFor(row: HarnessSessionRow): string {
@@ -319,12 +340,16 @@ function relatedHarnessRowsForPatch(row: HarnessSessionRow): HarnessSessionRow[]
 }
 
 interface HarnessSummaryCollection {
+  /** The single full-table scan this collection already paid for, shared with
+   *  the per-row fills below so they never scan again. */
+  allRows: HarnessSessionRow[];
   summaries: UnifiedRunSummary[];
   rawIds: Set<string>;
 }
 
 function collectHarnessSummaries(): HarnessSummaryCollection {
-  const rows = listUserFacingHarnessRows();
+  const allRows = listAllHarnessRows();
+  const rows = userFacingHarnessRows(allRows);
   const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
   const workflowRows = new Map<string, HarnessSessionRow[]>();
@@ -350,7 +375,7 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
     }
     out.push(summarizeHarness(row));
   }
-  return { summaries: out, rawIds };
+  return { summaries: out, rawIds, allRows };
 }
 
 function desktopSearchText(record: SessionRecord): string {
@@ -383,8 +408,8 @@ function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq:
   return null;
 }
 
-function reconstructWorkflowRunTranscript(workflowRunId: string, reference: HarnessSessionRow, perSessionLimit = 1000): UnifiedSessionTurn[] {
-  const turns = listHarnessRowsForWorkflowRun(workflowRunId, reference)
+function reconstructWorkflowRunTranscript(workflowRunId: string, reference: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[]): UnifiedSessionTurn[] {
+  const turns = listHarnessRowsForWorkflowRun(workflowRunId, reference, allRows)
     .flatMap((row) => listHarnessEvents(row.id, {
       types: ['user_input_received', 'conversation_completed'],
       limit: perSessionLimit,
@@ -395,21 +420,21 @@ function reconstructWorkflowRunTranscript(workflowRunId: string, reference: Harn
   return turns.map(({ seq: _seq, ...turn }) => turn);
 }
 
-function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000): UnifiedSessionTurn[] {
+function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000, allRows?: HarnessSessionRow[]): UnifiedSessionTurn[] {
   const workflowRunId = workflowRunIdFor(row);
   return workflowRunId
-    ? reconstructWorkflowRunTranscript(workflowRunId, row, perSessionLimit)
+    ? reconstructWorkflowRunTranscript(workflowRunId, row, perSessionLimit, allRows)
     : reconstructHarnessTranscript(row.id, perSessionLimit);
 }
 
-function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary): void {
+function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: HarnessSessionRow[]): void {
   const rawId = summary.id.slice(HARNESS_PREFIX.length);
   const row = getHarnessSession(rawId);
   if (!row) {
     summary.preview = clip(harnessPreview(rawId), 140);
     return;
   }
-  const turns = reconstructHarnessDetailTurns(row, 1000);
+  const turns = reconstructHarnessDetailTurns(row, 1000, allRows);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
 }
@@ -598,7 +623,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
       summary.preview = last ? clip(last.text, 140) : '';
     } else {
       fillWorkflowRunStatus(summary, readRunStatus);
-      fillHarnessPreviewAndCount(summary);
+      fillHarnessPreviewAndCount(summary, harnessCollection.allRows);
     }
   }
   return page;
