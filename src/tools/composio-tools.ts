@@ -170,6 +170,7 @@ import { getComposioCliDefaultAccountAuthority } from '../integrations/composio/
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { formatComposioCliDefaultReadAccountRoute } from '../integrations/composio/account-route.js';
 import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
+import { isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
 
 export { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
@@ -1498,10 +1499,18 @@ function recordDiscoveredComposioCapabilities(
  * search into a failed turn — and any operation that stages with a blocker
  * says so, rather than reproducing the silent gap this replaces.
  */
+export interface ComposioDiscoveryStagingResult {
+  /** Operations that did NOT become callable, and exactly why. */
+  blockers: Readonly<Record<string, { code: string; reason?: string }>>;
+  /** Operations whose current callable catalog entry was verified present
+   *  after staging — the model may call these by exact slug right now. */
+  proven: readonly string[];
+}
+
 export async function stageDiscoveredComposioCapabilities(
   matches: ReadonlyArray<{ slug: string; inputParameters?: unknown }>,
-): Promise<Readonly<Record<string, { code: string; reason?: string }>>> {
-  const none = Object.freeze({});
+): Promise<ComposioDiscoveryStagingResult> {
+  const none = Object.freeze({ blockers: Object.freeze({}), proven: Object.freeze([]) }) as ComposioDiscoveryStagingResult;
   const run = harnessRunContextStorage.getStore();
   if (!run?.sessionId || !Number.isSafeInteger(run.sourceUserSeq) || (run.sourceUserSeq ?? 0) <= 0) return none;
   const candidates = matches
@@ -1530,9 +1539,39 @@ export async function stageDiscoveredComposioCapabilities(
       // slowest surface; staging may not double it.
       deadlineAt: Date.now() + COMPOSIO_DISCOVERY_STAGING_BUDGET_MS,
     });
-    return staged.blockers;
+    // PROVEN IS A FACT ABOUT THE CATALOG, NOT THE ABSENCE OF A COMPLAINT.
+    // An operation can finish staging with no blocker and still have no
+    // current callable entry (account unresolved, publication expired). Ask
+    // the catalog the same question the pre-dispatch wall will ask.
+    const proven = candidates
+      .map((candidate) => candidate.name)
+      .filter((slug) => !staged.blockers[slug] && composioOperationIsCallableNow(slug));
+    return { blockers: staged.blockers, proven };
   } catch {
     return none; // discovery must never break on its own bookkeeping
+  }
+}
+
+/** Does a current, callable catalog entry exist for this exact operation? The
+ *  same positive attestation the dispatch boundary requires — never a guess
+ *  from a well-shaped or stale row. Exported so the claim "PROVEN AND CALLABLE
+ *  NOW" is pinned against something, rather than trusted. */
+export function composioOperationIsCallableNow(slug: string): boolean {
+  try {
+    const catalog = peekHostCapabilityCatalogFactory();
+    if (!catalog) return false;
+    const base = `cap:resolved:${slug.toLowerCase()}`;
+    // A capability whose live definition drifted is re-registered under a
+    // SUCCESSOR id (`<base>:definition:<hex>`) and the base id is forgotten,
+    // so checking only the base would call a drifted-but-current operation
+    // unavailable.
+    return catalog.snapshot().some((entry) => (
+      (entry.capabilityId === base || entry.capabilityId.startsWith(`${base}:definition:`))
+      && isCurrentCallableCatalogEntry(entry)
+      && entry.manifest?.operationId === slug
+    ));
+  } catch {
+    return false;
   }
 }
 
@@ -5208,7 +5247,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
             matches.map((match) => match.slug),
           );
           recordDiscoveredComposioCapabilities(matches);
-          const cliStagingBlockers = await stageDiscoveredComposioCapabilities(matches);
+          const cliStaging = await stageDiscoveredComposioCapabilities(matches);
           const output = formatComposioToolOutput({
             configured: true,
             discoveryBackend: 'cli',
@@ -5227,12 +5266,15 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
             })),
             ...(schemaLessCandidates.length > 0 ? { schemaLessCandidates } : {}),
             ...((): Record<string, string> => {
-              const note = formatComposioStagingBlockers(cliStagingBlockers);
+              const note = formatComposioStagingBlockers(cliStaging.blockers);
               return note
                 ? { message: `Disclosed, but NOT yet callable — ${note}. Resolve that exact blocker; do not substitute another provider.` }
                 : {};
             })(),
-            nextStep: matches.length > 0
+            nextStep: cliStaging.proven.length > 0
+              ? `PROVEN AND CALLABLE NOW for this step: ${cliStaging.proven.join(', ')}. `
+                + 'Each is already resolved to its connected account and published against its current schema — call one directly with `composio_execute_tool` using its exact slug and arguments built from `inputParameters`. Do NOT search again for an operation listed here. Writes still cross the ordinary effect gate at execution; being proven is not approval.'
+              : matches.length > 0
               ? 'Pick the best match, then call `composio_execute_tool` with its exact slug and arguments built from `inputParameters`.'
               : schemaLessCandidates.length > 0
                 ? 'The CLI returned related candidates without executable schemas. Refine this one search until a primary schema-backed match appears; do not execute or memorize a schema-less slug.'
@@ -5380,14 +5422,14 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         visibleMatches.map((m) => m.slug),
       );
       recordDiscoveredComposioCapabilities(visibleMatches);
-      const stagingBlockers = await stageDiscoveredComposioCapabilities(visibleMatches);
+      const staging = await stageDiscoveredComposioCapabilities(visibleMatches);
       const realMatchCount = matches.filter(
         (m) => m.slug && m.score > 0,
       ).length;
       // SAY WHEN A DISCLOSURE DID NOT BECOME CALLABLE. A found-but-unstaged
       // operation and a not-found one used to read identically from here, and
       // the model's only remaining move was a call the host would refuse.
-      const stagingNote = formatComposioStagingBlockers(stagingBlockers);
+      const stagingNote = formatComposioStagingBlockers(staging.blockers);
       const searchMessage = filteredSearchError
         ? `The bounded live Composio search failed before returning candidates: ${filteredSearchError}`
         : realMatchCount === 0
@@ -5416,7 +5458,23 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           : {}),
         matches: visibleMatches,
         ...(searchMessage ? { message: searchMessage } : {}),
-        nextStep: 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
+        // THE SEARCH MUST SAY WHAT IT JUST MADE TRUE.
+        //
+        // Staging proves these operations and mints their callable catalog
+        // entry, but the payload used to read exactly as it did before — "here
+        // is a slug, go call composio_execute_tool" — which is the same
+        // sentence that preceded a `candidates=0` refusal on the previous run.
+        // Live 2026-09-11 23:14: the operation was found (count 1), proven, and
+        // account-resolved on four separate searches, and the model executed
+        // NOTHING — it searched for the same Google Doc read five times and the
+        // turn died on `exact_checkpoint_admission_exhausted` with the document
+        // still unread. It had no way to tell that anything had changed.
+        //
+        // `proven` is verified against the catalog, not inferred from silence.
+        nextStep: staging.proven.length > 0
+          ? `PROVEN AND CALLABLE NOW for this step: ${staging.proven.join(', ')}. `
+            + 'Each is already resolved to its connected account and published against its current schema — call one directly with `composio_execute_tool` (`tool_slug` set to the exact slug, `arguments` a JSON object string built from that action\'s `inputParameters`). Do NOT search again for an operation listed here, and do not look for a different route to it. Writes still cross the ordinary effect gate at execution; being proven is not approval.'
+          : 'Pick the best match, then call `composio_execute_tool` with `tool_slug` set to the exact slug from this result and `arguments` as a JSON object string built from the action\'s `inputParameters` schema.',
       }, { context, details, toolName: 'composio_search_tools' });
       // Tool-bound standing rules surface at DISCOVERY time — the moment the
       // model picks a slug, right before it forms the execute call.

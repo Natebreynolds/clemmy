@@ -41,7 +41,7 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { __test__: composioClientTest } = await import('../integrations/composio/client.js');
-const { stageDiscoveredComposioCapabilities } = await import('./composio-tools.js');
+const { stageDiscoveredComposioCapabilities, composioOperationIsCallableNow } = await import('./composio-tools.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
 
 const DOCS_CONNECTION = 'ca_fixture_docs';
@@ -104,13 +104,13 @@ test('a schema-bearing composio_search_tools disclosure reaches the SAME staging
   composioClientTest.setConnectedAccountsLoader(connectedAccounts);
   const identity = acceptedSource('Read https://docs.example.invalid/document/d/FIXTURE/edit and plan the research from it');
 
-  const blockers = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
+  const staged = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
     { slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', inputParameters: SCHEMA },
   ]));
 
   const entries = capabilityResolutionEntries(identity.sessionId);
   const docs = entries.find((entry) => entry.identifier === 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT');
-  assert.ok(docs, `discovery must stage a resolution entry, not just a visible row: ${JSON.stringify({ entries, blockers })}`);
+  assert.ok(docs, `discovery must stage a resolution entry, not just a visible row: ${JSON.stringify({ entries, staged })}`);
   assert.equal(docs!.status, 'proven');
   assert.equal(docs!.connection, 'active');
   assert.equal(docs!.effectClass, 'read');
@@ -122,12 +122,13 @@ test('a disclosure with no executable schema is never staged — it cannot be ca
   composioClientTest.setConnectedAccountsLoader(connectedAccounts);
   const identity = acceptedSource('Find something in Google Docs');
 
-  const blockers = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
+  const staged = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
     { slug: 'GOOGLEDOCS_SOMETHING_WITHOUT_A_SCHEMA' },
     { slug: 'GOOGLEDOCS_ALSO_SCHEMALESS', inputParameters: undefined },
   ]));
 
-  assert.deepEqual(blockers, {});
+  assert.deepEqual(staged.blockers, {});
+  assert.deepEqual(staged.proven, []);
   assert.equal(capabilityResolutionEntries(identity.sessionId).length, 0,
     'a search hint without an executable contract is not a proven capability');
 });
@@ -137,7 +138,7 @@ test('staging never turns a discovery into a failed turn', async () => {
   composioClientTest.setConnectedAccountsLoader(connectedAccounts);
   assert.deepEqual(
     await stageDiscoveredComposioCapabilities([{ slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', inputParameters: SCHEMA }]),
-    {},
+    { blockers: {}, proven: [] },
     'without an accepted source there is nothing to stage against, and that is not an error',
   );
 
@@ -146,10 +147,10 @@ test('staging never turns a discovery into a failed turn', async () => {
   // but you still cannot call it" stop reading identically from the outside.
   composioClientTest.setConnectedAccountsLoader(() => Promise.reject(new Error('provider unreachable')));
   const identity = acceptedSource('Read the plan doc');
-  const blockers = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
+  const degraded = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
     { slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', inputParameters: SCHEMA },
   ]));
-  for (const [slug, blocker] of Object.entries(blockers)) {
+  for (const [slug, blocker] of Object.entries(degraded.blockers)) {
     assert.match(blocker.code, /^(account_selection_required|capability_publication_required)$/,
       `${slug} must report a typed blocker the model can act on, not an opaque failure`);
   }
@@ -168,5 +169,107 @@ test('both composio_search_tools discovery lanes await staging — the wiring, n
   for (const call of source.match(/recordDiscoveredComposioCapabilities\((matches|visibleMatches)\);\n(.*)/g) ?? []) {
     assert.match(call, /stageDiscoveredComposioCapabilities/,
       'every discovery that records a capability must also stage it');
+  }
+});
+
+test('`proven` is verified against the catalog, never inferred from the absence of a blocker', async () => {
+  // THE HALF-FIX THIS CLOSES. Staging minted the callable entry and the search
+  // payload still read exactly as it had before — "here is a slug, go call
+  // composio_execute_tool" — which is the same sentence that preceded a
+  // `candidates=0` refusal on the previous run. Live 2026-09-11 23:14: the
+  // operation was found (count 1), proven, and account-resolved on four
+  // separate searches, and the model executed NOTHING. It searched for the same
+  // Google Doc read five times and the turn died on
+  // `exact_checkpoint_admission_exhausted` with the document still unread,
+  // because nothing in the result told it anything had changed.
+  //
+  // The claim has to be worth believing, so it is checked the way the dispatch
+  // boundary checks it: a CURRENT CALLABLE catalog entry for that exact
+  // operation. An operation can finish staging with no blocker and still have
+  // no such entry — silence is not proof.
+  const { peekHostCapabilityCatalogFactory, isCurrentCallableCatalogEntry } =
+    await import('../runtime/harness/host-capability-catalog-factory.js');
+
+  composioClientTest.setConnectedAccountsLoader(connectedAccounts);
+  const identity = acceptedSource('Read https://docs.example.invalid/document/d/FIXTURE/edit');
+  const staged = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
+    { slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', inputParameters: SCHEMA },
+  ]));
+
+  // Whatever this test home could publish, the two must agree exactly: every
+  // slug reported proven has a current callable entry, and nothing else does.
+  const catalog = peekHostCapabilityCatalogFactory();
+  const callable = new Set((catalog?.snapshot() ?? [])
+    .filter((entry) => isCurrentCallableCatalogEntry(entry))
+    .map((entry) => entry.manifest!.operationId));
+  for (const slug of staged.proven) {
+    assert.ok(callable.has(slug),
+      `${slug} was reported PROVEN AND CALLABLE with no current callable catalog entry behind it`);
+  }
+  // And a blocked operation is never also claimed as proven.
+  for (const slug of Object.keys(staged.blockers)) {
+    assert.ok(!staged.proven.includes(slug),
+      `${slug} cannot be both blocked and callable`);
+  }
+});
+
+test('the search output tells the model what it just made callable', async () => {
+  // WHO READS THIS. The `proven` list is worthless if the payload never carries
+  // it — that was the whole defect. Neither discovery lane is reachable from a
+  // test home without a Composio key and a network, so pin the exact edges.
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./composio-tools.ts', import.meta.url), 'utf8');
+  const announcements = source.match(/PROVEN AND CALLABLE NOW for this step/g) ?? [];
+  assert.equal(announcements.length, 2,
+    'the SDK lane and the CLI-only lane must each report what staging proved');
+  assert.match(source, /staging\.proven\.length > 0/, 'the SDK lane branches on verified proof');
+  assert.match(source, /cliStaging\.proven\.length > 0/, 'the CLI lane branches on verified proof');
+  // Being callable is not being approved; the effect gate is unchanged.
+  assert.equal((source.match(/being proven is not approval/g) ?? []).length, 2,
+    'both lanes must say that a proven write still crosses the effect gate');
+});
+
+test('an operation with no current callable entry is never called callable', async () => {
+  // The claim "PROVEN AND CALLABLE NOW" has to be worth believing, because the
+  // two states that produced `candidates=0:proven=none` in the first place were
+  // nothing registered, and something registered that is not currently
+  // callable. Both must answer NO.
+  //
+  // HONEST LIMIT OF THIS PIN: minting a genuinely callable row needs the
+  // module-private attestation in host-capability-catalog-factory, so the
+  // POSITIVE case is not constructible here (the factory is not even installed
+  // in this home). What is pinned: the negative cases, and — structurally — that
+  // this code asks the catalog the same question the dispatch boundary asks
+  // rather than a weaker "a row exists" test, which is precisely how a
+  // confident sentence would get attached to an uncallable operation.
+  assert.equal(composioOperationIsCallableNow('GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT'), false,
+    'nothing registered for this operation: not callable');
+  assert.equal(composioOperationIsCallableNow('SOMETHING_NEVER_DISCOVERED'), false);
+  assert.equal(composioOperationIsCallableNow(''), false, 'a malformed lookup must not throw into discovery');
+
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./composio-tools.ts', import.meta.url), 'utf8');
+  const check = source.slice(source.indexOf('export function composioOperationIsCallableNow'));
+  const body = check.slice(0, check.indexOf('\n}\n'));
+  assert.match(body, /isCurrentCallableCatalogEntry\(entry\)/,
+    'the positive attestation the dispatch boundary requires, not a presence check');
+  assert.match(body, /entry\.manifest\?\.operationId === slug/,
+    'the entry must belong to THIS exact operation');
+  assert.match(body, /:definition:/,
+    'a drifted-but-current successor id must count, or a live operation reads as unavailable');
+});
+
+test('a blocked operation is never also announced as callable', async () => {
+  // Real and non-vacuous in this home: publication genuinely fails here, so the
+  // docs read comes back blocked — and must not appear in `proven`.
+  composioClientTest.setConnectedAccountsLoader(connectedAccounts);
+  const identity = acceptedSource('Read https://docs.example.invalid/document/d/FIXTURE/edit');
+  const staged = await underRunContext(identity, () => stageDiscoveredComposioCapabilities([
+    { slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', inputParameters: SCHEMA },
+  ]));
+  assert.ok(Object.keys(staged.blockers).length > 0 || staged.proven.length > 0,
+    'the fixture must exercise one branch or the other, never neither');
+  for (const slug of Object.keys(staged.blockers)) {
+    assert.ok(!staged.proven.includes(slug), `${slug} cannot be both blocked and callable`);
   }
 });
