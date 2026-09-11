@@ -1467,6 +1467,91 @@ function recordDiscoveredComposioCapabilities(
   } catch { /* continuation evidence must never break discovery */ }
 }
 
+/**
+ * MAKE A COMPOSIO DISCOVERY CALLABLE, not merely visible.
+ *
+ * `composio_search_tools` told the model, in its own catalog summary, to use it
+ * "BEFORE concluding an action is unavailable" — and then produced nothing it
+ * could call. The disclosure above records `capability_discovered` with an
+ * exact slug and a live schema fingerprint, but no `capabilityRef`, because it
+ * never staged a catalog entry. Two things follow from that one omission, and
+ * both of them killed a live turn on 2026-09-11 (22:18-22:20):
+ *
+ *   1. Every subsequent call refuses `catalog_entry_or_manifest_missing:
+ *      candidates=0:proven=none` — including the one that named the right slug
+ *      AND the right connected account, and the one the host's own
+ *      tool_choice_recall had just returned as the active recorded choice.
+ *   2. The no-progress governor credits authority only for capabilities that
+ *      carry a `capabilityRef`, so discovering three whole toolkits scored
+ *      `gained: []` and the turn was terminalized for `no_new_evidence` while
+ *      it was acquiring exactly the evidence it was asked for.
+ *
+ * The fix is not a new door — it is the SAME door `tool_search` already uses.
+ * A disclosure with a live executable schema is staged through the one
+ * boundary that mints proven entries, so it resolves its account, publishes a
+ * current manifest, and becomes callable on the very next call. Nothing about
+ * consent moves: the effect gate still runs at the write boundary and an
+ * irreversible send still asks.
+ *
+ * Bounded and failure-tolerant by construction. Discovery that cannot stage
+ * still returns its results — a slow or unreachable provider must never turn a
+ * search into a failed turn — and any operation that stages with a blocker
+ * says so, rather than reproducing the silent gap this replaces.
+ */
+export async function stageDiscoveredComposioCapabilities(
+  matches: ReadonlyArray<{ slug: string; inputParameters?: unknown }>,
+): Promise<Readonly<Record<string, { code: string; reason?: string }>>> {
+  const none = Object.freeze({});
+  const run = harnessRunContextStorage.getStore();
+  if (!run?.sessionId || !Number.isSafeInteger(run.sourceUserSeq) || (run.sourceUserSeq ?? 0) <= 0) return none;
+  const candidates = matches
+    .filter((match) => match.slug
+      && match.slug !== '__toolkit_error__'
+      && match.inputParameters
+      && typeof match.inputParameters === 'object'
+      && !Array.isArray(match.inputParameters))
+    .slice(0, 20)
+    .map((match) => ({
+      name: match.slug,
+      carrier: 'work_call' as const,
+      schema: match.inputParameters,
+      sourceKind: 'authorized_composio' as const,
+    }));
+  if (candidates.length === 0) return none;
+  try {
+    // Dynamic: the staging module imports this one, so a static edge would
+    // close a cycle.
+    const { stageDisclosedPlanningProviderCandidates } = await import('./tool-search-provider-sources.js');
+    const staged = await stageDisclosedPlanningProviderCandidates({
+      sessionId: run.sessionId,
+      sourceUserSeq: run.sourceUserSeq as number,
+      candidates,
+      // The broker's own clock. Discovery latency is already the model's
+      // slowest surface; staging may not double it.
+      deadlineAt: Date.now() + COMPOSIO_DISCOVERY_STAGING_BUDGET_MS,
+    });
+    return staged.blockers;
+  } catch {
+    return none; // discovery must never break on its own bookkeeping
+  }
+}
+
+/** How long staging may hold a discovery result before it returns anyway. */
+const COMPOSIO_DISCOVERY_STAGING_BUDGET_MS = 12_000;
+
+/** One line per operation that was disclosed but did not become callable, so
+ *  "found nothing" and "found it but you still cannot call it" stop looking
+ *  identical from the outside. */
+function formatComposioStagingBlockers(
+  blockers: Readonly<Record<string, { code: string; reason?: string }>>,
+): string | undefined {
+  const rows = Object.entries(blockers);
+  if (rows.length === 0) return undefined;
+  return rows
+    .map(([slug, blocker]) => `${slug}: ${blocker.code}${blocker.reason ? ` (${blocker.reason})` : ''}`)
+    .join('; ');
+}
+
 /** The honest intent behind an execute, for outcome learning: the session's
  *  fresh search query when that search actually surfaced this slug, else a
  *  readable seed from the slug. The surfaced-slug gate is the synchronous twin
@@ -5123,6 +5208,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
             matches.map((match) => match.slug),
           );
           recordDiscoveredComposioCapabilities(matches);
+          const cliStagingBlockers = await stageDiscoveredComposioCapabilities(matches);
           const output = formatComposioToolOutput({
             configured: true,
             discoveryBackend: 'cli',
@@ -5140,6 +5226,12 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
               consequence: classifyComposioActionConsequence(match.slug),
             })),
             ...(schemaLessCandidates.length > 0 ? { schemaLessCandidates } : {}),
+            ...((): Record<string, string> => {
+              const note = formatComposioStagingBlockers(cliStagingBlockers);
+              return note
+                ? { message: `Disclosed, but NOT yet callable — ${note}. Resolve that exact blocker; do not substitute another provider.` }
+                : {};
+            })(),
             nextStep: matches.length > 0
               ? 'Pick the best match, then call `composio_execute_tool` with its exact slug and arguments built from `inputParameters`.'
               : schemaLessCandidates.length > 0
@@ -5288,14 +5380,21 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         visibleMatches.map((m) => m.slug),
       );
       recordDiscoveredComposioCapabilities(visibleMatches);
+      const stagingBlockers = await stageDiscoveredComposioCapabilities(visibleMatches);
       const realMatchCount = matches.filter(
         (m) => m.slug && m.score > 0,
       ).length;
+      // SAY WHEN A DISCLOSURE DID NOT BECOME CALLABLE. A found-but-unstaged
+      // operation and a not-found one used to read identically from here, and
+      // the model's only remaining move was a call the host would refuse.
+      const stagingNote = formatComposioStagingBlockers(stagingBlockers);
       const searchMessage = filteredSearchError
         ? `The bounded live Composio search failed before returning candidates: ${filteredSearchError}`
         : realMatchCount === 0
           ? `No action in the connected toolkits matched "${query}". Refine this one role search or connect the required app; do not invent a slug.`
-          : undefined;
+          : stagingNote
+            ? `Disclosed, but NOT yet callable — ${stagingNote}. Resolve that exact blocker (an account choice is an input question for the user, not a different operation); do not substitute another provider.`
+            : undefined;
       let output = formatComposioToolOutput({
         configured: true,
         connectedToolkits: allConnections.map((connection) => ({
