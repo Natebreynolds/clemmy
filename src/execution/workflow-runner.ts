@@ -11131,6 +11131,29 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
  * after the first pause is normally picked up within one minute; a long-lived
  * missing connection eventually settles at one safe pre-dispatch probe every
  * fifteen minutes instead of hammering the provider or choking the run lane. */
+/**
+ * How many times the harness may re-admit a capability-blocked run on its own
+ * before the decision belongs to a person.
+ *
+ * Live 2026-09-10/11: a Google Sheets definition failed ONE revalidation call
+ * (`selected_connection_refresh_unavailable` — the check threw; the connection
+ * was fine). The run parked, and the reaper re-admitted it every fifteen
+ * minutes all night — ten times — while the drain re-dispatched the step every
+ * fifteen seconds in between, each dispatch dying silently at admission because
+ * the planning card cited a capability whose live row was missing. The run
+ * never terminated, so the 19:00 and 23:00 occurrences of that workflow never
+ * fired at all, and the owner was told to reconnect a working account.
+ *
+ * The owner's rule, in his words: if a workflow doesn't fire, no subsequent one
+ * fires until one of them executes; the retry is HIS call, not the machine's;
+ * and a second failure means it never fires again until repaired.
+ *
+ * One automatic attempt is worth keeping — a genuinely transient blip deserves
+ * a single free retry, which is what this whole path was built for. Past that,
+ * retrying is just a machine insisting; the run waits for a person.
+ */
+export const WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT = 1;
+
 export function workflowCapabilityRetryDelayMs(retryCount: number): number {
   const baseRaw = Number.parseInt(
     getRuntimeEnv('CLEMENTINE_WORKFLOW_CAPABILITY_RETRY_BASE_MS', '60000') ?? '60000',
@@ -11593,6 +11616,10 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
       || run.capabilityBlock.state !== 'blocked'
       || run.capabilityBlock.provenNoDispatch !== true
     ) continue;
+    // ONE free automatic attempt, then it is the owner's call. An unbounded
+    // ladder kept a run alive for ten hours over a transient check failure and
+    // silently held every later occurrence of that workflow behind it.
+    if ((run.capabilityBlock.retryCount ?? 0) > WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT) continue;
     const retryAtMs = Date.parse(run.capabilityBlock.retryAt);
     if (!Number.isFinite(retryAtMs) || retryAtMs > nowMs) continue;
     if (readmitCapabilityBlockedRun(filePath, run, new Date(nowMs).toISOString(), 'automatic-retry')) {

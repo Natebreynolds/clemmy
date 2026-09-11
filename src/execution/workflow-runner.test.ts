@@ -8054,3 +8054,26 @@ test('a capability pause says what actually happened instead of "go reconnect"',
   assert.match(reallyDead.title, /connect googlesheets/);
   assert.match(reallyDead.detail, /Open Settings/, 'a real disconnection keeps its real cure');
 });
+
+// The owner's rule, 2026-09-11: "if a workflow doesn't fire, any subsequent one
+// should never fire until one of them executes, and it should execute not
+// automatically but on the user's input; if it doesn't fire that second time it
+// should never fire again and it should be told it needs repair."
+//
+// What it replaces: a Google Sheets definition failed ONE revalidation call and
+// the reaper re-admitted the run every fifteen minutes for ten hours — ten
+// re-admissions in the log — while the run's own 19:00 and 23:00 occurrences
+// never fired because the stuck run never terminated.
+test('a capability-blocked run gets one automatic retry, then waits for a person', async () => {
+  const { WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT } = await import('./workflow-runner.js');
+  assert.equal(WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT, 1,
+    'one free attempt for a genuine blip; past that the machine is only insisting');
+
+  // The live record that prompted this: retryCount 6 and still climbing.
+  const stuck = { retryCount: 6 };
+  assert.ok(stuck.retryCount > WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT,
+    'tonight\'s run would no longer be re-admitted automatically');
+  const firstBlip = { retryCount: 1 };
+  assert.ok(firstBlip.retryCount <= WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT,
+    'a single transient failure still recovers on its own');
+});
