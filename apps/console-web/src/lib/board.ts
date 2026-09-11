@@ -348,6 +348,15 @@ export interface BackgroundTaskDetail {
   workManifests?: WorkManifestProgress[];
 }
 
+/** The live board: what she is doing. Done is rendered separately, below and
+ *  collapsed — finished work already has the Delivered shelf, and forty
+ *  terminal cards under the live ones is how a stuck run went unfindable. */
+export const LIVE_COLUMNS: { id: BoardColumnId; label: string }[] = [
+  { id: 'queued', label: 'Queued' },
+  { id: 'running', label: 'Running' },
+  { id: 'needs_you', label: 'Needs you' },
+];
+
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
   { id: 'queued', label: 'Queued' },
   { id: 'running', label: 'Running' },

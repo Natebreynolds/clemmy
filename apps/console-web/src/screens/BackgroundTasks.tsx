@@ -32,7 +32,7 @@ import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { listFocusSnapshot } from '@/lib/focus';
 import { pollIntervalForStream, useActionStreamStatus } from '@/lib/action-stream';
 import {
-  listBoard, COLUMNS, NEEDS_YOU_LANES, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
+  listBoard, LIVE_COLUMNS, NEEDS_YOU_LANES, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
   boardLanes,
   findBoardCardForRun, reconcileOpenBoardCard, resolveBoardRunSelection,
   type BoardCard, type BoardColumnId, type BoardButtonIntent, type BoardRunSelection,
@@ -69,6 +69,8 @@ export function BackgroundTasks() {
   const [open, setOpen] = useState<BoardCard | null>(null);
   const [pinnedSelection, setPinnedSelection] = useState<BoardRunSelection | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
+  // Finished work starts closed: the board answers "what is she doing".
+  const [doneOpen, setDoneOpen] = useState(false);
   const [keptStale, setKeptStale] = useState(false); // "Keep them" dismisses the banner for this view
   const [archiveAllBusy, setArchiveAllBusy] = useState(false);
 
@@ -311,7 +313,7 @@ export function BackgroundTasks() {
 
           {board.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-          {COLUMNS.map((c) => <Skeleton key={c.id} className="h-64" />)}
+          {LIVE_COLUMNS.map((c) => <Skeleton key={c.id} className="h-64" />)}
         </div>
       ) : cards.length === 0 ? (
         <EmptyState
@@ -325,8 +327,15 @@ export function BackgroundTasks() {
           onDragStart={onDragStart}
           onDragEnd={onDragEnd}
         >
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-            {COLUMNS.map((col) => (col.id === 'needs_you'
+          {/* LIVE WORK ONLY. Done was a fourth column of finished cards sitting
+              between the live work and the Delivered shelf below, which already
+              answers "what has she made me" and groups by piece of work. Forty
+              terminal cards under the live ones is how a ten-hour stuck run
+              became unfindable (live 2026-09-11). Done keeps its lane — a person
+              must still be able to clear what they can see — but below the fold
+              and collapsed, not competing with what is running now. */}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {LIVE_COLUMNS.map((col) => (col.id === 'needs_you'
               // "Needs you" is two different asks. Blocked cannot be cleared by
               // a decision; Ready for review is one approve from carrying on.
               // They share the column's grid cell so the board keeps its shape.
@@ -336,6 +345,18 @@ export function BackgroundTasks() {
                 </div>
               )
               : renderLane(col)))}
+          </div>
+          <div className="mt-4">
+            <button
+              type="button"
+              onClick={() => setDoneOpen((v) => !v)}
+              className="flex w-full items-center justify-between rounded-lg border border-border bg-surface px-3 py-2 text-small text-muted transition-colors hover:text-fg"
+              aria-expanded={doneOpen}
+            >
+              <span>Done · {byLane('done').length}</span>
+              <span className="text-caption">{doneOpen ? 'Hide' : 'Show'}</span>
+            </button>
+            {doneOpen && <div className="mt-3">{renderLane({ id: 'done', label: 'Done' })}</div>}
           </div>
           <DragOverlay>
             {active ? <DragPreview card={active} /> : null}
