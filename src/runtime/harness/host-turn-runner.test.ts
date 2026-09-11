@@ -9702,3 +9702,81 @@ test('a refusal for an account-blocked operation names the labeled accounts, not
   assert.match(text, /Scorpion \(ca_one\), Cameron & Kane \(ca_two\)/);
   assert.doesNotMatch(text, /Discover that exact operation with tool_search/);
 });
+
+// ─── The explanation must not be refused by the surface it is explaining ──────
+//
+// The no-progress check-in exists to replace a typed engine stop with Clem's own
+// words. It is documented in three places as "one tool-free model request", and
+// refreshTools duly empties its surface — then armed that emptied surface anyway.
+//
+// Live 2026-09-11, sess-desktop-f99c78cc64078f8eada66007: a turn discovered three
+// toolkits, terminalized on `authority_acquisition:no_new_evidence` at 22:20:02,
+// and the check-in that should have explained it was itself blocked
+// `authority_conflict` at 22:20:04 — replyBytes 0, asks false — because the
+// catalog it was about to explain had changed while the dying turn changed it.
+// It also POISONED the source's authority on the way out, over a surface it had
+// emptied two statements earlier, while the stop was still marked resumable.
+function driftedCheckInFixture(label: string) {
+  const fixture = acceptHostCanarySource(label);
+  const stable = brackets.wrapToolForHarness({
+    type: 'function', name: 'list_files', description: 'stable read schema',
+    parameters: { type: 'object', properties: { limit: { type: 'number' } } },
+    invoke: async () => 'read',
+  });
+  return { fixture, stable };
+}
+
+test('a tool-free check-in survives an authority conflict, speaks, and never poisons the source', async () => {
+  const { fixture, stable } = driftedCheckInFixture('checkin-tolerates-conflict');
+  // Arm the source on one surface, exactly as the exhausted turn did.
+  const first = { model: stubModel([[textMsg('the work stopped here')]]), tools: [stable] };
+  bindHostCanarySurface(fixture, first, [stable]);
+  await runHostCanary(fixture, first);
+
+  // The check-in runs on the SAME source after the catalog moved underneath it.
+  const drifted = brackets.wrapToolForHarness({
+    type: 'function', name: 'list_files', description: 'schema changed while the turn was dying',
+    parameters: { type: 'object', properties: { limit: { type: 'number' }, cursor: { type: 'string' } } },
+    invoke: async () => 'read',
+  });
+  const checkIn = { model: stubModel([[textMsg('I could not get the document read — want me to try the other account?')]]), tools: [drifted] };
+  bindHostCanarySurface(fixture, checkIn, [drifted]);
+  const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never,
+    checkIn as never,
+    [{ type: 'message', role: 'user', content: 'explain the stop' }] as never,
+    {
+      maxTurns: 1,
+      hostReadOnlyCanary: true,
+      hostConversationalCheckIn: true,
+      context: fixture.context,
+    } as never,
+  ));
+
+  assert.notEqual(outcome.terminal?.reason, 'authority_conflict',
+    'the check-in must not be refused by the surface it exists to explain');
+  assert.match(String(outcome.finalOutput ?? ''), /other account/,
+    'the person hears Clem, not the engine');
+  const authority = callAuthorities.acceptedTurnCallAuthorityFor(fixture.session.id, fixture.source.seq);
+  assert.notEqual(authority.status, 'conflict',
+    'a tool-free turn must never poison a still-resumable source over a surface it cannot use');
+});
+
+test('the tolerance belongs to the tool-free check-in alone — an ordinary turn still blocks on drift', async () => {
+  const { fixture, stable } = driftedCheckInFixture('checkin-control');
+  const first = { model: stubModel([[textMsg('armed')]]), tools: [stable] };
+  bindHostCanarySurface(fixture, first, [stable]);
+  await runHostCanary(fixture, first);
+
+  const drifted = brackets.wrapToolForHarness({
+    type: 'function', name: 'list_files', description: 'schema changed while the turn was dying',
+    parameters: { type: 'object', properties: { limit: { type: 'number' }, cursor: { type: 'string' } } },
+    invoke: async () => 'read',
+  });
+  const ordinary = { model: stubModel([[textMsg('must not be trusted')]]), tools: [drifted] };
+  bindHostCanarySurface(fixture, ordinary, [drifted]);
+  const outcome = await runHostCanary(fixture, ordinary);
+  assert.equal(outcome.terminal?.status, 'blocked');
+  assert.equal(outcome.terminal?.reason, 'authority_conflict',
+    'a turn that CAN call things still refuses a surface that moved after admission');
+});

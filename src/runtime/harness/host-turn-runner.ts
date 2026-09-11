@@ -2544,7 +2544,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       toolByName = new Map();
       configuredToolRefs = new Set();
       schemas = [];
-      armExactHostSurface();
+      // AN EXPLANATION MUST NOT BE REFUSED BY THE SURFACE IT IS EXPLAINING.
+      //
+      // This activation exists precisely BECAUSE the turn before it exhausted
+      // itself — which means the catalog it changed while doing so is exactly
+      // the catalog that no longer matches what was admitted. Live 2026-09-11
+      // (22:20:04): a turn discovered three toolkits, terminalized on
+      // `authority_acquisition:no_new_evidence`, and the check-in that should
+      // have explained that in Clem's words was itself refused
+      // `authority_conflict` — 0 reply bytes, `asks: false` — AND poisoned the
+      // source's authority on the way out, over a surface it had already
+      // emptied two statements ago.
+      //
+      // The surface is empty here. There is nothing to arm and nothing a
+      // changed catalog can mislead, so a failed arm is tolerated: no poison,
+      // no refusal, and the person hears why the work stopped. A clean arm is
+      // still the ordinary path and is unchanged.
+      armExactHostSurface({ toolFreeCheckIn: true });
       return;
     }
     const outputType = (agent as { outputType?: unknown }).outputType;
@@ -2887,8 +2903,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     };
   };
 
-  const armExactHostSurface = (): void => {
+  /**
+   * `toolFreeCheckIn` — the host's conversational check-in has an EMPTY
+   * callable surface (see refreshTools), so there is nothing for a changed
+   * catalog to mislead. Arming is still attempted, because a clean arm is the
+   * ordinary path and stays byte-identical; only the FAILURE changes. A
+   * tool-free turn must not poison its source's authority, and must not be
+   * refused, over a surface it cannot use.
+   */
+  const armExactHostSurface = (options?: { toolFreeCheckIn?: boolean }): void => {
     if (!hostReadOnlyCanary && !hostProduction) return;
+    const toolFreeCheckIn = options?.toolFreeCheckIn === true;
     const identity = exactHostIdentity();
     if (hostProduction) {
       const surface = currentProductionHostSurface();
@@ -2903,6 +2928,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         || (current.status === 'missing'
           && expectedTaskFor(identity.sessionId, identity.sourceUserSeq).status === 'ok')
       ) {
+        if (toolFreeCheckIn) return;
         throw new HostCallAuthorityBoundaryError('preaccepted_graph_execution_owner');
       }
       const armed = armHostCallAuthority({
@@ -2929,6 +2955,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : Math.min(maxToolConcurrency, identity.maxLogicalCalls),
       });
       if (armed.status === 'armed' || armed.status === 'existing') return;
+      if (toolFreeCheckIn) return;
       if (armed.status === 'conflict') {
         poisonExactHostAuthority(
           identity.sessionId,
@@ -2941,9 +2968,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const surface = currentHostSurfaceRevision();
     const { envelope, revision } = surface;
     if (Boolean(envelope) !== Boolean(revision)) {
+      if (toolFreeCheckIn) return;
       throw new HostCallAuthorityBoundaryError('incomplete_capability_revision');
     }
     if (envelope && revision?.envelopeDigest !== envelope.envelopeDigest) {
+      if (toolFreeCheckIn) return;
       throw new HostCallAuthorityBoundaryError('capability_revision_mismatch');
     }
     const armed = armHostReadOnlyCallAuthority({
@@ -2956,6 +2985,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       maxParallelCalls: Math.min(maxToolConcurrency, identity.maxLogicalCalls),
     });
     if (armed.status === 'armed' || armed.status === 'existing') return;
+    if (toolFreeCheckIn) return;
     if (armed.status === 'conflict') {
       poisonExactHostAuthority(
         identity.sessionId,
