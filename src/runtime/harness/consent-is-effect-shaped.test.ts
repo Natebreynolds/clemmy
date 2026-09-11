@@ -121,8 +121,8 @@ test('a write that addresses one person is describable whatever shape it has', (
   // invite naming a single attendee, a subject and a time. Nothing about this
   // is an email, and every part of it is reviewable in a sentence.
   const args = {
-    subject: 'Nate / James Marshall',
-    attendees_info: [{ email: 'james.marshall@example.co' }],
+    subject: 'Q3 planning sync',
+    attendees_info: [{ email: 'attendee@example.co' }],
     start_datetime: '2026-09-12T14:00:00',
   };
   const consent = autonomousSendConsent(
@@ -132,8 +132,8 @@ test('a write that addresses one person is describable whatever shape it has', (
   );
   assert.ok(consent, 'a single-attendee invite must get the one-line ask, not the formal card');
   assert.equal(consent.actionLabel, 'event');
-  assert.equal(consent.target, 'james.marshall@example.co');
-  assert.match(consent.question, /Nate \/ James Marshall/);
+  assert.equal(consent.target, 'attendee@example.co');
+  assert.match(consent.question, /Q3 planning sync/);
 });
 
 test('email keeps the behaviour it always had', () => {
@@ -199,8 +199,8 @@ test('a payload with a body must also name what it is', () => {
   // The same rule must NOT catch a write that has no body at all — that is the
   // whole point of the change, and the line these two rules sit either side of.
   const invite = {
-    subject: 'Nate / James',
-    attendees: ['james@example.co'],
+    subject: 'Team sync',
+    attendees: ['attendee@example.co'],
     start_datetime: '2026-09-12T14:00:00',
   };
   assert.ok(autonomousSendConsent(
