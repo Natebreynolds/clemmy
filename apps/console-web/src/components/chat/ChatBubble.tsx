@@ -110,6 +110,24 @@ function PayloadPreview({ value }: { value: unknown }) {
   );
 }
 
+/** Client-written stand-in when Stop fires before any tokens. The StatusPill
+ *  is the record — do not wrap this string in a hollow reply card. */
+const STOPPED_PLACEHOLDER = 'Stopped.';
+
+function BackgroundControl({ onBackground }: { onBackground?: () => void }) {
+  if (!onBackground) return null;
+  return (
+    <button
+      type="button"
+      onClick={onBackground}
+      title="Continue in background — keeps working, reports back here, frees the chat"
+      className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-muted transition-colors hover:border-primary/40 hover:text-fg cursor-pointer"
+    >
+      ⇥ background
+    </button>
+  );
+}
+
 
 export function ChatBubble({
   message,
@@ -259,10 +277,18 @@ export function ChatBubble({
   const thinking = message.status === 'thinking';
   const live = thinking || Boolean(message.workflowLive);
   const pendingAction = message.approval?.pendingAction;
+  const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
+  const hasReplyText = Boolean(message.text.trim()) && !stoppedPlaceholder;
+  const showReplyCard = Boolean(message.planArtifactRef)
+    || message.status === 'awaiting-approval'
+    || message.status === 'awaiting-plan'
+    || Boolean(message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply'))
+    || hasReplyText;
+  const fillColumn = live || showReplyCard;
   return (
     <div className="flex gap-3">
       <DogMark size={28} className="mt-0.5 self-start" />
-      <div className="min-w-0 max-w-[80%] flex-1">
+      <div className={cn('min-w-0 max-w-[80%]', fillColumn && 'w-full')}>
         {/* The build log rides ABOVE the reply: while the turn runs it is the
             whole story (steps, helpers, the thinking line); once the reply
             lands it settles to a results-first one-liner you can reopen. */}
@@ -276,27 +302,19 @@ export function ChatBubble({
             className={cn(!live && 'mb-1.5 px-1', live && 'mb-2')}
           />
         )}
+        {live && !hasReplyText && onBackground && (
+          <div className="mb-1 flex justify-end">
+            <BackgroundControl onBackground={onBackground} />
+          </div>
+        )}
         {!live && message.status === 'complete' && sessionId && message.startedAt && (
           <RememberedStrip sessionId={sessionId} startedAt={message.startedAt} />
         )}
+        {showReplyCard && (
         <div className="rounded-lg rounded-tl-sm border border-border bg-surface px-4 py-3 shadow-xs">
           {message.taskMode?.kind === 'plan' && <div className="mb-2 text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
           {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onPrepare={onPreparePlan} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
-          {thinking && !message.text ? (
-            <div className="flex items-center gap-2 text-body text-muted">
-              <span className="min-w-0 flex-1">{message.taskMode?.kind === 'plan' ? 'Working out the steps…' : 'Reply lands here as soon as it’s ready.'}</span>
-              {onBackground && (
-                <button
-                  type="button"
-                  onClick={onBackground}
-                  title="Continue in background — keeps working, reports back here, frees the chat"
-                  className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-muted transition-colors hover:border-primary/40 hover:text-fg cursor-pointer"
-                >
-                  ⇥ background
-                </button>
-              )}
-            </div>
-          ) : thinking && message.text ? (
+          {thinking && hasReplyText ? (
             // Mid-stream: render plain (linkified) text + a live caret. Full
             // markdown formatting is applied once the reply lands (below).
             // The background control stays available HERE too — brains that
@@ -313,22 +331,15 @@ export function ChatBubble({
               </p>
               {onBackground && (
                 <div className="mt-1.5 flex justify-end">
-                  <button
-                    type="button"
-                    onClick={onBackground}
-                    title="Continue in background — keeps working, reports back here, frees the chat"
-                    className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-muted transition-colors hover:border-primary/40 hover:text-fg cursor-pointer"
-                  >
-                    ⇥ background
-                  </button>
+                  <BackgroundControl onBackground={onBackground} />
                 </div>
               )}
             </div>
-          ) : (
+          ) : hasReplyText ? (
             <div className={cn('text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
               <Markdown text={message.text} />
             </div>
-          )}
+          ) : null}
 
           {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (
             <div className="mt-3 rounded-md border border-warning/40 bg-warning-tint p-3">
@@ -416,6 +427,7 @@ export function ChatBubble({
             <TaskEvidenceFooter taskRef={message.taskRef} />
           )}
         </div>
+        )}
 
         {/* The backend's TYPED terminal decides the pill. The legacy MessageStatus
             collapses blocked/cancelled/uncertain into "failed"/"stopped" and cannot

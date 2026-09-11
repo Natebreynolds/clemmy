@@ -72,10 +72,10 @@ export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
 ];
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
-  landing: 'last_conversation',
+  landing: 'home',
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
-    pinned: ['/chat', '/home', '/inbox', '/tasks', '/workspaces'],
+    pinned: ['/home', '/chat', '/inbox', '/tasks', '/workspaces'],
     shown: ['/automate', '/connect'],
     more: ['/memory', '/meetings', '/goals', '/agents'],
   },
@@ -83,23 +83,23 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
 };
 
-/** Chat is the permanent primary destination; all other nav choices retain
- * their relative order and grouping. This does not write the shared record. */
-export function primaryChatNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
+/** Home is the command center; all other nav choices retain their relative
+ *  order and grouping. This does not write the shared record. */
+export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
   return {
-    pinned: ['/chat', ...nav.pinned.filter(path => path !== '/chat')],
-    shown: nav.shown.filter(path => path !== '/chat'),
-    more: nav.more.filter(path => path !== '/chat'),
+    pinned: ['/home', ...nav.pinned.filter(path => path !== '/home')],
+    shown: nav.shown.filter(path => path !== '/home'),
+    more: nav.more.filter(path => path !== '/home'),
   };
 }
 
 /** Only the server's explicit untouched-default marker changes the landing.
- * A saved Home or current-project choice remains exactly that choice. */
+ * A saved last-conversation or current-project choice remains exactly that. */
 export function desktopHomePreferences(prefs: HomePreferences): HomePreferences {
   return {
     ...prefs,
-    landing: prefs.updatedAt === '1970-01-01T00:00:00.000Z' ? 'last_conversation' : prefs.landing,
-    nav: primaryChatNavigation(prefs.nav),
+    landing: prefs.updatedAt === '1970-01-01T00:00:00.000Z' ? 'home' : prefs.landing,
+    nav: primaryHomeNavigation(prefs.nav),
   };
 }
 

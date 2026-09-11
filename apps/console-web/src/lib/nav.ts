@@ -4,7 +4,7 @@ import {
   Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
   type LucideIcon,
 } from 'lucide-react';
-import { primaryChatNavigation, type HomePreferences } from './home-prefs';
+import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
 
 export interface NavDest {
   path: string;
@@ -21,8 +21,8 @@ export interface NavDest {
  * /inbox is now "Needs you", /tasks is "Running", /workspaces is "Projects".
  */
 export const PRIMARY_NAV: NavDest[] = [
-  { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/home', label: 'Home', icon: Home, hint: "What needs you, what's running, what got done" },
+  { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
   { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
@@ -107,7 +107,7 @@ export function resolveSidebarNav(
     return out;
   };
 
-  const primary = primaryChatNavigation(prefs.nav);
+  const primary = primaryHomeNavigation(prefs.nav);
   const pinned = resolve(primary.pinned);
   const shown = resolve(primary.shown);
   const more = resolve(primary.more);

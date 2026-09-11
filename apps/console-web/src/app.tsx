@@ -105,14 +105,15 @@ function DeferredScreen({ children }: { children: ReactNode }) {
 const deferred = (screen: ReactNode) => <DeferredScreen>{screen}</DeferredScreen>;
 
 /** If the preferences never arrive (daemon restarting, slow disk), land on
- *  Chat rather than a blank window. */
+ *  Home rather than a blank window. */
 const LANDING_WAIT_MS = 4_000;
 
 /**
  * The index route reads the user's chosen landing from HomePreferences:
- * 'home' → /home; 'last_conversation' → the active conversation the chat
- * surfaces remembered (Chat when there is none); 'current_project' → the
- * workspace the user is in the middle of (Chat when there is none).
+ * 'home' → /home (the command center); 'last_conversation' → the active
+ * conversation the chat surfaces remembered (Chat when there is none);
+ * 'current_project' → the workspace the user is in the middle of (Home
+ * when there is none).
  */
 function LandingRedirect() {
   const prefs = useHomePreferences();
@@ -124,7 +125,7 @@ function LandingRedirect() {
   // useHomePreferences serves the defaults as placeholder data while the real
   // record loads; a redirect on the placeholder would ignore the user's choice.
   const settled = !prefs.isPlaceholderData || prefs.isError || waitedOut;
-  const landing = settled && !prefs.isError ? (prefs.data?.landing ?? 'last_conversation') : 'last_conversation';
+  const landing = settled && !prefs.isError ? (prefs.data?.landing ?? 'home') : 'home';
   const spaces = useQuery({
     queryKey: ['spaces'],
     queryFn: listSpaces,
@@ -140,7 +141,7 @@ function LandingRedirect() {
   if (landing === 'current_project') {
     if (spaces.isPending && !waitedOut) return <LandingFallback />;
     const current = currentProject(spaces.data ?? []);
-    return <Navigate to={current ? `/workspaces/${encodeURIComponent(current.id)}` : '/chat'} replace />;
+    return <Navigate to={current ? `/workspaces/${encodeURIComponent(current.id)}` : '/home'} replace />;
   }
   return <Navigate to="/home" replace />;
 }
@@ -196,7 +197,7 @@ export function App() {
             <Route path="/settings" element={deferred(<Settings />)} />
             <Route path="/help" element={deferred(<Help />)} />
 
-            <Route path="*" element={<Navigate to="/chat" replace />} />
+            <Route path="*" element={<Navigate to="/home" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>

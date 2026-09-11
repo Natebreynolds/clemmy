@@ -100,10 +100,10 @@ test('the console client preserves every row in the bounded server snapshot for 
   assert.equal(snapshot.entries.at(-1)?.sessionId, 'session-29');
 });
 
-test('the running-task affordance mounts at every continuable desktop composer, not read-only transcripts', () => {
+test('the running-task affordance is not on Chat — Running lives on Home and /tasks', () => {
   const newChat = readFileSync(new URL('../screens/Chat.tsx', import.meta.url), 'utf8');
-  assert.match(newChat, /<RunningTasksDrawer className="mb-2" composerRef=\{composerRef\} \/>[\s\S]*<Composer inputRef=\{composerRef\}/);
-  assert.match(newChat, /<RunningTasksDrawer className="mb-1" composerRef=\{composerRef\} \/>[\s\S]*<Composer inputRef=\{composerRef\}/);
+  assert.doesNotMatch(newChat, /RunningTasksDrawer/);
+  assert.doesNotMatch(newChat, /border-t border-border/);
 
   const thread = readFileSync(
     new URL('../features/conversations/chat/ConversationThread.tsx', import.meta.url),
@@ -111,19 +111,12 @@ test('the running-task affordance mounts at every continuable desktop composer, 
   );
   const continuable = thread.slice(thread.indexOf('function ContinuableThread'), thread.indexOf('function ReadOnlyThread'));
   const readOnly = thread.slice(thread.indexOf('function ReadOnlyThread'));
-  assert.match(continuable, /<RunningTasksDrawer className="mb-1" composerRef=\{composerRef\} \/>[\s\S]*<Composer inputRef=\{composerRef\}/);
+  assert.doesNotMatch(continuable, /RunningTasksDrawer/);
   assert.doesNotMatch(readOnly, /RunningTasksDrawer/, 'a read-only transcript never gains task controls');
 
   const workspace = readFileSync(new URL('../screens/WorkspaceView.tsx', import.meta.url), 'utf8');
   assert.match(workspace, /const composerRef = useRef<HTMLTextAreaElement>\(null\)/);
   assert.match(workspace, /<RunningTasksDrawer className="mb-1" composerRef=\{composerRef\} \/>[\s\S]*<Composer inputRef=\{composerRef\}/);
-  assert.equal(
-    [newChat, continuable, workspace]
-      .flatMap((source) => source.match(/<Composer inputRef=\{composerRef\}/g) ?? [])
-      .length,
-    4,
-    'the affordance must cover exactly the four continuable desktop composers',
-  );
 
   const drawer = readFileSync(new URL('../components/chat/RunningTasksDrawer.tsx', import.meta.url), 'utf8');
   assert.match(drawer, /const view = presentWorkingNow\([\s\S]*activity\.data\?\.entries \?\? \[\][\s\S]*activity\.data\?\.observedAt \?\? ''[\s\S]*\)/);

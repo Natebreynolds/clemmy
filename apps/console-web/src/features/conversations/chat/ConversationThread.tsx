@@ -7,7 +7,6 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
@@ -106,7 +105,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl space-y-5 px-6 py-6">
+        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end space-y-5 px-6 py-6">
           <CollaborativeWorkstate snapshot={focus.data} compact />
           {chat.messages.map((m) => (
             <ChatBubble
@@ -124,11 +123,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
           <div ref={bottomRef} />
         </div>
       </div>
-      <div className="border-t border-border bg-canvas/80 backdrop-blur">
-        <div className="mx-auto w-full max-w-3xl px-6 py-4">
-          <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} />
-        </div>
+      <div className="mx-auto w-full max-w-3xl px-6 pb-5 pt-2">
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} />
       </div>
     </div>
   );
@@ -141,7 +137,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl space-y-5 px-6 py-6">
+        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end space-y-5 px-6 py-6">
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (

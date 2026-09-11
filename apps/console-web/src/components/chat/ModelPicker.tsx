@@ -4,13 +4,48 @@
  * write the same setting mobile's chip writes and re-pin THIS conversation;
  * workers and judge are global today and the popover says so.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronUp, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
 import { PROVIDER_LABEL, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
 import { ClaudeLoginForm } from '@/screens/settings/ClaudeLoginForm';
+
+const ROLE_ROW = 'grid grid-cols-[7.5rem_minmax(0,1fr)] items-center gap-3 px-4 py-2';
+const ROLE_TRIGGER = 'flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md bg-subtle px-2.5 text-small font-semibold text-fg hover:bg-hover disabled:opacity-60';
+
+function RoleSelect({
+  label,
+  title,
+  disabled,
+  value,
+  onChange,
+  children,
+}: {
+  label: string;
+  title?: string;
+  disabled: boolean;
+  value: string;
+  onChange: (value: string) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="relative min-w-0">
+      <select
+        aria-label={label}
+        title={title}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 w-full min-w-0 appearance-none truncate rounded-md border-0 bg-subtle py-1.5 pl-2.5 pr-8 text-small font-semibold text-fg focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60"
+      >
+        {children}
+      </select>
+      <ChevronUp className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 rotate-180 text-faint" aria-hidden />
+    </div>
+  );
+}
 
 function dotColor(provider: string): string {
   const key = provider === 'byo' ? 'byo' : provider === 'glm' ? 'glm' : provider;
@@ -88,41 +123,41 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
         <ChevronUp className={cn('h-3.5 w-3.5 text-faint transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
       {open && (
-        <div role="dialog" aria-label="Models for this conversation" className="absolute bottom-full right-0 z-30 mb-2 w-[420px] rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg">
-          <div className="grid grid-cols-[96px_1fr] items-center gap-3 px-4 py-2">
+        <div role="dialog" aria-label="Models for this conversation" className="absolute bottom-full right-0 z-30 mb-2 w-[420px] overflow-hidden rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg">
+          <div className={ROLE_ROW}>
             <span><span className="block text-small font-semibold text-fg">Brain</span><span className="block text-caption text-faint">{sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
-            <button type="button" onClick={() => setRoster((v) => !v)} aria-expanded={roster} disabled={busy} className="inline-flex items-center justify-between gap-2 rounded-md bg-subtle px-2.5 py-1.5 text-small font-semibold text-fg hover:bg-hover">
-              <span className="inline-flex min-w-0 items-center gap-2"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden /><span className="truncate">{brain}</span></span>
-              <ChevronUp className={cn('h-3.5 w-3.5 text-faint transition-transform', !roster && 'rotate-180')} aria-hidden />
+            <button type="button" onClick={() => setRoster((v) => !v)} aria-expanded={roster} disabled={busy} title={brain} className={ROLE_TRIGGER}>
+              <span className="inline-flex min-w-0 items-center gap-2"><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden /><span className="truncate">{brain}</span></span>
+              <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', !roster && 'rotate-180')} aria-hidden />
             </button>
           </div>
           {roster && <Roster rows={roles.brains} value={roles.brainValue} busy={busy} onPick={(v) => { setRoster(false); void roles.onBrain(v); }} />}
           {roles.claudeSignInFor && <div className="mx-4 mb-2"><ClaudeLoginForm embedded /></div>}
-          <div className="grid grid-cols-[96px_1fr] items-center gap-3 border-t border-border px-4 py-2">
+          <div className={cn(ROLE_ROW, 'border-t border-border')}>
             <span><span className="block text-small font-semibold text-fg">Workers</span><span className="block text-caption text-faint">helpers · everywhere</span></span>
-            <select
-              aria-label="Workers model"
+            <RoleSelect
+              label="Workers model"
+              title={mr.roles.worker.source === 'default' ? 'Follow the brain' : `${roleLabel(mr, 'worker')} · ${PROVIDER_LABEL[workerProv] ?? workerProv}`}
               disabled={busy}
               value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
-              onChange={(e) => void roles.onRole('worker', e.target.value)}
-              className="h-8 rounded-md border-0 bg-subtle px-2 text-small font-semibold text-fg"
+              onChange={(v) => void roles.onRole('worker', v)}
             >
               <option value="__default__">Follow the brain</option>
               {roles.workers.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-            </select>
+            </RoleSelect>
           </div>
-          <div className="grid grid-cols-[96px_1fr] items-center gap-3 border-t border-border px-4 py-2">
+          <div className={cn(ROLE_ROW, 'border-t border-border')}>
             <span><span className="block text-small font-semibold text-fg">Judge</span><span className="block text-caption text-faint">checks · everywhere</span></span>
-            <select
-              aria-label="Judge model"
+            <RoleSelect
+              label="Judge model"
+              title={mr.roles.judge.source === 'default' ? 'Automatic · different family, fast' : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
               disabled={busy}
               value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
-              onChange={(e) => void roles.onRole('judge', e.target.value)}
-              className="h-8 rounded-md border-0 bg-subtle px-2 text-small font-semibold text-fg"
+              onChange={(v) => void roles.onRole('judge', v)}
             >
               <option value="__default__">Automatic · different family, fast</option>
               {roles.judges.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-            </select>
+            </RoleSelect>
           </div>
           <div className="mt-1 flex items-center gap-2 border-t border-border px-4 pb-1 pt-2 text-caption text-faint">
             <Info className="h-3.5 w-3.5" aria-hidden />

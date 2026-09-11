@@ -4,30 +4,13 @@ import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-route
 import { ArrowRight, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
-import { getContext } from '@/lib/memory';
-import { greetingName, timeGreeting } from '@/lib/greeting';
-import { DEFAULT_HOME_PREFERENCES, useHomePreferences, visiblePanes, type HomePaneId } from '@/lib/home-prefs';
-import { ProjectsPane } from '@/components/home/ProjectsPane';
-import { SectionHeader } from '@/components/home/HomeSection';
-import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
-import { ModelStatusChips } from '@/components/ModelStatusChips';
-import { listSpaces } from '@/lib/spaces';
 import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { StatusPill } from '@/components/ui/StatusPill';
-import { QuickActions } from '@/components/home/QuickActions';
-import { NeedsYouPane } from '@/components/home/NeedsYouPane';
-import { RunningPane } from '@/components/home/RunningPane';
-import { WhileAwayPane } from '@/components/home/WhileAwayPane';
-import { awayCounts, presenceLine, type HomeFeedItem } from '@/components/home/home-model';
-import { listWorkingNowSnapshot } from '@/lib/activity';
-import { presentWorkingNow } from '@/lib/activity-presentation';
-import { cn } from '@/lib/cn';
 
 /** Where a "Needs you" card should land. Both approval- and needs-attention-
  *  notification-backed cards live on the Inbox "Needs you" tab now — deep-link
@@ -86,19 +69,6 @@ function AttentionStrip({ needsYou, onDismiss }: { needsYou: CommandCenterItem[]
 export function Chat() {
   const qc = useQueryClient();
   const cc = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
-  // The profile changes rarely; a slow poll keeps the greeting personal
-  // without adding chatter to the fast command-center loop.
-  const userContext = usePoll(['user-context'], getContext, 300000);
-  // The briefing's "Working now" — the ONE Working-Now presenter the Home
-  // screen and the Tasks board already read; never a second projection.
-  const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
-  // Quick actions are the user's own (HomePreferences) — the same chips the
-  // Home screen renders, never a hardcoded list.
-  const homePrefs = useHomePreferences();
-  const prefs = homePrefs.data ?? DEFAULT_HOME_PREFERENCES;
-  const quickActions = prefs.quickActions;
-  // Spaces feed the Projects pane when the user shows it; slow poll.
-  const spaces = usePoll(['spaces'], listSpaces, 60_000);
   const dismissCard = async (item: CommandCenterItem) => {
     if (!item.dismissKind || !item.dismissId) return;
     try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
@@ -119,11 +89,6 @@ export function Chat() {
   const seededRef = useRef(false);
 
   const needsYou = cc.data?.needsYou ?? [];
-  const recent = (cc.data?.recentCompleted ?? []) as HomeFeedItem[];
-  const workingView = presentWorkingNow(workingNow.data?.entries ?? [], workingNow.data?.observedAt ?? '');
-  const ccLoading = cc.isLoading;
-  const ccError = cc.isError && !cc.data;
-  const retryCommandCenter = () => { void cc.refetch(); };
   const hasThread = chat.messages.length > 0;
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
     const intent = chatDecisionIntent(message, decision);
@@ -199,65 +164,13 @@ export function Chat() {
   }
 
   if (!hasThread) {
-    // The chat home is a BRIEFING, not a session list (owner 2026-09-08: "I'd
-    // expect here's what I just did, here's what we need from you"). Sections
-    // in the order a person wants them: what needs you, what is running, what
-    // just finished, then the starters — and the composer last, where the eye
-    // lands after reading. Every section is the shared Home pane, so the chat
-    // and the Home screen never disagree about the same run.
-    const away = awayCounts(recent);
-    const presence = ccLoading && workingNow.isLoading
-      ? null
-      : presenceLine({ needsYou: needsYou.length, running: workingView.running, done: away.done, paused: away.paused });
+    // New conversation only. The command center (needs you, running, done)
+    // lives on Home — Chat is the thread and the composer.
     return (
       <div className="flex h-full flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto flex w-full max-w-[760px] flex-col gap-7 px-8 pb-6 pt-8 animate-fade-in">
-            <div>
-              <h1 className="text-h1 text-fg">{timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile))}</h1>
-              <p className="mt-1 text-body-lg text-muted" aria-live="polite">
-                {presence ?? (cc.data?.presence?.awayMessage ?? '')}
-              </p>
-            </div>
-            {/* The panes are the user's Home layout (order + hidden), so the
-                briefing IS the home: /home lands here now. */}
-            {visiblePanes(prefs).map((id: HomePaneId) => {
-              switch (id) {
-                case 'needs_you':
-                  return (ccLoading || needsYou.length > 0)
-                    ? <NeedsYouPane key={id} headingId="chat-needs-you" items={needsYou as HomeFeedItem[]} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
-                    : null;
-                case 'running':
-                  return (workingNow.isLoading || workingView.entries.length > 0)
-                    ? <RunningPane key={id} headingId="chat-running" view={workingView} loading={workingNow.isLoading} error={workingNow.isError && !workingNow.data} onRetry={() => { void workingNow.refetch(); }} />
-                    : null;
-                case 'while_away':
-                  return (ccLoading || recent.length > 0)
-                    ? <WhileAwayPane key={id} headingId="chat-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} />
-                    : null;
-                case 'projects':
-                  return <ProjectsPane key={id} headingId="chat-projects" spaces={spaces.data ?? []} loading={spaces.isLoading} error={spaces.isError && !spaces.data} onRetry={() => { void spaces.refetch(); }} />;
-                case 'quick_actions':
-                  return <QuickActions key={id} actions={quickActions} disabled={chat.busy} onPrompt={(text) => { void chat.send({ text }); }} />;
-                case 'workstate':
-                  return (
-                    <section key={id} aria-labelledby="chat-workstate" className="flex flex-col gap-2.5">
-                      <SectionHeader id="chat-workstate" label="Working together" />
-                      <CollaborativeWorkstate snapshot={cc.data?.focus} compact />
-                      <ModelStatusChips />
-                    </section>
-                  );
-                default:
-                  return null;
-              }
-            })}
-          </div>
-        </div>
-        <div className="border-t border-border bg-canvas/80 backdrop-blur">
-          <div className="mx-auto w-full max-w-[760px] px-8 py-4">
-            <RunningTasksDrawer className="mb-2" composerRef={composerRef} />
-            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
-          </div>
+        <div className="min-h-0 flex-1" />
+        <div className="mx-auto w-full max-w-[760px] px-8 pb-5 pt-2">
+          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
         </div>
       </div>
     );
@@ -266,7 +179,7 @@ export function Chat() {
   return (
     <div className="flex h-full flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-[760px] space-y-5 px-8 py-6">
+        <div className="mx-auto flex min-h-full w-full max-w-[760px] flex-col justify-end space-y-5 px-8 py-6">
           {needsYou.length > 0 && (
             <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           )}
@@ -288,11 +201,8 @@ export function Chat() {
           <div ref={bottomRef} />
         </div>
       </div>
-      <div className={cn('border-t border-border bg-canvas/80 backdrop-blur')}>
-        <div className="mx-auto w-full max-w-[760px] px-8 py-4">
-          <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
-        </div>
+      <div className="mx-auto w-full max-w-[760px] px-8 pb-5 pt-2">
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
       </div>
     </div>
   );
