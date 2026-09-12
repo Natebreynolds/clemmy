@@ -107,6 +107,7 @@ import {
 } from './exact-checkpoint-reentry.js';
 import pino from 'pino';
 import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
 import * as approvalRegistry from './approval-registry.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import {
@@ -2397,7 +2398,15 @@ function resultText(result: unknown): string {
   return toSmartString(result);
 }
 
-function functionResultItem(callId: string, name: string, output: unknown): AgentInputItem {
+function functionResultItem(
+  callId: string,
+  name: string,
+  output: unknown,
+  /** Host guidance delivered AT THE DECISION, never at the door. Appended to
+   *  the plain-text projection only: structured outputs are a contract the
+   *  model parses, and a host sentence must never enter one. */
+  steer?: string,
+): AgentInputItem {
   const structured = structuredToolOutputs(output);
   return {
     type: 'function_call_result',
@@ -2406,7 +2415,9 @@ function functionResultItem(callId: string, name: string, output: unknown): Agen
     status: 'completed',
     output: structured
       ? structured.map(structuredInputItem)
-      : { type: 'text', text: resultText(output) },
+      : { type: 'text', text: steer
+          ? appendSteerToResultText(resultText(output), steer)
+          : resultText(output) },
   } as unknown as AgentInputItem;
 }
 
@@ -5737,8 +5748,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const text = resultText(output);
     if (!hostRefusal && returnedPreDispatchRefusal) hostRefusal = text;
     emit('agent_tool_end', runContext, agent, tool ?? { name: call.name }, text, details);
+    // THE STEER CHANNEL. Host-computed from the ledger the harness already
+    // keeps; carries no authority; fires at most once per accepted source.
+    // Never allowed to fail a turn — a steer that throws would trade a slow
+    // turn for a dead one.
+    let hostSteer: string | undefined;
+    if (!structuredToolOutputs(output)) {
+      try {
+        const identity = exactHostIdentity();
+        const due = nextTurnSteer(identity);
+        if (due) {
+          hostSteer = due.text;
+          recordTurnSteer(identity, due.kind);
+        }
+      } catch { /* steering is advisory; never let it end a turn */ }
+    }
     return {
-      historyItem: functionResultItem(call.callId, call.name, output),
+      historyItem: functionResultItem(call.callId, call.name, output, hostSteer),
       ...(tool ? { tool } : {}),
       output,
       argumentsJson: call.argumentsJson,
