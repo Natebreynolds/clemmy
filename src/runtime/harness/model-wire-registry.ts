@@ -271,8 +271,34 @@ const REGISTRY: RegistryRow[] = [
   // ---- xAI Grok (openai_chat via BYO/native OAuth) --------------------------
   // ONE LOOP, MANY BRAINS (2026-08-20): grok ids previously fell to
   // DEFAULT_CAPABILITY (128K/8K, generic retry) — mis-budgeted for fleet
-  // work. grok-4 family: 256K window per xAI docs; no server-side prompt
-  // cache contract we can rely on; no effort knob on the chat shape.
+  // work. grok-4 family: 256K window per xAI docs; no effort knob on the chat
+  // shape.
+  //
+  // PROMPT CACHE: corrected 2026-09-12 from MEASUREMENT, not doctrine. The
+  // 2026-08-20 seed said "no server-side prompt cache contract we can rely
+  // on", which was a judgement rather than an observation, and it was wrong.
+  // Two days of this machine's own usage log
+  // (~/.clementine-next/state/token-usage):
+  //
+  //     grok usage events        690
+  //     calls reporting cache    673  (97.5%)
+  //     input tokens          11,449,913
+  //     cached tokens          3,457,024  (30.2% hit rate)
+  //     cacheDialect          'inclusive' on all 690
+  //
+  // The adapter has been stamping the dialect and recording the cached subset
+  // on every call the whole time. Smallest prompt observed WITH a cache hit
+  // was 1,093 tokens, so the floor is ~1024; the 17 calls without a hit
+  // include a 40,888-token prompt, i.e. they are cold prefixes, not a size
+  // threshold.
+  //
+  // This flag is load-bearing twice over. inFlightCompactionThresholds gates
+  // mid-turn collapse on it: reading false pinned grok to the absolute 32k
+  // trigger, so a 256k-window brain compacted at 13% of its context — and
+  // every collapse rewrote a prefix the provider was caching, the exact
+  // arithmetic that cost ~126k of one 2026-09-03 run's ~139k uncached tokens.
+  // Non-caching wires (GLM, gpt, kimi) keep the absolute trigger untouched,
+  // so the 2026-09-01 first-byte timeout that motivated it is unaffected.
   {
     idMatch: /grok-4|grok-3|grok-beta|grok-/i,
     cap: {
@@ -280,7 +306,7 @@ const REGISTRY: RegistryRow[] = [
       contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
       effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
       thinkingMode: 'none',
-      supportsPromptCache: false, cacheMinTokens: 0, retryClass: 'openai_compat',
+      supportsPromptCache: true, cacheMinTokens: 1_024, retryClass: 'openai_compat',
     },
   },
   // ---- Claude (anthropic_messages) ------------------------------------------

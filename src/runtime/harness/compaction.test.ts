@@ -307,7 +307,17 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
   const { inFlightPromptCacheScale } = await import('./compaction.js');
 
   // The 2026-09-01 regression was measured on these. They must not move.
-  for (const id of ['grok-4.6', 'glm-5.2', 'gpt-5.6', 'kimi-k3']) {
+  //
+  // grok WAS in this list and should never have been. It was seeded
+  // non-caching on a 2026-08-20 note ("no server-side prompt cache contract we
+  // can rely on") that was a judgement, not an observation — and this
+  // machine's own usage log showed 673 of 690 grok calls reporting cache
+  // reads, 3,457,024 cached of 11,449,913 input tokens, cacheDialect
+  // 'inclusive' on every one. This test encoded the same wrong belief the
+  // registry did, which is how a test keeps a measurable error alive. The
+  // genuinely non-caching wires stay, and the 2026-09-01 first-byte timeout
+  // they protect is untouched.
+  for (const id of ['glm-5.2', 'gpt-5.6', 'kimi-k3']) {
     assert.equal(inFlightPromptCacheScale(id), 1, `${id} caches nothing — stay absolute`);
     assert.deepEqual(inFlightCompactionThresholds(() => undefined, id), {
       resultTriggerTokens: 32_000,

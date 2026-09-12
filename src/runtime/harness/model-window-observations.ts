@@ -39,6 +39,16 @@ interface WindowObservation {
   provenAcceptedInput?: number;
   /** Effective ceiling learned from a context-overflow rejection. */
   rejectedCeiling?: number;
+  /** Calls whose usage reported a prompt-cache READ for this model. A wire
+   *  either caches or it does not, so this is evidence of a contract, not a
+   *  rate to average. */
+  cacheHitCalls?: number;
+  /** Calls observed at all — the denominator, so a single fluke cannot flip a
+   *  wire and a genuinely non-caching wire stays non-caching however long it
+   *  runs. */
+  cacheObservedCalls?: number;
+  /** Smallest prompt seen WITH a cache read: the provider's practical floor. */
+  smallestCachedPrompt?: number;
   updatedAt?: string;
 }
 
@@ -154,6 +164,90 @@ export function windowScaleForModel(modelId: string | undefined | null, maxScale
   } catch {
     return 1;
   }
+}
+
+/**
+ * LEARN THE CACHE CONTRACT FROM THE WIRE, NOT FROM DOCTRINE.
+ *
+ * The registry seeds `supportsPromptCache` per family, and on 2026-09-12 that
+ * seed was measurably wrong for a shipping brain: grok was marked
+ * non-caching on a 2026-08-20 note reading "no server-side prompt cache
+ * contract we can rely on", while this machine's own usage log showed 673 of
+ * 690 grok calls reporting cache reads — 3,457,024 cached of 11,449,913 input
+ * tokens, a 30.2% hit rate, with the adapter stamping cacheDialect
+ * 'inclusive' on every single one. The evidence was being recorded all along
+ * and nothing read it.
+ *
+ * That flag is load-bearing: mid-turn compaction stays absolute on a
+ * non-caching wire and scales with the window on a caching one. Reading it
+ * wrong pinned a 256k-window brain to a 32k trigger — compacting at 13% of
+ * context — while every collapse rewrote a prefix the provider was caching.
+ *
+ * So a user plugging in ANY model should not wait on a code release. Same
+ * shape as the window observations above: the registry is a seed, the wire is
+ * the authority.
+ */
+const CACHE_PROOF_MIN_CALLS = 5;
+
+/** Record what one model response reported. Best-effort; never throws. */
+export function recordCacheObservation(
+  modelId: string | undefined | null,
+  inputTokens: unknown,
+  cachedInputTokens: unknown,
+): void {
+  const id = cleanModelId(modelId);
+  if (!id) return;
+  const input = typeof inputTokens === 'number' && Number.isFinite(inputTokens) ? inputTokens : 0;
+  const cached = typeof cachedInputTokens === 'number' && Number.isFinite(cachedInputTokens)
+    ? cachedInputTokens
+    : 0;
+  if (input <= 0) return;
+  // Same locked read-modify-write every other observation uses, so concurrent
+  // lanes cannot lose each other's evidence.
+  mutate(id, (prev) => ({
+    ...prev,
+    cacheObservedCalls: (prev.cacheObservedCalls ?? 0) + 1,
+    ...(cached > 0
+      ? {
+        cacheHitCalls: (prev.cacheHitCalls ?? 0) + 1,
+        smallestCachedPrompt: Math.min(prev.smallestCachedPrompt ?? input, input),
+      }
+      : {}),
+  }));
+}
+
+/**
+ * Does this wire cache, according to the wire? The registry seed stands until
+ * the model has actually demonstrated otherwise — a proof needs several calls,
+ * so one fluke cannot flip a family, and absence of hits never flips a seeded
+ * `true` to false (a cold conversation legitimately reports no reads).
+ */
+export function effectivePromptCacheSupport(modelId: string | undefined | null): boolean {
+  const seeded = resolveModelCapability(cleanModelId(modelId) || undefined).supportsPromptCache;
+  if (seeded) return true;
+  try {
+    const id = cleanModelId(modelId);
+    if (!id) return seeded;
+    const obs = readObservations().entries[id];
+    if (!obs) return seeded;
+    return (obs.cacheHitCalls ?? 0) >= CACHE_PROOF_MIN_CALLS;
+  } catch {
+    return seeded;
+  }
+}
+
+/** The observed practical floor, for consumers that need a minimum. Falls back
+ *  to the registry's seeded value when the wire has taught us nothing. */
+export function effectiveCacheMinTokens(modelId: string | undefined | null): number {
+  const seeded = resolveModelCapability(cleanModelId(modelId) || undefined).cacheMinTokens;
+  try {
+    const id = cleanModelId(modelId);
+    const observed = id ? readObservations().entries[id]?.smallestCachedPrompt : undefined;
+    if (typeof observed === 'number' && observed > 0) {
+      return seeded > 0 ? Math.min(seeded, observed) : observed;
+    }
+  } catch { /* seeded value stands */ }
+  return seeded;
 }
 
 /** Test-only: reset the read cache (the state file is under a temp HOME in tests). */

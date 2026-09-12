@@ -616,6 +616,24 @@ export function recordUsage(event: UsageEvent): void {
   } catch {
     // intentional swallow
   }
+  // TEACH THE HARNESS WHAT THIS WIRE ACTUALLY DOES.
+  //
+  // Every call already reports whether the provider served a cached prefix;
+  // nothing read it. On 2026-09-12 the registry called grok non-caching while
+  // 673 of its 690 recorded calls reported cache reads, and that flag decides
+  // whether mid-turn compaction stays absolute or scales with the window — so
+  // a 256k brain was compacting at 13% of context and busting a cache the
+  // provider was serving. A model a user plugs in tomorrow should not wait on
+  // a code release to be budgeted correctly.
+  try {
+    void import('../runtime/harness/model-window-observations.js')
+      .then(({ recordCacheObservation }) => {
+        recordCacheObservation(event.model, event.inputTokens, event.cachedInputTokens);
+      })
+      .catch(() => undefined);
+  } catch {
+    // observability must never crash the model call path
+  }
 }
 
 /**

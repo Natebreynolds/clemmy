@@ -16,6 +16,7 @@ import { toolCallHint } from './tool-call-hint.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { heldInventory, heldInventoryLines } from './held-inventory.js';
+import { effectivePromptCacheSupport } from './model-window-observations.js';
 
 /**
  * Auto-compact for the harness loop. See plan v0.5.10.
@@ -113,7 +114,10 @@ export interface InFlightCompactionThresholds {
  * prompt, because collapsing a cached prefix costs more prefill than it saves. */
 export function inFlightPromptCacheScale(routedModelId?: string | null): number {
   try {
-    if (!resolveModelCapability(routedModelId).supportsPromptCache) return 1;
+    // The LEARNED contract, not just the seeded one: a wire the provider has
+    // demonstrably cached for scales even when the registry seed predates the
+    // evidence (see effectivePromptCacheSupport).
+    if (!effectivePromptCacheSupport(routedModelId)) return 1;
     return windowScaleForModel(routedModelId);
   } catch {
     return 1;

@@ -111,3 +111,65 @@ test('warmByoProviderCatalogs: daemon start records provider windows without the
   const recorded = await warmByoProviderCatalogs(500);
   assert.equal(typeof recorded, 'number');
 });
+
+// ─── The wire teaches the harness whether it caches ──────────────────────────
+//
+// The registry seeds supportsPromptCache per family, and on 2026-09-12 that
+// seed was measurably wrong for a shipping brain: grok was marked non-caching
+// on a 2026-08-20 note reading "no server-side prompt cache contract we can
+// rely on", while this machine's usage log held 673 of 690 grok calls reporting
+// cache reads — 3,457,024 cached of 11,449,913 input tokens, cacheDialect
+// 'inclusive' on every one. The evidence was recorded all along; nothing read
+// it. That flag decides whether mid-turn compaction stays absolute or scales
+// with the window, so reading it wrong pinned a 256k brain to a 32k trigger.
+//
+// A model a user plugs in tomorrow must not wait on a code release.
+test('a non-caching seed flips only after the wire proves it, repeatedly', async () => {
+  const obs = await import('./model-window-observations.js');
+  const id = 'fixture-unknown-brain-1';
+
+  // An unknown model seeds non-caching and stays there on no evidence.
+  assert.equal(obs.effectivePromptCacheSupport(id), false);
+
+  // A few cache-less calls teach nothing — absence of a hit is a cold prefix,
+  // not proof of a contract.
+  for (let i = 0; i < 8; i += 1) obs.recordCacheObservation(id, 5_000, 0);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(id), false,
+    'calls without hits must never flip a wire');
+
+  // One hit is a fluke, not a contract.
+  obs.recordCacheObservation(id, 5_000, 2_000);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(id), false, 'one hit is not proof');
+
+  // Repeated hits are the provider demonstrating its contract.
+  for (let i = 0; i < 5; i += 1) obs.recordCacheObservation(id, 5_000, 2_000);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(id), true,
+    'the wire demonstrated caching; the seed no longer governs');
+
+  // And the practical floor is learned from the smallest prompt that hit.
+  obs.recordCacheObservation(id, 1_093, 400);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.ok(obs.effectiveCacheMinTokens(id) <= 1_093);
+});
+
+test('a seeded caching wire is never un-learned by a cold conversation', async () => {
+  const obs = await import('./model-window-observations.js');
+  // Claude seeds true. A run of cache-less calls (a genuinely cold prefix)
+  // must not demote it — that would silently re-enable prefix-busting
+  // collapses on exactly the wire the 2026-09-03 incident was measured on.
+  for (let i = 0; i < 20; i += 1) obs.recordCacheObservation('claude-sonnet-5', 9_000, 0);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport('claude-sonnet-5'), true);
+});
+
+test('observation recording never throws on junk', async () => {
+  const obs = await import('./model-window-observations.js');
+  obs.recordCacheObservation('', 100, 10);
+  obs.recordCacheObservation(null, 100, 10);
+  obs.recordCacheObservation('x', 0, 0);
+  obs.recordCacheObservation('x', 'nonsense' as unknown as number, undefined);
+  assert.ok(true, 'budgeting must never break a turn');
+});
