@@ -15,6 +15,7 @@ import { resolveModelCapability } from './model-wire-registry.js';
 import { toolCallHint } from './tool-call-hint.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
+import { heldInventory, heldInventoryLines } from './held-inventory.js';
 
 /**
  * Auto-compact for the harness loop. See plan v0.5.10.
@@ -728,6 +729,19 @@ function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[], sessionId?: 
     `${pairs.length} older completed tool call/result pairs were collapsed to keep the active model context small. Recent tool calls remain verbatim. Exact older outputs remain available with ${toolCallHint('recall_tool_result', { call_id: '<call id>' })}.`,
     completeCallIdIndex,
   ];
+
+  // WHAT SURVIVED THE COLLAPSE, SAID PLAINLY.
+  //
+  // Collapsing results withdraws nothing — the capabilities stay callable and
+  // the inputs stay read — but it removes the model's only VIEW of that, and
+  // re-deriving the list is cheaper for it than recalling one. Live 2026-09-12:
+  // seven pairs collapsed at 05:28:33, then six near-identical DataForSEO
+  // searches over the next four minutes against nine DataForSEO operations it
+  // already held. This rides ahead of the per-pair lines and outside the char
+  // budget below, so the map is the one thing a truncated summary cannot drop.
+  if (sessionId) {
+    for (const line of heldInventoryLines(heldInventory(sessionId))) lines.push(line);
+  }
 
   let chars = lines.join('\n').length;
   let omitted = 0;
