@@ -3866,6 +3866,24 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           catalogBytes: searchCatalogBytes,
           estFirstClassTokens: searchFirstClassTokens,
           estCatalogTokens: searchCatalogTokens,
+          // CAN THIS TURN'S tool_search RETURN A PROVIDER OPERATION AT ALL?
+          //
+          // Nothing recorded that, so provider-blindness was undiagnosable
+          // from the log. Measured 2026-09-04..11: of the turns where the
+          // model named an exact provider slug and did not get it back, 37 of
+          // 38 results contained NO provider row of any kind — the ranker
+          // never saw the operation — and 67% of those turns never returned a
+          // provider row from ANY search in the whole turn. That is the shape
+          // of a surface with no candidate sources attached, but the log could
+          // not confirm it, and two plausible fixes (relevance-aware clipping,
+          // then ranking) were both aimed wrong before this was measured.
+          //
+          // Telemetry only. Nothing here changes what is searched.
+          providerSourceCount: actionToolSearchCandidateSources?.length ?? 0,
+          providerSourceKinds: [...new Set((actionToolSearchCandidateSources ?? [])
+            .map((source) => source.kind))].sort(),
+          planningDisclosureWired: Boolean(planningDisclosure),
+          carrierWork,
         },
       });
     } catch {

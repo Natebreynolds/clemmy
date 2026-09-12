@@ -388,3 +388,46 @@ test('fresh native work shows exact file-reader schemas and native authoring nam
   assert.ok(!namesOf(scoped).has('list_files'));
   assert.doesNotMatch(await renderInstructions(scoped), /\[native-authoring-catalog\]/);
 });
+
+// ─── Can this turn's tool_search return a provider operation at ALL? ──────────
+//
+// Nothing in the log answered that, so provider-blindness was undiagnosable.
+// Measured 2026-09-04..11 across 694 stored tool_search payloads: when the model
+// named an EXACT provider slug in its query, 38 of 114 searches did not return
+// it — and 37 of those 38 contained no provider row of any kind, so the ranker
+// never saw the operation. 67% of those turns never returned a provider row
+// from ANY search in the whole turn.
+//
+// Two fixes were aimed wrong before this was measured (relevance-aware clipping,
+// then ranking). This field is what makes the third attempt start from a fact.
+test('tool_search_scope records whether provider candidate sources were attached', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  await withFlag('on', () =>
+    buildOrchestratorAgent({ sessionId: sess.id, userInput: USER_INPUT, allowToolJit: true }));
+
+  const scopes = listEvents(sess.id, { types: ['tool_search_scope'] });
+  assert.ok(scopes.length > 0, 'the surface emitted its scope telemetry');
+  const data = scopes.at(-1)!.data as Record<string, unknown>;
+
+  // The question the log could not previously answer, in three fields.
+  assert.equal(typeof data.providerSourceCount, 'number',
+    'how many provider candidate sources this surface can search');
+  assert.ok(Array.isArray(data.providerSourceKinds),
+    'which kinds, so a missing lane is nameable rather than inferred');
+  assert.equal(typeof data.planningDisclosureWired, 'boolean',
+    'whether a found operation could even be staged callable');
+  assert.equal(typeof data.carrierWork, 'boolean',
+    'the branch that decides all three');
+
+  // Internally consistent: kinds are a deduped view of the same sources.
+  assert.ok((data.providerSourceKinds as unknown[]).length <= (data.providerSourceCount as number),
+    'kinds are distinct values drawn from the attached sources');
+  // A surface with zero provider sources cannot return a provider operation —
+  // that is exactly the state this field exists to expose, so it must be
+  // representable and must agree with the branch that produced it.
+  if (data.providerSourceCount === 0) {
+    assert.deepEqual(data.providerSourceKinds, [],
+      'no sources means no kinds; a provider-blind surface says so plainly');
+  }
+});
