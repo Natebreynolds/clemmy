@@ -13,6 +13,7 @@ import { getEvent, getTurnGraphEventForSource, openEventLog } from './eventlog.j
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import { expectedWorkPlanLines, type ExpectedWorkPlanLine } from './expected-work-admission.js';
+import { heldInventory } from './held-inventory.js';
 
 function latestUserSeq(sessionId: string): number | null {
   try {
@@ -78,12 +79,34 @@ export function composeRunProgressLine(input: {
          WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
            AND outcome_kind IN ('succeeded', 'empty_result')
       `).get(input.sessionId, sourceUserSeq) as { writes: number | null; reads: number | null };
+    // WHAT SHE HAS ASSEMBLED, NOT JUST HOW MANY CALLS RETURNED.
+    //
+    // This line is the only thing a watching person gets between tool rows, and
+    // for an investigating turn it said "1 result collected" for seven minutes
+    // while she bound five toolkits and fourteen operations. Live 2026-09-12:
+    // the owner watched a healthy 7m32s Plan run and could not tell it apart
+    // from the 33-minute one that circled, because the card never said what was
+    // accumulating — only that something had returned.
+    //
+    // The inventory is the same ledger read the compaction summary uses, so the
+    // number here and the map she keeps mid-turn can never disagree.
+    const held = heldInventory(input.sessionId, sourceUserSeq);
+    const assembled = [
+      held.reads.length > 0
+        ? `${held.reads.length} input${held.reads.length === 1 ? '' : 's'} read`
+        : '',
+      held.toolkits.length > 0
+        ? `${held.toolkits.length} toolkit${held.toolkits.length === 1 ? '' : 's'} bound (${held.toolkits.map((entry) => entry.toolkit.toLowerCase()).slice(0, 4).join(', ')})`
+        : '',
+      held.total > 0 ? `${held.total} operation${held.total === 1 ? '' : 's'} callable` : '',
+    ].filter(Boolean);
     const completedOperations = [
         counts.writes ? `${counts.writes} write${counts.writes === 1 ? '' : 's'} completed` : '',
         counts.reads ? `${counts.reads} result${counts.reads === 1 ? '' : 's'} collected` : '',
     ].filter(Boolean);
     if (lines.length === 0) {
-      return completedOperations.length ? `Still working — ${completedOperations.join(' · ')}.` : input.fallback;
+      const investigating = [...completedOperations, ...assembled];
+      return investigating.length ? `Still working — ${investigating.join(' · ')}.` : input.fallback;
     }
     const satisfied = lines.filter((line) => line.state === 'satisfied').length;
     const evidenceIn = lines.filter((line) => line.state === 'data_in').length;
@@ -106,6 +129,10 @@ export function composeRunProgressLine(input: {
     // An unsatisfied requirement is the next target, not proof that its tool
     // is executing. Live discovery/reads must not be labelled as active writes.
     if (next) parts.push(`next step: ${stepLabel(next)}${next.state === 'blocked_on_dependency' ? ' (waiting on a predecessor)' : ''}`);
+    // A frozen plan already says more than the inventory would, so only the
+    // toolkit count rides along — enough to show breadth without doubling the
+    // line's length on the surface that has the least room.
+    if (held.toolkits.length > 0) parts.push(`${held.toolkits.length} toolkit${held.toolkits.length === 1 ? '' : 's'} bound`);
     return `Still working — ${parts.join(' · ')}.`;
   } catch {
     return input.fallback;
