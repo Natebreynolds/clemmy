@@ -117,12 +117,21 @@ function alreadySteered(identity: SteerIdentity, kind: TurnSteerKind): boolean {
 interface EvidenceWindow {
   /** Inputs the turn actually read from a provider. */
   reads: number;
-  /** Capability resolutions staged for this source. */
+  /** Distinct provider toolkits the turn has proven capability in. */
   staged: number;
-  /** Settled tool calls since the newest read or staging event. */
+  /** Settled tool calls since the last genuinely NEW evidence. */
   quietCalls: number;
   /** The turn already published, so there is nothing to steer toward. */
   published: boolean;
+}
+
+/** The toolkit an operation identifier belongs to. Provider slugs are
+ *  TOOLKIT_VERB_NOUN, so the head segment is the toolkit. Deliberately crude:
+ *  this decides whether a staging event is NEWS, and a wrong split only ever
+ *  makes the window more conservative. */
+function toolkitOf(identifier: string): string {
+  const head = identifier.trim().toUpperCase().split('_')[0] ?? '';
+  return head || identifier.trim().toUpperCase();
 }
 
 function evidenceWindow(identity: SteerIdentity): EvidenceWindow | null {
@@ -135,19 +144,43 @@ function evidenceWindow(identity: SteerIdentity): EvidenceWindow | null {
       return seq === undefined || seq === identity.sourceUserSeq;
     });
     let reads = 0;
-    let staged = 0;
     let quietCalls = 0;
     let published = false;
+    const toolkits = new Set<string>();
     for (const event of events) {
       if (event.type === 'read_receipt') { reads += 1; quietCalls = 0; continue; }
-      if (event.type === 'capability_resolution') { staged += 1; quietCalls = 0; continue; }
+      if (event.type === 'capability_resolution') {
+        // NEW ROWS ARE NOT NEW KNOWLEDGE.
+        //
+        // Counting every capability_resolution as evidence made the window
+        // un-reachable in exactly the case it exists for. Live 2026-09-12
+        // 05:29-05:32: six near-identical DataForSEO searches in three
+        // minutes, three of them byte-for-byte repeats, against NINE
+        // DataForSEO operations already proven. Each one staged rows, each
+        // one reset the counter to zero, and the steer could never fire while
+        // she circled the same toolkit.
+        //
+        // A toolkit she already holds is not a discovery. Only the FIRST
+        // capability in a toolkit resets the window; re-proving that toolkit
+        // is churn and keeps counting toward quiet.
+        const entries = Array.isArray(event.data.entries) ? event.data.entries : [];
+        let learned = false;
+        for (const entry of entries) {
+          const row = entry as { identifier?: unknown; status?: unknown };
+          if (row.status !== 'proven' || typeof row.identifier !== 'string' || !row.identifier.trim()) continue;
+          const toolkit = toolkitOf(row.identifier);
+          if (!toolkits.has(toolkit)) { toolkits.add(toolkit); learned = true; }
+        }
+        if (learned) quietCalls = 0;
+        continue;
+      }
       // tool_returned
       if (event.data.effectiveTool === 'publish_plan') { published = true; continue; }
       // Only top-level settled calls count toward quiet; transport mirrors and
       // inner bookkeeping would inflate the window and fire early.
       if (event.data.accounting === 'top_level') quietCalls += 1;
     }
-    return { reads, staged, quietCalls, published };
+    return { reads, staged: toolkits.size, quietCalls, published };
   } catch {
     return null;
   }

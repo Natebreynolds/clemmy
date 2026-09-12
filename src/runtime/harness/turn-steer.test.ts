@@ -56,10 +56,10 @@ function readReceipt(id: { sessionId: string; sourceUserSeq: number }) {
   });
 }
 
-function staged(id: { sessionId: string; sourceUserSeq: number }) {
+function staged(id: { sessionId: string; sourceUserSeq: number }, identifier = 'FIXTURE_OP') {
   eventlog.appendEvent({
     sessionId: id.sessionId, turn: 1, role: 'system', type: 'capability_resolution',
-    data: { sourceUserSeq: id.sourceUserSeq, entries: [{ kind: 'composio', identifier: 'FIXTURE_OP', status: 'proven' }] },
+    data: { sourceUserSeq: id.sourceUserSeq, entries: [{ kind: 'composio', identifier, status: 'proven' }] },
   });
 }
 
@@ -102,14 +102,17 @@ test('the steer fires only after the inputs are read AND the capabilities are st
 });
 
 test('a turn that is still learning is never interrupted', async () => {
-  // Quiet resets on new evidence. A turn alternating real reads with recalls is
-  // working, not stalling, and must be left alone however long it runs.
+  // Quiet resets on GENUINELY new evidence. A turn that keeps reaching toolkits
+  // it did not have is working, not stalling, and must be left alone however
+  // long it runs. Each staging below is a DISTINCT toolkit — that is what
+  // "still learning" means; re-proving one she already holds is covered by the
+  // churn test below.
   const working = planTurn();
   readReceipt(working);
-  staged(working);
+  staged(working, 'FIRSTKIT_OP');
   for (let i = 0; i < 6; i += 1) {
     quietCall(working, 8);
-    staged(working); // new capability lands: the window resets
+    staged(working, `KIT${i}_OP`); // a toolkit she did not have: the window resets
   }
   assert.equal(nextTurnSteer(working), null,
     'evidence kept arriving — this turn is converging and must not be steered');
@@ -224,4 +227,43 @@ test('the steer carries its own evidence window — the call site, not just the 
   const runner = readFileSync(new URL('./host-turn-runner.ts', import.meta.url), 'utf8');
   assert.match(runner, /recordTurnSteer\(identity, due\.kind, due\.window\)/,
     'the only call site must record the window it was given');
+});
+
+test('re-proving a toolkit she already holds is churn, not evidence', async () => {
+  // THE SHAPE THAT DEFEATED THE FIRST VERSION. Live 2026-09-12 05:29-05:32:
+  // six near-identical DataForSEO searches in three minutes, three of them
+  // byte-for-byte repeats, against NINE DataForSEO operations already proven.
+  // Every one staged fresh capability rows; every one reset the quiet window to
+  // zero. The steer could never fire while she circled a single toolkit, and
+  // the turn was cancelled at 16 minutes with no plan.
+  //
+  // A toolkit already held is not a discovery.
+  const circling = planTurn();
+  readReceipt(circling);
+  staged(circling, 'DATAFORSEO_FIRST_OP');   // genuine: a new toolkit
+  for (let i = 0; i < 6; i += 1) {
+    quietCall(circling, 3);
+    staged(circling, `DATAFORSEO_VARIANT_${i}`); // churn: same toolkit again
+  }
+  const due = nextTurnSteer(circling);
+  assert.ok(due, 'circling one toolkit must reach the window, not reset it forever');
+  assert.equal(due!.window.staged, 1, 'nine DataForSEO rows are ONE toolkit of knowledge');
+  assert.ok(due!.window.quietCalls >= 12, `churn keeps counting: got ${due!.window.quietCalls}`);
+
+  // And a genuinely NEW toolkit still resets it — breadth she did not have is
+  // real progress and must never be mistaken for circling.
+  const widening = planTurn();
+  readReceipt(widening);
+  staged(widening, 'DATAFORSEO_OP');
+  quietCall(widening, 10);
+  staged(widening, 'APIFY_RUN_ACTOR');   // new toolkit: this IS news
+  quietCall(widening, 5);
+  assert.equal(nextTurnSteer(widening), null,
+    'she just learned a toolkit she did not have — that is progress, not a stall');
+  assert.equal(nextTurnSteer({ ...widening }), null);
+
+  quietCall(widening, 12);
+  const later = nextTurnSteer(widening);
+  assert.ok(later, 'once the new toolkit stops producing, the window closes normally');
+  assert.equal(later!.window.staged, 2, 'two distinct toolkits held');
 });
