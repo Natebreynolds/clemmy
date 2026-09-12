@@ -3,6 +3,7 @@ import type { AgentInputItem } from '@openai/agents';
 import { toSmartString } from '@openai/agents-core/utils';
 import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
 import { openEventLog } from './eventlog.js';
+import { defaultDispositionEdge, renderNextEdge, type HostNextEdgeV1 } from './next-edge.js';
 
 export const HOST_TOOL_DISPOSITION_PROTOCOL = 'host_tool_disposition_v1' as const;
 export const USER_REJECTED_HOST_RESULT_TEXT =
@@ -37,6 +38,12 @@ export interface HostToolDispositionOutput {
    * `diagnostic`; the no-progress projection reads it to key repair progress
    * without parsing prose. */
   repairKey?: string;
+  /** THE NEXT EDGE. Present on every `retry: 'replan'` disposition — a typed
+   * move, not prose, so a recoverable refusal can never be a dead end. Absent
+   * only when retry is 'do_not_retry', where by definition there is no edge
+   * back to this call. See next-edge.ts for why this is a type and not a
+   * better sentence. */
+  nextEdge?: HostNextEdgeV1;
 }
 
 export type CanonicalHostModelResultClass =
@@ -175,9 +182,23 @@ export function buildHostToolDispositionResult(input: {
   retired?: boolean;
   diagnostic?: string;
   repairKey?: string;
+  /** An exact edge from the site that knows the real next move. Omitted sites
+   * still get a typed default — a generic edge names a tool and a move, which
+   * is strictly more than the prose it replaces. */
+  nextEdge?: HostNextEdgeV1;
 }): AgentInputItem {
   const unknown = input.disposition === 'effect_unknown';
   const retry = unknown || input.retired === true ? 'do_not_retry' : 'replan';
+  // Every recoverable refusal carries an edge. Derived here rather than asked
+  // of each call site, because a message someone must remember to write is a
+  // message that regresses — which is exactly how this class survived a local
+  // fix on 2026-09-09 and reappeared one branch over in the same file.
+  const edge = retry === 'replan'
+    ? input.nextEdge ?? defaultDispositionEdge({
+      disposition: input.disposition,
+      toolName: input.toolName,
+    })
+    : undefined;
   const output: HostToolDispositionOutput = {
     protocol: HOST_TOOL_DISPOSITION_PROTOCOL,
     disposition: input.disposition,
@@ -188,7 +209,10 @@ export function buildHostToolDispositionResult(input: {
     effect: unknown ? 'may_have_started' : 'none',
     retry,
     requiresReconciliation: unknown,
-    message: dispositionMessage(input.disposition, retry),
+    message: edge
+      ? `${dispositionMessage(input.disposition, retry)} ${renderNextEdge(edge)}`
+      : dispositionMessage(input.disposition, retry),
+    ...(edge ? { nextEdge: edge } : {}),
     ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
     ...(input.repairKey ? { repairKey: input.repairKey } : {}),
   };

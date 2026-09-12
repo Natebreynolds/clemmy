@@ -157,7 +157,9 @@ function evidenceWindow(identity: SteerIdentity): EvidenceWindow | null {
  * The steer due at this frame, or null. Pure read of the ledger — computing it
  * must never be able to fail a turn, so every path swallows into null.
  */
-export function nextTurnSteer(identity: SteerIdentity): { kind: TurnSteerKind; text: string } | null {
+export function nextTurnSteer(
+  identity: SteerIdentity,
+): { kind: TurnSteerKind; text: string; window: { reads: number; staged: number; quietCalls: number } } | null {
   if (!turnSteerEnabled()) return null;
   if (!identity.sessionId || !Number.isSafeInteger(identity.sourceUserSeq) || identity.sourceUserSeq <= 0) {
     return null;
@@ -176,7 +178,11 @@ export function nextTurnSteer(identity: SteerIdentity): { kind: TurnSteerKind; t
     if (window.reads < 1 || window.staged < 1) return null;
     if (window.quietCalls < noNewEvidenceThreshold()) return null;
     if (alreadySteered(identity, 'publish_or_ask')) return null;
-    return { kind: 'publish_or_ask', text: PUBLISH_OR_ASK_STEER };
+    return {
+      kind: 'publish_or_ask',
+      text: PUBLISH_OR_ASK_STEER,
+      window: { reads: window.reads, staged: window.staged, quietCalls: window.quietCalls },
+    };
   } catch {
     return null;
   }

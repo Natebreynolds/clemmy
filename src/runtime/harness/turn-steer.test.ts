@@ -196,3 +196,32 @@ test('a broken ledger degrades to silence, never to a failed turn', async () => 
   // Recording against a dead session must also not throw.
   recordTurnSteer({ sessionId: 'no-such-session', sourceUserSeq: 5 }, 'publish_or_ask');
 });
+
+test('the steer carries its own evidence window — the call site, not just the helper', async () => {
+  // THE BUG THIS PINS. recordTurnSteer took an OPTIONAL window and the only
+  // call site never passed it, so the first live firing (2026-09-12 04:48:41)
+  // recorded {kind, steer, sourceUserSeq} and nothing else — the one event
+  // whose purpose was tuning the threshold carried no threshold data.
+  //
+  // The original test passed anyway because it called recordTurnSteer directly
+  // WITH a window. It pinned the function and not the connection, which is the
+  // same mistake in miniature.
+  const stalled = planTurn();
+  readReceipt(stalled);
+  staged(stalled);
+  quietCall(stalled, 20);
+
+  const due = nextTurnSteer(stalled);
+  assert.ok(due, 'the stall shape is recognised');
+  // The detector hands the window OUT, so a caller cannot forget to compute it.
+  assert.ok(due!.window, 'the steer carries its own evidence');
+  assert.equal(due!.window.reads, 1);
+  assert.equal(due!.window.staged, 1);
+  assert.equal(due!.window.quietCalls, 20);
+
+  // And the runner's call edge passes it through.
+  const { readFileSync } = await import('node:fs');
+  const runner = readFileSync(new URL('./host-turn-runner.ts', import.meta.url), 'utf8');
+  assert.match(runner, /recordTurnSteer\(identity, due\.kind, due\.window\)/,
+    'the only call site must record the window it was given');
+});

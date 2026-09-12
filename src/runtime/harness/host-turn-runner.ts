@@ -5759,7 +5759,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const due = nextTurnSteer(identity);
         if (due) {
           hostSteer = due.text;
-          recordTurnSteer(identity, due.kind);
+          // The window travels with the record. Without it the one event meant
+          // to tune the threshold carries no threshold data — which is exactly
+          // what happened on the first live firing (2026-09-12 04:48:41).
+          recordTurnSteer(identity, due.kind, due.window);
         }
       } catch { /* steering is advisory; never let it end a turn */ }
     }

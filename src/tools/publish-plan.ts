@@ -15,6 +15,7 @@ import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../shared/clo
 import { validateProofProviderArguments } from '../runtime/harness/proof-provider-args.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
 import { validatePlanArgumentPreparation } from './plan-argument-preparation.js';
+import { nextEdge, renderNextEdge, type HostNextEdgeV1 } from '../runtime/harness/next-edge.js';
 
 const bindingSchema = z.object({ producerStepId: z.string().min(1), outputPath: z.string().startsWith('/'), targetPath: z.string().startsWith('/'), expectedType: z.enum(['string', 'number', 'boolean', 'object', 'array']) }).strict();
 const stepSchema = z.object({
@@ -63,13 +64,52 @@ function issueDetails(error: z.ZodError) {
 
 /** SDK parser errors wrap the useful Zod paths in originalError. Return only
  * validation details, never the SDK's invocation input or run context. */
+/**
+ * THE EDGE OUT OF A VALIDATION REFUSAL.
+ *
+ * Live 2026-09-12 04:53:53: a steered Plan turn tried to publish and was
+ * refused with `bindings must cover every canonical topology operation exactly
+ * once` plus "Repair the listed fields in publish_plan". Both true. Neither
+ * mentioned that publish_plan ALREADY accepts the honest partial —
+ * `execution_draft: null` with `readiness: "needs_input"` and the gaps in
+ * `missing_prerequisites`. So she went back to gathering bindings she could not
+ * complete, which is the exact loop the steer had just ended.
+ *
+ * The escape hatch was never missing. Only the signpost was.
+ */
+function planRefusalEdge(issues: ReadonlyArray<{ path: string; message: string }>): HostNextEdgeV1 {
+  // An incomplete execution draft is the one refusal with a better move than
+  // "repair it": publish what is actually known and name what is not.
+  const draftIncomplete = issues.some((issue) => issue.path.startsWith('/execution_draft'));
+  if (draftIncomplete) {
+    return nextEdge({
+      tool: 'publish_plan',
+      change: 'publish_partial',
+      fields: [
+        { path: '/execution_draft', set: 'null' },
+        { path: '/readiness', set: '"needs_input"' },
+        { path: '/missing_prerequisites', set: 'the exact facts still unresolved' },
+      ],
+      say: 'Every topology operation needs its own binding, so an execution draft cannot be partially bound. If the remaining steps are genuinely unresolved, publish the honest partial instead of gathering more.',
+    });
+  }
+  return nextEdge({ tool: 'publish_plan', change: 'repair_arguments' });
+}
+
 function publicationError(error: unknown): string {
   // InvalidToolInputError is not a public SDK export. Inspect only its stable
   // error identity and wrapped validator, not the private invocation object.
   const invalidInput = error instanceof Error && error.name === 'InvalidToolInputError';
   const original = invalidInput && 'originalError' in error ? error.originalError : error;
-  if (original instanceof z.ZodError) return JSON.stringify({ ok: false, published: false,
-    error: 'invalid_plan_input', message: 'Repair the listed fields in publish_plan; no plan was published.', issues: issueDetails(original) });
+  if (original instanceof z.ZodError) {
+    const issues = issueDetails(original);
+    const edge = planRefusalEdge(issues);
+    return JSON.stringify({ ok: false, published: false,
+      error: 'invalid_plan_input',
+      message: `Repair the listed fields in publish_plan; no plan was published. ${renderNextEdge(edge)}`,
+      issues,
+      nextEdge: edge });
+  }
   if (invalidInput) return JSON.stringify({ ok: false, published: false,
     error: 'invalid_plan_input', message: 'publish_plan requires a valid JSON object matching its typed parameters; no plan was published.' });
   return JSON.stringify({ ok: false, published: false, error: 'plan_preparation_failed', code: 'plan_preparation_failed',
