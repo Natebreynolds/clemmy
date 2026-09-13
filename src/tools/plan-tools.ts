@@ -197,7 +197,7 @@ const PlanOperationBindingSchema = z.object({
    * pattern. Live 2026-09-03/04: this was the single most repeated plan_task
    * rejection of the day, including on a clean blank-state home. Naming the
    * vocabulary here is disclosure, not a new constraint. */
-  evidence: z.array(PlanId).max(32)
+  evidence: z.array(PlanId)
     .describe("Evidence kinds from the closed set: payload | tool_result | receipt | readback | local_commit_receipt. Copy from the capability's evidenceKinds; never prose."),
 }).strict();
 
@@ -205,10 +205,10 @@ const PlanOperationBindingSchema = z.object({
  * target, candidate list, open slots, proposal version, and rationale are all
  * host-derived, so paying to retransmit them on every plan was pure ceremony. */
 export const FreshActionPlanDraftSchema = z.object({
-  criteria: z.array(z.string().min(1).max(1_000)).min(1).max(32),
+  criteria: z.array(z.string().min(1).max(1_000)).min(1),
   cardinality: z.object({
     count: z.number().int().min(1).max(10_000),
-    fields: z.array(PlanId).max(32),
+    fields: z.array(PlanId),
     locator: z.object({
       contract: z.literal('workspace_social_posts_v1'),
       collectionPointer: z.literal('/posts'),
@@ -240,10 +240,10 @@ export const FreshActionPlanDraftSchema = z.object({
     handleRequired: z.boolean(),
   }).strict().nullable(),
   topology: ActionWorkTopologySchema,
-  bindings: z.array(PlanOperationBindingSchema).min(1).max(32),
-  deliverables: z.array(z.object({ id: PlanId, kind: PlanId }).strict()).max(32),
+  bindings: z.array(PlanOperationBindingSchema).min(1),
+  deliverables: z.array(z.object({ id: PlanId, kind: PlanId }).strict()),
   /** Same closed vocabulary as a binding's `evidence` — see above. */
-  evidenceRequirements: z.array(PlanId).max(32)
+  evidenceRequirements: z.array(PlanId)
     .describe("Evidence kinds from the closed set: payload | tool_result | receipt | readback | local_commit_receipt. Never prose or human criteria."),
 }).strict().superRefine((draft, ctx) => {
   const bindingIds = draft.bindings.map((binding) => binding.operationId);
@@ -1272,15 +1272,16 @@ function dagKindMismatchRepairInstruction(reason: string): string | null {
     .slice(0, 4)
     .map((match) => `${match[1]} — ${match[2]}`);
   const named = edges.length > 0 ? ` Offending edge(s): ${edges.join('; ')}.` : '';
-  return 'A dependsOn edge cannot carry data: the predecessor\'s produced kinds and the '
+  return 'A declared data dependency cannot carry data: the predecessor\'s produced kinds and the '
     + 'successor\'s accepted kinds do not overlap. This is a KIND problem, not an effect '
     + 'problem, so substituting a capability with the same effect will not fix it.'
     + named
     + ' Do exactly one of: (a) cite a successor operation whose acceptedInputKinds include '
     + 'one of the kinds the predecessor actually produces, (b) cite a different predecessor '
-    + 'that produces a kind the successor accepts, or (c) remove that dependsOn edge if the '
-    + 'successor does not really consume the predecessor\'s output — an operation with no '
-    + 'real data dependency should not declare one. Then call plan_task again.';
+    + 'that produces a kind the successor accepts, or (c) remove that dataFrom edge only if the '
+    + 'successor does not consume those raw result bytes. Keep dependsOn for required ordering; '
+    + 'a reviewed compute result has its own binding. For a legacy draft without topology, '
+    + 'express the separate ordering and dataFrom edges in topology. Then call plan_task again.';
 }
 
 function verifierRecoveryTool(reason: string): 'plan_task' | 'tool_search' | null {
@@ -1748,7 +1749,7 @@ async function executePlanTask(
       // plan froze workflow_create, two later searches ranked workflow_update
       // first, every attempt to use it returned unsupported_unmaterialized, and
       // the turn spent its remaining calls there instead of reporting the problem.
-      : 'Operation selection is now FROZEN by this plan. Invoke each plan-selected local read or business operation through work_call with its exact requirement_id; this call has no proposal field. Use tool_search only to fill in arguments or schemas for those exact operations — a different capabilityRef cannot be substituted into this plan, and searching for one will not materialize it. If a plan-selected operation cannot do what the request needs, say so plainly instead of searching for a replacement.',
+      : 'Invoke each plan-selected operation through work_call with its exact requirement_id and prepared arguments; this call has no proposal field. The host fills declared dynamicBindings and member bindings from retained results; omit those argument fields rather than retyping their values. Operation selection for required steps is frozen. Additional read-only investigation within this objective remains available through discovered capabilities using their capabilityRef (or call_tool for local reads), without claiming a reviewed step ID. Use those observations in the reviewed synthesis. These reads do not satisfy a failed required step or authorize different writes. If an indispensable operation cannot succeed, report that precise gap; do not substitute a different business operation.',
     ...(writeDeferredForValidation ? { writeDeferred: true } : {}),
     ...(bindingSeal.unverifiedMutations.length > 0
       ? { unverifiedMutations: bindingSeal.unverifiedMutations }

@@ -761,7 +761,7 @@ function RunningRow({ presented, index, onChanged, onOpenRun }: {
       </div>
       {pct !== null ? (
         <div class="home-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
-          <div class="home-progress-fill" style={{ width: `${pct}%` }} />
+          <div class="home-progress-fill" style={{ transform: `scaleX(${pct / 100})` }} />
         </div>
       ) : null}
     </>

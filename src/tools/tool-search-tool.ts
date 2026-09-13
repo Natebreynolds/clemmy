@@ -22,7 +22,7 @@ import { hostStructuralPlanningControlLookup } from './structural-control-lookup
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
-import { catalogEntries, rankCatalogEntriesLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
+import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 import {
@@ -1153,7 +1153,10 @@ export function registerToolSearchTool(
         : rankCatalogEntriesLexically(query, [
             ...sourceCandidates.map((candidate, index) => ({
               ...candidate,
-              oneLiner: [candidate.summary, candidate.relevanceText].filter(Boolean).join('\n'),
+              oneLiner: [candidate.summary, candidate.relevanceText, toolSchemaSearchText(candidate.schema)].filter(Boolean).join('\n'),
+              namespace: candidate.sourceKind === 'authorized_external_mcp'
+                ? candidate.name.split('__')[0]
+                : candidate.sourceKind === 'authorized_composio' ? registeredToolkitOfSlug(candidate.name) ?? undefined : undefined,
               sourceRank: Number.isFinite(candidate.score)
                 ? candidate.score!
                 : Math.max(0, 1 - index / Math.max(1, sourceCandidates.length)),
@@ -1178,6 +1181,7 @@ export function registerToolSearchTool(
             // An explicitly expressed compound operation name precedes
             // descriptive coverage; acquisition/lifecycle priorities stay intact.
             || Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+            || Number(right.namespaceMatch) - Number(left.namespaceMatch)
             || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
             || right.score - left.score
             || right.sourceRank - left.sourceRank
@@ -1718,6 +1722,10 @@ export function registerToolSearchTool(
             };
           }
         };
+        // Definitions remain directly addressable when the history carrying
+        // this page is condensed or the activation resumes. This reuses the
+        // existing content-addressed store, not a second discovery call.
+        for (const name of Object.keys(schemas)) ensureSchemaHandle(name);
         // REDUNDANT-DISCOVERY ADVISORY, delivered INSIDE the envelope.
         //
         // discovery-advisory.ts catches "searching one toolkit over and over

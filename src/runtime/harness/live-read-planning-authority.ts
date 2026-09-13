@@ -38,13 +38,15 @@ export interface AuthorizedLiveReadPlanningAuthorityV1 {
   readonly scope: typeof AUTHORIZED_LIVE_READ_PLANNING_SCOPE;
 }
 
-export interface CurrentLiveReadPlanningDefinitionV1 {
+export interface CurrentProviderDefinitionV1 {
   readonly providerInputSchemaDigest: string;
   readonly definitionFingerprint: string;
   readonly providerOperationVersion: string;
   readonly providerOutputSchemaDigest: string | null;
   readonly invokePortId: string;
 }
+
+export type CurrentLiveReadPlanningDefinitionV1 = CurrentProviderDefinitionV1;
 
 export interface ReopenedAuthorizedLiveReadPlanningCapabilityV1 {
   readonly entry: RegisteredHostCapability;
@@ -92,9 +94,19 @@ function closedSchema(value: unknown): Readonly<Record<string, unknown>> | null 
 export function currentLiveReadPlanningDefinitionFromEntry(
   entry: RegisteredHostCapability,
 ): CurrentLiveReadPlanningDefinitionV1 | null {
+  if (currentCapabilityManifest(entry.manifest)?.effect !== 'read') return null;
+  return currentProviderDefinitionFromEntry(entry);
+}
+
+/** Reopen definition identity without granting an effect. Accepted mutation
+ * carriers need the same metadata check, then their own consent hand-off;
+ * the read-planning wrapper above remains read-only. */
+export function currentProviderDefinitionFromEntry(
+  entry: RegisteredHostCapability,
+): CurrentProviderDefinitionV1 | null {
   if (!isCurrentCallableCatalogEntry(entry)) return null;
   const manifest = currentCapabilityManifest(entry.manifest);
-  if (!manifest || manifest.effect !== 'read') return null;
+  if (!manifest) return null;
   const stored = peekCapabilityManifestStore()?.get(manifest.manifestId);
   if (
     !stored

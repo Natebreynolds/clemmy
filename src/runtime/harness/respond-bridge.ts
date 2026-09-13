@@ -2147,6 +2147,7 @@ export async function respondViaHarness(
       return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
     }
     requestAttemptStatus = 'failed';
+    bridgeLogger.error({ surface, sessionId: sourceUserEvent.sessionId, sourceUserSeq: sourceUserEvent.seq, err }, 'Harness turn failed before its terminal could be delivered');
     // A hard provider/runtime error is reduced at the same durable public
     // boundary as every other terminal. Raw exception text remains in private
     // logs; if an exact terminal already committed, idempotency returns that

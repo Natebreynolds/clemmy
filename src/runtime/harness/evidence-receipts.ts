@@ -1,3 +1,4 @@
+import { deriveResultHandleFactsFromRaw, recordsAtRecordPath } from './result-facts.js';
 /**
  * Typed, host-issued evidence receipts.
  *
@@ -63,7 +64,7 @@ import {
   parseHostLocalWriteCommitFacts,
   proveHostLocalWorkspaceStructuredCollection,
 } from './host-local-write-commit.js';
-import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
+import { proveHostLocalWriteDerivation } from './host-local-write-derivation.js';
 import {
   ensureProviderAcknowledgementReceiptTable,
   loadProviderAcknowledgementReceipt,
@@ -249,18 +250,11 @@ function scalarIdentity(record: unknown): string | undefined {
   return undefined;
 }
 
-function valueAtRecordPath(payload: unknown, path: string | null): unknown {
-  if (path === null) return undefined;
-  if (path === '') return payload;
-  return path.split('.').reduce<unknown>((value, key) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    return (value as Record<string, unknown>)[key];
-  }, payload);
-}
-
 function recordsFromResult(result: SuccessfulSettlementResultEvidence): unknown[] | null {
-  const records = valueAtRecordPath(result.rawPayload, result.handle.recordPath);
-  if (Array.isArray(records)) return records;
+  // Resolve the same collection that handle creation counted. Native MCP can
+  // transport a JSON array inside one text block; a plain property walk sees
+  // the transport instead of the retained business records.
+  if (result.handle.recordPath !== null) return recordsAtRecordPath(result.rawPayload, result.handle.recordPath) ?? [];
   if (Array.isArray(result.rawPayload)) return result.rawPayload;
   if (
     result.rawPayload
@@ -269,7 +263,7 @@ function recordsFromResult(result: SuccessfulSettlementResultEvidence): unknown[
   ) {
     return (result.rawPayload as { records: unknown[] }).records;
   }
-  return result.handle.recordPath === null ? null : [];
+  return null;
 }
 
 function identitiesFromRecords(records: readonly unknown[]): string[] {
@@ -307,6 +301,17 @@ function readFacts(
   )
     && node.obligations.includes('source_observed')
     && !node.obligations.includes('source_completeness');
+  // A host file read transports JSON as text. Derive the same structured
+  // facts used by universe sealing, while the receipt still hashes the exact
+  // original text bytes. Provider-returned strings are never reinterpreted.
+  if (result.executionSite === 'host' && typeof result.rawPayload === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(result.rawPayload);
+      const facts = deriveResultHandleFactsFromRaw(parsed);
+      if (facts.recordPath !== null) result = { ...result, rawPayload: parsed, handle: { ...result.handle, ...facts } };
+    } catch { /* Plain text remains a point observation, never a collection. */ }
+    if (inspectProviderEnvelope(result.rawPayload).verdict !== 'clean') return { ok: false, reason: 'host JSON result contains a contradictory envelope' };
+  }
   const records = recordsFromResult(result);
   const locatorOnly = Boolean(
     result.rawPayload
@@ -1484,7 +1489,7 @@ function redeemHostWriteReceiptFacts(input: {
         nodeId: input.nodeId,
       });
       if (!sources.ok) return sources;
-      const derivation = proveHostLocalWorkspaceDerivation({
+      const derivation = proveHostLocalWriteDerivation({
         db,
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
@@ -1893,7 +1898,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         } else if (atomic?.ok) {
           intendedDigest = atomic.facts.intendedDigest;
         } else if (localCommit) {
-          const derivation = proveHostLocalWorkspaceDerivation({
+          const derivation = proveHostLocalWriteDerivation({
             db,
             sessionId: input.sessionId,
             sourceUserSeq: input.sourceUserSeq,

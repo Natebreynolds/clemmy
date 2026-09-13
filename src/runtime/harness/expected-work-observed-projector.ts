@@ -31,6 +31,7 @@ import { proveFiniteReadResultCoverage } from './read-evidence-refinement.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import type { ObservedReversibility } from './resolution-ledger.js';
+import { supersededReviewedFileCalls, staleReviewedReadCalls } from './reviewed-file-correction.js';
 
 interface AcceptedOperationProjectionRow {
   operation_id: string;
@@ -149,7 +150,21 @@ export function projectObservedExpectedWorkHistory(input: {
       input.contract.identity.sourceUserSeq,
     ) as AcceptedOperationProjectionRow[];
 
-    const operations: ObservedExpectedWorkOperationV1[] = rows.map((row) => {
+    // Coverage concerns the current generation of an approved output. Exact
+    // prior revisions/readbacks remain in the observed ledger, but cannot
+    // compete with their proven replacements for the same requirement.
+    const observedCalls = new Set(rows.map(row => row.logical_tool_call_id));
+    const historical = new Map<string, Set<string>>();
+    const operations: ObservedExpectedWorkOperationV1[] = rows.filter(row => {
+      if (!row.requirement_id) return true;
+      let retired = historical.get(row.requirement_id);
+      if (!retired) {
+        retired = supersededReviewedFileCalls(input.contract.identity, row.requirement_id, observedCalls);
+        for (const id of staleReviewedReadCalls(input.contract.identity, row.requirement_id)) retired.add(id);
+        historical.set(row.requirement_id, retired);
+      }
+      return !retired.has(row.logical_tool_call_id);
+    }).map((row) => {
       const effect = projectedEffect(row.effect_kind);
       const lexicalEvidence = operationEvidenceContract({
         resolvedTool: row.resolved_tool,

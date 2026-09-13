@@ -27,6 +27,7 @@ import {
   type MemoryHit,
 } from '../lib/api';
 import { humanizeReasons } from '../lib/memory-reasons';
+import { ChatBackButton } from '../components/ChatBackButton';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic } from '../lib/native-bridge';
@@ -391,7 +392,7 @@ function FactDetailView({ id, onBack, onOpenFact }: {
   return (
     <div class="workflow-detail">
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <div class="chat-title">Memory</div>
       </div>
       <div class="workflow-detail-body">
@@ -582,7 +583,7 @@ function EntityDetailView({ id, onBack, onOpenFact }: {
   return (
     <div class="workflow-detail">
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <div class="chat-title">{dossier?.entity?.canonicalName ?? 'Person'}</div>
       </div>
       <div class="workflow-detail-body">

@@ -70,16 +70,26 @@ function isProviderJsonValue(value: unknown): boolean {
   return isRecord(value) && Object.values(value).every(isProviderJsonValue);
 }
 
+/** Annotation keywords describe data; they do not restrict its JSON shape.
+ * Unknown or assertion keywords are deliberately not treated as annotations. */
+export function isOpenProviderDataSchema(schema: Record<string, unknown>): boolean {
+  return Object.keys(schema).every(key => [
+    'description', 'title', 'default', 'examples', '$comment', '$schema', '$id',
+    'deprecated', 'readOnly', 'writeOnly',
+  ].includes(key));
+}
+
 function matchesProviderProperty(value: unknown, schemas: Array<Record<string, unknown> | true>): boolean {
   return schemas.every((schema) => schema === true
     ? isProviderJsonValue(value)
-    : Object.keys(schema).length === 0
+    : isOpenProviderDataSchema(schema)
       ? isProviderJsonValue(value)
       : providerReadyValueMatchesSchema(value, schema));
 }
 
 function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, unknown> | undefined): boolean {
   if (!schema) return false;
+  if (isOpenProviderDataSchema(schema)) return isProviderJsonValue(value);
   if (value === null && schema.nullable === true) return true;
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) return false;
   if (Object.prototype.hasOwnProperty.call(schema, 'const') && !Object.is(schema.const, value)) return false;
@@ -94,6 +104,7 @@ function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, 
     ));
   }
   switch (propertyType(schema)) {
+    case 'null': return value === null;
     case 'string': return typeof value === 'string';
     case 'number': return typeof value === 'number' && Number.isFinite(value);
     case 'integer': return Number.isSafeInteger(value);
@@ -195,6 +206,9 @@ function collectRequiredOnlyFailures(
     if (out.length < budget.maxEntries) out.push(failure);
   };
   switch (propertyType(schema)) {
+    case 'null':
+      if (value !== null) push({ path: pointer, code: 'type_mismatch', expected: 'null' });
+      return;
     case 'array': {
       if (!Array.isArray(value) || !isRecord(schema.items)) return;
       const items = schema.items;
@@ -334,6 +348,10 @@ export function collectProviderSchemaFailures(
     push({ path: pointer, code: 'unresolved_shape', expected: 'undeclared' });
     return;
   }
+  if (isOpenProviderDataSchema(schema)) {
+    if (!isProviderJsonValue(value)) push({ path: pointer, code: 'type_mismatch', expected: 'JSON value' });
+    return;
+  }
   if (value === null && schema.nullable === true) return;
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) {
     push({ path: pointer, code: 'enum_mismatch', expected: schemaTypeWord(schema) });
@@ -420,7 +438,7 @@ export function collectProviderSchemaFailures(
           continue;
         }
         for (const constraint of constraints) {
-          if (constraint === true || Object.keys(constraint).length === 0) {
+          if (constraint === true || isOpenProviderDataSchema(constraint)) {
             if (!isProviderJsonValue(child)) push({ path: childPointer(pointer, key), code: 'type_mismatch', expected: 'JSON value' });
           } else {
             collectProviderSchemaFailures(child, constraint, childPointer(pointer, key), out, budget);

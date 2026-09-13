@@ -11,6 +11,7 @@ import {
   type WorkflowEventSummary,
   type WorkflowRunSummary,
 } from '../lib/api';
+import { ChatBackButton } from '../components/ChatBackButton';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
@@ -141,7 +142,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   return (
     <div class="workflow-detail">
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <div class="chat-title">{workflow.name}</div>
       </div>
       <div class="workflow-detail-body">
@@ -311,7 +312,7 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
   return (
     <div class="workflow-detail">
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <div class="chat-title">{run.id}</div>
       </div>
       <div class="workflow-detail-body">

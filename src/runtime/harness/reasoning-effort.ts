@@ -8,11 +8,12 @@
  * minimum effort; there is no over-reasoning to cut on a calendar lookup. This
  * feature only ever RAISES effort above that baseline, and only where it helps.
  *
- * THE AXIS — "is a human waiting on this turn?" (motivated by real traffic:
+ * Explicit Plan requests high effort: the owner chose to invest in preparation.
+ * Approved Execute uses the task's complexity tier, even in a chat session.
+ * Otherwise the axis is "is a human waiting on this turn?" (real traffic:
  * across 1271 turns, 83% of `complex` turns were background WORKFLOW turns where
  * latency is invisible; only ~10% of interactive chat turns were complex):
- *   - Interactive turns (a person is waiting): cap at 'medium' — never make a
- *     human wait on a 'high'-effort deliberation. 78% of chat is simple → 'none'
+ *   - Ordinary interactive turns: cap at 'medium'. 78% of chat is simple → 'none'
  *     (instant); the rest nudges to 'medium' at most.
  *   - Background turns (workflow / execution / goal-resume — no human waiting):
  *     may use 'high'. These are the multi-step prospect-prep / Salesforce
@@ -22,12 +23,13 @@
  * `classifyComplexity` (context-packet.ts), already computed every turn, so this
  * is one source of truth, not a duplicate classifier.
  *
- * Kill-switch: CLEMMY_DYNAMIC_REASONING=off → the orchestrator is built without
- * explicit modelSettings and the caller skips injection, so the SDK per-model
- * default rides (byte-identical to before this feature).
+ * CLEMMY_DYNAMIC_REASONING=off disables automatic complexity-based selection.
+ * Explicit Plan still requests high effort. Provider adapters translate only
+ * supported controls; selecting a tier is not proof it reached the wire.
  */
 import { getRuntimeEnv } from '../../config.js';
 import type { AgentContextPacket } from './context-packet.js';
+import type { TaskMode } from './task-mode.js';
 import {
   READ_RE,
   SEQUENCE_RE,
@@ -55,9 +57,11 @@ export function continuationClassifyEnabled(): boolean {
 }
 
 export interface EffortSignals {
+  /** Durable user-selected mode, never inferred from the request's wording. */
+  taskMode?: TaskMode['kind'];
   /**
    * True when a human is waiting on this turn (interactive chat). Caps effort
-   * at 'medium' so a person never waits on a 'high'-effort deliberation.
+   * at 'medium' for ordinary chat. Explicit Plan takes precedence.
    * Background turns (workflow / execution / goal-resume) leave this false and
    * may use 'high' — latency is invisible there and depth aids hard work.
    */
@@ -73,6 +77,7 @@ export interface EffortSignals {
 }
 
 export interface TurnEffortSignalInput {
+  taskMode?: TaskMode['kind'];
   interactive: boolean;
   turnIntent: AgentContextPacket['turnIntent'];
   multiItem: boolean;
@@ -89,6 +94,7 @@ export function reasoningEffortSignalsForTurn(input: TurnEffortSignalInput): Eff
   const hasRead = READ_RE.test(actionText);
   const hasWrite = WRITE_RE.test(actionText);
   return {
+    taskMode: input.taskMode,
     interactive: input.interactive,
     boundedForegroundAction: input.interactive
       && input.turnIntent === 'action'
@@ -119,7 +125,13 @@ export function selectReasoningEffort(
   complexity: AgentContextPacket['complexity'],
   signals: EffortSignals = {},
 ): { effort: ReasoningEffort; reason: string } {
+  if (signals.taskMode === 'plan') {
+    return { effort: 'high', reason: 'explicit-plan' };
+  }
   const base = baseEffort(complexity);
+  if (signals.taskMode === 'execute') {
+    return { effort: base, reason: `explicit-execute/complexity:${complexity}` };
+  }
   if (
     signals.interactive
     && signals.boundedForegroundAction

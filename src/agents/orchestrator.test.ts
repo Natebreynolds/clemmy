@@ -145,13 +145,13 @@ function installExactReversibleSheetCapability(): () => void {
  * dispatch. Chat-session fixtures persist the graph shadow; the harness run
  * context then carries the identity into settlement.
  */
-function anchorAcceptedTask(sessionId: string, text: string): { sourceUserSeq: number; turn: number } {
+function anchorAcceptedTask(sessionId: string, text: string, taskMode?: { version: 1; kind: 'plan' }): { sourceUserSeq: number; turn: number } {
   const source = appendEvent({
     sessionId,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text },
+    data: { text, ...(taskMode ? { taskMode } : {}) },
   });
   const shadow = recordTurnGraphShadow({
     identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
@@ -306,6 +306,22 @@ test('Orchestrator is built with explicit modelSettings so the SDK honors per-tu
   );
   assert.ok(agent.modelSettings?.reasoning, 'reasoning settings seeded at construction');
   assert.equal((agent.modelSettings as { text?: { verbosity?: string } }).text?.verbosity, 'low');
+});
+
+test('explicit Plan seeds SDK reasoning even when automatic effort selection is disabled', async () => {
+  const previous = process.env.CLEMMY_DYNAMIC_REASONING;
+  process.env.CLEMMY_DYNAMIC_REASONING = 'off';
+  try {
+    const session = HarnessSession.create({ kind: 'chat', title: 'plan-effort-construction' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Help me choose an approach.', taskMode: { version: 1, kind: 'plan' } } });
+    const agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq });
+    assert.equal(agent.hasExplicitModelSettings(), true);
+    assert.equal(agent.modelSettings.reasoning?.effort, 'high');
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_DYNAMIC_REASONING;
+    else process.env.CLEMMY_DYNAMIC_REASONING = previous;
+  }
 });
 
 test('Orchestrator carries the harness guardrails', async () => {
@@ -1260,6 +1276,136 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
     assert.equal(results.length, 1);
     assert.equal((results[0].data as { ok?: boolean }).ok, true);
     assert.equal((results[0].data as { model?: string }).model, 'gpt-5.4');
+  } finally {
+    setClaudeAgentSdkWorkerRunForTest(null);
+    rmSync(authFile, { force: true });
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a Plan delegates Claude investigation through the host with inherited high reasoning', async (t) => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', title: 'claude brain codex worker route' });
+  const authFile = path.join(TMP_HOME, 'state', 'auth.json');
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    CLAUDE_MODEL: process.env.CLAUDE_MODEL,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKER: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  const requestedModels: Array<string | undefined> = [];
+  try {
+    process.env.AUTH_MODE = 'claude_oauth';
+    process.env.CLAUDE_MODEL = 'claude-sonnet-5';
+    process.env.MODEL_ROUTING_MODE = 'off';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER = 'on';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([{
+      role: 'worker',
+      modelId: 'claude-sonnet-5',
+      whenIntent: 'research',
+      scope: 'durable',
+      source: 'settings',
+    }]);
+    writeFileSync(authFile, JSON.stringify({
+      source: 'native',
+      codexOauth: {
+        accessToken: 'test-codex-access',
+        refreshToken: 'test-codex-refresh',
+        accountId: 'test-codex-account',
+        lastRefresh: new Date().toISOString(),
+      },
+    }), 'utf8');
+    setClaudeAgentSdkWorkerRunForTest(async () => {
+      assert.fail('a Plan worker must retain its own host source instead of entering the legacy SDK lane');
+    });
+
+    const stubModel: import('@openai/agents').Model = {
+      async getResponse(request) {
+        assert.equal(request.modelSettings?.reasoning?.effort, 'high');
+        return {
+          output: [{
+            type: 'message',
+            id: 'msg_codex_worker_done',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'planning worker completed under claude brain', providerData: {} }],
+          }],
+          usage: new Usage(),
+          responseId: 'resp_codex_worker_done',
+        } as unknown as import('@openai/agents').ModelResponse;
+      },
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      },
+    };
+    const stubProvider: import('@openai/agents').ModelProvider = {
+      getModel(modelName?: string) {
+        requestedModels.push(modelName);
+        return stubModel;
+      },
+    };
+
+    const anchor = anchorAcceptedTask(session.id, 'Investigate one fictional account with the configured worker.', { version: 1, kind: 'plan' });
+    const agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq });
+    const runWorker = (agent.tools ?? []).find((tool) => (tool as { name?: string }).name === 'run_worker') as {
+      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(runWorker, 'expected run_worker on the Claude-brain orchestrator surface');
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
+
+    const packet = {
+      objective: 'Research one fictional account.',
+      item: 'Cedar & Finch',
+      resolvedTools: 'none needed',
+      externalMcpToolNames: null,
+      context: 'This is an offline routing proof.',
+      instructions: 'Return one concise sentence.',
+      expectedOutput: 'One sentence or ERROR: <reason>.',
+      intent: 'research',
+      workManifest: {
+        id: 'claude-brain-codex-worker',
+        contractVersion: '1',
+        phase: 'research',
+        mode: 'declare',
+        phases: [{ id: 'research' }],
+      },
+    };
+    const input = JSON.stringify(packet);
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      input,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_claude_brain_codex_worker', arguments: input },
+      },
+    ));
+
+    assert.equal(result, 'planning worker completed under claude brain');
+    assert.deepEqual(requestedModels, ['claude-sonnet-5']);
+    const started = listEvents(session.id, { types: ['worker_started'] });
+    assert.equal((started[0]?.data as { model?: string }).model, 'claude-sonnet-5');
+    assert.equal((started[0]?.data as { provider?: string }).provider, 'claude');
+    assert.ok(started[0]?.data.childSessionId);
+    assert.notEqual(started[0]?.data.childSessionId, session.id);
+    const routed = listEvents(session.id, { types: ['worker_model_routed'] });
+    assert.equal(routed.length, 1);
+    assert.equal((routed[0].data as { modelId?: string }).modelId, 'claude-sonnet-5');
+    assert.equal((routed[0].data as { provider?: string }).provider, 'claude');
+    assert.equal((routed[0].data as { transport?: string }).transport, 'host_harness');
+    const results = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(results.length, 1);
+    assert.equal((results[0].data as { ok?: boolean }).ok, true);
+    assert.equal((results[0].data as { model?: string }).model, 'claude-sonnet-5');
   } finally {
     setClaudeAgentSdkWorkerRunForTest(null);
     rmSync(authFile, { force: true });

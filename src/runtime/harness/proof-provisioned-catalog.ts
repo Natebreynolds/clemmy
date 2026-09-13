@@ -475,7 +475,10 @@ export async function registerProofProvisionedCapabilities(identity: {
       // provider schemas rather than preserving semantics while silently
       // dropping mutation or readback verification. Explicitly selected
       // definitions remain authoritative, including an intentional absence.
-      const documentedContracts = !selectedSchema
+      // An exact-schema discovery has a refreshed schema row, but no selected
+      // semantic contract. It must carry the same adapter declaration as its
+      // planning disclosure. Only explicit selectedDefinitions freeze absence.
+      const documentedContracts = !options.selectedDefinitions
         ? validatedDocumentedComposioDefinitionContracts({
             operationId: slug,
             inputSchema: schema,

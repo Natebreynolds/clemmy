@@ -81,6 +81,7 @@ export type LocalPlanningDefinitionsResult =
 
 interface ConfiguredLocalTool {
   name: string;
+  description?: string;
   parameters: unknown;
   /** Positive proof that this exact schema belongs to the generic local
    * work_call dispatcher rather than only to a first-class/call_tool surface. */
@@ -108,16 +109,16 @@ let observerOverride: ConfiguredLocalToolObserver | null = null;
  * closures: callers that build agents still get fresh instances from
  * getCoreTools. The exactly-one-match rule is preserved by keeping every
  * declaration for a name rather than collapsing duplicates. */
-let cachedCoreToolParameters: Map<string, Array<{ name: string; parameters: unknown }>> | null = null;
+let cachedCoreToolParameters: Map<string, Array<{ name: string; parameters: unknown; description?: string }>> | null = null;
 
-async function coreToolParameterProjection(): Promise<Map<string, Array<{ name: string; parameters: unknown }>>> {
+async function coreToolParameterProjection(): Promise<Map<string, Array<{ name: string; parameters: unknown; description?: string }>>> {
   if (!cachedCoreToolParameters) {
     const { getCoreTools } = await import('../../tools/registry.js');
-    const projection = new Map<string, Array<{ name: string; parameters: unknown }>>();
-    for (const entry of getCoreTools() as unknown as Array<{ name?: unknown; parameters?: unknown }>) {
+    const projection = new Map<string, Array<{ name: string; parameters: unknown; description?: string }>>();
+    for (const entry of getCoreTools() as unknown as Array<{ name?: unknown; parameters?: unknown; description?: unknown }>) {
       if (typeof entry.name !== 'string') continue;
       const rows = projection.get(entry.name) ?? [];
-      rows.push({ name: entry.name, parameters: entry.parameters });
+      rows.push({ name: entry.name, parameters: entry.parameters, ...(typeof entry.description === 'string' ? { description: entry.description } : {}) });
       projection.set(entry.name, rows);
     }
     cachedCoreToolParameters = projection;
@@ -137,7 +138,7 @@ async function defaultConfiguredLocalTool(
   // open JSON records. The first-class provider projection is intentionally
   // Codex-strict and therefore cannot be planning authority for this carrier.
   if (carrier === 'work_call') {
-    const [{ getLocalToolSchemas }, { z }] = await Promise.all([
+    const [{ getLocalToolSchemas, getLocalToolCatalog }, { z }] = await Promise.all([
       import('../../tools/local-runtime-tools.js'),
       import('zod'),
     ]);
@@ -146,6 +147,7 @@ async function defaultConfiguredLocalTool(
       return {
         name,
         parameters: z.toJSONSchema(schema),
+        description: getLocalToolCatalog().find(tool => tool.name === name)?.description,
         workCallLocalDispatch: true,
         argumentSchema: schema,
       };
@@ -163,7 +165,9 @@ async function defaultConfiguredLocalTool(
   // The core surface can carry provider-strict required+nullable placeholders.
   // Deferred callers omit those same optional fields. Use the same contract
   // discovery publishes, including when Plan later reopens this core tool.
-  return { name: matches[0].name, parameters: relaxJsonSchemaForDeferred(matches[0].parameters) };
+  return { name: matches[0].name, parameters: relaxJsonSchemaForDeferred(matches[0].parameters), description: matches[0].description,
+    ...(carrier === 'work_call' && isRegistryDeclaredCorePlanningRead(name) ? { workCallLocalDispatch: true } : {}),
+  };
 }
 
 export async function resolveConfiguredLocalPlanningTool(
@@ -297,6 +301,14 @@ export function isRegistryDeclaredNativePlanningRead(name: string): boolean {
     && declarationCanEnterLocalPlanningRead(matches[0]!);
 }
 
+/** Core reads dispatch through the existing inner-dispatch implementation.
+ * The explicit read-plan declaration supplies eligibility; observation still
+ * requires the exact configured core schema before any ref can be issued. */
+function isRegistryDeclaredCorePlanningRead(name: string): boolean {
+  return isRegistryDeclaredNativePlanningRead(name) && TOOL_REGISTRY.some(row => row.name === name
+    && row.tier === 'core' && row.innerDispatch === 'read' && row.lanes.includes('inner-dispatch'));
+}
+
 function declarationCanEnterLocalPlanning(declaration: ToolDecl): boolean {
   return declarationCanEnterLocalPlanningRead(declaration)
     || declarationCanEnterLocalPlanningMutation(declaration);
@@ -332,7 +344,7 @@ export function isWorkCallConfiguredLocalPlanningCapability(
   return isRegistryDeclaredLocalPlanningMutation(name)
     || (
       isRegistryDeclaredLocalPlanningCapability(name)
-      && workCallConfiguredNames.has(name.trim())
+      && (workCallConfiguredNames.has(name.trim()) || isRegistryDeclaredCorePlanningRead(name.trim()))
     );
 }
 

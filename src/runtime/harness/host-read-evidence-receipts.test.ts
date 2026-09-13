@@ -323,6 +323,29 @@ test('a complete collection derives identities from raw bytes and exactly replay
   assert.equal(eventlog.listEvents(settled.task.sessionId, { types: ['evidence_receipt'] }).length, 1);
 });
 
+test('native MCP JSON text receipts certify the exact business records rather than transport blocks', async () => {
+  const { deriveResultHandleFactsFromRaw } = await import('./result-facts.js');
+  const records = [{ id: 'a', score: 7 }, { id: 'b', score: 9 }, { id: 'c', score: 11 }];
+  for (const content of [records, []]) {
+    const rawPayload = { result: { content: [{ type: 'text', text: JSON.stringify(content) }] }, complete: true };
+    const facts = deriveResultHandleFactsFromRaw(rawPayload);
+    assert.equal(facts.recordCount, content.length);
+    const evidence = { executionSite: 'provider', rawPayload, handle: { ...facts, continuationRef: null, continuationRepeated: false } } as never;
+    const node = { nodeId: 'mcp-read', effectKind: 'read', operationMode: 'collection_read', obligations: ['source_observed'] } as never;
+    const observed = receipts._readFactsForTest(node, evidence);
+    assert.equal(observed.ok, true, JSON.stringify(observed));
+    if (observed.ok) {
+      assert.deepEqual(observed.facts.recordIdentities, content.map(record => `id:${record.id}`));
+      assert.equal(observed.facts.completeness, 'unknown', 'transport completion does not invent a provider completeness signal');
+    }
+    const forgedCount = receipts._readFactsForTest(node, { ...evidence as any, handle: { ...facts, recordCount: 900, continuationRef: null, continuationRepeated: false } });
+    assert.equal(forgedCount.ok, false, 'using the canonical reader must not waive count integrity');
+    const exhaustive = receipts._readFactsForTest({ ...node as any, obligations: ['source_completeness'] },
+      { ...evidence as any, handle: { ...facts, completeness: 'partial', continuationRef: 'next-page', continuationRepeated: false } });
+    assert.equal(exhaustive.ok, false);
+  }
+});
+
 for (const fixture of [
   {
     name: 'partial collection',

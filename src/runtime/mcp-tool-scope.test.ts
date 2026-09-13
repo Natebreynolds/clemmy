@@ -878,3 +878,20 @@ test('"only use X" stays exclusive', () => {
   });
   assert.deepEqual(scope.allowedServerSlugs, ['apify']);
 });
+
+
+test('connector authority uses complete catalog identities, not task nouns from their names', () => {
+  for (const [server, noun] of [['Research Lab', 'research'], ['Design Studio', 'design'], ['Sales Reports', 'sales']]) {
+    const input = `Use ${server} to inspect the available inputs. Do not perform the ${noun} yet.`;
+    const scope = compileMcpAccessConstraint(input, [server]);
+    assert.equal(scope.mode, 'none');
+    assert.deepEqual(scope.deny, []);
+    const refusal = compileMcpAccessConstraint(`Do not use ${server} for this task.`, [server]);
+    assert.equal(refusal.mode, 'deny_set');
+    assert.deepEqual(refusal.deny, [server.toLowerCase().replace(/ /g, '_')]);
+  }
+  assert.deepEqual(compileMcpAccessConstraint('Use only Research Lab, not Design Studio.', ['Research Lab', 'Design Studio']), {
+    mode: 'allow_only', allow: ['research_lab'], deny: ['design_studio'],
+  });
+  assert.equal(compileMcpAccessConstraint('Do not use any connectors.', ['Research Lab']).mode, 'deny_all');
+});

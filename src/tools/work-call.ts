@@ -27,7 +27,7 @@ import {
   type ExpectedWorkCallBinding,
   type ExpectedWorkUniverseSelectorV1,
 } from '../runtime/harness/expected-work-admission.js';
-import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { attestToolLocalInputInvalidity, harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import {
   loadExpectedWorkContract,
   prepareActionExpectedWorkContract,
@@ -617,10 +617,17 @@ export function graphlessForegroundReadAuthority(input: {
   logicalToolCallId: string;
   operationId: string;
   effect: 'read' | 'compute';
+  requirementId?: string;
 }): { ok: true } | { ok: false; reason: string } {
   try {
     if (getTurnGraphEventForSource(input.sessionId, input.sourceUserSeq)) {
-      return { ok: false, reason: 'foreground read authority cannot replace a persisted turn graph' };
+      const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+      // An extra read neither satisfies nor replaces a reviewed graph node.
+      // Its existing exact catalog attestation still owns the actual call.
+      if (input.effect !== 'read' || !input.requirementId || loaded.status !== 'ok'
+        || loaded.contract.operations.some(operation => operation.id === input.requirementId)) {
+        return { ok: false, reason: 'foreground read authority cannot replace a persisted turn graph' };
+      }
     }
     const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
     const attestation = currentHostCallAttestation();
@@ -630,11 +637,13 @@ export function graphlessForegroundReadAuthority(input: {
       || attestation.sourceUserSeq !== input.sourceUserSeq
       || attestation.acceptedTaskId !== acceptedTaskId
       || attestation.logicalToolCallId !== input.logicalToolCallId
-      || attestation.bindingKind !== 'catalog_manifest'
+      || (attestation.bindingKind !== 'catalog_manifest'
+        && !(attestation.bindingKind === 'local_envelope' && input.effect === 'read'))
       || attestation.effect !== input.effect
-      || attestation.operationId.toLowerCase() !== input.operationId.trim().toLowerCase()
+      || (attestation.bindingKind === 'local_envelope' ? attestation.toolName : attestation.operationId).toLowerCase()
+        !== input.operationId.trim().toLowerCase()
     ) {
-      return { ok: false, reason: 'foreground read lacks its exact current catalog attestation' };
+      return { ok: false, reason: 'foreground read lacks its exact current host attestation' };
     }
     const logical = logicalCallAuthorityState({
       sessionId: input.sessionId,
@@ -1267,6 +1276,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   } = options;
   const frozenAuthority = formatFrozenWorkCallDescription({
     frozenContract,
+    proposalFree: requireHostPlan,
     catalogIdentifiers,
     destinationFamily: destinationFamily
       ?? (frozenContract ? frozenCreateDestinationFamily(frozenContract) : null),
@@ -1470,11 +1480,11 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         ? normalizeWorkCallInputForFrozenCardinality(frame.input, cardinalityAuthority)
         : frame.input;
       const graphlessForegroundRead = graphNeutralReadCompute
-        && !sourceContract
-        && getTurnGraphEventForSource(
-          resolved.sessionId,
-          resolved.sourceUserSeq as number,
-        ) === null;
+        && ((!sourceContract && getTurnGraphEventForSource(
+          resolved.sessionId, resolved.sourceUserSeq as number,
+        ) === null)
+          || (resolvedRuntimeEffect === 'read' && proposal === null && sourceContract
+            && !sourceContract.operations.some(operation => operation.id === frame.input.requirement_id)));
       const preAdmissionSourceRequirement = sourceStrategyRequirementContext({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
@@ -1506,6 +1516,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           logicalToolCallId: resolved.logicalToolCallId,
           operationId: effectiveTarget.toolName,
           effect: resolvedRuntimeEffect,
+          requirementId: frame.input.requirement_id,
         });
         if (!foregroundAuthority.ok) {
           frame.refusalKind = 'work_authority_unavailable';
@@ -1528,8 +1539,12 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           frame.refusalKind = 'work_authority_unavailable';
           return refuse(frame.refusalKind, sourceCarrier.reason);
         }
-        return withUnboundWorkRequirement(frame.input.requirement_id, () =>
-          withSourceRequirementIfKnown(sourceRequirement, dispatch));
+        const invokeRead = () => withSourceRequirementIfKnown(sourceRequirement, dispatch);
+        // A supplemental capability selector must not masquerade as a graph
+        // requirement at the crossing/settlement layer. The call keeps its
+        // exact source and catalog identity, without claiming graph progress.
+        return sourceContract ? invokeRead()
+          : withUnboundWorkRequirement(frame.input.requirement_id, invokeRead);
       }
       const preAdmissionOperation = sourceContract?.operations.find((operation) => (
         operation.id === cardinalityBoundInput.requirement_id
@@ -1950,7 +1965,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
             });
             if (ready.length === 0) return [];
             return [
-              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name; \`capability_selector\` is the value to pass as requirement_id — they are DIFFERENT strings and neither substitutes for the other.`,
+              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
               `Invocation shape for a direct call: ${JSON.stringify({
                 requirement_id: 'cap:local:<name>:<variant>',
                 name: '<name>',
@@ -1966,7 +1981,9 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
             ];
           })()
         : []),
-      'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
+      requireHostPlan
+        ? 'For an approved plan with a model-authored compute step, record its actual output with plan_step_result after its dependencies succeed. Then invoke the consuming work_call with its exact plan requirement id; the host fills declared dynamicBindings from that retained output, so omit the bound argument fields. For ordinary direct work without a reviewed compute step, compose the content in the consuming write\'s arguments.'
+        : 'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
       'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
     ].join(' '),
     parameters: (requireHostPlan
@@ -2277,6 +2294,14 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     }
   };
 
+  // The same SDK parser owns this carrier and call_tool. A malformed envelope
+  // cannot dispatch; let it return its schema corrective without poisoning the
+  // source and its parallel healthy reads as an unknown-effect execution.
+  attestToolLocalInputInvalidity(built, ({ rawInput, parsedInput }) => {
+    if (typeof rawInput !== 'string') return 'unproven';
+    const schema = requireHostPlan ? HostPlannedWorkCallInputSchema : WorkCallInputSchema;
+    return schema.safeParse(parsedInput).success ? 'unproven' : 'invalid';
+  });
   registerHostWorkCallPreparer(built as object, prepareForHostConsent);
   if (hostPlanningReadCapabilityResolver) {
     registerHostPlanningReadCapabilityResolver(

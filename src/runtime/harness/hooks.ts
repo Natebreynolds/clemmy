@@ -613,6 +613,9 @@ export function attachEventLogHooks(
           topologyRole,
           effect: accounting.effect,
           ...(connectionObservationNonce ? { invocationNonce: connectionObservationNonce } : {}),
+          // Preserve a negative result before its diagnostic text is clipped.
+          // Absence of failure does not manufacture positive business proof.
+          ...(!toolOutputLooksSuccessful(resultStr) ? { ok: false } : {}),
           ...(effectiveToolTail(tool?.name ?? '') === 'tool_search'
             ? { ok: pairedAdmittedStart && toolOutputLooksSuccessful(resultStr) }
             : {}),

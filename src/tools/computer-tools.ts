@@ -6,7 +6,9 @@ import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { canonicalLocalFileTarget, commitLocalFileRevision } from '../runtime/harness/local-file-revision.js';
+import { canonicalLocalFileTarget, commitLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
+import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
+import { reviewedFileCorrectionPrecondition } from '../runtime/harness/reviewed-file-correction.js';
 import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
@@ -1394,8 +1396,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
           + 'the connection/toolkit directly (composio_status for configuration state).';
       }
-      if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
-      if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
+      if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
+      if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
       // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
       // HTML, so routing it through markitdown strips the tags (and was erroring
       // on workspace views: "An error occurred while running the tool"). Only
@@ -1445,8 +1447,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
           + 'Nothing was read and no approval is needed — use the already-authenticated connection instead.';
       }
-      if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
-      if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
+      if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
+      if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
       const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
       if (ingested.error) return `Conversion failed: ${ingested.error}`;
       return formatToolOutput(
@@ -1464,6 +1466,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     description: [
       'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path.',
       'mode=create or null creates a new file and refuses to replace an existing one.',
+      'Missing parent directories are created automatically inside the allowed workspace; a separate directory-creation step is unnecessary.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
       'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
       'A successful write retains the prior bytes for recovery and returns a receipt for the committed file. Send the complete content when it fits your response budget; append is available when you need to continue a large file.',
@@ -1503,8 +1506,13 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
       }
       let revision: ReturnType<typeof commitLocalFileRevision>;
-      try { revision = commitLocalFileRevision({ target: canonicalTarget, content: input.content, mode }); }
+      try {
+        const bound = currentExpectedWorkBinding();
+        const expectedContentDigest = bound ? reviewedFileCorrectionPrecondition(bound, { target: canonicalTarget, content: input.content, mode }) : undefined;
+        revision = commitLocalFileRevision({ target: canonicalTarget, content: input.content, mode, expectedContentDigest });
+      }
       catch (error) {
+        if (error instanceof LocalFileRevisionConflict) return new InvalidArgumentsPreDispatchResult(error.message) as unknown as string;
         if (error instanceof Error && error.message.startsWith('Refused to overwrite existing file:')) return error.message;
         throw error;
       }

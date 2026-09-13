@@ -269,3 +269,46 @@ test('documented atomic content commits retain receipt and content-commit eviden
   assert.ok(entry?.manifest?.operationSemantics?.atomicInputContent);
   assert.deepEqual(entry.manifest.evidenceContract, { kinds: ['receipt', 'content_commit'], readbackRequired: false });
 });
+
+test('foreground exact-schema discovery retains documented semantics through Plan preparation', async () => {
+  const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+  const publisher = await import('../../tools/publish-plan.js');
+  const operation = 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN';
+  const schema = { type: 'object', required: ['title', 'markdown_text'], properties: {
+    title: { type: 'string' }, markdown_text: { type: 'string' },
+  } };
+  composio.__test__.setConnectedAccountsLoader(async () => [{ id: ACCOUNT, status: 'ACTIVE', user_id: 'selected-user', toolkit: { slug: 'googledocs' } }]);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  schemas._setToolSchemaLoaderForTests(async identifier => identifier === operation ? {
+    inputParameters: schema, outputParameters: PROVIDER_ENVELOPE, providerObservedAt: Date.now(), providerOperationVersion: '20260912',
+  } : null);
+  const session = eventlog.createSession({ id: 'foreground-plan-contract', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: {
+    text: 'Plan a new report in my connected Google Docs account.', taskMode: { version: 1, kind: 'plan' },
+  } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'capability_resolution', data: {
+    sourceUserSeq: source.seq, authoritativeForTask: true, entries: [{ intent: 'foreground tool_search disclosed this exact live operation',
+      kind: 'composio', identifier: operation, status: 'proven', connection: 'active', accountIdentity: ACCOUNT, effectClass: 'write' }],
+  } });
+  // This is the actual discovery publication route: exact digest, not a caller-authored selected definition.
+  const result = await provisioning.registerProofProvisionedCapabilities(identity, {
+    allowedIdentifiers: [operation], expectedSchemaDigests: [{ identifier: operation, schemaDigest: digestSchema(schema) }],
+  });
+  assert.equal(result.refusal, undefined, JSON.stringify(result));
+  const ref = catalogs.canonicalResolvedCapabilityId(operation, ACCOUNT, 'composio');
+  const entry = factory.get(ref)!;
+  assert.deepEqual(entry.manifest?.operationSemantics, { version: 1, reversibility: 'reversible' });
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority,
+    candidates: [{ name: operation, carrier: 'work_call', sourceKind: 'authorized_composio', schema }] });
+  assert.equal(refs[operation], ref);
+  const prepared = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: {
+    steps: [{ id: 'save', action: 'Create the report.', effect: 'external_write', capabilityRef: ref,
+      staticArguments: { title: 'Prepared report', markdown_text: 'Exact prepared content.' }, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Document receipt returned.' }],
+    successCriteria: ['The report exists.'], subagents: [],
+  } });
+  assert.equal((prepared.preparedBindings as any[])[0].identity.manifestDigest, entry.manifestDigest);
+});

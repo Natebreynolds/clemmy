@@ -492,6 +492,17 @@ input, textarea, select { font: inherit; font-size: 16px; }
   letter-spacing: -0.02em;
   margin: var(--sp-3) 2px var(--sp-3);
 }
+.app-main .chat-header h2.chat-title {
+  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--t-body);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .app-main h3 {
   font-family: var(--font-display);
   font-size: var(--t-sm);
@@ -1141,9 +1152,41 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* ── chat ───────────────────────────────────────────────────────── */
 
-.chat-shell { position: relative; display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.chat-header { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-3); padding-bottom: var(--sp-3); }
+/* Local `?preview=chat` only — not a product control. */
+.chat-preview-switch {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+.chat-preview-switch button {
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+.chat-preview-switch button.is-on {
+  background: var(--accent-soft);
+  border-color: var(--line-hot);
+  color: var(--accent);
+}
+
+.chat-shell { position: relative; display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; }
+.app-main:has(.chat-shell) {
+  padding-bottom: 0;
+  overflow: hidden;
+}
+.chat-header { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-3); padding-bottom: var(--sp-3); min-width: 0; }
+.chat-header .brain-chip { flex: 0 0 auto; }
 .chat-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: var(--bg-2);
   border: 1px solid var(--line);
   border-radius: 50%;
@@ -1153,12 +1196,17 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex: 0 0 auto;
   transition: transform 0.14s var(--ease-out);
 }
+.chat-back svg { width: 18px; height: 18px; }
 .chat-back:active { transform: scale(0.9); }
-.chat-title {
+.chat-title,
+.app-main h2.chat-title {
   margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
   font-family: var(--font-display);
   font-weight: 700;
   font-size: var(--t-body);
+  letter-spacing: -0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1170,13 +1218,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
   -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
-  padding: var(--sp-3) 0 var(--sp-4);
+  padding: var(--sp-3) 0 calc(var(--chat-dock-h, 140px) + max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px) + 12px);
 }
 .chat-jump {
   position: absolute;
-  z-index: 3;
+  z-index: 41;
   left: 50%;
-  bottom: 72px;
+  bottom: calc(var(--chat-dock-h, 140px) + max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px) + 12px);
   transform: translateX(-50%);
   min-height: 44px;
   padding: 8px 16px;
@@ -1368,7 +1416,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .bubble-md blockquote {
   margin: 0 0 0.55em;
   padding-left: var(--sp-3);
-  border-left: 3px solid var(--line-strong);
+  border-left: 2px solid var(--line-strong);
   color: var(--fg-2);
 }
 .bubble-md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
@@ -1717,50 +1765,127 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .conn-recovering { color: var(--accent-warn); border-color: rgba(176, 125, 10, 0.30); }
 
-/* The composer is a tool, not a headline: it holds the bottom of the screen
-   without drawing the eye off the transcript. */
-.chat-composer { flex: 0 0 auto; display: flex; gap: var(--sp-2); padding: var(--sp-3) 0 var(--sp-1); align-items: flex-end; }
-.chat-input {
-  flex: 1;
-  background: var(--bg-2);
-  border: 1px solid var(--line-strong);
-  border-radius: 24px;
-  color: var(--fg);
-  padding: 12px 18px;
-  outline: none;
-  min-width: 0;
-  font-size: var(--t-body);
-  transition: border-color 0.16s ease, box-shadow 0.2s ease;
+/* The open-thread composer is the same object as AskCapsule: a blurred
+   pill that lifts with the keyboard and clears the home indicator. Plan
+   mode sits just above it so the thumb still finds Send. */
+.chat-dock-fade {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(var(--chat-dock-h, 140px) + max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px) + 36px);
+  z-index: 30;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.95) 55%, var(--bg-0) 100%);
 }
-.chat-input:focus { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
+.chat-dock {
+  position: fixed;
+  left: max(16px, env(safe-area-inset-left));
+  right: max(16px, env(safe-area-inset-right));
+  bottom: calc(max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px));
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  max-width: 728px;
+  margin: 0 auto;
+}
+.chat-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+  min-height: 56px;
+  padding: 6px;
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.86);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  border: 1px solid rgba(63, 42, 22, 0.12);
+  box-shadow: var(--shadow-lift);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.chat-composer:focus-within { border-color: var(--line-hot); box-shadow: var(--shadow-lift), 0 0 0 4px var(--accent-soft); }
+.chat-mic {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg-2);
+  transition: background 0.16s ease, color 0.16s ease, transform 0.14s var(--ease-out);
+}
+.chat-mic svg { width: 20px; height: 20px; }
+.chat-mic:active { transform: scale(0.92); background: var(--bg-2); }
+.chat-mic[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); }
+.chat-dock.listening .chat-mic svg { animation: breathe 1.4s ease-in-out infinite; }
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-height: 160px;
+  resize: none;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--fg);
+  padding: 10px 6px 10px 10px;
+  outline: none;
+  font-size: 16px;
+  line-height: 1.4;
+  box-shadow: none;
+}
+.chat-input::placeholder { color: var(--fg-3); }
+.chat-input:focus { border: 0; box-shadow: none; }
 .chat-send {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 44px;
   height: 44px;
   border-radius: 50%;
-  border: none;
+  border: 0;
   /* Solid accent, no glow: the send button is the one warm mark on the
      screen and it does not need a halo to be found. */
   background: var(--accent);
   color: var(--on-accent);
-  font-weight: 700;
-  transition: transform 0.14s var(--ease-out), opacity 0.16s ease;
+  transition: transform 0.14s var(--ease-out), opacity 0.2s ease, filter 0.16s ease;
 }
-.chat-send:active { transform: scale(0.92); }
-.chat-send:disabled { opacity: 0.3; }
+.chat-send svg { width: 18px; height: 18px; }
+.chat-send:active:not(:disabled) { transform: scale(0.9); filter: brightness(0.95); }
+.chat-send:disabled { opacity: 0.32; }
 
 /* Stop reads as a halt, not a second send: the accent is what you press to
    ADD, so taking it away is what tells you this one takes something back. */
-/* Stop is reached when a run has gone long with nothing to show, so it is the
-   last control that should look foreign. It was painting on --surface-2,
-   --text and --hairline: three desktop-shaped names this stylesheet has never
-   defined. The fallbacks kept it visible but cool grey, on a warm-paper app. */
 .chat-stop {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
   background: var(--bg-2);
   color: var(--fg);
   border: 1px solid var(--line);
-  font-size: 13px;
-  line-height: 1;
+  transition: transform 0.14s var(--ease-out), opacity 0.16s ease;
+}
+.chat-stop svg { width: 18px; height: 18px; }
+.chat-stop:active:not(:disabled) { transform: scale(0.9); }
+.chat-stop:disabled { opacity: 0.45; }
+.chat-stop-busy {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-strong);
+  border-top-color: var(--fg);
+  animation: act-spin 0.9s linear infinite;
 }
 
 /* ── foreground running-task affordance ────────────────────────── */
@@ -3488,7 +3613,15 @@ textarea:focus-visible,
 .home-run-elapsed { flex: 0 0 auto; font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 .home-run .running-task-state { margin-top: 0; }
 .home-progress { height: 5px; border-radius: 999px; background: var(--bg-3); overflow: hidden; }
-.home-progress-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width 0.4s var(--ease-out); }
+.home-progress-fill {
+  height: 100%;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 0.4s var(--ease-out);
+}
 .home-run-control { display: flex; justify-content: flex-end; }
 .home-run-control .run-control { margin-left: 0; }
 .home-away-glyph { flex: 0 0 auto; width: 16px; height: 16px; }
@@ -3839,12 +3972,19 @@ textarea.cz-input { resize: vertical; }
 }
 
 /* Typed Plan mode uses the same composer and reply vocabulary as normal chat. */
-.chat-mode-bar { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) 0 0; color: var(--fg-3); font-size: 12px; line-height: 1.4; }
+.chat-mode-bar { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-2); padding: 0 4px; color: var(--fg-3); font-size: 12px; line-height: 1.4; min-width: 0; }
+.chat-mode-bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-mode-bar button { flex-shrink: 0; min-height: 44px; min-width: 64px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 12px; background: var(--bg-1); color: var(--fg); font: inherit; font-weight: 600; }
 .chat-mode-bar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft, transparent); }
 .chat-mode-bar button:disabled { opacity: .6; }
 .plan-mode-label { font-size: 12px; margin: 8px 0; color: var(--fg-3); }
-.plan-review { border: 1px solid var(--line-strong); border-top: 3px solid var(--accent); background: var(--bg-1); border-radius: 14px; padding: 16px; margin: 12px 0; }
+.plan-review {
+  background: var(--accent-soft);
+  border: 1px solid rgba(239, 95, 12, 0.24);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  margin: 12px 0;
+}
 .plan-review > * + * { margin-top: 14px; }
 .plan-review > div:first-child { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
 .plan-review > div:first-child > span, .plan-revision { color: var(--fg-3); font-size: 12px; font-weight: 400; }

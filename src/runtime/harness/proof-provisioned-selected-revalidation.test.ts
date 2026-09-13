@@ -388,14 +388,14 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
     ),
     {
       allowedIdentifiers: [create, readback],
-      expectedSchemaDigests: [
+      selectedDefinitions: [
         {
           identifier: create,
-          schemaDigest: digestSchema(createInput),
+          schemaDigest: digestSchema(createInput), accountIdentity: CONNECTION_ID, verificationContract: null, operationSemantics: null,
         },
         {
           identifier: readback,
-          schemaDigest: digestSchema(readbackInput),
+          schemaDigest: digestSchema(readbackInput), accountIdentity: CONNECTION_ID, verificationContract: null, operationSemantics: null,
         },
       ],
     },

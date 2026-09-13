@@ -29,6 +29,7 @@ import {
   type HarnessEvent,
 } from '@clem/chat-engine';
 import { getRun, runDetailPath } from '../lib/api';
+import { ChatBackButton } from '../components/ChatBackButton';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { lastGoodAt, lastGoodNotice } from '../lib/last-good';
@@ -96,7 +97,7 @@ export function Run({ sessionId, onBack }: Props) {
   return (
     <div class="workflow-detail">
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <div class="chat-title">{run?.title || 'Run'}</div>
       </div>
       <div class="workflow-detail-body">

@@ -1,4 +1,5 @@
 import { renderCanonicalMemoryContext } from './canonical-context.js';
+import { acceptedPlanOwnerScopeInput } from './accepted-plan-execution.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { batchShapeDirective } from '../../tools/batch-shape-directive.js';
 import { getComposio } from '../../integrations/composio/client.js';
@@ -2552,7 +2553,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
       }
     : mode === 'full'
     ? resolveMcpToolScopeWithRecall({
-        userInput: declinedParentWithNewTask ? taskInput : request.message,
+        userInput: declinedParentWithNewTask ? taskInput : acceptedPlanOwnerScopeInput(sessionId, userInputEvent.seq, request.message),
         priorUserInputs: priorBrainInputs,
         standingCapabilityHints: composioStandingPolicyCapabilityHints(),
         configuredServerNames: enabledExternalServerNames(),

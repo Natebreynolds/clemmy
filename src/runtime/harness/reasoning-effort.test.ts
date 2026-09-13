@@ -27,6 +27,37 @@ test('interactive leaves simple/moderate unchanged (cap only bites at high)', ()
   assert.equal(selectReasoningEffort('moderate', { interactive: true }).effort, 'medium');
 });
 
+test('explicit Plan requests high across complexity and foreground/background posture', () => {
+  for (const complexity of ['simple', 'moderate', 'complex'] as const) {
+    for (const interactive of [true, false]) {
+      const signals = reasoningEffortSignalsForTurn({ taskMode: 'plan', interactive,
+        turnIntent: 'action', multiItem: false, text: 'Continue.' });
+      assert.deepEqual(selectReasoningEffort(complexity, signals),
+        { effort: 'high', reason: 'explicit-plan' });
+    }
+  }
+});
+
+test('Plan wording does not change effort without the durable Plan mode', () => {
+  for (const taskMode of [undefined, 'normal'] as const) {
+    const signals = reasoningEffortSignalsForTurn({ taskMode, interactive: true,
+      turnIntent: 'action', multiItem: false, text: 'Explain what Plan mode means.' });
+    assert.equal(selectReasoningEffort('simple', signals).effort, 'none');
+    assert.equal(selectReasoningEffort('complex', signals).effort, 'medium');
+  }
+});
+
+test('approved Execute uses task complexity instead of the chat latency ceiling', () => {
+  for (const interactive of [true, false]) {
+    const signals = reasoningEffortSignalsForTurn({ taskMode: 'execute', interactive,
+      turnIntent: 'action', multiItem: false, text: 'Execute.' });
+    assert.equal(selectReasoningEffort('simple', signals).effort, 'none');
+    assert.equal(selectReasoningEffort('moderate', signals).effort, 'medium');
+    assert.deepEqual(selectReasoningEffort('complex', signals),
+      { effort: 'high', reason: 'explicit-execute/complexity:complex' });
+  }
+});
+
 test('bounded foreground action avoids extended reasoning on scalar-only moderate complexity', () => {
   const input = 'Publish the prepared announcement to my existing website at 9:30 PM with the approved title.';
   const packet = buildAgentContextPacket(input, primer, { sessionKind: 'chat', sessionId: 'bounded-action' });

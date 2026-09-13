@@ -335,7 +335,7 @@ test('registry semantics admit reversible local writes generically and refuse un
 });
 
 test('reviewed project reads enter local planning generically without widening arbitrary reads or shell', async () => {
-  for (const name of ['user_profile_read', 'time_slots'] as const) {
+  for (const name of ['user_profile_read', 'time_slots', 'read_file'] as const) {
     assert.equal(local.isRegistryDeclaredLocalPlanningCapability(name), true, name);
     assert.equal(
       local.isWorkCallConfiguredLocalPlanningCapability(name, workCallConfiguredNames),
@@ -359,7 +359,7 @@ test('reviewed project reads enter local planning generically without widening a
     assert.deepEqual(wrongCarrier, { ok: false, reason: 'carrier_mismatch' });
   }
 
-  for (const name of ['run_shell_command', 'read_file'] as const) {
+  for (const name of ['run_shell_command', 'list_files'] as const) {
     assert.equal(local.isRegistryDeclaredLocalPlanningCapability(name), false, name);
     const refused = await local.observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
     assert.equal(refused.ok, false, name);

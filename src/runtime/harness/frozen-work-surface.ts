@@ -107,10 +107,12 @@ function formatOperationLine(operation: AcceptedTaskWorkContractV1['operations']
   return `- ${operation.id}: ${operation.effect}${coverage}${cardinality}${depends}`;
 }
 
-export function formatFrozenWorkAuthority(contract: AcceptedTaskWorkContractV1): string {
+export function formatFrozenWorkAuthority(contract: AcceptedTaskWorkContractV1, proposalFree = false): string {
   return [
     'The host already froze this turn\'s work contract. Do not propose a new topology.',
-    'Every work_call uses proposal:null and binds one of these exact requirement ids:',
+    proposalFree
+      ? 'Every work_call binds one of these exact requirement ids. There is no proposal field on this call:'
+      : 'Every work_call uses proposal:null and binds one of these exact requirement ids:',
     ...contract.operations.map(formatOperationLine),
   ].join('\n');
 }
@@ -261,6 +263,7 @@ export function formatFrozenNodeBindings(bindings: readonly FrozenNodeToolBindin
 
 export function formatFrozenWorkCallDescription(input: {
   frozenContract?: AcceptedTaskWorkContractV1 | null;
+  proposalFree?: boolean;
   catalogIdentifiers?: readonly string[];
   catalogDescriptors?: readonly FrozenCatalogBindingDescriptorV1[];
   destinationFamily?: string | null;
@@ -275,7 +278,7 @@ export function formatFrozenWorkCallDescription(input: {
     sourceStrategyBinding: input.sourceStrategyBinding,
   });
   return [
-    formatFrozenWorkAuthority(input.frozenContract),
+    formatFrozenWorkAuthority(input.frozenContract, input.proposalFree),
     formatFrozenNodeBindings(bindings),
   ].filter(Boolean).join(' ');
 }

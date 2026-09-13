@@ -372,3 +372,14 @@ test('complete generic and specific names retain the existing score and base-ver
   assert.equal(reply[0]!.name, 'MAIL_CREATE_REPLY_DRAFT');
   assert.ok(reply[0]!.score > reply[1]!.score);
 });
+
+test('multi-provider queries preserve repeated words in each namespace', () => {
+  const entries = [
+    { name: 'ATLAS_CALENDAR_READ', namespace: 'atlascalendar', oneLiner: 'Read events.' },
+    { name: 'ATLAS_DOCS_READ', namespace: 'atlasdocs', oneLiner: 'Read documents.' },
+  ];
+  const ranked = rankCatalogEntriesLexically('Atlas Calendar and Atlas Docs', entries);
+  assert.ok(ranked.every(entry => entry.namespaceMatch), 'both explicitly named namespaces must be recognized');
+  const control = rankCatalogEntriesLexically('Atlas Calendar and Docs', entries);
+  assert.equal(control.find(entry => entry.name === 'ATLAS_DOCS_READ')?.namespaceMatch, false, 'do not join non-adjacent provider words');
+});

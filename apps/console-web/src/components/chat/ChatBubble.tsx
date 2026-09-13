@@ -235,7 +235,7 @@ export function ChatBubble({
   if (isUser) {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[80%] rounded-lg rounded-tr-sm bg-primary-tint px-4 py-2.5">
+        <div className="max-w-[min(80%,40rem)] rounded-lg rounded-tr-sm bg-primary-tint px-4 py-2.5">
           <p className="whitespace-pre-wrap text-body-lg text-fg">{message.text}</p>
           {message.attachmentNames && message.attachmentNames.length > 0 && (
             <p className="mt-1 text-caption text-muted">📎 {message.attachmentNames.join(', ')}</p>
@@ -303,7 +303,7 @@ export function ChatBubble({
   return (
     <div className="flex gap-3">
       <DogMark size={28} className="mt-0.5 self-start" />
-      <div className={cn('min-w-0 max-w-[80%]', fillColumn && 'w-full')}>
+      <div className={cn('min-w-0', message.planArtifactRef || fillColumn ? 'w-full' : 'max-w-[min(80%,40rem)]')}>
         {/* The build log rides ABOVE the reply: while the turn runs it is the
             whole story (steps, helpers, the thinking line); once the reply
             lands it settles to a results-first one-liner you can reopen. */}

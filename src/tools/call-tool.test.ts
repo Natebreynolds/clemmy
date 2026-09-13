@@ -2346,3 +2346,52 @@ test('a unique current catalog live-read is reachable as an inner work_call targ
     capabilityCatalogs.installHostCapabilityCatalogFactory(previousFactory);
   }
 });
+
+
+test('host-accounted local reads and argument refusals do not spend the same call twice', async () => {
+  const { withLogicalToolCall } = await import('../runtime/harness/attempt-identity.js');
+  const accepted = acceptedSourceForCallToolFixture('sess-host-counted-carrier');
+  const calls: string[] = [];
+  _setInnerDispatchToolsForTests(new Map([['skill_list', {
+    name: 'skill_list', invoke: async () => { calls.push('skill_list'); return '[]'; },
+  }]]));
+  try {
+    for (const [id, args, expected] of [
+      ['valid', { name: 'skill_list', args_json: '{}' }, '[]'],
+      ['refused', { name: 'memory_search', args_json: '{"query":"brief","limit":20}' }, 'arg_validation'],
+    ] as const) {
+      const counter = new ToolCallsCounter(1);
+      counter.increment(); // The actual host stepper charges before entering the carrier.
+      const wrapped = wrapToolForHarness(buildCallTool({ reachableBuiltinNames: new Set(['skill_list', 'memory_search']) }) as never) as unknown as ToolLike;
+      const out = await withHarnessRunContext({ sessionId: 'sess-host-counted-carrier', ...accepted, counter, hostOwnsToolAccounting: true }, () =>
+        withLogicalToolCall({ sessionId: 'sess-host-counted-carrier', sourceUserSeq: accepted.sourceUserSeq, tool: 'call_tool', args, logicalToolCallId: id }, () =>
+          wrapped.invoke!({ context: { sessionId: 'sess-host-counted-carrier' } }, JSON.stringify(args), { toolCall: { callId: id } })));
+      assert.ok(String(out).includes(expected), String(out));
+      assert.equal(counter.calls, 1);
+    }
+    assert.deepEqual(calls, ['skill_list']);
+  } finally { _setInnerDispatchToolsForTests(null); }
+});
+
+
+test('wrapped first-class discovery uses the turn-configured instance and retains its authority boundary', async () => {
+  const sessionId = 'sess-configured-discovery-instance';
+  const accepted = acceptedSourceForCallToolFixture(sessionId);
+  const calls: unknown[] = [];
+  const configuredSearch = { name: 'tool_search', invoke: async (_ctx: unknown, raw: string) => {
+    calls.push(JSON.parse(raw)); return JSON.stringify({ brokerCoverage: 'connected-source-fixture', results: [{ name: 'connected__read' }] });
+  }};
+  const args = { name: 'tool_search', args_json: JSON.stringify({ query: 'connected__read', limit: 1, role_key: null, cursor: null, account_selection: null }) };
+  const options = { reachableBuiltinNames: new Set<string>(), firstClassNames: new Set(['tool_search']),
+    localToolOverrides: new Map([['tool_search', configuredSearch]]) as never };
+  const invoke = (deniedNames = new Set<string>()) => (buildCallTool({ ...options, deniedNames }) as unknown as ToolLike).invoke!(
+    { context: { sessionId } }, JSON.stringify(args), { toolCall: { callId: `configured-${calls.length}` } });
+  await withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(4) }, async () => {
+    const result = String(await invoke());
+    assert.ok(result.includes('connected-source-fixture'), result);
+    assert.equal(calls.length, 1);
+    const denied = String(await invoke(new Set(['tool_search'])));
+    assert.ok(denied.includes('not_reachable'), denied);
+    assert.equal(calls.length, 1, 'the selected instance never bypasses this turn exclusion');
+  });
+});

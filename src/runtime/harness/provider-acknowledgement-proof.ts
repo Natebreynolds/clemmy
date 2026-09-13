@@ -91,15 +91,30 @@ export function proveProviderAcknowledgement(input: Scope & {
       || binding.bindingKind !== 'catalog_manifest' || binding.toolName !== node.resolvedTool) {
       return refuse('provider acknowledgement has no exact external host call');
     }
+    const work = db.prepare(`SELECT b.requirement_id, b.cardinality_kind, b.universe_id, b.universe_item_id, b.universe_member_digest, b.universe_member_count, b.contract_id, b.argument_digest, b.tool_name, b.effect_kind,
+        c.accepted_task_id, c.contract_json FROM expected_work_call_bindings b
+      JOIN accepted_task_work_contracts c ON c.session_id = b.session_id AND c.source_user_seq = b.source_user_seq
+      WHERE b.session_id = ? AND b.source_user_seq = ? AND b.logical_tool_call_id = ?
+        AND b.accepted_task_id = ? AND c.contract_id = b.contract_id`)
+      .get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId, input.acceptedTaskId) as {
+        requirement_id: string; cardinality_kind: string; universe_id: string | null; universe_item_id: string | null; universe_member_digest: string | null; universe_member_count: number | null; contract_id: string; argument_digest: string; tool_name: string; effect_kind: string;
+        accepted_task_id: string; contract_json: string;
+      } | undefined;
+    if (!work) return refuse('provider acknowledgement expected-work call is missing');
+    const selectedOperationId = work.requirement_id;
+    const resolved = db.prepare(`SELECT logical_tool_call_id FROM accepted_task_operations
+      WHERE session_id=? AND source_user_seq=? AND operation_id=? AND resolved_tool=?`)
+      .all(input.sessionId, input.sourceUserSeq, node.operationId, node.resolvedTool) as Array<{ logical_tool_call_id: string }>;
+    if (resolved.length !== 1 || resolved[0]!.logical_tool_call_id !== input.logicalToolCallId) return refuse('provider acknowledgement resolved member is not exact');
     const sealedRow = db.prepare(`SELECT binding_json, binding_digest FROM graph_node_bindings
       WHERE session_id = ? AND source_user_seq = ? AND node_id = ?`)
-      .get(input.sessionId, input.sourceUserSeq, node.operationId) as { binding_json: string; binding_digest: string } | undefined;
+      .get(input.sessionId, input.sourceUserSeq, selectedOperationId) as { binding_json: string; binding_digest: string } | undefined;
     if (!sealedRow) return refuse('provider acknowledgement selection was not sealed');
     const sealed = JSON.parse(sealedRow.binding_json) as SealedNodeBindingDigestInput & { bindingDigest: string };
     const mode = parseProviderAcknowledgementMode(sealed.writeEvidenceMode);
     if (!mode || sealed.bindingDigest !== sealedRow.binding_digest
       || sealedNodeBindingDigestOf(sealed) !== sealedRow.binding_digest
-      || sealed.nodeId !== node.operationId || sealed.effect !== 'external_write'
+      || sealed.nodeId !== selectedOperationId || sealed.effect !== 'external_write'
       || sealed.capabilityId !== binding.capabilityId || sealed.providerOperationId !== binding.operationId
       || sealed.toolName !== binding.operationId || sealed.logicalToolName !== binding.toolName
       || sealed.account !== binding.accountId || sealed.schemaDigest !== binding.schemaFingerprint
@@ -107,15 +122,6 @@ export function proveProviderAcknowledgement(input: Scope & {
       || sealed.verification || sealed.asyncRead || sealed.operationSemantics?.atomicInputContent) {
       return refuse('provider acknowledgement selection and host account/schema authority disagree');
     }
-    const work = db.prepare(`SELECT b.contract_id, b.argument_digest, b.tool_name, b.effect_kind,
-        c.accepted_task_id, c.contract_json FROM expected_work_call_bindings b
-      JOIN accepted_task_work_contracts c ON c.session_id = b.session_id AND c.source_user_seq = b.source_user_seq
-      WHERE b.session_id = ? AND b.source_user_seq = ? AND b.logical_tool_call_id = ?
-        AND b.requirement_id = ? AND b.accepted_task_id = ? AND c.contract_id = b.contract_id`)
-      .get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId, node.operationId, input.acceptedTaskId) as {
-        contract_id: string; argument_digest: string; tool_name: string; effect_kind: string;
-        accepted_task_id: string; contract_json: string;
-      } | undefined;
     if (!work || work.contract_id !== mode.workContractId || work.accepted_task_id !== input.acceptedTaskId
       || work.tool_name !== binding.toolName || work.effect_kind !== 'external_write'
       || (work.argument_digest !== binding.effectiveArgumentDigest
@@ -134,10 +140,20 @@ export function proveProviderAcknowledgement(input: Scope & {
       || contract.graphHash !== input.manifest.graphHash || contract.graphId !== input.manifest.graphId) {
       return refuse('provider acknowledgement work-contract bytes or content address changed');
     }
-    const workOperation = topology.topology.operations.find((entry) => entry.id === node.operationId);
-    if (workOperation?.effect !== 'external_write' || workOperation.cardinality.kind !== 'once' || workOperation.dataFrom.length) {
-      return refuse('provider acknowledgement cannot discharge source derivation or repeated work');
+    const workOperation = topology.topology.operations.find((entry) => entry.id === selectedOperationId);
+    if (workOperation?.effect !== 'external_write' || !['once', 'each'].includes(workOperation.cardinality.kind) || workOperation.dataFrom.length) {
+      return refuse('provider acknowledgement cannot discharge source derivation or set work');
     }
+    if (work.cardinality_kind !== workOperation.cardinality.kind) return refuse('provider acknowledgement cardinality changed');
+    if (workOperation.cardinality.kind === 'each') {
+      const universeId = workOperation.cardinality.universeId;
+      const universe = topology.topology.universes.find(entry => entry.id === universeId);
+      if (!universe || universe.seal !== 'accepted_input' || work.universe_id !== universe.id
+        || !work.universe_item_id || !universe.members.includes(work.universe_item_id)
+        || work.universe_member_count !== 1 || work.universe_member_digest !== digest([work.universe_item_id])) {
+        return refuse('provider acknowledgement collection member changed');
+      }
+    } else if (work.universe_id !== null || work.universe_item_id !== null) return refuse('provider acknowledgement once call acquired a member');
     const graphRows = db.prepare(`SELECT id, data_json FROM events WHERE session_id = ?
       AND type = 'turn_graph_compiled' AND json_extract(data_json, '$.sourceUserSeq') = ?`)
       .all(input.sessionId, input.sourceUserSeq) as Array<{ id: string; data_json: string }>;
@@ -154,7 +170,7 @@ export function proveProviderAcknowledgement(input: Scope & {
     if (providerRow.digest !== binding.manifestDigest || capabilityManifestDigest(provider) !== binding.manifestDigest
       || provider.operationId !== binding.operationId || provider.accountId !== binding.accountId
       || provider.invokePortId !== binding.invokePortId
-      || !selectProviderAcknowledgementMode({ graph, operationId: node.operationId, workContractId: work.contract_id, manifest: provider })) {
+      || !selectProviderAcknowledgementMode({ graph, operationId: selectedOperationId, workContractId: work.contract_id, manifest: provider })) {
       return refuse('provider acknowledgement cannot replace an explicit provider or accepted-work obligation');
     }
     const crossings = db.prepare(`SELECT p.physical_dispatch_id, p.state, p.execution_site, p.argument_digest,

@@ -52,7 +52,7 @@ function collectContract() {
   };
 }
 
-test('frozen surface names the host-owned requirement ids and does not invent a proposal', () => {
+test('frozen surface names the host-owned requirement ids and does not invent a proposal', async () => {
   const { contract } = collectContract();
   const authorityText = surface.formatFrozenWorkAuthority(contract);
   assert.match(authorityText, /already froze/);
@@ -61,6 +61,15 @@ test('frozen surface names the host-owned requirement ids and does not invent a 
     assert.match(authorityText, new RegExp(`- ${operation.id}:`));
   }
   assert.doesNotMatch(authorityText, /write_per_record/);
+  const { buildWorkCall } = await import('../../tools/work-call.js');
+  const planned = buildWorkCall({ frozenContract: contract, requireHostPlan: true });
+  assert.doesNotMatch(planned.description, /proposal:null/);
+  assert.match(planned.description, /There is no proposal field/);
+  assert.match(planned.description, /plan_step_result/);
+  assert.doesNotMatch(planned.description, /compute ONLY for work a tool will perform/);
+  const legacy = buildWorkCall({ frozenContract: contract });
+  assert.match(legacy.description, /proposal:null/);
+  assert.match(legacy.description, /compute ONLY for work a tool will perform/);
 });
 
 test('a unique generic create descriptor binds only the accepted destination family', () => {

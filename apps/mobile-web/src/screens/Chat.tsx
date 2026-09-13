@@ -37,7 +37,10 @@ import {
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
+import { useDictation } from '../lib/use-dictation';
+import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
+import { ChatBackButton } from '../components/ChatBackButton';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 
@@ -76,7 +79,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   useEffect(loadBrain, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const autoSent = useRef(false);
+  const keyboardInset = useKeyboardInset();
+  const [dockH, setDockH] = useState(140);
 
   const engine = useMemo(() => new ChatEngine({
     transport: createChatStreamTransport(),
@@ -154,6 +160,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const canStop = busy && Boolean(snapshot?.sessionId);
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
+    draft,
+    setDraft,
+    () => textareaRef.current?.focus(),
+  );
 
   useEffect(() => { if (!busy) setStopping(false); }, [busy]);
 
@@ -210,9 +221,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   }
 
+  useEffect(() => {
+    const el = dockRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const measure = () => setDockH(el.offsetHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [canStop, planning, listening]);
+
   function submitDraft() {
     const text = draft.trim();
     if (!text || executing) return;
+    stopDictation();
     setDraft('');
     if (textareaRef.current) {
       textareaRef.current.value = '';
@@ -264,9 +286,12 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }
 
   return (
-    <div class="chat-shell">
+    <div
+      class="chat-shell"
+      style={{ '--kb-inset': `${keyboardInset}px`, '--chat-dock-h': `${dockH}px` }}
+    >
       <div class="chat-header">
-        <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
+        <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
         {brainLabel ? (
           <button
@@ -336,65 +361,93 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       {showJumpToLatest ? (
         <button type="button" class="chat-jump" onClick={jumpToLatest}>Jump to latest</button>
       ) : null}
-      <div class="chat-mode-bar">
-        <button type="button" aria-pressed={planning} disabled={busy}
-          onClick={() => setComposerMode(mode => mode === 'plan' ? 'normal' : 'plan')}>Plan</button>
-        <span>{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
-          ? 'Planning · investigating with read-only tools'
-          : composerMode === 'plan' ? 'Plan mode · review before Execute' : 'Normal · handle the task'}</span>
-      </div>
-      <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
-        <textarea
-          ref={textareaRef}
-          class="chat-input"
-          rows={1}
-          aria-label="Message Clem"
-          placeholder={planning ? 'What should we plan?' : 'Message Clem…'}
-          value={draft}
-          onInput={(ev) => {
-            const el = ev.currentTarget as HTMLTextAreaElement;
-            setDraft(el.value);
-            autoresize(el);
-          }}
-          onKeyDown={(ev) => {
-            if (ev.isComposing) return;
-            if (ev.key === 'Enter' && !ev.shiftKey) {
-              ev.preventDefault();
-              submitDraft();
-            }
-          }}
-        />
-        {canStop ? (
-          <>
+      <div class="chat-dock-fade" aria-hidden="true" />
+      <div ref={dockRef} class={`chat-dock${listening ? ' listening' : ''}`}>
+        <div class="chat-mode-bar">
+          <button type="button" aria-pressed={planning} disabled={busy}
+            onClick={() => setComposerMode(mode => mode === 'plan' ? 'normal' : 'plan')}>Plan</button>
+          <span>{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
+            ? 'Planning · investigating with read-only tools'
+            : composerMode === 'plan' ? 'Plan mode · review before Execute' : 'Normal · handle the task'}</span>
+        </div>
+        <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
+          {dictation ? (
+            <button
+              type="button"
+              class="chat-mic"
+              aria-label={listening ? 'Stop dictation' : 'Dictate'}
+              aria-pressed={listening}
+              onClick={toggleDictation}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
+              </svg>
+            </button>
+          ) : null}
+          <textarea
+            ref={textareaRef}
+            class="chat-input"
+            rows={1}
+            aria-label="Message Clem"
+            placeholder={listening ? 'Listening…' : planning ? 'What should we plan?' : 'Message Clem…'}
+            value={draft}
+            enterkeyhint="send"
+            autocomplete="off"
+            onInput={(ev) => {
+              const el = ev.currentTarget as HTMLTextAreaElement;
+              setDraft(el.value);
+              autoresize(el);
+            }}
+            onKeyDown={(ev) => {
+              if (ev.isComposing) return;
+              if (ev.key === 'Enter' && !ev.shiftKey) {
+                ev.preventDefault();
+                submitDraft();
+              }
+            }}
+          />
+          {canStop ? (
+            <>
+              <button
+                class="chat-send"
+                type="submit"
+                disabled={executing || draft.trim().length === 0}
+                aria-label="Send while she works"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 19V5M5 12l7-7 7 7" />
+                </svg>
+              </button>
+              <button
+                class="chat-stop"
+                type="button"
+                onClick={stopTurn}
+                disabled={stopping}
+                aria-label="Stop"
+              >
+                {stopping ? (
+                  <span class="chat-stop-busy" aria-hidden="true" />
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" />
+                  </svg>
+                )}
+              </button>
+            </>
+          ) : (
             <button
               class="chat-send"
               type="submit"
               disabled={executing || draft.trim().length === 0}
-              aria-label="Send while she works"
+              aria-label="Send"
             >
-              ↑
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 19V5M5 12l7-7 7 7" />
+              </svg>
             </button>
-            <button
-              class="chat-send chat-stop"
-              type="button"
-              onClick={stopTurn}
-              disabled={stopping}
-              aria-label="Stop"
-            >
-              {stopping ? '…' : '■'}
-            </button>
-          </>
-        ) : (
-          <button
-            class="chat-send"
-            type="submit"
-            disabled={executing || draft.trim().length === 0}
-            aria-label="Send"
-          >
-            ↑
-          </button>
-        )}
-      </form>
+          )}
+        </form>
+      </div>
     </div>
   );
 }

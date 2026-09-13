@@ -2658,7 +2658,28 @@ test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done
   assert.equal(doneNoReason.outcome, 'done', 'clean text with no stoppedReason stays done');
 });
 
-test('processBackgroundTasks blocks promise-shaped completion from durable evidence, without a delivery judge', async () => {
+test('phase completion does not turn a deferred artifact into current work', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Understand the brief',
+    prompt: 'Read the brief and identify the tools we can use. We will eventually create a new document. Return the research outline before we begin that work.',
+    originSessionId: 'phase-completion-owner',
+  });
+  let calls = 0;
+  const reply = 'The brief asks for a comparison. The available sources support primary research and measurements. Here is the research outline for your review.';
+  const assistant = { getRuntime() { return {}; }, async respond() {
+    calls += 1;
+    return { text: reply, stoppedReason: 'success' as const };
+  } };
+  assert.equal(await processBackgroundTasks(assistant as never, 1), 1);
+  assert.equal(getBackgroundTask(task.id)?.status, 'done');
+  assert.equal(getBackgroundTask(task.id)?.deliverableContinueQueuedAt, undefined);
+  assert.equal(getBackgroundTask(task.id)?.result, reply);
+  assert.equal(await processBackgroundTasks(assistant as never, 1), 0);
+  assert.equal(calls, 1, 'a completed phase is not rewritten into a new assignment');
+});
+
+test('processBackgroundTasks reports a promise-only reply without inventing another worker assignment', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({ title: 'Prepare contacts', prompt: 'Pull the contacts and write the sheet' });
 
@@ -2675,23 +2696,13 @@ test('processBackgroundTasks blocks promise-shaped completion from durable evide
     },
   };
 
-  // Pass 1 (2026-07-23 contract): an artifact-committed prompt whose first
-  // completion has zero deliverable evidence earns ONE objective-re-anchored
-  // continuation instead of a terminal block.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  const processed = await processBackgroundTasks(stubAssistant as never, 1);
   assert.equal(processed, 1);
-  assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'first artifact-less completion re-anchors, not blocks');
-
-  // Pass 2: the continuation still produces only a promise with ZERO
-  // deliverable evidence — the deterministic tripwire blocks it with no model
-  // opinion in the state transition.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const processed2 = await processBackgroundTasks(stubAssistant as any, 1);
-  assert.equal(processed2, 1);
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'blocked');
-  assert.match(updated?.error ?? '', /promised an external deliverable/);
+  assert.match(updated?.error ?? '', /only promised future work/);
+  assert.equal(updated?.deliverableContinueQueuedAt, undefined);
+
 });
 
 test('processBackgroundTasks accepts a completed manifest despite a future conditional in the report', async () => {
@@ -3706,166 +3717,6 @@ test('awaiting-approval park emits the approval card into the origin chat', asyn
 // stamped done with the promised Google Sheet never produced).
 // ---------------------------------------------------------------------------
 
-test('tripwire: artifact-committed prompt with zero evidence trips; any evidence clears it', async () => {
-  const { completionLacksDeliverableEvidence } = await import('./background-tasks.js');
-  const artifactPrompt = 'fully autonomously: check 120 accounts and put the results in a google sheet, one tab per rep';
-
-  const bare = createSession({ kind: 'execution', title: 'tripwire-bare' });
-  assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: artifactPrompt }), true);
-  declareWorkManifest({
-    sessionId: bare.id,
-    manifestId: 'sheet-rows',
-    contractVersion: 1,
-    phases: [{ id: 'research' }],
-    items: [{ id: 'account-a' }],
-  });
-  checkpointWorkItem({
-    sessionId: bare.id,
-    manifestId: 'sheet-rows',
-    contractVersion: 1,
-    phase: 'research',
-    itemId: 'account-a',
-    status: 'succeeded',
-    evidence: [{ kind: 'worker_result', ref: 'event:account-a' }],
-  });
-  assert.equal(
-    completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: artifactPrompt }),
-    true,
-    'completed worker evidence cannot substitute for the promised Google Sheet receipt',
-  );
-
-  // Non-artifact prompts never trip regardless of evidence.
-  assert.equal(completionLacksDeliverableEvidence({ runSessionId: bare.id, prompt: 'summarize my unread email' }), false);
-  assert.equal(
-    completionLacksDeliverableEvidence({
-      runSessionId: bare.id,
-      prompt: 'This is read-only and hermetic: do not write files, browse, or make external writes. Return the analysis in the report-back.',
-    }),
-    false,
-    'a negative safety constraint is not misread as a promised file',
-  );
-  assert.equal(
-    completionLacksDeliverableEvidence({
-      runSessionId: bare.id,
-      prompt: 'Do not stop until you write the final report.md.',
-    }),
-    true,
-    'a do-not-stop-until commitment remains a real artifact promise',
-  );
-
-  // An external_write clears it.
-  const written = createSession({ kind: 'execution', title: 'tripwire-write' });
-  appendEvent({
-    sessionId: written.id, turn: 1, role: 'system', type: 'external_write',
-    data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['spreadsheet:abc'] },
-  });
-  assert.equal(completionLacksDeliverableEvidence({ runSessionId: written.id, prompt: artifactPrompt }), false);
-
-  // A successful local write_file return clears it too. Merely intending to
-  // call write_file is not completion evidence.
-  const filed = createSession({ kind: 'execution', title: 'tripwire-file' });
-  const filedPath = path.join(TMP_HOME, 'report.md');
-  writeFileSync(filedPath, '# Report\n', 'utf8');
-  appendEvent({
-    sessionId: filed.id, turn: 1, role: 'tool', type: 'tool_returned',
-    data: { tool: 'write_file', callId: 'write-report', ok: true, preview: `Wrote ${filedPath} (9 chars).` },
-  });
-  assert.equal(completionLacksDeliverableEvidence({ runSessionId: filed.id, prompt: artifactPrompt }), false);
-
-  const intendedOnly = createSession({ kind: 'execution', title: 'tripwire-file-intent-only' });
-  appendEvent({
-    sessionId: intendedOnly.id, turn: 1, role: 'assistant', type: 'tool_called',
-    data: { tool: 'write_file', callId: 'write-never-returned', args: { path: 'missing.md' } },
-  });
-  assert.equal(
-    completionLacksDeliverableEvidence({ runSessionId: intendedOnly.id, prompt: artifactPrompt }),
-    true,
-    'a call intent without a successful return cannot prove the deliverable exists',
-  );
-});
-
-test('objective re-anchor: first artifact-less completion auto-continues ONCE with the note in front; repeat blocks honestly', async () => {
-  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
-  const task = createBackgroundTask({
-    title: 'Build the outreach sheet',
-    prompt: 'in the background: create a google sheet with the 120-account outreach list, one row per account',
-  });
-  const phantom = '## Completed\n- Loaded the account roster\n- Confirmed Salesforce and Sheets access';
-
-  try {
-    // First pass: worker "completes" with setup-only text and zero evidence.
-    const processed = await processBackgroundTasks({
-      getRuntime() { return {}; },
-      async respond() {
-        return { text: phantom, stoppedReason: 'success' as const };
-      },
-    } as any, 1);
-    assert.equal(processed, 1);
-
-    const after = getBackgroundTask(task.id);
-    assert.equal(after?.status, 'pending', 'NOT phantom-done — re-queued');
-    assert.ok(after?.deliverableContinueQueuedAt, 'one-shot guard stamped');
-    assert.ok(after?.continueResolution, 'continuation queued');
-    assert.match(after?.lastCheckInMessage ?? '', /caught it and am continuing/, 'self-correction is visible to the user');
-    assert.match(after?.result ?? '', /deliverable does not exist yet/, 'corrective note is the continuation note the model will see');
-
-    // Second pass: the continuation runs and AGAIN produces no evidence →
-    // the one-shot guard falls through to verify → blocked, never done.
-    let sawNote = false;
-    const processed2 = await processBackgroundTasks({
-      getRuntime() { return {}; },
-      async respond(req: { message?: string }) {
-        sawNote = /deliverable does not exist yet/.test(req?.message ?? '');
-        return { text: phantom, stoppedReason: 'success' as const };
-      },
-    } as any, 1);
-    assert.equal(processed2, 1);
-    assert.equal(sawNote, true, 'the re-anchor note reached the worker prompt');
-    const settled = getBackgroundTask(task.id);
-    assert.equal(settled?.status, 'blocked', 'second artifact-less completion blocks honestly');
-    assert.match(settled?.error ?? '', /promised an external deliverable/);
-
-    // The evidence-present direction: same shape of task, but the run writes.
-    const good = createBackgroundTask({
-      title: 'Build the small sheet',
-      prompt: 'create a google sheet with this quarter summary',
-    });
-    const processed3 = await processBackgroundTasks({
-      getRuntime() { return {}; },
-      async respond() {
-        appendEvent({
-          sessionId: good.runSessionId, turn: 1, role: 'system', type: 'external_write',
-          data: { shapeKey: 'GOOGLESHEETS_VALUES_UPDATE', targets: ['spreadsheet:q-summary'] },
-        });
-        return { text: 'Done — sheet written: https://docs.google.com/spreadsheets/d/q-summary', stoppedReason: 'success' as const };
-      },
-    } as any, 1);
-    assert.equal(processed3, 1);
-    assert.equal(getBackgroundTask(good.id)?.status, 'done', 'evidence-backed completion still lands done in one pass');
-  } finally { /* task records live under the disposable suite home */ }
-});
-
-test('tripwire widening: destination-cued draft promises are gated; bare text-draft asks are not', async () => {
-  const { completionLacksDeliverableEvidence } = await import('./background-tasks.js');
-  const bare = createSession({ kind: 'execution', title: 'tripwire-drafts' });
-
-  // External destination named -> the promise is an external artifact.
-  assert.equal(completionLacksDeliverableEvidence({
-    runSessionId: bare.id,
-    prompt: 'in the background: draft 20 outreach emails in outlook for my reps',
-  }), true);
-  assert.equal(completionLacksDeliverableEvidence({
-    runSessionId: bare.id,
-    prompt: 'prepare replies in my drafts folder for every unanswered thread',
-  }), true);
-
-  // No destination -> text-form drafts in the report-back are legitimate.
-  assert.equal(completionLacksDeliverableEvidence({
-    runSessionId: bare.id,
-    prompt: 'draft me some emails for the top accounts',
-  }), false);
-});
-
 test('awaiting-input terminal truth cannot be learned as a successful background strategy', () => {
   const task = createBackgroundTask({
     title: 'Compile an exotic orchid greenhouse inventory',
@@ -4115,29 +3966,6 @@ test('a deliverable verified on disk satisfies the completion-evidence gate (she
   assert.equal(verifiedOnDiskDeliverables('Wrote ./notes/summary.md', startedAt), 0);
 });
 
-test('negated send mentions create no send-receipt obligation; real send intent still does', async () => {
-  const { taskRequiresExternalSendReceipt } = await import('./background-tasks.js');
-  // Live 2026-08-04: "no emails, no drafts, local file only" matched the
-  // send-intent words and demanded a receipt the task was FORBIDDEN to
-  // produce — an unsatisfiable gate.
-  assert.equal(
-    taskRequiresExternalSendReceipt({
-      title: 'Write local firm profiles',
-      prompt: 'Write markdown files. Local files only — no web, no emails, no drafts, no external services.',
-    }),
-    false,
-    'explicitly forbidden sends are not an obligation',
-  );
-  assert.equal(
-    taskRequiresExternalSendReceipt({
-      title: 'Re-engage dormant accounts',
-      prompt: 'Send the outreach email to each of the 29 accounts.',
-    }),
-    true,
-    'a real send commitment still requires a receipt',
-  );
-});
-
 test('an honest overcame-the-obstacle success narrative with verified files completes done', async () => {
   const { verifyBackgroundTaskDelivery, createBackgroundTask: create9, markBackgroundTaskRunning: run9 } = await import('./background-tasks.js');
   const { mkdirSync: mkdir9, writeFileSync: write9 } = await import('node:fs');
@@ -4171,12 +3999,12 @@ test('an honest overcame-the-obstacle success narrative with verified files comp
   );
   assert.equal(outcome.outcome, 'done', `reality outranks the prose read (got: ${outcome.reason ?? ''})`);
 
-  // Without on-disk evidence the text heuristic still protects against
-  // fake-done: same narrative, no files.
+  // A typed live blocker remains blocked without inventing an artifact
+  // requirement from words in the original prompt.
   const hollow = await verifyBackgroundTaskDelivery(
     { ...task, startedAt: new Date().toISOString() },
     'I could not finish — the source was unavailable and nothing had been written.',
-    'success' as never,
+    'blocked' as never,
   );
   assert.equal(hollow.outcome, 'blocked', 'a live blocker narrative with no deliverable still blocks');
 });
@@ -4761,32 +4589,6 @@ test('a resumed task credits files a PRIOR attempt wrote (floor = task creation,
   assert.equal(outcome.outcome, 'done', `prior-attempt files count as this task's deliverables (got: ${outcome.reason ?? ''})`);
 });
 
-test('report-back and self-send phrasing never creates a send obligation; real sends still gate', async () => {
-  const { taskRequiresExternalSendReceipt: gate } = await import('./background-tasks.js');
-  // The three live 2026-08-04 audit repros — all local-only work:
-  assert.equal(gate({
-    title: 'Research firms',
-    prompt: 'Research 20 firms, write /tmp/brief.md, then send me a summary message here when done.',
-  }), false, 'asking for the report-back is the north star, not an external send');
-  assert.equal(gate({
-    title: 'Draft emails locally',
-    prompt: 'Draft the emails and save them locally as files; I will send the emails myself later.',
-  }), false, 'the user sending it themselves is not the run\'s obligation');
-  assert.equal(gate({
-    title: 'Compile findings',
-    prompt: 'Compile findings and deliver the final message back to this chat.',
-  }), false, 'delivery back to the chat is the runtime report-back');
-  // Clause scoping: a REAL send elsewhere in the same prompt still gates.
-  assert.equal(gate({
-    title: 'Invite blast',
-    prompt: 'Send the invite emails to all 40 accounts. Then send me a summary message here.',
-  }), true, 'a genuine outbound send still requires its receipt');
-  assert.equal(gate({
-    title: 'Email me',
-    prompt: 'Send me an email with the compiled report attached.',
-  }), true, 'emailing the user IS a real send — only chat report-back is exempt');
-});
-
 test('free auto-continues cover the granted minutes (no more time-arithmetic park at minute 40)', async () => {
   const { freeAutoContinueCapForTask } = await import('./background-tasks.js');
   // The audit headline: 4 free continues × ~10-min slices parked a healthy
@@ -4797,30 +4599,4 @@ test('free auto-continues cover the granted minutes (no more time-arithmetic par
   assert.equal(freeAutoContinueCapForTask(undefined), 4, 'no grant → base cap');
   assert.equal(freeAutoContinueCapForTask(240), 24, 'bounded by the hard self-resume ceiling');
   assert.equal(freeAutoContinueCapForTask(100000), 24, 'never exceeds the hard ceiling');
-});
-
-test('a daemon meeting-analysis task (local JSON + negated sends) creates no send-receipt obligation', async () => {
-  // Live 2026-08-05: two transcript-analysis tasks blocked with "required an
-  // external send or publish, but the run has no committed external-write
-  // receipt". The prompt NEGATES sends ("No external API calls, no sending
-  // messages, no scheduling — analysis only") and the only send-shaped words
-  // are a report-back confirmation line. Local analysis must never owe a
-  // receipt it is forbidden to produce.
-  const { taskRequiresExternalSendReceipt } = await import('./background-tasks.js');
-  assert.equal(
-    taskRequiresExternalSendReceipt({
-      title: 'Analyze meeting transcript: Model-Agnostic Agent Automation Demo',
-      prompt: [
-        'You just received a meeting transcript captured by the desktop SDK.',
-        'Your job: produce a structured analysis the user can act on at a glance.',
-        'Steps:',
-        '1. Read the transcript file end-to-end.',
-        '2. Produce a single JSON object with exactly these keys: {...}',
-        '4. After saving, return a one-line confirmation message — do NOT include the JSON in your response.',
-        '- No external API calls, no sending messages, no scheduling — analysis only.',
-      ].join('\n'),
-    }),
-    false,
-    'negated sends + a report-back confirmation are not an external send obligation',
-  );
 });

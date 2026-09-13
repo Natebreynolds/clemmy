@@ -51,6 +51,7 @@ test('core file schema survives discovered Plan publication and exact Execute re
   raw.executionDraft.deliverables = [{ id: 'brief', kind: 'file' }];
   const prepared = await publisher.preparePlanOutline({ ...f, raw, ready: true });
   assert.ok((prepared.preparedBindings as any[])[0].inputSchema.properties.content);
+  assert.match((prepared.preparedBindings as any[])[0].description, /Missing parent directories are created automatically/);
   const plans = await import('../runtime/harness/plan-artifacts.js');
   const reviewed = await import('../runtime/harness/reviewed-plan-runtime.js');
   const artifact = plans.publishPlanRevision({ ...f, principalId: f.sessionId, fullText: 'Write the reviewed brief.', structuredPlan: prepared, readiness: 'ready' });
@@ -92,19 +93,43 @@ test('missing tools remain inspectable draft prerequisites, never ready capabili
   assert.equal((draft.preparedBindings as any[]).length, 0); assert.match(String((draft.preparationIssues as any[])[0]), /discover and cite/);
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: outline('cap:local:invented', {}), ready: true }), /discover and cite/);
 });
+
+test('an unresolved question publishes without inventing an executable outline and cannot be executed', async () => {
+  const f = await fixture();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const input = { full_text: 'I can outline the briefing once its audience is known. Which team is this for?',
+    readiness: 'needs_input', missing_prerequisites: ['Team selection'] };
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  const published = await invoke(input);
+  assert.equal(published.ok, true, JSON.stringify(published));
+  assert.match(published.message, /answer continues planning/);
+  log.closeEventLog();
+  const artifact = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId });
+  assert.equal(artifact?.fullText, input.full_text);
+  assert.deepEqual(artifact?.structuredPlan?.steps, []);
+  assert.deepEqual(artifact?.structuredPlan?.preparedBindings, []);
+  const executeSource = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Execute it.', taskMode: { version: 1, kind: 'execute', executeRef: published.planArtifactRef } } });
+  assert.throws(() => plans.claimPlanExecution({ sessionId: f.sessionId, sourceUserSeq: executeSource.seq,
+    principalId: f.sessionId, executeRef: published.planArtifactRef }),
+    (error: any) => error.code === 'not_ready', 'a partial question cannot confer execution authority');
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
+  const rejected = await invoke({ ...input, readiness: 'ready' });
+  assert.equal(rejected.ok, false, JSON.stringify(rejected));
+  assert.match(JSON.stringify(rejected), /ready plan requires/);
+});
 test('wrong native arguments and mismatched effects/dependencies cannot be called ready', async () => {
   const f = await fixture();
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: outline(f.capabilityRef, { name: 'Missing graph' }), ready: true }), /static arguments/);
   const wrongEffect = outline(f.capabilityRef, {}); wrongEffect.steps[0]!.effect = 'external_write';
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: wrongEffect, ready: true }), /disagrees/);
   wrongEffect.executionDraft.topology.operations[0].effect = 'external_write';
-  await assert.rejects(publisher.preparePlanOutline({ ...f, raw: wrongEffect, ready: true }), error => {
-    assert.ok(error instanceof Error);
-    assert.match(error.message, /has effect local_write, not external_write/);
-    assert.match(error.message, /both this step.effect and its matching execution_draft topology operation.effect to local_write/);
-    assert.doesNotMatch(error.message, /discover and cite/);
-    return true;
-  });
+  wrongEffect.steps[0].staticArguments = { name: 'Derived effect', description: 'Compute a fixture result.', steps: [{ id: 'compute', prompt: 'Return complete.', sideEffect: 'read' }] };
+  const corrected = await publisher.preparePlanOutline({ ...f, raw: wrongEffect, ready: true }) as any;
+  assert.equal(corrected.steps[0].effect, 'local_write');
+  assert.equal(corrected.executionDraft.topology.operations[0].effect, 'local_write');
   const cycle = outline(f.capabilityRef, {}); cycle.steps[0]!.dependsOn = ['create_workflow'];
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: cycle, ready: true }), /cycle/);
 });
@@ -173,4 +198,198 @@ test('actual SDK publication errors expose repair paths without echoing invocati
   assert.equal(JSON.parse(String(malformed)).error, 'invalid_plan_input');
   assert.doesNotMatch(String(malformed), /DO-NOT-ECHO/);
   assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
+});
+
+
+test('the host compiles one reviewed outline and reports independent argument problems together', async () => {
+  const f = await fixture();
+  const raw = outline(f.capabilityRef, { name: 'One Outline', description: 'A prepared fixture.', steps: [{ id: 'compute', prompt: 'Return complete.', sideEffect: 'read' }] });
+  raw.executionDraft = null;
+  const prepared = await publisher.preparePlanOutline({ ...f, raw, ready: true }) as any;
+  assert.equal(prepared.executionDraft.topology.operations.length, 1);
+  assert.equal(prepared.executionDraft.bindings[0].capabilityRef, f.capabilityRef);
+  assert.deepEqual(prepared.executionDraft.criteria, raw.successCriteria);
+  assert.deepEqual(prepared.executionDraft.evidenceRequirements, ['local_commit_receipt']);
+  assert.deepEqual(prepared.steps[0].staticArguments, raw.steps[0].staticArguments);
+  const invalid = { ...raw, steps: [
+    { ...raw.steps[0], id: 'missing_name', staticArguments: { steps: raw.steps[0].staticArguments.steps } },
+    { ...raw.steps[0], id: 'missing_graph', staticArguments: { name: 'Missing graph' } },
+  ] };
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw: invalid, ready: true }), error => {
+    assert.match(String(error), /missing_name/); assert.match(String(error), /missing_graph/); return true;
+  });
+});
+
+test('data bindings supply dependency edges; invalid producers and cycles still fail', async () => {
+  const f = await fixture('write_file');
+  const raw = outline(f.capabilityRef, { path: path.join(home, 'consumer.md') });
+  raw.executionDraft = null;
+  raw.steps[0].dynamicBindings = [{ producerStepId: 'producer', outputPath: '/content', targetPath: '/content', expectedType: 'string' }];
+  raw.steps.unshift({ ...raw.steps[0], id: 'producer', dynamicBindings: [],
+    staticArguments: { path: path.join(home, 'producer.md'), content: 'Exact source' } });
+  const prepared = await publisher.preparePlanOutline({ ...f, raw, ready: true }) as any;
+  assert.deepEqual(prepared.steps[1].dependsOn, ['producer']);
+  assert.deepEqual(prepared.executionDraft.topology.operations[1].dependsOn, ['producer']);
+  assert.deepEqual(prepared.executionDraft.topology.operations[1].dataFrom, ['producer']);
+  raw.steps[0].dependsOn = ['create_workflow'];
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw, ready: true }), /cycle/);
+  raw.steps.shift();
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw, ready: true }), /does not exist/);
+});
+
+
+test('the model sees one outline, without the duplicate action grammar', () => {
+  const parameters = publisher.buildPublishPlanTool().parameters as any;
+  assert.equal(parameters.properties.execution_draft.type, 'null');
+  assert.doesNotMatch(JSON.stringify(parameters), /workspace_social_posts_v1|evidenceRequirements|memberIdPointer/);
+});
+
+test('failed preparation retains the full outline across reopen and exhaustion publishes an unexecutable draft without another model call', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const drafts = await import('../runtime/harness/plan-preparation-draft.js');
+  const { modelCheckInForExhaustedTurn } = await import('../runtime/harness/loop.js');
+  const raw = outline(f.capabilityRef, { path: path.join(home, 'unprepared.md') });
+  raw.executionDraft = null;
+  const { executionDraft, ...publicOutline } = raw;
+  publicOutline.steps = raw.steps.map(({ staticArguments, ...step }: any) => ({ ...step, staticArgumentsJson: JSON.stringify(staticArguments) }));
+  const fullText = 'The investigated plan, preserved in full.\n'.repeat(2_000) + 'END-OF-REVIEWED-PLAN';
+  const invoke = () => withHarnessRunContext(f, () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify({
+    execution_draft: executionDraft, structured_plan: publicOutline, full_text: fullText,
+    readiness: 'ready', missing_prerequisites: [], base_ref_json: null,
+  })));
+  const rejected = JSON.parse(String(await invoke()));
+  assert.equal(rejected.code, 'plan_preparation_failed');
+  assert.match(rejected.message ?? rejected.detail ?? JSON.stringify(rejected), /content/);
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId }), null);
+  log.closeEventLog();
+  const stop = { status: 'blocked', blockedReason: 'control_no_progress_exhausted', finalOutput: 'Old engine stop.', turn: 1 } as any;
+  const outcome = await modelCheckInForExhaustedTurn(stop, { ...f, run: async () => { throw new Error('No additional model request is needed.'); } });
+  assert.equal(outcome.status, 'blocked');
+  assert.equal(outcome.blockedReason, 'plan_preparation_incomplete');
+  assert.ok(outcome.finalOutput?.startsWith(fullText));
+  const artifact = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId });
+  assert.equal(artifact?.readiness, 'needs_input');
+  assert.match(artifact!.missingPrerequisites.join('\n'), /content/);
+  assert.equal(drafts.publishRetainedPlanDraft(f), null, 'fallback publication is idempotent');
+  const executeRef = { planId: artifact!.planId, revision: artifact!.revision, digest: artifact!.digest };
+  const execute = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute.', taskMode: { version: 1, kind: 'execute', executeRef } } });
+  assert.throws(() => plans.claimPlanExecution({ sessionId: f.sessionId, sourceUserSeq: execute.seq, principalId: f.sessionId, executeRef }), /not ready|needs input|prerequisites/i, 'an unresolved outline must not execute');
+  assert.equal(drafts.publishRetainedPlanDraft({ ...f, sourceUserSeq: execute.seq }), null, 'Act cannot publish a Plan fallback');
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0, 'retaining and publishing never executes a tool');
+});
+
+test('a minimal object-based plan repairs one retained step after SQLite reopen without repeating its text', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const tool = publisher.buildPublishPlanTool(f.planning);
+  assert.equal(tool.strict, false);
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f, () => tool.invoke(new RunContext(), JSON.stringify(args)))));
+  const fullText = 'Investigated plan with complete source notes.\n'.repeat(1500);
+  const unchanged = { path: path.join(home, 'second.md'), content: 'Literal \\n and real\nnewline.' };
+  const first = await invoke({ full_text: fullText, structured_plan: { successCriteria: ['Both exact files saved'], steps: [
+    { id: 'first', action: 'Save first file', verification: 'Exact contents', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'first.md') } },
+    { id: 'second', action: 'Save second file', verification: 'Exact contents', capabilityRef: f.capabilityRef, staticArguments: unchanged },
+  ] } });
+  assert.equal(first.published, false, JSON.stringify(first)); assert.match(first.draft_digest, /^[a-f0-9]{64}$/);
+  assert.match(first.message, /content/); assert.doesNotMatch(first.message, /tool_slug/);
+  const unknownStep = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'new_step', changes: { action: 'Add a new step' } }] });
+  assert.match(unknownStep.message, /Unknown step_id.*new_step/);
+  assert.match(unknownStep.message, /structured_plan/);
+  assert.match(unknownStep.message, /without draft_digest and step_patches/);
+  const duplicatePatch = await invoke({ draft_digest: first.draft_digest, step_patches: [
+    { step_id: 'first', changes: { verification: 'one change' } },
+    { step_id: 'first', changes: { action: 'another change' } },
+  ] });
+  assert.match(duplicatePatch.message, /Duplicate patch.*first/);
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId }), null);
+  log.closeEventLog();
+  const second = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'first', changes: { staticArguments: { path: path.join(home, 'first.md'), content: 7 } } }] });
+  assert.equal(second.published, false, JSON.stringify(second)); assert.notEqual(second.draft_digest, first.draft_digest);
+  const stale = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'first', changes: { verification: 'stale repair' } }] });
+  assert.match(stale.message, /stale/);
+  const done = await invoke({ draft_digest: second.draft_digest, step_patches: [{ step_id: 'first', changes: { staticArguments: { path: path.join(home, 'first.md'), content: 'Correct content' } } }] });
+  assert.equal(done.ok, true, JSON.stringify(done));
+  const artifact = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId })!;
+  assert.equal(artifact.fullText, fullText);
+  const outline = artifact.structuredPlan as any;
+  assert.deepEqual(outline.steps[1].staticArguments, unchanged);
+  assert.equal(outline.steps[0].effect, 'local_write');
+  assert.deepEqual(outline.steps[0].dependsOn, []);
+  assert.equal(outline.executionDraft.topology.operations[0].effect, 'local_write');
+  assert.equal(log.listEvents(f.sessionId, { types: ['plan_revision_published'] }).length, 1);
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
+});
+
+test('more than 32 distinct prepared steps do not require splitting the owner task', async () => {
+  const f = await fixture('write_file');
+  const steps = Array.from({ length: 40 }, (_, i) => ({ id: `file_${i}`, action: `Save file ${i}`, verification: 'Exact file contents',
+    capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, `file-${i}.md`), content: `Content ${i}` } }));
+  const plan = await publisher.preparePlanOutline({ ...f, ready: true, raw: { steps, successCriteria: ['All 40 files retained'] } }) as any;
+  assert.equal(plan.steps.length, 40); assert.equal(plan.executionDraft.topology.operations.length, 40);
+});
+
+test('one reviewed operation compiles 50 members to the existing per-member ledger', async () => {
+  const f = await fixture('write_file');
+  const items = Array.from({ length: 50 }, (_, i) => ({ path: path.join(home, `member-${i}.md`), content: `Member ${i}\n` }));
+  const plan = await publisher.preparePlanOutline({ ...f, ready: true, raw: { steps: [{
+    id: 'save', action: 'Save one file per member', verification: 'Each exact file saved', capabilityRef: f.capabilityRef,
+    forEach: { items, memberIdPath: '/path', bindings: [{ itemPath: '/path', targetPath: '/path' }, { itemPath: '/content', targetPath: '/content' }] },
+  }], successCriteria: ['All 50 files saved exactly once'] } }) as any;
+  assert.equal(plan.steps.length, 1);
+  assert.deepEqual(plan.executionDraft.topology.operations[0].cardinality, { kind: 'each', universeId: 'members:save' });
+  assert.equal(plan.executionDraft.topology.universes[0].members.length, 50);
+  assert.deepEqual(plan.steps[0].forEach.items, items);
+  const duplicate = structuredClone(plan.steps[0]); duplicate.forEach.items.push(items[0]);
+  await assert.rejects(publisher.preparePlanOutline({ ...f, ready: true, raw: { steps: [duplicate], successCriteria: ['No duplicates'] } }), /unique/);
+});
+
+
+test('publication reviews the current candidate and retains a rejected draft for repair', async () => {
+  const f = await fixture();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const review = await import('../runtime/harness/plan-publication-review.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const seen: string[] = [];
+  const invoke = async (full_text: string, verdict: 'continue' | 'done') => JSON.parse(String(await withHarnessRunContext(f,
+    () => review.withPlanCompletionReview(async candidate => { seen.push(candidate.fullText); return verdict; },
+      () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify({ full_text,
+        readiness: 'needs_input', missing_prerequisites: ['Audience selection'] }))))));
+  const rejected = await invoke('Which audience should I write for?', 'continue');
+  assert.equal(rejected.status, 'review_feedback');
+  assert.ok(rejected.draft_digest);
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId }), null);
+  const repaired = await invoke('I have the comparison method ready. Which team will read the briefing?', 'done');
+  assert.equal(repaired.ok, true);
+  assert.ok(repaired.planArtifactRef);
+  assert.deepEqual(seen, ['Which audience should I write for?', 'I have the comparison method ready. Which team will read the briefing?']);
+});
+
+
+for (const ownerRefuses of [false, true]) test(`Execute scope reads durable owner text rather than expanded plan prose (ownerRefuses=${ownerRefuses})`, async () => {
+  const f = await fixture('write_file');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const execution = await import('../runtime/harness/accepted-plan-execution.js');
+  const scope = await import('../runtime/mcp-tool-scope.js');
+  const raw = { steps: [{ id: 'save', action: 'Save the briefing.', capabilityRef: f.capabilityRef,
+    staticArguments: { path: path.join(home, 'brief.md'), content: 'Reviewed brief.' }, verification: 'Local receipt.' }], successCriteria: ['Briefing saved.'] };
+  const structuredPlan = await publisher.preparePlanOutline({ ...f, raw, ready: true });
+  const artifact = plans.publishPlanRevision({ ...f, principalId: f.sessionId, readiness: 'ready', structuredPlan,
+    fullText: 'As part of this step’s own read-only investigation (not a separate mandatory graph dependency): (i) call research-lab__api_request against /v3/visibility/live.' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const literal = ownerRefuses ? 'Execute this approved revision. Do not use research-lab.' : 'Execute this approved revision and save the completed briefing.';
+  const source = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: literal, taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  plans.claimPlanExecution({ sessionId: f.sessionId, sourceUserSeq: source.seq, principalId: f.sessionId, executeRef: ref });
+  log.closeEventLog();
+  const expanded = execution.acceptedPlanExecutionText(f.sessionId, source.seq)!;
+  const ownerText = execution.acceptedPlanOwnerScopeInput(f.sessionId, source.seq, expanded);
+  assert.equal(ownerText, literal);
+  const selected = scope.resolveMcpToolScope({ userInput: ownerText, configuredServerNames: ['research-lab'] });
+  assert.equal(selected.deniedServerSlugs?.includes('research_lab') ?? false, ownerRefuses, JSON.stringify(selected));
+  if (!ownerRefuses) {
+    const old = scope.resolveMcpToolScope({ userInput: expanded, configuredServerNames: ['research-lab'] });
+    assert.ok(old.deniedServerSlugs?.includes('research_lab'), 'the retained clause must reproduce the original false exclusion');
+  }
 });

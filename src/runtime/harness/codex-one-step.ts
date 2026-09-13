@@ -20,6 +20,7 @@
  */
 import { resolveHarnessModel } from './codex-client.js';
 import {
+  isCompletedDeadlineRescue,
   streamEventHasActionableContent,
   streamEventHasModelActivity,
 } from './fallback-model.js';
@@ -760,7 +761,10 @@ async function streamedResponse(
       observedTermination = mergeTerminationFields(observedTermination, candidate);
     }
   }
-  if (!response) throw new Error('model stream ended without a response_done event');
+  if (!response) {
+    (request as { signal?: AbortSignal }).signal?.throwIfAborted();
+    throw new Error('model stream ended without a response_done event');
+  }
   return {
     response,
     ...(observedTermination.present ? { termination: observedTermination } : {}),
@@ -794,6 +798,12 @@ export async function codexOneStep(input: CodexOneStepInput): Promise<CodexOneSt
     ? await streamedResponse(model, request, input.onActivity)
     : undefined;
   const response = streamed?.response ?? await model.getResponse(request);
+  // An adapter may manufacture a completed envelope while cancellation drains
+  // its partial stream. Only a completed rescue tied to this exact request can
+  // outlive a host deadline; a partial frame never becomes history or effects.
+  if (input.signal?.aborted && !isCompletedDeadlineRescue(response, input.signal)) {
+    input.signal.throwIfAborted();
+  }
   const output = response.output ?? [];
   const providerData = response.providerData;
   const providerTermination = terminationField(providerData);

@@ -211,12 +211,12 @@ function slugOf(name: string): string {
  * Every way a user might name one configured server, longest first.
  *
  * Multiword names matter: "Google Sheets" and "Google Drive" share a word, so
- * the full phrase must win and the shared word must never decide. A single
- * token only counts when it identifies exactly one server in THIS catalog.
+ * the full phrase must win and a component word must never decide authority.
+ * A catalog with one "Research Lab" does not turn "do not research yet" into
+ * a refusal of that connector. Explicit full names and canonical aliases count.
  */
 function catalogAliases(configured: string[]): Array<{ slug: string; alias: string }> {
   const aliases: Array<{ slug: string; alias: string }> = [];
-  const tokenOwners = new Map<string, Set<string>>();
 
   for (const name of configured) {
     const slug = slugOf(name);
@@ -225,15 +225,6 @@ function catalogAliases(configured: string[]): Array<{ slug: string; alias: stri
     for (const alias of new Set([spaced, slug.replace(/_/g, ' '), canonicalMcpServerAliasLocal(name)])) {
       if (alias.length >= 2) aliases.push({ slug, alias });
     }
-    for (const token of spaced.split(' ').filter((t) => t.length >= 3)) {
-      const owners = tokenOwners.get(token) ?? new Set<string>();
-      owners.add(slug);
-      tokenOwners.set(token, owners);
-    }
-  }
-  // A bare word is an alias only when it is unambiguous across the catalog.
-  for (const [token, owners] of tokenOwners) {
-    if (owners.size === 1) aliases.push({ slug: [...owners][0]!, alias: token });
   }
   return aliases.sort((a, b) => b.alias.length - a.alias.length);
 }

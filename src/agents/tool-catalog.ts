@@ -27,6 +27,45 @@ export interface CatalogEntry {
   name: string;
   /** First-sentence one-liner from the registry (may be empty for a bare tool). */
   oneLiner: string;
+  /** Observed provider namespace. Ranking metadata only, never tool authority. */
+  namespace?: string;
+}
+
+/** Search open-ended API carriers using the same live schema we disclose.
+ * Examples and field descriptions often name operations absent from the tool
+ * title. This reads metadata; it does not execute examples or infer effects. */
+export function toolSchemaSearchText(schema: unknown): string {
+  const pending: unknown[] = [schema];
+  const seen = new Set<object>();
+  const text: string[] = [];
+  while (pending.length) {
+    const value = pending.pop();
+    if (!value || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    if (Array.isArray(value)) { pending.push(...value); continue; }
+    for (const [key, child] of Object.entries(value)) {
+      if ((key === 'description' || key === 'title') && typeof child === 'string') text.push(child);
+      if ((key === 'enum' || key === 'examples') && Array.isArray(child)) {
+        text.push(...child.filter((item): item is string => typeof item === 'string'));
+      }
+      if (key === 'properties' && child && typeof child === 'object') text.push(...Object.keys(child));
+      if (child && typeof child === 'object') pending.push(child);
+    }
+  }
+  return text.join('\n');
+}
+
+function namesNamespace(tokens: string[], namespace?: string): boolean {
+  if (!namespace) return false;
+  const name = namespace.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return Boolean(name) && tokens.some((_, start) => {
+    let joined = '';
+    for (let end = start; end < tokens.length && joined.length < name.length; end += 1) {
+      joined += tokens[end];
+      if (joined === name) return true;
+    }
+    return false;
+  });
 }
 
 /**
@@ -320,10 +359,11 @@ export function rankCatalogLexically(
 export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   query: string,
   entries: readonly T[],
-): Array<T & { score: number; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean }> {
+): Array<T & { score: number; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean; namespaceMatch: boolean }> {
   const q = (query ?? '').trim();
-  if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false }));
-  const queryTokens = [...new Set(q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))];
+  if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
+  const querySequence = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const queryTokens = [...new Set(querySequence)];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.
@@ -336,8 +376,9 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
     token, Math.log(1 + (entries.length - count + 0.5) / (count + 0.5)),
   ]));
   return entries
-    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, entry, weights) }))
+    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, entry, weights), namespaceMatch: namesNamespace(querySequence, entry.namespace) }))
     .sort((left, right) => Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+      || Number(right.namespaceMatch) - Number(left.namespaceMatch)
       || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
       || right.score - left.score || left.name.localeCompare(right.name));
 }

@@ -68,6 +68,25 @@ test('append preserves the exact preimage and file permissions before adding a n
   assert.equal(statSync(target).mode & 0o777, 0o640);
 });
 
+test('revision lineage requires matching immutable descriptors and retained preimage bytes', async () => {
+  const target = path.join(workspace, 'lineage.md');
+  const first = await write(target, 'first', 'create');
+  const second = await write(target, 'corrected', 'overwrite');
+  const chain = { prior: first.facts, next: second.facts, target: files.canonicalLocalFileTarget(target),
+    expectedContentDigest: createHash('sha256').update('first\n').digest('hex'), content: 'corrected' };
+  assert.equal(files.localFileRevisionReplaces(chain), true);
+  const third = await write(target, 'final', 'overwrite');
+  assert.equal(files.localFileRevisionReplaces(chain), true, 'earlier links remain provable after another revision');
+  assert.equal(files.localFileRevisionReplaces({ ...chain, next: third.facts }), false, 'a non-adjacent revision is not the recorded correction');
+  assert.equal(files.localFileRevisionReplaces({ ...chain, target: target + '.other' }), false);
+  assert.equal(files.localFileRevisionReplaces({ ...chain, content: 'invented' }), false);
+  writeFileSync(target, 'owner edit');
+  assert.equal(files.localFileRevisionReplaces(chain), true, 'history does not change when the owner edits the current file');
+  assert.equal(proof.readCommittedArtifactContent(third.facts).verified, false, 'historical lineage cannot certify current bytes');
+  writeFileSync(path.join(base, second.descriptor.previous.handle), 'changed backup');
+  assert.equal(files.localFileRevisionReplaces(chain), false);
+});
+
 test('failure to retain recovery data leaves the original file unchanged', () => {
   const target = path.join(workspace, 'cannot-backup.txt');
   writeFileSync(target, 'keep these bytes');
@@ -103,4 +122,19 @@ test('create remains exclusive and model file tools cannot modify revision recei
   assert.match(String(refused), /authorization state cannot be mutated/);
   assert.deepEqual(readFileSync(descriptor), before);
   assert.equal(existsSync(target), true);
+});
+
+
+test('an admitted correction checks prior bytes under the file lock and preserves an intervening edit', async () => {
+  const target = path.join(workspace, 'correction-precondition.txt');
+  const first = await write(target, 'First draft', 'create');
+  const expectedContentDigest = createHash('sha256').update('First draft\n').digest('hex');
+  writeFileSync(target, 'Owner changed it.');
+  assert.throws(() => files.commitLocalFileRevision({ target, content: 'Correction', mode: 'overwrite', expectedContentDigest }), files.LocalFileRevisionConflict);
+  assert.equal(readFileSync(target, 'utf8'), 'Owner changed it.');
+  assert.deepEqual(JSON.parse(readFileSync(path.join(base, first.facts.handle), 'utf8')), first.descriptor);
+  writeFileSync(target, 'First draft\n');
+  const revised = files.commitLocalFileRevision({ target, content: 'Correction', mode: 'overwrite', expectedContentDigest });
+  assert.equal(readFileSync(revised.previousPath!, 'utf8'), 'First draft\n');
+  assert.equal(readFileSync(target, 'utf8'), 'Correction\n');
 });

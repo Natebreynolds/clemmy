@@ -1,5 +1,6 @@
 import { render } from 'preact';
 import { App } from './app';
+import { ChatPreview } from './screens/ChatPreview';
 import { installNativeBridge } from './lib/native-bridge';
 import './styles.css';
 
@@ -7,7 +8,11 @@ import './styles.css';
 // it likes — including during the pairing load.
 installNativeBridge();
 
-render(<App />, document.getElementById('app')!);
+const preview = new URLSearchParams(window.location.search).get('preview');
+render(
+  preview === 'chat' ? <ChatPreview /> : <App />,
+  document.getElementById('app')!,
+);
 
 // Register the service worker. The SW lives at /m/sw.js (stable
 // filename — see vite.config.ts rollupOptions). Scope is /m/ so it

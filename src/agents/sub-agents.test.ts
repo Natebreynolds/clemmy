@@ -121,6 +121,18 @@ test('buildWorkerAgent honors an explicit routed model override', async () => {
   assert.equal(worker.model, 'claude-opus-4-8');
 });
 
+test('a worker inherits high effort from its exact planning source without changing ordinary workers', async () => {
+  const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+  const session = createSession({ kind: 'chat', title: 'worker-plan-effort' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Investigate this item.', taskMode: { version: 1, kind: 'plan' } } });
+  const worker = await buildWorkerAgent({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(worker.hasExplicitModelSettings(), true);
+  assert.equal(worker.modelSettings.reasoning?.effort, 'high');
+  const ordinary = await buildWorkerAgent({ sessionId: session.id });
+  assert.equal(ordinary.hasExplicitModelSettings(), false, 'do not borrow a different source’s Plan setting');
+});
+
 test('buildWorkerAgent attaches no external MCP servers without an explicit parent scope or packet need', async () => {
   const worker = await buildWorkerAgent();
   assert.equal(worker.mcpServers.length, 0);

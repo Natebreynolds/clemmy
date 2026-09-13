@@ -4,7 +4,9 @@
  * conversation the moment the daemon acknowledges it.
  */
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { HomeMock } from './HomeMock';
+import { isHomeMockScreen } from '@/components/home/mock/screens';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { getContext } from '@/lib/memory';
@@ -32,6 +34,16 @@ import { awayCounts, presenceLine, type HomeFeedItem } from '@/components/home/h
 const OPEN_THREAD_TIMEOUT_MS = 30_000;
 
 export function Home() {
+  const [params] = useSearchParams();
+  const mockFlag = params.get('mock');
+  const mockScreen = params.get('screen');
+  if (mockFlag !== null || isHomeMockScreen(mockScreen)) {
+    return <HomeMock initialScreen={mockFlag || mockScreen || undefined} embedded />;
+  }
+  return <LiveHome />;
+}
+
+function LiveHome() {
   const navigate = useNavigate();
   const prefsQuery = useHomePreferences();
   const prefs = prefsQuery.data ?? DEFAULT_HOME_PREFERENCES;

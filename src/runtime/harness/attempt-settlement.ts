@@ -1143,7 +1143,10 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
             // 2026-09-08: "Step X needs its settled tool producer in dependsOn"
             // settled unknown/envelope_failure twice and ended a plan turn that
             // had in fact published and was waiting on the user).
-            || (input.toolName === 'publish_plan' && negative.errorCode === 'plan_preparation_failed'))
+            || (input.toolName === 'publish_plan' && negative.errorCode === 'plan_preparation_failed')
+            // This host-only result channel validates the approved output
+            // shape; a mismatch is repairable and has no business effect.
+            || (input.toolName === 'plan_step_result' && negative.errorCode === 'invalid_arguments'))
           && extracted.argumentValidationFailed === undefined
         ) {
           extracted.argumentValidationFailed = true;

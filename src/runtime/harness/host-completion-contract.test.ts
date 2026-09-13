@@ -18,7 +18,8 @@ const host = await import('./host-turn-runner.js');
 const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
-const { sourceAttemptedCompletionWork, sourceSettledReadEvidence } = await import('./host-completion-work.js');
+const { acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceSettledReadEvidence } = await import('./host-completion-work.js');
+const plans = await import('./plan-artifacts.js');
 const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
   completionJudgeContextAdmission, runRoutedJudgeAttempt, parseCompletionVerdict } = await import('./objective-judge.js');
 const { recordCatalogWindow } = await import('./model-window-observations.js');
@@ -51,6 +52,18 @@ function attempted(identity: ReturnType<typeof accepted>, tool = 'tool_search') 
     sourceUserSeq: identity.sourceUserSeq, tool, accounting: 'top_level', callId: `attempt-${serial}`,
   } });
 }
+
+test('the Plan review objective requires preparation now and permits justified execution refreshes', () => {
+  const session = events.createSession({ id: `plan-refresh-objective-${++serial}`, kind: 'chat' });
+  const text = 'Read my current inventory now. Plan a comparison; the inventory will change before I approve execution.';
+  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text, taskMode: { version: 1, kind: 'plan' } } });
+  const objective = host.acceptedObjectiveForSource({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.ok(objective?.endsWith(text), 'the owner’s exact objective stays intact');
+  assert.match(objective!, /preparation to do now/);
+  assert.match(objective!, /refresh read during execution when freshness/);
+  assert.doesNotMatch(objective!, /must never appear as one/);
+});
 function settledHostRead(identity: ReturnType<typeof accepted>) {
   const digest = 'a'.repeat(64);
   assert.equal(armHostCallAuthority({ ...identity, catalogRevisionDigest: digest,
@@ -78,7 +91,7 @@ function settledHostRead(identity: ReturnType<typeof accepted>) {
       0,'settle',0,0,0,0,0,0,?,'agents_runner',?,?,0,0,1,2)`)
     .run(identity.sessionId, identity.sourceUserSeq, callId, digest, digest, settlementEvent.id, now);
 }
-function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false, hostOwned = false) {
+function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false, hostOwned = false, failed = false) {
   const task = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq) };
   if (!hostOwned) assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
   const logicalToolCallId = `read:${name}`;
@@ -110,12 +123,12 @@ function retainedRead(identity: ReturnType<typeof accepted>, name: string, paylo
   assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: name, outcome: 'returned' }).status, 'inserted');
   const committed = settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId },
     contract: { toolName: name, args: {} }, execution: { kind: 'local_execution' },
-    result: { payload }, outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    result: { payload }, outcome: outcomes.classifyAttemptOutcome(failed ? { argumentValidationFailed: true } : { envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating }, observer: { lane: 'byo', turn: identity.turn } });
   assert.equal(committed.status, 'committed', JSON.stringify(committed));
   if (committed.status !== 'committed') throw new Error('Fixture settlement did not commit');
-  assert.ok(committed.settlement.resultHandleId);
-  return committed.settlement.resultHandleId;
+  if (!failed) assert.ok(committed.settlement.resultHandleId);
+  return committed.settlement.resultHandleId ?? '';
 }
 const eligible = (sourceWorkAttempted: boolean, nextAction = 'completed') => shouldRunObjectiveJudge({
   optIn: true, actionIntent: false, promiseShaped: false, meaningfulToolEvidence: true,
@@ -259,12 +272,125 @@ test('discovery, native reads and failed business attempts are review eligibilit
   }
 });
 
+test('trajectory review omits successful discovery schemas while completion retains them and both keep actual source bytes', () => {
+  const identity = accepted();
+  retainedRead(identity, 'tool_search', { schema: 'DISCOVERY-SCHEMA-ONLY' });
+  const source = 'Whole research result.\n'.repeat(2_000) + 'EXACT-RESEARCH-TAIL';
+  retainedRead(identity, 'read_file', source);
+  events.closeEventLog();
+  const trajectory = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: true });
+  const completion = sourceSettledReadEvidence(identity);
+  assert.equal(trajectory.count, 1);
+  assert.equal(completion.count, 2);
+  assert.doesNotMatch(trajectory.summary, /DISCOVERY-SCHEMA-ONLY/);
+  assert.match(completion.summary, /DISCOVERY-SCHEMA-ONLY/);
+  assert.ok(trajectory.summary.includes(source));
+  assert.ok(completion.summary.includes(source));
+});
+
 test('an unrelated accepted source and check-in alone do not make ordinary chat eligible', () => {
   const identity = accepted('Hello');
   attempted({ ...identity, sourceUserSeq: identity.sourceUserSeq + 100 }, 'tool_search');
   attempted(identity, 'check_in');
   assert.equal(sourceAttemptedCompletionWork(identity), false);
   assert.equal(eligible(false), false);
+});
+
+test('incremental trajectory windows keep exact new content, discovery navigation and reopenable prior coverage', () => {
+  const identity = accepted();
+  const brief = 'The task brief has a decisive requirement at the end. EXACT_BRIEF_TAIL';
+  retainedRead(identity, 'read_file', brief);
+  retainedRead(identity, 'tool_search', { results: [{ name: 'ATLAS_FETCH', capabilityRef: 'cap:atlas',
+    carrier: 'work_call', selectedAccount: { label: 'owner account' } }],
+    schemas: { ATLAS_FETCH: { type: 'object', description: 'SCHEMA_DUMP'.repeat(10_000) } } });
+  const first = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: 0 });
+  assert.ok(first.summary.includes(brief));
+  assert.match(first.summary, /ATLAS_FETCH/);
+  assert.match(first.summary, /owner account/);
+  assert.doesNotMatch(first.summary, /SCHEMA_DUMP/);
+  const firstCursor = first.throughSettlementIndex!;
+  const docs = 'API_CONTRACT\n'.repeat(20_000) + 'EXACT_DOCUMENTATION_TAIL';
+  retainedRead(identity, 'atlas__reference', docs);
+  retainedRead(identity, 'atlas__identical_reference', docs);
+  retainedRead(accepted(), 'atlas__other_owner', 'UNRELATED_SOURCE_SECRET');
+  events.closeEventLog();
+  const second = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: firstCursor });
+  assert.ok(second.summary.includes(docs), 'new documentation is complete, not keyword-filtered or truncated');
+  assert.equal(second.summary.split('EXACT_DOCUMENTATION_TAIL').length - 1, 1, 'identical bytes expand once');
+  assert.doesNotMatch(second.summary, /UNRELATED_SOURCE_SECRET/);
+  assert.equal(second.results.find(r => r.toolName === 'read_file')?.contentDisposition, 'prior_review_window');
+  assert.equal(second.results.find(r => r.toolName === 'read_file')?.contentComplete, false);
+  assert.equal(second.results.find(r => r.toolName === 'atlas__identical_reference')?.contentDisposition, 'duplicate_content');
+  const third = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: second.throughSettlementIndex });
+  assert.doesNotMatch(third.summary, /EXACT_DOCUMENTATION_TAIL/);
+  assert.ok(third.results.every(r => r.resultHandleId && r.contentDigest && !r.contentComplete));
+  const completion = sourceSettledReadEvidence(identity);
+  assert.ok(completion.summary.includes(brief));
+  assert.ok(completion.summary.includes(docs));
+  assert.ok(completion.results.every(r => r.contentComplete), 'completion still receives all exact source evidence');
+});
+
+test('the active planning discovery map survives history collapse and database reopen without mixing sources', async () => {
+  const { sourceDiscoveryContext } = await import('./discovered-tool-context.js');
+  const { collapseOldCompletedToolPairs } = await import('./compaction.js');
+  const identity = accepted('Plan using the selected supplier API.');
+  const output = JSON.stringify({ results: [{ name: 'SUPPLIER_FETCH', capabilityRef: 'cap:supplier',
+    carrier: 'work_call', selectedAccount: { accountIdentity: 'owner' } }],
+    schemas: { SUPPLIER_FETCH: { type: 'object', required: ['account_id'] } },
+    schema_handles: { SUPPLIER_FETCH: { cursor: 'tool_search_schema:v1:retained:0' } } });
+  retainedRead(identity, 'tool_search', output);
+  events.writeToolOutput({ sessionId: identity.sessionId, callId: 'read:tool_search', tool: 'tool_search', output });
+  const history: any[] = [
+    { type: 'function_call', callId: 'read:tool_search', name: 'tool_search', arguments: '{}' },
+    { type: 'function_call_result', callId: 'read:tool_search', name: 'tool_search', output },
+  ];
+  assert.equal(collapseOldCompletedToolPairs(history, 0, identity.sessionId).collapsed, 1);
+  const other = accepted();
+  retainedRead(other, 'tool_search', { results: [{ name: 'UNRELATED_TOOL' }] });
+  events.writeToolOutput({ sessionId: other.sessionId, callId: 'read:tool_search', tool: 'tool_search',
+    output: JSON.stringify({ results: [{ name: 'UNRELATED_TOOL' }] }) });
+  events.closeEventLog();
+  const navigation = sourceDiscoveryContext(identity);
+  assert.match(navigation, /SUPPLIER_FETCH/);
+  assert.match(navigation, /cap:supplier/);
+  assert.match(navigation, /tool_search_schema:v1:retained:0/);
+  assert.match(navigation, /read:tool_search/);
+  assert.doesNotMatch(navigation, /UNRELATED_TOOL/);
+});
+
+test('Execute review reopens only the exact approved Plan observations, labeled historical', () => {
+  const session = events.createSession({ id: `preparation-evidence-${++serial}`, kind: 'chat' });
+  const planSource = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Investigate the project before preparing the briefing.', taskMode: { version: 1, kind: 'plan' } } });
+  const initial = { sessionId: session.id, sourceUserSeq: planSource.seq, turn: 1 };
+  retainedRead(initial, 'memory_recall_all', 'PREPARATION-MEMORY-ONLY');
+  retainedRead(initial, 'tool_search', { schema: 'PREPARATION-DISCOVERY-DUMP' });
+  const artifact = plans.publishPlanRevision({ ...initial, principalId: initial.sessionId,
+    fullText: 'Use the project evidence and prepare a briefing.', readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const unrelated = accepted('Another project');
+  retainedRead(unrelated, 'memory_recall_all', 'UNRELATED-PRIVATE-EVIDENCE');
+  const aside = events.appendEvent({ sessionId: initial.sessionId, turn: 2, role: 'user',
+    type: 'user_input_received', data: { text: 'Check an unrelated topic.' } });
+  retainedRead({ sessionId: initial.sessionId, sourceUserSeq: aside.seq, turn: 2 }, 'memory_recall_all', 'SAME-SESSION-UNRELATED');
+  const execute = events.appendEvent({ sessionId: initial.sessionId, turn: 2, role: 'user',
+    type: 'user_input_received', data: { text: 'Execute', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  const identity = { sessionId: initial.sessionId, sourceUserSeq: execute.seq, turn: 2 };
+  plans.claimPlanExecution({ ...identity, principalId: initial.sessionId, executeRef: ref });
+  retainedRead(identity, 'read_file', 'EXECUTION-FRESH-EVIDENCE');
+  events.closeEventLog();
+  const preparation = acceptedPlanPreparationReadEvidence(identity)!;
+  assert.deepEqual(preparation.plan, ref);
+  assert.deepEqual(preparation.source, { sessionId: initial.sessionId, sourceUserSeq: initial.sourceUserSeq });
+  assert.match(preparation.summary, /PREPARATION-MEMORY-ONLY/);
+  assert.match(preparation.summary, /Historical READ evidence/);
+  assert.match(preparation.summary, /do not prove fresh state/);
+  assert.doesNotMatch(preparation.summary, /PREPARATION-DISCOVERY-DUMP|UNRELATED-PRIVATE-EVIDENCE|EXECUTION-FRESH-EVIDENCE|SAME-SESSION-UNRELATED/);
+  const current = sourceSettledReadEvidence(identity);
+  assert.match(current.summary, /EXECUTION-FRESH-EVIDENCE/);
+  assert.doesNotMatch(current.summary, /PREPARATION-MEMORY-ONLY/);
+  assert.equal(acceptedPlanPreparationReadEvidence(unrelated), undefined);
+  assert.equal(preparation.evidence.results[0]?.status, 'verified');
 });
 
 test('typed waiting and stopped decisions cannot become reviewer continuations', () => {
@@ -311,6 +437,27 @@ test('an authenticated empty result stays visible evidence rather than missing b
   assert.match(evidence.summary, /Records=0/);
 });
 
+test('failed read review retains its exact diagnostic without calling it successful source evidence', () => {
+  const identity = accepted();
+  retainedRead(identity, 'read_file', { ok: false }, false, false, true);
+  events.appendEvent({ ...identity, role: 'tool', type: 'tool_returned', data: {
+    sourceUserSeq: identity.sourceUserSeq, callId: 'read:read_file', tool: 'read_file',
+    ok: false, result: 'File does not exist: /fixture/retired.json',
+  } });
+  for (const [sourceUserSeq, callId] of [[identity.sourceUserSeq, 'another-call'], [identity.sourceUserSeq + 1, 'read:read_file']] as const) {
+    events.appendEvent({ ...identity, role: 'tool', type: 'tool_returned', data: {
+      sourceUserSeq, callId, tool: 'read_file', ok: false, result: 'UNRELATED-DIAGNOSTIC',
+    } });
+  }
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.equal(evidence.results[0]?.status, 'not_succeeded');
+  assert.equal(evidence.results[0]?.resultHandleId, undefined);
+  assert.match(evidence.summary, /File does not exist: \/fixture\/retired.json/);
+  assert.match(evidence.summary, /not successful read content/);
+  assert.doesNotMatch(evidence.summary, /UNRELATED-DIAGNOSTIC/);
+});
+
 test('reviewed text loses only its JSON transport encoding, including literal escapes and middle records', () => {
   const identity = accepted('Review every line of the retained text.');
   const text = Array.from({ length: 500 }, (_, i) => `Record ${i}: "quoted" \\literal\\n — café 🧡`).join('\n');
@@ -320,6 +467,8 @@ test('reviewed text loses only its JSON transport encoding, including literal es
   assert.ok(evidence.summary.includes(text), 'every character from the original string must be present');
   assert.equal(evidence.results[0]?.resultHandleId, handle);
   assert.equal(evidence.results[0]?.presentation, 'decoded_text');
+  assert.match(evidence.summary, /Retained binding value type=string/);
+  assert.match(evidence.summary, /itemPath="\/result"/);
   assert.equal(evidence.results[0]?.shownByteCount, Buffer.byteLength(text));
   assert.equal(evidence.results[0]?.rawByteCount, Buffer.byteLength(JSON.stringify(text)));
   assert.equal(evidence.results[0]?.contentComplete, true);

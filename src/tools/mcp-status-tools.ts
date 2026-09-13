@@ -216,14 +216,14 @@ export function registerMcpStatusTools(server: McpServer): void {
           totalToolCount: all.length,
           results,
           schemas,
-          hint: 'Invoke the selected exact name with call_tool(name, args_json), using the schema above. Do not guess a neighboring vendor name.',
+          hint: 'Use the selected exact tool name and the invocation contract already returned by tool_search. If that contract is missing, tool_search with this exact name returns its capabilityRef and current carrier. Use the schema above for the tool arguments; do not guess a neighboring vendor name.',
         };
         let rendered = JSON.stringify(payload);
         // Preserve the exact names even if a vendor ships an unusually large
         // schema. A schema-less result can be reacquired with a tighter query.
         if (rendered.length > DEFAULT_TOOL_RESULT_MAX_CHARS) {
           payload.schemas = {};
-          payload.hint = 'The best schema exceeded the bounded result size. Search again with the exact returned tool name, or call it once and follow its validation response.';
+          payload.hint = 'The best schema exceeded the inline result size. Use tool_search with the exact returned tool name to retrieve its schema and current invocation contract.';
           rendered = JSON.stringify(payload);
         }
         return textResult(rendered);

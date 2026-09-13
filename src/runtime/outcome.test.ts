@@ -23,8 +23,8 @@ const {
   deliverOutcome,
   deliverOutcomeWithAcknowledgement,
   outcomePrefix,
-  renderProactiveOutcomeDirective,
-  __test__: outcomeTest,
+  publishProactiveOutcome,
+  renderPublicOutcomeText,
 } = await import('./outcome.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
@@ -101,71 +101,53 @@ test('renderOutcomeText: per-lane head-word override (workflow soft-block → ne
   assert.ok(text.startsWith('[workflow run wf-9 needs attention] My WF'), 'uses the override word, keeps the prefix');
 });
 
-test('proactive needs-input directive preserves completed progress instead of collapsing to a blocker', () => {
-  const directive = renderProactiveOutcomeDirective(
-    { status: 'needs_input' },
-    { sourceLabel: 'background task', sourceId: 'bg-railway' },
-  );
-  assert.match(directive, /completed progress/i);
-  assert.match(directive, /exact remaining dependency/i);
-  assert.match(directive, /do not replay/i);
-  assert.doesNotMatch(directive, /one short message/i);
+test('public background report preserves the full result and publishes once without a model turn', () => {
+  const sessionId = 'sess-direct-report';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const human = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Read the brief and outline the approach. We will create the report later.' } });
+  const detail = 'Here is the outline. ' + 'Complete supporting detail. '.repeat(300) + ' Awaiting your decision.';
+  const outcome = { status: 'done' as const, detail };
+  const context = ctx({ originSessionId: sessionId, sourceId: 'bg-direct' });
+  publishProactiveOutcome(sessionId, outcome, context);
+  const newerHuman = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'One more constraint before execution.' } });
+  publishProactiveOutcome(sessionId, outcome, context);
+  const events = listEvents(sessionId);
+  const reports = events.filter(e => e.type === 'conversation_completed');
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].data.reply, detail, 'the worker result is not truncated or regenerated');
+  const source = events.find(e => e.type === 'user_input_received' && e.data.deliveryPhase === 'report')!;
+  assert.equal(reports[0].data.sourceUserSeq, source.seq);
+  assert.notEqual(source.seq, human.seq);
+  assert.notEqual(source.seq, newerHuman.seq, 'replay cannot consume a newer human source');
+  assert.equal(source.data.synthetic, true);
+  assert.equal(events.some(e => e.type === 'tool_called' || e.type === 'model_request_started'), false);
 });
 
-test('proactive failed directive never erases partial success or replays committed work', () => {
-  const directive = renderProactiveOutcomeDirective(
-    { status: 'failed' },
-    { sourceLabel: 'background task', sourceId: 'bg-partial' },
-  );
-  assert.match(directive, /without erasing partial success/i);
-  assert.match(directive, /completed work, saved artifacts, or committed actions/i);
-  assert.match(directive, /never imply that proven work disappeared/i);
-  assert.match(directive, /do not re-run/i);
-});
-
-test('proactive report turn stays bound to its appended directive when a newer human input arrives', async () => {
-  const sessionId = 'sess-proactive-source-owner';
-  createSession({ id: sessionId, kind: 'chat', channel: 'discord' });
-
-  let observedSourceUserSeq: number | undefined;
-  let observedReuseRecordedInput: boolean | undefined;
-  let observedSuppressMemoryCapture: boolean | undefined;
-  let competingHumanSeq: number | undefined;
-  const directiveSource = await outcomeTest.runRecordedProactiveReportTurn({
-    sessionId,
-    directive: 'Relay the verified workflow result now.',
-    outcome: { status: 'done' },
-    ctx: { sourceLabel: 'workflow run', sourceId: 'wf-source-owner' },
-    conversationOptions: {
-      agent: {} as never,
-      judgeCompletion: false,
-    },
-  }, async (options) => {
-    // Reproduce the ownership race: another input becomes latest after the
-    // directive is accepted but before runConversation starts its work.
-    competingHumanSeq = appendEvent({
-      sessionId,
-      turn: 1,
-      role: 'user',
-      type: 'user_input_received',
-      data: { text: 'What is the status now?' },
-    }).seq;
-    observedSourceUserSeq = options.sourceUserSeq;
-    observedReuseRecordedInput = options.reuseRecordedUserInput;
-    observedSuppressMemoryCapture = options.suppressMemoryCapture;
-  });
-
-  assert.notEqual(competingHumanSeq, directiveSource.seq, 'the human input is a distinct, newer source');
-  assert.equal(observedSourceUserSeq, directiveSource.seq, 'the proactive turn owns the exact directive row, not latest input');
-  assert.equal(observedReuseRecordedInput, true);
-  assert.equal(
-    observedSuppressMemoryCapture,
-    true,
-    'a runtime-authored outcome carrier can never enter automatic memory capture',
-  );
-  assert.equal(directiveSource.data.synthetic, true);
-  assert.equal(directiveSource.data.source, 'outcome');
-  assert.equal(directiveSource.data.deliveryPhase, 'directive');
+test('public questions, blocked progress and completion keep their typed status and evidence', () => {
+  const sessionId = 'sess-direct-question';
+  createSession({ id: sessionId, kind: 'chat' });
+  const context = ctx({ sourceId: 'bg-questions' });
+  for (const outcome of [
+    { status: 'needs_input' as const, detail: 'Which account?' },
+    { status: 'needs_input' as const, detail: 'Which date?' },
+    { status: 'blocked' as const, detail: 'The remaining lookup needs sign-in.', resumable: true,
+      evidence: { committedExternalActions: 1 }, nextAction: 'Reconnect the account.' },
+    { status: 'done' as const, detail: 'Finished the requested work.' },
+  ]) {
+    publishProactiveOutcome(sessionId, outcome, context);
+    publishProactiveOutcome(sessionId, outcome, context);
+  }
+  const reports = listEvents(sessionId).filter(e => e.type === 'conversation_completed');
+  assert.equal(reports.length, 4);
+  assert.deepEqual(reports.map(e => e.data.reply), [
+    'Which account?', 'Which date?',
+    renderPublicOutcomeText({ status: 'blocked', detail: 'The remaining lookup needs sign-in.', resumable: true,
+      evidence: { committedExternalActions: 1 }, nextAction: 'Reconnect the account.' }, context),
+    'Finished the requested work.',
+  ]);
+  assert.match(String(reports[2].data.reply), /1 committed external action receipt/);
 });
 
 test('outcomePrefix matches the idempotency/UI-detect prefix exactly', () => {

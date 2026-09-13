@@ -992,3 +992,22 @@ test('getTurn callback is threaded into the event row', () => {
   const events = listEvents(sess.id);
   assert.equal(events[0].turn, 7);
 });
+
+
+test('a rejected plan remains negative on the public stream even when its diagnostic is clipped', async () => {
+  resetEventLog();
+  const session = createSession({ id: 'plan-negative-presentation', kind: 'chat' });
+  const stub = new EventEmitter();
+  attachEventLogHooks(stub as RunHooksLike, { getSessionId: () => session.id, maxResultChars: 80 });
+  const details = { toolCall: { callId: 'publish-failed', arguments: '{}' } };
+  stub.emit('agent_tool_start', {}, { name: 'Clem' }, { name: 'publish_plan' }, details);
+  stub.emit('agent_tool_end', {}, { name: 'Clem' }, { name: 'publish_plan' }, JSON.stringify({
+    ok: false, published: false, error: 'plan_preparation_failed', message: 'Missing input. '.repeat(100),
+  }), details);
+  const returned = listEvents(session.id, { types: ['tool_returned'] }).at(-1)!;
+  assert.equal(returned.data.ok, false);
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const visible = projectHarnessEventForPublic(returned)!;
+  assert.equal(visible.data.ok, false);
+  assert.equal(visible.data.result, undefined, 'internal diagnostics stay private');
+});

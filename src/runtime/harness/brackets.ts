@@ -1277,6 +1277,8 @@ export interface HarnessRunContext {
    * Reasoning is buffered until text/tool output makes the attempt replay-unsafe,
    * but the outer stream watchdog still needs to know the model is alive. */
   privateModelActivityAt?: number;
+  /** Active host model requests, for truthful liveness; never execution authority. */
+  hostModelActivity?: { pendingRequests: number };
   /** The most recent slice of the brain's own reasoning, when the transport can
    *  see it (Claude's thinking deltas are read off the wire — the SDK adapter
    *  emits no event for them). Bounded to a short tail: it exists to prove the
@@ -1446,6 +1448,21 @@ function workerScopeIdFromDetails(sessionId: string, details: unknown): string {
  *  sessionId without explicit threading through SDK options. */
 export const harnessRunContextStorage = new AsyncLocalStorage<HarnessRunContext>();
 
+/** A carrier mirror of the exact logical call the host already charged.
+ * This transfers accounting only, never work/consent authority. A batch item,
+ * different call, or different source must still spend its own attempt. */
+export function hostOwnsLogicalCallAccounting(sessionId: string, callId: string | undefined): boolean {
+  const context = harnessRunContextStorage.getStore();
+  const logical = currentLogicalCall();
+  return context?.hostOwnsToolAccounting === true
+    && context.sessionId === sessionId
+    && Number.isSafeInteger(context.sourceUserSeq)
+    && (context.sourceUserSeq ?? 0) > 0
+    && logical?.acceptedTaskId === acceptedTaskIdFor(sessionId, context.sourceUserSeq!)
+    && typeof callId === 'string'
+    && logical.logicalToolCallId === callId;
+}
+
 export class ExternalWriteReservationError extends Error {
   constructor(toolName: string, cause?: unknown) {
     super(
@@ -1487,6 +1504,9 @@ export function withHarnessRunContext<T>(
   ctx: HarnessRunContext,
   work: () => T | Promise<T>,
 ): T | Promise<T> {
+  // Attempt contexts shallow-copy their parent; keep liveness shared with the
+  // parent heartbeat across that boundary, just like the tool counter.
+  ctx.hostModelActivity ??= { pendingRequests: 0 };
   return harnessRunContextStorage.run(ctx, work);
 }
 

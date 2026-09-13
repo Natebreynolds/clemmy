@@ -78,3 +78,28 @@ test('an acquired live read survives a window flooded by provider rows', () => {
     'the window must stay bounded',
   );
 });
+
+test('a named integration with spaced words leads its relevant operation, without hiding alternatives', async () => {
+  const provider: ToolSearchCandidateSource = { kind: 'authorized_composio', search: async () => [
+    { name: 'FIRECRAWL_EXTRACT', summary: 'Create a document from markdown extracted from webpages.', carrier: 'work_call', score: 1 },
+    { name: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', summary: 'Create a document with Markdown content.', carrier: 'work_call', score: 0 },
+  ] };
+  const result = await search('Google Docs create document from markdown', true, [provider]);
+  assert.equal(result.results[0]?.name, 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN');
+  assert.ok(result.results.some((row: any) => row.name === 'FIRECRAWL_EXTRACT'));
+  assert.equal(result.results[0]?.capabilityRef, undefined, 'ranking cannot invent a callable capability');
+});
+
+test('generic MCP operations are searchable through their live input contract', async () => {
+  const provider: ToolSearchCandidateSource = { kind: 'authorized_external_mcp', search: async () => [
+    { name: 'atlas__a_docs_index', summary: 'Atlas API documentation index.', carrier: 'work_call', score: 1 },
+    { name: 'atlas__z_api_request', summary: 'Make an authenticated request to Atlas.', carrier: 'work_call', score: 0,
+      schema: { type: 'object', properties: { path: { type: 'string', description: 'API path, e.g. /v3/supplier/pricing/live' }, data: { description: 'Request body with supplier product identifiers' } } } },
+  ] };
+  const result = await search('Atlas supplier pricing live', true, [provider]);
+  assert.equal(result.results[0]?.name, 'atlas__z_api_request');
+  assert.ok(result.schemas.atlas__z_api_request);
+  const withoutSchema: ToolSearchCandidateSource = { ...provider, search: async input => (await provider.search(input)).map(({ schema, ...row }) => row) };
+  const control = await search('Atlas supplier pricing live', true, [withoutSchema]);
+  assert.equal(control.results[0]?.name, 'atlas__a_docs_index', 'the selected input contract, not a name/rank tie, makes the operation discoverable');
+});

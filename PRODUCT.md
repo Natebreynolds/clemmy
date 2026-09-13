@@ -58,6 +58,11 @@ approvals, and typed run terminals are engine facts the UI can show.
 - Customization priorities (confirmed): which panes show and their order; nav
   hide/pin/reorder and default landing; personal pinned prompts/quick actions.
   Density/text size were NOT prioritized by the owner.
+- Home (in design, mock at `/console/dev/home-mock`): a blank canvas of
+  concentrated Spaces — first-party widget presentations pinned to Home, not
+  iframes. Users change widgets out; Clem acts through declared Space actions
+  and the existing approval door. Workspaces remain the full-page room.
+  Not yet the live default.
 - Preferences must survive relaunch and, where sensible, be shared by desktop and
   mobile (server-side per-user record preferred; today's localStorage is wiped by the
   Electron session partition on every relaunch).

@@ -89,7 +89,8 @@ async function* modelStream(this: { getResponse(request: unknown): Promise<any> 
   yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
 }
 
-async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_result'], c6Collision = false) {
+async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_result'], c6Collision = false, delayedPublication: boolean | 'contract_drift' = false, collectionCount = 0) {
+  const payloads = collectionCount ? Array.from({ length: collectionCount }, (_, i) => ({ ...PAYLOADS[i % PAYLOADS.length]!, subject: `collection-draft-${i}` })) : PAYLOADS;
   const schema = JSON.parse(readFileSync(new URL('../../tools/fixtures/outlook-create-draft-input-schema.json', import.meta.url), 'utf8'));
   schema.properties.attachment.anyOf[0].description = undefined;
   const providerInputSchemaDigest = digestSchema(schema);
@@ -107,7 +108,7 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
     externalDefinition: { version: 1, providerInputSchemaDigest, providerOutputSchemaObserved: true, providerOutputSchemaDigest: digestSchema({ type: 'object' }), semanticName: OPERATION,
       behaviorHints: { readOnly: false, destructive: false, idempotent: null, openWorld: false } },
     effect: 'external_write', accountId: ACCOUNT,
-    operationSemantics: { version: 1, reversibility: 'reversible' },
+    ...(delayedPublication === true ? {} : { operationSemantics: { version: 1 as const, reversibility: 'reversible' as const } }),
     destination: { family: 'outlook_draft', posture: 'create_new' },
     idempotency: { required: true, policy: 'key_before_dispatch' }, reconciliation: { supported: true, policy: 'exact_artifact' },
     outputContract: { kind: 'result' }, purpose: 'Create a draft in the connected fixture owner mailbox.',
@@ -123,16 +124,16 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   let providerCalls = 0;
   const providerResult = async (slug: string, body: Record<string, unknown>) => {
     const ordinal = providerCalls++;
-    assert.equal(modelCalls, 2, 'all writes execute only after the first model frame admitted the plan');
+    assert.ok(modelCalls >= 2, 'all writes execute only after the first model frame admitted the plan');
     assert.equal(slug, OPERATION);
-    assert.deepEqual(body.arguments, PAYLOADS[ordinal]);
+    assert.deepEqual(body.arguments, payloads[ordinal]);
     assert.equal(body.connected_account_id, ACCOUNT);
     assert.equal(body.version, '1');
     // Actual Graph/Composio output shape. There is no fabricated handle,
     // receipt, writtenDigest, or provider readback observation in this result.
     return { successful: true, error: null, logId: `fixture-provider-log-${ordinal + 1}`, data: {
-      id: `fixture-draft-${ordinal + 1}`, subject: PAYLOADS[ordinal]!.subject,
-      body: { content: PAYLOADS[ordinal]!.body, contentType: 'text' }, isDraft: true,
+      id: `fixture-draft-${ordinal + 1}`, subject: payloads[ordinal]!.subject,
+      body: { content: payloads[ordinal]!.body, contentType: 'text' }, isDraft: true,
       toRecipients: [], ccRecipients: [], bccRecipients: [], parentFolderId: 'fixture-drafts-folder',
     } };
   };
@@ -152,8 +153,9 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   }).ok, true);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
-  factory.register(adapters.registeredCapabilityFromManifest({ manifest, observation, invoke: invoke as never }));
-  const basePrompt = 'Create exactly these three plain-text drafts in my connected owner mailbox, owner@example.invalid. Preserve the exact subjects and bodies, including punctuation and the line break; keep To, Cc, Bcc empty. Do not send any email. Plan the three creations, then report each returned draft ID.\n' + JSON.stringify(PAYLOADS);
+  const registered = adapters.registeredCapabilityFromManifest({ manifest, observation, invoke: invoke as never });
+  if (!delayedPublication) factory.register(registered);
+  const basePrompt = `Create exactly these ${payloads.length} plain-text drafts in my connected owner mailbox, owner@example.invalid. Preserve the exact subjects and bodies, including punctuation and the line break; keep To, Cc, Bcc empty. Do not send any email. Plan these creations, then report each returned draft ID.\n` + JSON.stringify(payloads);
   const session = eventlog.createSession({ id: `planned-draft-ack-${suffix}`, kind: 'chat' });
   const priorHistory: Array<Record<string, unknown>> = [];
   if (c6Collision) {
@@ -164,10 +166,10 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
     for (const entry of saved) writeWorkflow(entry.slug, { name: entry.name, enabled: entry.enabled,
       description: 'Synthetic metadata-only collision fixture; never execute.',
       trigger: { schedule: '0 0 1 1 *', timezone: 'UTC' }, steps: [{ id: 'never-execute', prompt: 'No provider operations.' }] });
-    const composeText = 'Compose these exact three draft messages without creating or sending anything: ' + JSON.stringify(PAYLOADS);
+    const composeText = 'Compose these exact three draft messages without creating or sending anything: ' + JSON.stringify(payloads);
     const composeSource = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: composeText } });
     const composeIdentity = { sessionId: session.id, turn: 1, sourceUserSeq: composeSource.seq };
-    const composeReply = JSON.stringify(PAYLOADS);
+    const composeReply = JSON.stringify(payloads);
     const composed = commitTurnOutcome({ version: 2, id: turnOutcomeId(composeIdentity), identity: composeIdentity,
       status: 'done', resumable: false, presentation: { kind: 'answer', text: composeReply } });
     assert.equal(composed.presentation.status, 'done');
@@ -181,7 +183,32 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   let primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.equal(primed.ok, true, JSON.stringify(primed));
   if (!primed.ok) throw new Error('fixture catalog must prime');
-  assert.ok(primed.planning.capabilities.some(cap => cap.id === CAPABILITY), 'the exact provider capability is published before planning');
+  if (delayedPublication) {
+    const resolution = await import('./capability-resolution.js');
+    resolution.recordAdmissionCapabilityResolution({ ...identity, acceptedInput: prompt, entries: [{
+      kind: 'composio', identifier: OPERATION, intent: 'foreground tool_search disclosed this exact live operation',
+      status: 'proven', connection: 'active', accountIdentity: ACCOUNT, effectClass: 'write',
+    }] });
+    const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority,
+      candidates: [{ name: OPERATION, carrier: 'work_call', sourceKind: 'authorized_composio', schema }] });
+    assert.equal(refs[OPERATION], CAPABILITY);
+    const disclosed = semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({ authority: primed.planning.authority,
+      identity, selectedRefs: new Set([CAPABILITY]) })[0]!;
+    assert.notEqual(disclosed.manifestDigest, registered.manifestDigest,
+      'the live failure compared a resolution-proof digest with a later callable manifest digest');
+    factory.register(registered);
+    const current = semantic.currentPrimaryModelPlanningDescriptor({ authority: primed.planning.authority, identity, capabilityRef: CAPABILITY });
+    if (delayedPublication === 'contract_drift') {
+      assert.equal(current, null, 'an altered operation contract cannot borrow the discovered definition');
+    } else {
+      assert.equal(current?.manifestDigest, registered.manifestDigest);
+      assert.equal(semantic.currentPrimaryModelPlanningDescriptor({ authority: primed.planning.authority,
+        identity: { ...identity, sourceUserSeq: source.seq + 1 }, capabilityRef: CAPABILITY }), null,
+      'another accepted request cannot borrow this discovery');
+    }
+  } else {
+    assert.ok(primed.planning.capabilities.some(cap => cap.id === CAPABILITY), 'the exact provider capability is published before planning');
+  }
   const planArgs = {
     preamble: 'Saving the three fixture drafts to your connected owner mailbox, without recipients, using plain text.',
     draft: {
@@ -203,74 +230,99 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
       effect: 'external_write', capabilityRef: CAPABILITY, staticArguments: payload, dynamicBindings: [], dependsOn: [], subagentRole: null,
       verification: 'Exact provider acknowledgement and returned draft ID.' })), successCriteria: planArgs.draft.criteria, subagents: [],
   };
-  // C9 repeatedly used local_write for an already-discovered external draft.
-  // Keep refusing it, but identify the actual contract and both fields to fix.
+  if (delayedPublication === 'contract_drift') await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: preparedInput });
+  // The host derives effects from the selected definition, even when the
+  // legacy authoring payload repeats a wrong effect in both representations.
   const wrongEffect = structuredClone(preparedInput);
   wrongEffect.steps[0]!.effect = 'local_write';
   wrongEffect.executionDraft.topology.operations[0]!.effect = 'local_write';
-  await assert.rejects(publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: wrongEffect }), error => {
-    assert.ok(error instanceof Error);
-    assert.match(error.message, /has effect external_write, not local_write/);
-    assert.match(error.message, /both this step.effect and its matching execution_draft topology operation.effect to external_write/);
-    assert.doesNotMatch(error.message, /discover and cite/);
-    return true;
-  });
+  const effectPrepared = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: wrongEffect }) as any;
+  assert.equal(effectPrepared.steps[0].effect, 'external_write');
+  assert.equal(effectPrepared.executionDraft.topology.operations[0].effect, 'external_write');
   const wrappedArguments = structuredClone(preparedInput);
   wrappedArguments.steps[0]!.staticArguments = { tool_slug: OPERATION, arguments: PAYLOADS[0] } as never;
   await assert.rejects(publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: wrappedArguments }), error => {
     assert.ok(error instanceof Error);
-    assert.match(error.message, /exact provider schema/);
-    assert.match(error.message, /input_schema fields directly/);
-    assert.match(error.message, /Required input fields:/);
+    assert.match(error.message, /discovered schema/);
+    assert.match(error.message, /unknown_field/);
+    assert.match(error.message, /missing_required/);
     return true;
   });
   assert.equal(providerCalls, 0, 'rejected authoring must never invoke the provider or repair arguments silently');
-  const structuredPlan = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: preparedInput });
+  const preparedCollection = { successCriteria: [`All ${payloads.length} exact drafts created once`], steps: [{
+    id: 'drafts', action: 'Create each reviewed draft', verification: 'One exact acknowledgement per member', capabilityRef: CAPABILITY,
+    forEach: { items: payloads, memberIdPath: '/subject', bindings: Object.keys(payloads[0]!).map(key => ({ itemPath: `/${key}`, targetPath: `/${key}` })) },
+  }] };
+  const structuredPlan = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: collectionCount ? preparedCollection : { ...preparedInput, executionDraft: null } });
   const artifact = plans.publishPlanRevision({ ...identity, principalId: session.id, fullText: basePrompt, structuredPlan, readiness: 'ready' });
   assert.equal(providerCalls, 0, 'Plan must not invoke the provider');
   const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
-  source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute the reviewed three drafts.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: `Execute the reviewed ${payloads.length} drafts.`, taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
   identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
   plans.claimPlanExecution({ ...identity, principalId: session.id, executeRef: ref });
   primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) throw new Error('Execute catalog missing');
   await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  if (delayedPublication === true) {
+    // This fixture's provider observation has no reversibility declaration.
+    // Qualify publication and exact reopen here; the separate registered
+    // manifest fixture below qualifies actual writes, including consent.
+    return { session, source, identity, outcome: { terminal: undefined, history: [] }, artifact, ref,
+      counts: () => ({ providerCalls, modelCalls }) };
+  }
   const plan = brackets.wrapToolForHarness(buildPlanTaskTool({ planning: primed.planning }) as never);
   const work = brackets.wrapToolForHarness(buildWorkCall({ requireHostPlan: true, hostPlanningReady: () => true }) as never);
+  const batches = Math.ceil(payloads.length / 8);
+  let replay = false, frame = 0;
+  const writeCall = (payload: typeof PAYLOADS[number], index: number) => ({
+    type: 'function_call', callId: `${replay ? 'replay' : 'write'}-draft-${index + 1}`, name: 'work_call', arguments: JSON.stringify({
+      requirement_id: collectionCount ? 'drafts' : ['draft_a', 'draft_b', 'draft_c'][index],
+      universe_item_id: collectionCount ? payload.subject : null, universe_selector: null,
+      seal_amendment: null, source_call_ids: null, source_record_ids: null,
+      name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: OPERATION, arguments: collectionCount ? (index % 2 ? {} : { body: 'A retyped body must not replace the reviewed member.' }) : payload }),
+    }),
+  });
   const model = {
     async getResponse(request: unknown) {
-      modelCalls += 1;
+      modelCalls += 1; frame += 1;
       if (modelCalls === 2) {
         assert.ok(eventlog.getTurnGraphEventForSource(session.id, source.seq), JSON.stringify(request));
         assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'ok');
       }
       return { responseId: `planned-draft-${suffix}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        output: modelCalls === 1
-          ? [{ type: 'function_call', callId: 'plan-three-drafts', name: 'plan_task', arguments: '{}' }]
-          : modelCalls === 2 ? PAYLOADS.map((payload, index) => ({
-            type: 'function_call', callId: `write-draft-${index + 1}`, name: 'work_call', arguments: JSON.stringify({
-              requirement_id: ['draft_a', 'draft_b', 'draft_c'][index], universe_item_id: null, universe_selector: null,
-              seal_amendment: null, source_call_ids: null, source_record_ids: null,
-              name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: OPERATION, arguments: payload }),
-            }),
-          })) : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Created the three drafts: fixture-draft-1, fixture-draft-2, fixture-draft-3.' }] }],
+        output: replay ? frame === 1 ? [writeCall(payloads[0]!, 0)] : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Kept the existing completed drafts.' }] }]
+          : frame === 1 ? [{ type: 'function_call', callId: 'plan-three-drafts', name: 'plan_task', arguments: '{}' }]
+          : frame <= batches + 1 ? payloads.slice((frame - 2) * 8, (frame - 1) * 8).map((payload, index) => writeCall(payload, (frame - 2) * 8 + index))
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Created the drafts, each once.' }] }],
       };
     }, getStreamedResponse: modelStream,
   };
   const agent = { model, tools: [plan, work] };
   const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [plan, work], activeToolNames: ['plan_task', 'work_call'],
-    policyHash: 'planned-draft-ack-fixture', budget: { maxUncachedTokens: 10_000, maxModelCalls: 6, maxToolCalls: 8, maxElapsedMs: 60_000 } });
+    policyHash: 'planned-draft-ack-fixture', budget: { maxUncachedTokens: 10_000, maxModelCalls: batches + 6, maxToolCalls: payloads.length + 8, maxElapsedMs: 60_000 } });
   assert.ok(sealed.ok);
   if (!sealed.ok) throw new Error('fixture surface must seal');
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('legacy Runner must not own the turn'); } });
-  const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:${source.turn}` }, () => hostRunRunner(runner as never, agent as never, [...priorHistory, { type: 'message', role: 'user', content: executionContext.acceptedPlanExecutionText(session.id, source.seq)! }] as never,
-    { maxTurns: 6, hostTurnEngine: 'host_v1', context: identity } as never));
-  return { session, source, identity, outcome, artifact, ref, counts: () => ({ providerCalls, modelCalls }) };
+  const run = () => brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(payloads.length + 8), behaviorScopeId: `${session.id}::turn:${source.turn}` }, () => hostRunRunner(runner as never, agent as never, [...priorHistory, { type: 'message', role: 'user', content: executionContext.acceptedPlanExecutionText(session.id, source.seq)! }] as never,
+    { maxTurns: batches + 6, hostTurnEngine: 'host_v1', context: identity } as never));
+  const outcome = await run();
+  return { session, source, identity, outcome, artifact, ref, payloads, replay: async () => { eventlog.closeEventLog(); replay = true; frame = 0; return run(); }, counts: () => ({ providerCalls, modelCalls }) };
 }
 
+
+test('a changed operation contract cannot upgrade a discovery proof', async () => {
+  await assert.rejects(plannedDraftFixture('provider-contract-drift', ['tool_result'], false, 'contract_drift'), error => String(error).includes('manifest contract differs from the disclosed definition'));
+});
+
+test('a discovered proof upgrades to its exact callable definition for publication and Execute reopen', async () => {
+  const f = await plannedDraftFixture('delayed-publication', ['tool_result'], false, true);
+  assert.equal(f.outcome.terminal, undefined, JSON.stringify(f.outcome));
+  assert.equal(f.counts().providerCalls, 0, 'publication and revalidation never dispatch');
+  assert.equal((f.artifact.structuredPlan.preparedBindings as any[]).length, 3);
+});
 
 test('reviewed real provider schema activates without reauthoring; three exact writes settle once and reopen', async () => {
   const fixture = await plannedDraftFixture('reviewed-provider');
@@ -298,4 +350,42 @@ test('reviewed real provider schema activates without reauthoring; three exact w
   assert.equal(preparation.prepareAcceptedTaskTerminal({ ...fixture.identity, proposedReply: reply }).status, 'ready');
   assert.equal(plans.getPlanExecutionClaim({ sessionId: fixture.session.id, principalId: fixture.session.id, ref: fixture.ref })?.sourceUserSeq, fixture.source.seq);
   assert.equal(fixture.counts().providerCalls, 3);
+});
+
+
+test('one reviewed collection executes 50 exact drafts and refuses a completed member after SQLite reopen', async () => {
+  const f = await plannedDraftFixture('collection-fifty', ['tool_result'], false, false, 50);
+  assert.equal(f.counts().providerCalls, 50, JSON.stringify({ results: f.outcome.history.filter((x: any) => x.type === 'function_call_result').slice(0, 2), contract: expectedWork.loadExpectedWorkContract(f.session.id, f.source.seq), outline: (f.artifact.structuredPlan as any).executionDraft.topology.universes }));
+  assert.equal(f.outcome.terminal, undefined, JSON.stringify(f.outcome));
+  const terminal = preparation.prepareAcceptedTaskTerminal({ ...f.identity, proposedReply: 'Created all 50 reviewed drafts once.' });
+  assert.equal(terminal.status, 'ready', JSON.stringify(terminal));
+  const { resolveReviewedPlanStepResult } = await import('./reviewed-plan-results.js');
+  const results = resolveReviewedPlanStepResult(f.identity, 'drafts') as any;
+  assert.equal(results.items.length, 50);
+  assert.equal(new Set(results.items.map((item: any) => item.memberId)).size, 50);
+  const replay = await f.replay!();
+  assert.equal(f.counts().providerCalls, 50, JSON.stringify(replay.history));
+  assert.deepEqual(resolveReviewedPlanStepResult(f.identity, 'drafts'), results);
+  assert.equal(preparation.prepareAcceptedTaskTerminal({ ...f.identity, proposedReply: 'All 50 original drafts retained.' }).status, 'ready');
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(f.identity), identity: f.identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'All 50 original drafts retained.' } });
+  assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
+  eventlog.closeEventLog();
+  const db = eventlog.openEventLog();
+  const manifest = loadManifestState(f.session.id, f.source.seq);
+  assert.equal(manifest.status, 'ok'); if (manifest.status !== 'ok') throw new Error('missing manifest');
+  const receiptRows = db.prepare('SELECT receipt_json FROM host_provider_acknowledgement_receipts_v1 WHERE session_id=? AND source_user_seq=?').all(f.session.id, f.source.seq) as any[];
+  assert.equal(receiptRows.length, 50, 'one receipt per actual member execution');
+  const first = JSON.parse(receiptRows[0].receipt_json);
+  const proof = () => verifyAcceptedTaskTerminalProofInTransaction({ db, ...f.identity,
+    acceptedTaskId: first.acceptedTaskId, manifest: manifest.manifest });
+  assert.deepEqual(proof(), { ok: true });
+  db.exec('SAVEPOINT member_corruption');
+  try {
+    for (const trigger of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='expected_work_call_bindings'").all() as Array<{ name: string }>) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+    db.prepare('UPDATE expected_work_call_bindings SET universe_item_id=? WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?')
+      .run('outside-reviewed-members', f.session.id, f.source.seq, first.logicalToolCallId);
+    assert.equal(proof().ok, false, 'an acknowledged call cannot be reassigned to another member after reopen');
+  } finally { db.exec('ROLLBACK TO member_corruption'); db.exec('RELEASE member_corruption'); }
+  assert.deepEqual(proof(), { ok: true });
 });

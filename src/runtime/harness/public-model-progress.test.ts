@@ -91,3 +91,27 @@ test('an active-turn beat speaks on change, not on the clock', async () => {
   assert.equal(spoke.length, 10, JSON.stringify(spoke));
 });
 
+
+test('heartbeats retain the host pending-request fact across their own events and clear it after the request', async () => {
+  const { withActiveTurnHeartbeat } = await import('./loop.js');
+  const events = await import('./eventlog.js');
+  const { getHarnessBudgetSettings } = await import('./budget-settings.js');
+  const session = events.createSession({ id: 'heartbeat-request-owner', kind: 'chat' });
+  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan a comparison.' } });
+  let pending = true;
+  const beats = () => events.listEvents(session.id).filter(e => e.type === 'heartbeat');
+  await withActiveTurnHeartbeat({ sessionId: session.id, sourceUserSeq: source.seq, turn: 1,
+    budget: getHarnessBudgetSettings(), checkInMs: 5, stage: 'turn', modelRequestInFlight: () => pending,
+  }, async () => {
+    const deadline = Date.now() + 2000;
+    while (beats().length < 2 && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+    assert.ok(beats().length >= 2, 'both the first and subsequent heartbeat are observed');
+    assert.ok(beats().every(e => e.data.composing === true));
+    assert.match(String(beats().at(-1)?.data.message), /waiting for the model response/);
+    pending = false;
+    const before = beats().length;
+    while (beats().length === before && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+    assert.ok(beats().length > before);
+    assert.equal(beats().at(-1)?.data.composing, undefined, 'a finished model request cannot remain pending');
+  });
+});

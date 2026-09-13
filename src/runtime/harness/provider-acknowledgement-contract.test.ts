@@ -66,12 +66,12 @@ test('explicit accepted evidence or destination requirements cannot be lowered t
   assert.equal(select(missing), null);
 });
 
-test('derived content, collection writes and non-provider effects retain stronger evidence paths', () => {
+test('derived content, set writes and non-provider effects retain stronger evidence paths', () => {
   const derived = fixture();
   derived.graph.workTopology.topology.operations[0]!.dataFrom = ['source_read'];
   assert.equal(select(derived), null);
   const each = fixture();
-  each.graph.workTopology.topology.operations[0]!.cardinality.kind = 'each';
+  each.graph.workTopology.topology.operations[0]!.cardinality.kind = 'set';
   assert.equal(select(each), null);
   for (const effect of ['read', 'local_write', 'admin', 'unknown']) {
     const value = fixture();
@@ -104,4 +104,10 @@ test('the durable mode rejects unknown versions, additional assertions and unbou
     { ...mode, contentVerified: true }]) {
     assert.equal(parseProviderAcknowledgementMode(raw), null);
   }
+});
+
+test('each call in a collection can carry its own acknowledgement without claiming collection completion', () => {
+  const each = fixture();
+  each.graph.workTopology.topology.operations[0]!.cardinality = { kind: 'each', universeId: 'members' } as any;
+  assert.equal(select(each)?.kind, 'provider_acknowledgement_v1');
 });

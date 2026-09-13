@@ -92,13 +92,13 @@ export function composeRunProgressLine(input: {
     // number here and the map she keeps mid-turn can never disagree.
     const held = heldInventory(input.sessionId, sourceUserSeq);
     const assembled = [
-      held.reads.length > 0
-        ? `${held.reads.length} input${held.reads.length === 1 ? '' : 's'} read`
+      held.readCount > 0
+        ? `${held.readCount} read result${held.readCount === 1 ? '' : 's'} retained`
         : '',
-      held.toolkits.length > 0
-        ? `${held.toolkits.length} toolkit${held.toolkits.length === 1 ? '' : 's'} bound (${held.toolkits.map((entry) => entry.toolkit.toLowerCase()).slice(0, 4).join(', ')})`
+      held.toolkitCount > 0
+        ? `${held.toolkitCount} toolkit${held.toolkitCount === 1 ? '' : 's'} identified (${held.toolkits.map((entry) => entry.toolkit.toLowerCase()).slice(0, 4).join(', ')})`
         : '',
-      held.total > 0 ? `${held.total} operation${held.total === 1 ? '' : 's'} callable` : '',
+      held.total > 0 ? `${held.total} operation${held.total === 1 ? '' : 's'} identified` : '',
     ].filter(Boolean);
     const completedOperations = [
         counts.writes ? `${counts.writes} write${counts.writes === 1 ? '' : 's'} completed` : '',
@@ -132,7 +132,7 @@ export function composeRunProgressLine(input: {
     // A frozen plan already says more than the inventory would, so only the
     // toolkit count rides along — enough to show breadth without doubling the
     // line's length on the surface that has the least room.
-    if (held.toolkits.length > 0) parts.push(`${held.toolkits.length} toolkit${held.toolkits.length === 1 ? '' : 's'} bound`);
+    if (held.toolkitCount > 0) parts.push(`${held.toolkitCount} toolkit${held.toolkitCount === 1 ? '' : 's'} identified`);
     return `Still working — ${parts.join(' · ')}.`;
   } catch {
     return input.fallback;

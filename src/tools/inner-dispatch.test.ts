@@ -301,3 +301,25 @@ test('batchShapeDirective: fires on a data-heavy turn, silent otherwise, and ste
   assert.match(sharpened, /THIS TURN IS BATCH-SHAPED/);
   assert.match(sharpened, /~18 independent firms/);
 });
+
+
+test('accounting mirrors cannot exempt another call, source or session', async () => {
+  const { withHarnessRunContext, ToolCallsCounter, hostOwnsLogicalCallAccounting } = await import('../runtime/harness/brackets.js');
+  const { withLogicalToolCall } = await import('../runtime/harness/attempt-identity.js');
+  const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
+  const sessionId = createSession({ kind: 'chat' }).id;
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'List skills' } });
+  const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+  assert.ok(recordTurnGraphShadow({ identity: { sessionId, sourceUserSeq: source.seq, turn: 1 } }));
+  const context = { sessionId, sourceUserSeq: source.seq, counter: new ToolCallsCounter(1), hostOwnsToolAccounting: true };
+  await withHarnessRunContext(context, () => withLogicalToolCall({ sessionId, sourceUserSeq: source.seq, logicalToolCallId: 'charged', tool: 'skill_list', args: {} }, async () => {
+    assert.equal(hostOwnsLogicalCallAccounting(sessionId, 'charged'), true);
+    assert.equal(inheritedNestedHarnessContext(sessionId, false, 'charged').hostOwnsToolAccounting, true);
+    assert.equal(hostOwnsLogicalCallAccounting(sessionId, 'child'), false);
+    assert.equal(hostOwnsLogicalCallAccounting('foreign-session', 'charged'), false);
+    assert.equal(inheritedNestedHarnessContext(sessionId, false, 'child').hostOwnsToolAccounting, undefined);
+    await withHarnessRunContext({ ...context, sourceUserSeq: source.seq + 1 }, async () => {
+      assert.equal(hostOwnsLogicalCallAccounting(sessionId, 'charged'), false);
+    });
+  }));
+});

@@ -804,7 +804,7 @@ export function collapseOldCompletedToolPairs(
     return { nextItems: items, collapsed: 0, callIds: [] };
   }
 
-  const keepIds = new Set(completedIds.slice(-normalizedRetain));
+  const keepIds = new Set(normalizedRetain === 0 ? [] : completedIds.slice(-normalizedRetain));
   const pairs: CompletedToolPair[] = [];
   for (const pair of completed) {
     if (keepIds.has(pair.callId)) continue;

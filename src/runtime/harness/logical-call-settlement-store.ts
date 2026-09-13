@@ -1134,8 +1134,11 @@ export function commitLogicalCallSettlement(
         )
         && recovery.businessCall === true
         && recovery.continuesRequirement !== true
-        && (!progressDigest || progressClaimed)
       ) {
+        // Novel progress and observed effects are different facts. A corrected
+        // file or refreshed readback may reuse a requirement's progress key,
+        // but its successful crossing must still enter the resolution ledger.
+        // Progress accounting remains deduplicated above.
         // Call-root ownership and work-topology attribution are orthogonal.
         // A foreground host plan keeps host_v1 as the sole call root, while an
         // immutable expected-work binding still requires this successful call

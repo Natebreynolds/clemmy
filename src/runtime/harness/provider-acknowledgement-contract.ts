@@ -25,7 +25,7 @@ export function graphAllowsProviderAcknowledgement(graph: TurnGraphIR, operation
   const operation = graph.workTopology?.topology.operations.find((entry) => entry.id === operationId);
   const destinations = graph.classification.goalConstraints?.destinations;
   return Boolean(requirements?.length === 1 && requirements[0] === 'tool_result'
-    && operation?.effect === 'external_write' && operation.cardinality.kind === 'once'
+    && operation?.effect === 'external_write' && (operation.cardinality.kind === 'once' || operation.cardinality.kind === 'each')
     && operation.dataFrom.length === 0
     && destinations?.length && destinations.every((entry) => entry.posture === 'create_new' && !entry.handleRequired));
 }

@@ -1,3 +1,5 @@
+import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
+import { supersededReviewedFileCalls } from './reviewed-file-correction.js';
 /**
  * The obligation manifest: what an accepted turn owes, as authority.
  *
@@ -278,6 +280,9 @@ export function compileObligationManifest(input: {
   } catch { /* an unreadable contract keeps the strict historical obligation */ }
 
   const nodes: ObligationManifestNode[] = [];
+  const executableIds = new Map<string, string>();
+  const supersededByStep = new Map<string, Set<string>>();
+  const observedCalls = new Set(ledgerFacts.map(operation => operation.logicalToolCallId));
   for (const operation of ledgerFacts) {
     const parent = graphNodes.get(operation.nodeId);
     if (!parent) {
@@ -313,7 +318,25 @@ export function compileObligationManifest(input: {
     // node. Capability semantics must come from that executable node rather
     // than from the shared write owner, otherwise every upstream read inherits
     // the destination manifest.
-    const executableNode = graphNodes.get(operation.operationId) ?? parent;
+    const callBinding = loadExpectedWorkCallBindingState({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, logicalToolCallId: operation.logicalToolCallId });
+    const executableId = callBinding.status === 'ok' && expectedWork.status === 'ok'
+      && callBinding.binding.contractId === expectedWork.contract.contractId
+      && callBinding.binding.acceptedTaskId === expectedWork.contract.acceptedTaskId
+      ? callBinding.binding.requirementId : operation.operationId;
+    // A verified correction replaces this request's own local output. Earlier
+    // writes remain in the settlement ledger and immutable revision history;
+    // final content proof belongs to the replacement, which keeps all ordinary
+    // obligations. Missing lineage leaves the old obligation intact.
+    if (effectKind === 'local_write') {
+      let superseded = supersededByStep.get(executableId);
+      if (!superseded) {
+        superseded = supersededReviewedFileCalls(identity, executableId, observedCalls);
+        supersededByStep.set(executableId, superseded);
+      }
+      if (superseded.has(operation.logicalToolCallId)) continue;
+    }
+    executableIds.set(operation.operationId, executableId);
+    const executableNode = graphNodes.get(executableId) ?? graphNodes.get(operation.operationId) ?? parent;
     const sealed = loadSealedNodeBinding(identity.sessionId, identity.sourceUserSeq, executableNode.id);
     const producedOutputKinds = (
       (sealed?.capabilityId
@@ -351,7 +374,7 @@ export function compileObligationManifest(input: {
       : undefined;
     const hasSourceRead = operationRequiresSourceDerivation(
       expectedOperations,
-      operation.operationId,
+      executableId,
       legacyHasSourceRead,
     );
     const acknowledgement = sealed?.writeEvidenceMode?.kind === 'provider_acknowledgement_v1'
@@ -404,8 +427,8 @@ export function compileObligationManifest(input: {
   const isUpstreamRead = (sourceOperationId: string, writeOperationId: string): boolean => {
     return expectedWorkDataLineageIncludes(
       expectedOperations,
-      sourceOperationId,
-      writeOperationId,
+      executableIds.get(sourceOperationId) ?? sourceOperationId,
+      executableIds.get(writeOperationId) ?? writeOperationId,
     );
   };
   for (const node of nodes) {

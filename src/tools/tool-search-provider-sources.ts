@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { rankCatalogEntriesLexically } from '../agents/tool-catalog.js';
+import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
 import {
   mcpToolScopeAuthority,
@@ -1893,7 +1893,8 @@ export function buildAuthorizedToolSearchCandidateSources(
       const tools = await server.listTools();
       if (signal?.aborted) return [];
       const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({
-        name: tool.name, oneLiner: typeof tool.description === 'string' ? tool.description : '',
+        name: tool.name, namespace: stripMcpToolCarrier(tool.name).split('__')[0],
+        oneLiner: [typeof tool.description === 'string' ? tool.description : '', toolSchemaSearchText(tool.inputSchema)].filter(Boolean).join('\n'),
         tool,
       })));
       return ranked.slice(0, limit).map(({ tool }, index): ToolSearchBrokerCandidate => ({

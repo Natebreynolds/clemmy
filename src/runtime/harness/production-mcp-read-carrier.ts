@@ -10,7 +10,7 @@
  * immutable port invocation, so stale catalog or memory rows can never dispatch
  * and metadata I/O is never hidden inside the business crossing.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { MCPServer } from '@openai/agents';
 
@@ -639,8 +639,8 @@ function definitionMatchesAttestation(input: {
     && actual.operationVersion === input.expected.operationVersion
     && actual.accountId === input.expected.accountId
     && actual.effect === input.expected.effect
-    && JSON.stringify(actual.externalDefinition ?? null)
-      === JSON.stringify(input.expected.externalDefinition ?? null)
+    && closedCanonicalJson(actual.externalDefinition ?? null)
+      === closedCanonicalJson(input.expected.externalDefinition ?? null)
     && actual.invoke.portId === input.expected.invoke.portId
     && actual.invoke.argumentCompiler.id === input.expected.invoke.argumentCompiler.id
     && actual.invoke.argumentCompiler.version === input.expected.invoke.argumentCompiler.version
@@ -674,8 +674,8 @@ function snapshotMatchesManifest(
     && actual.invoke.portId === manifest.invokePortId
     && actual.invoke.argumentCompiler.id === manifest.argumentCompiler.id
     && actual.invoke.argumentCompiler.version === manifest.argumentCompiler.version
-    && JSON.stringify(actual.externalDefinition ?? null)
-      === JSON.stringify(manifest.externalDefinition);
+    && closedCanonicalJson(actual.externalDefinition ?? null)
+      === closedCanonicalJson(manifest.externalDefinition);
 }
 
 /**
@@ -962,6 +962,23 @@ function exactMcpScopeManifests(
   }).sort((left, right) => left.manifestId.localeCompare(right.manifestId));
 }
 
+function stableExactMcpManifest(manifest: CapabilityManifestV1): CapabilityManifestV1 {
+  // Reusing an ID with a fresh issuedAt changed its digest and made a second
+  // search revoke the first disclosure. Observation freshness is separate
+  // from issuance: compare the whole contract, retaining its original issue.
+  const existing = exactMcpScopeManifests(manifest).find(prior =>
+    capabilityManifestDigest({ ...manifest, manifestId: prior.manifestId,
+      provenance: { ...manifest.provenance, issuedAt: prior.provenance.issuedAt } })
+      === capabilityManifestDigest(prior));
+  if (existing) return existing;
+  const store = peekCapabilityManifestStore() ?? resolveCapabilityManifestStore();
+  // A new live discovery may reacquire a definition, but must never revive
+  // the revoked ID retained by an older plan or pending execution.
+  return store.get(manifest.manifestId)
+    ? { ...manifest, manifestId: `${manifest.manifestId}:reacquired:${randomUUID()}` }
+    : manifest;
+}
+
 export function createProductionMcpReadCarrier(input: {
   serverName: string;
   runtime?: ProductionMcpRuntime;
@@ -1195,7 +1212,7 @@ export function createProductionMcpReadCarrier(input: {
 
     let manifest: CapabilityManifestV1;
     try {
-      manifest = exactMcpManifest(first.attestation);
+      manifest = stableExactMcpManifest(exactMcpManifest(first.attestation));
     } catch (error) {
       return block('definition_drift', error instanceof Error ? error.message : String(error), true);
     }
@@ -1203,7 +1220,7 @@ export function createProductionMcpReadCarrier(input: {
     if (!registeredPort.ok) {
       return block('port_registration_failed', registeredPort.reason, true);
     }
-    const port = resolveProductionPortsForManifest(manifest);
+    let port = resolveProductionPortsForManifest(manifest);
     if (!port?.invoke) {
       return block('port_registration_failed', 'the exact immutable invoke port is absent', true);
     }
@@ -1285,6 +1302,16 @@ export function createProductionMcpReadCarrier(input: {
       );
     }
 
+    // Another search can finish during tools/list. Adopt an identical issued
+    // contract again immediately before the synchronous lifecycle commit.
+    const stable = stableExactMcpManifest(manifest);
+    if (capabilityManifestDigest(stable) !== capabilityManifestDigest(manifest)) {
+      manifest = stable;
+      const registration = registerPort({ manifest, attestation: final.attestation });
+      if (!registration.ok) return block('port_registration_failed', registration.reason, true);
+      port = resolveProductionPortsForManifest(manifest);
+      if (!port?.invoke) return block('port_registration_failed', 'the exact immutable invoke port is absent', true);
+    }
     const prior = exactMcpScopeManifests(manifest)
       .filter((candidate) => candidate.manifestId !== manifest.manifestId);
     const same = store.get(manifest.manifestId);

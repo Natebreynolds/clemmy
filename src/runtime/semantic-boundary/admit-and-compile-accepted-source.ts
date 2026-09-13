@@ -862,6 +862,37 @@ export interface PrimaryModelPlanningReadCapabilityV1 {
   readonly manifestDigest: string;
 }
 
+/** Resolve a same-source discovery to its current callable descriptor. A
+ * resolution-proof digest is not a manifest digest. Compare the full staged
+ * definition before upgrading that nomination; names alone cannot do it.
+ * This reads existing authority and grants or executes nothing. */
+export function currentPrimaryModelPlanningDescriptor(input: {
+  authority: PrimaryModelPlanningCatalogAuthorityV1;
+  identity: Readonly<{ sessionId: string; sourceUserSeq: number }>;
+  capabilityRef: string;
+}): HostCapabilityDescriptorV1 | null {
+  const catalog = primaryModelPlanningCatalogs.get(input.authority as object);
+  if (!catalog || input.authority.scope !== PRIMARY_MODEL_PLANNING_CATALOG_SCOPE
+    || catalog.sessionId !== input.identity.sessionId || catalog.sourceUserSeq !== input.identity.sourceUserSeq
+    || catalog.digest !== sha256(JSON.stringify(catalog.capabilities))) return null;
+  const staged = catalog.stagedById.get(input.capabilityRef);
+  const nominated = staged?.descriptor ?? catalog.capabilities.find(row => row.id === input.capabilityRef);
+  if (!nominated) return null;
+  const entry = peekHostCapabilityCatalogFactory()?.get(input.capabilityRef);
+  if (!entry || !isCurrentCallableCatalogEntry(entry)) return null;
+  const current = hostDescriptorFromRegistered(entry);
+  if (!current || current.accountScope !== nominated.accountScope || current.effect !== nominated.effect) return null;
+  if (!staged?.providerDefinition) {
+    return current.manifestDigest === nominated.manifestDigest ? current : null;
+  }
+  const definition = stagedProviderDefinitionFromRegistered(entry);
+  if (entry.manifest.operationId.toLowerCase() !== staged.identifier.toLowerCase()
+    || entry.manifest.providerKind !== staged.providerKind
+    || entry.manifest.accountId !== staged.accountIdentity
+    || !definition || !stagedProviderDefinitionsEqual(definition, staged.providerDefinition)) return null;
+  return current;
+}
+
 /** Reopen one exact read manifest from the opaque, source-bound foreground
  * planning card. This is deliberately narrower than the public snapshot: a
  * caller cannot nominate a catalog id, account, provider, or digest. It may

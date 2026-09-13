@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildWatcherPrompt,
+  latestWatcherAssistantNote,
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
   parseWatcherVerdict,
@@ -136,4 +137,23 @@ test('gate: a fan-out re-arm waives only the interval — every other cap still 
   assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence({ ...midBatch, enabled: false })), false, 'kill-switch still wins');
   // Re-arming is pure: the caller's gate input is untouched.
   assert.equal(midBatch.lastCheckedAtToolCalls, 0);
+});
+
+test('watcher evidence and public notes survive whole while prior turns and reasoning are excluded', () => {
+  const source = 'Prefix ' + 'evidence '.repeat(1000) + 'TAIL: source contradicts the claimed price.';
+  const note = 'Public progress ' + 'context '.repeat(300) + 'TAIL: checking the comparison.';
+  const history = [
+    { type: 'message', role: 'assistant', content: 'Old request note.' },
+    { type: 'message', role: 'user', content: 'Current objective.' },
+    { type: 'reasoning', content: 'Private reasoning is not a progress note.' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: note }] },
+    { type: 'function_call_result', output: 'Tool text is not the agent note.' },
+  ];
+  assert.equal(latestWatcherAssistantNote(history, 2), note);
+  assert.equal(latestWatcherAssistantNote(history.slice(0, 3), 2), '');
+  const prompt = buildWatcherPrompt({ objective: 'Compare the two offers.', sourceEvidence: source,
+    latestAssistantNote: note, toolCallSummary: 'read_file ×2', toolCallCount: 2 });
+  assert.ok(prompt.includes(source));
+  assert.ok(prompt.includes(note));
+  assert.doesNotMatch(prompt, /Old request note|Private reasoning/);
 });

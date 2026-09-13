@@ -26,6 +26,7 @@
  * snapshot.
  */
 import { loadMemoryContext } from '../memory/vault.js';
+import { withInstructionMemory } from '../runtime/harness/model-memory-evidence.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFocusSnapshot } from '../memory/focus.js';
@@ -517,5 +518,5 @@ export function harnessInstructions(roleInstructions: string, opts?: {
         ctx ? `${ctx}\n\n---\n\n${historicalRole}` : historicalRole,
         volatileMemoryInstructions,
       ].filter(Boolean).join('\n\n');
-  return () => rendered;
+  return withInstructionMemory(() => rendered, [ctx, volatileMemoryInstructions]);
 }

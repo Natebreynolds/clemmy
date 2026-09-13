@@ -1,4 +1,5 @@
 import { buildPlanningDisclosure } from './worker-planning-disclosure.js';
+import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import type { HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { Agent } from '@openai/agents';
@@ -319,10 +320,16 @@ export async function buildWorkerAgent(options: {
       '  - Do NOT call notify_user, ask_user_question, or write to shared tasks/executions — those mutate state your sibling workers also touch and create race conditions.',
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
     ].join('\n\n');
-  const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}`;
+  const planning = acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq ?? undefined)?.kind === 'plan';
+  const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}${planning
+    ? '\n\nYou are investigating part of a Plan. Explain the evidence, missing facts and relevant tool contracts that will make the parent’s execution plan useful. Distinguish observed facts from claims and inference. Return findings to the parent; do not execute the proposed business work.'
+    : ''}`;
   const agent = new Agent<RuntimeContextValue>({
     name: 'Worker',
     handoffDescription: 'Stateless per-item worker. Use via run_worker tool for parallel fan-out.',
+    // Packet workers enter the host runner directly, bypassing runTurn's
+    // selector. Inherit the child's durable Plan mode at construction.
+    ...(planning ? { modelSettings: { reasoning: { effort: 'high' as const } } } : {}),
     // Instructions are a FUNCTION so a worker fanned out from a chat session
     // inherits that session's parked GOAL (goal-contract P3 — replaced the
     // Active Task pin). Keyed by the parent run context's sessionId — never

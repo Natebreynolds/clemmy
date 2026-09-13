@@ -130,6 +130,20 @@ export interface FallbackRouteResolution {
 // Clementine-private route truth without mutating providerData or leaking our
 // bookkeeping back into a provider continuation payload.
 const fallbackRouteResolutions = new WeakMap<object, FallbackRouteResolution>();
+// Keep a completed rescue tied to the exact retired request. The original
+// signal remains aborted, while the rescue's own signal is still live.
+const completedDeadlineRescues = new WeakMap<object, AbortSignal>();
+export function isCompletedDeadlineRescue(response: object, signal: AbortSignal): boolean {
+  return completedDeadlineRescues.get(response) === signal;
+}
+function retainCompletedDeadlineRescue(response: object, request: ModelRequest, attempt: ModelRequest): void {
+  const original = (request as { signal?: AbortSignal }).signal;
+  if (original?.aborted && isHarnessDeadlineAbortReason(original.reason)
+    && (attempt as { signal?: AbortSignal }).signal?.aborted === false) {
+    completedDeadlineRescues.set(response, original);
+  }
+}
+
 
 export function fallbackRouteResolution(value: unknown): FallbackRouteResolution | undefined {
   return value !== null && typeof value === 'object'
@@ -907,14 +921,20 @@ export class FallbackModel implements Model {
         // therefore stream-only, where the first real event is observable below.
         // Any caller/provider overall deadline remains intact through `req.signal`.
         const result = await chain[i].getModel().getResponse(req);
+        // Compatibility adapters can resolve a partial result on cancellation.
+        // A retired attempt cannot certify its own synthetic completion.
+        (req as { signal?: AbortSignal }).signal?.throwIfAborted();
         if (!modelResponseHasActionableContent(result)) {
           throw new PreContentStreamEndedError(modelResponseHasActivity(result));
         }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
         this.tagRouteResolution(result, chain[i], falloverReason);
+        retainCompletedDeadlineRescue(result, request, req);
         return result;
       } catch (err) {
+        const retiredReason = (req as { signal?: AbortSignal }).signal?.reason;
+        if (isHarnessDeadlineAbortReason(retiredReason)) err = retiredReason;
         cleanup(true); // release a hung request
         const harnessDeadline = harnessDeadlineRetired(request, err);
         const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true && !harnessDeadline;
@@ -1007,6 +1027,9 @@ export class FallbackModel implements Model {
                 () => cleanup(true),
                 firstContentDeadlineAt,
               );
+          // Check this attempt's signal, not the original request: a rescue
+          // links to the owner's cancellation authority after a host deadline.
+          (req as { signal?: AbortSignal }).signal?.throwIfAborted();
           if (cur.done) {
             if (!committedActionable) throw new PreContentStreamEndedError(sawModelActivity);
             break;
@@ -1033,12 +1056,15 @@ export class FallbackModel implements Model {
             pending.length = 0;
           }
           this.tagRouteResolution(event, chain[i], falloverReason);
+          if (event.type === 'response_done') retainCompletedDeadlineRescue(event.response, request, req);
           yield event;
         }
         cleanup(false);
         clearBrainSilentFailure(chain[i].label);
         return; // streamed to completion
       } catch (err) {
+        const retiredReason = (req as { signal?: AbortSignal }).signal?.reason;
+        if (isHarnessDeadlineAbortReason(retiredReason)) err = retiredReason;
         cleanup(true); // release a hung brain
         const harnessDeadline = harnessDeadlineRetired(request, err);
         const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true && !harnessDeadline;

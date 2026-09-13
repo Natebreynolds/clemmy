@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/production-mcp-read-carrier.test.ts */
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -63,6 +63,7 @@ function generatedRuntime(input: {
   server?: string;
   objective: string;
   tools?: ToolState[];
+  result?: unknown;
 }) {
   const server = input.server ?? generated('server').toLowerCase();
   const state: {
@@ -94,7 +95,7 @@ function generatedRuntime(input: {
     async callTool(name, args) {
       counts.call += 1;
       calls.push({ name, args });
-      const result = [{ type: 'text', text: JSON.stringify({ accepted: true, name, args }) }] as unknown as Awaited<ReturnType<MCPServer['callTool']>>;
+      const result = [{ type: 'text', text: JSON.stringify(input.result ?? { accepted: true, name, args }) }] as unknown as Awaited<ReturnType<MCPServer['callTool']>>;
       return result;
     },
   };
@@ -721,6 +722,297 @@ test('exact foreground MCP disclosure materializes one declared ordinary write w
     result.manifest.externalDefinition?.providerInputSchemaDigest,
   );
   assert.equal(runtime.counts.call, 0, 'materialization performs metadata I/O only');
+});
+
+for (const reacquire of [false, true]) test(`objective MCP discovery retains its disclosed identity across repeat and reopen (reacquired=${reacquire})`, async () => {
+  const objective = generated('discovery').toLowerCase();
+  const runtime = generatedRuntime({ objective });
+  const { store, factory } = resetAuthoritySurfaces({ durable: true });
+  const discover = () => mcp.createProductionMcpReadCarrier({ serverName: runtime.server, runtime: runtime.runtime })
+    .materialize(`retrieve ${objective}`);
+  const first = await discover();
+  assert.equal(first.status, 'installed', JSON.stringify(first));
+  if (first.status !== 'installed') return;
+  let retained = first.manifest;
+  if (reacquire) {
+    assert.ok(store.revoke(retained.manifestId));
+    factory.forget(retained.manifestId);
+    const fresh = await discover();
+    assert.equal(fresh.status, 'installed', JSON.stringify(fresh));
+    if (fresh.status !== 'installed') return;
+    assert.notEqual(fresh.manifest.manifestId, retained.manifestId, 'do not revive a retired plan reference');
+    retained = fresh.manifest;
+  }
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const again = await discover();
+  assert.equal(again.status, 'installed', JSON.stringify(again));
+  if (again.status !== 'installed') return;
+  assert.deepEqual(again.manifest, retained, 'unchanged live schema keeps the exact disclosed reference and issuance');
+  const materializer = await import('./live-capability-materializer.js');
+  const { closedCanonicalJson } = await import('../../shared/closed-canonical-json.js');
+  assert.equal(materializer.liveReadIdentityMatches(again.attestation, {
+    ...again.attestation,
+    externalDefinition: JSON.parse(closedCanonicalJson(again.attestation.externalDefinition)),
+  }), true, 'JSON object enumeration order is not a provider definition change');
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  eventlog.closeEventLog();
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore([], { durable: true }));
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+  const reopened = await discover();
+  assert.equal(reopened.status, 'installed', JSON.stringify(reopened));
+  if (reopened.status !== 'installed') return;
+  assert.deepEqual(reopened.manifest, retained, 'SQLite reopen must not invalidate the reviewed reference');
+  const entry = catalogs.peekHostCapabilityCatalogFactory()!.get(retained.manifestId);
+  assert.ok(entry);
+  const plan = invocationPlan(entry);
+  const armed = arm(plan, 'objective-reopen');
+  assert.equal(armed.status, 'armed', JSON.stringify(armed));
+  if (armed.status !== 'armed') return;
+  const executed = await kernel.executeWorkflowReadOnlyCall({ activationId: armed.ref.activationId, invocationPlan: plan, args: { token: 'reviewed' } });
+  assert.equal(executed.status, 'completed', JSON.stringify(executed));
+  assert.equal(runtime.counts.call, 1);
+});
+
+for (const effect of ['read', 'external_write'] as const) for (const reacquire of [false, true]) for (const mixedDiscovery of (effect === 'read' ? [false, true] : [false])) for (const retireBeforeRead of (mixedDiscovery ? [false, true] : [false])) for (const literalControls of (effect === 'read' && mixedDiscovery && !reacquire && !retireBeforeRead ? [false, true] : [false])) test(`repeated exact MCP discovery preserves the published identity across a later observation and reopen (${effect}, reacquired=${reacquire}, mixed=${mixedDiscovery}, retired=${retireBeforeRead}, literalControls=${literalControls})`, async () => {
+  // One variant exercises the whole native transport, including dependencies
+  // submitted out of order in one model frame and final receipt certification.
+  const completeJourney = effect === 'read' && mixedDiscovery && !reacquire && !retireBeforeRead;
+  const objective = generated('research').toLowerCase();
+  const runtime = generatedRuntime({ objective, ...(completeJourney ? { result: [{ id: 'a', score: 7 }, { id: 'b', score: 9 }, { id: 'c', score: 11 }] } : {}) });
+  const tool = (runtime.state.tools as ToolState[])[0]!;
+  tool.annotations = { readOnlyHint: effect === 'read', destructiveHint: false };
+  const { store } = resetAuthoritySurfaces({ durable: true });
+  const carrier = mcp.createProductionMcpReadCarrier({ serverName: runtime.server, runtime: runtime.runtime });
+  const discover = () => mixedDiscovery ? carrier.materialize(`retrieve ${objective}`)
+    : carrier.materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+  let first = await discover();
+  assert.equal(first.status, 'installed', JSON.stringify(first));
+  if (first.status !== 'installed') return;
+  if (mixedDiscovery) {
+    const exact = await carrier.materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+    assert.equal(exact.status, 'installed', JSON.stringify(exact));
+    first = await discover();
+    assert.equal(first.status, 'installed', JSON.stringify(first));
+    if (first.status !== 'installed') return;
+  }
+  if (reacquire) {
+    assert.ok(store.revoke(first.manifest.manifestId));
+    catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+    first = await discover();
+    assert.equal(first.status, 'installed', JSON.stringify(first));
+    if (first.status !== 'installed') return;
+    assert.ok(first.manifest.manifestId.length > 128, 'exercise the full reacquired reference through Plan and Execute');
+  }
+  const { closedCanonicalJson } = await import('../../shared/closed-canonical-json.js');
+  const reorderedManifest = {
+    ...first.manifest,
+    externalDefinition: {
+      ...JSON.parse(closedCanonicalJson(first.manifest.externalDefinition)),
+      // Keep the existing manifest hash dialect: this control changes only
+      // property enumeration at the definition boundary, not its nested hints.
+      behaviorHints: first.manifest.externalDefinition!.behaviorHints,
+    },
+  };
+  assert.equal(manifests.capabilityManifestDigest(reorderedManifest), manifests.capabilityManifestDigest(first.manifest));
+  await mcp.prepareProductionMcpInvocation(reorderedManifest);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const again = await discover();
+  assert.equal(again.status, 'installed', JSON.stringify(again));
+  if (again.status !== 'installed') return;
+  assert.deepEqual(again.manifest, first.manifest, 'observation time is not manifest issuance time');
+  assert.equal(store.get(first.manifest.manifestId)?.manifest.lifecycle.state, 'current');
+  const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+  const publisher = await import('../../tools/publish-plan.js');
+  const artifacts = await import('./plan-artifacts.js');
+  const reviewed = await import('./reviewed-plan-runtime.js');
+  const session = eventlog.createSession({ id: generated('mcp-plan'), kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Prepare a plan using my connected records.', taskMode: { version: 1, kind: 'plan' } } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) return;
+  await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority,
+    candidates: [{ sourceKind: 'authorized_external_mcp', name: tool.name, schema: tool.inputSchema as Record<string, unknown>, carrier: 'work_call' }] });
+  const synthesisSteps: unknown[] = [];
+  const outputPath = path.join(TEST_HOME, `reviewed-native-comparison-${source.seq}.md`);
+  const content = 'The source reports a: 7, b: 9, c: 11. These are observations, not causal claims.\n';
+  const synthesisArgs = JSON.stringify({ step_id: 'synthesize', data: { markdown: content } });
+  const modelSynthesisArgs = literalControls ? synthesisArgs.replaceAll('\\n', '\n') : synthesisArgs;
+  if (literalControls) assert.throws(() => JSON.parse(modelSynthesisArgs));
+  if (effect === 'read') {
+    const local = await import('./local-planning-capability.js');
+    const { getCoreTools } = await import('../../tools/registry.js');
+    const names = new Set(getCoreTools().map(tool => tool.name));
+    const candidates = await Promise.all(['write_file', 'read_file'].map(name => local.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'work_call', configuredNames: names })));
+    assert.ok(candidates.every(candidate => candidate && !('refused' in candidate)));
+    const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates: candidates as any });
+    const base = { dynamicBindings: [], dependsOn: [], subagentRole: null };
+    synthesisSteps.push(
+      { ...base, id: 'synthesize', action: 'Interpret the connected records and compose a briefing.', effect: 'compute', capabilityRef: null,
+        staticArguments: {}, dependsOn: completeJourney ? ['records', 'metrics'] : ['records'], verification: 'The briefing cites the records.' },
+      { ...base, id: 'save', action: 'Save the composed briefing.', effect: 'local_write', capabilityRef: refs.write_file,
+        staticArguments: { path: outputPath }, dynamicBindings: [{ producerStepId: 'synthesize', outputPath: '/markdown', targetPath: '/content', expectedType: 'string' }], verification: 'Committed composed bytes.' },
+      { ...base, id: 'verify', action: 'Read the saved briefing.', effect: 'read', capabilityRef: refs.read_file,
+        staticArguments: { path: outputPath }, dependsOn: ['save'], verification: 'Readback matches the composed briefing.' },
+    );
+  }
+  const outline = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: {
+    steps: [{ id: 'records', action: 'Use the exact connected operation.', effect, capabilityRef: first.manifest.manifestId,
+      staticArguments: mixedDiscovery ? {} : { token: 'reviewed-token' },
+      ...(mixedDiscovery ? { forEach: { items: [{ id: 'member-a', token: 'reviewed-token' }], memberIdPath: '/id',
+        bindings: [{ itemPath: '/token', targetPath: '/token' }] } } : {}),
+      dynamicBindings: [], dependsOn: completeJourney ? ['brief'] : [], subagentRole: null, verification: 'Returned records.' },
+      ...(completeJourney ? [
+        { id: 'brief', action: 'Read the brief before researching.', effect: 'read', capabilityRef: first.manifest.manifestId,
+          staticArguments: { token: 'brief-token' }, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Brief read.' },
+        { id: 'metrics', action: 'Read comparative metrics after the brief.', effect: 'read', capabilityRef: first.manifest.manifestId,
+          staticArguments: { token: 'metrics-token' }, dynamicBindings: [], dependsOn: ['brief'], subagentRole: null, verification: 'Metrics read.' },
+      ] : []), ...synthesisSteps],
+    successCriteria: ['Connected result retained.'], subagents: [],
+  } });
+  const plan = artifacts.publishPlanRevision({ ...identity, principalId: session.id, fullText: 'Use the connected operation with reviewed-token.', structuredPlan: outline, readiness: 'ready' });
+  const ref = { planId: plan.planId, revision: plan.revision, digest: plan.digest };
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  eventlog.closeEventLog();
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore([], { durable: true }));
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+  const reopened = await discover();
+  assert.equal(reopened.status, 'installed', JSON.stringify(reopened));
+  if (reopened.status === 'installed') assert.deepEqual(reopened.manifest, first.manifest);
+  if (mixedDiscovery) {
+    const other = await carrier.materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+    assert.equal(other.status, 'installed', JSON.stringify(other));
+    if (other.status === 'installed') assert.notEqual(other.manifest.manifestId, first.manifest.manifestId);
+  }
+  const execute = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute this plan.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  artifacts.claimPlanExecution({ sessionId: session.id, sourceUserSeq: execute.seq, principalId: session.id, executeRef: ref });
+  const selected = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: execute.seq });
+  assert.ok(selected.ok, JSON.stringify(selected)); if (!selected.ok) return;
+  await reviewed.revalidateReviewedPlanPreparation(selected.planning);
+  if (effect === 'read') {
+    const brackets = await import('./brackets.js');
+    const { EventEmitter } = await import('node:events');
+    const envelopes = await import('../../agents/capability-envelope.js');
+    const host = await import('./host-turn-runner.js');
+    const { buildPlanTaskTool } = await import('../../tools/plan-tools.js');
+    const { buildWorkCall } = await import('../../tools/work-call.js');
+    const { buildPlanStepResultTool } = await import('../../tools/plan-step-result.js');
+    const { loadExpectedWorkContract } = await import('./expected-work-contract.js');
+    const { acceptedPlanExecutionText } = await import('./accepted-plan-execution.js');
+    const activationIdentity = { sessionId: session.id, sourceUserSeq: execute.seq, turn: 2 };
+    const planTool = brackets.wrapToolForHarness(buildPlanTaskTool({ planning: selected.planning }) as never);
+    const workTool = brackets.wrapToolForHarness(buildWorkCall({ requireHostPlan: true, reachableBuiltinNames: new Set(completeJourney ? ['write_file', 'read_file'] : []),
+      firstClassNames: new Set(), catalogIdentifiers: [tool.name], hostPlanningReady: () => true }) as never);
+    const resultTool = brackets.wrapToolForHarness(buildPlanStepResultTool(activationIdentity) as never);
+    const reviewedManifestId = first.manifest.manifestId;
+    let requests = 0;
+    const model = {
+      async getResponse() {
+        const frame = requests++;
+        if (frame === 1 && retireBeforeRead) {
+          assert.ok(manifestStores.resolveCapabilityManifestStore().revoke(reviewedManifestId));
+          catalogs.peekHostCapabilityCatalogFactory()!.forget(reviewedManifestId);
+        }
+        const output = frame === 0
+          ? [{ type: 'function_call', callId: 'activate-native-synthesis', name: 'plan_task', arguments: '{}' }]
+          : frame === 1
+          ? [{ type: 'function_call', callId: 'read-native-synthesis', name: 'work_call', arguments: JSON.stringify({ requirement_id: 'records',
+            ...(mixedDiscovery ? { universe_item_id: 'member-a' } : {}), name: tool.name, args_json: JSON.stringify({ token: 'reviewed-token' }) }) },
+            ...(completeJourney ? ['metrics', 'brief'].map(id => ({ type: 'function_call', callId: `read-native-${id}`, name: 'work_call', arguments: JSON.stringify({ requirement_id: id, name: tool.name, args_json: JSON.stringify({ token: `${id}-token` }) }) })) : [])]
+          : completeJourney && frame === 2
+          ? [{ type: 'function_call', callId: 'compose-native-synthesis', name: 'plan_step_result', arguments: modelSynthesisArgs }]
+          : completeJourney && (frame === 3 || frame === 4)
+          ? [{ type: 'function_call', callId: frame === 3 ? 'save-native-synthesis' : 'verify-native-synthesis', name: 'work_call', arguments: JSON.stringify({ requirement_id: frame === 3 ? 'save' : 'verify', name: frame === 3 ? 'write_file' : 'read_file', args_json: JSON.stringify({ path: outputPath }) }) }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: completeJourney ? 'The briefing is saved.' : 'Fixture stops after the approved read.' }] }];
+        return { output, responseId: `native-plan-${requests}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+      async *getStreamedResponse() {
+        const response = await this.getResponse();
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      },
+    };
+    const agent = { model, tools: [planTool, workTool, ...(completeJourney ? [resultTool] : [])] };
+    const turnLimit = completeJourney ? 6 : 3;
+    const callLimit = completeJourney ? 8 : 3;
+    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: agent.tools, activeToolNames: agent.tools.map(t => t.name), policyHash: 'native-plan-activation',
+      budget: { maxUncachedTokens: 20_000, maxModelCalls: turnLimit, maxToolCalls: callLimit, maxElapsedMs: 60_000 } });
+    assert.ok(sealed.ok); if (!sealed.ok) return;
+    envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+    envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+    const runner = new EventEmitter();
+    (runner as any).run = () => { throw new Error('SDK runner must not execute this host turn.'); };
+    const outcome = await brackets.withHarnessRunContext({ ...activationIdentity, counter: new brackets.ToolCallsCounter(callLimit) },
+      () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: acceptedPlanExecutionText(session.id, execute.seq)! }] as never,
+        { maxTurns: turnLimit, hostTurnEngine: 'host_v1', hostJudgeCompletion: false, context: activationIdentity } as never));
+    assert.equal(loadExpectedWorkContract(session.id, execute.seq).status, 'ok', JSON.stringify(outcome));
+    const activationResult = outcome.history.find((item: any) => item.type === 'function_call_result' && item.callId === 'activate-native-synthesis');
+    assert.match(JSON.stringify(activationResult), /\\"ok\\":true/);
+    const settlement = eventlog.openEventLog().prepare('SELECT outcome_kind, physical_crossing_count FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?')
+      .get(session.id, execute.seq, 'read-native-synthesis');
+    if (retireBeforeRead) {
+      assert.notEqual((settlement as any)?.outcome_kind, 'succeeded', 'do not replace a revoked reviewed identity with its unreviewed sibling');
+      assert.equal((settlement as any)?.physical_crossing_count ?? 0, 0);
+    } else {
+      assert.deepEqual(settlement, { outcome_kind: 'succeeded', physical_crossing_count: 2 }, JSON.stringify(outcome.history));
+      const binding = eventlog.openEventLog().prepare('SELECT capability_id FROM host_call_capability_bindings WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?')
+        .get(session.id, execute.seq, 'read-native-synthesis') as { capability_id: string };
+      assert.equal(binding.capability_id, first.manifest.manifestId, 'the approved identity, not its other current transport, owns dispatch');
+    }
+    const frozen = (artifacts.getPlanRevision({ sessionId: session.id, principalId: session.id, ref }).structuredPlan as any);
+    assert.deepEqual(frozen.steps.find((step: any) => step.id === 'save').dynamicBindings,
+      [{ producerStepId: 'synthesize', outputPath: '/markdown', targetPath: '/content', expectedType: 'string' }]);
+    assert.deepEqual(frozen.executionDraft.topology.operations.find((step: any) => step.id === 'save').dependsOn, completeJourney ? ['records', 'metrics'] : ['records']);
+    assert.deepEqual(frozen.executionDraft.topology.operations.find((step: any) => step.id === 'save').dataFrom, []);
+    if (completeJourney) {
+      assert.equal(runtime.calls[0]?.args?.token, 'brief-token', 'the root must settle before either dependent read, regardless of model call order');
+      assert.deepEqual(runtime.calls.map(call => call.args?.token).sort(), ['brief-token', 'metrics-token', 'reviewed-token']);
+      const write = eventlog.openEventLog().prepare('SELECT outcome_kind FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?')
+        .get(session.id, execute.seq, 'save-native-synthesis') as { outcome_kind?: string } | undefined;
+      assert.equal(write?.outcome_kind, 'succeeded', JSON.stringify(outcome.history));
+      assert.equal(readFileSync(outputPath, 'utf8'), content, JSON.stringify(outcome.history));
+      assert.equal((outcome.history.find((item: any) => item.type === 'function_call' && item.callId === 'compose-native-synthesis') as any)?.arguments, modelSynthesisArgs, 'admission/history retain the original model bytes, including malformed string escapes');
+      eventlog.closeEventLog();
+      const terminal = (await import('./accepted-task-terminal-preparation.js')).prepareAcceptedTaskTerminal({ ...activationIdentity, proposedReply: 'The briefing is saved.' });
+      assert.equal(terminal.status, 'ready', JSON.stringify(terminal));
+      const { commitTurnOutcome } = await import('./delivery-committer.js');
+      const { turnOutcomeId } = await import('./turn-outcome.js');
+      const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(activationIdentity), identity: activationIdentity,
+        status: 'done', resumable: false, presentation: { kind: 'answer', text: 'The briefing is saved.' } });
+      assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
+    }
+  }
+  assert.equal(runtime.counts.call, completeJourney ? 3 : effect === 'read' && !retireBeforeRead ? 1 : 0, 'only the exact current Execute reads reach the provider');
+});
+
+test('fresh MCP discovery reacquires a revoked definition without reviving its old plan identity', async () => {
+  const runtime = generatedRuntime({ objective: generated('research') });
+  const tool = (runtime.state.tools as ToolState[])[0]!;
+  const { store, factory } = resetAuthoritySurfaces({ durable: true });
+  const discover = () => mcp.createProductionMcpReadCarrier({ serverName: runtime.server, runtime: runtime.runtime })
+    .materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+  const first = await discover(); assert.equal(first.status, 'installed'); if (first.status !== 'installed') return;
+  store.revoke(first.manifest.manifestId); factory.forget(first.manifest.manifestId);
+  const fresh = await discover(); assert.equal(fresh.status, 'installed', JSON.stringify(fresh)); if (fresh.status !== 'installed') return;
+  assert.notEqual(fresh.manifest.manifestId, first.manifest.manifestId);
+  assert.equal(store.get(first.manifest.manifestId)?.manifest.lifecycle.state, 'revoked');
+  const repeat = await discover(); assert.equal(repeat.status, 'installed');
+  if (repeat.status === 'installed') assert.deepEqual(repeat.manifest, fresh.manifest);
+  assert.equal(factory.get(first.manifest.manifestId), undefined);
+});
+
+test('concurrent exact MCP discoveries converge on one immutable current contract', async () => {
+  const runtime = generatedRuntime({ objective: generated('research') });
+  const tool = (runtime.state.tools as ToolState[])[0]!;
+  const { store, factory } = resetAuthoritySurfaces();
+  const results = await Promise.all(Array.from({ length: 3 }, () =>
+    mcp.createProductionMcpReadCarrier({ serverName: runtime.server, runtime: runtime.runtime })
+      .materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema })));
+  for (const result of results) assert.equal(result.status, 'installed', JSON.stringify(result));
+  assert.equal(new Set(results.map(r => r.status === 'installed' ? manifests.capabilityManifestDigest(r.manifest) : '')).size, 1);
+  assert.equal(factory.snapshot().length, 1);
+  assert.equal(store.list().filter(r => r.manifest.lifecycle.state === 'current').length, 1);
 });
 
 test('production native MCP definitions drive provider-neutral read, ordinary-write, and approval decisions', async (t) => {

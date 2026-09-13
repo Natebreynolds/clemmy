@@ -43,7 +43,7 @@ import { ExternalWritePreDispatchError } from './external-write-admission.js';
 import { PhysicalDispatchPreDispatchError } from './attempt-identity.js';
 import { loadToolContract, type ToolContract } from '../../tools/tool-contract-store.js';
 import { stripMcpToolCarrier } from '../mcp-tool-authority.js';
-import { currentLiveReadPlanningDefinitionFromEntry } from './live-read-planning-authority.js';
+import { currentProviderDefinitionFromEntry } from './live-read-planning-authority.js';
 
 export class ExactMcpCarrierPreDispatchError extends ExternalWritePreDispatchError {
   override readonly name = 'ExactMcpCarrierPreDispatchError';
@@ -169,7 +169,7 @@ export function resolveAcceptedExactMcpCarrier(
       || canonical.argumentCompiler.version !== manifest.argumentCompiler.version
     ) return refused('the exact catalog identity is absent or drifted');
 
-    const currentDefinition = currentLiveReadPlanningDefinitionFromEntry(catalogEntry);
+    const currentDefinition = currentProviderDefinitionFromEntry(catalogEntry);
     if (
       !currentDefinition
       || currentDefinition.providerInputSchemaDigest
@@ -224,8 +224,9 @@ export async function invokeAcceptedExactMcpCarrier(input: {
   args: unknown;
   sessionId: string;
   counter: ToolCallsCounter;
-  /** work_call owns a separate one-shot nested hand-off. A direct call_tool is
-   * already the host-attested logical call and therefore needs no second token. */
+  /** A work_call mutation owns a separate one-shot consent hand-off. Reads
+   * already carry the exact accepted call and work binding; the host never
+   * mints a mutation-consent token for them. */
   requiresNestedAdmission: boolean;
 }): Promise<unknown> {
   const resolved = resolveAcceptedExactMcpCarrier(input.requestedOperationId);
@@ -238,8 +239,9 @@ export async function invokeAcceptedExactMcpCarrier(input: {
   // one-shot nested admission CAS so an auto-resume can retain that authority.
   // ToolCallsCounter is synchronous; no await can interleave this check with
   // the later increment in this process.
-  if (input.counter.willExceed()) {
-    const { ToolCallsLimitExceeded } = await import('./brackets.js');
+  const { hostOwnsLogicalCallAccounting, ToolCallsLimitExceeded } = await import('./brackets.js');
+  const alreadyCounted = hostOwnsLogicalCallAccounting(input.sessionId, attestation.logicalToolCallId);
+  if (!alreadyCounted && input.counter.willExceed()) {
     throw new ToolCallsLimitExceeded(input.counter.limit);
   }
   if (input.sessionId !== attestation.sessionId) {
@@ -247,6 +249,7 @@ export async function invokeAcceptedExactMcpCarrier(input: {
   }
   if (
     input.requiresNestedAdmission
+    && manifest.effect !== 'read'
     && !consumeNestedCallAdmission({
       sessionId: input.sessionId,
       toolName: operationId,
@@ -257,7 +260,7 @@ export async function invokeAcceptedExactMcpCarrier(input: {
       'the exact accepted work/consent admission is missing, consumed, or mismatched',
     );
   }
-  input.counter.increment();
+  if (!alreadyCounted) input.counter.increment();
 
   const sourceCapability = physicalSourceCapabilityIdentityFromCatalog({
     manifest,

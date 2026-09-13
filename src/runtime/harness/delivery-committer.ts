@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
 import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
+import { planReviewDigest } from './plan-publication-review.js';
 import { sourceRefusedAttempts } from './source-refused-attempts.js';
 import {
   AcceptedTaskTerminalPublicationError,
@@ -1210,6 +1211,10 @@ export function commitTurnOutcome(
   const replyMatches = publishedVerdict?.replyDigest
     ? publishedVerdict.replyDigest === createHash('sha256').update(proposed.text, 'utf8').digest('hex')
     : false;
+  const planMatches = !publishedPlan || publishedVerdict?.planDigest === planReviewDigest({
+    fullText: publishedPlan.fullText, structuredPlan: publishedPlan.structuredPlan,
+    readiness: publishedPlan.readiness, missingPrerequisites: publishedPlan.missingPrerequisites,
+  });
   // RE-VERIFY the artifacts NOW, against the files as they stand at publication.
   // Trusting the `digestMatches` flags recorded during judging misses every
   // change made between the verdict and the terminal — the artifact could have
@@ -1292,6 +1297,7 @@ export function commitTurnOutcome(
     && settledNow.evidenceAvailable
     && replyMatches
     && objectiveMatches
+    && planMatches
     && artifactsMatch,
   );
   // VERIFICATION GOVERNS THE PUBLIC RESULT.
@@ -1340,6 +1346,8 @@ export function commitTurnOutcome(
                 ? 'completion_review_objective_mismatch'
                 : !replyMatches
                   ? 'completion_review_reply_mismatch'
+                  : !planMatches
+                    ? 'completion_review_plan_mismatch'
                   : !artifactsMatch
                     ? 'completion_review_artifact_drift'
                     : 'completion_review_did_not_stand';
@@ -1349,6 +1357,7 @@ export function commitTurnOutcome(
     // had failed. This appends one factual sentence saying what was checked and
     // what would settle it. It never repeats or undoes a committed effect.
     const NOTES: Record<string, string> = {
+      completion_review_plan_mismatch: 'Verification note: the saved plan differs from the plan that was reviewed. Its final contents need review.',
       completion_review_absent:
         'Verification note: no completion review was recorded for this request, so nothing '
         + 'has confirmed the result. Ask me to check it.',
@@ -1440,6 +1449,7 @@ export function commitTurnOutcome(
     };
   }
   const verdictMetadata = publishedVerdict ? { completionVerdictRef: {
+    ...(publishedPlan ? { planMatches, planDigest: publishedVerdict.planDigest } : {}),
     version: 1 as const,
     eventId: publishedVerdict.eventId,
     seq: publishedVerdict.seq,

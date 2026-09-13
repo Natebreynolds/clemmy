@@ -52,7 +52,7 @@ function planTurn(kind: string | null = 'plan') {
 function readReceipt(id: { sessionId: string; sourceUserSeq: number }) {
   eventlog.appendEvent({
     sessionId: id.sessionId, turn: 1, role: 'system', type: 'read_receipt',
-    data: { sourceUserSeq: id.sourceUserSeq, record: { effectClass: 'read', identifier: 'FIXTURE_READ' } },
+    data: { sourceUserSeq: id.sourceUserSeq, record: { effectClass: 'read', identifier: 'FIXTURE_READ', dispatchOutcome: 'succeeded', receiptId: 'fixture-read', readEvidenceRef: 'evt:fixture-result' } },
   });
 }
 
@@ -128,8 +128,8 @@ test('once the plan exists there is nothing to steer toward', async () => {
   staged(published);
   quietCall(published, 40);
   eventlog.appendEvent({
-    sessionId: published.sessionId, turn: 1, role: 'system', type: 'tool_returned',
-    data: { sourceUserSeq: published.sourceUserSeq, accounting: 'top_level', effectiveTool: 'publish_plan' },
+    sessionId: published.sessionId, turn: 1, role: 'system', type: 'plan_revision_published',
+    data: { sourceUserSeq: published.sourceUserSeq },
   });
   quietCall(published, 40);
   assert.equal(nextTurnSteer(published), null,
@@ -229,7 +229,7 @@ test('the steer carries its own evidence window — the call site, not just the 
     'the only call site must record the window it was given');
 });
 
-test('re-proving a toolkit she already holds is churn, not evidence', async () => {
+test('re-proving the same operation is churn, while a different operation adds evidence', async () => {
   // THE SHAPE THAT DEFEATED THE FIRST VERSION. Live 2026-09-12 05:29-05:32:
   // six near-identical DataForSEO searches in three minutes, three of them
   // byte-for-byte repeats, against NINE DataForSEO operations already proven.
@@ -243,11 +243,11 @@ test('re-proving a toolkit she already holds is churn, not evidence', async () =
   staged(circling, 'DATAFORSEO_FIRST_OP');   // genuine: a new toolkit
   for (let i = 0; i < 6; i += 1) {
     quietCall(circling, 3);
-    staged(circling, `DATAFORSEO_VARIANT_${i}`); // churn: same toolkit again
+    staged(circling, 'DATAFORSEO_FIRST_OP'); // identical operation/routing identity
   }
   const due = nextTurnSteer(circling);
   assert.ok(due, 'circling one toolkit must reach the window, not reset it forever');
-  assert.equal(due!.window.staged, 1, 'nine DataForSEO rows are ONE toolkit of knowledge');
+  assert.equal(due!.window.staged, 1, 'repeated rows still describe one operation');
   assert.ok(due!.window.quietCalls >= 12, `churn keeps counting: got ${due!.window.quietCalls}`);
 
   // And a genuinely NEW toolkit still resets it — breadth she did not have is
@@ -256,7 +256,7 @@ test('re-proving a toolkit she already holds is churn, not evidence', async () =
   readReceipt(widening);
   staged(widening, 'DATAFORSEO_OP');
   quietCall(widening, 10);
-  staged(widening, 'APIFY_RUN_ACTOR');   // new toolkit: this IS news
+  staged(widening, 'DATAFORSEO_NEW_OP'); // a NEW operation within the SAME toolkit
   quietCall(widening, 5);
   assert.equal(nextTurnSteer(widening), null,
     'she just learned a toolkit she did not have — that is progress, not a stall');
@@ -265,5 +265,59 @@ test('re-proving a toolkit she already holds is churn, not evidence', async () =
   quietCall(widening, 12);
   const later = nextTurnSteer(widening);
   assert.ok(later, 'once the new toolkit stops producing, the window closes normally');
-  assert.equal(later!.window.staged, 2, 'two distinct toolkits held');
+  assert.equal(later!.window.staged, 2, 'two distinct operation identities recorded');
+});
+
+
+test('a rejected publish is still unpublished and can receive recovery guidance', () => {
+  const id = planTurn(); readReceipt(id); staged(id); quietCall(id, 20);
+  eventlog.appendEvent({ sessionId: id.sessionId, turn: 1, role: 'system', type: 'tool_returned', data: {
+    sourceUserSeq: id.sourceUserSeq, effectiveTool: 'publish_plan', accounting: 'top_level', ok: false,
+    result: '{"ok":false,"error":"incomplete draft"}',
+  } });
+  assert.ok(nextTurnSteer(id));
+});
+
+test('guidance cannot claim one receipt proves all inputs were read or close discovery', () => {
+  const id = planTurn(); readReceipt(id); staged(id); quietCall(id, 20);
+  const due = nextTurnSteer(id);
+  assert.ok(due);
+  assert.match(due.text, /does not establish that all inputs were read/);
+  assert.match(due.text, /Read any supplied inputs not yet inspected/);
+  assert.match(due.text, /discover a missing operation if needed/);
+  assert.doesNotMatch(due.text, /You have already read the inputs|Do not run more discovery|Publish the plan now/);
+});
+
+test('a newly discovered operation in the same toolkit resets the window', () => {
+  const id = planTurn(); readReceipt(id); staged(id, 'FIXTURE_INITIAL');
+  for (let i = 0; i < 12; i++) { quietCall(id, 3); staged(id, `FIXTURE_NEW_${i}`); }
+  assert.equal(nextTurnSteer(id), null);
+});
+
+test('source-scoped evidence includes learning receipts but excludes another source', () => {
+  const id = planTurn(); staged(id); quietCall(id, 20);
+  eventlog.appendEvent({ sessionId: id.sessionId, turn: 0, role: 'system', type: 'read_receipt', data: {
+    record: { identifier: 'FIXTURE_READ', effectClass: 'read', dispatchOutcome: 'succeeded', readEvidenceRef: 'evt:nested', source: { sourceUserSeq: id.sourceUserSeq + 1 } },
+  } });
+  assert.equal(nextTurnSteer(id), null, 'foreign receipt cannot prime this source');
+  eventlog.appendEvent({ sessionId: id.sessionId, turn: 0, role: 'system', type: 'read_receipt', data: {
+    record: { identifier: 'FIXTURE_READ', effectClass: 'read', dispatchOutcome: 'succeeded', readEvidenceRef: 'evt:nested', source: { sourceUserSeq: id.sourceUserSeq } },
+  } });
+  quietCall(id, 20);
+  assert.ok(nextTurnSteer(id), 'learning producer binds the source inside its record');
+});
+
+test('a duplicate receipt does not reset the quiet window', () => {
+  const id = planTurn(); readReceipt(id); staged(id);
+  for (let i = 0; i < 12; i++) { quietCall(id, 2); readReceipt(id); }
+  const due = nextTurnSteer(id);
+  assert.ok(due);
+  assert.equal(due.window.reads, 1);
+});
+
+test('the delivered steer survives more than sixty subsequent guard events', () => {
+  const id = planTurn(); readReceipt(id); staged(id); quietCall(id, 20);
+  const due = nextTurnSteer(id)!; recordTurnSteer(id, due.kind, due.window);
+  for (let i = 0; i < 70; i++) eventlog.appendEvent({ sessionId: id.sessionId, turn: 1, role: 'system', type: 'guardrail_tripped', data: { sourceUserSeq: id.sourceUserSeq, kind: 'other_guard' } });
+  assert.equal(nextTurnSteer(id), null);
 });

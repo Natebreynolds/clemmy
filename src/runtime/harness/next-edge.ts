@@ -36,6 +36,8 @@
 /** The closed set of moves a refused caller can actually make. Prose is not a
  *  member: "try again properly" is the failure this replaces. */
 export type NextEdgeChange =
+  /** Host scheduling yielded before invocation; unchanged work remains valid. */
+  | 'reissue_unstarted'
   /** The same tool, with specific argument fields changed. */
   | 'repair_arguments'
   /** The capability is not proven for this step; disclose it first. */
@@ -68,6 +70,7 @@ export interface HostNextEdgeV1 {
 }
 
 const DEFAULT_SAY: Record<NextEdgeChange, string> = {
+  reissue_unstarted: 'Continue the unfinished work with a fresh call ID and the same arguments; reuse completed results.',
   repair_arguments: 'Correct the named argument fields on this same call and retry it once.',
   discover_capability: 'Disclose the exact operation with tool_search first, then call it by its published ref.',
   choose_account: 'Resolve which connected account this acts as, then retry with that exact account.',

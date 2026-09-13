@@ -155,3 +155,61 @@ test('a host blocked terminal persists its machine reason and bounded detail, no
   assert.equal(plainTerminal?.data.blockedReason, 'blocked');
   assert.equal(plainTerminal && 'blockedDetail' in plainTerminal.data, false);
 });
+
+
+test('a failed terminal retains its returned diagnostic even when the advisory failure event is absent', () => {
+  const sessionId = 'failure-without-advisory-event';
+  const source = acceptedSource(sessionId);
+  const diagnostic = 'model transport\nclosed before an accepted response';
+  const result = { sessionId, status: 'failed' as const, steps: 1, lastTurn: source.turn, error: diagnostic };
+  const reduced = reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq, result });
+  assert.equal(eventlog.listEvents(sessionId, { types: ['run_failed'] }).length, 0);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.failureDetail, 'model transport closed before an accepted response');
+  assert.doesNotMatch(reduced.publicPresentation?.text ?? '', /transport|accepted response/);
+  // A replay cannot replace the persisted diagnostic or create a second final.
+  reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq, result: { ...reduced, error: 'later diagnostic' } });
+  const terminals = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].data.failureDetail, terminal?.data.failureDetail);
+});
+
+test('failure metadata belongs to the exact source and the returned error wins over advisory history', () => {
+  const sessionId = 'failure-detail-source-ownership';
+  const first = acceptedSource(sessionId);
+  eventlog.appendEvent({ sessionId, turn: first.turn, role: 'system', type: 'run_failed', data: {
+    sourceUserSeq: first.sourceUserSeq, error: 'previous request failure',
+  } });
+  const second = eventlog.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Another request.' } });
+  const reduce = (sourceUserSeq: number, turn: number, error?: string) => reduceStandardConversationTerminal({
+    sourceUserSeq, result: { sessionId, status: 'failed', steps: 1, lastTurn: turn, ...(error ? { error } : {}) },
+  });
+  reduce(second.seq, second.turn);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureDetail, undefined,
+    'an unrelated previous request must not explain a new failure');
+  const third = eventlog.appendEvent({ sessionId, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Third request.' } });
+  eventlog.appendEvent({ sessionId, turn: third.turn, role: 'system', type: 'run_failed', data: {
+    sourceUserSeq: third.seq, error: 'intermediate failure',
+  } });
+  reduce(third.seq, third.turn, 'actual terminal failure');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureDetail, 'actual terminal failure');
+});
+
+
+test('an exact-source advisory can supply a missing diagnostic without entering public prose', () => {
+  const sessionId = 'exact-advisory-fallback';
+  const source = acceptedSource(sessionId);
+  eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'run_failed', data: {
+    sourceUserSeq: source.sourceUserSeq, error: ' first detail ',
+  } });
+  eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'run_failed', data: {
+    sourceUserSeq: source.sourceUserSeq, error: ' latest   detail ' + 'x'.repeat(350),
+  } });
+  const reduced = reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq,
+    result: { sessionId, status: 'failed', steps: 1, lastTurn: source.turn } });
+  const detail = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1)?.data.failureDetail;
+  assert.equal(typeof detail, 'string');
+  assert.equal((detail as string).length, 300);
+  assert.match(detail as string, /^latest detail /);
+  assert.doesNotMatch(reduced.publicPresentation?.text ?? '', /latest detail/);
+});

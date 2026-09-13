@@ -247,6 +247,10 @@ for (const variant of ['fanout', 'no_fanout'] as const) test(`watcher cadence re
   // The coordinator call is still OPEN while its children run, so the parent
   // trajectory count is the settled business-call count the cadence uses (0).
   assert.equal(check!.input.toolCallCount, 0);
+  const completedReviews = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter(event => event.data.kind === 'trajectory_review' && event.data.phase === 'completed' && event.data.sourceUserSeq === source.seq);
+  assert.equal(completedReviews.length, 1);
+  assert.equal(completedReviews[0].data.verdict, 'on_track');
   // The on-track verdict spent a check, never an injection or an authority.
   assert.equal(eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] }).filter((event) => event.data.kind === 'watcher').length, 0);
   assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input', 'external_write_succeeded'] }).length, 0);

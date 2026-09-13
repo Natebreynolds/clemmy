@@ -851,8 +851,8 @@ test('a progress identity is claimed once across distinct successful logical cal
       SELECT COUNT(*) AS n FROM accepted_task_operations
        WHERE session_id = ? AND source_user_seq = ?
     `).get(task.sessionId, task.sourceUserSeq) as { n: number }).n,
-    1,
-    'repeating one completed step does not manufacture a second operation',
+    2,
+    'both actual crossings remain observed even though they earn only one progress credit',
   );
 });
 

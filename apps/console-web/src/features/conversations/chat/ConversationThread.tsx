@@ -24,6 +24,7 @@ import { originMeta } from '../lib/origin';
 import type { Session, Turn } from '../types';
 import { ReadOnlyNotice } from './ReadOnlyNotice';
 import { historyToMessages } from './conversation-history';
+import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '../lib/chatColumn';
 
 function Header({ session }: { session: Session }) {
   const mutations = useSessionMutations();
@@ -105,7 +106,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end space-y-5 px-6 py-6">
+        <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} compact />
           {chat.messages.map((m) => (
             <ChatBubble
@@ -123,7 +124,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
           <div ref={bottomRef} />
         </div>
       </div>
-      <div className="mx-auto w-full max-w-3xl px-6 pb-5 pt-2">
+      <div className={CHAT_COMPOSER_WRAP}>
         <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} />
       </div>
     </div>
@@ -137,7 +138,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end space-y-5 px-6 py-6">
+        <div className={CHAT_THREAD}>
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (

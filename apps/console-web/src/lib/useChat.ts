@@ -1,4 +1,5 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
+import { reduceActivity as reduceSharedActivity } from '../../../../packages/chat-engine/src/reduce-activity';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -446,6 +447,10 @@ function helperOf(ev: unknown): { sessionId: string; item: string } | null {
 
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
+  if (ev.type === 'turn_started' || ev.type === 'turn_model_routed'
+    || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
+    return reduceSharedActivity(prev, { ...ev, createdAt: typeof ev.createdAt === 'number' ? ev.createdAt : undefined });
+  }
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
   const callId = typeof d.callId === 'string' ? d.callId : typeof d.call_id === 'string' ? d.call_id : '';
@@ -913,7 +918,7 @@ export function progressLabel(ev: HarnessEvent): string | null {
         const key = typeof g.key === 'string' && g.key ? g.key : 'results';
         return `Got ${g.count} ${key}`;
       }
-      if (isDiscoveryToolName(tool)) return 'Working on it…';
+      if (isDiscoveryToolName(tool)) return null; // retain the last meaningful host progress
       return pretty ? `Got results from ${pretty}` : 'Got results';
     }
     case 'handoff': return 'Handing off…';

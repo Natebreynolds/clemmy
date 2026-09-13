@@ -444,3 +444,13 @@ test('publish_plan owns its exact preparation refusal the way plan_task does; a 
   }), 'some_other_tool');
   assert.equal(foreign.outcome.kind, 'unknown', 'another tool cannot mint plan-repair authority with the same code');
 });
+
+test('plan_step_result shape errors remain repairable host calls without business effects', () => {
+  const payload = JSON.stringify({ ok: false, code: 'invalid_arguments', message: 'Result synthesis must be string.' });
+  const settled = settleHostString(accept('reviewed result repair'), 'logical:result-repair', payload, 'plan_step_result');
+  assert.equal(settled.outcome.kind, 'invalid_arguments');
+  assert.equal(settled.outcome.directive.action, 'repair_arguments');
+  assert.equal(settled.resultHandleId, undefined);
+  const foreign = settleHostString(accept('foreign result code'), 'logical:foreign-result-code', payload, 'some_other_tool');
+  assert.equal(foreign.outcome.kind, 'unknown');
+});

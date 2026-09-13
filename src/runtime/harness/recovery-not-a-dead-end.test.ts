@@ -62,6 +62,31 @@ test('retained-result readers do not smuggle in writes', () => {
   }
 });
 
+test('Plan publication repair keeps discovery and read preparation available after a settled refusal', () => {
+  // Claude Sonnet live 2026-09-12: publish_plan said to discover an exact
+  // operation, then recovery refused both tool_search calls. A settled host
+  // refusal is known_terminal; it does not mean investigation must end.
+  const tools = ['publish_plan', 'tool_search', 'read_file', 'tool_output_query',
+    'write_file', 'workflow_run', 'composio_execute_tool', 'ask_user_question'];
+  const repair = consequence(['publish_plan']);
+  const plan = hostNoProgressRecoveryToolNames(repair, tools, [], true);
+  assert.deepEqual([...plan], ['publish_plan', 'tool_search', 'read_file', 'tool_output_query', 'ask_user_question']);
+  const normal = hostNoProgressRecoveryToolNames(repair, tools, [], false);
+  assert.equal(normal.has('tool_search'), false, 'ordinary settled-effect recovery remains unchanged');
+
+  for (const [recovery, effectState] of [
+    ['stop_factual', 'known_terminal'], ['reconcile', 'unknown'],
+  ] as const) {
+    assert.equal(hostNoProgressRecoveryToolNames(createNoProgressConsequence({
+      stage: 'execution:effect_unknown', recovery, effectState, recoveryToolNames: [],
+    }), tools, [], true).size, 0);
+  }
+  assert.deepEqual([...hostNoProgressRecoveryToolNames(createNoProgressConsequence({
+    stage: 'input:needed', recovery: 'ask_user', effectState: 'not_started',
+    recoveryToolNames: [], userInput: { question: 'Which source?', choices: [] },
+  }), tools, [], true)], ['ask_user_question']);
+});
+
 test('a stop_factual or reconcile consequence still permits nothing', () => {
   for (const [recovery, effectState] of [
     ['stop_factual', 'known_terminal'],

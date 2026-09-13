@@ -228,6 +228,15 @@ test('check_delegation reports the result AND its author', async () => {
   assert.match(out, /Completed by: test-builder/, 'and who produced it');
 });
 
+test('a missing identifier or wrong resource family is a repairable diagnostic, not completed delegation work', async () => {
+  const { isInvalidArgumentsTextResult } = await import('./shared.js');
+  for (const args of [{}, { id: 'bg-missing-fixture' }]) {
+    const result = await tools.get('check_delegation')!(args);
+    assert.equal(isInvalidArgumentsTextResult(result), true);
+    assert.match(JSON.stringify(result), /background_task_status/);
+  }
+});
+
 test('a delegation that cannot be found is reported, not silently dropped', async () => {
   const out = await asAgent('test-builder', () => call('complete_delegation', {
     delegation_id: 'deadbeef',

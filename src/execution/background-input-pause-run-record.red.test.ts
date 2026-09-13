@@ -168,23 +168,23 @@ test('a run-budget continuation is user input, never a phantom approval', async 
   assert.equal(run?.pendingApprovalId, undefined);
 });
 
-test('an automatic objective re-anchor stays queued and never invents an approval', async () => {
+test('a completed outline stays complete without inventing a continuation or approval', async () => {
   const { taskId, runId } = await runOneWith({
     title: 'Build the saved report',
-    prompt: 'Create and save a report file with the complete findings.',
-    text: 'I reviewed the requirements and am ready to build the report.',
+    prompt: 'Return an outline first. We will create and save a report file later.',
+    text: 'The outline covers source collection, comparison, and a review of missing evidence. Please review the proposed approach.',
     stoppedReason: 'success',
   });
   assert.equal(
     getBackgroundTask(taskId)?.status,
-    'pending',
-    'fixture precondition: the missing deliverable queued the objective-reanchored continuation',
+    'done',
+    'a completed outline is the requested result',
   );
   const run = getRun(runId);
   assert.equal(
     run?.status,
-    'queued',
-    'the automatic continuation wrote awaiting_approval even though it needs no human decision',
+    'completed',
+    'the run board agrees with the completed current phase',
   );
   assert.equal(run?.pendingApprovalId, undefined);
   assert.equal(run?.pendingInput, undefined);

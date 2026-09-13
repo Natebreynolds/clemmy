@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync,
-  mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
+  mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
@@ -10,6 +10,7 @@ import type { CommittedArtifactContent, HostLocalWriteCommitFacts } from './host
 
 const PREFIX = 'state/local-file-revisions/';
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
+export class LocalFileRevisionConflict extends Error {}
 
 /** Resolve existing parent aliases without creating anything. The caller must
  * check this canonical target against its existing path policy before writing. */
@@ -84,6 +85,7 @@ export function commitLocalFileRevision(input: {
   target: string;
   content: string;
   mode: 'create' | 'append' | 'overwrite';
+  expectedContentDigest?: string;
 }): { createdId: string; committedPath: string; previousPath: string | null; unchanged: boolean } {
   const target = canonicalLocalFileTarget(input.target);
   const key = digest(target);
@@ -96,6 +98,10 @@ export function commitLocalFileRevision(input: {
   const current = path.join(dir, 'current.json');
   return withFileLockSyncStrict(current, () => {
     const prior = existsSync(target) ? readDirectFile(target) : null;
+    if (input.expectedContentDigest !== undefined
+      && (!prior || digest(prior.bytes) !== input.expectedContentDigest)) {
+      throw new LocalFileRevisionConflict('The local file changed since this request wrote it. Re-read it and reconcile the intervening edit before replacing it. No file content was changed.');
+    }
     if (input.mode === 'create' && prior) throw new Error(`Refused to overwrite existing file: ${target}. Use mode="append" or mode="overwrite" for a requested revision.`);
     const content = input.content.endsWith('\n') ? input.content : `${input.content}\n`;
     const bytes = input.mode === 'append' && prior
@@ -128,6 +134,46 @@ export function commitLocalFileRevision(input: {
 
 export function isLocalFileRevisionHandle(handle: string): boolean {
   return /^state\/local-file-revisions\/[a-f0-9]{64}\/current\.json$/.test(handle);
+}
+
+/** Verify historical replacement from immutable descriptors and retained prior
+ * bytes. This proves lineage, never that the latest target is still current;
+ * the ordinary receipt reader must independently verify that at publication. */
+export function localFileRevisionReplaces(input: {
+  prior: HostLocalWriteCommitFacts; next: HostLocalWriteCommitFacts;
+  target: string; expectedContentDigest: string; content: string;
+}): boolean {
+  try {
+    if (!isLocalFileRevisionHandle(input.prior.handle) || input.prior.handle !== input.next.handle
+      || input.prior.createdId !== input.next.createdId) return false;
+    const root = realpathSync(BASE_DIR);
+    const dir = path.dirname(path.join(root, input.next.handle));
+    if (realpathSync(dir) !== dir) return false;
+    const descriptors = readdirSync(dir).filter(name => /^[a-f0-9-]{36}\.prepared\.json$/.test(name));
+    const find = (facts: HostLocalWriteCommitFacts): Revision | undefined => {
+      for (const name of descriptors) {
+        const bytes = readDirectFile(path.join(dir, name)).bytes;
+        if (digest(bytes) !== facts.contentDigest) continue;
+        const value = JSON.parse(bytes.toString('utf8')) as Revision;
+        if (value.version !== 1 || value.kind !== 'local_file_revision_v1'
+          || value.revisionId !== name.slice(0, -'.prepared.json'.length)
+          || value.target !== input.target || value.createdId !== facts.createdId
+          || value.createdId !== `file-${digest(input.target)}`
+          || facts.handle !== `${PREFIX}${digest(input.target)}/current.json`) return undefined;
+        return value;
+      }
+      return undefined;
+    };
+    const prior = find(input.prior), next = find(input.next);
+    if (!prior || !next || prior.revisionId === next.revisionId || !next.previous) return false;
+    const expectedPriorHandle = `${PREFIX}${digest(input.target)}/${next.revisionId}.before`;
+    const content = Buffer.from(input.content.endsWith('\n') ? input.content : `${input.content}\n`);
+    return next.previous.handle === expectedPriorHandle
+      && prior.contentDigest === input.expectedContentDigest
+      && next.previous.contentDigest === prior.contentDigest && next.previous.bytes === prior.bytes
+      && digest(readDirectFile(path.join(root, expectedPriorHandle)).bytes) === prior.contentDigest
+      && next.contentDigest === digest(content) && next.bytes === content.length;
+  } catch { return false; }
 }
 
 /** Called only after the ordinary safe in-root reader verified the descriptor

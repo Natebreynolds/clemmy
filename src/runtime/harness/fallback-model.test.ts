@@ -1425,3 +1425,26 @@ test('first-byte window still fires when nothing proves the brain is working', a
   assert.equal(rescueCalls, 1, 'genuine silence must still fall over');
   assert.ok((out as Array<{ delta?: string }>).some((e) => e.delta === 'rescued'));
 });
+
+for (const transport of ['stream', 'buffered'] as const) test(`retired ${transport} adapter cannot turn its partial reply into a completion`, async () => {
+  const { ModelStreamStalledError } = await import('./model-stall-policy.js');
+  const controller = new AbortController();
+  const reason = new ModelStreamStalledError(600, false);
+  const partial = resp('I will save the file next.');
+  const broken = model({
+    async getResponse() { controller.abort(reason); return partial; },
+    async *getStreamedResponse() {
+      yield { type: 'output_text_delta', delta: 'I will save the file next.' } as never;
+      controller.abort(reason);
+      yield { type: 'response_done', response: partial } as never;
+    },
+  });
+  const wrapped = withModelFallback([target('retired-adapter', broken)]);
+  const request = { ...req(), signal: controller.signal } as ModelRequest;
+  const observed: any[] = [];
+  await assert.rejects(async () => {
+    if (transport === 'buffered') await wrapped.getResponse(request);
+    else for await (const event of wrapped.getStreamedResponse(request)) observed.push(event);
+  }, error => error === reason);
+  assert.ok(!observed.some(event => event.type === 'response_done'), 'late synthetic completion never escapes its retired attempt');
+});

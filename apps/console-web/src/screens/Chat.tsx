@@ -11,6 +11,7 @@ import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
+import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '@/features/conversations/lib/chatColumn';
 
 /** Where a "Needs you" card should land. Both approval- and needs-attention-
  *  notification-backed cards live on the Inbox "Needs you" tab now — deep-link
@@ -167,9 +168,9 @@ export function Chat() {
     // New conversation only. The command center (needs you, running, done)
     // lives on Home — Chat is the thread and the composer.
     return (
-      <div className="flex h-full flex-col">
+      <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1" />
-        <div className="mx-auto w-full max-w-[760px] px-8 pb-5 pt-2">
+        <div className={CHAT_COMPOSER_WRAP}>
           <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
         </div>
       </div>
@@ -177,9 +178,9 @@ export function Chat() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex min-h-full w-full max-w-[760px] flex-col justify-end space-y-5 px-8 py-6">
+        <div className={CHAT_THREAD}>
           {needsYou.length > 0 && (
             <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           )}
@@ -201,7 +202,7 @@ export function Chat() {
           <div ref={bottomRef} />
         </div>
       </div>
-      <div className="mx-auto w-full max-w-[760px] px-8 pb-5 pt-2">
+      <div className={CHAT_COMPOSER_WRAP}>
         <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
       </div>
     </div>

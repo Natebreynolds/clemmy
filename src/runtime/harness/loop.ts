@@ -1246,20 +1246,23 @@ function reduceStandardConversationTerminal(input: {
         },
       };
       legacyReason = 'failed';
-      // The user-facing text stays generic; the terminal EVENT names the
-      // failure so diagnosis is one glance instead of a run_failed hunt
-      // (live 2026-08-12: an approve-turn's wall error surfaced only as
-      // "Something went wrong").
-      try {
-        const lastFailure = listEvents(result.sessionId, {
-          types: ['run_failed'],
-          desc: true,
-          limit: 1,
-        })[0];
-        if (typeof lastFailure?.data.error === 'string' && lastFailure.data.error) {
-          failureDetail = lastFailure.data.error.replace(/\s+/g, ' ').slice(0, 300);
-        }
-      } catch { /* advisory metadata only */ }
+      // The returned failure owns the diagnostic. An advisory run_failed
+      // append can be absent (for example after source-scoped journaling
+      // rejects it); that must not erase the cause at the durable terminal.
+      // Older callers may only have journaled it. Use their exact source,
+      // never the most recent failure from a different request in the chat.
+      if (typeof result.error === 'string' && result.error.trim()) {
+        failureDetail = result.error.replace(/\s+/g, ' ').trim().slice(0, 300);
+      } else {
+        try {
+          const lastFailure = listEvents(result.sessionId, { types: ['run_failed'], sinceSeq: sourceUserSeq })
+            .filter(event => event.data.sourceUserSeq === sourceUserSeq)
+            .at(-1);
+          if (typeof lastFailure?.data.error === 'string' && lastFailure.data.error.trim()) {
+            failureDetail = lastFailure.data.error.replace(/\s+/g, ' ').trim().slice(0, 300);
+          }
+        } catch { /* advisory metadata only */ }
+      }
       break;
   }
 
@@ -1524,6 +1527,16 @@ export async function modelCheckInForExhaustedTurn(
     if (getSession(input.sessionId)?.kind !== 'chat') return turnResult;
   } catch {
     return turnResult;
+  }
+  // A prepared outline is already the model's answer. Preserve it with its
+  // exact unresolved preparation instead of paying another model to suggest
+  // unrelated projects or asking the owner to fix host plumbing.
+  try {
+    const { publishRetainedPlanDraft } = await import('./plan-preparation-draft.js');
+    const partial = publishRetainedPlanDraft({ sessionId: input.sessionId, sourceUserSeq: sourceUserSeq! });
+    if (partial) return { ...turnResult, finalOutput: partial.fullText, blockedReason: 'plan_preparation_incomplete' };
+  } catch (error) {
+    logger.warn({ err: error }, 'retained plan publication unavailable');
   }
   const alreadyAsked = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
     .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
@@ -3057,7 +3070,8 @@ export interface RunOutcome {
    * The status travels with the outcome so the caller does not have to
    * re-derive "was this blocked?" from the text it produced.
    */
-  terminal?: { status: 'blocked'; reason: string; resumable?: false };
+  terminal?: { status: 'blocked'; reason: string; resumable?: false }
+    | { status: 'awaiting_user_input'; reason: string };
   /** Internal nonterminal recovery ownership. No public terminal is authored. */
   hold?: {
     owner: 'host';
@@ -9712,7 +9726,7 @@ export function activeTurnBeatSpeaks(input: {
   return input.quietEvery > 0 && input.unchangedTicks % input.quietEvery === 0;
 }
 
-async function withActiveTurnHeartbeat<T>(
+export async function withActiveTurnHeartbeat<T>(
   opts: {
     sessionId: string;
     sourceUserSeq?: number;
@@ -9726,6 +9740,7 @@ async function withActiveTurnHeartbeat<T>(
      *  inside the tick returns undefined and the heartbeat would silently stay
      *  generic forever. */
     thinking?: () => string | undefined;
+    modelRequestInFlight?: () => boolean | undefined;
   },
   work: () => Promise<T>,
 ): Promise<T> {
@@ -9759,11 +9774,12 @@ async function withActiveTurnHeartbeat<T>(
     const durableProgress = composeRunProgressLine({
       sessionId: opts.sessionId, sourceUserSeq: opts.sourceUserSeq, fallback: '',
     });
-    /** True when a model request is dispatched and has not returned:
-     *  prompt_composition is appended immediately before every request, so it
-     *  being the newest event for this session means one is outstanding. */
+    // The active host owns this fact. A heartbeat must not hide the earlier
+    // prompt event and turn a still-pending request into "no change".
     const modelRequestInFlight = (): boolean => {
       try {
+        const active = opts.modelRequestInFlight?.();
+        if (active !== undefined) return active;
         return listEvents(opts.sessionId, { desc: true, limit: 1 })[0]?.type === 'prompt_composition';
       } catch { return false; }
     };
@@ -9808,10 +9824,9 @@ async function withActiveTurnHeartbeat<T>(
           // to the one person who could not see inside it. A slow model and a
           // stalled turn are different things and must not read the same.
           //
-          // prompt_composition is written immediately before every model
-          // request, so it being the newest event means one is in flight.
+          // Pending means awaiting a response, not proof of useful reasoning.
           : modelRequestInFlight()
-            ? `${durableProgress || 'Still working on your request.'} (composing a reply — ${quietFor} so far)`
+            ? `${durableProgress || 'Still working on your request.'} (waiting for the model response — ${quietFor} so far)`
             : `${durableProgress || 'Still working on your request.'} (no change for ${quietFor})`,
       },
     });
@@ -11263,8 +11278,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // Dynamic reasoning effort (per-turn). gpt-5.x reasons before emitting any
   // token, so reasoning depth is the dominant per-turn latency knob. gpt-5.5's
   // SDK default is effort:'none', so simple turns are already minimal — this
-  // only RAISES effort, and only by the "is a human waiting?" axis: interactive
-  // chat turns cap at 'medium' (never make a person wait on 'high'), background
+  // Explicit Plan requests high effort; ordinary interactive
+  // chat turns cap at 'medium', background
   // turns (workflow/execution/goal-resume) may go 'high' where depth aids hard
   // multi-step work and latency is invisible. Reuses the context packet's
   // complexity (one classifier, no duplicate).
@@ -11273,19 +11288,26 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // (buildOrchestratorAgent seeds it when the feature is on — that's what flips
   // the SDK's explicit flag legitimately, no internal poking here). We just
   // mutate reasoning.effort on the public field. Kill-switch
-  // CLEMMY_DYNAMIC_REASONING=off → orchestrator has no explicit modelSettings,
-  // so this mutation is a no-op the SDK ignores and its default rides.
-  if (dynamicReasoningEnabled()) {
+  // CLEMMY_DYNAMIC_REASONING=off disables automatic complexity selection,
+  // but explicit Plan still carries the owner's preparation preference.
+  const effortTaskMode = acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind;
+  if (dynamicReasoningEnabled() || effortTaskMode === 'plan') {
     try {
       const effortSignals = reasoningEffortSignalsForTurn({
+        taskMode: effortTaskMode,
         interactive: session.sessionRow.kind === 'chat',
         turnIntent: contextPacket.turnIntent,
         multiItem: contextPacket.multiItem.detected,
         text: classifierInput,
       });
-      const { effort, reason } = selectReasoningEffort(contextPacket.complexity, effortSignals);
+      const selected = selectReasoningEffort(contextPacket.complexity, effortSignals);
       const agentRef = options.agent as unknown as { modelSettings?: Record<string, unknown> };
       const prev = agentRef.modelSettings ?? {};
+      const priorEffort = (prev.reasoning as { effort?: string } | undefined)?.effort;
+      const preserveHigherEffort = effortTaskMode === 'plan'
+        && ['xhigh', 'max', 'ultra'].includes(priorEffort ?? '');
+      const effort = preserveHigherEffort ? priorEffort : selected.effort;
+      const reason = preserveHigherEffort ? 'explicit-plan/preserve-higher-effort' : selected.reason;
       agentRef.modelSettings = {
         ...prev,
         reasoning: { ...(prev.reasoning as object ?? {}), effort },
@@ -11299,6 +11321,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         data: {
           effort,
           reason,
+          taskMode: effortTaskMode ?? 'normal',
+          sourceUserSeq,
           complexity: contextPacket.complexity,
           kind: session.sessionRow.kind,
           boundedForegroundAction: effortSignals.boundedForegroundAction === true,
@@ -11403,6 +11427,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         checkInMs: heartbeatMs,
         stage: 'turn',
         thinking: () => harnessCtx?.latestModelThinking,
+        modelRequestInFlight: () => harnessCtx?.hostModelActivity === undefined
+          ? undefined : harnessCtx.hostModelActivity.pendingRequests > 0,
       },
       async () => {
         // Budget raised 3×60KB → 5×150KB via env (2026-07-08): the morning
@@ -11569,6 +11595,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     }
 
     if (session.loadRecoveryState()) session.clearRecoveryState();
+
+    if (outcome.terminal?.status === 'awaiting_user_input') {
+      const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');
+      session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
+      safeAppend({ sessionId: options.sessionId, turn, role: 'Clem', type: 'awaiting_user_input',
+        data: { question, sourceUserSeq, source: 'completion_review', reason: outcome.terminal.reason } });
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_user_input',
+        finalOutput: question, toolCalls: toolCounter.currentCount };
+    }
 
     if (outcome.terminal?.status === 'blocked') {
       // A host-owned terminal is control data, not a model-authored ordinary
@@ -12247,6 +12283,8 @@ export async function resumePendingApproval(
         budget: heartbeatBudget,
         checkInMs: heartbeatMs,
         stage: 'approval_resume',
+        modelRequestInFlight: () => resumeCtx?.hostModelActivity === undefined
+          ? undefined : resumeCtx.hostModelActivity.pendingRequests > 0,
       },
       async () => {
         // Resume needs the exact physical-attempt context even when the legacy
@@ -12376,6 +12414,16 @@ export async function resumePendingApproval(
     }
 
     if (session.loadRecoveryState()) session.clearRecoveryState();
+
+    if (outcome.terminal?.status === 'awaiting_user_input') {
+      const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');
+      session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
+      safeAppend({ sessionId: options.sessionId, turn, role: 'Clem', type: 'awaiting_user_input',
+        data: { question, sourceUserSeq: resumeSourceUserSeq, source: 'completion_review', reason: outcome.terminal.reason } });
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_user_input',
+        finalOutput: question, toolCalls: toolCounter.currentCount };
+    }
 
     if (outcome.terminal?.status === 'blocked') {
       session.recordTurnResult({

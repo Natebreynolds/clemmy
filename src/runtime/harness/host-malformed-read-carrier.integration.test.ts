@@ -20,6 +20,7 @@ const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
+const { buildWorkCall } = await import('../../tools/work-call.js');
 const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const { acceptedTaskIdFor } = await import('./attempt-identity.js');
@@ -27,7 +28,7 @@ const { acceptedTurnCallAuthorityFor } = await import('./accepted-turn-call-auth
 
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
-async function runScenario(options: { id: string; replaceInvoke?: boolean }) {
+async function runScenario(options: { id: string; replaceInvoke?: boolean; workCarrier?: boolean }) {
   const prompt = 'Find the search tool, then list my tasks.';
   const session = events.createSession({ id: options.id, kind: 'chat' });
   const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
@@ -41,6 +42,7 @@ async function runScenario(options: { id: string; replaceInvoke?: boolean }) {
     ? { ...configured, invoke: async () => { replacedBodyCalls += 1; return 'unvalidated code ran'; } }
     : configured;
   const carrier = brackets.wrapToolForHarness(candidate as never);
+  const workCarrier = brackets.wrapToolForHarness(buildWorkCall({ requireHostPlan: true }) as never);
   const taskList = getLocalRuntimeTools().find((tool) => tool.name === 'task_list');
   assert.ok(taskList);
   let calls = 0;
@@ -49,7 +51,14 @@ async function runScenario(options: { id: string; replaceInvoke?: boolean }) {
     async getResponse(request: unknown) {
       calls += 1;
       observed.push(request);
-      const output = calls === 1
+      const output = options.workCarrier
+        ? calls === 1
+          ? [
+            { type: 'function_call', callId: 'malformed-work', name: 'work_call', arguments: JSON.stringify({ name: 'task_list', requirement_id: 'cap:local:task_list:read', universe_item_id: null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null }) },
+            { type: 'function_call', callId: 'healthy-sibling', name: 'call_tool', arguments: JSON.stringify({ name: 'task_list', args_json: JSON.stringify({ status: null, priority: null, project: null, since: null, limit: 10 }) }) },
+          ]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The task list is empty.' }] }]
+        : calls === 1
         ? [{ type: 'function_call', callId: 'malformed-search', name: 'call_tool', arguments: JSON.stringify({ name: 'composio_search_tools', args_json: { query: 'Find the search tool' } }) }]
         : calls === 2
           ? [{ type: 'function_call', callId: 'recovered-task-list', name: 'call_tool', arguments: JSON.stringify({ name: 'task_list', args_json: JSON.stringify({ status: null, priority: null, project: null, since: null, limit: 10 }) }) }]
@@ -63,11 +72,11 @@ async function runScenario(options: { id: string; replaceInvoke?: boolean }) {
       yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
     },
   };
-  const agent = { model, tools: [carrier, taskList] };
+  const agent = { model, tools: [carrier, taskList, ...(options.workCarrier ? [workCarrier] : [])] };
   const prior = catalogs.peekHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   try {
-    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: agent.tools as never, activeToolNames: ['call_tool', 'task_list'], policyHash: 'carrier-input-recovery', budget: { maxUncachedTokens: 10_000, maxModelCalls: 4, maxToolCalls: 20, maxElapsedMs: 60_000 } });
+    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: agent.tools as never, activeToolNames: ['call_tool', 'task_list', ...(options.workCarrier ? ['work_call'] : [])], policyHash: 'carrier-input-recovery', budget: { maxUncachedTokens: 10_000, maxModelCalls: 4, maxToolCalls: 20, maxElapsedMs: 60_000 } });
     assert.equal(sealed.ok, true);
     if (!sealed.ok) throw new Error('fixture envelope did not seal');
     envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
@@ -115,4 +124,22 @@ test('a copied carrier with a replaced invoke cannot borrow the parser proof or 
   const root = acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
   assert.equal(root.status, 'conflict', JSON.stringify(root));
   if (root.status === 'conflict') assert.match(root.reason, /effect violation: unknown/);
+});
+
+
+test('a malformed work_call returns its schema repair while a parallel healthy read settles and the source stays usable', async () => {
+  const { identity, result, calls, observed } = await runScenario({ id: 'malformed-work-parallel', workCarrier: true });
+  assert.equal(calls, 2, JSON.stringify(result));
+  assert.equal(result.finalOutput, 'The task list is empty.');
+  assert.match(JSON.stringify(observed[1]), /args_json.*string|args_json.*schema/i);
+  events.closeEventLog();
+  for (const [callId, expected] of [['malformed-work', 'invalid_arguments'], ['healthy-sibling', 'succeeded']]) {
+    const redeemed = settlements.redeemDurableLogicalCallSettlementForHost({ ...identity, acceptedTaskId: acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq), logicalToolCallId: callId! });
+    assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+    if (redeemed.status !== 'ok') throw new Error(redeemed.reason);
+    assert.equal(redeemed.settlement.outcome.kind, expected);
+    if (callId === 'malformed-work') assert.equal(redeemed.settlement.hostCrossingCount + redeemed.settlement.physicalCrossingCount, 0);
+  }
+  assert.equal(acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq).status, 'ok');
+  assert.equal((result as { hold?: unknown }).hold, undefined);
 });

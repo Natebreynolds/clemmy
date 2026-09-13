@@ -9,7 +9,7 @@
  * Run:
  *   node scripts/run-tests-isolated.mjs src/runtime/harness/local-space-save-work-call.integration.test.ts
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -279,7 +279,7 @@ test('explicit Plan prepares native Space schema without effects; Execute activa
   const publishTool = brackets.wrapToolForHarness(publisher.buildPublishPlanTool(primed.planning) as never);
   const planModel = stubModel([
     [toolCall('publish-reviewed-workspace', 'publish_plan', { full_text: planArtifactText, structured_plan: { ...publicOutline, steps: (publicOutline.steps as any[]).map(({ staticArguments, ...step }) => ({ ...step, staticArgumentsJson: JSON.stringify(staticArguments) })) },
-      execution_draft: planArgs.draft, readiness: 'ready', missing_prerequisites: [], base_ref_json: null })],
+      execution_draft: null, readiness: 'ready', missing_prerequisites: [], base_ref_json: null })],
     [textMessage('The full plan is ready for review.')],
   ]);
   const planAgent = { model: planModel, tools: [publishTool] };
@@ -479,7 +479,7 @@ test('a ready read-only revision executes the real prepared read without a plan 
   const outline = await publisher.preparePlanOutline({ sessionId: session.id, sourceUserSeq: source.seq, planning: primed.planning, ready: true, raw: {
     executionDraft: null, steps: [{ id: 'read_document', action: 'Read the exact local profile.', effect: 'read', capabilityRef: refs.user_profile_read, staticArguments: args, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Read result contains the document.' }], successCriteria: ['Read the requested document.'], subagents: [],
   } });
-  const artifact = plans.publishPlanRevision({ sessionId: session.id, sourceUserSeq: source.seq, principalId: session.id, fullText: 'Read the exact local profile and report its contents.', structuredPlan: outline, readiness: 'ready' });
+  const artifact = plans.publishPlanRevision({ sessionId: session.id, sourceUserSeq: source.seq, principalId: session.id, fullText: 'Read the exact local profile and report its contents. Do not use external tools.', structuredPlan: outline, readiness: 'ready' });
   const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
   source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: `Execute the reviewed plan, revision ${ref.revision}.`, taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
   plans.claimPlanExecution({ sessionId: session.id, sourceUserSeq: source.seq, principalId: session.id, executeRef: ref });
@@ -487,6 +487,7 @@ test('a ready read-only revision executes the real prepared read without a plan 
   assert.ok(primed.ok); if (!primed.ok) return;
   await reviewed.revalidateReviewedPlanPreparation(primed.planning);
   const built = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: execution.acceptedPlanExecutionText(session.id, source.seq)!, allowToolJit: true, hostFreshPlanning: primed.planning });
+  assert.doesNotMatch(String(eventlog.listEvents(session.id, { types: ['mcp_tool_scope'] }).at(-1)?.data.reason), /user excluded|user refused|user prohibited|explicit local-only|user restricted/i, 'model-authored plan text cannot become an owner access prohibition');
   assert.equal(built.tools.some(tool => ['plan_task', 'draft_plan', 'publish_plan'].includes(tool.name)), false, 'read-only Execute does not expose a needless activation/replanning control');
   const read = brackets.wrapToolForHarness(runtime.getLocalRuntimeTools().find(tool => tool.name === 'user_profile_read') as never);
   const model = stubModel([[toolCall('read-reviewed-document', 'user_profile_read', args)], [textMessage('Read the requested document.')]]);
@@ -501,4 +502,398 @@ test('a ready read-only revision executes the real prepared read without a plan 
   assert.match(JSON.stringify(outcome.history), new RegExp(nonce));
   assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] }).some(event => event.data.tool === 'plan_task'), false);
   assert.equal(model.calls(), 2);
+});
+
+for (const [wholeText, repair, review] of [[false, false, false], [true, false, false], [true, true, false], [true, true, true]]) test(`approved research → synthesis → write uses ${wholeText ? 'whole text' : 'object fields'} and survives reopen${repair ? ' with an owned-file correction' : ''}${review ? ' requested by the completion judge' : ''}`, async () => {
+  const local = await import('./local-planning-capability.js');
+  const runtime = await import('../../tools/local-runtime-tools.js');
+  const { getCoreTools } = await import('../../tools/registry.js');
+  const publisher = await import('../../tools/publish-plan.js');
+  const plans = await import('./plan-artifacts.js');
+  const reviewed = await import('./reviewed-plan-runtime.js');
+  const results = await import('./reviewed-plan-results.js');
+  const execution = await import('./accepted-plan-execution.js');
+  const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'runtime-synthesis', kind: 'chat' });
+  let source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan to read the latest profile and synthesize a local briefing. Do not write during Plan.', taskMode: { version: 1, kind: 'plan' } } });
+  let identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  let primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  const names = new Set(getCoreTools().map(t => t.name));
+  const candidates = await Promise.all(['read_file', 'write_file'].map(name => local.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'work_call', configuredNames: names })));
+  assert.ok(candidates.every(c => c && !('refused' in c)));
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates: candidates as any });
+  const outputPath = path.join(HOME, `runtime-synthesized-${wholeText ? 'text' : 'object'}-${repair ? 'repair' : 'clean'}-${review ? 'review' : 'self'}.md`);
+  const base = { subagentRole: null, dynamicBindings: [], dependsOn: [] };
+  const outline = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: {
+    steps: [
+      { ...base, id: 'research', action: 'Read the latest profile.', effect: 'read', capabilityRef: refs.read_file, staticArguments: { path: path.join(HOME, 'state/user-profile.json') }, verification: 'Current profile returned.' },
+      { ...base, id: 'synthesize', action: 'Write a short Markdown briefing containing the current profile notes.', effect: 'compute', capabilityRef: null, staticArguments: {}, dependsOn: ['research'], verification: 'The briefing includes the exact current note.' },
+      { ...base, id: 'save', action: 'Save the synthesized briefing.', effect: 'local_write', capabilityRef: refs.write_file, staticArguments: { path: outputPath },
+        dynamicBindings: [{ producerStepId: 'synthesize', outputPath: wholeText ? '' : '/markdown', targetPath: '/content', expectedType: 'string' }], verification: 'Committed bytes equal the recorded synthesis.' },
+      ...(repair ? [{ ...base, id: 'verify', action: 'Read the saved briefing back.', effect: 'read', capabilityRef: refs.read_file,
+        staticArguments: { path: outputPath }, dependsOn: ['save'], verification: 'Read the current saved text.' }] : []),
+    ], successCriteria: ['One file with the current profile note, no duplicate effects.'], subagents: [],
+  } });
+  const artifact = plans.publishPlanRevision({ ...identity, principalId: session.id, fullText: 'Read the current profile, synthesize a briefing, and save it.', structuredPlan: outline, readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const nonce = 'AFTER-PLAN-RESEARCH-97231';
+  writeFileSync(path.join(HOME, 'state/user-profile.json'), JSON.stringify({ displayName: 'Research fixture', notes: nonce }));
+  assert.doesNotMatch(JSON.stringify(artifact), new RegExp(nonce), 'the plan did not pretend to know future findings');
+  source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute this reviewed plan.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  plans.claimPlanExecution({ ...identity, principalId: session.id, executeRef: ref });
+  primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', { markdown: 'premature' }), /Activate|settled result/);
+  const input = execution.acceptedPlanExecutionText(session.id, source.seq)!;
+  const built = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: input, allowToolJit: true, hostFreshPlanning: primed.planning });
+  assert.ok(built.tools.some(t => t.name === 'plan_step_result'), 'the actual Execute surface contains the result channel');
+  const workTool = built.tools.find(t => t.name === 'work_call')!;
+  assert.match(workTool.description, /plan_step_result/);
+  assert.match(workTool.description, /omit the bound argument fields/);
+  assert.doesNotMatch(workTool.description, /compute ONLY for work a tool will perform/,
+    'the Execute carrier must not contradict its reviewed model-authored synthesis step');
+  const resultTool = built.tools.find(t => t.name === 'plan_step_result')!;
+  if (wholeText) {
+    assert.equal((resultTool.parameters as any).properties.data.type, 'string', 'whole-text synthesis advertises its actual argument type');
+    assert.doesNotMatch(resultTool.description, /\{"markdown"/);
+  } else {
+    assert.notEqual((resultTool.parameters as any).properties.data.type, 'string', 'object bindings keep structured data available');
+  }
+  const supplementalPath = path.join(HOME, 'supplemental-profile-note.txt');
+  const supplementalNote = 'Supplemental observation: the delivery window is Thursday.';
+  writeFileSync(supplementalPath, supplementalNote);
+  const content = `# Briefing\n\n${nonce}\n${wholeText ? supplementalNote : ''}\n`;
+  const initialContent = repair ? '# Briefing\n\nAn unsupported first draft.\n' : content;
+  const resultValue = (text: string) => wholeText ? text : { markdown: text };
+  const work = (id: string, name: string, args: unknown) => ({ requirement_id: id, name, args_json: JSON.stringify(args), source_call_ids: null, source_record_ids: null });
+  const frames = [
+    [toolCall('activate-runtime-synthesis', 'plan_task', {})],
+    [toolCall('read-runtime-synthesis', 'work_call', work('research', 'read_file', { path: path.join(HOME, 'state/user-profile.json') }))],
+    ...(wholeText ? [[toolCall('missing-supplement-runtime-synthesis', 'work_call', work(refs.read_file!, 'read_file', { path: path.join(HOME, 'missing-note.txt') }))]] : []),
+    ...(wholeText ? [[toolCall('supplement-runtime-synthesis', 'work_call', work(refs.read_file!, 'read_file', { path: supplementalPath }))]] : []),
+    [toolCall('record-runtime-synthesis', 'plan_step_result', { step_id: 'synthesize', data: resultValue(initialContent) })],
+    [toolCall('write-runtime-synthesis', 'work_call', work('save', 'write_file', { path: outputPath, ...(wholeText ? { content: 'A retyped paraphrase must never replace the recorded briefing.' } : {}) }))],
+    ...(repair ? [[toolCall('initial-readback-runtime-synthesis', 'work_call', work('verify', 'read_file', { path: outputPath }))]] : []),
+    ...(review ? [[textMessage('The first briefing is saved.')]] : []),
+    ...(repair ? [
+      [toolCall('correct-runtime-synthesis', 'plan_step_result', { step_id: 'synthesize', data: resultValue(content) })],
+      [toolCall('revise-runtime-synthesis', 'work_call', work('save', 'write_file', { path: outputPath }))],
+    ] : []),
+    [repair ? toolCall('readback-runtime-synthesis', 'work_call', work('verify', 'read_file', { path: outputPath })) : wholeText
+      ? toolCall('readback-runtime-synthesis', 'work_call', work(refs.read_file!, 'read_file', { path: outputPath }))
+      : toolCall('readback-runtime-synthesis', 'call_tool', { name: 'read_file', args_json: JSON.stringify({ path: outputPath }) })],
+    [textMessage('The briefing is saved.')],
+  ];
+  let calls = 0;
+  const model = { async getResponse(request: any) {
+    if (calls === 2) assert.match(JSON.stringify(request.input), new RegExp(nonce), 'the model sees the actual settled research');
+    if (calls === (wholeText ? 4 : 2)) assert.ok(JSON.stringify(request.input).includes(wholeText ? supplementalNote : nonce));
+    if (calls === (wholeText ? 5 : 3)) {
+      eventlog.closeEventLog();
+      assert.deepEqual(results.resolveReviewedPlanStepResult(identity, 'synthesize'), resultValue(initialContent));
+      const stored = eventlog.openEventLog().prepare('SELECT inputs_json FROM reviewed_plan_step_results_v1 WHERE session_id=? AND source_user_seq=? ORDER BY id DESC LIMIT 1').get(session.id, source.seq) as { inputs_json: string };
+      const inputs = JSON.parse(stored.inputs_json);
+      assert.equal(inputs.version, 2);
+      if (wholeText) {
+        assert.ok(inputs.supplementalReads.some((row: any) => row.callId === 'supplement-runtime-synthesis' && row.digest.length === 64), 'the optional read survives reopen with the synthesis');
+        assert.ok(!inputs.supplementalReads.some((row: any) => row.callId === 'missing-supplement-runtime-synthesis'), 'a failed read is not represented as evidence of its missing content');
+        const corrupted = structuredClone(inputs);
+        corrupted.supplementalReads[0].digest = '0'.repeat(64);
+        const updateInputs = eventlog.openEventLog().prepare('UPDATE reviewed_plan_step_results_v1 SET inputs_json=? WHERE session_id=? AND source_user_seq=?');
+        updateInputs.run(JSON.stringify(corrupted), session.id, source.seq);
+        assert.throws(() => results.resolveReviewedPlanStepResult(identity, 'synthesize'), /changed or lost its source evidence/);
+        updateInputs.run(stored.inputs_json, session.id, source.seq);
+      }
+      // Existing saved results use the flat dependency-digest shape.
+      eventlog.openEventLog().prepare('UPDATE reviewed_plan_step_results_v1 SET inputs_json=? WHERE session_id=? AND source_user_seq=?')
+        .run(JSON.stringify(inputs.dependencies), session.id, source.seq);
+      assert.deepEqual(results.resolveReviewedPlanStepResult(identity, 'synthesize'), resultValue(initialContent));
+      eventlog.openEventLog().prepare('UPDATE reviewed_plan_step_results_v1 SET inputs_json=? WHERE session_id=? AND source_user_seq=?')
+        .run(stored.inputs_json, session.id, source.seq);
+      assert.match(reviewed.reviewedPlanCallRefusal({ ...identity, toolName: 'work_call', effect: 'read',
+        args: work('research', 'read_file', { path: supplementalPath }) })!, /REVIEWED_PLAN_CALL_REFUSED/, 'an extra read cannot claim changed arguments for a planned step');
+      assert.match(reviewed.reviewedPlanCallRefusal({ ...identity, toolName: 'work_call', effect: 'local_write',
+        args: work(refs.write_file!, 'write_file', { path: outputPath + '.extra', content }) })!, /REVIEWED_PLAN_CALL_REFUSED/, 'supplemental reads never widen write authority');
+      const materialize = (id: string, args: unknown, name = 'write_file') => reviewed.materializeReviewedPlanCallArguments({ ...identity,
+        toolName: 'work_call', argumentsJson: JSON.stringify(work(id, name, args)) });
+      const bound = materialize('save', { path: outputPath + '.unapproved', content: 'retyped' });
+      assert.ok(bound, 'declared result fields are materialized from the reopened synthesis');
+      const boundCall = JSON.parse(bound.argumentsJson);
+      assert.deepEqual(JSON.parse(boundCall.args_json), { path: outputPath + '.unapproved', content: initialContent }, 'only result-bound fields change');
+      assert.match(reviewed.reviewedPlanCallRefusal({ ...identity, toolName: 'work_call', args: boundCall, effect: 'local_write' })!, /arguments differ at \/path/, 'an unapproved static destination remains refused');
+      assert.equal(materialize('not-a-reviewed-step', { path: outputPath }), undefined);
+      assert.equal(materialize('save', { path: outputPath }, 'delete_file'), undefined, 'binding a result cannot select a different operation');
+      assert.equal(reviewed.materializeReviewedPlanCallArguments({ ...identity, sourceUserSeq: artifact.sourceUserSeq,
+        toolName: 'work_call', argumentsJson: JSON.stringify(work('save', 'write_file', { path: outputPath })) }), undefined, 'another accepted source cannot borrow this binding');
+      assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', { wrongField: content }), /must be string/);
+      assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', undefined), /closed JSON domain/);
+      assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', { invalid: Number.NaN }), /finite/);
+      results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue('A draft to revise before writing.'));
+      results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue(initialContent));
+      eventlog.closeEventLog();
+      assert.deepEqual(results.resolveReviewedPlanStepResult(identity, 'synthesize'), resultValue(initialContent), 'A → B → A records A as current without erasing the earlier revision');
+    }
+    const output = frames[Math.min(calls++, frames.length - 1)];
+    return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 }, output, responseId: `runtime-synthesis-${calls}` };
+  }, getStreamedResponse: testModelStream };
+  const tools = built.tools.filter(t => ['plan_task', 'work_call', 'plan_step_result', 'call_tool'].includes(t.name));
+  const agent = { model, tools };
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: tools, activeToolNames: tools.map(t => t.name), policyHash: 'runtime-synthesis', budget: { maxUncachedTokens: 100_000, maxModelCalls: 12, maxToolCalls: frames.length * 2, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok); if (!sealed.ok) return;
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope); capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  let reviewCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviewCalls++;
+    return { done: readFileSync(outputPath, 'utf8') === content,
+      reason: 'Compare the saved briefing with the current notes. Correct unsupported content in the same owned file.' };
+  });
+  const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(frames.length * 2) }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: input }] as never, { maxTurns: 12, hostTurnEngine: 'host_v1', hostJudgeCompletion: review, context: identity } as never));
+  _setHostObjectiveJudgeForTests(null);
+  assert.equal(reviewCalls, review ? 2 : 0);
+  assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+  assert.equal(calls, frames.length, 'the read failure and alternate source complete without an extra model frame');
+  assert.ok(existsSync(outputPath), JSON.stringify(outcome.history.filter((item: any) => item.type === 'function_call_result')));
+  assert.equal(readFileSync(outputPath, 'utf8'), content, JSON.stringify(outcome.history.filter((item: any) => item.type === 'function_call_result')));
+  const readback = outcome.history.find((item: any) => item.type === 'function_call_result' && item.callId === 'readback-runtime-synthesis');
+  assert.match(JSON.stringify(readback), new RegExp(nonce), 'selecting a reader for the plan must not prevent a later contextual readback');
+  const settled = eventlog.openEventLog().prepare('SELECT outcome_kind,mutating FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?').all(session.id, source.seq) as any[];
+  assert.equal(settled.filter(x => x.mutating && x.outcome_kind === 'succeeded').length, repair ? 2 : 1);
+  if (repair) {
+    const firstReadback = outcome.history.find((item: any) => item.type === 'function_call_result' && item.callId === 'initial-readback-runtime-synthesis');
+    assert.match(JSON.stringify(firstReadback), /unsupported first draft/);
+    assert.doesNotMatch(JSON.stringify(readback), /unsupported first draft/);
+    assert.match(String(results.resolveReviewedPlanStepResult(identity, 'verify')), new RegExp(nonce), 'a reviewed readback refreshes after the upstream file changes');
+    const journal = eventlog.openEventLog().prepare('SELECT correction_json FROM reviewed_file_corrections_v1 WHERE session_id=? AND source_user_seq=?').all(session.id, source.seq) as any[];
+    assert.equal(journal.length, 1);
+    const correction = JSON.parse(journal[0].correction_json);
+    assert.equal(correction.priorCallId, 'write-runtime-synthesis');
+    const correctionProof = await import('./reviewed-file-correction.js');
+    assert.deepEqual([...correctionProof.supersededReviewedFileCalls(identity, 'save')], ['write-runtime-synthesis']);
+    assert.equal(correctionProof.supersededReviewedFileCalls(identity, 'save', new Set(['write-runtime-synthesis'])).size, 0,
+      'a replacement missing from observed authority cannot remove the original obligation');
+    assert.deepEqual([...correctionProof.supersededReviewedFileCalls({ ...identity, sourceUserSeq: artifact.sourceUserSeq }, 'save')], []);
+    const graphState = (await import('./resolution-ledger.js')).expectedTaskFor(session.id, source.seq);
+    assert.equal(graphState.status, 'ok'); if (graphState.status !== 'ok') throw new Error(graphState.reason);
+    const finalized = (await import('./resolution-ledger.js')).finalizeResolutionAgainstExpectedWork(identity);
+    assert.ok(finalized.status === 'finalized' || finalized.status === 'replayed', JSON.stringify(finalized));
+    const { compileObligationManifest } = await import('./obligation-manifest.js');
+    const manifestWrites = () => compileObligationManifest({ graph: graphState.graph }).manifest.nodes.filter(node => node.effectKind === 'local_write');
+    assert.equal(manifestWrites().length, 1, JSON.stringify(compileObligationManifest({ graph: graphState.graph })));
+    for (const tamper of [{ priorCallId: 'supplement-runtime-synthesis' }, { priorReceiptDigest: '0'.repeat(64) }, { resultId: -1 }, { content: 'unproven replacement' }]) {
+      eventlog.openEventLog().prepare('UPDATE reviewed_file_corrections_v1 SET correction_json=? WHERE session_id=? AND source_user_seq=?')
+        .run(JSON.stringify({ ...correction, ...tamper }), session.id, source.seq);
+      assert.equal(correctionProof.supersededReviewedFileCalls(identity, 'save').size, 0, 'a mismatched lineage cannot hide a settled write');
+      assert.equal(compileObligationManifest({ graph: graphState.graph }).manifest.readiness, 'unresolved',
+        'invalid lineage prevents the frozen work contract from certifying completion');
+    }
+    eventlog.openEventLog().prepare('UPDATE reviewed_file_corrections_v1 SET correction_json=? WHERE session_id=? AND source_user_seq=?')
+      .run(journal[0].correction_json, session.id, source.seq);
+    const receipts = (await import('./host-turn-runner.js')).settledSourceArtifacts(identity);
+    assert.equal(receipts.artifacts.filter(row => row.superseded).length, 1, 'the first receipt remains explicitly historical');
+    assert.equal(receipts.artifacts.filter(row => !row.superseded && row.digestMatches).length, 1, 'only the corrected current bytes certify completion');
+    assert.match(String(results.resolveReviewedPlanStepResult(identity, 'save')), /Overwrote/, 'downstream consumers use the exact revised result');
+
+    assert.equal(correction.expectedContentDigest, createHash('sha256').update(initialContent).digest('hex'));
+    const receiptRows = eventlog.openEventLog().prepare('SELECT result_json FROM reviewed_plan_step_results_v1 WHERE session_id=? AND source_user_seq=? ORDER BY id').all(session.id, source.seq) as any[];
+    assert.ok(receiptRows.some(row => JSON.parse(row.result_json) === initialContent), 'first synthesis remains immutable history');
+    eventlog.closeEventLog();
+    assert.equal(readFileSync(outputPath, 'utf8'), content, JSON.stringify(outcome.history.filter((item: any) => item.type === 'function_call_result')));
+  }
+  assert.equal(results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue(content)).replayed, true);
+  eventlog.closeEventLog();
+  const terminal = terminalPreparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: 'The briefing is saved.' });
+  assert.equal(terminal.status, 'ready', JSON.stringify(terminal));
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'The briefing is saved.' } });
+  assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
+  writeFileSync(outputPath, 'An intervening owner edit.');
+  assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue('changed after effect')), /successful write/, 'an intervening edit prevents automatic replacement');
+  assert.equal(readFileSync(outputPath, 'utf8'), 'An intervening owner edit.');
+  assert.throws(() => results.recordReviewedPlanStepResult(identity, 'save', resultValue(content)), /Only a reviewed compute/);
+  assert.throws(() => results.resolveReviewedPlanStepResult({ ...identity, sourceUserSeq: artifact.sourceUserSeq }, 'synthesize'), /selected ready plan/);
+});
+
+test('a reviewed runtime collection uses the complete current read and keeps member progress across reopen', async () => {
+  const local = await import('./local-planning-capability.js');
+  const { getCoreTools } = await import('../../tools/registry.js');
+  const publisher = await import('../../tools/publish-plan.js');
+  const plans = await import('./plan-artifacts.js');
+  const reviewed = await import('./reviewed-plan-runtime.js');
+  const results = await import('./reviewed-plan-results.js');
+  const execution = await import('./accepted-plan-execution.js');
+  const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'runtime-collection', kind: 'chat' });
+  let source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan to read the current batch and save each exact record to its stated local path.', taskMode: { version: 1, kind: 'plan' } } });
+  let identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  let primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  const names = new Set(getCoreTools().map(t => t.name));
+  const candidates = await Promise.all(['read_file', 'write_file'].map(name => local.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'work_call', configuredNames: names })));
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates: candidates as any });
+  const sourcePath = path.join(HOME, 'current-collection.json');
+  writeFileSync(sourcePath, JSON.stringify([{ id: 'before-plan', path: path.join(HOME, 'old.md'), content: 'old' }]));
+  const outline = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: {
+    steps: [
+      { id: 'read', action: 'Read the entire current collection.', capabilityRef: refs.read_file, staticArguments: { path: sourcePath }, verification: 'Complete current records returned.' },
+      { id: 'save', action: 'Save each current record.', capabilityRef: refs.write_file, verification: 'Each record saved once with exact content.',
+        forEach: { producerStepId: 'read', memberIdPath: '/id', bindings: [{ itemPath: '/path', targetPath: '/path' }, { itemPath: '/content', targetPath: '/content' }] } },
+    ], successCriteria: ['All records in the current complete collection saved once.'],
+  } });
+  const artifact = plans.publishPlanRevision({ ...identity, principalId: session.id, fullText: 'Read the whole current batch and save each exact record. The collection is determined by the execution-time read.', structuredPlan: outline, readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const records = Array.from({ length: 3 }, (_, i) => ({ id: `current-${i}`, path: path.join(HOME, `current-member-${i}.md`), content: `Execution-only value ${i}\nLiteral \\n retained.\n` }));
+  writeFileSync(sourcePath, JSON.stringify(records));
+  assert.doesNotMatch(JSON.stringify(artifact), /Execution-only/);
+  source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  plans.claimPlanExecution({ ...identity, principalId: session.id, executeRef: ref });
+  primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  const input = execution.acceptedPlanExecutionText(session.id, source.seq)!;
+  const built = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: input, allowToolJit: true, hostFreshPlanning: primed.planning });
+  const write = (index: number, callId = `save-member-${index}`) => toolCall(callId, 'work_call', { requirement_id: 'save', universe_item_id: records[index]!.id, name: 'write_file', args_json: JSON.stringify(index === 1 ? {} : { path: records[index]!.path, content: 'The host must use the exact member content.' }) });
+  const frames = [
+    [toolCall('activate-collection', 'plan_task', {})],
+    [toolCall('read-collection', 'work_call', { requirement_id: 'read', name: 'read_file', args_json: JSON.stringify({ path: sourcePath }) })],
+    [write(0)], [write(1), write(2)], [write(0, 'replay-member-0')], [textMessage('All current records saved exactly once.')],
+  ];
+  let frame = 0;
+  const model = { async getResponse() {
+    if (frame === 3) {
+      eventlog.closeEventLog();
+      assert.equal(readFileSync(records[0]!.path, 'utf8'), records[0]!.content);
+      assert.throws(() => results.resolveReviewedPlanStepResult(identity, 'save'), /not complete/);
+    }
+    const output = frames[Math.min(frame++, frames.length - 1)];
+    return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 }, output, responseId: `collection-${frame}` };
+  }, getStreamedResponse: testModelStream };
+  const tools = built.tools.filter(t => ['plan_task', 'work_call'].includes(t.name));
+  const agent = { model, tools };
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: tools, activeToolNames: tools.map(t => t.name), policyHash: 'runtime-collection', budget: { maxUncachedTokens: 100_000, maxModelCalls: 8, maxToolCalls: 10, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok); if (!sealed.ok) return;
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope); capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(10) }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: input }] as never, { maxTurns: 8, hostTurnEngine: 'host_v1', context: identity } as never));
+  assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+  for (const record of records) assert.equal(readFileSync(record.path, 'utf8'), record.content);
+  assert.equal(existsSync(path.join(HOME, 'old.md')), false);
+  const settlements = eventlog.openEventLog().prepare('SELECT outcome_kind,mutating FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?').all(session.id, source.seq) as any[];
+  assert.equal(settlements.filter(x => x.mutating && x.outcome_kind === 'succeeded').length, 3, JSON.stringify(settlements));
+  assert.equal(settlements.filter(x => x.outcome_kind === 'policy_denial').length, 1, 'completed member replay stays refused');
+  eventlog.closeEventLog();
+  assert.equal((results.resolveReviewedPlanStepResult(identity, 'save') as any).items.length, 3);
+  const terminal = terminalPreparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: 'All three current records saved.' });
+  assert.equal(terminal.status, 'ready', JSON.stringify(terminal));
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'All three current records saved.' } });
+  assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
+});
+
+test('repeated reads feed repeated writes with exact member results across reopen and terminal commit', async () => {
+  const local = await import('./local-planning-capability.js');
+  const { getCoreTools } = await import('../../tools/registry.js');
+  const publisher = await import('../../tools/publish-plan.js');
+  const plans = await import('./plan-artifacts.js');
+  const reviewed = await import('./reviewed-plan-runtime.js');
+  const results = await import('./reviewed-plan-results.js');
+  const execution = await import('./accepted-plan-execution.js');
+  const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'chained-collection', kind: 'chat' });
+  let source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan to read the current batch and save each exact record to its stated local path.', taskMode: { version: 1, kind: 'plan' } } });
+  let identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  let primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  const names = new Set(getCoreTools().map(t => t.name));
+  const candidates = await Promise.all(['read_file', 'write_file'].map(name => local.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'work_call', configuredNames: names })));
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates: candidates as any });
+  const records = Array.from({ length: 3 }, (_, i) => ({ id: path.join(HOME, `chain-output-${i}.md`), sourcePath: path.join(HOME, `chain-input-${i}.txt`), content: `Current result ${i}\n` }));
+  for (const record of records) writeFileSync(record.sourcePath, 'old content');
+  const outline = await publisher.preparePlanOutline({ ...identity, planning: primed.planning, ready: true, raw: {
+    steps: [
+      { id: 'read', action: 'Read each current source.', capabilityRef: refs.read_file, verification: 'Each input read once.',
+        forEach: { items: records.map(({ id, sourcePath }) => ({ id, path: sourcePath })), memberIdPath: '/id', bindings: [{ itemPath: '/path', targetPath: '/path' }] } },
+      { id: 'save', action: 'Save each corresponding result.', capabilityRef: refs.write_file, verification: 'Each current result saved once under its own member ID.',
+        forEach: { producerStepId: 'read', bindings: [{ itemPath: '/memberId', targetPath: '/path' }, { itemPath: '/result', targetPath: '/content' }] } },
+    ], successCriteria: ['All current results saved once.'],
+  } });
+  const graph = outline.executionDraft as any;
+  assert.equal(graph.topology.universes.length, 1, 'repeated stages share member identity');
+  assert.deepEqual(graph.topology.operations[1].cardinality, graph.topology.operations[0].cardinality);
+  assert.deepEqual(graph.topology.operations[1].dataFrom, ['read']);
+  const artifact = plans.publishPlanRevision({ ...identity, principalId: session.id, fullText: 'Read the whole current batch and save each exact record. The collection is determined by the execution-time read.', structuredPlan: outline, readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  for (const record of records) writeFileSync(record.sourcePath, record.content);
+  assert.doesNotMatch(JSON.stringify(artifact), /Current result/);
+  source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+  identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  plans.claimPlanExecution({ ...identity, principalId: session.id, executeRef: ref });
+  primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) throw new Error(primed.reason);
+  await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  const input = execution.acceptedPlanExecutionText(session.id, source.seq)!;
+  const built = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: input, allowToolJit: true, hostFreshPlanning: primed.planning });
+  const write = (index: number, callId = `save-member-${index}`) => toolCall(callId, 'work_call', { requirement_id: 'save', universe_item_id: records[index]!.id, name: 'write_file', args_json: JSON.stringify({ path: records[index]!.id, content: records[index]!.content }) });
+  const frames = [
+    [toolCall('activate-collection', 'plan_task', {})],
+    records.map((record, i) => toolCall(`read-chain-${i}`, 'work_call', { requirement_id: 'read', universe_item_id: record.id, name: 'read_file', args_json: JSON.stringify({ path: record.sourcePath }) })),
+    [write(0)], [write(1), write(2)], [write(0, 'replay-member-0')], [textMessage('All current records saved exactly once.')],
+  ];
+  let frame = 0;
+  const model = { async getResponse(request: unknown) {
+    if (frame === 2) {
+      const exact = { ...identity, stepId: 'read', memberId: records[0]!.id, toolName: 'read_file', args: { path: records[0]!.sourcePath } };
+      assert.equal(reviewed.reviewedPlanMemberReadArgumentsMatch(exact), true);
+      assert.equal(reviewed.reviewedPlanMemberReadArgumentsMatch({ ...exact, memberId: records[1]!.id }), false);
+      assert.equal(reviewed.reviewedPlanMemberReadArgumentsMatch({ ...exact, sourceUserSeq: source.seq + 1 }), false);
+      assert.equal(reviewed.reviewedPlanMemberReadArgumentsMatch({ ...exact, args: { path: records[0]!.sourcePath, max_chars: 1 } }), false);
+    }
+    if (frame === 3) {
+      eventlog.closeEventLog();
+      assert.ok(existsSync(records[0]!.id), JSON.stringify((request as any).input?.filter((item: any) => item.type === 'function_call_result')));
+      assert.equal(readFileSync(records[0]!.id, 'utf8'), records[0]!.content);
+      assert.throws(() => results.resolveReviewedPlanStepResult(identity, 'save'), /not complete/);
+    }
+    const output = frames[Math.min(frame++, frames.length - 1)];
+    return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 }, output, responseId: `collection-${frame}` };
+  }, getStreamedResponse: testModelStream };
+  const tools = built.tools.filter(t => ['plan_task', 'work_call'].includes(t.name));
+  const agent = { model, tools };
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: tools, activeToolNames: tools.map(t => t.name), policyHash: 'chained-collection', budget: { maxUncachedTokens: 100_000, maxModelCalls: 8, maxToolCalls: 10, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok); if (!sealed.ok) return;
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope); capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(10) }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: input }] as never, { maxTurns: 8, hostTurnEngine: 'host_v1', context: identity } as never));
+  assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+  for (const record of records) assert.equal(readFileSync(record.id, 'utf8'), record.content);
+  const settlements = eventlog.openEventLog().prepare('SELECT outcome_kind,mutating FROM logical_call_settlements WHERE session_id=? AND source_user_seq=?').all(session.id, source.seq) as any[];
+  assert.equal(settlements.filter(x => x.mutating && x.outcome_kind === 'succeeded').length, 3, JSON.stringify(settlements));
+  assert.equal(settlements.filter(x => x.outcome_kind === 'policy_denial').length, 1, 'completed member replay stays refused');
+  eventlog.closeEventLog();
+  assert.equal((results.resolveReviewedPlanStepResult(identity, 'save') as any).items.length, 3);
+  const terminal = terminalPreparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: 'All three current records saved.' });
+  assert.equal(terminal.status, 'ready', JSON.stringify(terminal));
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'All three current records saved.' } });
+  assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
 });

@@ -34,6 +34,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessRunContextStorage,
+  hostOwnsLogicalCallAccounting,
   attestToolLocalInputInvalidity,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
@@ -734,6 +735,10 @@ export interface BuildCallToolOptions {
    * calendar-invite run looped 4× / ~3.5 min calling `memory_recall_all` via
    * call_tool before self-correcting. */
   firstClassNames?: ReadonlySet<string>;
+  /** Exact turn-configured local instances (for example connected discovery).
+   * A wrapper must not fall back to a global instance with different context.
+   * Reachability, arguments and all inner brackets still apply. */
+  localToolOverrides?: ReadonlyMap<string, Tool<RuntimeContextValue>>;
   /** Explicit per-turn denials also apply to external MCP names. */
   deniedNames?: ReadonlySet<string>;
   /** Exact external MCP authority for this dispatcher. `undefined` falls back
@@ -883,9 +888,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     ): Promise<string> => {
       let resolvedRefusalTarget: ResolvedCarrierTarget | undefined;
       // Exactly-once budget contract: the harness wrapper exempts call_tool
-      // from the per-turn counter (the INNER tool's wrapper charges it on the
+      // from the per-turn counter on the legacy lane (the INNER wrapper charges it on the
       // dispatch path). Every early return below therefore charges the
-      // ambient counter itself — otherwise a model looping on failing
+      // ambient counter itself unless the host already charged this exact call — otherwise a model looping on failing
       // call_tool invocations would burn ZERO tool budget and lose the
       // deterministic runaway ceiling.
       // Identity for a refusal raised BEFORE the resolver refines the contract.
@@ -927,8 +932,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         payload: Record<string, unknown>,
         classification: 'invalid_arguments' | 'policy_denial' = 'invalid_arguments',
       ): string => {
-        const counter = harnessRunContextStorage.getStore()?.counter;
-        if (counter) {
+        const accountingContext = harnessRunContextStorage.getStore();
+        const counter = accountingContext?.counter;
+        if (counter && !hostOwnsLogicalCallAccounting(accountingContext!.sessionId, details?.toolCall?.callId ?? details?.toolCall?.id)) {
           // The ceiling is terminal for this turn. Returning another nominal
           // refusal here would cost zero calls and let the model retry forever.
           if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
@@ -1403,6 +1409,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           // callback as proof of a plan made that valid read demand a token
           // which, by construction, could never exist.
           Boolean(options.aroundResolvedDispatch && currentExpectedWorkBinding()),
+          options.localToolOverrides?.get(target) as never,
         );
       const dispatchWithCarrierPreparation = async (): Promise<unknown> => {
         if (!remappedCatalogPreparation) return dispatch();

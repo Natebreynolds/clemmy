@@ -431,3 +431,22 @@ test('tool_search_scope records whether provider candidate sources were attached
       'no sources means no kinds; a provider-blind surface says so plainly');
   }
 });
+
+
+test('Plan instructions and logged tool surface permit investigation before a ready publication', async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: {
+    text: 'Inspect the supplied documents and propose the work.', taskMode: { version: 1, kind: 'plan' },
+  } });
+  const agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: String(source.data.text), allowToolJit: true });
+  const instructions = await renderInstructions(agent);
+  const plan = instructions.split('[explicit-plan-mode]')[1]?.split('\n')[0] ?? '';
+  assert.match(plan, /discover missing ones when needed/);
+  assert.match(plan, /read-only shell commands remain available/);
+  assert.match(plan, /There is no mandatory separate shape-approval round/);
+  assert.doesNotMatch(plan, /do not go and gather it|Once the user approves the shape/);
+  const policy = listEvents(session.id, { types: ['tool_policy_resolved'] }).at(-1)!;
+  assert.equal(policy.data.sourceUserSeq, source.seq);
+  assert.deepEqual(new Set(policy.data.resolvedToolNames as string[]), namesOf(agent));
+  assert.ok((policy.data.resolvedToolNames as string[]).includes('publish_plan'));
+});

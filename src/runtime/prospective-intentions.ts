@@ -956,7 +956,7 @@ function projectedIntentionState(intention: ProspectiveIntention): {
   return {
     label: `PRIOR-WORK CANDIDATE; child status: ${childStatus}`,
     reconciliation:
-      '; reconcile the child task before resuming or starting duplicate work—the parent index is not proof of active or completed execution',
+      `; resource: background_task ${JSON.stringify(intention.sourceId)}; inspect with background_task_status. This is advisory prior-work context, not an obligation inherited by the current request. Reconcile the child task if resuming it, reporting its current status, or about to repeat its effects; a fresh read-only plan need not investigate it. The parent index is not proof of active or completed execution`,
   };
 }
 
@@ -992,7 +992,16 @@ export function buildProspectiveIntentionContext(input: {
       intention.action.ref,
       intention.trigger.kind === 'event' ? intention.trigger.eventType : '',
     ].filter(Boolean).join(' ');
-    const overlap = overlapCount(queryWords, words(haystack));
+    const intentionWords = words(haystack);
+    const overlap = overlapCount(queryWords, intentionWords);
+    // Two shared integration names are not a shared task. Account for the
+    // amount of unmatched purpose as well; a longer request may still fully
+    // contain a short prior objective. Exact durable references bypass text
+    // relevance, so explicit recall never depends on the original wording.
+    const coverage = overlap / Math.max(1, Math.min(queryWords.size, intentionWords.size));
+    const referenceMatch = [intention.id, intention.sourceId, intention.action.ref, intention.goalId]
+      .some(ref => Boolean(ref && ref.length > 2 && new RegExp(`(?:^|[^a-z0-9_-])${ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[^a-z0-9_-])`, 'i').test(query)));
+    const related = referenceMatch || (overlap >= 2 && coverage >= 0.5);
     const sameSession = Boolean(input.sessionId && intention.sessionId === input.sessionId);
     const due = intention.status === 'due'
       || (intention.dueAt ? Date.parse(intention.dueAt) <= nowMs : false);
@@ -1005,16 +1014,14 @@ export function buildProspectiveIntentionContext(input: {
     const sessionRelevant = sameSession && (
       overview
       || followUp
-      || overlap >= 1
-      || due
-      || blocked
+      || related
+      || (overlap >= 1 && coverage >= 0.5)
     );
     const eligible = monitorRelevant && (
       sessionRelevant
       || overview
-      || overlap >= 2
-      || (prospectiveLanguage && overlap >= 1)
-      || ((due || blocked) && overlap >= 1)
+      || related
+      || (prospectiveLanguage && overlap >= 1 && coverage >= 0.5)
     );
     const score = (sameSession ? 20 : 0)
       + (overview ? 8 : 0)

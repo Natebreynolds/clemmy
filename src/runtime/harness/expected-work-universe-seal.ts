@@ -118,7 +118,7 @@ function memberIdOf(
  * provider string is untouched: a provider that returns text is making a
  * claim about its own shape, and we do not reinterpret it.
  */
-function sourceRecordsFor(
+export function sourceRecordsFor(
   value: SuccessfulSettlementResultEvidence,
 ): { ok: true; records: unknown[] } | { ok: false; reason: 'no_collection' | 'count_mismatch' } {
   const direct = recordsAtRecordPath(value.rawPayload, value.handle.recordPath);

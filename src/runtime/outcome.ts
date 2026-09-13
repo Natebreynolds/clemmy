@@ -22,10 +22,12 @@ import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
 import { appendEvent, getSession as getHarnessSession, listEvents, type EventRow } from './harness/eventlog.js';
-import type { RunConversationOptions } from './harness/loop.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import pino from 'pino';
+import { createHash } from 'node:crypto';
+import { commitTurnOutcome } from './harness/delivery-committer.js';
+import { turnOutcomeId, type TurnOutcome } from './harness/turn-outcome.js';
 
 const logger = pino({ name: 'clementine-next.outcome' });
 
@@ -100,10 +102,9 @@ export interface DeliverContext {
   /** Detail truncation cap. */
   maxDetailChars?: number;
   /**
-   * Report-back v2 (2026-06-11): when true and the origin is an IDLE chat
-   * session, fire ONE proactive conversation turn so Clementine SPEAKS the
-   * outcome into the conversation immediately ("test passed — fire it now or
-   * wait for the schedule?") instead of waiting for the user's next message.
+   * When true and the origin is an idle chat, publish the worker-authored
+   * outcome through the canonical presentation committer immediately.
+   * No additional model turn or new work assignment is needed.
    * Falls back to the passive synthetic-turn staging whenever the session is
    * busy, non-chat, or anything errors. Best-effort by construction.
    */
@@ -278,64 +279,6 @@ function appendGoalEvidence(sessionId: string, outcome: Outcome, ctx: DeliverCon
   } catch { /* goal ledger is best-effort */ }
 }
 
-function proactiveGoalTail(status: OutcomeStatus, goalObjective?: string): string {
-  const objective = goalObjective?.trim();
-  if (!objective) return '';
-  const head = ` This conversation has a pinned goal ("${objective.slice(0, 120)}"). `;
-  if (status === 'done') {
-    return head
-      + 'If this outcome unblocks the next step of that goal, CONTINUE the goal work now (do not just narrate); '
-      + 'if it does not, relay briefly and stop.';
-  }
-  if (status === 'needs_input') {
-    return head
-      + 'The answer may unblock that goal, but do not continue goal work until the user answers.';
-  }
-  return head
-    + 'If this blocks the goal, say that plainly; do not continue or re-run anything in this turn.';
-}
-
-export function renderProactiveOutcomeDirective(
-  outcome: Pick<Outcome, 'status'>,
-  ctx: Pick<DeliverContext, 'sourceLabel' | 'sourceId'>,
-  goalObjective?: string,
-): string {
-  const ref = `[${ctx.sourceLabel} ${ctx.sourceId}]`;
-  const goalTail = proactiveGoalTail(outcome.status, goalObjective);
-  switch (outcome.status) {
-    case 'needs_input':
-      return `A ${ctx.sourceLabel} you started from this conversation needs your input (see the latest ${ref} NEEDS INPUT note in context). `
-        + 'Ask the user for the required input or action NOW in one concise but COMPLETE update: preserve any completed progress and key evidence in the note, then name the exact remaining dependency. '
-        + 'Do not guess, do not replay prior work or side effects, and do not describe the whole objective as finished. The saved task will resume from its checkpoint after the user responds.'
-        + goalTail;
-    case 'failed':
-      return `A ${ctx.sourceLabel} you started from this conversation FAILED (see the latest ${ref} FAILED note in context). `
-        + 'Relay it NOW without erasing partial success: first state any completed work, saved artifacts, or committed actions from the note; then name what stopped and the next safe action. '
-        + 'Do not re-run anything in this turn and never imply that proven work disappeared.'
-        + goalTail;
-    case 'blocked':
-      // 'blocked' is a LANE, not one shape: a run that couldn't produce its
-      // deliverable AND a run that completed but tripped a quality advisory
-      // both land here. The directive must not assert "a prerequisite is
-      // missing" for a delivered result (live 2026-07-23: a completed run
-      // with a judge advisory was relayed as BLOCKED-missing-prerequisite,
-      // contradicting the "✓ completed — please review" note one line up).
-      return `A ${ctx.sourceLabel} you started from this conversation NEEDS ATTENTION (see the latest ${ref} note in context). `
-        + 'Relay the note\'s substance NOW in one concise but COMPLETE message, matching what it actually says and preserving completed progress: '
-        + 'if it delivered a result with a quality warning, lead with the result and what to review; '
-        + 'if a prerequisite was missing, lead with what is missing and what decision or action is needed. '
-        + 'Always include saved artifacts or completed item counts from the execution-evidence block. '
-        + 'Never call the work failed or blocked if the note says it completed. Do not replay prior work or side effects in this turn.'
-        + goalTail;
-    case 'done':
-      return `A ${ctx.sourceLabel} you started from this conversation just finished (see the latest ${ref} note in context). `
-        + 'Relay the outcome to the user NOW in one short message: lead with pass/fail and the key evidence. '
-        + 'If it passed and the workflow is enabled, end by asking: fire it off now, or wait for the next scheduled run? '
-        + 'If it failed, say exactly what you will fix. Do not re-run anything in this turn.'
-        + goalTail;
-  }
-}
-
 function isSyntheticOutcomeForSource(
   event: Pick<EventRow, 'type' | 'data'>,
   ctx: Pick<DeliverContext, 'sourceLabel' | 'sourceId'>,
@@ -411,108 +354,63 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
   })();
 }
 
+/** The worker has already authored and settled the result. Relay that exact
+ * outcome through the public committer, without asking a new agent to restate
+ * it or treating a machine-authored notification as a human clarification.
+ * The synthetic source is delivery identity only; it grants no tool authority. */
 async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx: DeliverContext): Promise<void> {
-  const [{ runConversation }, { buildOrchestratorAgent }, { buildChatFalloverWiring }] = await Promise.all([
-    import('./harness/loop.js'),
-    import('../agents/orchestrator.js'),
-    import('./harness/respond-bridge.js'),
-  ]);
-  // If the origin session has an active goal, this finished sub-work may
-  // unblock it — tell the model to continue the goal rather than just
-  // narrate. This is the EVENT-DRIVEN half of self-resumption (the
-  // heartbeat in goal-resume.ts is the fallback for stalls/sleep).
-  let goalObjective = '';
-  try {
-    const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
-    const goal = getActiveGoalForSession(sessionId);
-    if (goal) {
-      const plan = goal.approvedPlan ?? goal.plan;
-      goalObjective = plan.objective ?? '';
-    }
-  } catch { /* goal read is best-effort */ }
-  const directive = renderProactiveOutcomeDirective(outcome, ctx, goalObjective);
-  const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
-  // W1c — the report-back already runs on the DEFAULT brain (= the origin
-  // chat's brain, since no model override). Give it the same chat
-  // step-boundary fallover as a normal chat turn so a transient on that
-  // brain doesn't drop the report. Best-effort; absent = today's behavior.
-  const fallover = buildChatFalloverWiring({ userInput: directive, sessionId, buildAgent: buildOrchestratorAgent });
-  // Record the machine directive as a SYNTHETIC user turn (same flags the
-  // passive outcome turn above carries) so the desktop transcript never
-  // shows "Relay the outcome to the user NOW…" as if the user typed it —
-  // the user-facing read paths skip data.synthetic. The model still
-  // receives the directive via runConversation's `input`; passing
-  // reuseRecordedUserInput stops the loop from re-logging it as a plain
-  // (un-flagged) user turn. Best-effort — the surrounding catch covers it.
-  await runRecordedProactiveReportTurn({
-    sessionId,
-    directive,
-    outcome,
-    ctx,
-    conversationOptions: {
-      agent,
-      judgeCompletion: false,
-      falloverModelIds: fallover.falloverModelIds,
-      rebuildAgentForBrain: fallover.rebuildAgentForBrain,
-    },
-  }, runConversation);
+  publishProactiveOutcome(sessionId, outcome, ctx);
 }
 
-type ProactiveReportConversationOptions = Omit<
-  RunConversationOptions,
-  'sessionId' | 'input' | 'reuseRecordedUserInput' | 'sourceUserSeq'
->;
+export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
+  const text = renderPublicOutcomeText(outcome, ctx);
+  const digest = createHash('sha256').update(JSON.stringify({
+    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status, text,
+  })).digest('hex');
+  // A crash between acceptance and publication reuses the same identity. The
+  // committer is idempotent; another status or another question is a new report.
+  const source = listEvents(sessionId, { types: ['user_input_received'] }).find((event) => (
+    event.data.synthetic === true && event.data.source === 'outcome'
+    && event.data.deliveryPhase === 'report' && event.data.outcomeDigest === digest
+  )) ?? appendEvent({
+    sessionId, turn: 0, role: 'user', type: 'user_input_received',
+    data: { text, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel,
+      sourceId: ctx.sourceId, status: outcome.status, deliveryPhase: 'report', outcomeDigest: digest },
+  });
+  const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn };
+  const base = { version: 2 as const, id: turnOutcomeId(identity), identity };
+  const terminal: TurnOutcome = outcome.status === 'done'
+    ? { ...base, status: 'done', resumable: false, presentation: { kind: 'answer', text } }
+    : outcome.status === 'needs_input'
+      ? { ...base, status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text } }
+      : outcome.status === 'blocked'
+        ? { ...base, status: 'blocked', resumable: outcome.resumable === true, presentation: { kind: 'blocked', text } }
+        : { ...base, status: 'failed', resumable: false, presentation: { kind: 'error', text } };
+  commitTurnOutcome(terminal);
+}
 
-/**
- * Accept the synthetic directive before starting its model turn and bind that
- * turn to the exact row returned by appendEvent. Looking up the session's
- * latest input inside runConversation is unsafe: a concurrent human message
- * can arrive between these two operations and must remain a different turn.
- */
-async function runRecordedProactiveReportTurn(
-  input: {
-    sessionId: string;
-    directive: string;
-    outcome: Pick<Outcome, 'status'>;
-    ctx: Pick<DeliverContext, 'sourceLabel' | 'sourceId'>;
-    conversationOptions: ProactiveReportConversationOptions;
-  },
-  runConversationImpl: (options: RunConversationOptions) => Promise<unknown>,
-): Promise<EventRow> {
-  const directiveSource = appendEvent({
-    sessionId: input.sessionId,
-    turn: 0,
-    role: 'user',
-    type: 'user_input_received',
-    data: {
-      text: input.directive,
-      synthetic: true,
-      source: 'outcome',
-      sourceLabel: input.ctx.sourceLabel,
-      sourceId: input.ctx.sourceId,
-      status: input.outcome.status,
-      deliveryPhase: 'directive',
-    },
-  });
-  await runConversationImpl({
-    ...input.conversationOptions,
-    sessionId: input.sessionId,
-    input: input.directive,
-    reuseRecordedUserInput: true,
-    sourceUserSeq: directiveSource.seq,
-    suppressMemoryCapture: true,
-  });
-  return directiveSource;
+/** Public result, without runtime instructions or a second truncation pass.
+ * Large results already carry their durable file reference in the outbox. */
+export function renderPublicOutcomeText(outcome: Outcome, ctx: DeliverContext): string {
+  const parts: string[] = [];
+  const evidence = renderOutcomeEvidence(outcome.evidence);
+  if (outcome.status !== 'done' && evidence) parts.push(evidence);
+  if (outcome.summary?.trim()) parts.push(outcome.summary.trim());
+  if (outcome.detail?.trim() && outcome.detail.trim() !== outcome.summary?.trim()) parts.push(outcome.detail.trim());
+  if (outcome.status === 'done' && evidence) parts.push(evidence);
+  if (outcome.blocker?.trim() && !parts.some(part => part.includes(outcome.blocker!.trim()))) {
+    parts.push(outcome.blocker.trim());
+  }
+  if (outcome.nextAction?.trim() && !parts.some(part => part.includes(outcome.nextAction!.trim()))) {
+    parts.push(outcome.nextAction.trim());
+  }
+  return parts.join('\n\n') || `${ctx.title || ctx.sourceLabel}: ${DEFAULT_HEAD_WORDS[outcome.status]}.`;
 }
 
 let fireProactiveReportTurnImpl: typeof fireProactiveReportTurn = fireProactiveReportTurn;
 export function setProactiveReportFireForTest(fn: typeof fireProactiveReportTurn | null): void {
   fireProactiveReportTurnImpl = fn ?? fireProactiveReportTurn;
 }
-
-export const __test__ = {
-  runRecordedProactiveReportTurn,
-};
 
 // ---------------------------------------------------------------------------
 // Deferred proactive reports (2026-07-21): a proactive report that finds its

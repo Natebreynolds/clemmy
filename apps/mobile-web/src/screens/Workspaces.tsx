@@ -22,6 +22,7 @@ import {
   type WorkspaceSummary,
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
+import { ChatBackButton } from '../components/ChatBackButton';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
@@ -546,7 +547,7 @@ function IssueDisclosure({ issues }: { issues: string[] }) {
 function DetailHeader({ title, onBack }: { title: string; onBack: () => void }) {
   return (
     <div class="chat-header">
-      <button class="chat-back" onClick={() => { haptic('light'); onBack(); }} aria-label="Back">←</button>
+      <ChatBackButton onClick={() => { haptic('light'); onBack(); }} />
       <div class="chat-title">{title}</div>
     </div>
   );

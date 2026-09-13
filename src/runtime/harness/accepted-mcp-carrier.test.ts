@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import type { CapabilityManifestV1 } from './capability-manifest.js';
 import type { MCPServer } from '@openai/agents';
 import type { ManagedMcpServer } from '../../types.js';
 
@@ -34,7 +35,7 @@ interface ToolState {
   name: string;
   description: string;
   inputSchema: Readonly<Record<string, unknown>>;
-  annotations: { readOnlyHint: true; destructiveHint: false };
+  annotations: { readOnlyHint: boolean; destructiveHint: false };
 }
 
 function generatedRuntime() {
@@ -122,10 +123,13 @@ async function acquireGenericMcpCapability() {
   return { live, surfaces, installed: result };
 }
 
-function resolveInsideAcceptedCall(input: {
-  installed: Awaited<ReturnType<typeof acquireGenericMcpCapability>>['installed'];
+interface AcceptedCallFixture {
+  installed: { manifest: CapabilityManifestV1 };
   beforeResolve?: () => void;
-}) {
+}
+function resolveInsideAcceptedCall(input: AcceptedCallFixture): carrier.AcceptedExactMcpCarrierResolution;
+function resolveInsideAcceptedCall<T>(input: AcceptedCallFixture & { invoke: (args: Record<string, unknown>, sessionId: string) => T }): T;
+function resolveInsideAcceptedCall<T>(input: AcceptedCallFixture & { invoke?: (args: Record<string, unknown>, sessionId: string) => T }): T | carrier.AcceptedExactMcpCarrierResolution {
   const { manifest } = input.installed;
   const entry = catalogs.peekHostCapabilityCatalogFactory()?.get(manifest.manifestId);
   const canonical = entry ? catalogs.canonicalCatalogIdentityOf(entry) : null;
@@ -174,7 +178,7 @@ function resolveInsideAcceptedCall(input: {
     logicalToolCallId,
     toolName: contract.toolName,
     argumentDigest: contract.argumentDigest,
-    effect: 'read' as const,
+    effect: manifest.effect,
     bindingKind: 'catalog_manifest' as const,
     capabilityId: canonical.capabilityId,
     providerInputSchemaDigest: canonical.providerInputSchemaDigest,
@@ -213,11 +217,11 @@ function resolveInsideAcceptedCall(input: {
       acceptedTaskId,
       toolName: contract.toolName,
       argumentDigest: contract.argumentDigest,
-      effect: 'read',
+      effect: manifest.effect,
     });
     assert.equal(persisted.status, 'bound', JSON.stringify(persisted));
     input.beforeResolve?.();
-    return carrier.resolveAcceptedExactMcpCarrier(manifest.operationId);
+    return input.invoke ? input.invoke(args, session.id) : carrier.resolveAcceptedExactMcpCarrier(manifest.operationId);
   }));
 }
 
@@ -291,4 +295,26 @@ test('missing exact invoke port refuses before native-MCP provider I/O', async (
   });
   assert.equal(resolved.ok, false);
   assert.deepEqual(acquired.live.counts, before);
+});
+
+
+test('a native MCP mutation still requires its exact nested consent before any provider I/O', async () => {
+  const live = generatedRuntime();
+  live.tool.annotations.readOnlyHint = false;
+  resetAuthoritySurfaces();
+  const installed = await mcp.createProductionMcpReadCarrier({ serverName: live.server, runtime: live.runtime })
+    .materializeExact({ operationId: live.tool.name, inputSchema: live.tool.inputSchema });
+  assert.equal(installed.status, 'installed', JSON.stringify(installed));
+  if (installed.status !== 'installed') return;
+  assert.equal(installed.manifest.effect, 'external_write');
+  const { currentLiveReadPlanningDefinitionFromEntry } = await import('./live-read-planning-authority.js');
+  assert.equal(currentLiveReadPlanningDefinitionFromEntry(catalogs.peekHostCapabilityCatalogFactory()!.get(installed.manifest.manifestId)!), null,
+    'definition reuse must not admit a write through read-planning authority');
+  const { ToolCallsCounter } = await import('./brackets.js');
+  const before = { ...live.counts };
+  await assert.rejects(resolveInsideAcceptedCall({ installed, invoke: (args, sessionId) => carrier.invokeAcceptedExactMcpCarrier({
+    requestedOperationId: installed.manifest.operationId, args, sessionId,
+    counter: new ToolCallsCounter(5), requiresNestedAdmission: true,
+  }) }), /exact accepted work\/consent admission is missing/);
+  assert.deepEqual(live.counts, before, 'neither preparation nor business dispatch ran without mutation consent');
 });

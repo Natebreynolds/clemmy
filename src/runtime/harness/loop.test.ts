@@ -2034,6 +2034,36 @@ test('dynamic reasoning effort: background (workflow) complex turn → high (no 
   assert.equal(listEvents(sess.id, { types: ['reasoning_effort'] })[0].data.effort, 'high');
 });
 
+test('explicit Plan carries high effort from the accepted source even on a short continuation with dynamic selection off', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_DYNAMIC_REASONING;
+  process.env.CLEMMY_DYNAMIC_REASONING = 'off';
+  try {
+    for (const priorEffort of [undefined, 'xhigh'] as const) {
+      const agent = makeAgentStub() as any;
+      if (priorEffort) agent.modelSettings = { reasoning: { effort: priorEffort } };
+      const session = HarnessSession.create({ kind: 'chat', title: 'effort-explicit-plan' });
+      const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+        type: 'user_input_received', data: { text: 'Continue.', taskMode: { version: 1, kind: 'plan' } } });
+      const runRunner: RunRunnerFn = async (_runner, selectedAgent, items) => {
+        assert.equal((selectedAgent as any).modelSettings?.reasoning?.effort, priorEffort ?? 'high');
+        return { history: items, lastResponseId: 'plan-effort', finalOutput: { ok: true } };
+      };
+      await runTurn({ agent, sessionId: session.id, sourceUserSeq: source.seq,
+        input: 'Continue.', makeRunner: makeRunnerStub, runRunner });
+      const event = listEvents(session.id, { types: ['reasoning_effort'] })[0];
+      assert.ok(event, 'the real loop must select effort before entering the model');
+      assert.equal(event.data.effort, priorEffort ?? 'high');
+      assert.equal(event.data.taskMode, 'plan');
+      assert.equal(event.data.sourceUserSeq, source.seq);
+      assert.match(String(event.data.reason), /^explicit-plan/);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_DYNAMIC_REASONING;
+    else process.env.CLEMMY_DYNAMIC_REASONING = prev;
+  }
+});
+
 test('dynamic reasoning effort: kill-switch off leaves the agent untouched (SDK default rides)', async () => {
   resetEventLog();
   const prev = process.env.CLEMMY_DYNAMIC_REASONING;

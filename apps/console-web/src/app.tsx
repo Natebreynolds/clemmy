@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import { AppShell } from './components/AppShell';
 import { Chat } from './screens/Chat';
 import { Home } from './screens/Home';
+import { HomeMock } from './screens/HomeMock';
 import { useHomePreferences } from './lib/home-prefs';
 import { lastChatSession } from './lib/last-session';
 import { listSpaces } from './lib/spaces';
@@ -164,6 +165,9 @@ export function App() {
           {/* Transparent companion surface: deliberately outside AppShell so
               the native notch helper never inherits dashboard chrome. */}
           <Route path="/notch" element={<NotchSurface />} />
+          {/* Fixture-only Home command-center mock. Outside AppShell so it
+              does not depend on the daemon, and does not replace /home. */}
+          <Route path="/dev/home-mock" element={<HomeMock />} />
 
           <Route element={<AppShell />}>
             <Route index element={<LandingRedirect />} />

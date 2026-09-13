@@ -16,6 +16,7 @@ import {
   ToolCallsCounter,
   ToolCallsLimitExceeded,
   harnessRunContextStorage,
+  hostOwnsLogicalCallAccounting,
   pendingActionApprovalRequiredError,
   pendingNestedToolApprovalRequiredError,
 } from '../runtime/harness/brackets.js';
@@ -261,7 +262,7 @@ export function _innerDispatchLegacyMcpTestResolverActive(): boolean {
   return isolatedTestContractActive() && externalMcpResolverForTest !== null;
 }
 
-export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmission = false): Partial<Pick<
+export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmission = false, mirroredCallId?: string): Partial<Pick<
   NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
   | 'sourceUserSeq'
   | 'behaviorScopeId'
@@ -287,10 +288,10 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
     ...(parent.mcpToolScope !== undefined ? { mcpToolScope: parent.mcpToolScope } : {}),
     ...(parent.dispatchLease ? { dispatchLease: parent.dispatchLease } : {}),
     ...(parent.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
-    // A one-shot exact admission mirrors the logical call already charged by
-    // the host. Ordinary nested/batch calls remain separately accounted: an
+    // An exact consent admission or same-logical-call mirror retains the host
+    // charge. Ordinary nested/batch calls remain separately accounted: an
     // ambient parent flag cannot exempt arbitrary child work.
-    ...(exactHostAdmission && parent.hostOwnsToolAccounting === true
+    ...((exactHostAdmission || hostOwnsLogicalCallAccounting(sessionId, mirroredCallId)) && parent.hostOwnsToolAccounting === true
       ? { hostOwnsToolAccounting: true } : {}),
     // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
     // protects the MODEL's context window, but an inner recall never enters
@@ -303,8 +304,9 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
   };
 }
 
-async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean): Promise<unknown> {
-  const real = (await realToolsByName()).get(method);
+async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean, localToolOverride?: InvokableTool): Promise<unknown> {
+  const real = localToolOverride ?? (await realToolsByName()).get(method);
+  if (real?.name !== method) throw new Error('inner-dispatch: configured local tool identity mismatch');
   if (!real || typeof real.invoke !== 'function') {
     throw new Error(`inner-dispatch: unknown tool "${method}"`);
   }
@@ -373,7 +375,7 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
-  const inheritedContext = inheritedNestedHarnessContext(sessionId, exactHostAdmission);
+  const inheritedContext = inheritedNestedHarnessContext(sessionId, exactHostAdmission, batchItem === false ? callId : undefined);
   // Local SDK adapters reopen source identity from RunContext, not just ALS.
   // Carry the same accepted source into both contexts; otherwise the adapter
   // overwrites the exact bracket context with sourceUserSeq:undefined and a
@@ -459,7 +461,7 @@ async function dispatchInnerMcpTool(
   const activeCounter = counter ?? new ToolCallsCounter(1000);
   return withHarnessRunContext(
     {
-      ...inheritedNestedHarnessContext(sessionId),
+      ...inheritedNestedHarnessContext(sessionId, false, batchItem === false ? callId : undefined),
       sessionId,
       counter: activeCounter,
       nestedDispatch: true,
@@ -521,6 +523,7 @@ export async function dispatchBatchItemTool(
   mcpToolScopeOverride?: McpToolScope | null,
   pendingActionExecution?: PendingActionExecutionCapability,
   exactMcpRequiresNestedAdmission = false,
+  localToolOverride?: InvokableTool,
 ): Promise<unknown> {
   // `call_tool` is a transport mirror of the model's existing invocation, so
   // its inner bracket must carry the same logical id.  A real batch item has no
@@ -557,7 +560,7 @@ export async function dispatchBatchItemTool(
           pendingActionExecution,
           exactMcpRequiresNestedAdmission,
         )
-      : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem);
+      : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, localToolOverride);
     const ok = toolOutputLooksSuccessful(out);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;

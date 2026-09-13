@@ -372,7 +372,10 @@ test('cross-session background matches stay prior-work candidates and expose the
     );
     assert.match(context.text, /child status: awaiting_input/i);
     assert.match(context.text, /prior-work candidate/i);
-    assert.match(context.text, /reconcile the child task/i);
+    assert.match(context.text, /reconcile the child task if resuming it/i);
+    assert.match(context.text, /fresh read-only plan need not investigate it/);
+    assert.match(context.text, /resource: background_task "ventura-restaurants-sheet-email"; inspect with background_task_status/);
+    assert.doesNotMatch(context.text, /check_delegation/);
     assert.doesNotMatch(
       context.text,
       /\[ACTIVE\]/,
@@ -407,6 +410,25 @@ test('read-back validation does not recall unrelated due report-back commitments
   } finally {
     prospective.cancelProspectiveIntention(id, 'test_cleanup');
   }
+});
+
+test('shared integrations do not make different objectives relevant, while paraphrases and explicit recall still work', () => {
+  const id = prospective.prospectiveIntentionId('workflow_schedule', 'community-digest');
+  prospective.upsertProspectiveIntention({
+    id, sourceKind: 'workflow_schedule', sourceId: 'community-digest',
+    objective: 'Use Atlas and Beacon to summarize community discussions and report recurring customer complaints every morning.',
+    trigger: { kind: 'cron', expression: '30 7 * * 1-5' },
+    action: { kind: 'run_workflow', ref: 'community-digest' }, recurring: true,
+    sessionId: 'old-session',
+  });
+  try {
+    const context = (query: string) => prospective.buildProspectiveIntentionContext({ query, sessionId: 'new-session' });
+    assert.ok(!context('Use Atlas and Beacon to compare supplier prices, delivery terms and product warranties for a procurement report.').ids.includes(id));
+    assert.ok(context('What customer complaints recur in the community discussions?').ids.includes(id));
+    assert.ok(context('Check community-digest').ids.includes(id));
+    assert.ok(context('What scheduled commitments do I have?').ids.includes(id));
+    assert.equal(prospective.getProspectiveIntention(id)?.status, 'active', 'retrieval never pauses scheduled work');
+  } finally { prospective.cancelProspectiveIntention(id, 'test_cleanup'); }
 });
 
 test('blocked time commitments stay blocked until their source is explicitly resumed', () => {

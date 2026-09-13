@@ -549,7 +549,7 @@ test('progressLabel names the live work, not the compiled topology', () => {
   assert.equal(progressLabel(ev('tool_called', { tool: 'tool_search' })), 'Finding the right tool…');
   assert.equal(
     progressLabel(ev('tool_returned', { tool: 'tool_search' })),
-    'Working on it…',
+    null,
     'a finished lookup is not still finding a tool',
   );
   assert.equal(
@@ -772,9 +772,14 @@ test('reduceActivity: verdict_recorded appends a check row with door, scorecard,
   assert.equal(a[2].status, 'done');
 });
 
-test('reduceActivity: watcher_steer heartbeat appends a check row; other heartbeats stay invisible', () => {
+test('reduceActivity: host progress uses one live phase and watcher steering stays distinct', () => {
   let a = reduceActivity([], ev('heartbeat', { kind: 'progress_check_in', message: 'still going' }));
-  assert.equal(a.length, 0, 'generic heartbeats never clutter the strip');
+  assert.equal(a.length, 1);
+  assert.equal(a[0].id, 'model-phase-live');
+  a = reduceActivity(a, ev('heartbeat', { kind: 'progress_check_in', message: 'Read 4 sources; preparing the plan.' }));
+  assert.equal(a.length, 1, 'progress updates one phase rather than appending rows');
+  assert.equal(a[0].label, 'Read 4 sources; preparing the plan.');
+  a = [];
   a = reduceActivity(a, ev('heartbeat', { kind: 'watcher_steer', miss: 'criterion untouched', steer: 'address it before drafting' }));
   assert.equal(a.length, 1);
   assert.equal(a[0].kind, 'check');
@@ -1088,4 +1093,14 @@ test('the progress line says when a helper is handed work and when it finishes',
   assert.equal(progressLabel(ev('worker_started', { item: 'prospects' })), 'Handing prospects to a helper…');
   assert.equal(progressLabel(ev('worker_result', { item: 'prospects', ok: true })), 'Helper finished prospects');
   assert.equal(progressLabel(ev('worker_result', { item: 'prospects', ok: false })), 'Helper could not finish prospects');
+});
+
+
+test('discovery completion cannot erase meaningful progress between model calls', () => {
+  assert.equal(progressLabel(ev('tool_returned', { tool: 'tool_search', callId: 'discovery' })), null);
+  let rows = reduceActivity([], ev('turn_model_routed', { model: 'claude-sonnet-5', provider: 'claude' }));
+  assert.match(rows[0].label, /Sonnet/i);
+  rows = reduceActivity(rows, ev('heartbeat', { kind: 'progress_check_in', message: 'Read 4 sources; preparing the plan.' }));
+  assert.equal(rows.at(-1)?.status, 'running');
+  assert.equal(rows.at(-1)?.label, 'Read 4 sources; preparing the plan.');
 });

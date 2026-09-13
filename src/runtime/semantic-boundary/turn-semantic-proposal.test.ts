@@ -3,12 +3,16 @@ import test from 'node:test';
 import {
   isContextCheckedTurnSemanticProposalV1,
   validateTurnSemanticProposalV1,
+  CapabilityGroundingJudgeV1Schema,
+  GroundingDescriptorViewV1Schema,
+  groundingDescriptorViewFromHost,
   type HostCapabilityDescriptorV1,
   type TurnSemanticHostViewV1,
   type TurnSemanticProposalV1,
 } from './turn-semantic-proposal.js';
 import { admitTurnSemantics } from './admit-turn-semantics.js';
 import { workTopologyDigest } from '../graph/work-topology.js';
+import { WORK_ID_MAX_CHARS } from '../../shared/work-id.js';
 
 const activeGoal = { goalId: 'goal-17', baseRevision: 4 } as const;
 
@@ -1002,6 +1006,40 @@ test('kind-flow checking survives around a host-native operation in a mixed chai
   );
 });
 
+test('explicit topology orders incompatible tool results without claiming data transfer', () => {
+  const capabilities = [
+    descriptor('cap-1', 'read', 'arguments', 'result'),
+    descriptor('cap-2', 'local_write', 'artifact_content', 'file_revision'),
+  ];
+  const view = host({ catalog: { capabilityIds: new Set(capabilities.map(row => row.id)), workflowIds: new Set(), capabilities } });
+  const topology = {
+    version: 1 as const, universes: [], operations: [
+      { id: 'read', effect: 'read' as const, coverage: 'single' as const, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' as const } },
+      { id: 'write', effect: 'local_write' as const, coverage: null, dependsOn: ['read'], dataFrom: [] as string[], cardinality: { kind: 'once' as const } },
+    ],
+  };
+  const check = (value: typeof topology) => validateTurnSemanticProposalV1(proposal({ work: {
+    ...work(), cardinality: null, requestedEffect: 'local_write', destination: null, deliverables: [], topology: value,
+    operations: [
+      { id: 'read', role: 'source', requestedEffect: 'read', dependsOn: [], evidence: [], capabilityRef: 'cap-1' },
+      { id: 'write', role: 'destination', requestedEffect: 'local_write', dependsOn: ['read'], evidence: [], capabilityRef: 'cap-2' },
+    ],
+  } }), view);
+  // The reviewed outline retains its own compute output and exact content
+  // binding. Its tool-only projection preserves order, not raw-byte lineage.
+  const ordered = check(topology);
+  assert.equal(ordered.ok, true, JSON.stringify(ordered));
+  if (ordered.ok) assert.deepEqual(ordered.checked.proposal.work?.topology?.operations[1]?.dependsOn, ['read']);
+  const copied = structuredClone(topology);
+  copied.operations[1]!.dataFrom = ['read'];
+  const mismatch = check(copied);
+  assert.equal(mismatch.ok, false, 'declared raw data flow still needs compatible kinds');
+  if (!mismatch.ok) assert.ok(mismatch.issues.some(row => row.code === 'dag_kind_mismatch' && row.path.endsWith('.dataFrom')));
+  const missing = structuredClone(topology);
+  missing.operations[1]!.dependsOn = ['absent'];
+  assert.equal(check(missing).ok, false, 'ordering prerequisites must still exist');
+});
+
 
 // ─── Candidates are hints, not authority (live 2026-08-25, unified lane) ─────
 //
@@ -1513,6 +1551,31 @@ test('a host-minted live capability id longer than 128 chars is not an invalid c
     },
   }));
   assert.ok(!issueCodes(result).includes('host_invalid_catalog_id'), JSON.stringify(issueCodes(result)));
+});
+
+test('host capability references survive semantic submission, grounding and exact catalog checks', () => {
+  const reacquired = `cap:live:v1:${'c'.repeat(24)}:${'b'.repeat(24)}:${'1'.repeat(64)}:reacquired:${'d'.repeat(16)}`;
+  for (const id of [reacquired, `cap:${'a'.repeat(WORK_ID_MAX_CHARS - 4)}`]) {
+    const card = host();
+    const read = { ...card.catalog.capabilities![0], id };
+    card.catalog = { ...card.catalog,
+      capabilityIds: new Set([id, 'cap-2', 'cap-collect']),
+      capabilities: [read, ...card.catalog.capabilities!.slice(1)],
+    };
+    const submitted = proposal();
+    submitted.goal!.candidates[0].id = id;
+    submitted.work!.operations[0].capabilityRef = id;
+    const result = validateTurnSemanticProposalV1(submitted, card);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(GroundingDescriptorViewV1Schema.safeParse(groundingDescriptorViewFromHost(read)).success, true);
+    const verdict = { verdict: 'entailed', capabilityRef: id, manifestDigest: 'a'.repeat(64), proposalDigest: 'b'.repeat(64), rationale: 'Exact host binding.' };
+    assert.equal(CapabilityGroundingJudgeV1Schema.safeParse(verdict).success, true);
+    assert.equal(CapabilityGroundingJudgeV1Schema.safeParse({ ...verdict, capabilityRef: 'x'.repeat(WORK_ID_MAX_CHARS + 1) }).success, false);
+    assert.equal(CapabilityGroundingJudgeV1Schema.safeParse({ ...verdict, capabilityRef: 'cap:bad ref' }).success, false);
+    const substituted = structuredClone(submitted);
+    substituted.work!.operations[0].capabilityRef = `${id.slice(0, -1)}z`;
+    assert.equal(validateTurnSemanticProposalV1(substituted, card).ok, false, 'a well-formed but unissued reference must still be refused');
+  }
 });
 
 

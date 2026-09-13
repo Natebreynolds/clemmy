@@ -21,3 +21,10 @@ test('reviewed native artifact arguments retain full bytes above the generic64KB
   assert.ok(Buffer.byteLength(content) > 75_000);
   assert.equal(resolveReviewedStepArguments({ staticArguments: { view_html: content }, dependsOn: [], dynamicBindings: [] }, () => { throw new Error('no producer required'); }).view_html, content);
 });
+
+test('whole settled results preserve arrays and objects without a guessed /data wrapper', () => {
+  for (const payload of [[{ id: 'a' }], { actualProviderWrapper: { rows: [1, 2] } }]) {
+    const result = resolveReviewedStepArguments({ staticArguments: {}, dependsOn: ['source'], dynamicBindings: [{ producerStepId: 'source', outputPath: '', targetPath: '/data', expectedType: 'json' }] }, () => payload);
+    assert.deepEqual(result, { data: payload });
+  }
+});

@@ -121,6 +121,7 @@ function exactSourceEvents(identity: HostNoProgressIdentity): EventRow[] {
       'discovery_governor_outcome',
       'planning_catalog_disclosed',
       'expected_work_progress',
+      'goal_alignment_judged',
       'guardrail_tripped',
     ],
   }).filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
@@ -281,6 +282,20 @@ function eventCapabilityTokens(
   const disclosedWriteRefs: string[] = [];
   const disclosedReadRefs: string[] = [];
   for (const event of events) {
+    if (event.type === 'goal_alignment_judged' && event.role === 'system'
+      && event.data.lane === 'host_v1' && event.data.kind === 'completion'
+      && event.data.planReviewRepair === true && event.data.fulfills === false
+      && event.data.failedOpen !== true
+      && typeof event.data.planDigest === 'string' && /^[a-f0-9]{64}$/.test(event.data.planDigest)
+      && typeof event.data.objectiveDigest === 'string' && /^[a-f0-9]{64}$/.test(event.data.objectiveDigest)) {
+      const reason = nonEmptyString(event.data.reason)?.replace(/\s+/g, ' ').trim();
+      // The host asked for this repair after judging a complete prepared
+      // plan. New diagnostic evidence is useful progress, not another failed
+      // attempt at discovering authority. A changed draft, event ID or call
+      // ID alone earns nothing; the same finding stays seen after reopen.
+      if (reason) tokens.evidence.add(token('evidence', 'plan_review_feedback', [event.data.objectiveDigest, reason]));
+      continue;
+    }
     if (event.type === 'capability_resolution') {
       // Resolution entries are candidate alternatives, even when their
       // accepted-source provenance is authoritative. The task-needed durable

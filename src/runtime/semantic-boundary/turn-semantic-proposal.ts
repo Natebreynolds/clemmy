@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { z } from 'zod';
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import type { StrategicMetaAction } from '../../memory/strategic-option-intent.js';
 import {
   ActionWorkTopologySchema,
   ActionWorkTopologyBaseSchema,
   validateWorkTopology,
   workTopologyDigest,
+  WorkTopologyIdSchema,
 } from '../graph/work-topology.js';
 
 /**
@@ -61,11 +63,9 @@ const MAX_SLOT_ANSWERS = 1;
 const MAX_SLOT_VALUE_CHARS = 4_000;
 const MAX_RATIONALE_CHARS = 2_000;
 
-// Opaque ids are host-minted. Live capability ids carry a 64-hex digest plus
-// a "reacquired:<hash>" suffix (154 chars measured 2026-09-08), and the old
-// 128 cap made the host reject its OWN catalog: the whole interpretation was
-// marked invalid, a correct slot answer became keepOpen, the clarification
-// packet stayed live and the fresh turn parked on pending_continuity forever.
+// Semantic labels remain bounded separately from executable catalog refs.
+// A capability ref must use the shared work-id contract everywhere it crosses
+// this boundary: catalog validation alone does not cover proposal or judge input.
 const OPAQUE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,255}$/;
 
 const opaqueIdSchema = z.string().min(1).max(128).regex(OPAQUE_ID_RE);
@@ -122,7 +122,7 @@ const openSlotSchema = z.object({
 const candidateRefSchema = z.object({
   kind: z.enum(['capability', 'workflow']),
   /** Opaque host catalog identity. It is advisory until separately admitted. */
-  id: opaqueIdSchema,
+  id: WorkTopologyIdSchema,
 }).strict();
 
 const semanticGoalDraftSchema = z.object({
@@ -153,9 +153,9 @@ const proposedOperationSchema = z.object({
    * Required. Every operation, including host_only, names an exact host-issued
    * capability identity. Human-language roles never authorize.
    */
-  capabilityRef: opaqueIdSchema,
-  dependsOn: z.array(opaqueIdSchema).max(32),
-  evidence: z.array(opaqueIdSchema).max(32),
+  capabilityRef: WorkTopologyIdSchema,
+  dependsOn: z.array(opaqueIdSchema),
+  evidence: z.array(opaqueIdSchema),
 }).strict();
 
 const proposedDeliverableSchema = z.object({
@@ -183,7 +183,7 @@ export type SourceEffectJudgeV1 = z.infer<typeof SourceEffectJudgeV1Schema>;
 /** Independent grounding judge. Assesses one exact named capability. */
 export const CapabilityGroundingJudgeV1Schema = z.object({
   verdict: z.enum(['entailed', 'conflict', 'uncertain']),
-  capabilityRef: opaqueIdSchema,
+  capabilityRef: WorkTopologyIdSchema,
   manifestDigest: z.string().regex(/^[a-f0-9]{64}$/i),
   proposalDigest: z.string().regex(/^[a-f0-9]{64}$/i),
   rationale: z.string().max(MAX_RATIONALE_CHARS),
@@ -200,7 +200,7 @@ export const PlanGroundingOperationVerdictV1Schema = z.object({
 
 export const PlanGroundingJudgeV1Schema = z.object({
   verdict: z.enum(['entailed', 'conflict', 'uncertain']),
-  operations: z.array(PlanGroundingOperationVerdictV1Schema).max(32),
+  operations: z.array(PlanGroundingOperationVerdictV1Schema),
 }).strict();
 
 export type PlanGroundingOperationVerdictV1 = z.infer<typeof PlanGroundingOperationVerdictV1Schema>;
@@ -211,7 +211,7 @@ const proposedSemanticWorkV1BaseSchema = z.object({
   construct: z.enum(['none', 'collect_then_construct', 'fanout', 'single_act']),
   cardinality: z.object({
     count: z.number().int().min(1).max(10_000),
-    fields: z.array(opaqueIdSchema).max(32),
+    fields: z.array(opaqueIdSchema),
     locator: z.object({
       contract: z.literal('workspace_social_posts_v1'),
       collectionPointer: z.literal('/posts'),
@@ -261,9 +261,9 @@ const proposedSemanticWorkV1BaseSchema = z.object({
   /** Content digest when topology is present. Admission recomputes it; the
    * model cannot grant authority by supplying a matching string. */
   topologyHash: z.string().regex(/^[a-f0-9]{64}$/).nullish(),
-  operations: z.array(proposedOperationSchema).max(32),
-  deliverables: z.array(proposedDeliverableSchema).max(32),
-  evidenceRequirements: z.array(opaqueIdSchema).max(32),
+  operations: z.array(proposedOperationSchema),
+  deliverables: z.array(proposedDeliverableSchema),
+  evidenceRequirements: z.array(opaqueIdSchema),
 }).strict();
 
 export const ProposedSemanticWorkV1Schema = proposedSemanticWorkV1BaseSchema.superRefine((work, ctx) => {
@@ -512,7 +512,7 @@ export interface TurnSemanticHostViewV1 {
 }
 
 export const GroundingDescriptorViewV1Schema = z.object({
-  id: opaqueIdSchema,
+  id: WorkTopologyIdSchema,
   effect: requestedEffectSchema,
   purpose: z.string().min(1).max(256),
   acceptedInputKinds: z.array(opaqueIdSchema).min(1).max(8),
@@ -1120,7 +1120,14 @@ function validateProposedWork(
         );
         continue;
       }
-      for (const dep of operation.dependsOn) {
+      // An explicit topology separates ordering from raw result lineage.
+      // Reviewed synthesis is retained separately, so flattening its ordering
+      // ancestors must not assert that a file tool accepts an MCP result as
+      // artifact content. Legacy proposals without a topology retain their
+      // original dependency-kind check.
+      const topologyOperation = work.topology?.operations.find(entry => entry.id === operation.id);
+      const kindEdge = topologyOperation ? 'dataFrom' : 'dependsOn';
+      for (const dep of topologyOperation?.dataFrom ?? operation.dependsOn) {
         const predecessorOp = byOp.get(dep);
         // An edge with a host-native endpoint has no descriptor pair to
         // compare; kind flow is only checkable between two cited operations.
@@ -1132,7 +1139,7 @@ function validateProposedWork(
           issue(
             issues,
             'dag_kind_metadata_missing',
-            `work.operations.${operation.id}.dependsOn`,
+            `work.operations.${operation.id}.${kindEdge}`,
             'executable edge is missing a predecessor capability descriptor',
           );
           continue;
@@ -1163,7 +1170,7 @@ function validateProposedWork(
           issue(
             issues,
             'dag_kind_mismatch',
-            `work.operations.${operation.id}.dependsOn`,
+            `work.operations.${operation.id}.${kindEdge}`,
             `predecessor produces [${nameKinds(produced)}] but successor accepts [${nameKinds(accepted)}]`,
             { operationId: predecessorOp?.id ?? operation.id, capabilityRef: predecessorOp?.capabilityRef },
           );
@@ -1364,7 +1371,7 @@ function validateHostView(host: TurnSemanticHostViewV1): TurnSemanticValidationI
     ['workflow', host.catalog.workflowIds],
   ] as const) {
     for (const id of ids) {
-      if (!validOpaqueHostId(id)) {
+      if (typeof id !== 'string' || !WORK_ID_PATTERN.test(id)) {
         issue(issues, 'host_invalid_catalog_id', `host.catalog.${kind}Ids`, `host ${kind} id is invalid`);
       }
     }

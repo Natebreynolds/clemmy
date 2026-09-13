@@ -333,7 +333,8 @@ test('native planning opt-in is exact host declaration and current schema, never
     assert.equal(await localPlanning.issueAuthorizedLocalPlanningDisclosureCandidate({ name, carrier: 'call_tool',
       configuredNames: new Set() }), null, 'explicit turn scope still denies issuance');
   }
-  for (const name of ['skill_read', 'space_get_runner', 'space_refresh', 'read_file', 'run_shell_command']) {
+  assert.equal(localPlanning.isRegistryDeclaredNativePlanningRead('read_file'), true, 'the host explicitly declares file reads for prepared runtime synthesis');
+  for (const name of ['skill_read', 'space_get_runner', 'space_refresh', 'run_shell_command']) {
     assert.equal(localPlanning.isRegistryDeclaredNativePlanningRead(name), false, name);
   }
   for (const name of ['session_history', 'space_get_runner']) {

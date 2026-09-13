@@ -84,7 +84,6 @@ import {
   evaluateLearningCandidate,
   recordLearningDecision,
 } from '../memory/learning-receipt.js';
-import { stepLooksLikeIrreversibleSend } from './workflow-enforce.js';
 import { hasActiveLegacyComposioJobForTask } from '../integrations/composio/legacy-job-record.js';
 import { detectStructuredToolFailure } from '../runtime/harness/tool-error-corrective.js';
 import {
@@ -2735,7 +2734,7 @@ function captureRunStrategyFromTrace(updated: BackgroundTaskRecord): void {
       (sum, manifest) => sum + manifest.untrackedCheckpoints,
       0,
     ),
-    externalWriteRequired: taskRequiresExternalSendReceipt(updated),
+    externalWriteRequired: acceptedTaskExternalEffectRequirement(updated.runSessionId) === true,
     externalWriteReceipts: completion.externalWriteReceipts,
   };
   const learningDecision = evaluateLearningCandidate(learningInput);
@@ -3575,39 +3574,6 @@ export function probeObjectiveForTask(
   return task.prompt || task.title || '';
 }
 
-/** Deliverable-evidence tripwire (live 2026-07-23): a resumed run concluded
- *  "## Completed — loaded the roster, confirmed access" TWICE and was stamped
- *  done, with the actual deliverable (a Google Sheet) never produced. When
- *  the task's own prompt commits to an external artifact, a completion with
- *  ZERO evidence of one — no artifact-ledger claim, no external_write, no
- *  session deliverable — is not a completion. Deterministic, zero-LLM. */
-const ARTIFACT_INTENT_RE =
-  /\b(?:write|create|build|save|put|produce|generate|make|draft)\b[\s\S]{0,60}\b(?:sheet|spreadsheet|workbook|google doc|document|docs?|file|\.md|csv|report|deck|slide)/i;
-// Destination-cued draft promises ("draft 20 emails IN OUTLOOK", "create
-// replies in my drafts folder") also commit to an external artifact. A bare
-// "draft me some emails" is deliberately NOT gated — text-form drafts returned
-// in the report-back are a legitimate deliverable with no external evidence.
-const EXTERNAL_DRAFT_INTENT_RE =
-  /\b(?:draft|create|prepare|write|make)\b[^.\n]{0,60}\b(?:emails?|messages?|repl(?:y|ies)|follow[- ]?ups?)\b[^.\n]{0,80}\b(?:in|into)\s+(?:outlook|gmail|my\s+drafts|the\s+drafts?\s+folder|drafts?\s+folder|salesforce|hubspot)/i;
-
-/** A safety constraint such as "do not write files" is evidence AGAINST an
- * artifact promise, not a promise whose absence should block completion. Check
- * the clause immediately before the matched action; "do not stop until you
- * write the report" remains positive because `until` reverses that reading. */
-function promptCommitsTo(
-  prompt: string,
-  intentPattern: RegExp,
-): boolean {
-  for (const clause of prompt.split(/[\n;]|(?<=[.!?])\s+/)) {
-    const match = intentPattern.exec(clause);
-    if (!match) continue;
-    const prefix = clause.slice(Math.max(0, match.index - 80), match.index);
-    const directlyNegated = /\b(?:do\s+not|don't|never)\b(?:(?!\b(?:until|before)\b)[\s\S]){0,70}$/i.test(prefix);
-    if (!directlyNegated) return true;
-  }
-  return false;
-}
-
 export interface BackgroundCompletionEvidence {
   artifactBindings: number;
   extractedDeliverables: number;
@@ -4060,29 +4026,6 @@ function workManifestHasDurableCompletionEvidence(manifest: WorkManifestSummary)
   ));
 }
 
-export function taskRequiresExternalSendReceipt(
-  task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
-): boolean {
-  // Phrases that LOOK like sends but create no external obligation must not
-  // demand a receipt the task can never produce — an unsatisfiable gate that
-  // false-blocks verified-complete work (live 2026-08-04, twice):
-  //  (a) negated mentions — "no emails, no drafts, local file only";
-  //  (b) REPORT-BACK requests — "send me a summary message here", "deliver
-  //      the findings back to this chat": that delivery is the runtime's own
-  //      report-back, not an external send. The north-star instruction
-  //      ("always report back") must never block the task that obeyed it.
-  //  (c) user self-commitments — "I will send the emails myself".
-  // Every strip is clause-scoped (stops at sentence end), so a real send
-  // elsewhere in the prompt still gates.
-  const text = `${task.title}\n${task.prompt}`
-    .replace(/\b(?:no|not|never|don'?t|do not|without(?: any)?)\s+(?:external\s+)?(?:emails?|sends?|sending|drafts?|publish(?:ing)?|posts?|messages?|external (?:writes?|services?|systems?))\b/gi, '')
-    .replace(/\breport(?:ing)?\s+back\b[^.\n!?]*/gi, '')
-    .replace(/\b(?:send|deliver|post|give|message)\b[^.\n!?]{0,60}\b(?:here|back here|back to (?:me|this chat|the chat)|in (?:the|this) chat|to this chat)\b[^.\n!?]*/gi, '')
-    .replace(/\b(?:send|message|ping)\s+me\b(?![^.\n!?]{0,50}\b(?:e-?mail|sms|text)s?\b)[^.\n!?]*/gi, '')
-    .replace(/\bI(?:['’]ll| will)?\s*(?:will\s+)?send\b[^.\n!?]{0,80}\bmyself\b[^.\n!?]*/gi, '');
-  return stepLooksLikeIrreversibleSend(text);
-}
-
 /**
  * Reality check for the deliverable-evidence gates (live 2026-08-04): a run
  * that wrote its files through shell/python leaves no artifact binding, no
@@ -4115,18 +4058,6 @@ export function verifiedOnDiskDeliverables(finalText: string, startedAt?: string
   return count;
 }
 
-export function completionLacksDeliverableEvidence(
-  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt'>,
-): boolean {
-  try {
-    const prompt = task.prompt ?? '';
-    if (!promptCommitsTo(prompt, ARTIFACT_INTENT_RE) && !promptCommitsTo(prompt, EXTERNAL_DRAFT_INTENT_RE)) return false;
-    return !hasDurableDeliverableEvidence(backgroundCompletionEvidence(task));
-  } catch {
-    return false; // evidence read failure must never block an honest done
-  }
-}
-
 export async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title' | 'startedAt' | 'createdAt'>,
   finalText: string,
@@ -4142,7 +4073,6 @@ export async function verifyBackgroundTaskDelivery(
   const acceptedExternal = acceptedTaskExternalEffectAuthority(task.runSessionId);
   const completionEvidence = backgroundCompletionEvidenceWithAuthority(task, acceptedExternal);
   const effectLedger = backgroundEffectLedgerDisposition(task, completionEvidence, acceptedExternal);
-  const externalEffectRequired = effectLedger.requirement;
   const ledgerCompletedExternalEffect = effectLedger.complete;
   const terminalReadbackOnly = stoppedReason === 'unverified'
     || (
@@ -4191,27 +4121,6 @@ export async function verifyBackgroundTaskDelivery(
       return classified;
     }
   }
-  if (
-    externalEffectRequired === null
-    && taskRequiresExternalSendReceipt(task)
-    && completionEvidence.externalWriteReceipts === 0
-  ) {
-    return {
-      outcome: 'blocked',
-      reason: 'The task required an external send or publish, but the run has no committed external-write receipt.',
-      blockerType: 'unknown',
-    };
-  }
-  if (!ledgerCompletedExternalEffect
-    && completionLacksDeliverableEvidence(task)
-    && verifiedOnDiskDeliverables(finalText, deliverableFloor) === 0) {
-    return {
-      outcome: 'blocked',
-      reason: 'Completion claimed, but the task promised an external deliverable and the run shows no evidence of one (no artifact, no external write, no file written).',
-      blockerType: 'unknown',
-    };
-  }
-
   // Stage 3: close out the reduce tier before verification — reduce any
   // full-but-unstarted shard a crash left behind and let in-flight shard
   // reduces land, so every shard artifact is on disk for synthesis/readers.
@@ -4310,9 +4219,8 @@ export async function verifyBackgroundTaskDelivery(
   // When a receipt/artifact DOES exist, facts win: do not let awkward tense
   // erase already-committed work or invite a duplicate retry.
   // A fully completed logical manifest is also durable completion evidence for
-  // hermetic/research fan-out. This gate runs after the stricter external-send
-  // and promised-artifact receipt checks above, so worker receipts can never
-  // substitute for a missing sheet, file, publish, or external mutation.
+  // hermetic/research fan-out. The accepted external-effect ledger above still
+  // requires its own receipts; worker results cannot substitute for them.
   const manifestCompletionEvidence = workManifests.some(workManifestHasDurableCompletionEvidence);
   if (
     isPromiseShapedReply(finalText)
@@ -5442,50 +5350,10 @@ async function finishWorkerRun(
     logger.warn({ taskId: task.id, reason }, 'Background task paused awaiting continue (not done)');
     return;
   }
-  // Objective re-anchor, normal completion path (same contract as the approval
-  // settle above): a first artifact-less completion on an artifact-committed
-  // task earns ONE auto-queued continuation with the objective re-pinned; the
-  // verify below blocks honestly on repeat.
-  if (
-    acceptedExternalEffectRequired !== true
-    && acceptedExternalEffectRequired !== 'ambiguous'
-    && completionLacksDeliverableEvidence(task)
-    && !task.deliverableContinueQueuedAt
-  ) {
-    const reAnchored = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
-      status: 'pending',
-      deliverableContinueQueuedAt: nowIso(),
-      result: [
-        'CONTINUATION NOTE (auto): the reply below concluded after setup/preamble only — the promised deliverable does not exist yet.',
-        'Continue the ORIGINAL objective to completion now, and do not conclude until the deliverable exists.',
-        '',
-        (response.text ?? '').slice(0, 4_000),
-      ].join('\n'),
-      continueResolution: {
-        queuedAt: nowIso(),
-        reason: 'Completion lacked deliverable evidence; objective re-anchored.',
-        auto: true,
-      },
-      lastCheckInAt: nowIso(),
-      lastCheckInMessage: 'Completion lacked deliverable evidence; auto-queued one objective-re-anchored continuation.',
-    });
-    if (reAnchored) {
-      finishRun(run.id, {
-        status: 'queued',
-        message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
-        outputPreview: response.text,
-      });
-      clearLedger(task.runSessionId);
-      emitBackgroundTaskCheckIn(reAnchored, {
-        title: `Self-correcting: ${reAnchored.title}`,
-        body: 'The run concluded without producing its promised deliverable — I caught it and am continuing the original objective now. No action needed.',
-        runId: run.id,
-        metadata: { status: 'reanchored' },
-      });
-      logger.warn({ taskId: task.id }, 'Artifact-less completion — objective-re-anchored continuation queued');
-      return;
-    }
-  }
+  // The host turn already owns current-phase completion and recovery. An
+  // artifact mentioned in the request is not another accepted obligation:
+  // background delivery verifies the durable effects/manifests below, never
+  // reopens the task from a second interpretation of the owner's prose.
   const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
   // Verification may take long enough for a stop request to arrive. Re-read
   // durable task state after the await so a late-but-valid cancellation cannot
@@ -5951,56 +5819,6 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           });
           logger.info({ taskId: task.id, approvalId: resolution.approvalId, questionId }, 'Background task awaiting input after approval continuation');
           continue;
-        }
-        // Objective re-anchor (live 2026-07-23, twice in one night): a resumed
-        // run concluded after SETUP ONLY ("loaded roster, confirmed access")
-        // with the promised artifact never produced. When the completion lacks
-        // deliverable evidence, re-queue ONE continuation that re-pins the
-        // FULL original objective — the exact manual intervention the owner's
-        // runs needed, automated. A second artifact-less completion falls
-        // through to the verify below and blocks honestly.
-        const postApprovalExternalEffectRequired = acceptedTaskExternalEffectRequirement(task.runSessionId);
-        if (
-          postApprovalExternalEffectRequired !== true
-          && postApprovalExternalEffectRequired !== 'ambiguous'
-          && completionLacksDeliverableEvidence(task)
-          && !task.deliverableContinueQueuedAt
-        ) {
-          // The continue prompt renders task.result as the "continuation note"
-          // (it wins over continueResolution.reason), so the corrective framing
-          // lives THERE — guaranteed in front of the model on the next turn.
-          const reAnchored = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
-            status: 'pending',
-            deliverableContinueQueuedAt: nowIso(),
-            result: [
-              'CONTINUATION NOTE (auto): the reply below concluded after setup/preamble only — the promised deliverable does not exist yet.',
-              'Continue the ORIGINAL objective to completion now, and do not conclude until the deliverable exists.',
-              '',
-              (result.text ?? '').slice(0, 4_000),
-            ].join('\n'),
-            continueResolution: {
-              queuedAt: nowIso(),
-              reason: 'Completion lacked deliverable evidence; objective re-anchored.',
-              auto: true,
-            },
-            lastCheckInAt: nowIso(),
-            lastCheckInMessage: 'Completion lacked deliverable evidence; auto-queued one objective-re-anchored continuation.',
-          });
-          if (reAnchored) {
-            finishRun(run.id, {
-              status: 'queued',
-              message: `Background task ${task.id} concluded without its promised deliverable — auto-continuing with the objective re-anchored.`,
-              outputPreview: result.text,
-            });
-            emitBackgroundTaskCheckIn(reAnchored, {
-              title: `Self-correcting: ${reAnchored.title}`,
-              body: 'The run concluded without producing its promised deliverable — I caught it and am continuing the original objective now. No action needed.',
-              runId: run.id,
-              metadata: { status: 'reanchored', approvalId: resolution.approvalId },
-            });
-            logger.warn({ taskId: task.id, approvalId: resolution.approvalId }, 'Artifact-less completion after approval — objective-re-anchored continuation queued');
-            continue;
-          }
         }
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {

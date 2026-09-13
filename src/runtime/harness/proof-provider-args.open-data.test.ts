@@ -4,6 +4,7 @@ import {
   compileProofProviderArgs,
   createProofProviderForegroundPayloadValidator,
   validateProofProviderArguments,
+  collectProviderSchemaFailures,
 } from './proof-provider-args.js';
 
 // The actor identifier and input shape reproduce the captured provider contract;
@@ -21,6 +22,13 @@ const actorArgs = {
   input: { startUrls: [{ url: 'https://www.facebook.com/scorpion.co' }], resultsLimit: 25 },
   limit: 25, format: 'json',
 };
+
+test('an explicitly nullable integer accepts null through matching and failure projection', () => {
+  const schema = { type: 'object', additionalProperties: false, properties: { count: { anyOf: [{ type: 'integer' }, { type: 'null' }] } } };
+  for (const count of [null, 12]) assert.equal(validateProofProviderArguments({ schema, payload: { count } }).ok, true);
+  for (const count of ['12', 1.5, {}]) assert.equal(validateProofProviderArguments({ schema, payload: { count } }).ok, false);
+  assert.equal(validateProofProviderArguments({ schema: { ...schema, properties: { count: { type: 'integer' } } }, payload: { count: null } }).ok, false);
+});
 
 test('a provider-declared open actor input reaches the sealed compiler unchanged', () => {
   const check = createProofProviderForegroundPayloadValidator({ operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', schema: actorSchema })!;
@@ -76,4 +84,33 @@ test('patterned and named constraints both apply, and unmatched closed keys stay
 test('provider-data support does not opt an unsealed caller into payload passthrough', () => {
   const compiled = compileProofProviderArgs({ schema: actorSchema, payload: actorArgs, role: 'foreground', effect: 'read' });
   assert.equal(compiled, null);
+});
+
+test('annotations on declared open JSON data cannot change object or array admission', () => {
+  const annotations = { description: 'JSON request body', title: 'Body', default: {}, examples: [{}], deprecated: false };
+  for (const value of [{ tasks: [{ term: 'fixture' }] }, [{ term: 'fixture' }], 'literal', 3, false, null]) {
+    const schema = { type: 'object', additionalProperties: false, required: ['method'], properties: {
+      method: { type: 'string', enum: ['POST'] }, data: annotations,
+      items: { type: 'array', items: annotations },
+    } };
+    const payload = { method: 'POST', data: value, items: [value] };
+    const result = validateProofProviderArguments({ schema, payload });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (result.ok) assert.deepEqual(result.args, payload);
+    const failures: Parameters<typeof collectProviderSchemaFailures>[3] = [];
+    collectProviderSchemaFailures(payload, schema, '', failures);
+    assert.deepEqual(failures, []);
+    assert.equal(validateProofProviderArguments({ schema, payload: { ...payload, method: 'DELETE' } }).ok, false);
+    assert.equal(validateProofProviderArguments({ schema, payload: { ...payload, operation: 'other' } }).ok, false);
+  }
+});
+
+test('annotations do not erase constraints or admit non-JSON data', () => {
+  const schema = (data: unknown) => ({ type: 'object', properties: { data } });
+  for (const data of [undefined, Infinity, () => 1, { nested: undefined }]) {
+    assert.equal(validateProofProviderArguments({ schema: schema({ description: 'Open data' }), payload: { data } }).ok, false);
+  }
+  for (const constraint of [{ type: 'string' }, { $ref: '#/$defs/unknown' }, { not: {} }]) {
+    assert.equal(validateProofProviderArguments({ schema: schema({ description: 'A description', ...constraint }), payload: { data: {} } }).ok, false);
+  }
 });

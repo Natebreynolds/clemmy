@@ -329,6 +329,42 @@ test('all same-source citable catalog growth collapses to one pre-graph transiti
   assert.deepEqual(grown.authority, projected.authority);
 });
 
+test('new host-accepted Plan review feedback is progress; repeats, failed reviews and other sources are not', () => {
+  const identity = accepted('plan-review-feedback');
+  const snapshot = () => {
+    const projected = projectHostNoProgressAuthority(identity);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') throw new Error(projected.reason);
+    return projected.authority;
+  };
+  let state = initializeNoProgressGovernor({ taskKey: 'plan-review', authority: snapshot() });
+  const review = (reason: string, extra = {}) => appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'system',
+    type: 'goal_alignment_judged', data: { sourceUserSeq: identity.sourceUserSeq, lane: 'host_v1', kind: 'completion',
+      fulfills: false, planReviewRepair: true, reason, planDigest: 'a'.repeat(64), objectiveDigest: 'b'.repeat(64), ...extra } });
+  for (const reason of ['Missing source coverage.', 'Unbound result.', 'Unsupported comparison.', 'Incorrect output location.']) {
+    review(reason);
+    const decision = observeNoProgress(state, { taskKey: 'plan-review', attemptClass: 'plan_admission', authority: snapshot() });
+    assert.equal(decision.reason, 'authority_progress');
+    assert.deepEqual(decision.gained, ['evidence']);
+    state = decision.state;
+  }
+  const prior = snapshot();
+  review('Incorrect output location.', { planDigest: 'c'.repeat(64) });
+  review('Different diagnostic.', { failedOpen: true });
+  review('Different diagnostic.', { sourceUserSeq: identity.sourceUserSeq + 1 });
+  review('Different diagnostic.', { planReviewRepair: false });
+  review('Different diagnostic.', { planDigest: 'not-a-digest' });
+  assert.deepEqual(snapshot(), prior, 'new event/plan IDs and invalid review evidence buy no progress');
+  eventlog.closeEventLog();
+  assert.deepEqual(snapshot(), prior, 'the same diagnostic is still seen after reopen');
+  let decision;
+  for (let i = 0; i < 4; i++) {
+    decision = observeNoProgress(state, { taskKey: 'plan-review', attemptClass: 'plan_admission', authority: snapshot() });
+    state = decision.state;
+  }
+  assert.equal(decision!.action, 'terminalize', 'unchanged review loops still converge on the existing floor');
+});
+
 test('each distinct exact write ref disclosed is its own effect gain; re-disclosure and siblings are not', () => {
   const identity = accepted('write-refs');
   const disclose = (capabilities: Record<string, unknown>[]) => appendPublishedCapabilities(identity, capabilities);

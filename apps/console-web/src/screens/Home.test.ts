@@ -10,6 +10,20 @@ const CHAT = readFileSync(new URL('./Chat.tsx', import.meta.url), 'utf8');
 const APP = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
 const RUNNING = readFileSync(new URL('../components/home/RunningPane.tsx', import.meta.url), 'utf8');
 
+test('Home mock screens cover the visual contract', () => {
+  const MOCK = readFileSync(new URL('./HomeMock.tsx', import.meta.url), 'utf8');
+  const TILES = readFileSync(new URL('../components/home/mock/tiles.tsx', import.meta.url), 'utf8');
+  const SCREENS = readFileSync(new URL('../components/home/mock/screens.ts', import.meta.url), 'utf8');
+  assert.match(MOCK, /Build your command center/);
+  assert.match(MOCK, /Add to home/);
+  assert.match(MOCK, /Start here/);
+  assert.match(MOCK, /Clem can build/);
+  assert.match(TILES, /Content trends/);
+  assert.match(TILES, /Social capture/);
+  assert.match(TILES, /Baseline set/);
+  assert.match(SCREENS, /id: 'phone'/);
+});
+
 test('Home renders the command center instead of redirecting to Chat', () => {
   assert.match(HOME, /export function Home\(/);
   assert.doesNotMatch(HOME, /Navigate to="\/chat"/);
@@ -43,6 +57,16 @@ test('the app lands on Home by default', () => {
   assert.match(APP, /prefs\.data\?\.landing \?\? 'home'/);
   assert.match(APP, /path="\/made"/);
   assert.match(APP, /path="\/made\/:groupId"/);
+});
+
+test('the Home mock is a side door, not the live landing', () => {
+  assert.match(APP, /path="\/dev\/home-mock" element=\{<HomeMock \/>\}/);
+  assert.doesNotMatch(APP, /Navigate to="\/dev\/home-mock"/);
+  const HOME = readFileSync(new URL('./Home.tsx', import.meta.url), 'utf8');
+  assert.match(HOME, /function LiveHome\(/);
+  assert.match(HOME, /isHomeMockScreen/);
+  const SCREENS = readFileSync(new URL('../components/home/mock/screens.ts', import.meta.url), 'utf8');
+  assert.match(SCREENS, /export function isHomeMockScreen/);
 });
 
 test('Made is reachable from Home, not a sidebar pin', () => {

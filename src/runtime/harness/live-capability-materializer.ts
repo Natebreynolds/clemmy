@@ -586,8 +586,8 @@ export function liveReadIdentityMatches(
     && actual.effect === expected.effect
     && actual.effectAttestation === expected.effectAttestation
     && actual.schemaFingerprint === expected.schemaFingerprint
-    && JSON.stringify(actual.externalDefinition ?? null)
-      === JSON.stringify(expected.externalDefinition ?? null)
+    && canonicalJson(actual.externalDefinition ?? null)
+      === canonicalJson(expected.externalDefinition ?? null)
     && actual.outputSchemaFingerprint === expected.outputSchemaFingerprint
     && actual.outputSchemaAttestation === expected.outputSchemaAttestation
     && actual.definitionFingerprint === expected.definitionFingerprint
@@ -1002,8 +1002,8 @@ function manifestMatchesAttestation(
     && manifest.providerVersion === attestation.providerVersion
     && manifest.operationVersion === attestation.operationVersion
     && manifest.definitionFingerprint === attestation.definitionFingerprint
-    && JSON.stringify(manifest.externalDefinition ?? null)
-      === JSON.stringify(attestation.externalDefinition ?? null)
+    && canonicalJson(manifest.externalDefinition ?? null)
+      === canonicalJson(attestation.externalDefinition ?? null)
     && manifest.accountId === attestation.accountId
     && manifest.effect === 'read'
     && manifest.invokePortId === attestation.invoke.portId
@@ -1058,11 +1058,13 @@ function manifestForAttestation(input: {
 }): CapabilityManifestV1 {
   const baseId = `${input.prefix}:${input.attestation.definitionFingerprint}`;
   const prior = input.store.get(baseId);
-  if (
-    prior
-    && prior.manifest.lifecycle.state === 'current'
-    && manifestMatchesAttestation(prior.manifest, input.attestation)
-  ) return prior.manifest;
+  // A retired base reference stays retired. Its current replacement is still
+  // reusable: rediscovery must not supersede an unchanged reviewed identity
+  // merely because it was previously reacquired after a real interruption.
+  const current = currentOwnedManifests(input.store, input.prefix)
+    .filter(manifest => manifestMatchesAttestation(manifest, input.attestation))
+    .sort((a, b) => a.manifestId.localeCompare(b.manifestId))[0];
+  if (current) return current;
   const manifestId = prior
     ? `${baseId}:reacquired:${sha256(String(input.attestation.observedAt)).slice(0, 16)}`
     : baseId;

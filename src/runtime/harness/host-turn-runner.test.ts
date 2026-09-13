@@ -3485,6 +3485,14 @@ test('host lifecycle listener propagates an over-limit pre-invoke checkpoint', a
     }]);
     assert.equal(firstRuns, 1, 'the one admitted call may execute');
     assert.equal(secondRuns, 0, 'the (limit + 1)th listener throw prevents its body');
+    const { canonicalHostModelResultClass } = await import('./host-model-result-receipt.js');
+    const unstarted = checkpoint.history.find((item: any) => item.type === 'function_call_result' && item.callId === 'cap-second')!;
+    assert.equal(canonicalHostModelResultClass(unstarted), 'not_started', 'the continuation remains a canonically redeemable receipt');
+    const marker = JSON.parse((unstarted as any).output.text);
+    assert.equal(marker.continuationReason, 'activation_budget');
+    assert.equal(marker.nextEdge.change, 'reissue_unstarted');
+    assert.match(marker.message, /same arguments/);
+    assert.doesNotMatch(marker.message, /another call in the same frame could not safely proceed/);
   } finally {
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
@@ -3804,6 +3812,33 @@ test('host stepping materializes omitted strict-nullable fields before approval 
   assert.deepEqual(seenApprovalArgs, [expected]);
   assert.deepEqual(seenInvokeArgs, [expected]);
   assert.equal(outcome.finalOutput, 'read complete');
+});
+
+test('literal string controls are decoded before tool approval, without bypassing the SDK schema', async () => {
+  const approval: unknown[] = [];
+  const invoked: unknown[] = [];
+  const raw = '{"text":"| Claim | Source |\n| observed | fixture |","count":1}';
+  const wrongType = '{"text":"line\nend","count":"wrong"}';
+  const unexpectedKey = '{"text":"line\nend","count":1,"invented":true}';
+  const model = stubModel([
+    [{ ...toolCall('literal-json-good', 'inspect_fixture_text', {}), arguments: raw }],
+    [{ ...toolCall('literal-json-wrong-type', 'inspect_fixture_text', {}), arguments: wrongType }],
+    [{ ...toolCall('literal-json-extra', 'inspect_fixture_text', {}), arguments: unexpectedKey }],
+    [textMsg('finished')],
+  ]);
+  const inspect = tool({
+    name: 'inspect_fixture_text', description: 'Inspect text for a local test.',
+    parameters: z.object({ text: z.string(), count: z.number() }).strict(),
+    needsApproval: async (_context, args) => { approval.push(args); return false; },
+    execute: async args => { invoked.push(args); return 'inspected'; },
+  });
+  const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [inspect] } as never,
+    [{ type: 'message', role: 'user', content: 'inspect text' }] as never, { maxTurns: 5 });
+  const expected = { text: '| Claim | Source |\n| observed | fixture |', count: 1 };
+  assert.deepEqual(invoked, [expected], 'wrong types and unknown fields never enter the tool body');
+  assert.deepEqual(approval[0], expected, 'approval sees the actual invocation values');
+  assert.equal((outcome.history.find((item: any) => item.type === 'function_call' && item.callId === 'literal-json-good') as any)?.arguments, raw);
+  assert.equal(outcome.finalOutput, 'finished');
 });
 
 test('callModelInputFilter still shapes every model request', async () => {
@@ -6429,6 +6464,7 @@ test('accepted native MCP call_tool uses one exact preparation row and one busin
       mcpToolScope: exactScope,
     }) as never);
     const fixture = acceptHostCanarySource(`exact-native-mcp-${suffix}`);
+    fixture.parent.counter = new brackets.ToolCallsCounter(1);
     const model = stubModel([
       [toolCall(`exact-native-mcp-call-${suffix}`, 'call_tool', {
         name: operationId,
@@ -6443,6 +6479,7 @@ test('accepted native MCP call_tool uses one exact preparation row and one busin
     const outcome = await runProductionHost(fixture, agent);
     assert.equal(outcome.finalOutput, 'exact native MCP settled', JSON.stringify(outcome.terminal));
     assert.equal(counts.call, 1, 'one and only one callTool business body');
+    assert.equal(fixture.parent.counter.calls, 1, 'the exact native MCP carrier reuses the host charge, including at the ceiling');
     const rows = eventlog.openEventLog().prepare(`
       SELECT ordinal, relation, state
         FROM physical_dispatches
@@ -8421,6 +8458,39 @@ test('a synchronous write batch lets the event loop service chat between writes'
   assert.ok(attempts.every(attempt => attempt?.status === 'returned'));
 });
 
+test('one read frame honors graph dependencies in either model order while independent children stay parallel', async () => {
+  const entered: string[] = [];
+  let children = 0;
+  let peakChildren = 0;
+  let release!: () => void;
+  const bothChildrenStarted = new Promise<void>(resolve => { release = resolve; });
+  const calls = ['child-a', 'child-b', 'root'];
+  const attempts = await mapHostCallAttemptsWithBarriersInOrder(calls, 3, () => 'parallel', async call => {
+    entered.push(call);
+    if (call !== 'root') {
+      assert.equal(entered[0], 'root');
+      peakChildren = Math.max(peakChildren, ++children);
+      if (children === 2) release();
+      await bothChildrenStarted;
+      children--;
+    }
+    return { status: 'returned' as const, value: call, invocationEntered: true };
+  }, undefined, call => call === 'root' ? [] : [2]);
+  assert.equal(peakChildren, 2, 'graph order must not serialize independent research');
+  assert.deepEqual(attempts.map(attempt => attempt?.status === 'returned' ? attempt.value : null), calls, 'results still pair in model call order');
+});
+
+test('a failed graph predecessor leaves dependent reads unstarted', async () => {
+  const entered: string[] = [];
+  const attempts = await mapHostCallAttemptsWithBarriersInOrder(['child', 'root'], 2, () => 'parallel', async call => {
+    entered.push(call);
+    return { status: 'failed' as const, error: new Error('root transport failed'), invocationEntered: true };
+  }, undefined, call => call === 'root' ? [] : [1]);
+  assert.deepEqual(entered, ['root']);
+  assert.equal(attempts[0], undefined);
+  assert.equal(attempts[1]?.status, 'failed');
+});
+
 test('a write whose verifier holds is a scheduling barrier: no later sibling write starts', async () => {
   const entered: string[] = [];
   const attempts = await mapHostCallAttemptsWithBarriersInOrder(
@@ -8929,6 +8999,30 @@ function runJudgedHost(
   ));
 }
 
+test('the host explanation survives an enabled completion judge without claiming task completion', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => { judgeCalls++; return { done: false, reason: 'The original work remains incomplete.' }; });
+  try {
+    const fixture = acceptJudgedSource('explanation-not-completion', 'Post the summary to the channel');
+    const model = scriptedRecordingModel([[textMsg('I prepared the summary, but the channel connection is unavailable. Nothing was posted.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+      throwingRunner() as never, agent as never,
+      [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+      { maxTurns: 1, hostTurnEngine: 'host_v1', context: fixture.context,
+        hostJudgeCompletion: true, hostConversationalCheckIn: true } as never,
+    ));
+    assert.match(String(outcome.finalOutput), /Nothing was posted/);
+    assert.equal(outcome.terminal, undefined, 'the explanation itself must deliver');
+    assert.equal(model.calls(), 1);
+    assert.equal(judgeCalls, 0, 'a blocked-work explanation is not a new claim of task completion');
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged', 'conversation_completed'] }).length, 0,
+      'the explanation cannot certify or terminalize the original task');
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
 test('production host retains completion feedback in request projection without adding an uncheckpointed draft to history)', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const verdicts = [
@@ -9001,6 +9095,39 @@ test('the completion judge is bounded: after MAX continuations the reply stands;
   }
 });
 
+
+test('completion review receives the memory actually shown to the brain, not a fresh vault read', async (t) => {
+  const fs = await import('node:fs');
+  const { MEMORY_FILE } = await import('../../memory/vault.js');
+  const { harnessInstructions } = await import('../../agents/harness-context.js');
+  const host = await import('./host-turn-runner.js');
+  const prior = fs.existsSync(MEMORY_FILE) ? fs.readFileSync(MEMORY_FILE, 'utf8') : null;
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    host._setHostObjectiveJudgeForTests(null);
+    if (prior === null) fs.rmSync(MEMORY_FILE, { force: true }); else fs.writeFileSync(MEMORY_FILE, prior);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  fs.mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
+  fs.writeFileSync(MEMORY_FILE, '# Curated context\nPrefer a recommendation followed by labeled inference: remembered-742.\n');
+  const fixture = acceptJudgedSource('judge-prompt-memory', 'Prepare a briefing using my preferences.');
+  const instructions = harnessInstructions('Prepare the requested briefing.', { sessionId: fixture.session.id });
+  fs.writeFileSync(MEMORY_FILE, '# Curated context\nA later edit the brain never saw: unseen-963.\n');
+  let judged = 0;
+  let reviewedEvidence = '';
+  host._setHostObjectiveJudgeForTests(async (_objective, _reply, options) => {
+    judged++;
+    reviewedEvidence = JSON.stringify(options?.toolCallSummary);
+    return { done: true, reason: 'The framing follows the shown preference.' };
+  });
+  const agent = { instructions, model: stubModel([[textMsg('Done: the briefing leads with a recommendation and labels inference.')]]), tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  await runJudgedHost(fixture, agent, true);
+  assert.equal(judged, 1);
+  assert.match(reviewedEvidence, /remembered-742/);
+  assert.doesNotMatch(reviewedEvidence, /unseen-963/);
+});
 
 test('the completion judge budget survives serialized checkpoint recovery and resets only for a fresh source', async (t) => {
   const { _setHostObjectiveJudgeForTests, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } = await import('./host-turn-runner.js');
@@ -9779,4 +9906,422 @@ test('the tolerance belongs to the tool-free check-in alone — an ordinary turn
   assert.equal(outcome.terminal?.status, 'blocked');
   assert.equal(outcome.terminal?.reason, 'authority_conflict',
     'a turn that CAN call things still refuses a surface that moved after admission');
+});
+
+for (const variant of ['drift', 'unavailable', 'disabled', 'stale', 'changed_after_review', 'on_track', 'in_flight'] as const) test(`Plan publication does not let an earlier advisory hold the current candidate (${variant})`, async t => {
+  const watcher = await import('./watcher-judge.js');
+  const { buildPublishPlanTool } = await import('../../tools/publish-plan.js');
+  const keys = ['CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '12';
+  process.env.CLEMMY_WATCHER_JUDGE = variant === 'disabled' ? 'off' : 'on';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  const fixture = acceptHostCanarySource(`publication-review-${variant}`, 'Prepare a comparison plan with evidence coverage.', { taskMode: { version: 1, kind: 'plan' } });
+  const reader = brackets.wrapToolForHarness(tool({ name: 'read_file', description: 'Inspect the brief.',
+    parameters: z.object({ path: z.string() }), execute: async () => JSON.stringify({ ok: false, code: 'invalid_arguments', message: 'Brief path missing; use retained brief.' }),
+  }) as never);
+  const publisher = brackets.wrapToolForHarness(buildPublishPlanTool() as never);
+  const publication = (corrected: boolean) => ({ full_text: corrected ? 'Compare the sources and verify coverage.' : 'Compare the sources.',
+    structured_plan: { steps: [{ id: 'compare', action: corrected ? 'Compare and verify coverage.' : 'Compare.', effect: 'compute', capabilityRef: null,
+      staticArgumentsJson: '{}', dynamicBindings: [], dependsOn: [], subagentRole: null, verification: corrected ? 'All sources covered.' : 'Comparison present.' }],
+      successCriteria: [corrected ? 'All sources covered.' : 'Comparison present.'], subagents: [] },
+    readiness: 'ready', missing_prerequisites: [], base_ref_json: null });
+  let finishReview: ((verdict: watcher.WatcherVerdict | null) => void) | undefined;
+  watcher._setWatcherJudgeForTests(() => new Promise(resolve => { finishReview = resolve; }));
+  const model = scriptedRecordingModel([[toolCall('publication-read', 'read_file', { path: 'brief' })],
+    [toolCall('publication-draft', 'publish_plan', publication(variant === 'drift'))],
+    [toolCall('publication-corrected', 'publish_plan', publication(true))]]);
+  const getResponse = model.getResponse.bind(model);
+  model.getResponse = async request => {
+    if (model.calls() === 1) {
+      assert.equal(Boolean(finishReview), variant !== 'disabled');
+      const changeObjective = () => {
+        const note = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: 'Only compare the available sources.' } });
+        eventlog.appendEvent({ sessionId: fixture.session.id, turn: 1, role: 'system', type: 'user_steer_note_delivered', data: { sourceUserSeq: fixture.source.seq, noteSeqs: [note.seq] } });
+      };
+      if (variant === 'stale') changeObjective();
+      if (variant !== 'in_flight') finishReview?.(variant === 'unavailable' ? null : { onTrack: variant === 'on_track', miss: 'Evidence coverage is missing.', steer: 'Include evidence coverage before publishing this plan.' });
+      await new Promise(resolve => setImmediate(resolve));
+      if (variant === 'changed_after_review') changeObjective();
+    }
+    return getResponse(request);
+  };
+  const agent = { model, tools: [reader, publisher] };
+  bindHostCanarySurface(fixture, agent, [reader, publisher]);
+  const result = await runProductionHost(fixture, agent);
+  if (variant === 'in_flight') { finishReview?.(null); await new Promise(resolve => setImmediate(resolve)); }
+  assert.equal(result.terminal, undefined, JSON.stringify(result));
+  const publications = eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] });
+  assert.equal(publications.length, 1, 'only the final plan becomes executable; no duplicate revision repair loop');
+  assert.equal((publications[0].data.artifact as any).fullText, publication(variant === 'drift').full_text);
+  assert.equal(model.calls(), 2, 'an advisory about an earlier draft must not force the already corrected candidate through another model turn');
+  const reviews = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'trajectory_review');
+  assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, 0);
+  const mutations = eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM logical_call_settlements WHERE session_id = ? AND mutating = 1').get(fixture.session.id) as { n: number };
+  assert.equal(mutations.n, 0);
+});
+
+for (const variant of ['drift', 'unavailable', 'disabled', 'stale'] as const) test(`trajectory review uses settled evidence and delivers only a real correction (${variant})`, async (t) => {
+  const watcher = await import('./watcher-judge.js');
+  const prior = { interval: process.env.CLEMMY_WATCHER_INTERVAL_TOOLS,
+    enabled: process.env.CLEMMY_WATCHER_JUDGE, isolated: process.env.CLEMMY_TEST_ISOLATED_HOME,
+    brackets: process.env.HARNESS_TOOL_BRACKETS };
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '2';
+  process.env.CLEMMY_WATCHER_JUDGE = variant === 'disabled' ? 'off' : 'on';
+  t.after(() => {
+    watcher._setWatcherJudgeForTests(null);
+    for (const [key, value] of Object.entries({ CLEMMY_WATCHER_INTERVAL_TOOLS: prior.interval,
+      CLEMMY_WATCHER_JUDGE: prior.enabled, CLEMMY_TEST_ISOLATED_HOME: prior.isolated, HARNESS_TOOL_BRACKETS: prior.brackets })) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const fixture = acceptHostCanarySource(`trajectory-${variant}`, 'Read and compare the three source records.');
+  const sourceText = 'Source facts '.repeat(800) + 'TAIL-SOURCE: version is 7.';
+  let reads = 0;
+  const reader = brackets.wrapToolForHarness(tool({ name: 'read_file', description: 'Read a source record.',
+    parameters: z.object({ index: z.number() }), execute: async ({ index }) => { reads++; return `${index}: ${sourceText}`; },
+  }) as never);
+  const model = scriptedRecordingModel([
+    [textMsg('I am comparing the source versions.'), toolCall('trajectory-read-a', 'read_file', { index: 1 }), toolCall('trajectory-read-b', 'read_file', { index: 2 })],
+    [toolCall('trajectory-read-c', 'read_file', { index: 3 })],
+    [textMsg('All three sources specify version 7.')],
+  ]);
+  const { withInstructionMemory } = await import('./model-memory-evidence.js');
+  const agent = { model, tools: [reader], instructions: withInstructionMemory(() => 'Remembered owner preference: lead with the recommendation.', ['Remembered owner preference: lead with the recommendation.']) };
+  bindHostCanarySurface(fixture, agent, [reader]);
+  const seen: watcher.WatcherJudgeInput[] = [];
+  watcher._setWatcherJudgeForTests(async input => {
+    seen.push(input);
+    if (variant === 'unavailable') input.onUnavailable?.('judge_context_unavailable: complete prompt does not fit');
+    if (variant === 'stale') {
+      const note = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 1, role: 'user', type: 'user_steer_note', data: { text: 'Change of scope: stop the comparison and report the raw versions only.' } });
+      eventlog.appendEvent({ sessionId: fixture.session.id, turn: 1, role: 'system', type: 'user_steer_note_delivered', data: { sourceUserSeq: fixture.source.seq, noteSeqs: [note.seq] } });
+    }
+    return variant === 'unavailable' ? null : { onTrack: false, miss: 'Version discrepancy needs reconciliation.',
+      steer: 'Compare the retained version values before reporting.' };
+  });
+  const result = await runProductionHost(fixture, agent);
+  assert.equal(result.terminal, undefined, JSON.stringify(result.terminal));
+  assert.equal(reads, 3, 'the fixture must execute real reads, not merely request them');
+  const settled = eventlog.openEventLog().prepare('SELECT outcome_kind FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?')
+    .all(fixture.session.id, fixture.source.seq) as Array<{ outcome_kind: string }>;
+  assert.equal(settled.length, 3);
+  assert.ok(settled.every(row => row.outcome_kind === 'succeeded'));
+  const reviews = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .filter(e => e.data.kind === 'trajectory_review');
+  if (variant === 'disabled') { assert.equal(seen.length, 0); assert.equal(reviews.length, 0); return; }
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].sourceEvidence ?? '', /Remembered owner preference: lead with the recommendation/);
+  assert.ok(seen[0].sourceEvidence?.includes(sourceText), 'whole receipt-owned source reaches the reviewer');
+  assert.equal(seen[0].latestAssistantNote, 'I am comparing the source versions.');
+  assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.verdict, variant === 'unavailable' ? 'unavailable' : 'drift');
+  if (variant === 'unavailable') assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.unavailableReason,
+    'judge_context_unavailable: complete prompt does not fit');
+  if (variant === 'stale') assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.stale, true);
+  assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, variant === 'drift' ? 1 : 0);
+  assert.equal(JSON.stringify(model.requests[2]).includes('Compare the retained version values before reporting.'), variant === 'drift');
+  assert.equal(model.calls(), 3, 'advisory review adds no model continuation or approval gate');
+});
+
+test('successive advisory windows include each newly settled read once', async t => {
+  const watcher = await import('./watcher-judge.js');
+  const keys = ['CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '2'; process.env.CLEMMY_WATCHER_JUDGE = 'on';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1'; process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  const fixture = acceptHostCanarySource('incremental-review', 'Read all six records.');
+  const reader = brackets.wrapToolForHarness(tool({ name: 'read_file', description: 'Read one record.',
+    parameters: z.object({ index: z.number() }), execute: async ({ index }) => `UNIQUE-SOURCE-${index}: factual record`,
+  }) as never);
+  const seen: watcher.WatcherJudgeInput[] = [];
+  watcher._setWatcherJudgeForTests(async input => { seen.push(input); return { onTrack: true, miss: '', steer: '' }; });
+  const model = scriptedRecordingModel([1, 3, 5].map(first => [first, first + 1].map(index => toolCall(`read-increment-${index}`, 'read_file', { index }))).concat([[textMsg('All six records read.')]]));
+  const agent = { model, tools: [reader] };
+  bindHostCanarySurface(fixture, agent, [reader]);
+  const result = await runProductionHost(fixture, agent);
+  assert.equal(result.terminal, undefined, JSON.stringify(result));
+  assert.equal(seen.length, 3);
+  for (let window = 0; window < 3; window++) for (let index = 1; index <= 6; index++) {
+    assert.equal(seen[window].sourceEvidence?.includes(`UNIQUE-SOURCE-${index}:`), index === window * 2 + 1 || index === window * 2 + 2,
+      `window ${window + 1} must contain only its new read bytes; source ${index}`);
+  }
+});
+
+test('a concrete tool failure starts advisory review before the ordinary cadence, and tool-free stop explanations do not start another review', async t => {
+  const watcher = await import('./watcher-judge.js');
+  const keys = ['CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '12';
+  process.env.CLEMMY_WATCHER_JUDGE = 'on';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  const fixture = acceptHostCanarySource('early-failure-review', 'Read the current document and report its findings.');
+  const reader = brackets.wrapToolForHarness(tool({ name: 'read_file', description: 'Read the document.',
+    parameters: z.object({ path: z.string() }), execute: async ({ path }) => {
+      if (path === 'missing') return JSON.stringify({ ok: false, code: 'invalid_arguments', message: 'DOCUMENT_PATH_MISSING: use the retained exact path.' });
+      return 'The current document contains four findings.';
+    },
+  }) as never);
+  const model = scriptedRecordingModel([
+    [toolCall('early-failed-read', 'read_file', { path: 'missing' })],
+    [toolCall('early-corrected-read', 'read_file', { path: 'current' })],
+    [textMsg('The current document contains four findings.')],
+  ]);
+  const agent = { model, tools: [reader] };
+  bindHostCanarySurface(fixture, agent, [reader]);
+  const seen: watcher.WatcherJudgeInput[] = [];
+  watcher._setWatcherJudgeForTests(async input => {
+    seen.push(input);
+    return { onTrack: false, miss: 'The first path failed.', steer: 'Use the retained exact document path and preserve the original objective.' };
+  });
+  const runner = throwingRunner();
+  const { attachEventLogHooks } = await import('./hooks.js');
+  const detach = attachEventLogHooks(runner, { getSessionId: () => fixture.session.id, getTurn: () => fixture.source.turn });
+  t.after(detach);
+  const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(runner as never, agent as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context } as never));
+  assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+  assert.equal(seen.length, 1, 'one new settled failure starts one check below twelve calls');
+  assert.match(seen[0].sourceEvidence ?? '', /DOCUMENT_PATH_MISSING/);
+  assert.match(JSON.stringify(model.requests[2]), /Use the retained exact document path/);
+  const phases = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'trajectory_review');
+  assert.equal(phases.filter(e => e.data.phase === 'delivered').length, 1);
+  const checkin = { model: stubModel([[textMsg('The earlier read failed; the corrected read is retained.')]]), tools: [] };
+  bindHostCanarySurface(fixture, checkin, []);
+  await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(throwingRunner() as never, checkin as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns: 1, hostTurnEngine: 'host_v1', hostConversationalCheckIn: true, context: fixture.context } as never));
+  assert.equal(seen.length, 1, 'a tool-free explanation cannot receive a useful tool correction');
+});
+
+for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wrong_plan_digest'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
+  const host = await import('./host-turn-runner.js');
+  const { buildPublishPlanTool } = await import('../../tools/publish-plan.js');
+  const { planReviewDigest } = await import('./plan-publication-review.js');
+  const fixture = acceptHostCanarySource(`final-plan-${variant}`, 'Prepare a comparison plan with complete evidence coverage.', { taskMode: { version: 1, kind: 'plan' } });
+  host.captureEffectiveCompletionPolicyOnce({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, enabled: variant !== 'disabled' });
+  const publisher = brackets.wrapToolForHarness(buildPublishPlanTool() as never);
+  const publication = (fixed: boolean) => ({ full_text: 'Compare the evidence.', structured_plan: {
+    steps: [{ id: 'compare', action: fixed ? 'Compare all sources and report missing evidence.' : 'Compare one source.', effect: 'compute', verification: fixed ? 'Every required source accounted for.' : 'One source cited.' }],
+    successCriteria: ['All requested evidence covered.'],
+  } });
+  let count = 0;
+  host._setHostObjectiveJudgeForTests(async (_objective, reply, options) => {
+    count++;
+    assert.equal(reply, publication(false).full_text);
+    assert.match(options?.toolCallSummary ?? '', /THIS IS A PLAN TURN/);
+    assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
+    assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
+    assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] }).length, 0, 'the reviewed bytes must still be an editable draft');
+    if (variant === 'unavailable') throw new Error('review service unavailable');
+    if (variant === 'correction' && count === 1) return { done: false, reason: 'The graph omits evidence coverage. Revise the comparison step.' };
+    if (variant === 'correction') assert.match(options?.toolCallSummary ?? '', /Every required source accounted for/);
+    return { done: true, reason: 'The plan covers the objective.', judgeModelId: 'claude-opus-5', judgeProvider: 'claude', ownerSelectedJudge: true, selfJudge: true };
+  });
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const model = scriptedRecordingModel([[toolCall('first-draft', 'publish_plan', publication(false))], [toolCall('revised-draft', 'publish_plan', publication(true))]]);
+  const respond = model.getResponse.bind(model);
+  model.getResponse = async (...args) => {
+    const response = await respond(...args);
+    if (variant === 'correction' && model.calls() === 2) {
+      const row = eventlog.openEventLog().prepare('SELECT draft_json FROM reviewed_plan_preparation_drafts_v1 WHERE session_id=? AND source_user_seq=?')
+        .get(fixture.session.id, fixture.source.seq) as { draft_json: string };
+      const digest = createHash('sha256').update(row.draft_json).digest('hex');
+      assert.ok(JSON.stringify(args[0]).includes(digest), 'the model receives the exact repair reference');
+      response.output = [toolCall('revised-draft', 'publish_plan', { draft_digest: digest,
+        step_patches: [{ step_id: 'compare', changes: { action: 'Compare all sources and report missing evidence.', verification: 'Every required source accounted for.' } }] })];
+    }
+    return response;
+  };
+  const agent = { model, tools: [publisher] }; bindHostCanarySurface(fixture, agent, [publisher]);
+  const result = await runProductionHost(fixture, agent);
+  assert.equal(result.terminal, undefined, JSON.stringify(result));
+  assert.equal(count, variant === 'disabled' ? 0 : variant === 'correction' ? 2 : 1);
+  assert.equal(model.calls(), variant === 'correction' ? 2 : 1);
+  if (variant === 'correction') assert.match(JSON.stringify(model.requests[1]), /graph omits evidence coverage/);
+  if (variant === 'correction') {
+    assert.match(JSON.stringify(model.requests[1]), /This is a Plan revision/);
+    assert.match(JSON.stringify(model.requests[1]), /a reviewer cannot authorize work the owner deferred/);
+    const reviewMessage = (model.requests[1] as any).input.find((item: any) =>
+      typeof item.content === 'string' && item.content.startsWith('[RETAINED COMPLETION REVIEW'));
+    const retained = JSON.parse(reviewMessage.content.slice(reviewMessage.content.lastIndexOf('\n') + 1));
+    assert.equal(retained.phase, 'plan');
+    const repair = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] }).find(e => e.data.fulfills === false);
+    assert.equal(repair?.data.planReviewRepair, true, 'host-accepted plan corrections are durable progress evidence');
+    assert.match(String(repair?.data.planDigest), /^[a-f0-9]{64}$/);
+  }
+  const published = eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] });
+  assert.equal(published.length, 1);
+  const artifact = published[0].data.artifact as any;
+  const verdict = host.completionVerdictForAcceptedSource({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
+  if (variant === 'disabled') assert.equal(verdict, null);
+  else {
+    assert.equal(verdict?.planDigest, planReviewDigest({ fullText: artifact.fullText, structuredPlan: artifact.structuredPlan, readiness: artifact.readiness, missingPrerequisites: artifact.missingPrerequisites }));
+    assert.equal(verdict?.failedOpen, variant === 'unavailable' ? true : undefined);
+  }
+  if (variant === 'wrong_plan_digest') {
+    const row = eventlog.openEventLog().prepare('SELECT data_json FROM events WHERE seq=?').get(verdict!.seq) as { data_json: string };
+    eventlog.openEventLog().prepare('UPDATE events SET data_json=? WHERE seq=?').run(JSON.stringify({ ...JSON.parse(row.data_json), planDigest: '0'.repeat(64) }), verdict!.seq);
+  }
+  eventlog.closeEventLog();
+  const { commitTurnOutcome } = await import('./delivery-committer.js');
+  const { turnOutcomeId } = await import('./turn-outcome.js');
+  const identity = { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, turn: fixture.source.turn };
+  const terminal = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false, presentation: { kind: 'answer', text: String(result.finalOutput) } });
+  if (variant === 'positive' || variant === 'correction') {
+    assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, true, JSON.stringify(terminal));
+    assert.equal((terminal.event.data.completionVerdictRef as any)?.planMatches, true);
+  } else if (variant === 'wrong_plan_digest') {
+    assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, false);
+    assert.match(terminal.presentation.text, /saved plan differs/);
+  } else if (variant === 'disabled') assert.equal((terminal.event.data.completionReview as any)?.disposition, 'disabled_by_owner');
+  else assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, false);
+
+});
+
+
+test('a completion judge accepting a clarification preserves the resumable question through publication', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const question = 'The saved report needs an owner decision. Which reporting period should I use?';
+  _setHostObjectiveJudgeForTests(async () => ({ done: true, awaitingUser: true, reason: 'The reporting period needs owner input.' }));
+  try {
+    const session = eventlog.createSession({ id: `judge-waiting-${++acceptedSerial}`, kind: 'chat' });
+    const model = stubModel([[textMsg(question)]]);
+    const outcome = await runConversation({ sessionId: session.id, input: 'Post the summary to the channel',
+      turnEngine: 'host_v1', maxSteps: 1, maxTurns: 3, judgeCompletion: true,
+      buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
+      makeRunner: () => { const runner = new EventEmitter();
+        (runner as any).run = () => { throw new Error('legacy runner must not execute'); }; return runner as never; },
+    });
+    assert.equal(outcome.status, 'awaiting_user_input', JSON.stringify(outcome));
+    assert.equal(outcome.publicPresentation?.status, 'needs_input');
+    assert.equal(outcome.publicPresentation?.text, question);
+    const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0]!.data.awaitingUser, true);
+    const reviews = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] });
+    assert.equal(reviews.at(-1)!.data.fulfills, false, 'accepting a question cannot certify the unfinished work');
+    assert.equal(reviews.at(-1)!.data.awaitingUser, true);
+    const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0]!.data.question, question);
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+
+for (const [review, repairReady] of [[false, false], [true, false], [true, true]]) test(`a published needs-input plan pauses with completion review ${review ? 'on' : 'off'}${repairReady ? ' after correcting ready status' : ''}`, async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const { buildPublishPlanTool } = await import('../../tools/publish-plan.js');
+  const fixture = acceptHostCanarySource(`plan-waiting-${review}`, 'Prepare a research plan. Ask if an owner decision is needed.', { taskMode: { version: 1, kind: 'plan' } });
+  host.captureEffectiveCompletionPolicyOnce({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, enabled: review });
+  let judgments = 0;
+  host._setHostObjectiveJudgeForTests(async () => { judgments++; return { done: true, awaitingUser: true, reason: 'The audience requires an owner choice.' }; });
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const publisher = brackets.wrapToolForHarness(buildPublishPlanTool() as never);
+  const publication = {
+    full_text: 'Which audience should the research address?', readiness: 'needs_input', missing_prerequisites: ['The intended audience.'],
+    structured_plan: { steps: [{ id: 'compare', action: 'Compare evidence for the chosen audience.', effect: 'compute', verification: 'Evidence is relevant to the chosen audience.' }], successCriteria: ['A useful research plan.'] },
+  };
+  const model = scriptedRecordingModel([
+    ...(repairReady ? [[toolCall('premature-ready', 'publish_plan', { ...publication, readiness: 'ready', missing_prerequisites: [] })]] : []),
+    [toolCall('publish-question-plan', 'publish_plan', publication)],
+  ]);
+  const agent = { model, tools: [publisher] }; bindHostCanarySurface(fixture, agent, [publisher]);
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(judgments, repairReady ? 2 : review ? 1 : 0);
+  if (repairReady) assert.match(JSON.stringify(model.requests[1]), /audience requires an owner choice/);
+  assert.equal(outcome.terminal?.status, 'awaiting_user_input', JSON.stringify(outcome));
+  assert.equal(outcome.finalOutput, 'Which audience should the research address?');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] }).length, 1);
+});
+
+test('the host model request liveness clears on both a response and a rejected request', async () => {
+  for (const fail of [false, true]) {
+    const context = { sessionId: `host-request-liveness-${fail}`, counter: new brackets.ToolCallsCounter(5), hostModelActivity: { pendingRequests: 0 } };
+    let entered = false;
+    const observedCounts: number[] = [];
+    const model = {
+      async getResponse() {
+        entered = true;
+        observedCounts.push(context.hostModelActivity.pendingRequests);
+        if (fail) throw new Error('fixture transport failed');
+        return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [textMsg('done')], responseId: 'liveness-response' };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    await Promise.allSettled([brackets.withHarnessRunContext(context, () => hostRunRunner(
+      throwingRunner() as never, { model, tools: [] } as never,
+      [{ type: 'message', role: 'user', content: 'Answer.' }] as never,
+      { maxTurns: 2, context: { sessionId: context.sessionId } },
+    ))]);
+    assert.equal(entered, true);
+    assert.deepEqual(observedCounts, [1], 'the heartbeat parent sees the physical request');
+    assert.equal(context.hostModelActivity.pendingRequests, 0);
+  }
+});
+
+for (const retries of [0, 1]) test(`mid-stream retirement preserves settled work and retries only the unadmitted model frame (${retries} retry)`, async () => {
+  const keys = ['CLEMMY_MODEL_STREAM_STALL_MS', 'CLEMMY_MODEL_FIRST_BYTE_STALL_MS', 'CLEMMY_MODEL_STREAM_STALL_RETRIES', 'CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS'];
+  const prior = keys.map(key => process.env[key]);
+  Object.assign(process.env, { CLEMMY_MODEL_STREAM_STALL_MS: '40', CLEMMY_MODEL_FIRST_BYTE_STALL_MS: '40',
+    CLEMMY_MODEL_STREAM_STALL_RETRIES: String(retries), CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS: '5000' });
+  let calls = 0, reads = 0, writes = 0, lateBodies = 0;
+  const requests: string[] = [];
+  const model = {
+    async getResponse(): Promise<never> { throw new Error('stream required'); },
+    async *getStreamedResponse(request: { input: unknown; signal?: AbortSignal }) {
+      calls += 1;
+      requests.push(JSON.stringify(request.input));
+      if (calls === 2) {
+        yield { type: 'output_text_delta', delta: 'UNACCEPTED PARTIAL save promise' } as never;
+        await new Promise<void>(resolve => request.signal!.addEventListener('abort', () => resolve(), { once: true }));
+        // The real compatibility adapter manufactured a finished response on abort.
+        yield { type: 'response_done', response: { usage: {}, output: [textMsg('UNACCEPTED PARTIAL save promise'),
+          toolCall('retired-late-call', 'late_mutation', {})] } } as never;
+        return;
+      }
+      const output = calls === 1 ? [toolCall('retained-read', 'read_fixture', {})]
+        : calls === 3 ? [toolCall('one-current-write', 'write_fixture', {})] : [textMsg('saved and finished')];
+      yield { type: 'response_done', response: { usage: {}, output } } as never;
+    },
+  };
+  const fixtureTool = (name: string, invoke: () => Promise<string>) => ({ type: 'function', name, description: name,
+    parameters: { type: 'object', properties: {} }, needsApproval: async () => false, invoke });
+  try {
+    const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [
+      fixtureTool('read_fixture', async () => { reads += 1; return 'retained read evidence'; }),
+      fixtureTool('write_fixture', async () => { writes += 1; return 'saved'; }),
+      fixtureTool('late_mutation', async () => { lateBodies += 1; return 'must not execute'; }),
+    ] } as never, [] as never, { maxTurns: 6 });
+    assert.equal(reads, 1, 'settled work is never replayed');
+    assert.equal(lateBodies, 0, 'aborted model intents never enter a tool body');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /UNACCEPTED PARTIAL|retired-late-call/);
+    if (retries) {
+      assert.equal(calls, 4);
+      assert.equal(writes, 1);
+      assert.equal(outcome.finalOutput, 'saved and finished');
+      assert.match(requests[2], /retained read evidence/);
+      assert.doesNotMatch(requests[2], /UNACCEPTED PARTIAL|retired-late-call/);
+    } else {
+      assert.equal(calls, 2);
+      assert.equal(writes, 0);
+      assert.equal(outcome.terminal?.reason, 'model_stalled');
+    }
+  } finally {
+    keys.forEach((key, index) => { if (prior[index] === undefined) delete process.env[key]; else process.env[key] = prior[index]; });
+  }
 });

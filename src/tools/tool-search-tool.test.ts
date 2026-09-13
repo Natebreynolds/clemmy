@@ -921,9 +921,13 @@ for (const renderChars of [20_000, 20_001, 100_000]) {
     }]);
     const baselineRaw = await baseline.handler({ query: name, limit: 1 });
     const renderOverhead = baselineRaw.content[0].text.length - JSON.stringify(baselineSchema).length;
-    const schema = exactSizedNestedEnumSchema(renderChars - renderOverhead);
+    // Every schema now has a durable handle. Its chars/bytes fields grow by
+    // a digit with this larger fixture; account for that actual wire overhead.
+    const handleDigitGrowth = 2 * (String(renderChars - renderOverhead).length
+      - String(JSON.stringify(baselineSchema).length).length);
+    const schema = exactSizedNestedEnumSchema(renderChars - renderOverhead - handleDigitGrowth);
     assert.equal(
-      renderOverhead + JSON.stringify(schema).length,
+      renderOverhead + handleDigitGrowth + JSON.stringify(schema).length,
       renderChars,
       'fixture pins the pre-ceiling compact JSON render exactly',
     );

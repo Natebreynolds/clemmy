@@ -122,7 +122,7 @@ export function ActivityCard({
 }) {
   const [open, setOpen] = useState<boolean | null>(null);
   const anyRunning = live && items.some((a) => a.status === 'running');
-  const now = useNowTick(live && (anyRunning || items.length === 0));
+  const now = useNowTick(live);
   const view = items.length > 0
     ? settleTerminalActivity(narrateActivity(items, { live }), live ? undefined : (terminalOutcome ?? 'interrupted'))
     : [];

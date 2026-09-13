@@ -14,6 +14,7 @@ import {
   loadTeamAgents,
   slugifyAgentName,
   textResult,
+  invalidArgumentsTextResult,
   writeTeamAgent,
 } from './shared.js';
 import { proposeAgentDefinition } from '../agents/agent-proposals.js';
@@ -603,7 +604,7 @@ export function registerTeamTools(server: McpServer): void {
     },
     async ({ id, agent }) => {
       if (id) {
-        if (!existsSync(DELEGATIONS_DIR)) return textResult('No delegations found.');
+        if (!existsSync(DELEGATIONS_DIR)) return invalidArgumentsTextResult(`Delegation not found: ${id}. For a durable background task use background_task_status with its id.`);
         for (const slug of readdirSync(DELEGATIONS_DIR)) {
           const filePath = delegationFilePath(slug, id);
           if (!existsSync(filePath)) continue;
@@ -627,11 +628,11 @@ export function registerTeamTools(server: McpServer): void {
             ].filter(Boolean).join('\n'),
           );
         }
-        return textResult(`Delegation not found: ${id}`);
+        return invalidArgumentsTextResult(`Delegation not found: ${id}. For a durable background task use background_task_status with its id.`);
       }
 
       if (!agent) {
-        return textResult('Provide either id or agent.');
+        return invalidArgumentsTextResult('Provide either the delegation id or agent. For a durable background task use background_task_status with its id.');
       }
 
       const dirPath = path.join(DELEGATIONS_DIR, agent);

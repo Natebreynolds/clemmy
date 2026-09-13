@@ -136,7 +136,10 @@ export function AppShell() {
             </button>
           </div>
         )}
-        <main id="main" className="min-h-0 flex-1 overflow-y-auto">
+        <main
+          id="main"
+          className={`min-h-0 flex-1 ${location.pathname === '/chat' || location.pathname.startsWith('/chat/') ? 'overflow-hidden' : 'overflow-y-auto'}`}
+        >
           <ErrorBoundary resetKey={location.pathname}>
             <Outlet />
           </ErrorBoundary>

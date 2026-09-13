@@ -1,3 +1,4 @@
+import { reviewedFileCorrectionReservation, retainedFileCorrectionReservation } from './reviewed-file-correction.js';
 import path from 'node:path';
 import os from 'node:os';
 import { isSensitivePath } from '../security.js';
@@ -593,6 +594,10 @@ function reservationKey(input: {
     cardinality: input.cardinality,
     universeItemId: input.prepared.binding.universeItemId ?? null,
     universeMemberDigest: input.prepared.binding.universeMemberDigest ?? null,
+    ...(reviewedFileCorrectionReservation(input.prepared, input.prepared.binding.requirementId,
+      input.prepared.targetName, input.prepared.targetArgs) ? {
+        correction: retainedFileCorrectionReservation(input.prepared),
+      } : {}),
   });
 }
 
@@ -626,7 +631,11 @@ function priorReservationExists(prepared: PreparedHostWorkCallV1): boolean {
       universe_item_id: string | null;
       universe_member_digest: string | null;
     }>;
-    if (binding.cardinality === 'once') return rows.length > 0;
+    if (binding.cardinality === 'once') {
+      const correction = reviewedFileCorrectionReservation(prepared, binding.requirementId, prepared.targetName, prepared.targetArgs);
+      return correction ? rows.some(row => retainedFileCorrectionReservation({ sessionId: prepared.sessionId,
+        sourceUserSeq: prepared.sourceUserSeq, logicalToolCallId: row.logical_tool_call_id }) === correction) : rows.length > 0;
+    }
     if (binding.cardinality === 'each') {
       return rows.some((row) => row.cardinality_kind === 'each'
         && row.universe_item_id === (binding.universeItemId ?? null));

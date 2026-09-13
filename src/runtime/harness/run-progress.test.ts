@@ -8,7 +8,7 @@
  * counted returns instead of saying what was accumulating. The owner watched
  * the good run and asked whether she was going in circles, which is the right
  * question to ask of a surface that cannot answer it. Reconstructed from that
- * run's ledger: document read at t+30s, five toolkits bound by t+2:00, then
+ * run's ledger: document read at t+30s, five toolkits identified by t+2:00, then
  * three minutes of silence while the plan was written.
  */
 import assert from 'node:assert/strict';
@@ -41,7 +41,7 @@ function turn(text = 'read this doc and plan the research') {
 function readDoc(id: { sessionId: string; sourceUserSeq: number }) {
   events.appendEvent({
     sessionId: id.sessionId, turn: 1, role: 'system', type: 'read_receipt',
-    data: { sourceUserSeq: id.sourceUserSeq, record: { identifier: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', effectClass: 'read' } },
+    data: { sourceUserSeq: id.sourceUserSeq, record: { identifier: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT', effectClass: 'read', dispatchOutcome: 'succeeded', receiptId: 'fixture-input', readEvidenceRef: 'evt:fixture-input' } },
   });
 }
 
@@ -70,10 +70,10 @@ test('an investigating turn reports what it has assembled, not just that somethi
   bind(id, 'FIRECRAWL', 2);
 
   const line = composeRunProgressLine({ ...id, fallback: 'FALLBACK' });
-  assert.match(line, /1 input read/, 'the document she read counts as progress');
-  assert.match(line, /3 toolkits bound/, 'breadth is what shows a plan taking shape');
+  assert.match(line, /1 read result retained/, 'the document she read counts as progress');
+  assert.match(line, /3 toolkits identified/, 'breadth is what shows a plan taking shape');
   assert.match(line, /dataforseo/, 'and WHICH toolkits, so "bound" is checkable rather than a number');
-  assert.match(line, /12 operations callable/, 'the honest total across toolkits');
+  assert.match(line, /12 operations identified/, 'the honest total across toolkits');
   assert.doesNotMatch(line, /FALLBACK/);
 });
 
@@ -93,8 +93,8 @@ test('the line distinguishes a turn that is accumulating from one that is not', 
   const a = composeRunProgressLine({ ...circling, fallback: '' });
   const b = composeRunProgressLine({ ...converging, fallback: '' });
   assert.notEqual(a, b, 'one toolkit and four must not render identically');
-  assert.match(a, /1 toolkit bound/, 'singular reads correctly');
-  assert.match(b, /4 toolkits bound/);
+  assert.match(a, /1 toolkit identified/, 'singular reads correctly');
+  assert.match(b, /4 toolkits identified/);
 });
 
 test('re-proving the same toolkit does not inflate the line', () => {
@@ -104,8 +104,8 @@ test('re-proving the same toolkit does not inflate the line', () => {
   readDoc(id);
   for (let i = 0; i < 5; i += 1) bind(id, 'DATAFORSEO', 3);
   const line = composeRunProgressLine({ ...id, fallback: '' });
-  assert.match(line, /1 toolkit bound/, 'repeat proofs of one toolkit stay one toolkit');
-  assert.match(line, /3 operations callable/, 'and duplicate operations are not counted twice');
+  assert.match(line, /1 toolkit identified/, 'repeat proofs of one toolkit stay one toolkit');
+  assert.match(line, /3 operations identified/, 'and duplicate operations are not counted twice');
 });
 
 test('a broken ledger falls back rather than inventing progress', () => {

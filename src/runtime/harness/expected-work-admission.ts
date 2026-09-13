@@ -1,3 +1,4 @@
+import { reviewedFileCorrectionForCall, retainReviewedFileCorrection, staleReviewedReadCalls } from './reviewed-file-correction.js';
 /**
  * Fused action-topology admission.
  *
@@ -8,6 +9,8 @@
  * rules.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { acceptedPlanExecution } from './accepted-plan-execution.js';
+import { reviewedPlanMemberReadArgumentsMatch } from './reviewed-plan-runtime.js';
 import type Database from 'better-sqlite3';
 import { armAcceptedTaskAuthority } from './accepted-task-authority.js';
 import {
@@ -718,6 +721,22 @@ function sourceWitness(
   } catch {
     return { ok: false, reason: 'accepted user input witness is unreadable', callTargetFallback: false };
   }
+  // Execute selects the immutable reviewed records. Its short user message
+  // need not enumerate them again or turn them into count-only target slots.
+  // Read the exact claimed revision, and compare its entire universe with
+  // this contract; an unrelated plan or a modified member set cannot witness it.
+  const reviewed = acceptedPlanExecution(contract.identity.sessionId, contract.identity.sourceUserSeq);
+  const reviewedDraft = reviewed?.artifact.structuredPlan?.executionDraft;
+  const reviewedTopology = reviewedDraft && typeof reviewedDraft === 'object' && !Array.isArray(reviewedDraft) ? reviewedDraft.topology : null;
+  const reviewedUniverses = reviewedTopology && typeof reviewedTopology === 'object' && !Array.isArray(reviewedTopology) ? reviewedTopology.universes : null;
+  const reviewedUniverse = Array.isArray(reviewedUniverses) ? reviewedUniverses.find(entry => entry && typeof entry === 'object' && !Array.isArray(entry) && entry.id === universe.id) : null;
+  const reviewedMembers = reviewedUniverse && typeof reviewedUniverse === 'object' && !Array.isArray(reviewedUniverse) && Array.isArray(reviewedUniverse.members) ? reviewedUniverse.members : null;
+  if (reviewedUniverse && typeof reviewedUniverse === 'object' && !Array.isArray(reviewedUniverse) && reviewedUniverse.seal === 'accepted_input' && reviewedMembers
+    && canonicalExpectedWorkJson({ ...reviewedUniverse, members: [...reviewedMembers].sort() }) === canonicalExpectedWorkJson({ ...universe, members: [...universe.members].sort() })
+    && selectedIds.every(id => universe.members.includes(id))) {
+    return { ok: true, kind: 'accepted_user_input', ref: row.id,
+      digest: expectedWorkDigest(canonicalExpectedWorkJson([...universe.members].sort())) };
+  }
   // A DELEGATED WORKER CHILD's accepted input is a host-authored job packet
   // whose item the host named from the parent's frozen contract
   // (worker-host-runner, authority 'delegated_item'). That lineage is the
@@ -999,7 +1018,9 @@ function dischargedRequirementSettlements(
     execution_kind: string;
     result_handle_id: string | null;
   }>;
+  const staleReads = staleReviewedReadCalls(contract.identity, requirementId);
   const discharged = rows.filter((row) => {
+    if (staleReads.has(row.logical_tool_call_id)) return false;
     if (
       (row.outcome_kind !== 'succeeded' && row.outcome_kind !== 'empty_result')
       || row.continues_requirement !== 0
@@ -1966,9 +1987,11 @@ function priorRequirementAllowsAdmission(
     requires_reconciliation: number | null;
     physical_crossing_count: number | null;
   }>;
+  const staleReads = operation.effect === 'read' ? staleReviewedReadCalls(contract.identity, operation.id) : new Set<string>();
+  const currentRows = rows.filter(row => !staleReads.has(row.logical_tool_call_id));
   const relevant = operation.cardinality.kind === 'each'
-    ? rows.filter((row) => row.universe_item_id === universeItemId)
-    : rows;
+    ? currentRows.filter((row) => row.universe_item_id === universeItemId)
+    : currentRows;
   // AN ITEM A DELEGATED CHILD ALREADY WROTE IS DISCHARGED, even though the
   // parent holds no binding row for it — the write happened in the child's
   // session (expected-work-delegation.ts). Without this the once-per-item
@@ -1999,6 +2022,10 @@ function priorRequirementAllowsAdmission(
   if (relevant.length === 0) return { ok: true };
   if (relevant.some((row) => row.state === 'open' || row.outcome_kind === null)) {
     return { ok: false, reason: 'this requirement instance already has an open logical call' };
+  }
+  if (operation.effect === 'local_write' && operation.cardinality.kind === 'once'
+    && reviewedFileCorrectionForCall(contract.identity, operation.id, currentInvocation.tool, currentInvocation.args)) {
+    return { ok: true };
   }
   // The same oracle that drives dependency admission and plan projection is
   // the only authority allowed to say a read/compute requirement is
@@ -2923,6 +2950,11 @@ export function admitExpectedWorkInvocation(input: {
       }
 
       const universe = universeFor(contract, operation);
+      const reviewedMemberRead = operation.effect === 'read' && operation.cardinality.kind === 'each'
+        && typeof input.universeItemId === 'string' && reviewedPlanMemberReadArgumentsMatch({
+          ...contract.identity, stepId: operation.id, memberId: input.universeItemId,
+          toolName: logicalContract.toolName, args: unwrapRuntimeEffectiveToolIdentity(input.tool, input.args).args ?? evidenceArgs,
+        });
       let selectorJson: string | null = null;
       let memberDigest: string | null = null;
       let memberCount: number | null = null;
@@ -2959,7 +2991,7 @@ export function admitExpectedWorkInvocation(input: {
           return refusedWithPlan('work_cardinality_mismatch', 'set cardinality binds the full set, not one item');
         }
         const hostMayBindPerItemTarget = operation.cardinality.kind === 'each'
-          && (operation.effect === 'external_write' || operation.effect === 'local_write')
+          && (operation.effect === 'external_write' || operation.effect === 'local_write' || reviewedMemberRead)
           && !universeSelector;
         if (!universeSelector && !hostMayBindPerItemTarget) {
           return refusedWithPlan('work_cardinality_mismatch', 'set/read cardinality requires an immutable argument selector');
@@ -3086,7 +3118,9 @@ export function admitExpectedWorkInvocation(input: {
       let schemaFingerprint: string | null = null;
       let schemaDigest: string | null = null;
       if (operation.effect === 'read') {
-        const refinement = refinePreDispatchReadEvidence({
+        const refinement = reviewedMemberRead
+          ? { status: 'authoritative' as const, mode: 'point_read' as const, requiresExhaustion: false, basis: 'reviewed_plan_member' }
+          : refinePreDispatchReadEvidence({
           operation,
           universes: contract.universes,
           ...(input.universeItemId ? { universeItemId: input.universeItemId } : {}),
@@ -3248,6 +3282,9 @@ export function admitExpectedWorkInvocation(input: {
           ? { generatedArtifactContentContract: generatedArtifactContract.contentContract }
           : {}),
       };
+      const correction = operation.effect === 'local_write' && operation.cardinality.kind === 'once'
+        ? reviewedFileCorrectionForCall(input, operation.id, input.tool, input.args) : null;
+      if (correction) retainReviewedFileCorrection(input, correction);
       input.recordContinuationInTransaction?.({
         db,
         binding,

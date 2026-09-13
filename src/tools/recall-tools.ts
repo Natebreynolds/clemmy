@@ -11,6 +11,7 @@ import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
+import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -325,6 +326,16 @@ export function registerRecallTools(server: McpServer): void {
       // One canonical spelling past this line: the widened string form
       // ("subject,start") becomes the same array the documented form produces.
       const fields = normalizeFieldsInput(input.fields);
+      // The receipt reader and this query must agree on the payload owner.
+      // JSON inside an exact MCP result is data, not a list of text blocks.
+      // Preserve explicit envelope inspection and never select a failed or
+      // conflicting payload. Raw stored bytes and receipt authority are intact.
+      const explicitlyQueriesEnvelope = fields?.some(field => parsed !== null && typeof parsed === 'object'
+        && Object.prototype.hasOwnProperty.call(parsed, field));
+      const view = explicitlyQueriesEnvelope ? undefined : projectProviderResultEvidenceView(parsed);
+      const decodedMcpPayload = view?.kind === 'provider_payload'
+        && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
+      if (decodedMcpPayload) parsed = view.payload;
       const project = (rec: unknown): unknown => {
         if (!fields || !rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
         const out: Record<string, unknown> = {};
@@ -402,7 +413,7 @@ export function registerRecallTools(server: McpServer): void {
         // field → a precise path.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
-        const refHint = resolved.receipt ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }
@@ -420,7 +431,7 @@ export function registerRecallTools(server: McpServer): void {
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
-        const refHint = resolved.receipt ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
+        const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
         const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
         return textResult(bodyText, { maxChars: bodyText.length });
       }

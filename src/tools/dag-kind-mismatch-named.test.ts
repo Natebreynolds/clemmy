@@ -44,7 +44,8 @@ test('dag_kind_mismatch gets its own repair, not the effect-substitution advice'
   // All three real exits must be offered, including dropping the edge.
   assert.match(fn, /acceptedInputKinds include/);
   assert.match(fn, /different predecessor/);
-  assert.match(fn, /remove that dependsOn edge/);
+  assert.match(fn, /remove that dataFrom edge/);
+  assert.match(fn, /Keep dependsOn for required ordering/);
 });
 
 test('the repair names the offending edges when the reason carries them', () => {

@@ -29,6 +29,7 @@ export interface HostToolDispositionOutput {
   effect: 'none' | 'may_have_started';
   retry: 'replan' | 'do_not_retry';
   requiresReconciliation: boolean;
+  continuationReason?: 'activation_budget';
   message: string;
   /** Exact host-authored repair detail. It is sealed by digest in the receipt,
    * never duplicated into the receipt row itself. */
@@ -159,7 +160,11 @@ function textResultItem(callId: string, toolName: string, output: unknown): Agen
 function dispositionMessage(
   disposition: HostToolDisposition,
   retry: 'replan' | 'do_not_retry',
+  continuationReason?: 'activation_budget',
 ): string {
+  if (continuationReason === 'activation_budget' && disposition === 'not_started') {
+    return 'The host paused this activation before this call started. No effect occurred. This is a scheduling continuation, not an argument failure or a missing capability.';
+  }
   if (disposition === 'effect_unknown') {
     return 'Execution may have started. Do not retry this call; reconciliation is required.';
   }
@@ -182,6 +187,7 @@ export function buildHostToolDispositionResult(input: {
   retired?: boolean;
   diagnostic?: string;
   repairKey?: string;
+  continuationReason?: 'activation_budget';
   /** An exact edge from the site that knows the real next move. Omitted sites
    * still get a typed default — a generic edge names a tool and a move, which
    * is strictly more than the prose it replaces. */
@@ -189,12 +195,17 @@ export function buildHostToolDispositionResult(input: {
 }): AgentInputItem {
   const unknown = input.disposition === 'effect_unknown';
   const retry = unknown || input.retired === true ? 'do_not_retry' : 'replan';
+  const continuationReason = input.disposition === 'not_started' && retry === 'replan'
+    ? input.continuationReason : undefined;
   // Every recoverable refusal carries an edge. Derived here rather than asked
   // of each call site, because a message someone must remember to write is a
   // message that regresses — which is exactly how this class survived a local
   // fix on 2026-09-09 and reappeared one branch over in the same file.
   const edge = retry === 'replan'
-    ? input.nextEdge ?? defaultDispositionEdge({
+    ? continuationReason ? {
+      version: 1 as const, tool: input.toolName, change: 'reissue_unstarted' as const,
+      say: 'Continue only this unstarted work with a fresh call ID and the same arguments if still needed. Reuse successful sibling results; no rediscovery or argument repair is required by this pause.',
+    } : input.nextEdge ?? defaultDispositionEdge({
       disposition: input.disposition,
       toolName: input.toolName,
     })
@@ -209,9 +220,10 @@ export function buildHostToolDispositionResult(input: {
     effect: unknown ? 'may_have_started' : 'none',
     retry,
     requiresReconciliation: unknown,
+    ...(continuationReason ? { continuationReason } : {}),
     message: edge
-      ? `${dispositionMessage(input.disposition, retry)} ${renderNextEdge(edge)}`
-      : dispositionMessage(input.disposition, retry),
+      ? `${dispositionMessage(input.disposition, retry, continuationReason)} ${renderNextEdge(edge)}`
+      : dispositionMessage(input.disposition, retry, continuationReason),
     ...(edge ? { nextEdge: edge } : {}),
     ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
     ...(input.repairKey ? { repairKey: input.repairKey } : {}),
@@ -290,6 +302,8 @@ export function describeCanonicalHostModelResult(
     || (marker.retry !== 'replan' && marker.retry !== 'do_not_retry')
     || marker.effect !== 'none'
     || marker.requiresReconciliation !== false
+    || (marker.continuationReason !== undefined
+      && (marker.continuationReason !== 'activation_budget' || marker.disposition !== 'not_started'))
     || (marker.countsRefusal !== undefined && marker.countsRefusal !== true)
     || (marker.diagnostic !== undefined
       && (typeof marker.diagnostic !== 'string' || !marker.diagnostic))
@@ -307,6 +321,7 @@ export function describeCanonicalHostModelResult(
     frameSize: Number(marker.frameSize),
     countsRefusal: marker.countsRefusal === true,
     retired: marker.retry === 'do_not_retry',
+    ...(marker.continuationReason === 'activation_budget' ? { continuationReason: 'activation_budget' as const } : {}),
     ...(typeof marker.diagnostic === 'string' ? { diagnostic: marker.diagnostic } : {}),
     ...(typeof marker.repairKey === 'string' ? { repairKey: marker.repairKey } : {}),
   });

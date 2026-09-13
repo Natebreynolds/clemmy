@@ -21,6 +21,7 @@ import {
 } from './provider-read-evidence.js';
 import {
   deriveResultHandleFactsFromRaw,
+  recordsAtRecordPath,
   reconcileStoredEnvelopeMetadata,
 } from './result-facts.js';
 import { readDurableResultPayload } from './result-payload-storage.js';
@@ -49,7 +50,7 @@ import {
   parseHostLocalWriteCommitFacts,
   proveHostLocalWorkspaceStructuredCollection,
 } from './host-local-write-commit.js';
-import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
+import { proveHostLocalWriteDerivation } from './host-local-write-derivation.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { parseCapabilityManifestOperationSemantics } from './capability-manifest.js';
 import { parseProviderAcknowledgementMode } from './provider-acknowledgement-contract.js';
@@ -626,17 +627,6 @@ function providerArgumentsForSuccessfulCall(input: {
   return matching.length === 1 ? matching[0]! : null;
 }
 
-function recordAtPath(payload: unknown, recordPath: string | null): unknown[] | null {
-  if (recordPath === null) return null;
-  const value = recordPath === ''
-    ? payload
-    : recordPath.split('.').reduce<unknown>((current, key) => {
-      if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
-      return (current as Record<string, unknown>)[key];
-    }, payload);
-  return Array.isArray(value) ? value : [];
-}
-
 function scalarIdentity(record: unknown): string | undefined {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return undefined;
   const value = record as Record<string, unknown>;
@@ -963,7 +953,20 @@ function verifyReceipt(input: {
   ) {
     return { ok: false, status: 'conflict', reason: 'receipt and durable handle projections do not match their raw payload' };
   }
-  const records = recordAtPath(rawPayload, facts.recordPath);
+  // Authenticate the original text handle above, then rederive the record
+  // view used by host file-read receipts. Decoding must never replace the
+  // original raw-byte proof or reinterpret an external provider string.
+  let recordPayload = rawPayload;
+  let recordFacts = facts;
+  if (row.dispatch_execution_site === 'host' && typeof rawPayload === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(rawPayload);
+      const parsedFacts = deriveResultHandleFactsFromRaw(parsed);
+      if (parsedFacts.recordPath !== null) { recordPayload = parsed; recordFacts = parsedFacts; }
+    } catch { /* Ordinary text remains an observation. */ }
+  }
+  if (inspectProviderEnvelope(recordPayload).verdict !== 'clean') return { ok: false, status: 'conflict', reason: 'host record envelope is contradictory' };
+  const records = recordsAtRecordPath(recordPayload, recordFacts.recordPath);
   if (records === null && expectedKind === 'collection') {
     return { ok: false, status: 'conflict', reason: 'collection proof has no durable record collection' };
   }
@@ -979,14 +982,22 @@ function verifyReceipt(input: {
     || storedIdentities.some((identity) => typeof identity !== 'string')
     || JSON.stringify(storedIdentities) !== JSON.stringify(derivedIdentities)
     || JSON.stringify(storedIdentities) !== row.record_identities_json
-    || (records !== null && records.length !== row.record_count)
+    || (records !== null && records.length !== recordFacts.recordCount)
     || row.aggregate_digest !== digest(derivedIdentities)
   ) {
     return { ok: false, status: 'conflict', reason: 'receipt record projection does not match its raw payload' };
   }
+  // A complete, parseable host file is the finite source selected by this
+  // plan. It need not invent an external provider pagination flag. Explicit
+  // partial/cursor signals still refuse; external strings never enter here.
+  const finiteHostFile = row.dispatch_execution_site === 'host'
+    && recordPayload !== rawPayload && records !== null && recordFacts.success
+    && recordFacts.completeness !== 'partial' && facts.completeness !== 'partial';
   if (expectedKind === 'collection' && (
-    row.receipt_completeness !== 'complete'
-    || row.handle_completeness !== 'complete'
+    (row.receipt_completeness !== 'complete' && !finiteHostFile)
+    || (recordFacts.completeness !== 'complete' && !finiteHostFile)
+    || recordFacts.cursor !== null
+    || (row.handle_completeness !== 'complete' && !finiteHostFile)
     || row.receipt_continuation_outstanding !== 0
     || row.continuation_ref !== null
     || row.receipt_cursor_repeated !== 0
@@ -1586,7 +1597,7 @@ function verifyHostSealedWriteReceipt(input: {
       };
     }
     if (receipt.kind === 'derivation') {
-      const derivation = proveHostLocalWorkspaceDerivation({
+      const derivation = proveHostLocalWriteDerivation({
         db: input.db,
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,

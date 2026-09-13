@@ -1,4 +1,5 @@
 /** Exact reviewed preparation at activation and each business call. No grants. */
+import { jsonSchemaAllowsNull } from '../schema-normalizer.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { canonicalCatalogIdentityOf, isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
@@ -7,13 +8,14 @@ import { digestSchema } from '../../tools/tool-contract-store.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { disclosePrimaryModelPlanningCapabilities, type HostFreshPlanningContextV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
-import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
-import { openEventLog } from './eventlog.js';
-import { resolveWorkTopologyJsonPointer } from '../graph/work-topology.js';
+import { resolveReviewedPlanStepResult, resolveReviewedPlanCollectionRecords } from './reviewed-plan-results.js';
+import { reviewedCollectionMembers, bindReviewedCollectionItem, planPointer } from './reviewed-plan-collection.js';
+import { resolveReviewedStepArguments } from './reviewed-plan-bindings.js';
+import { reviewedFileCorrection } from './reviewed-file-correction.js';
 import { unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { PlanArtifactV1 } from './plan-artifacts.js';
+import { isPlainOrClementineLocalTool, isTrustedComposioGateway } from './runtime-tool-identity.js';
 
 const object = (v: unknown): v is Record<string, any> => Boolean(v && typeof v === 'object' && !Array.isArray(v));
 const equal = (a: unknown, b: unknown) => closedCanonicalJson(a, SEALED_CALL_CANONICAL_LIMITS) === closedCanonicalJson(b, SEALED_CALL_CANONICAL_LIMITS);
@@ -52,43 +54,118 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
   }
 }
 
-/** The producer resolver must return durable raw settled bytes, never model prose. */
-export function resolveReviewedStepArguments(step: Record<string, any>, resolveProducer: (id: string) => unknown): Record<string, unknown> {
-  if (!object(step.staticArguments) || !Array.isArray(step.dynamicBindings)) throw new Error('Reviewed argument contract is malformed.');
-  const args = JSON.parse(closedCanonicalJson(step.staticArguments, SEALED_CALL_CANONICAL_LIMITS));
-  const targets = new Set<string>();
-  for (const binding of step.dynamicBindings) {
-    if (!object(binding) || typeof binding.targetPath !== 'string' || !Array.isArray(step.dependsOn)
-      || !step.dependsOn.includes(binding.producerStepId) || targets.has(binding.targetPath)) throw new Error('Reviewed dynamic binding is malformed or ambiguous.');
-    targets.add(binding.targetPath);
-    const producer = resolveProducer(binding.producerStepId);
-    if (typeof binding.outputPath !== 'string' || !binding.outputPath.startsWith('/')) throw new Error('Reviewed producer path is invalid.');
-    let cursor: unknown = producer;
-    for (const part of binding.outputPath.slice(1).split('/').map((part: string) => part.replace(/~1/g, '/').replace(/~0/g, '~'))) {
-      if ((!object(cursor) && !Array.isArray(cursor)) || !Object.hasOwn(cursor, part)) throw new Error(`Producer ${binding.producerStepId} did not return ${binding.outputPath}.`);
-      cursor = (cursor as Record<string, unknown>)[part];
-    }
-    const result = resolveWorkTopologyJsonPointer(producer, binding.outputPath);
-    if (!result.ok) throw new Error(`Producer ${binding.producerStepId} did not return ${binding.outputPath}.`);
-    const type = Array.isArray(result.value) ? 'array' : result.value === null ? 'null' : typeof result.value;
-    if (type !== binding.expectedType) throw new Error('Reviewed dynamic argument type does not match its settled producer.');
-    const parts = binding.targetPath.slice(1).split('/').map((part: string) => part.replace(/~1/g, '/').replace(/~0/g, '~'));
-    if (!binding.targetPath.startsWith('/') || parts.some((part: string) => ['__proto__', 'prototype', 'constructor'].includes(part))) throw new Error('Reviewed dynamic target is invalid.');
-    let target: Record<string, unknown> = args;
-    for (const part of parts.slice(0, -1)) {
-      if (!object(target[part])) throw new Error('Reviewed dynamic target parent must be explicitly declared.');
-      target = target[part] as Record<string, unknown>;
-    }
-    const key = parts.at(-1)!;
-    if (Object.hasOwn(target, key)) throw new Error('A reviewed argument cannot have both a static value and a dynamic binding.');
-    target[key] = result.value;
+export { resolveReviewedStepArguments } from './reviewed-plan-bindings.js';
+
+function resolvedCallArguments(input: { sessionId: string; sourceUserSeq: number; args: unknown }, step: Record<string, any>) {
+  let expected = resolveReviewedStepArguments(step, id => resolveReviewedPlanStepResult(input, id));
+  if (step.forEach) {
+    const itemId = object(input.args) ? input.args.universe_item_id : undefined;
+    const member = reviewedCollectionMembers(step.forEach, resolveReviewedPlanCollectionRecords(input, step.forEach))
+      .find(member => member.id === itemId);
+    if (!member) throw new Error('The call must name an exact member of the reviewed collection.');
+    expected = bindReviewedCollectionItem(expected, step.forEach, member.record);
   }
-  return args;
+  // The exact approved destination is already ours. A newly recorded content
+  // revision uses the native replacement operation with a retained receipt and
+  // an atomic current-byte precondition, not a replay of the create.
+  if (reviewedFileCorrection(input, step.id)) expected.mode = 'overwrite';
+  return expected;
 }
 
-export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSeq: number; toolName: string; args: unknown; effect: RuntimeToolEffect; attestation?: HostCallAttestation; effectiveArgs?: unknown }): string | undefined {
+/** The approved bindings own these values, not a second transcription by the
+ * model. Materialize before call admission so dispatch, receipts and recovery
+ * all use the same bytes. Static arguments, operation and account still pass
+ * the ordinary exact reviewed-call checks. Never manufacture missing evidence. */
+export function materializeReviewedPlanCallArguments(input: { sessionId: string; sourceUserSeq: number; toolName: string; argumentsJson: string }): { argumentsJson: string; targets: string[] } | undefined {
+  if (!isPlainOrClementineLocalTool(input.toolName, 'work_call')) return undefined;
+  try {
+    const args: unknown = JSON.parse(input.argumentsJson);
+    if (!object(args) || typeof args.requirement_id !== 'string' || typeof args.name !== 'string') return undefined;
+    const execution = acceptedPlanExecution(input.sessionId, input.sourceUserSeq);
+    if (!execution || loadExpectedWorkContract(input.sessionId, input.sourceUserSeq).status !== 'ok') return undefined;
+    const outline = prepared(execution.artifact);
+    const step = outline.steps.find(row => row.id === args.requirement_id);
+    const binding = outline.bindings.find(row => row.stepId === step?.id);
+    if (!step || !binding || !object(binding.identity)) return undefined;
+    const targets: string[] = [...(step.dynamicBindings ?? []).map((row: any) => row.targetPath),
+      ...(step.forEach?.bindings ?? []).map((row: any) => row.targetPath)];
+    if (!targets.length) return undefined;
+    const effective = unwrapRuntimeEffectiveToolIdentity(input.toolName, args);
+    const name = binding.identity.kind === 'local_registry' ? binding.identity.definition.name : binding.identity.operationId;
+    if (effective.toolName?.toLowerCase() !== name.toLowerCase() || !object(effective.args)) return undefined;
+    const expected = resolvedCallArguments({ ...input, args }, step);
+    if (reviewedFileCorrection(input, step.id)) targets.push('/mode');
+    const actual = structuredClone(effective.args);
+    for (const pointer of targets) {
+      const parts = pointer.slice(1).split('/').map((part: string) => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+      if (!pointer.startsWith('/') || parts.some(part => ['__proto__', 'prototype', 'constructor'].includes(part))) return undefined;
+      let destination: Record<string, any> = actual, source: Record<string, any> = expected;
+      for (const part of parts.slice(0, -1)) {
+        // Omitted parent containers can carry approved static siblings. An
+        // explicitly supplied incompatible container remains a call error.
+        if (!Object.hasOwn(destination, part)) destination[part] = structuredClone(source[part]);
+        if (!object(destination[part]) && !Array.isArray(destination[part])) return undefined;
+        destination = destination[part]; source = source[part];
+      }
+      destination[parts.at(-1)!] = planPointer(expected, pointer);
+    }
+    if (equal(actual, effective.args)) return undefined;
+    // Repack only the canonical selected carrier. Aliases and malformed
+    // envelopes retain their existing validation/repair path.
+    const inner = JSON.parse(args.args_json);
+    if (isTrustedComposioGateway(args.name)) {
+      if (!object(inner) || inner.tool_slug?.toLowerCase() !== name.toLowerCase()) return undefined;
+      inner.arguments = JSON.stringify(actual);
+      args.args_json = JSON.stringify(inner);
+    } else {
+      if (args.name.toLowerCase() !== name.toLowerCase()) return undefined;
+      args.args_json = JSON.stringify(actual);
+    }
+    return { argumentsJson: JSON.stringify(args), targets };
+  } catch { return undefined; } // The ordinary call check reports unresolved bindings.
+}
+
+/** A reviewed member's input mapping is stronger evidence than finding its
+ * bookkeeping ID by coincidence inside provider arguments. No authority is
+ * inferred for unreviewed reads. Current capability/account checks still run. */
+export function reviewedPlanMemberReadArgumentsMatch(input: { sessionId: string; sourceUserSeq: number; stepId: string; memberId: string; toolName: string; args: unknown }): boolean {
+  try {
+    const execution = acceptedPlanExecution(input.sessionId, input.sourceUserSeq);
+    if (!execution) return false;
+    const outline = prepared(execution.artifact);
+    const step = outline.steps.find(step => step.id === input.stepId && step.effect === 'read' && step.forEach);
+    const binding = outline.bindings.find(row => row.stepId === input.stepId);
+    if (!step || !binding) return false;
+    const name = binding.identity.kind === 'local_registry' ? binding.identity.definition.name : binding.identity.operationId;
+    if (name.toLowerCase() !== input.toolName.toLowerCase()) return false;
+    const member = reviewedCollectionMembers(step.forEach, resolveReviewedPlanCollectionRecords(input, step.forEach)).find(member => member.id === input.memberId);
+    if (!member) return false;
+    const expected = bindReviewedCollectionItem(resolveReviewedStepArguments(step,
+      id => resolveReviewedPlanStepResult(input, id)), step.forEach, member.record);
+    // The local args_json adapter materializes omitted nullable optionals.
+    // Compare that same representation; never discard a non-null value or
+    // apply local omission rules to provider data.
+    if (binding.identity.kind === 'local_registry' && object(input.args)) {
+      for (const [key, value] of Object.entries(input.args)) if (value === null
+        && !Object.hasOwn(expected, key) && Object.hasOwn(binding.inputSchema.properties ?? {}, key)
+        && jsonSchemaAllowsNull(binding.inputSchema.properties[key])) expected[key] = null;
+    }
+    return equal(input.args, expected);
+  } catch { return false; }
+}
+
+export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSeq: number; toolName: string; args: unknown; effect: RuntimeToolEffect; attestation?: HostCallAttestation; effectiveArgs?: unknown; authorityIssue?: string }): string | undefined {
   const execution = acceptedPlanExecution(input.sessionId, input.sourceUserSeq);
-  if (!execution || ['read', 'compute', 'host_only'].includes(input.effect)) return undefined;
+  if (!execution || ['compute', 'host_only'].includes(input.effect)) return undefined;
+  // A capability reference on a contextual read is not a reviewed step ID.
+  // Keep supplemental reads carrier-neutral; normal tool-edge discovery,
+  // account, schema and effect checks still own their admission below us.
+  // Calls claiming an actual reviewed step keep its exact prepared arguments.
+  const requestedId = object(input.args) ? input.args.requirement_id : undefined;
+  const reviewedSteps = execution.artifact.structuredPlan?.steps;
+  if (input.effect === 'read' && Array.isArray(reviewedSteps) && !reviewedSteps.some(
+    (step: unknown) => object(step) && step.id === requestedId,
+  )) return undefined;
   const unwrapped = unwrapRuntimeEffectiveToolIdentity(input.toolName, input.args);
   const toolName = unwrapped.toolName ?? input.toolName;
   if (['run_worker', 'request_approval'].includes(toolName) && !unwrapped.composioCarrier) return undefined;
@@ -96,7 +173,10 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
     const outline = prepared(execution.artifact);
     const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
     if (loaded.status !== 'ok') throw new Error('Activate the exact reviewed plan with plan_task before its business calls.');
-    const requestedId = object(input.args) ? input.args.requirement_id : undefined;
+    const requestedBinding = outline.bindings.find(row => row.stepId === requestedId);
+    if (requestedBinding && requestedBinding.identity?.kind !== 'local_registry' && !input.attestation) {
+      throw new Error(`Reviewed step ${requestedId}: current provider authority could not be bound (${input.authorityIssue || 'attestation_missing'}). This is a host capability binding failure, not a request to rewrite the approved arguments.`);
+    }
     const candidates = outline.steps.filter(step => {
       if (typeof requestedId === 'string' && requestedId !== step.id) return false;
       const binding = outline.bindings.find(row => row.stepId === step.id);
@@ -105,20 +185,19 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
         : binding.identity.operationId === input.attestation?.operationId;
     });
     const matching = candidates.filter(step => {
-      const expected = resolveReviewedStepArguments(step, producerId => {
-        const rows = openEventLog().prepare('SELECT logical_tool_call_id FROM expected_work_call_bindings WHERE session_id = ? AND source_user_seq = ? AND requirement_id = ?')
-          .all(input.sessionId, input.sourceUserSeq, producerId) as Array<{ logical_tool_call_id: string }>;
-        const successful = rows.flatMap(row => {
-          const binding = loadExpectedWorkCallBindingState({ ...input, logicalToolCallId: row.logical_tool_call_id });
-          if (binding.status !== 'ok' || binding.binding.contractId !== loaded.contract.contractId || binding.binding.requirementId !== producerId) return [];
-          const result = redeemSuccessfulSettlementResultForHost({ ...input, acceptedTaskId: loaded.contract.acceptedTaskId, logicalToolCallId: row.logical_tool_call_id });
-          return result.status === 'ok' ? [result.value.rawPayload] : [];
-        });
-        if (successful.length !== 1) throw new Error(`Reviewed producer ${producerId} requires one exact settled result.`);
-        return successful[0];
-      });
+      const expected = resolvedCallArguments(input, step);
       const actual = unwrapped.args ?? input.effectiveArgs ?? input.args;
-      if (!equal(actual, expected)) return false;
+      if (!equal(actual, expected)) {
+        if (candidates.length === 1 && object(actual)) {
+          const paths = [...new Set([...Object.keys(actual), ...Object.keys(expected)])]
+            .filter(key => !Object.hasOwn(actual, key) || !Object.hasOwn(expected, key) || !equal(actual[key], expected[key]))
+            .map(key => `/${key.replace(/~/g, '~0').replace(/\//g, '~1')}`);
+          const sources = (step.dynamicBindings ?? []).filter((binding: any) => paths.some(path => binding.targetPath === path || binding.targetPath.startsWith(`${path}/`)))
+            .map((binding: any) => `${binding.targetPath} consumes ${binding.outputPath === '' ? 'the entire recorded value' : binding.outputPath} from ${binding.producerStepId}`);
+          throw new Error(`Reviewed step ${step.id}: arguments differ at ${paths.join(', ')}. ${sources.join('; ')}${sources.length ? '. Reuse those exact recorded values; if the synthesis is wrong, correct it with plan_step_result before writing.' : ' Use the arguments from the approved step.'}`);
+        }
+        return false;
+      }
       const binding = outline.bindings.find(row => row.stepId === step.id)!;
       if (binding.identity.kind !== 'local_registry') {
         const a = input.attestation;

@@ -1,5 +1,6 @@
+import { buildPlanStepResultTool } from '../tools/plan-step-result.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
-import { acceptedPlanExecution } from '../runtime/harness/accepted-plan-execution.js';
+import { acceptedPlanExecution, acceptedPlanOwnerScopeInput } from '../runtime/harness/accepted-plan-execution.js';
 import { buildPublishPlanTool } from '../tools/publish-plan.js';
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
@@ -1901,7 +1902,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // parent decline.
   const scopeUserInput = declinedParentWithNewTask
     ? options.taskContinuation?.activeTaskInput ?? currentUserInput
-    : currentUserInput;
+    : acceptedPlanOwnerScopeInput(options.sessionId, options.sourceUserSeq, currentUserInput);
   const hostFreshPlanning = options.hostFreshPlanning;
   const actionWork = (() => {
     if (options.acceptedRoute !== 'act') return false;
@@ -1958,6 +1959,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const routesPlanBoundLocalCapability = (name: string): boolean => (
     isRegistryDeclaredLocalPlanningCapability(name)
     && isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)
+    // Being citable in a future plan must not hide a reader that is already
+    // useful now. Bind it through work_call only for reviewed Execute or once
+    // this source has actually selected it into durable work.
+    && !(isRegistryDeclaredNativePlanningRead(name)
+      && !durableSelectedLocalPlanningNames.has(name) && taskMode?.kind !== 'execute')
     // Read-only control context (skill instructions, profile/status reads,
     // recovery inspection) is evidence for the foreground model, not a node
     // in the accepted business topology. Routing these through work_call made
@@ -2006,6 +2012,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ...(options.allowedToolNames ?? []),
           'call_tool',
           'work_call',
+          ...(taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? ['plan_step_result'] : []),
           ...(planMode ? ['publish_plan', 'run_worker'] : hostFreshPlanning && !reviewedReadOnlyExecution ? ['plan_task'] : []),
         ])]
       // A planning control the host ADVERTISES must be callable. The structural
@@ -3049,8 +3056,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'orchestrator' },
         });
       } catch { /* telemetry is best-effort */ }
+      // Explicit Plan workers need the same accepted-source mode, capability
+      // attestation and reasoning settings as their parent. The legacy SDK
+      // worker borrows the parent source and cannot preserve those contracts.
+      const useClaudeSdkWorker = !planMode && claudeAgentSdkWorkerEnabled(workerModel);
       if (sessionId) {
-        if (claudeAgentSdkWorkerEnabled(workerModel)) {
+        if (useClaudeSdkWorker) {
           try {
             appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
           } catch { /* telemetry is best-effort */ }
@@ -3063,7 +3074,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           } catch { /* manifest visibility is best-effort */ }
         }
       }
-      if (claudeAgentSdkWorkerEnabled(workerModel)) {
+      if (useClaudeSdkWorker) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +
         // plan-scope + execution lane aggregate across the fan-out (one batch
         // approval covers all workers).
@@ -3532,9 +3543,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // filtered to host-only controls below, so this can only ever admit a
       // host-local control — never a business tool.
       const structuralControlNames: readonly string[] = hostFreshPlanning
-        ? (planMode ? ['publish_plan'] : reviewedReadOnlyExecution ? [] : ['plan_task'])
+        ? (planMode ? ['publish_plan'] : [...(taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? ['plan_step_result'] : []), ...(reviewedReadOnlyExecution ? [] : ['plan_task'])])
         : [];
       const dispatcherOptions: BuildCallToolOptions = {
+        localToolOverrides: new Map(firstClassDiscovery
+          .filter((tool) => typeof (tool as { name?: unknown }).name === 'string')
+          .map((tool) => [(tool as { name: string }).name, tool])),
         // Structural controls belong in BOTH reachability sets, on BOTH turn
         // kinds. call-tool.ts refuses when the target is in neither
         // reachableBuiltinNames nor firstClassNames; widening only the latter,
@@ -3616,10 +3630,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               reachableBuiltinNames: new Set([
                 ...[...deferredActionControlNames]
                   .filter((name) => !localPlanningCapabilityNames.has(name)),
-                ...[...dispatchableActionReadNames]
-                  .filter((name) => !localPlanningCapabilityNames.has(name)),
+                // A planned read still has its bound work_call path, but
+                // selecting it must not revoke ordinary contextual/readback
+                // access to the same reader. This set is already read-only
+                // and filtered by this turn's allowed/excluded tool policy.
+                ...dispatchableActionReadNames,
               ]),
               firstClassNames: visibleFirstClassNames,
+              localToolOverrides: dispatcherOptions.localToolOverrides,
               deniedNames: excludes,
               mcpToolScope: {
                 authority: 'none',
@@ -3768,8 +3786,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // catalog or frozen-plan revision silently revise the stable prefix.
   const volatileInstructions = [
     !planMode && batchShapeMandate,
-    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. If a current capability changed, stop and explain the need to revise. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Do not repeat successful writes.' : null,
-    planMode ? '[explicit-plan-mode] The user selected Plan. FIRST read every input the user named — the documents, links, sheets or files they pointed you at — and use what you already know from memory and context. Reading what the user handed you is a precondition, never a plan step; a plan whose first step is "read your document" is not a plan. THEN publish, promptly, the plan they can actually review: what those inputs told you, the steps you intend to fan out, what each step produces, which subagent roles run them, the order and dependencies, and how you will verify the result. Do not carry out the work to write the plan. Bind the capability refs, schemas, accounts and argument values you ALREADY have; for anything still unresolved, publish readiness needs_input with those prerequisites named, or ask the user that exact question — do not go and gather it. Once the user approves the shape, revise this same plan (base) into the bound artifact: exact discovered capability refs, static schema-valid arguments, dependencies, verification, and dynamic values bound to earlier result paths. You may delegate bounded investigation to run_worker; every worker remains read-only. Do not execute business changes, workflow/space mutations, sends, shell operations, approvals, or plan_task. Never guess account IDs or pretend model-authored identities were verified. This Plan turn ends with a saved artifact for review, not with execution of the proposed work. Normal reads still remain available.' : null,
+    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. For a compute step, synthesize its actual findings after dependencies finish. Before recording content that a write will consume, compare that content with the accepted objective, source evidence and reviewed success criteria; preserve unresolved facts as unknown, distinguish preparation from current reads, and correct unsupported claims now. Then record its actual JSON value with plan_step_result using step_id and data (text for a whole-text binding, or the object fields used by later bindings) before the consuming write. The host fills declared dynamicBindings and per-member bindings from their retained results; omit those bound fields from work_call args_json instead of retyping the content. Static arguments still match the approved plan. Reuse evidence already gathered in Plan; read it again when freshness affects the result or the reviewed verification requires it. If a finding is missing, contradictory or a read fails, investigate with additional read-only calls within the same objective and synthesize the result before the write. Such contextual reads use their discovered capabilityRef through work_call (or call_tool for local reads), not a reviewed step ID. They do not replace required reviewed steps or authorize new effects. Successful supplemental observations are retained with the synthesis automatically. If a current capability changed, stop and explain the need to revise. If a saved local file contains a mistake, record its corrected synthesis with plan_step_result and invoke the same reviewed write step at its original destination. The host binds a new revision, keeps prior receipts and refuses to overwrite an intervening edit. Do not retry external creates or sends. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Reuse successful results when no correction is needed.' : null,
+    planMode ? '[explicit-plan-mode] The user selected Plan. Understand the current goal, adopted user changes and what successful execution must deliver. Think through the approach before publishing: connect the important questions or decisions to the evidence needed and explain how findings will support the result. For comparisons, use consistent criteria across subjects; separate observed facts, source claims and inference. Describe follow-up investigation for missing or conflicting evidence within the synthesis method. Required graph steps must succeed: do not turn a contingent lookup or its fallback into mandatory success dependencies. Execute can make additional contextual read-only calls while synthesizing, retaining their observations without freezing an unknown number of lookups. Keep indispensable input reads as graph steps; if those cannot be obtained, explain the unresolved prerequisite. A missing fact remains unknown rather than guessed. Investigate enough to choose a useful method without doing the proposed business work. Inspect supplied inputs and use relevant recalled preferences, previous successful procedures and skills; read a matching skill before relying on its method, and search memory when the request depends on prior work not already present. In the plan, briefly name material remembered preferences, procedures or facts that shape the approach and explain why they matter to this goal. Distinguish established preferences from changeable facts: confirm the latter through available current evidence, or label them as assumptions with a verification step. Retrieval and plan approval do not themselves verify a fact. Do not add a memory-search checklist or ask separately to approve each remembered item; ask only about unresolved choices that materially change the work. Treat recalled tools as candidates to validate, not permission or proof of current availability. Investigate the exact capabilities, schemas, accounts and arguments needed for this task. If a tool wraps another operation or accepts an open input object, inspect the selected operation’s own input contract before treating its arguments as prepared. Check that pagination, batch settings and per-item settings cover the intended collection. When repairing a step or changing from per-item work to a batch, reconsider coverage and downstream dependencies, not just whether the arguments now parse. More connected tools means more options to consider, not a checklist to exhaust. Preparation reads and read-only shell commands remain available; do not perform the proposed business work while planning. Reuse retained evidence and exact known operations, and discover missing ones when needed. Once an exact operation is available, use its supplied schema or inspect the selected nested operation’s documentation; do not repeat broad catalog searches or a full documentation index to recover a contract you already have. A supplied exact input or destination path does not require repeated directory exploration after its scope is established. Reopen only the missing or changed definition. Publish full_text and one structured_plan with ordinary staticArguments objects; omit redundant execution_draft and unused optional fields. The host compiles the execution structure. Explain the findings, chosen method and relevant skill or memory constraints in the full plan so Execute inherits them. Carry their evidence and confirmation status into execution and the final deliverable. Before reporting completion, compare material claims against the sources; saving and reading back a file proves persistence, not the accuracy of its contents. Keep interpretation and uncertainty labeled rather than adding unsupported specificity. Describe choices in terms of the user’s outcome; keep harness repair details out of the user-facing plan unless they materially affect the approach. Keep known input values exact. Link future values to settled tool outputs or to a reviewed compute step. A compute step with capabilityRef:null declares the synthesis method and dependencies; Execute records its actual output with plan_step_result. Reference its output fields in dynamicBindings (for example /markdown into /markdown_text), never freeze placeholder report text. Use one tool step per distinct operation. For repeated work over a known collection or a reviewed read, use forEach with stable member IDs and item-to-argument bindings instead of copying the operation for every record. A repeated step can feed another repeated step: its result records contain memberId and result; preserve /memberId. result is the retained inner tool value, not a carrier envelope. If the tool returns text, bind /result directly; do not invent /result/output or /result/content fields. For an object, bind only known fields under /result. If outputs need interpretation or reshaping, prepare a compute step that consumes them and produces the exact input object or batch array for the next tool. Distinguish reading API documentation from calling that API. Separate independent work from actual dependencies, assign helpers only where useful, and describe verification and meaningful user check-ins. Surface only choices or missing facts that materially change the result. Prepare a ready plan when the necessary facts are available. If a missing user choice prevents useful planning, ask that specific question now; do not inventory tools or memories just to postpone it. Publish the partial findings and question as full_text with readiness needs_input; structured_plan can be omitted for that partial. An answer continues planning, not business execution. If a prerequisite cannot be resolved, publish needs_input naming the gap or ask the specific question. Do not claim an unread input was inspected. The user may discuss and revise the saved plan; use its exact base reference for a revision. Execute selects the reviewed revision. There is no mandatory separate shape-approval round before investigating and preparing the plan. You may delegate investigation to run_worker; workers inherit Plan mode. Business mutations, workflow dispatch, sends, unknown-effect commands, approvals and plan_task stay closed. Never guess account IDs or present model-authored identities as verified. This turn produces a reviewable plan, not execution of its business effects.' : null,
     !planMode && carrierWork
       ? frozenContract
         ? [
@@ -3798,12 +3816,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     focusInput: scopeUserInput || undefined,
     volatileInstructions,
   });
+  const reviewedComputeResults = taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? [buildPlanStepResultTool(options.sessionId && options.sourceUserSeq ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq } : undefined)] : [];
   const structuralTools = factorySkip
     ? []
     : planMode
       ? [buildPublishPlanTool(hostFreshPlanning), buildAskUserQuestionTool(), runWorkerTool]
     : reviewedReadOnlyExecution
-      ? [buildAskUserQuestionTool(), runWorkerTool]
+      ? [...reviewedComputeResults, buildAskUserQuestionTool(), runWorkerTool]
     : carrierWork
     // run_worker stays DIRECT on action turns: it is the fan-out coordination
     // primitive (control role), not a business operation — dropping it made
@@ -3815,7 +3834,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // control on the fresh planning surface so that exact host evidence can
       // produce one visible, resumable choice instead of falling back to the
       // background-agent check-in tool with the same public name.
-      ? [buildPlanTaskTool({ planning: hostFreshPlanning }), buildAskUserQuestionTool(), runWorkerTool]
+      ? [...reviewedComputeResults, buildPlanTaskTool({ planning: hostFreshPlanning }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
     ? [plannerTool!, buildAskUserQuestionTool()]
@@ -3907,6 +3926,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         type: 'tool_policy_resolved',
         data: {
           ...toolPolicy.diagnostics,
+          resolvedToolNames: toolPolicy.tools.map(tool => tool.name),
+          ...(options.sourceUserSeq ? { sourceUserSeq: options.sourceUserSeq } : {}),
           ...(factorySkip
             ? {
                 shortCircuitReason: declinedContinuation ? 'declined_continuation' : 'direct_reply',
@@ -3950,12 +3971,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // Dynamic per-turn reasoning effort needs the SDK to honor agent.modelSettings,
     // which it only does when modelSettings was passed at CONSTRUCTION (it sets a
     // private `_modelSettingsExplicitlyConfigured` flag then). So we seed the
-    // gpt-5.5 default here (effort:'none' + verbosity:'low') and runTurn mutates
-    // only reasoning.effort per turn — no reaching into SDK internals. When the
-    // feature is off we pass nothing, so the SDK's own per-model default rides
-    // (byte-identical to before). See runtime/harness/reasoning-effort.ts.
-    ...(dynamicReasoningEnabled()
-      ? { modelSettings: { reasoning: { effort: 'none' as const }, text: { verbosity: 'low' as const } } }
+    // ordinary default here (effort:'none' + verbosity:'low'), or 'high' for
+    // explicit Plan, and runTurn adjusts effort per turn. When automatic
+    // selection is off, only explicit Plan supplies a preparation preference.
+    ...(dynamicReasoningEnabled() || planMode
+      ? { modelSettings: { reasoning: { effort: planMode ? 'high' as const : 'none' as const }, text: { verbosity: 'low' as const } } }
       : {}),
     // Plain-text DECISION contract: no SDK structured outputType. The model
     // ends its turn with prose plus an optional marker, and the loop parses or

@@ -12,6 +12,7 @@ import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { WORK_ID_MAX_CHARS, WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export const WORK_TOPOLOGY_VERSION = 1 as const;
+/** Legacy projection batch size; no longer an admission ceiling. */
 export const WORK_TOPOLOGY_MAX_OPERATIONS = 32 as const;
 export const WORK_TOPOLOGY_MAX_UNIVERSES = 16 as const;
 /** Runtime/store ceiling for a sealed member universe. This is deliberately
@@ -105,8 +106,8 @@ export const WorkTopologyOperationSchema = z.object({
   id: WorkTopologyIdSchema,
   effect: WorkTopologyEffectSchema,
   coverage: WorkTopologyModelCoverageSchema.nullable(),
-  dependsOn: z.array(WorkTopologyIdSchema).max(WORK_TOPOLOGY_MAX_OPERATIONS),
-  dataFrom: z.array(WorkTopologyIdSchema).max(WORK_TOPOLOGY_MAX_OPERATIONS),
+  dependsOn: z.array(WorkTopologyIdSchema),
+  dataFrom: z.array(WorkTopologyIdSchema),
   cardinality: WorkTopologyCardinalitySchema,
 }).strict();
 
@@ -135,7 +136,7 @@ export const WorkTopologyUniverseSchema = z.discriminatedUnion('seal', [
  * the exact same authority boundary. */
 export const WorkTopologySchema = z.object({
   version: z.literal(WORK_TOPOLOGY_VERSION),
-  operations: z.array(WorkTopologyOperationSchema).max(WORK_TOPOLOGY_MAX_OPERATIONS),
+  operations: z.array(WorkTopologyOperationSchema),
   universes: z.array(WorkTopologyUniverseSchema).max(WORK_TOPOLOGY_MAX_UNIVERSES),
 }).strict();
 
@@ -144,7 +145,7 @@ export const WorkTopologySchema = z.object({
  *  every topology mistake THROW inside runner.run as `model_failed`, bypassing
  *  the repair gate that the identical check at admission feeds. */
 export const ActionWorkTopologyBaseSchema = WorkTopologySchema.extend({
-  operations: z.array(WorkTopologyOperationSchema).min(1).max(WORK_TOPOLOGY_MAX_OPERATIONS),
+  operations: z.array(WorkTopologyOperationSchema).min(1),
 }).strict();
 
 export const ActionWorkTopologySchema = ActionWorkTopologyBaseSchema.superRefine((topology, ctx) => {
@@ -285,9 +286,6 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
   if (!Array.isArray(value.universes)) errors.push('topology universes must be an array');
   const rawOperations = Array.isArray(value.operations) ? value.operations : [];
   const rawUniverses = Array.isArray(value.universes) ? value.universes : [];
-  if (rawOperations.length > WORK_TOPOLOGY_MAX_OPERATIONS) {
-    errors.push(`topology exceeds ${WORK_TOPOLOGY_MAX_OPERATIONS} operations`);
-  }
   if (rawUniverses.length > WORK_TOPOLOGY_MAX_UNIVERSES) {
     errors.push(`topology exceeds ${WORK_TOPOLOGY_MAX_UNIVERSES} universes`);
   }

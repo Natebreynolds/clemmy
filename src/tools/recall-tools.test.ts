@@ -496,3 +496,50 @@ test('a near-miss call_id gets the exact correction, not a dead end', async () =
   assert.equal(nearestToolOutputCallId('', known), null);
   assert.equal(nearestToolOutputCallId('toolu_016PctF8QXsnvKo5ZKasu1ri', []), null);
 });
+
+
+for (const sealed of [false, true]) test(`MCP metadata fields are queryable through their JSON carrier (sealed=${sealed})`, async () => {
+  const session = createSession({ kind: 'chat' });
+  const payload = { path: '/v3/visibility/live', method: 'POST', bodySchema: { type: 'array', items: { type: 'object', required: ['target'], properties: { target: { type: 'string' } } } }, documentation: 'A long API reference. '.repeat(5000) };
+  const envelope = { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+  const original = JSON.stringify(sealed ? { result: envelope, complete: true } : envelope);
+  writeToolOutput({ sessionId: session.id, callId: 'nested-api', tool: 'work_call', output: original });
+  const query = captureToolOutputQueryHandler();
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => query({ call_id: 'nested-api', fields: ['path', 'method', 'bodySchema'] }));
+  const text = result.content[0].text;
+  assert.match(text, /visibility\/live/); assert.match(text, /"target"/);
+  assert.doesNotMatch(text, /None of|long API reference|clipped/);
+  assert.ok(text.length < 1500, 'project only the requested schema instead of paging a 100KB transport string');
+  assert.doesNotMatch(text, /\$fromToolOutput/, 'a decoded payload path must not be advertised as a raw-envelope path');
+  const { getToolOutput } = await import('../runtime/harness/eventlog.js');
+  assert.equal(getToolOutput(session.id, 'nested-api')?.output, original, 'raw retained bytes remain unchanged');
+  const raw = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => query({ call_id: 'nested-api', fields: [sealed ? 'complete' : 'content'] }));
+  assert.match(raw.content[0].text, new RegExp('"' + (sealed ? 'complete' : 'content') + '"'), 'explicit transport-field queries retain the original view');
+});
+
+test('MCP record queries decode one owner and never select a conflicting or failed payload', async () => {
+  const session = createSession({ kind: 'chat' });
+  const query = captureToolOutputQueryHandler();
+  const run = async (callId: string, value: unknown, fields: string[], options = {}) => {
+    writeToolOutput({ sessionId: session.id, callId, tool: 'work_call', output: JSON.stringify(value) });
+    const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+      () => query({ call_id: callId, fields, ...options }));
+    return result.content[0].text;
+  };
+  const rows = [{ id: 'first', count: 7 }, { id: 'second', count: 9 }, { id: 'third', count: 11 }];
+  const records = await run('mcp-records', { result: { content: [{ type: 'text', text: JSON.stringify(rows) }] }, complete: true }, ['id'], { offset: 1, limit: 1 });
+  assert.match(records, /"second"/); assert.doesNotMatch(records, /"first"|"third"|\$fromToolOutput/);
+  const payload = { path: '/exact', method: 'GET' };
+  const same = await run('agreeing-owners', { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload }, ['path']);
+  assert.match(same, /"path": "\/exact"/);
+  for (const [callId, envelope] of [
+    ['conflicting-owners', { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: { path: '/different' } }],
+    ['failed-owner', { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true }],
+    ['ordinary-business-object', { content: [{ type: 'text', text: JSON.stringify(payload) }], invoiceId: 'not-an-mcp-envelope' }],
+  ] as const) {
+    const text = await run(callId, envelope, ['path']);
+    assert.match(text, /None of/); assert.doesNotMatch(text, /"path": "\/exact"/, 'do not promote failed, ambiguous or merely similar transport bytes');
+  }
+});
