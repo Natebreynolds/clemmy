@@ -1,4 +1,5 @@
 import { apiGet, apiPost, api } from './api';
+import type { CanvasGraph } from './workflow-canvas';
 
 export type WorkflowCertificationState =
   | 'blocked'
@@ -220,12 +221,52 @@ export interface WorkflowDetail {
   resourceBinding?: WorkflowResourceBindingReport;
   inputs?: Record<string, unknown>;
   certification?: WorkflowCertification;
+  /**
+   * Ready-to-draw flow graph the daemon derives from this workflow's own steps
+   * (nodes = steps, edges = dependsOn). Always server-computed, never authored,
+   * so the canvas draws what the engine compiles rather than a second model.
+   */
+  graph?: CanvasGraph;
+}
+
+/**
+ * A step edit as PATCH /api/console/workflows/:name accepts it under
+ * `stepEdits`. The route merges each edit over the stored step with the same
+ * id, so a field left out keeps its authored value, and a STEP left out is
+ * untouched rather than deleted — which is what lets the canvas save the two
+ * dependencies it changed without restating a workflow it may have loaded
+ * before someone else added to it. An id the daemon has never stored is
+ * appended as a new step. (The sibling `steps` field is authoritative and does
+ * delete what it omits; the canvas deliberately does not use it.)
+ */
+export interface WorkflowStepPatch {
+  id: string;
+  dependsOn?: string[];
+  prompt?: string;
+}
+
+/**
+ * What a PATCH actually did. A 2xx is not always a plain save: changing how an
+ * ENABLED workflow runs can turn it off and queue a verification test
+ * (`verificationQueued`, HTTP 202), and the daemon may have repaired the
+ * definition on the way in. Callers should report these rather than assume the
+ * workflow is still live.
+ */
+export interface WorkflowPatchResult {
+  updated?: boolean;
+  name?: string;
+  enabled?: boolean;
+  verificationQueued?: boolean;
+  runId?: string;
+  message?: string;
+  repairs?: string[];
+  readinessGaps?: unknown;
 }
 
 export const getWorkflow = (name: string) =>
   apiGet<WorkflowDetail>(`/api/console/workflows/${encodeURIComponent(name)}`);
-export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string; models?: { brain?: string; worker?: string } }) =>
-  api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
+export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string; models?: { brain?: string; worker?: string }; stepEdits?: WorkflowStepPatch[] }) =>
+  api<WorkflowPatchResult>(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteWorkflow = (name: string) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio } from 'lucide-react';
+import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, Workflow } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -337,6 +337,13 @@ export function Automate() {
                               <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
                                 {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
                               </Button>
+                            )}
+                            {(w.stepCount ?? 0) > 0 && (
+                              <Link to={`/automate/${encodeURIComponent(w.name)}/canvas`}>
+                                <Button size="sm" variant="ghost" title={`See ${w.name} as a graph`}>
+                                  <Workflow className="h-4 w-4" aria-hidden /> Canvas
+                                </Button>
+                              </Link>
                             )}
                           </div>
                         </Card>
