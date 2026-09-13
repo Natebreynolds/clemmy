@@ -20,7 +20,7 @@ All four builds passed under Node22.22.0:
 
 The affected UI, shared chat engine, hotpatch and dev-launch checks passed **103/103** tests across10 files using the isolated repository runner. The frozen T harness qualification already passed **618/618** across22 files. A byte comparison against T found no source-code difference; only the updated harness checkpoint document and the newly included UI critique differed at that comparison. Three trailing-whitespace/EOF cleanups were then included before finalizing the commit. Build fingerprints include documentation and Git state, so the committed checkpoint gets a new fingerprint on rebuild. These counts overlap earlier testing and are not a full-suite claim.
 
-Build/test logs are retained locally at `output/reviewer-monitor/2026-09-13-combined-checkpoint/`. The prior live reports remain under `output/reviewer-monitor/2026-09-13-plan-continuation-fixes/`. Generated builds, logs, proof homes and credentials remain outside Git under the existing ignore rules. No live-home isolation sentinel pass is claimed while the installed daemon was running.
+Build/test logs are retained locally at `output/reviewer-monitor/2026-09-13-combined-checkpoint/`. The prior live reports remain under `output/reviewer-monitor/2026-09-13-plan-continuation-fixes/`. Ignored dist builds, logs, proof homes and credentials remain outside Git. The canonical source execution bundles under `src/runtime/harness/implementation-artifacts/emitted/` are intentionally tracked and are included in the checkpoint. No live-home isolation sentinel pass is claimed while the installed daemon was running.
 
 ## Dev launch and repeatability
 
@@ -43,3 +43,5 @@ bash scripts/dev-down.sh
 ## Qualification still needed
 
 R Sonnet5 + selected Opus5 completed Plan→Execute with verified final bytes and judge-directed correction, but planning took11m50s and the original strict test recorded failures. Q Grok Execute stopped without a retained cause; the new diagnostics and fixes need a fresh replay. Grok's access grant last observed expired at2026-09-13T19:44:55.974Z, so reconnect Grok before that leg. No new failure was attributed to a provider without evidence. Test Plan→Execute and ordinary Act across chosen models before the next tag, including real connected tools and the live desktop/mobile UI.
+
+Dev startup regenerated the tracked source execution bundle and manifest from the already compiled harness. This exposed a stale checked-in transport generation; the current generation matches the compiled T manifest (`ae019266fa28afebb8f284d0154ffe37d10ce98854a706adce4d190c81adfcce`). It is committed in the checkpoint follow-up so another source launch remains clean and reproducible. This is a build-artifact synchronization, not a new harness behavior change.
