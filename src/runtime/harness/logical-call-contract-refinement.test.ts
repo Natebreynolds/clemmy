@@ -17,9 +17,11 @@ const ledger = await import('./dispatch-ledger.js');
 const identities = await import('./attempt-identity.js');
 const settlement = await import('./attempt-settlement.js');
 const resolution = await import('./resolution-ledger.js');
+const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
 
 test.after(() => {
   eventlog.closeEventLog();
+  closeOperationalTelemetryDb();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 

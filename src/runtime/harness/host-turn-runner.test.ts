@@ -9130,7 +9130,7 @@ test('production host retains completion feedback in request projection without 
   }
 });
 
-test('the completion judge is bounded: after MAX continuations the reply stands; it never runs without opt-in or on a non-action ask', async () => {
+test('completion repairs stay bounded while the final candidate is still reviewed; opt-out and ordinary chat stay untouched', async () => {
   const { _setHostObjectiveJudgeForTests, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } = await import('./host-turn-runner.js');
   let judgeCalls = 0;
   _setHostObjectiveJudgeForTests(async () => { judgeCalls += 1; return { done: false, reason: 'still nothing posted' }; });
@@ -9140,7 +9140,7 @@ test('the completion judge is bounded: after MAX continuations the reply stands;
     bindHostCanarySurface(stubbornFixture, stubbornAgent, []);
     const stubborn = await runJudgedHost(stubbornFixture, stubbornAgent, true);
     assert.equal(stubborn.finalOutput, 'Done: posted the summary to the channel.');
-    assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS, 'bounded continuations, then the reply stands');
+    assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS + 1, 'two repairs plus final verification; no third repair');
 
     judgeCalls = 0;
     const noOptInFixture = acceptJudgedSource('judge-no-opt-in', 'Post the summary to the channel');
@@ -9251,8 +9251,8 @@ test('the completion judge budget survives serialized checkpoint recovery and re
     state = HostRecoveryState.fromString(recovered.serializedRecoveryState);
   }
   const final = await run(state);
-  assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS,
-    'two continuations cover the whole accepted source, not each admit/finalize/continue re-entry');
+  assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS + 1,
+    'two continuations cover the whole accepted source, followed by final verification');
   assert.equal(model.calls(), 5, 'an exhausted judge budget does not start another model cycle');
   assert.equal(final.finalOutput, 'I will post the summary.');
   assert.deepEqual(db.prepare(`SELECT logical_tool_call_id, outcome_kind FROM logical_call_settlements
@@ -9272,13 +9272,13 @@ test('the completion judge budget survives serialized checkpoint recovery and re
     }
   }
   assert.deepEqual(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
-    .map((event) => event.data.continuationsUsed), [0, 1]);
+    .map((event) => event.data.continuationsUsed), [0, 1, 2]);
 
   const fresh = acceptJudgedSource('judge-fresh-budget', 'Post the summary to the channel');
   const freshAgent = { model: stubModel([[textMsg('I will post the summary.')]]), tools: [] };
   bindHostCanarySurface(fresh, freshAgent, []);
   await runJudgedHost(fresh, freshAgent, true);
-  assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS * 2, 'a genuinely new source gets its own budget');
+  assert.equal(judgeCalls, (MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS + 1) * 2, 'a genuinely new source gets its own repair budget and final verification');
 });
 
 test('an interruption checkpoint restores the exhausted completion judge budget without changing approval authority', async (t) => {
@@ -9300,7 +9300,7 @@ test('an interruption checkpoint restores the exhausted completion judge budget 
     { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
   ));
   assert.equal(outcome.finalOutput, 'I will post the summary.');
-  assert.equal(judgeCalls, 0);
+  assert.equal(judgeCalls, 1, 'the restored final candidate is reviewed without another repair');
   assert.equal(model.calls(), 1);
   const parsed = JSON.parse(state.toString());
   delete parsed.objectiveJudgeContinuations;
@@ -10489,4 +10489,39 @@ test('persistent transport failure becomes a visible continuation question with 
     if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
     else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
   }
+});
+
+
+test('a result completed on the last repair receives a fresh positive verdict', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const fixture = acceptJudgedSource('final-repair-verification', 'Read the current harness status and report it.');
+  const corrected = 'The current status was read and its evidence is available.';
+  let judged = 0;
+  _setHostObjectiveJudgeForTests(async (_objective, reply, options) => {
+    judged++;
+    if (judged < 3) return { done: false, reason: 'Read the actual current status before answering.' };
+    assert.equal(reply, corrected);
+    assert.match(options?.toolCallSummary ?? '', /harness_status/);
+    return { done: true, reason: 'The current result now answers the request.' };
+  });
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['harness_status']), firstClassNames: new Set(['call_tool']),
+    deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async () => ({ ok: true }),
+  }) as never);
+  const model = scriptedRecordingModel([
+    [textMsg('I will read the status.')], [textMsg('I will check it now.')],
+    [toolCall('final-repair-read', 'call_tool', { name: 'harness_status', args_json: '{}' })],
+    [textMsg(corrected)],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindHostCanarySurface(fixture, agent, [carrier]);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.finalOutput, corrected);
+  assert.equal(model.calls(), 4);
+  const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+  assert.deepEqual(verdicts.map(e => e.data.fulfills), [false, false, true]);
+  assert.deepEqual(verdicts.map(e => e.data.continuationsUsed), [0, 1, 2]);
+  assert.equal(verdicts[2]?.data.replyDigest, createHash('sha256').update(corrected).digest('hex'));
 });

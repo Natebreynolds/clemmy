@@ -670,7 +670,8 @@ export function attachToolSearchSelectedAccountEvidence(
     connectionId?: string;
   },
 ): void {
-  if (candidate.sourceKind !== 'authorized_composio' || candidate.carrier !== 'work_call') return;
+  if (candidate.sourceKind !== 'authorized_composio'
+    || (candidate.carrier !== 'work_call' && candidate.carrier !== 'call_tool')) return;
   const toolkit = boundedEvidenceText(input.toolkit.toLowerCase(), 80);
   const possibleEmail = boundedEvidenceText(input.email?.toLowerCase().replace(/^smtp:/, ''), 320);
   const email = possibleEmail?.includes('@') ? possibleEmail : undefined;

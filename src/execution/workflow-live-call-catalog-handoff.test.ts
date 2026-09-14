@@ -283,3 +283,43 @@ test('revalidation preserves the existing multiple-account ambiguity refusal', (
   assert.equal(selectedB.identity.account, 'account-b');
   assert.equal(selectedB.plan.binding.accountId, 'account-b');
 });
+
+for (const effect of ['read', 'external_write'] as const) {
+  test(`a prepared ${effect} catalog does not confuse read creation tests with write grants`, async (t) => {
+    let modelEntries = 0;
+    let preparations = 0;
+    runner._setWorkflowHarnessLoopImplsForTests({
+      configureRuntime: (async () => ({ ok: true })) as never,
+      buildAgent: (async () => ({})) as never,
+      // Replace provider discovery, retaining the real source, attempt,
+      // immutable-definition check and workflow execution owner.
+      prepareExternalCatalog: async () => {
+        preparations++;
+        return { status: 'ready', manifestIds: ['cap:fixture'], operationIds: ['RECORDS_LIST_RECENT'],
+          catalogIdentities: [{ effect, manifestId: 'cap:fixture', operationId: 'RECORDS_LIST_RECENT' }] as never };
+      },
+      runConversation: (async (request: { sessionId: string }) => {
+        modelEntries++;
+        return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+          lastDecision: { summary: 'Read test reached its model.', reply: 'Read test reached its model.', done: true, nextAction: 'completed' } };
+      }) as never,
+    });
+    t.after(() => runner._setWorkflowHarnessLoopImplsForTests());
+    const saved = workflows.writeWorkflow(`prose-catalog-${effect}`, {
+      name: `Prose catalog ${effect}`, description: 'Read-only creation test with an external catalog.',
+      enabled: false, trigger: { manual: true },
+      steps: [{ id: 'inspect', prompt: 'Inspect the recent records.', sideEffect: 'read', allowedTools: ['RECORDS_LIST_RECENT'] }],
+    });
+    const result = await runner.runCreationTest(saved.data, saved.name, `creation-prose-${effect}`, {},
+      { respond: async () => { throw new Error('legacy responder must not execute'); } } as never);
+    assert.equal(preparations, 1);
+    if (effect === 'read') {
+      assert.equal(result.pass, true, JSON.stringify(result));
+      assert.equal(modelEntries, 1, 'a read does not owe an authored write grant');
+    } else {
+      assert.equal(result.pass, false, JSON.stringify(result));
+      assert.equal(modelEntries, 0, 'an unbound external write still cannot reach execution');
+      assert.match(JSON.stringify(result), /authored write authority refused/);
+    }
+  });
+}

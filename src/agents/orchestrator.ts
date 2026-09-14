@@ -32,7 +32,7 @@ import { getCoreToolsAsync } from '../tools/registry.js';
 import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
-import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { mcpToolScopeAuthority, resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { renderCapabilityCandidateCard, type TurnCapabilityCandidates } from '../runtime/read-path/capability-candidates.js';
 import { bindAgentMcpToolScope } from '../runtime/mcp-tool-authority.js';
 import { bindHostLocalCallPreparation } from '../runtime/harness/host-local-call-preparation.js';
@@ -46,6 +46,7 @@ import { priorTurnEndedAwaitingClarification } from '../runtime/harness/converge
 import type { Tool } from '@openai/agents';
 import {
   appendEvent,
+  getSession,
   listEvents,
   resolveToolOutputEvidenceExcerptsForAuthority,
   resolveToolOutputExcerptsForAuthority,
@@ -2104,10 +2105,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   if (!factorySkip && scopeUserInput.trim() && !mcpToolScope.queryText) {
     mcpToolScope.queryText = scopeUserInput;
   }
-  const actionToolSearchCandidateSources = carrierWork
+  const workflowDiscoveryIdentity = !carrierWork && options.sessionId
+    && Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    && getSession(options.sessionId)?.kind === 'workflow'
+    && mcpToolScopeAuthority(mcpToolScope) !== 'none'
+    ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
+    : undefined;
+  const actionToolSearchCandidateSources = carrierWork || workflowDiscoveryIdentity
     ? buildAuthorizedToolSearchCandidateSources(
         mcpToolScope,
         hostFreshPlanning?.identity,
+        workflowDiscoveryIdentity ? 'call_tool' : 'work_call',
       )
     : undefined;
   const planningDisclosure = hostFreshPlanning
@@ -2141,7 +2149,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           blockers: staged.blockers,
         };
       }
-    : undefined;
+    : workflowDiscoveryIdentity
+      ? async (candidates: readonly ToolSearchPlanningDisclosureCandidate[], control?: Readonly<ToolSearchPlanningDisclosureControl>) => ({
+          version: 1 as const,
+          ...await stageDisclosedPlanningProviderCandidates({
+            ...workflowDiscoveryIdentity, candidates,
+            signal: control?.signal,
+            get deadlineAt() { return control?.deadlineAt; },
+            awaitModelReview: control?.awaitModelReview,
+            accountSelection: control?.accountSelection,
+          }),
+        })
+      : undefined;
   if (carrierWork) {
     // Initialize exact request ownership before either foreground lane can
     // discover. Existing accepted sources keep their durable replay strategy.
@@ -3532,7 +3551,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 actionToolSearchCandidateSources,
                 planningDisclosure,
               )
-            : buildScopedLocalToolSearch(discoverableNames, 'call_tool');
+            : buildScopedLocalToolSearch(discoverableNames, 'call_tool', undefined,
+                actionToolSearchCandidateSources, planningDisclosure);
         });
       // Suppress the generic dispatcher ONLY on the local-memory-scoped turn
       // (memory tools are first-class there; a generic door invites off-scope

@@ -3624,6 +3624,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       acceptedExecutionEvidence: false,
       continuationsUsed: objectiveJudgeContinuations,
       maxContinuations: MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS,
+      reviewAtContinuationLimit: true,
       // A plain reply with no marker or envelope IS the done shape
       // (turn-decision.ts returns null for it); ASK: keeps its own reading.
       nextAction: decision?.nextAction ?? 'completed',
@@ -3683,7 +3684,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
     const continuation = ((!verdict.done && !awaitingInput)
-      || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted;
+      || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
+      && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
     try {
       const judgedRow = appendEvent({
         sessionId: identity.sessionId,

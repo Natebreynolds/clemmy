@@ -1066,8 +1066,8 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   deadlineAt?: number;
   accountSelection?: SourceAccountNomination | null;
   awaitModelReview?: DiscoveryDeadline['awaitModelReview'];
-}): Promise<{ blockers: Readonly<Record<string, ToolSearchPlanningBlocker>> }> {
-  const empty = () => ({ blockers: Object.freeze({}) });
+}): Promise<{ refs: Readonly<Record<string, string>>; blockers: Readonly<Record<string, ToolSearchPlanningBlocker>> }> {
+  const empty = () => ({ refs: Object.freeze({}), blockers: Object.freeze({}) });
   // Non-broker callers use the same ownership rule. Metadata keeps its budget;
   // account judging remains attached to the current cancellable invocation.
   if (!input.awaitModelReview && input.deadlineAt !== undefined) {
@@ -1080,7 +1080,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   if (!discoveryStillActive(guard)) return empty();
   const composioCandidates = input.candidates.filter((candidate) => (
     candidate.sourceKind === 'authorized_composio'
-    && candidate.carrier === 'work_call'
+    && (candidate.carrier === 'work_call' || candidate.carrier === 'call_tool')
     && candidate.name.trim()
     && candidate.schema
     && typeof candidate.schema === 'object'
@@ -1107,6 +1107,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   if (connectionOutcome.kind !== 'settled' || !discoveryStillActive(guard)) return empty();
   const connections = connectionOutcome.value;
   const entries = new Map<string, CapabilityResolutionEntry>();
+  const refs: Record<string, string> = {};
   const blockers: Record<string, ToolSearchPlanningBlocker> = {};
   const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const candidate of composioCandidates.slice(0, 20)) {
@@ -1247,7 +1248,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         });
         const outcome = publication.kind === 'settled' ? publication.value : undefined;
         const expectedAccount = entries.get(`composio:${identifier.toLowerCase()}`)?.accountIdentity;
-        const registered = outcome?.registered.some((capabilityId) => {
+        const registered = outcome?.registered.find((capabilityId) => {
           const base = `cap:resolved:${identifier.toLowerCase()}`;
           if (capabilityId !== base && !capabilityId.startsWith(`${base}:definition:`)) return false;
           const current = peekHostCapabilityCatalogFactory()?.get(capabilityId);
@@ -1258,7 +1259,8 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
             && durable?.manifest.lifecycle.state === 'current'
             && durable.digest === current.manifestDigest);
         });
-        if (!registered) {
+        if (registered) refs[identifier] = registered;
+        else {
           blockers[identifier] = Object.freeze({
             code: 'capability_publication_required',
             choices: Object.freeze([]),
@@ -1271,7 +1273,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     }));
   }
   if (!discoveryStillActive(guard)) return empty();
-  return { blockers: Object.freeze({ ...blockers }) };
+  return { refs: Object.freeze({ ...refs }), blockers: Object.freeze({ ...blockers }) };
 }
 /**
  * Bind provider adapters to the already-resolved turn scope. The returned
@@ -1807,6 +1809,7 @@ function liveReadNominationAllowedByMcpScope(
 export function buildAuthorizedToolSearchCandidateSources(
   scope: McpToolScope,
   planningIdentity?: { sessionId: string; sourceUserSeq: number },
+  carrier: 'work_call' | 'call_tool' = 'work_call',
 ): readonly ToolSearchCandidateSource[] {
   const prepareExternalMcpCandidates: NonNullable<ToolSearchCandidateSource['prepareCandidates']> = async ({
     candidates, signal, deadlineAt,
@@ -2210,5 +2213,21 @@ export function buildAuthorizedToolSearchCandidateSources(
   // read registry here contains reviewed CLI descriptors only. Presenting a
   // candidate grants no execution permission; planning disclosure and the
   // actual invocation still consume the exact current host binding.
-  return [...(liveReadRegistrySource ? [liveReadRegistrySource] : []), externalMcp, composio];
+  const sources = [...(liveReadRegistrySource ? [liveReadRegistrySource] : []), externalMcp, composio];
+  if (carrier === 'work_call') return sources;
+  // A workflow controller already owns execution. Discovery must describe its
+  // actual carrier rather than advertise a second planning/execution owner.
+  const throughCallTool = (candidate: ToolSearchBrokerCandidate): ToolSearchBrokerCandidate => ({
+    ...candidate,
+    carrier,
+    guidance: 'Use call_tool with the invocation name and wrapper shown in this result. Fill the selected operation schema; args_json is one JSON object string. Discovery does not authorize execution.',
+  });
+  return sources.map(source => ({
+    ...source,
+    search: async input => (await source.search(input)).map(throughCallTool),
+    ...(source.prepareCandidates ? {
+      prepareCandidates: async (input: Parameters<NonNullable<ToolSearchCandidateSource['prepareCandidates']>>[0]) =>
+        (await source.prepareCandidates!(input)).map(throughCallTool),
+    } : {}),
+  }));
 }

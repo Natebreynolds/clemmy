@@ -25,6 +25,8 @@ import {
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { buildCallTool, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
+import { buildAuthorizedToolSearchCandidateSources, stageDisclosedPlanningProviderCandidates } from '../tools/tool-search-provider-sources.js';
+import { mcpToolScopeAuthority } from '../runtime/mcp-tool-scope.js';
 import { peekStepResult } from '../tools/step-result-tool.js';
 import {
   bindAgentMcpToolScope,
@@ -377,6 +379,7 @@ export function workflowStepFinalOutputText(value: unknown): string {
 export interface BuildWorkflowStepAgentOptions {
   userInput?: string | null;
   sessionId?: string | null;
+  sourceUserSeq?: number;
   mcpToolScope?: McpToolScope | null;
   /** The step's explicit allowedTools. When it locks the surface (non-wildcard),
    *  the agent's tool list is pruned to that family + the structural baseline,
@@ -579,10 +582,27 @@ export async function buildWorkflowStepAgent(
     });
     const firstClassNames = new Set(surface.firstClass);
     const deferredNames = new Set(surface.deferred);
+    const discoveryIdentity = options.sessionId && Number.isSafeInteger(options.sourceUserSeq)
+      && (options.sourceUserSeq ?? 0) > 0 && externalMcpScope
+      && mcpToolScopeAuthority(externalMcpScope) !== 'none'
+      ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
+      : undefined;
+    const candidateSources = discoveryIdentity && externalMcpScope
+      ? buildAuthorizedToolSearchCandidateSources(externalMcpScope, undefined, 'call_tool')
+      : undefined;
     const firstClassTools = lockedTools
       .filter((toolRef) => firstClassNames.has((toolRef as { name?: string }).name ?? ''))
       .map((toolRef) => (toolRef as { name?: string }).name === 'tool_search'
-        ? buildScopedLocalToolSearch(deferredNames)
+        ? buildScopedLocalToolSearch(deferredNames, 'call_tool', undefined, candidateSources,
+            discoveryIdentity ? async (candidates, control) => ({
+              version: 1 as const,
+              ...await stageDisclosedPlanningProviderCandidates({
+                ...discoveryIdentity, candidates, signal: control?.signal,
+                get deadlineAt() { return control?.deadlineAt; },
+                awaitModelReview: control?.awaitModelReview,
+                accountSelection: control?.accountSelection,
+              }),
+            }) : undefined)
         : toolRef);
     const dispatcher = buildCallTool({
       reachableBuiltinNames: deferredNames,

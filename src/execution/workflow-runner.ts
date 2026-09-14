@@ -410,17 +410,21 @@ let afterStepArtifactPersistForTests: ((input: {
   artifact: StepOutputArtifactReference;
 }) => void) | null = null;
 
+let prepareWorkflowStepExternalCatalogImpl = prepareWorkflowStepExternalCatalog;
+
 export function _setWorkflowHarnessLoopImplsForTests(input: {
   buildAgent?: typeof buildOrchestratorAgent;
   runConversation?: typeof runConversation;
   runConversationFromResume?: typeof runConversationFromResume;
   configureRuntime?: typeof configureHarnessRuntime;
+  prepareExternalCatalog?: typeof prepareWorkflowStepExternalCatalog;
   stepWallClockMs?: number;
 } = {}): void {
   buildWorkflowOrchestratorAgentImpl = input.buildAgent ?? buildOrchestratorAgent;
   runWorkflowConversationImpl = input.runConversation ?? runConversation;
   resumeWorkflowConversationImpl = input.runConversationFromResume ?? runConversationFromResume;
   configureWorkflowHarnessRuntimeImpl = input.configureRuntime ?? configureHarnessRuntime;
+  prepareWorkflowStepExternalCatalogImpl = input.prepareExternalCatalog ?? prepareWorkflowStepExternalCatalog;
   workflowStepWallClockMsImpl = Number.isSafeInteger(input.stepWallClockMs)
     && Number(input.stepWallClockMs) > 0
     ? Number(input.stepWallClockMs)
@@ -5066,7 +5070,7 @@ async function runStepViaHarness(
     // edge, reconstruct its exact ports, and carry that subtractive manifest
     // scope through planning and freeze. Rendered inputs/context never
     // participate in operation selection.
-    const preparedExternalCatalog = await prepareWorkflowStepExternalCatalog({
+    const preparedExternalCatalog = await prepareWorkflowStepExternalCatalogImpl({
       immutablePrompt: step.prompt,
       allowedTools,
       acceptedSource: {
@@ -5111,7 +5115,8 @@ async function runStepViaHarness(
         // bound (no run definition snapshot, legacy run record) the step runs
         // exactly as it did before receipts existed — local writes fall to the
         // uncovered consent path and reads/notifications proceed.
-        if (preparedExternalCatalog.status === 'ready') {
+        if (preparedExternalCatalog.status === 'ready'
+          && preparedExternalCatalog.catalogIdentities.some(identity => identity.effect === 'external_write')) {
           throw new Error(
             `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
           );
@@ -5248,6 +5253,7 @@ async function runStepViaHarness(
       ? await buildWorkflowStepAgent({
           userInput: message,
           sessionId: realSessionId,
+          sourceUserSeq: sourceUserEvent.seq,
           lockTools: step.allowedTools,
           exactTools: isCompiledProjectRuntimeWorkflowStep(step),
           resultOnlyTools: isGraphRuntimeWorkflowStep(step),
@@ -5265,7 +5271,8 @@ async function runStepViaHarness(
           model: stepModel,
           mcpToolScope: workflowMcpToolScope,
         })
-      : await buildWorkflowOrchestratorAgentImpl({ userInput: message, sessionId: realSessionId, model: stepModel });
+      : await buildWorkflowOrchestratorAgentImpl({ userInput: message, sessionId: realSessionId,
+          sourceUserSeq: sourceUserEvent.seq, model: stepModel });
     let result: RunConversationResult;
     const scopedMaxTurns = workflowStepRunMaxTurns(step);
     if (session.loadInterruptState() || approvalRegistry.hasPending(realSessionId)) {

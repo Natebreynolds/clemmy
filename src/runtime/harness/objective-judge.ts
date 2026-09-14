@@ -155,6 +155,8 @@ export interface ObjectiveJudgeGateInput {
   continuationsUsed: number;
   /** Hard cap on judge continuations. */
   maxContinuations: number;
+  /** Verify the final candidate after repairs are exhausted; this grants no further repair. */
+  reviewAtContinuationLimit?: boolean;
   /** The orchestrator's self-declared next action. */
   nextAction: string;
   /**
@@ -195,7 +197,8 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     input.optIn &&
     input.nextAction === 'completed' &&
     !input.openApprovalCard &&
-    input.continuationsUsed < input.maxContinuations &&
+    (input.continuationsUsed < input.maxContinuations
+      || (input.reviewAtContinuationLimit === true && input.continuationsUsed === input.maxContinuations)) &&
     (input.sourceWorkAttempted === true
       || Boolean(input.promiseShaped)
       // VERIFICATION path: this source actually settled an effect, so the

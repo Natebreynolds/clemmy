@@ -104,6 +104,14 @@ test('gate: does NOT fire once the continuation budget is exhausted', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, continuationsUsed: 3 }), false);
 });
 
+test('final verification can review the repaired candidate without granting another continuation', () => {
+  const input = { ...baseGate, actionIntent: true, continuationsUsed: 3, reviewAtContinuationLimit: true };
+  assert.equal(shouldRunObjectiveJudge(input), true);
+  assert.equal(shouldRunObjectiveJudge({ ...input, optIn: false }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...input, openApprovalCard: true }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...input, continuationsUsed: 4 }), false);
+});
+
 test('gate: does NOT fire when nextAction is not completed (e.g. awaiting approval)', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, nextAction: 'awaiting_approval' }), false);
 });

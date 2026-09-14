@@ -781,12 +781,13 @@ test('due parallel read bodies return before the first durable settlement contin
     deadlineMs: 1_000,
     invoke: async () => {
       enteredBodies += 1;
-      if (enteredBodies === 4) releaseBodies();
+      // Release all four bodies from one timer. Four separately scheduled
+      // zero-delay timers can straddle timer buckets, so the check phase can
+      // legitimately run with only some of them due.
+      if (enteredBodies === 4) setTimeout(releaseBodies, 0);
       await allBodiesEntered;
-      // These are four independent timers due in the same timers phase. The
-      // first body schedules a check-phase observer before its host completion
-      // continuation can schedule durable settlement.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // Every body is now due. The first schedules a check-phase observer
+      // before its host completion continuation can persist settlement.
       returnedBodies += 1;
       if (!checkpointScheduled) {
         checkpointScheduled = true;
