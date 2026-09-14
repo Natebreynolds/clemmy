@@ -4,6 +4,7 @@ import os from 'node:os';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isMainThread } from 'node:worker_threads';
 import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
@@ -745,8 +746,16 @@ export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined
 // Eager local warmup on no-key installs so isEmbeddingsEnabled() flips true
 // before the first recall, instead of reporting "off" for the first turn.
 // Fire-and-forget; failures already degrade to lexical inside loadLocalProvider.
+//
+// Main thread only. The point of warming early is to have the model ready
+// before the first turn asks for it, which is a statement about the thread
+// that serves turns. A worker importing this module gets the side effect for
+// free and pays a second full model load for it -- and embedding.worker.ts is
+// exactly such an importer, which is how this line became the entry point to
+// an unbounded worker-spawning recursion. See embedding-worker.ts.
 if (
-  !CUTOVER_HOLD
+  isMainThread
+  && !CUTOVER_HOLD
   && localEmbeddingsAllowed()
   && providerOverride() !== 'off'
   && providerOverride() !== 'openai'
