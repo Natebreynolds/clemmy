@@ -4096,11 +4096,16 @@ export function workflowAdvisoryRequiresAttention(
     case 'skill_not_executed':
     case 'idempotent_skip':
     case 'ungrounded_output':
-    case 'inferred_output_contract':
       // A figure that contradicts the run's own captured tool results is the
       // trust-killer ("plausible fluff") — it must surface for review, never pass
       // as clean success.
       return true;
+    case 'inferred_output_contract':
+      // Prompt vocabulary can describe inputs rather than deliverables. A
+      // legacy shape suggestion must not override completed tool evidence or
+      // become a blocked terminal. Declared output contracts still validate
+      // in the step executor; retain this heuristic only as an advisory.
+      return false;
     case 'goal_validation_unavailable':
     case 'target_unverified':
       // A dead judge is not proof the deliverable is bad. It is still delivered

@@ -2540,6 +2540,20 @@ test('inferredOutputContractAdvisory: flags a legacy deliverable step with no li
   assert.match(note ?? '', /produced string/);
 });
 
+test('a verified file briefing is not blocked by source-record vocabulary in a legacy prompt', () => {
+  const filePath = path.join(tmp, 'record-briefing.md');
+  writeFileSync(filePath, '# Briefing\nBudget: 237\n', 'utf-8');
+  const note = inferredOutputContractAdvisory(
+    { id: 'brief', prompt: 'Read the project record and follow its referenced sources. Create one Markdown briefing file and read the saved file back.' } as never,
+    { path: filePath, read_back_verified: true, budget: 237 },
+  );
+  assert.match(note ?? '', /non-empty list/); // The legacy heuristic confuses an input with an output.
+  const advisory = { kind: 'inferred_output_contract' as const };
+  assert.equal(workflowAdvisoryRequiresAttention(advisory), false);
+  assert.equal(workflowReportLaneForOutcome({ needsAttention: false, advisories: [advisory] }), 'done');
+  assert.equal(workflowReportLaneForOutcome({ needsAttention: true, advisories: [advisory] }), 'blocked');
+});
+
 test('inferredOutputContractAdvisory: explicit output contracts own their own enforcement path', () => {
   const note = inferredOutputContractAdvisory(
     {
@@ -2560,7 +2574,7 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   // Move 3: a Claude-lane figure that contradicts the run's own tool results is
   // the trust-killer — it must surface for review, never pass as clean success.
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
-  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), false, 'a prose-inferred shape is not a declared output contract');
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unmet' }), false, 'delivered work with a judge-only goal miss reads as delivered');
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
   // Tier-1 item 3: a judge OUTAGE on a legacy run is reported honestly as
