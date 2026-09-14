@@ -788,6 +788,71 @@ function bindHostCanarySurface(
   capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
 }
 
+test('workflow controller-owned discovery can replace metadata without freezing the entire step catalog', async () => {
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('workflow-metadata-refresh');
+  eventlog.openEventLog().prepare('UPDATE sessions SET kind = ? WHERE id = ?')
+    .run('workflow', fixture.session.id);
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1, manifestId: 'cap:fixture:workflow-existing-read',
+    providerKind: 'native_mcp', operationId: 'fixture__read_records',
+    providerIdentity: 'fixture-provider', providerVersion: '1', operationVersion: '1',
+    definitionFingerprint: 'c'.repeat(64), effect: 'read', accountId: 'fixture-account',
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-09-14T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' }, advisoryRoles: ['source'],
+  });
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  let businessCalls = 0;
+  const register = (m: typeof manifest) => factory.register({
+    capabilityId: m.manifestId, toolName: m.operationId,
+    schemaVersion: m.operationVersion, schemaDigest: m.definitionFingerprint,
+    effect: m.effect, account: m.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(m),
+    providerKind: m.providerKind, liveFingerprint: m.definitionFingerprint,
+    manifest: m, invoke: async () => { businessCalls += 1; return {}; },
+  });
+  register(manifest);
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  let discoveryCalls = 0;
+  const lookup = brackets.wrapToolForHarness({
+    type: 'function', name: 'tool_search', description: 'Refresh exact current capabilities.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => {
+      discoveryCalls += 1;
+      factory.forget(manifest.manifestId);
+      register({ ...manifest, manifestId: `${manifest.manifestId}:successor` });
+      return { refreshed: true };
+    },
+  });
+  const model = stubModel([
+    [toolCall('workflow-metadata-refresh', 'tool_search', {})],
+    [textMsg('Current metadata is available; no business changes were made.')],
+  ]);
+  const agent = { model, tools: [lookup] };
+  bindHostCanarySurface(fixture, agent, [lookup]);
+  try {
+    const result = await runProductionHost(fixture, agent);
+    assert.equal(result.finalOutput, 'Current metadata is available; no business changes were made.');
+    assert.equal(model.calls(), 2);
+    assert.equal(discoveryCalls, 1);
+    assert.equal(businessCalls, 0, 'metadata refresh must not invoke a business capability');
+    const frozen = eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM accepted_source_catalog_snapshots
+      WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq) as { n: number };
+    assert.equal(frozen.n, 0, 'the workflow controller owns execution; its model step must not freeze ambient inventory');
+  } finally {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 function fusedPlanArgs(effect: 'read' | 'compute' | 'external_write' = 'read') {
   return {
     preamble: 'I’ll collect the exact records and then continue with the requested artifact.',

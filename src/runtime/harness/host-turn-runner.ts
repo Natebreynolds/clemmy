@@ -2858,7 +2858,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // The settled activation winner is durable, source-bound phase authority;
     // neither current tool membership nor prompt reconstruction may replace it.
     const settledPlanControl = settledFreshPlanControl(identity);
-    const progressivePlanningRoot = freshPlan || settledPlanControl || investigationOnly;
+    // The workflow controller owns its node bindings and recovery. Its inner
+    // model loop still checks every call's exact current capability, but must
+    // not pin a second, process-wide inventory. Discovery can replace a read's
+    // metadata without invalidating the whole workflow step (Platform 49).
+    const workflowControllerOwned = getSession(identity.sessionId)?.kind === 'workflow';
+    const progressivePlanningRoot = freshPlan || settledPlanControl || investigationOnly || workflowControllerOwned;
     const planActivated = progressivePlanningRoot && actionExpectedWorkRequired(identity);
     const emptyModelSurface = tools.length === 0;
     // A fresh foreground action begins under a graph-neutral host call root.
@@ -2871,7 +2876,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // refreshed, unrelated tool invalidate the entire planning conversation.
     // Reads still bind their current exact capability at the ordinary call
     // edge; only accepted execution activates a frozen business-work catalog.
-    const discoveryPhase = investigationOnly || (freshPlan && !planActivated);
+    const discoveryPhase = investigationOnly || workflowControllerOwned || (freshPlan && !planActivated);
     const frozen = !emptyModelSurface && !discoveryPhase
       ? peekHostCapabilityCatalogFactory()
         ? freezeCatalogSnapshotForSource({
