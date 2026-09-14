@@ -387,7 +387,7 @@ test('oversized continuity fails closed instead of hiding an intervening correct
   }
 });
 
-test('production staging requires checked default compatibility for a sole mailbox, never legacy identity hints', async () => {
+test('production staging checks sole-mailbox writes independently of the available read route', async () => {
   aliases.resetAccountAliasesForTest();
   composio.__test__.setComposioApiKeyOverride('fixture-account-routing');
   composio.__test__.setConnectedAccountsLoader(async () => connections.slice(0, 1).map(c => ({
@@ -431,16 +431,21 @@ test('production staging requires checked default compatibility for a sole mailb
       }
     } else {
       assert.equal(Object.keys(staged.blockers).length, 2);
-      assert.equal(proven.length, 0, 'an unresolved operating account cannot publish a proven selected-account operation');
+      assert.equal(staged.blockers.OUTLOOK_CREATE_DRAFT?.code, 'account_selection_required');
+      assert.deepEqual(proven.map(entry => entry.identifier), ['OUTLOOK_LIST_MAIL_FOLDERS'],
+        'a rejected write review cannot authorize the write or suppress the independent sole-account read');
+      assert.equal(proven[0]?.sourceAccountRouting?.judgeModelIdentity, 'host:read_single_account');
+      assert.equal(proven[0]?.accountIdentity, 'fixture-scorpion');
     }
     await provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates, accountSelection: null });
-    assert.equal(calls.length, 1, 'all operations and same-source retries share one verdict');
+    assert.equal(calls.length, 1, 'write retries reuse their verdict; the independent read needs no judge');
   }
   registry.installTurnSemanticModelPort(null);
   const unavailable = source('Draft a note in Outlook.');
   const blocked = await provider.stageDisclosedPlanningProviderCandidates({ ...unavailable, candidates });
   assert.equal(blocked.blockers.OUTLOOK_CREATE_DRAFT?.reason, 'review_unavailable');
-  assert.equal(resolution.provenCapabilityEntriesForTurn(unavailable).length, 0);
+  assert.deepEqual(resolution.provenCapabilityEntriesForTurn(unavailable).map(entry => entry.identifier),
+    ['OUTLOOK_LIST_MAIL_FOLDERS'], 'review unavailability blocks the write, while the read remains independently proven');
 });
 
 test('default judgments are source/principal/connection scoped and use a distinct verdict from explicit selection', async () => {
