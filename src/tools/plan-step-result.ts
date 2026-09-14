@@ -39,7 +39,10 @@ export function buildPlanStepResultTool(identity?: { sessionId: string; sourceUs
         if ((data === undefined) === (data_json === undefined)) throw new Error('Supply one JSON result in data or legacy data_json.');
         const context = harnessRunContextStorage.getStore();
         if (!context?.sessionId || !context.sourceUserSeq || context.workerScope) throw new Error('Only the parent Execute turn can record its reviewed synthesis.');
-        return JSON.stringify(recordReviewedPlanStepResult({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq }, step_id, data === undefined ? JSON.parse(data_json!) : data));
+        const saved = recordReviewedPlanStepResult({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq }, step_id, data === undefined ? JSON.parse(data_json!) : data);
+        return JSON.stringify({ ...saved,
+          message: 'This compute step is complete. Continue the reviewed plan with its saved result. Record this step again only to correct its content, not to announce that you are moving on.',
+        });
       } catch (error) {
         return JSON.stringify({ ok: false, code: 'invalid_arguments', message: error instanceof Error ? error.message : 'Could not record the reviewed result.' });
       }

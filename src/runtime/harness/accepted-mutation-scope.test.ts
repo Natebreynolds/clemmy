@@ -143,3 +143,20 @@ test('scope is per accepted source, not per session', () => {
     'workflow_update', 'named_existing');
   assert.equal(edit.allowed, true, "the new source's own first mutation sets its scope");
 });
+
+
+test('mixed-family work keeps independent scope: creating a Space can also arrange Home', () => {
+  const j = job('workspace-and-home');
+  const input = { ...j, turn: 1, logicalToolCallId: 'create-space', operationId: 'space_save', deliverableKind: 'workspace', destinationPosture: 'create_new' };
+  assert.equal(admitMutationIntoAcceptedScope(input).allowed, true);
+  assert.equal(admitMutationIntoAcceptedScope({ ...input, logicalToolCallId: 'place-space', operationId: 'home_update', deliverableKind: 'home', destinationPosture: 'named_existing' }).allowed, true);
+  // The Home edit cannot grant an overwrite of an existing Space after a failed create.
+  assert.equal(admitMutationIntoAcceptedScope({ ...input, logicalToolCallId: 'overwrite-collision', destinationPosture: 'named_existing' }).allowed, false);
+});
+
+test('a second family edit cannot launder a failed workflow create into overwrite authority', () => {
+  const j = job('no-cross-family-authority');
+  propose(j, 'workflow_create', 'create_new');
+  assert.equal(admitMutationIntoAcceptedScope({ ...j, turn: 1, logicalToolCallId: 'arrange-home', operationId: 'home_update', deliverableKind: 'home', destinationPosture: 'named_existing' }).allowed, true);
+  assert.equal(propose(j, 'workflow_update', 'named_existing').allowed, false);
+});

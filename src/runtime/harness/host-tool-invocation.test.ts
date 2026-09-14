@@ -278,6 +278,53 @@ function runCall<T>(
   }))) as Promise<invocation.HostToolInvocationResult<T>>;
 }
 
+test('internal model review outlives the metadata deadline and settles its original call once', async () => {
+  const task = fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const verdict = new Promise<void>(resolve => { release = resolve; });
+  const pending = runCall(task, { callId: 'slow-review', toolName: 'publish_plan', effect: 'host_only', deadlineMs: 30,
+    invoke: async () => {
+      await abortContext.awaitToolModelReview(async () => { entered(); await verdict; });
+      assert.ok((abortContext.currentToolAbortDeadlineAt() ?? 0) > Date.now());
+      return { ok: true, planArtifactRef: 'saved-once' };
+    } });
+  await started;
+  await new Promise(resolve => setTimeout(resolve, 90));
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['tool_attempt_settled'] }).length, 0);
+  release();
+  assert.deepEqual((await pending).value, { ok: true, planArtifactRef: 'saved-once' });
+  const settled = eventlog.listEvents(task.sessionId, { types: ['tool_attempt_settled'] });
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]!.data.kind, 'succeeded');
+});
+
+test('cancellation still terminates an internal model review and rejects its late return', async () => {
+  const task = fixture();
+  const controller = new AbortController();
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const verdict = new Promise<void>(resolve => { release = resolve; });
+  let committed = false;
+  const pending = runCall(task, { callId: 'cancel-review', toolName: 'publish_plan', effect: 'host_only', deadlineMs: 30,
+    callerSignal: controller.signal,
+    invoke: async () => {
+      await abortContext.awaitToolModelReview(async () => { entered(); await verdict; });
+      committed = true;
+      return { ok: true };
+    } });
+  const stopped = assert.rejects(pending);
+  await started;
+  controller.abort();
+  await stopped;
+  release();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(committed, false);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['tool_attempt_settled'] }).length, 1);
+});
+
 function rows(task: ReturnType<typeof fixture>, callId?: string) {
   const db = eventlog.openEventLog();
   return db.prepare(`

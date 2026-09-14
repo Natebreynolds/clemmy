@@ -642,6 +642,8 @@ test('mobile Needs You projects bounded exact account choices and resolves B thr
 });
 
 test('mobile Inbox trust decision uses only the persisted exact scope', async () => {
+  const fixtureNow = Date.now();
+  const daysAgo = (days: number) => new Date(fixtureNow - days * 86_400_000).toISOString();
   const proposalId = `tgp-mobile-${Date.now()}`;
   const expiredProposalId = `${proposalId}-expired`;
   const scope = {
@@ -671,13 +673,13 @@ test('mobile Inbox trust decision uses only the persisted exact scope', async ()
       evidence: {
         cleanSendCount: 6,
         distinctDays: 4,
-        firstAt: '2026-08-01T18:00:00.000Z',
-        lastAt: '2026-08-29T18:00:00.000Z',
+        firstAt: daysAgo(6),
+        lastAt: daysAgo(1),
         sampleApprovalIds: ['private-approval-id'],
       },
       rationale: 'You approved this exact recipient six times.',
       status: 'pending',
-      createdAt: '2026-08-30T18:00:00.000Z',
+      createdAt: daysAgo(1),
     }, {
       id: expiredProposalId,
       scopeKey: 'expired-scope-key',
@@ -687,13 +689,13 @@ test('mobile Inbox trust decision uses only the persisted exact scope', async ()
       evidence: {
         cleanSendCount: 6,
         distinctDays: 4,
-        firstAt: '2026-07-01T18:00:00.000Z',
-        lastAt: '2026-07-10T18:00:00.000Z',
+        firstAt: daysAgo(90),
+        lastAt: daysAgo(80),
         sampleApprovalIds: [],
       },
       rationale: 'This request is intentionally expired.',
       status: 'pending',
-      createdAt: '2026-07-10T18:00:00.000Z',
+      createdAt: daysAgo(80),
     }],
   }), 'utf-8');
 

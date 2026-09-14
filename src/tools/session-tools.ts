@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { ExecutionStore } from '../execution/store.js';
 import { loadSessionBrief, listSessionBriefs, refreshSessionBrief, renderSessionResume, saveSessionManualHandoff } from '../memory/session-briefs.js';
 import { PlanStore } from '../planning/plan-store.js';
-import { INBOX_DIR, TASKS_FILE, parseTasks, sessions, textResult } from './shared.js';
+import { INBOX_DIR, TASKS_FILE, parseTasks, sessions, textResult, invalidArgumentsTextResult } from './shared.js';
 import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { getSession as getHarnessSession, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { exactSessionHistoryForTool, pullRecentTurnsForHarnessHistory, renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
@@ -276,6 +276,9 @@ export function registerSessionTools(server: McpServer): void {
         ? sameConversationAncestorSessionIds({ sessionId: requester.id, principalId: requesterPrincipal }).includes(session_id)
         : false;
       let searchRead: ReturnType<typeof redeemSessionHistorySearch> | undefined;
+      if (search_receipt_id && max_turns != null) {
+        return invalidArgumentsTextResult('session_history: max_turns cannot be combined with a search receipt. Omit max_turns and keep session_id, search_receipt_id, through_seq and snapshot_sha256 unchanged.');
+      }
       if (search_receipt_id) {
         try {
           if (!context?.sessionId || !sourceUserSeq) throw new Error('An exact accepted requesting source is required.');

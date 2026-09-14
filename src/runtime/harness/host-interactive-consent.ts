@@ -45,7 +45,7 @@ import {
 import {
   canonicalExternalInputSchemaDigestV1,
   deriveExternalCapabilityCallSignalsV1,
-  loadCatalogManifestExternalRiskAttestationV1,
+  loadFreshCatalogManifestExternalRiskAttestationV1,
 } from './external-capability-risk-loader.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import {
@@ -1003,7 +1003,7 @@ async function semanticBasisForExactCall(input: {
   if (!destination) {
     return { status: 'hold', reason: 'bound_catalog_destination_projection_unavailable' };
   }
-  const loaded = loadCatalogManifestExternalRiskAttestationV1({
+  const loaded = await loadFreshCatalogManifestExternalRiskAttestationV1({
     version: 1,
     binding: {
       bindingKind: 'catalog_manifest' as const,

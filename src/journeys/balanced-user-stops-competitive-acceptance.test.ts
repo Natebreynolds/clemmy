@@ -323,11 +323,7 @@ test('incomplete, irreversible, destructive, and ambiguous creates retain typed 
     destination: { family: 'artifact:generated', posture: 'named_existing' },
   });
 
-  assert.deepEqual(evaluateGeneratedCreate({ manifest: missing, cohort: [missing] }), {
-    status: 'consent_decision',
-    decision: { kind: 'repair', reason: 'risk_unknown' },
-  });
-  for (const manifest of [irreversible, destructive]) {
+  for (const manifest of [missing, namedExisting, irreversible, destructive]) {
     const evaluated = evaluateGeneratedCreate({ manifest, cohort: [manifest] });
     assert.equal(evaluated.status, 'consent_decision');
     if (evaluated.status !== 'consent_decision') continue;
@@ -335,10 +331,6 @@ test('incomplete, irreversible, destructive, and ambiguous creates retain typed 
     if (evaluated.decision.kind !== 'needs_user') continue;
     assert.equal(evaluated.decision.need, 'approval');
   }
-  assert.deepEqual(evaluateGeneratedCreate({ manifest: namedExisting, cohort: [namedExisting] }), {
-    status: 'consent_decision',
-    decision: { kind: 'repair', reason: 'risk_unknown' },
-  });
 
   const ambiguous = generatedManifest(105);
   const siblingBase = generatedManifest(106);

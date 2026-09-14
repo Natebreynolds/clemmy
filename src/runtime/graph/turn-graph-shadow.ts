@@ -1,4 +1,4 @@
-import { acceptedPlanExecutionText } from '../harness/accepted-plan-execution.js';
+import { acceptedPlanExecution, acceptedPlanOwnerScopeInput } from '../harness/accepted-plan-execution.js';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import pino from 'pino';
@@ -252,8 +252,17 @@ export function graphSemanticText(
   context?: TaskContinuationContext,
   source?: EventRow,
 ): string {
-  const reviewedExecution = acceptedPlanExecutionText(identity.sessionId, identity.sourceUserSeq);
-  if (reviewedExecution) return reviewedExecution;
+  const reviewedExecution = acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq);
+  if (reviewedExecution) {
+    // Classify the owner's work and the selected plan, not the host's execution
+    // guidance. That guidance mentions sends and destructive actions only to
+    // explain consent; treating it as the task invented an external-write
+    // obligation for a local-file plan and prevented delegated execution.
+    return [
+      acceptedPlanOwnerScopeInput(identity.sessionId, identity.sourceUserSeq, sourceText),
+      reviewedExecution.artifact.fullText,
+    ].join('\n');
+  }
   // A conversational Yes is not a fresh semantic task. Rehydrate the exact
   // frozen send only after the registry proves this accepted source is the
   // addressed response that resolved it. This makes the graph/expected-work

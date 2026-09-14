@@ -19,8 +19,7 @@ test('live with no tokens does not render a hollow reply card', () => {
 
 test('the assistant column is not unconditionally flex-1', () => {
   assert.match(SOURCE, /const fillColumn = live \|\| showReplyCard/);
-  assert.match(SOURCE, /fillColumn && 'w-full'/);
-  assert.match(SOURCE, /min-w-0 max-w-\[80%\]',\s*fillColumn && 'w-full'/);
+  assert.match(SOURCE, /message\.planArtifactRef \|\| fillColumn \? 'w-full' : 'max-w-\[min\(80%,40rem\)\]'/);
 });
 
 test('Stop before tokens still offers background on the live card', () => {

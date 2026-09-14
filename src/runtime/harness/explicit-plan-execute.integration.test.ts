@@ -282,6 +282,31 @@ test('explicit Plan prepares native Space schema without effects; Execute activa
       execution_draft: null, readiness: 'ready', missing_prerequisites: [], base_ref_json: null })],
     [textMessage('The full plan is ready for review.')],
   ]);
+  // Discovery can retire an unrelated previously connected tool while this
+  // Plan turn is preparing its own operations. That catalog change must not
+  // poison Plan's host root or grant any authority to execute the new plan.
+  const { attachSemanticContract, capabilityManifestDigest } = await import('./capability-manifest.js');
+  const unrelated = attachSemanticContract({
+    version: 1, manifestId: 'cap:unrelated-prior-read', providerKind: 'native_mcp',
+    operationId: 'unrelated__read', providerIdentity: 'unrelated', providerVersion: '1', operationVersion: '1',
+    definitionFingerprint: createHash('sha256').update('unrelated read').digest('hex'), effect: 'read', accountId: 'unrelated-account',
+    idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'result' }, evidenceContract: { kinds: ['result'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: new Date().toISOString(), trusted: true }, lifecycle: { state: 'current' },
+  });
+  const manifestStore = capabilityManifestStores.resolveCapabilityManifestStore();
+  assert.ok(manifestStore.install(unrelated).ok);
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory()!;
+  factory.register({ capabilityId: unrelated.manifestId, toolName: unrelated.operationId,
+    schemaVersion: unrelated.operationVersion, schemaDigest: unrelated.definitionFingerprint,
+    effect: unrelated.effect, account: unrelated.accountId, manifest: unrelated,
+    manifestDigest: capabilityManifestDigest(unrelated), providerKind: unrelated.providerKind, invoke: async () => ({}) });
+  const originalPlanResponse = planModel.getResponse.bind(planModel);
+  planModel.getResponse = async () => {
+    factory.forget(unrelated.manifestId);
+    manifestStore.revoke(unrelated.manifestId);
+    return originalPlanResponse();
+  };
   const planAgent = { model: planModel, tools: [publishTool] };
   const planEnvelope = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [publishTool], activeToolNames: ['publish_plan'],
     policyHash: 'explicit-plan-publication', budget: { maxUncachedTokens: 20_000, maxModelCalls: 3, maxToolCalls: 3, maxElapsedMs: 60_000 } });

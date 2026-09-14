@@ -22,6 +22,7 @@ import {
   renderHistoricalFocusPointer,
 } from './focus-projection.js';
 import { classifyTurnIntent } from './turn-intent.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
 import {
   classifyTurnPreflight,
   confirmBeatDirective,
@@ -415,14 +416,10 @@ function rankWorkflows(input: string): RankedContextCandidate[] {
   }
 }
 
-const PROJECT_COMMANDS_INSTRUCTION = 'The user\'s local project already produces this deliverable with its own slash command, skills, and connected data. Offer to run it via project_run (one approval, runs in the background, you poll status and deliver the produced files). Do NOT rebuild the deliverable by hand in-loop when a matching project command exists.';
+const PROJECT_COMMANDS_INSTRUCTION = 'Contextual candidates only: shared words do not establish that a project command fits the requested deliverable. Inspect its instructions only when its purpose is relevant. Use its procedure through available tools if useful; a saved command does not prove that an executor is available. Keep the current objective and deliver directly when the candidate does not help.';
 
-/** Project slash commands as deliverable routes. When the ask matches a
- *  command a project already implements (its own skills, MCP creds, and
- *  templates behind it), the honest answer is to DRIVE that project via
- *  project_run — an in-loop rebuild produces a lookalike, not the real
- *  deliverable. Matching is deliberately strict (two token hits or an
- *  explicit name) so unrelated turns pay zero prompt tax. */
+/** Rank saved project procedures as context. Retrieval is not a task decision
+ * or an attestation that their original executor is available. */
 function rankProjectCommands(input: string): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
@@ -438,7 +435,7 @@ function rankProjectCommands(input: string): RankedContextCandidate[] {
         if (score <= 0) continue;
         candidates.push({
           name: `/${command} in ${project.name}`,
-          description: `project_run {"action":"start","project":"${project.name}","prompt":"/${command} <args>"} — runs the project's own command via the user's CLI.`,
+          description: `Saved /${command} procedure in ${project.name}; inspect its instructions if relevant to the current task.`,
           score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
           matchCount: matched.length,
@@ -467,7 +464,7 @@ export function projectCommandsLineForInput(input: string): string | null {
     const candidates = rankProjectCommands(input);
     if (candidates.length === 0) return null;
     return renderCandidates(
-      'Project commands (the real deliverable route)',
+      'Potentially relevant project procedures',
       candidates,
       PROJECT_COMMANDS_INSTRUCTION,
     ).join('\n');
@@ -633,6 +630,10 @@ export function buildAgentContextPacket(
   },
 ): AgentContextPacket {
   const authorityInput = opts?.authorityInput ?? input;
+  // Execute already has an owner-selected method and topology. Global health
+  // summaries are not evidence about this run: words such as "failed" in a
+  // reviewed plan previously imported another workflow's repair directive.
+  const reviewedExecution = acceptedTaskMode(opts?.sessionId, opts?.sourceUserSeq)?.kind === 'execute';
   const suppressSemanticEnrichment = opts?.suppressSemanticEnrichment === true;
   const plainConversationSurface = opts?.plainConversationSurface === true;
   const suppressActionSemanticEnrichment = suppressSemanticEnrichment || plainConversationSurface;
@@ -723,7 +724,7 @@ export function buildAgentContextPacket(
         explicitParallelRequest: false,
       }
     : detectMultiItemIntent(authorityInput);
-  const agentSystem = plainConversationSurface
+  const agentSystem = plainConversationSurface || reviewedExecution
     ? { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' }
     : renderAgentSystemGuidance(authorityInput, opts?.sessionKind);
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
@@ -735,7 +736,7 @@ export function buildAgentContextPacket(
   // with the full items array" (2026-08-04 efficiency audit; matches the
   // measured chat-runs-heavy-work-as-one-loop pattern). Workflow keeps its
   // own line; the policy block applies wherever the directive can fire.
-  const fanoutLaneEligible = multiItem.isMultiItem && opts?.sessionKind !== 'workflow';
+  const fanoutLaneEligible = multiItem.isMultiItem && opts?.sessionKind !== 'workflow' && !reviewedExecution;
   const fanoutBlockedByPolicy = Boolean(
     fanoutLaneEligible &&
     agentSystem.policy &&
@@ -818,7 +819,7 @@ export function buildAgentContextPacket(
     }
   }
 
-  const mcpScopeLine = suppressActionSemanticEnrichment || toolScope.allowAll
+  const mcpScopeLine = suppressActionSemanticEnrichment || toolScope.allowAll || reviewedExecution
     ? ''
     : `External MCP scope: ${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''} (${toolScope.reason}).`;
   const memoryStatusLine = memory.skippedReason || !memory.enabled
@@ -853,7 +854,7 @@ export function buildAgentContextPacket(
     suppressActionSemanticEnrichment ? '' : pitfallsForSkills(skills.map((s) => s.name)),
     ...(suppressActionSemanticEnrichment
       ? []
-      : renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION)),
+      : renderCandidates('Potentially relevant project procedures', projectCommands, PROJECT_COMMANDS_INSTRUCTION)),
     ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),

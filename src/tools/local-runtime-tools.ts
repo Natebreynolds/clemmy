@@ -20,6 +20,7 @@ import { registerModelRoleTools } from './model-role-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerWorkflowReshapeTools } from './workflow-reshape-tools.js';
 import { registerSpaceTools } from './space-tools.js';
+import { registerHomeTools } from './home-tools.js';
 import { registerDynamicTools } from './dynamic-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerGoalTools } from './goal-tools.js';
@@ -312,6 +313,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerWorkflowScheduleTools(server);
   registerWorkflowReshapeTools(server);
   registerSpaceTools(server);
+  registerHomeTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
   registerMcpServerTools(server);

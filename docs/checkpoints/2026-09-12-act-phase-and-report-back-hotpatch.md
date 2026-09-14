@@ -38,8 +38,8 @@ Quit Clementine after any live work has safely finished, then run:
 ```sh
 (
 set -e
-cd /Users/nathan.reynolds/clementine-next
-NODE=/Users/nathan.reynolds/.nvm/versions/node/v22.22.0/bin/node
+cd $HOME/clementine-next
+NODE=$HOME/.nvm/versions/node/v22.22.0/bin/node
 "$NODE" --import tsx scripts/hotpatch-daemon.mjs --check
 "$NODE" --import tsx scripts/hotpatch-daemon.mjs
 open /Applications/Clementine.app

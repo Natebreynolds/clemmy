@@ -847,15 +847,13 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   const refreshBearer = byo.refreshBearer;
   const bearerRefreshingFetch: typeof fetch | undefined = refreshBearer
     ? (async (url, init) => {
-        let headers = init?.headers;
-        try {
-          const fresh = await refreshBearer();
-          if (fresh) {
-            const merged = new Headers(headers as HeadersInit | undefined);
-            merged.set('authorization', `Bearer ${fresh}`);
-            headers = merged;
-          }
-        } catch { /* an unrefreshable grant falls through to the stored bearer */ }
+        const fresh = await refreshBearer();
+        if (!fresh) throw new Error(`${byo.providerLabel || 'Model provider'} is disconnected. Reconnect the model account to continue.`);
+        // Refresh errors belong to the normal request retry path. Falling
+        // through with the cached token hides the cause and can reuse a
+        // disconnected grant or turn a transient refresh failure into a 401.
+        const headers = new Headers(init?.headers as HeadersInit | undefined);
+        headers.set('authorization', `Bearer ${fresh}`);
         return fetch(url as never, { ...(init ?? {}), headers });
       }) as typeof fetch
     : undefined;

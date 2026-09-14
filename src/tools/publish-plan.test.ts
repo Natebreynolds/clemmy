@@ -116,9 +116,10 @@ test('an unresolved question publishes without inventing an executable outline a
     principalId: f.sessionId, executeRef: published.planArtifactRef }),
     (error: any) => error.code === 'not_ready', 'a partial question cannot confer execution authority');
   assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
-  const rejected = await invoke({ ...input, readiness: 'ready' });
-  assert.equal(rejected.ok, false, JSON.stringify(rejected));
-  assert.match(JSON.stringify(rejected), /ready plan requires/);
+  const recovered = await invoke({ ...input, readiness: 'ready' });
+  assert.equal(recovered.status, 'already_published');
+  assert.equal(recovered.readiness, 'needs_input', 'recovery cannot upgrade the saved question');
+  assert.deepEqual(recovered.planArtifactRef, published.planArtifactRef);
 });
 test('wrong native arguments and mismatched effects/dependencies cannot be called ready', async () => {
   const f = await fixture();
@@ -365,6 +366,96 @@ test('publication reviews the current candidate and retains a rejected draft for
   assert.equal(repaired.ok, true);
   assert.ok(repaired.planArtifactRef);
   assert.deepEqual(seen, ['Which audience should I write for?', 'I have the comparison method ready. Which team will read the briefing?']);
+});
+
+test('publication recovery returns the saved artifact without judging or replacing another draft', async () => {
+  const f = await fixture();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const review = await import('../runtime/harness/plan-publication-review.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  let reviews = 0;
+  const invoke = (full_text: string) => withHarnessRunContext(f,
+    () => review.withPlanCompletionReview(async () => { reviews++; return 'done'; },
+      () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify({
+        full_text, readiness: 'needs_input', missing_prerequisites: ['Audience'] }))));
+  const first = JSON.parse(String(await invoke('Which audience should this research cover?')));
+  log.closeEventLog();
+  const recovered = JSON.parse(String(await invoke('Different retry text that was never published.')));
+  assert.equal(recovered.status, 'already_published');
+  assert.deepEqual(recovered.planArtifactRef, first.planArtifactRef);
+  assert.equal(reviews, 1);
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId })?.fullText, 'Which audience should this research cover?');
+  assert.equal(log.listEvents(f.sessionId, { types: ['plan_revision_published'] }).length, 1);
+});
+
+test('a cancelled publication cannot save a late positive review', async () => {
+  const f = await fixture();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const { runWithToolAbortSignal } = await import('../runtime/tool-abort-context.js');
+  const review = await import('../runtime/harness/plan-publication-review.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const controller = new AbortController();
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const verdict = new Promise<void>(resolve => { release = resolve; });
+  const pending = withHarnessRunContext(f, () => runWithToolAbortSignal(controller.signal,
+    () => review.withPlanCompletionReview(async () => { entered(); await verdict; return 'done'; },
+      () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify({
+        full_text: 'Which audience should this research cover?', readiness: 'needs_input', missing_prerequisites: ['Audience'] })))));
+  await started;
+  controller.abort(new Error('Owner stopped this turn.'));
+  release();
+  const result = JSON.parse(String(await pending));
+  assert.equal(result.ok, false);
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId }), null);
+  assert.equal(log.listEvents(f.sessionId, { types: ['plan_revision_published'] }).length, 0);
+});
+
+test('an early graph error retains the full draft and accepts a targeted repair after reopen', async () => {
+  const f = await fixture();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  const fullText = 'Complete research method.\n'.repeat(500) + 'Decisive final verification.';
+  const first = await invoke({ full_text: fullText, structured_plan: { steps: [
+    { id: 'rubric', action: 'Build the evidence rubric.', effect: 'compute', dependsOn: ['rubric'], verification: 'Every source question represented.' },
+  ], successCriteria: ['A complete source-backed research method.'] } });
+  assert.equal(first.ok, false);
+  assert.match(first.message, /cycle/);
+  assert.equal(typeof first.draft_digest, 'string');
+  log.closeEventLog();
+  const fixed = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'rubric', changes: { dependsOn: [] } }] });
+  assert.equal(fixed.ok, true, JSON.stringify(fixed));
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId })?.fullText, fullText);
+});
+
+test('an interpreted collection can be repaired to a single bound input without resending the plan', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  const fullText = 'Interpret the evidence, then save the complete briefing.';
+  const first = await invoke({ full_text: fullText, structured_plan: { steps: [
+    { id: 'synthesize', action: 'Produce the complete briefing.', effect: 'compute', verification: 'All source questions answered.' },
+    { id: 'save', action: 'Save the briefing.', capabilityRef: f.capabilityRef,
+      staticArguments: { path: path.join(home, 'brief.md') },
+      forEach: { producerStepId: 'synthesize', memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] },
+      verification: 'Read the saved briefing.' },
+  ], successCriteria: ['Complete briefing saved.'] } });
+  assert.equal(first.ok, false);
+  assert.match(first.message, /collection producer must be a tool step/);
+  assert.equal(typeof first.draft_digest, 'string');
+  log.closeEventLog();
+  const fixed = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'save', changes: {
+    forEach: null, dynamicBindings: [{ producerStepId: 'synthesize', outputPath: '', targetPath: '/content' }],
+  } }] });
+  assert.equal(fixed.ok, true, JSON.stringify(fixed));
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const saved = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId })!;
+  assert.equal(saved.fullText, fullText);
+  assert.equal((saved.structuredPlan!.steps as any[])[1].forEach, undefined);
 });
 
 

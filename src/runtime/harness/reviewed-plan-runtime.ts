@@ -16,6 +16,7 @@ import { unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './to
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { PlanArtifactV1 } from './plan-artifacts.js';
 import { isPlainOrClementineLocalTool, isTrustedComposioGateway } from './runtime-tool-identity.js';
+import { getTurnGraphEventForSource } from './eventlog.js';
 
 const object = (v: unknown): v is Record<string, any> => Boolean(v && typeof v === 'object' && !Array.isArray(v));
 const equal = (a: unknown, b: unknown) => closedCanonicalJson(a, SEALED_CALL_CANONICAL_LIMITS) === closedCanonicalJson(b, SEALED_CALL_CANONICAL_LIMITS);
@@ -49,6 +50,17 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
       if (!canonical || !schema || !equal(canonical, binding.identity)
         || digestSchema(JSON.parse(closedCanonicalJson(schema, { ...SEALED_CALL_CANONICAL_LIMITS, omitUndefinedObjectMembers: true }))) !== canonical.providerInputSchemaDigest) {
         throw new Error(`Reviewed provider capability ${step.capabilityRef} changed or is unavailable. Revise the plan before execution.`);
+      }
+      // Revalidation must also attach the exact approved selection to THIS
+      // accepted source. A live catalog row alone is not its planning card,
+      // and unrelated remembered tools can occupy every display slot.
+      const providerKind = entry!.manifest?.providerKind;
+      if (!getTurnGraphEventForSource(planning.identity.sessionId, planning.identity.sourceUserSeq)
+        && (providerKind === 'composio' || providerKind === 'native_mcp')) {
+        const refs = await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority,
+          candidates: [{ name: step.capabilityRef, carrier: 'work_call', schema,
+            sourceKind: providerKind === 'composio' ? 'authorized_composio' : 'authorized_external_mcp' }] });
+        if (refs[step.capabilityRef] !== step.capabilityRef) throw new Error(`Reviewed provider capability ${step.capabilityRef} could not be attached to this execution source.`);
       }
     }
   }

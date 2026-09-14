@@ -48,6 +48,7 @@ import {
 import {
   independentlyObserveCapability,
   observationIsFresh,
+  refreshIndependentCapabilityObservation,
 } from './independent-capability-observation.js';
 import {
   EXTERNAL_CAPABILITY_RISK_INPUT_VERSION,
@@ -179,6 +180,7 @@ export interface CatalogManifestExternalRiskAuthorityV1 {
   manifestStore: CapabilityManifestStore;
   catalogFactory: HostCapabilityCatalogFactory;
   observe: LiveCapabilityObserver;
+  refresh?: (manifest: CapabilityManifestV1) => Promise<void>;
 }
 
 export type CatalogManifestExternalRiskRefusal =
@@ -1155,6 +1157,17 @@ function productionAuthority(): CatalogManifestExternalRiskAuthorityV1 | null {
   return {
     manifestStore,
     catalogFactory,
+    refresh: async (manifest) => {
+      const current = independentlyObserveCapability(manifest.operationId, manifest.accountId);
+      // A fresh disagreement is drift, not permission to erase that evidence
+      // with a fallback. Only missing/aged metadata needs another observation.
+      if (current && observationIsFresh(current)) return;
+      await refreshIndependentCapabilityObservation({
+        operationId: manifest.operationId, accountId: manifest.accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion, operationVersion: manifest.operationVersion,
+      });
+    },
     observe: (manifest) => {
       // Proof provisioning and live carrier materialization both register the
       // shipped independent observer as crossing-time authority. Reopen that
@@ -1311,4 +1324,23 @@ export function loadCatalogManifestExternalRiskAttestationV1(
     callSignals: input.callSignals,
     safety: input.safety,
   });
+}
+
+/** Planning/review can outlast a native MCP observation. Refresh its exact
+ * metadata before consent, then reopen all the existing binding checks. The
+ * synchronous loader remains the last check; no operation is invoked here. */
+export async function loadFreshCatalogManifestExternalRiskAttestationV1(
+  input: LoadCatalogManifestExternalRiskAttestationInputV1,
+  authority?: CatalogManifestExternalRiskAuthorityV1,
+): Promise<LoadCatalogManifestExternalRiskAttestationResultV1> {
+  const resolved = authority ?? productionAuthority();
+  const loaded = loadCatalogManifestExternalRiskAttestationV1(input, resolved ?? undefined);
+  if (loaded.ok || loaded.reason !== 'current_definition_unavailable' || !resolved?.refresh) return loaded;
+  const manifest = resolved.manifestStore.get(input.binding.manifestId)?.manifest;
+  // This refusal occurs after the exact catalog/schema checks, except when a
+  // native manifest lacks its definition entirely. That cannot be refreshed
+  // into a different contract under a previously approved reference.
+  if (manifest?.providerKind !== 'native_mcp' || !manifest.externalDefinition) return loaded;
+  try { await resolved.refresh(manifest); } catch { return loaded; }
+  return loadCatalogManifestExternalRiskAttestationV1(input, authority);
 }

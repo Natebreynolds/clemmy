@@ -8,7 +8,7 @@ Recorded identities at write time (re-check; they drift):
 
 | Item | Value |
 | --- | --- |
-| Checkout | `/Users/nathan.reynolds/clementine-next` |
+| Checkout | `$HOME/clementine-next` |
 | Branch | `wave/boot-resilience-and-footprint` |
 | HEAD when this file was written | `8a7c68e3` — re-run `git rev-parse --short HEAD` |
 | Live daemon | Packaged `/Applications/Clementine.app`, PID observed `28421`, port `8520`, home `~/.clementine-next` |

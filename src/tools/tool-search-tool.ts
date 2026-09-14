@@ -14,6 +14,8 @@
  * It remains additive while `CLEMMY_CODEX_TOOL_SEARCH` is off. When the switch is
  * enabled, catalog discovery can replace most first-class schemas.
  */
+import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
@@ -710,7 +712,8 @@ export interface ToolSearchPlanningDisclosureOutcome {
 
 export interface ToolSearchPlanningDisclosureControl {
   signal: AbortSignal;
-  deadlineAt: number;
+  readonly deadlineAt: number;
+  awaitModelReview?: DiscoveryDeadline['awaitModelReview'];
   accountSelection?: SourceAccountNomination | null;
 }
 
@@ -969,7 +972,7 @@ export function registerToolSearchTool(
       // ordinary orchestrator lifecycle owns when their real schemas appear.
       const structuralControl = deferredPage ? null : hostStructuralPlanningControlLookup(query);
       if (structuralControl) return textResult(JSON.stringify(structuralControl));
-      const brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
+      let brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
       // An exact tool name is an explicit selection, not another fuzzy search
       // term. Resolve it against the policy-filtered catalog BEFORE semantic
@@ -1380,41 +1383,19 @@ export function registerToolSearchTool(
                     reason,
                   }]))),
               });
-              let timer: ReturnType<typeof setTimeout> | undefined;
-              const controller = new AbortController();
-              const groupBudgetMs = Math.min(
-                PLANNING_DISCLOSURE_DEADLINE_MS,
-                remainingBrokerMs(),
-              );
-              if (groupBudgetMs <= 0) {
-                outcomes.push(expiredDisclosure());
-                continue;
-              }
-              const groupDeadlineAt = Date.now() + groupBudgetMs;
-              try {
-                const outcome = await Promise.race([
-                  Promise.resolve(disclose(group, {
-                    signal: controller.signal,
-                    deadlineAt: groupDeadlineAt,
-                    accountSelection: account_selection,
-                  })).catch(() => expiredDisclosure('proof_not_registered')),
-                  new Promise<null>((resolve) => {
-                    timer = setTimeout(() => {
-                      controller.abort();
-                      resolve(null);
-                    }, groupBudgetMs);
-                  }),
-                ]);
-                outcomes.push(
-                  controller.signal.aborted
-                  || Date.now() >= groupDeadlineAt
-                  || remainingBrokerMs() <= 0
-                  ? expiredDisclosure()
-                  : outcome ?? expiredDisclosure(),
-                );
-              } finally {
-                if (timer) clearTimeout(timer);
-              }
+              const groupBudgetMs = Math.min(PLANNING_DISCLOSURE_DEADLINE_MS, remainingBrokerMs());
+              if (groupBudgetMs <= 0) { outcomes.push(expiredDisclosure()); continue; }
+              const outcome = await withDiscoveryDeadline({
+                deadlineAt: Date.now() + groupBudgetMs,
+                signal: currentToolAbortSignal(),
+                onModelWait: elapsed => { brokerDeadlineAt += elapsed; },
+              }, async control => disclose(group, {
+                signal: control.signal,
+                get deadlineAt() { return control.deadlineAt; },
+                awaitModelReview: control.awaitModelReview,
+                accountSelection: account_selection,
+              })).catch(() => expiredDisclosure('proof_not_registered'));
+              outcomes.push(outcome ?? expiredDisclosure());
             }
             const refs: Record<string, string> = {};
             const blockers: Record<string, ToolSearchPlanningBlocker> = {};

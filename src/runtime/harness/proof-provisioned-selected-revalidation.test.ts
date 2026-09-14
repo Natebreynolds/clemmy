@@ -1130,3 +1130,79 @@ test('a stale pre-existing global catalog entry cannot bypass selected revalidat
   assert.ok(factory.get(`cap:resolved:${STALE_SELECTED.toLowerCase()}`),
     'the stale global entry may remain installed, but the typed caller must abort before freeze');
 });
+
+for (const change of ['none', 'schema', 'account'] as const) {
+  test(`retained planning restores a missing callable after restart: ${change}`, async () => {
+    const identifier = `MEGA_RESTART_${change.toUpperCase()}`;
+    const capabilityRef = `cap:resolved:${identifier.toLowerCase()}`;
+    resetSchemaCaches();
+    composio.__test__.setConnectedAccountsLoader(async () => [{
+      id: CONNECTION_ID, status: 'ACTIVE', user_id: 'selected-user', toolkit: { slug: 'mega' },
+    }]);
+    const factory = catalogs.createHostCapabilityCatalogFactory();
+    catalogs.installHostCapabilityCatalogFactory(factory);
+    let businessCalls = 0;
+    production.installProductionTransport(async () => { businessCalls += 1; return {}; });
+    let schemaReads = 0;
+    let changed = false;
+    schemas._setToolSchemaLoaderForTests(async () => {
+      schemaReads += 1;
+      return {
+        inputParameters: changed && change === 'schema' ? SCHEMA_B : SCHEMA_A,
+        outputParameters: null, providerObservedAt: Date.now(), providerOperationVersion: '20260914_01',
+      };
+    });
+    const identity = proofTurn(`restart-planning-${change}`, [identifier]);
+    const initial = await semantic.primePrimaryModelPlanningCatalog(identity);
+    assert.ok(initial.ok, JSON.stringify(initial));
+    if (!initial.ok) throw new Error(initial.reason);
+    const seed = await provisioning.registerProofProvisionedCapabilities(identity, {
+      allowedIdentifiers: [identifier],
+      expectedSchemaDigests: [{ identifier, schemaDigest: digestSchema(SCHEMA_A) }],
+    });
+    assert.equal(seed.refusal, undefined, JSON.stringify(seed));
+    assert.ok(factory.get(capabilityRef), JSON.stringify(typedRuntime.typedExecutionCatalogRefusals()));
+    const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: initial.planning.authority,
+      candidates: [{ name: identifier, carrier: 'work_call', sourceKind: 'authorized_composio', schema: SCHEMA_A }] });
+    assert.equal(refs[identifier], capabilityRef);
+
+    catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+    eventlog.closeEventLog();
+    const resumed = await semantic.primePrimaryModelPlanningCatalog(identity);
+    assert.ok(resumed.ok, JSON.stringify(resumed));
+    if (!resumed.ok) throw new Error(resumed.reason);
+    assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.get(capabilityRef), undefined);
+    assert.equal(semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+      authority: resumed.planning.authority, identity, selectedRefs: new Set([capabilityRef]),
+    }).length, 1, 'the producer disclosure survives SQLite reopen without a callable');
+    const restore = { authority: resumed.planning.authority, identity, capabilityRef, publicationGuard: () => true };
+    await semantic.restoreSelectedPlanningCallable({ ...restore, identity: { ...identity, sourceUserSeq: identity.sourceUserSeq + 1 } });
+    await semantic.restoreSelectedPlanningCallable({ ...restore, publicationGuard: () => false });
+    assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.get(capabilityRef), undefined);
+    changed = true;
+    if (change === 'account') composio.__test__.setConnectedAccountsLoader(async () => [{
+      id: 'different-connected-account', status: 'ACTIVE', user_id: 'selected-user', toolkit: { slug: 'mega' },
+    }]);
+    const publisher = await import('../../tools/publish-plan.js');
+    const prepare = () => publisher.preparePlanOutline({ ...identity, planning: resumed.planning, ready: true,
+      raw: { successCriteria: ['Read the requested records.'], steps: [{
+        id: 'read', action: 'Read the requested records.', verification: 'Provider returns the requested records.',
+        capabilityRef, staticArguments: { query: 'requested records' },
+      }] },
+    });
+    if (change !== 'none') {
+      await assert.rejects(prepare, change === 'account'
+        ? /Cannot reopen.*selected_connection_missing_or_changed/
+        : /Cannot reopen.*selected_definition/);
+      assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.get(capabilityRef), undefined);
+    } else {
+      const prepared = await prepare() as { preparedBindings: unknown[] };
+      assert.equal(prepared.preparedBindings.length, 1);
+      assert.ok(catalogs.peekHostCapabilityCatalogFactory()?.get(capabilityRef));
+      const before = schemaReads;
+      await semantic.restoreSelectedPlanningCallable(restore);
+      assert.equal(schemaReads, before, 'a live selected callable adds no metadata round-trip');
+    }
+    assert.equal(businessCalls, 0, 'restoring a definition never invokes the selected business operation');
+  });
+}

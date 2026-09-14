@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   buildWatcherPrompt,
   latestWatcherAssistantNote,
+  lastCoveredWatcherReview,
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
   parseWatcherVerdict,
@@ -156,4 +157,16 @@ test('watcher evidence and public notes survive whole while prior turns and reas
   assert.ok(prompt.includes(source));
   assert.ok(prompt.includes(note));
   assert.doesNotMatch(prompt, /Old request note|Private reasoning/);
+});
+
+
+test('an unavailable or stale window cannot hide pending evidence from the next review', () => {
+  const completed = (cursor: number, extra = {}) => ({ data: { kind: 'trajectory_review', phase: 'completed',
+    sourceUserSeq: 7, objectiveDigest: 'current-objective', verdict: 'on_track',
+    readEvidenceCursor: cursor, ...extra } });
+  const rows = [completed(10), completed(20, { verdict: 'unavailable' }),
+    completed(30, { stale: true }), completed(40, { sourceUserSeq: 8 }),
+    completed(50, { objectiveDigest: 'abandoned-objective' }), completed(60, { evidenceAvailable: false })];
+  assert.equal(lastCoveredWatcherReview(rows as never, 7, 'current-objective')?.data.readEvidenceCursor, 10);
+  assert.equal(lastCoveredWatcherReview(rows.slice(1) as never, 7, 'current-objective'), undefined);
 });

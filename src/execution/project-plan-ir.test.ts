@@ -115,6 +115,9 @@ test('every positive project capability is present on the real constrained step 
     admitted.map((declaration) => declaration.name).sort(),
     [
       'git_status',
+      // Fixed owner-local layout read: no arbitrary path, refresh, workflow,
+      // or write. Replaying it observes the current placement revision.
+      'home_get',
       'memory_list_facts',
       'memory_recall',
       'memory_search',

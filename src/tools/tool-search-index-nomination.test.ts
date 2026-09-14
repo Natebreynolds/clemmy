@@ -836,7 +836,7 @@ test('missing exact operation version or output definition never warms planning 
   }
 });
 
-test('an ambiguous connected account never fetches or deposits an indexed operation', async () => {
+test('ambiguous accounts still allow indexed metadata; nomination grants no executable authority', async () => {
   schemaCache.resetToolSchemaCache();
   capabilityIndex._resetCapabilityIndexForTest();
   const operation = 'OUTLOOK_GET_CALENDAR_VIEW_AMBIGUOUS_ACCOUNT';
@@ -850,9 +850,10 @@ test('an ambiguous connected account never fetches or deposits an indexed operat
   nominate(operation);
 
   const names = (await composioCandidates('calendar view ambiguous account')).map((entry) => entry.name);
-  assert.ok(!names.includes(operation));
-  assert.ok(!exactLookups.includes(operation), 'account selection is required before exact materialization');
-  assert.equal(schemaCache.liveComposioSchemaFingerprint(operation), undefined);
+  assert.ok(names.includes(operation));
+  assert.ok(exactLookups.includes(operation), 'definition discovery does not select an operating account');
+  const resolution = await import('../runtime/harness/capability-resolution.js');
+  assert.equal(resolution.provenCapabilityEntriesForTurn({ sessionId: 'unowned-nomination', sourceUserSeq: 1 }).length, 0);
 });
 
 test('typed source selection reaches the best indexed operation on the first five-row discovery page', async () => {
@@ -969,7 +970,7 @@ test('typed source selection reaches the best indexed operation on the first fiv
   } finally { registry.installTurnSemanticModelPort(null); }
 });
 
-test('an unsupported source nomination cannot unlock indexed metadata acquisition', async () => {
+test('an unsupported account selection cannot turn discovered metadata into an executable operation', async () => {
   const registry = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
   const operation = 'OUTLOOK_CREATE_DRAFT_UNSUPPORTED_SELECTION';
   schemaCache.resetToolSchemaCache();
@@ -996,10 +997,17 @@ test('an unsupported source nomination cannot unlock indexed metadata acquisitio
     const rows = await provider.search({ query: 'calendar create draft', limit: 5, accountSelection: {
       toolkit: 'outlook', identity: 'operator@work.invalid', source_quote: 'Create a draft in my personal mailbox.',
     } });
+    assert.equal(judgeCalls, 0, 'metadata lookup does not review operating identity');
+    assert.ok(rows.some(row => row.name === operation));
+    const staged = await providerSources.stageDisclosedPlanningProviderCandidates({
+      sessionId: session.id, sourceUserSeq: source.seq,
+      candidates: rows.map(row => ({ ...row, sourceKind: 'authorized_composio' as const })),
+      accountSelection: { toolkit: 'outlook', identity: 'operator@work.invalid', source_quote: 'Create a draft in my personal mailbox.' },
+    });
     assert.equal(judgeCalls, 1);
-    assert.ok(!rows.some(row => row.name === operation));
-    assert.ok(!exactLookups.includes(operation));
-    assert.equal(schemaCache.liveComposioSchemaFingerprint(operation), undefined);
+    assert.equal(staged.blockers[operation]?.reason, 'not_entailed');
+    const resolution = await import('../runtime/harness/capability-resolution.js');
+    assert.equal(resolution.provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: source.seq }).length, 0);
   } finally { registry.installTurnSemanticModelPort(null); }
 });
 

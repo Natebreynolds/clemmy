@@ -59,6 +59,7 @@ import { approvalKindLabel, approvalQuestion } from '../lib/inbox-presentation';
 import { homeLead, homeNeedsYouPane, homeWorkPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
+import { HomeTiles } from '../components/HomeTiles';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
@@ -387,6 +388,8 @@ export function Home({
         onRetry={() => { void refresh(); void workingNow.refresh(); }}
         hasData={needsYouCount + workingView.total + awayRows.length + projects.length > 0}
       />
+
+      <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
 
       {panes.map((id) => {
         const rendered = sections[id]();

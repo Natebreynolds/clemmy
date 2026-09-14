@@ -14,20 +14,27 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-const abortStore = new AsyncLocalStorage<{ signal: AbortSignal; deadlineAt?: number }>();
+type ModelReviewWait = <T>(work: () => Promise<T>) => Promise<T>;
+const abortStore = new AsyncLocalStorage<{
+  signal: AbortSignal;
+  deadlineAt?: number | (() => number | undefined);
+  awaitModelReview?: ModelReviewWait;
+}>();
 
 /** Run `fn` with `signal` visible to `currentToolAbortSignal()` across every
  *  await boundary reached from inside it. Returns whatever `fn` returns. */
 export function runWithToolAbortSignal<T>(
   signal: AbortSignal,
   fn: () => T,
-  deadlineAt?: number,
+  deadlineAt?: number | (() => number | undefined),
+  awaitModelReview?: ModelReviewWait,
 ): T {
-  const inheritedDeadline = abortStore.getStore()?.deadlineAt;
-  const exactDeadline = Number.isFinite(deadlineAt) && (deadlineAt ?? 0) > 0
+  const parent = abortStore.getStore();
+  const exactDeadline = typeof deadlineAt === 'function' || (typeof deadlineAt === 'number' && Number.isFinite(deadlineAt) && deadlineAt > 0)
     ? deadlineAt
-    : inheritedDeadline;
-  return abortStore.run({ signal, ...(exactDeadline ? { deadlineAt: exactDeadline } : {}) }, fn);
+    : parent?.deadlineAt;
+  return abortStore.run({ signal, deadlineAt: exactDeadline,
+    awaitModelReview: awaitModelReview ?? parent?.awaitModelReview }, fn);
 }
 
 /** The abort signal for the tool call currently on the stack, or undefined when
@@ -40,5 +47,16 @@ export function currentToolAbortSignal(): AbortSignal | undefined {
 
 /** Exact absolute outer tool deadline, when the invocation owner supplied one. */
 export function currentToolAbortDeadlineAt(): number | undefined {
-  return abortStore.getStore()?.deadlineAt;
+  const deadline = abortStore.getStore()?.deadlineAt;
+  return typeof deadline === 'function' ? deadline() : deadline;
+}
+
+/** A model review has its own transport lifetime. Do not spend a local tool's
+ * metadata timer while awaiting it; cancellation still belongs to that tool. */
+export async function awaitToolModelReview<T>(work: () => Promise<T>): Promise<T> {
+  const owner = abortStore.getStore();
+  owner?.signal.throwIfAborted();
+  const result = await (owner?.awaitModelReview ? owner.awaitModelReview(work) : work());
+  owner?.signal.throwIfAborted();
+  return result;
 }

@@ -118,16 +118,18 @@ async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown'
   return { result, request };
 }
 
-test('unknown current mutation semantics remain repair, never an invented approval or automatic write', async () => {
+test('unknown current mutation semantics ask for the exact external action without an automatic write', async () => {
   const { result } = await exactCall('unknown');
   assert.equal(result.status, 'decided', JSON.stringify(result));
   if (result.status !== 'decided') return;
-  assert.deepEqual(result.decision, { kind: 'repair', reason: 'risk_unknown' });
-  assert.equal(result.consentSubject, undefined);
+  assert.equal(result.decision.kind, 'needs_user');
+  if (result.decision.kind !== 'needs_user') throw new Error('exact approval decision missing');
+  assert.equal(result.decision.need, 'approval');
+  assert.ok(result.consentSubject, 'unknown risk still binds the exact account, arguments and definition');
 });
 
-test('the exact approved direct call reuses the same risk subject and rejects changed scope', async () => {
-  const { result, request } = await exactCall('send');
+for (const kind of ['send', 'unknown'] as const) test(`the exact approved direct call reuses the same risk subject and rejects changed scope: ${kind}`, async () => {
+  const { result, request } = await exactCall(kind);
   assert.equal(result.status, 'decided');
   if (result.status !== 'decided' || !result.consentSubject) throw new Error('approval subject missing');
   const subject = result.consentSubject;

@@ -105,7 +105,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 95688
+          "bytes": 96779
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -741,7 +741,7 @@
           "bytes": 11292
         },
         "src/runtime/auth-store.ts": {
-          "bytes": 50060
+          "bytes": 51251
         },
         "src/runtime/harness/model-wire-registry.ts": {
           "bytes": 24236
@@ -759,7 +759,7 @@
           "bytes": 3588
         },
         "src/runtime/harness/byo-model.ts": {
-          "bytes": 45748
+          "bytes": 45911
         },
         "src/runtime/xai-auth-bridge.ts": {
           "bytes": 664
@@ -945,7 +945,7 @@
           "bytes": 54983
         },
         "src/runtime/harness/production-mcp-read-carrier.ts": {
-          "bytes": 53689
+          "bytes": 54485
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 14185
@@ -1074,7 +1074,7 @@
           "bytes": 20009
         },
         "src/runtime/harness/accepted-mutation-scope.ts": {
-          "bytes": 6819
+          "bytes": 7162
         },
         "src/runtime/harness/host-interactive-consent.ts": {
           "bytes": 60088
@@ -2081,6 +2081,12 @@
         "src/tools/space-tools.ts": {
           "bytes": 107204
         },
+        "src/runtime/home-layout.ts": {
+          "bytes": 6038
+        },
+        "src/tools/home-tools.ts": {
+          "bytes": 1719
+        },
         "src/tools/mcp-server-tools.ts": {
           "bytes": 10804
         },
@@ -2130,7 +2136,7 @@
           "bytes": 3543
         },
         "src/tools/mcp-server.ts": {
-          "bytes": 38000
+          "bytes": 38082
         },
         "src/runtime/harness/content-chant-detector.ts": {
           "bytes": 4163
@@ -2181,7 +2187,7 @@
           "bytes": 797
         },
         "src/tools/local-runtime-tools.ts": {
-          "bytes": 30776
+          "bytes": 30858
         },
         "src/tools/inner-dispatch.ts": {
           "bytes": 28056
@@ -2781,7 +2787,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 95688
+          "bytes": 96779
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -3417,7 +3423,7 @@
           "bytes": 11292
         },
         "src/runtime/auth-store.ts": {
-          "bytes": 50060
+          "bytes": 51251
         },
         "src/runtime/harness/model-wire-registry.ts": {
           "bytes": 24236
@@ -3435,7 +3441,7 @@
           "bytes": 3588
         },
         "src/runtime/harness/byo-model.ts": {
-          "bytes": 45748
+          "bytes": 45911
         },
         "src/runtime/xai-auth-bridge.ts": {
           "bytes": 664
@@ -3621,7 +3627,7 @@
           "bytes": 54983
         },
         "src/runtime/harness/production-mcp-read-carrier.ts": {
-          "bytes": 53689
+          "bytes": 54485
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 14185
@@ -3750,7 +3756,7 @@
           "bytes": 20009
         },
         "src/runtime/harness/accepted-mutation-scope.ts": {
-          "bytes": 6819
+          "bytes": 7162
         },
         "src/runtime/harness/host-interactive-consent.ts": {
           "bytes": 60088
@@ -4757,6 +4763,12 @@
         "src/tools/space-tools.ts": {
           "bytes": 107204
         },
+        "src/runtime/home-layout.ts": {
+          "bytes": 6038
+        },
+        "src/tools/home-tools.ts": {
+          "bytes": 1719
+        },
         "src/tools/mcp-server-tools.ts": {
           "bytes": 10804
         },
@@ -4806,7 +4818,7 @@
           "bytes": 3543
         },
         "src/tools/mcp-server.ts": {
-          "bytes": 38000
+          "bytes": 38082
         },
         "src/runtime/harness/content-chant-detector.ts": {
           "bytes": 4163
@@ -4857,7 +4869,7 @@
           "bytes": 797
         },
         "src/tools/local-runtime-tools.ts": {
-          "bytes": 30776
+          "bytes": 30858
         },
         "src/tools/inner-dispatch.ts": {
           "bytes": 28056
@@ -5372,8 +5384,8 @@
       }
     },
     "transport": {
-      "file": "transport-c48564bd730fa87e18e51b1fd9298407000567fc9c1e2132a7978fb6f2f1ab25.cjs",
-      "sha256": "c48564bd730fa87e18e51b1fd9298407000567fc9c1e2132a7978fb6f2f1ab25",
+      "file": "transport-87c57ded911b534ac7c7d9afbe38c8e662df187ee827021dcc344c91ff7e82ee.cjs",
+      "sha256": "87c57ded911b534ac7c7d9afbe38c8e662df187ee827021dcc344c91ff7e82ee",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5415,7 +5427,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 95688
+          "bytes": 96779
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -5489,5 +5501,5 @@
       }
     }
   },
-  "manifestDigest": "ae019266fa28afebb8f284d0154ffe37d10ce98854a706adce4d190c81adfcce"
+  "manifestDigest": "d566a047b834fc8deea2b5ad659b9914b950c5ae794437a1fcda6f8b5ad585ea"
 }

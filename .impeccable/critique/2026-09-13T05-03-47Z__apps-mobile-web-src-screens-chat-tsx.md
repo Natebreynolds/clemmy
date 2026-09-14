@@ -5,9 +5,9 @@ max_score: 40
 na_heuristics:
 p0_count: 0
 p1_count: 4
-target_identity: "file:/Users/nathan.reynolds/clementine-next/apps/mobile-web/src/screens/Chat.tsx"
+target_identity: "file:$HOME/clementine-next/apps/mobile-web/src/screens/Chat.tsx"
 target_fingerprint: "sha256:78c46420492cd52666ff4e1a54e47297aff78a322b27a6f55f208d6e30fd8331"
-target_path: /Users/nathan.reynolds/clementine-next/apps/mobile-web/src/screens/Chat.tsx
+target_path: $HOME/clementine-next/apps/mobile-web/src/screens/Chat.tsx
 timestamp: 2026-09-13T05-03-47Z
 slug: apps-mobile-web-src-screens-chat-tsx
 ---

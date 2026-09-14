@@ -288,3 +288,27 @@ test('protected/untrusted calls refuse, unknown semantics repair, and spent card
     kind: 'proceed', basis: 'settled_replay', authorityDigest: replay.bindingDigest,
   });
 });
+
+test('opaque external work uses exact consent without inventing safe semantics or accepting drift', () => {
+  const opaque = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'unknown', consequence: 'unknown', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  const decision = evaluateInteractiveConsentV1(input(opaque));
+  assert.equal(decision.kind, 'needs_user');
+  if (decision.kind !== 'needs_user') return;
+  assert.equal(decision.need, 'approval');
+  assert.equal(decision.subjectDigest, opaque.bindingDigest);
+  assert.match(decision.reason, /cannot classify/i);
+  const exact = grant(opaque);
+  assert.equal(evaluateInteractiveConsentV1(input(opaque, { userGrant: exact })).kind, 'proceed');
+  for (const changed of [
+    { argumentDigest: digest('9') }, { accountId: 'other-account' },
+    { schemaFingerprint: digest('7') }, { logicalToolCallId: 'sibling' },
+    { risk: { ...opaque.risk, consequence: 'send' as const } },
+  ]) {
+    assert.deepEqual(evaluateInteractiveConsentV1(input(call({ ...opaque, ...changed }), { userGrant: exact })),
+      { kind: 'repair', reason: 'scope_mismatch' });
+  }
+  assert.deepEqual(evaluateInteractiveConsentV1(input(opaque, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(opaque, { crossing: 'possibly_started' })), { kind: 'reconcile', reason: 'possible_effect', retry: 'never_blind' });
+});

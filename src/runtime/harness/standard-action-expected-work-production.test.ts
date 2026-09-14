@@ -159,7 +159,7 @@ test('standard spine activates exact action authority while keeping registered r
   assert.ok(capturedNames.includes('workspace_roots'), 'the registered filesystem reader carries its actual schema');
   assert.equal(capturedNames.includes('write_file'), false, 'authoring still crosses work_call with exact authority');
   assert.ok(capturedNames.includes('tool_search'), 'control discovery remains directly callable');
-  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.status, 'blocked', JSON.stringify(result));
   assert.equal(result.publicPresentation?.kind, 'blocked', 'a zero-call action done claim must fail closed');
   const source = eventlog.listEvents(session.id, { types: ['user_input_received'] })[0]!;
   assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'conflict',
@@ -271,10 +271,6 @@ test('standard action keeps control discovery before freeze, fuses proposal with
       name: 'user_profile_read',
       invoke: async () => { calls.push('user_profile_read'); return { successful: true, data: { name: 'Clem' } }; },
     }],
-    ['workspace_roots', {
-      name: 'workspace_roots',
-      invoke: async () => { calls.push('workspace_roots'); return { successful: true, data: ['/workspace'] }; },
-    }],
     ['write_file', {
       name: 'write_file',
       invoke: async () => { calls.push('write_file'); return { successful: true }; },
@@ -332,7 +328,7 @@ test('standard action keeps control discovery before freeze, fuses proposal with
       workInput({ proposal: null, requirementId: 'read-roots', name: 'workspace_roots' }),
       { toolCall: { callId: 'subsequent-bound-call' } },
     );
-    assert.match(JSON.stringify(second), /successful/);
+    assert.ok(String(second).includes(TMP_HOME), 'the bound native read returns the actual allowed roots');
 
     // Satisfied-replay + steering card (live 2026-08-11: an already-settled
     // requirement returned a bare error and restarted the guess-loop; a
@@ -382,8 +378,8 @@ test('standard action keeps control discovery before freeze, fuses proposal with
     terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
   });
 
-  assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(result.publicPresentation?.kind, 'blocked', 'unfinished write obligation cannot publish done');
+  assert.equal(result.publicPresentation?.status, 'blocked', JSON.stringify(result));
+  assert.equal(result.publicPresentation?.kind, 'blocked', JSON.stringify(result));
   const blockedText = result.publicPresentation?.text ?? '';
   assert.match(
     blockedText,
@@ -391,7 +387,7 @@ test('standard action keeps control discovery before freeze, fuses proposal with
   );
   assert.match(blockedText, /Retained work \(durable checkpoint\):/);
   assert.match(blockedText, /Source\/tool user_profile_read: completed result retained as rh_[a-f0-9]+\./);
-  assert.match(blockedText, /Source\/tool workspace_roots: 1 record \(unknown\) retained as rh_[a-f0-9]+\./);
+  assert.match(blockedText, /Source\/tool workspace_roots: completed result retained as rh_[a-f0-9]+\./);
   assert.match(blockedText, /External write state: no settled external-write attempt is recorded\./);
   assert.equal(repairCalls, 1, 'one exact staged verification gap earns one sealed repair call');
   assert.equal(repairPacket?.acceptedRequest, 'Read my profile and workspace roots, then write a local report.');
@@ -404,7 +400,7 @@ test('standard action keeps control discovery before freeze, fuses proposal with
     eventlog.listEvents(session.id, { types: ['terminal_authority_repair_consumed'] }).length,
     1,
   );
-  assert.deepEqual(calls, ['user_profile_read', 'workspace_roots'], 'dependency refusal crosses no tool boundary');
+  assert.deepEqual(calls, ['user_profile_read'], 'the native roots reader bypasses inner dispatch; the refused write and satisfied replay never dispatch');
   const db = eventlog.openEventLog();
   const bindings = db.prepare(`
     SELECT logical_tool_call_id, requirement_id FROM expected_work_call_bindings
@@ -466,7 +462,7 @@ test('malformed standard work_call settles one corrective refusal and makes zero
     terminalDeliveryJudgePort: unavailableTerminalDeliveryJudge(),
   });
 
-  assert.equal(result.publicPresentation?.status, 'blocked');
+  assert.equal(result.publicPresentation?.status, 'blocked', JSON.stringify(result));
   assert.equal(result.publicPresentation?.kind, 'blocked');
   const db = eventlog.openEventLog();
   assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)

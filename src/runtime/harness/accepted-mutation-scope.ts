@@ -9,9 +9,12 @@
  * its own coverage, because graphless consent DERIVES that coverage from the
  * proposed call itself. Exact consistency with yourself is not permission.
  *
- * The independent fact this compares against is the scope the source's FIRST
- * accepted mutation froze, plus what that source has actually built. A later
- * call cannot widen it by proposing something wider.
+ * The independent fact this compares against is the first accepted mutation
+ * FOR THE SAME DELIVERABLE FAMILY, plus what that source has actually built.
+ * A workspace create cannot decide whether the same request may arrange Home,
+ * and a Home edit cannot grant permission to overwrite a colliding workflow.
+ * This protects create-to-overwrite collisions; it is not a substitute for
+ * the source/call consent checks that authorize each operation.
  *
  * Deliberately NOT how this works: no reading of the owner's words, no tool-name
  * list, no argument field names, no mandatory Plan, no same-family permission,
@@ -21,7 +24,7 @@
 import { appendEvent, listEvents, openEventLog } from './eventlog.js';
 
 export type MutationScopeBasis =
-  /** Nothing was frozen yet; this call becomes the source's accepted scope. */
+  /** Nothing in this family was frozen yet; establish its accepted scope. */
   | 'first_accepted_mutation'
   /** Creating something new is bounded by its own duplicate/consent checks. */
   | 'create_new'
@@ -45,9 +48,10 @@ interface FrozenScope {
   deliverableKinds: Set<string>;
 }
 
-function frozenScopeFor(sessionId: string, sourceUserSeq: number): FrozenScope | null {
+function frozenScopeFor(sessionId: string, sourceUserSeq: number, deliverableKind: string): FrozenScope | null {
   const rows = listEvents(sessionId, { types: [SCOPE_EVENT] })
-    .filter((row) => row.data.sourceUserSeq === sourceUserSeq);
+    .filter((row) => row.data.sourceUserSeq === sourceUserSeq
+      && row.data.deliverableKind === deliverableKind);
   if (rows.length === 0) return null;
   const postures = new Set<string>();
   const deliverableKinds = new Set<string>();
@@ -140,7 +144,7 @@ export function admitMutationIntoAcceptedScope(input: {
     return { allowed: true, basis };
   };
 
-  const frozen = frozenScopeFor(input.sessionId, input.sourceUserSeq);
+  const frozen = frozenScopeFor(input.sessionId, input.sourceUserSeq, input.deliverableKind);
   if (!frozen) return record('first_accepted_mutation');
 
   // Creating something NEW is not a scope expansion over someone else's work:

@@ -381,7 +381,8 @@ export function redeemSessionHistorySearch(input: HistorySearchObserver & {
   const hit = receipt.hits.find(candidate => candidate.session_id === input.targetSessionId
     && (input.throughSeq === undefined || candidate.through_seq === input.throughSeq)
     && (input.snapshotSha256 === undefined || candidate.snapshot_sha256 === input.snapshotSha256));
-  if (!hit || input.maxTurns !== undefined) deny('The requested history snapshot was not returned by this exact search.');
+  if (!hit) deny('The requested history snapshot was not returned by this exact search.');
+  if (input.maxTurns !== undefined) deny('max_turns cannot be combined with a search receipt. Omit max_turns and retain the exact receipt, boundary and digest.');
   const history = publicHistorySnapshot(input.targetSessionId, hit.through_seq, canonicalProjection(input.targetSessionId, hit.through_seq),
     input.targetSessionId === observer.sessionId ? observer.sourceUserSeq : undefined);
   if (sessionHistorySnapshotDigest({ sessionId: input.targetSessionId, ...history }) !== hit.snapshot_sha256) deny('The retained history snapshot changed; search again before reading.');

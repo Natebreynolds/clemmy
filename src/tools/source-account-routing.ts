@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { getSession, listEvents } from '../runtime/harness/eventlog.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
+import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering } from '../runtime/harness/steer-notes.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
@@ -100,8 +101,14 @@ function acceptedSource(sessionId: string, seq: number) {
   const event = listEvents(sessionId, { sinceSeq: seq - 1, types: ['user_input_received'], limit: 1 })[0];
   if (!event || event.seq !== seq || event.role !== 'user') return null;
   const display = typeof event.data.displayText === 'string' ? event.data.displayText : '';
-  const text = display || (typeof event.data.text === 'string' ? event.data.text : '');
-  return text.trim() ? { sessionId, seq, text, digest: digest(text) } : null;
+  const original = display || (typeof event.data.text === 'string' ? event.data.text : '');
+  if (!original.trim()) return null;
+  // Account routing must see the same delivered owner corrections as the
+  // running brain. Binding the digest to those notes also invalidates a cached
+  // route when the owner changes the selection. Queued notes and notes from a
+  // different accepted source are excluded by the shared adoption contract.
+  const text = objectiveWithAdoptedSteering(original, adoptedSteerNotesForSource({ sessionId, sourceUserSeq: seq }));
+  return { sessionId, seq, text, digest: digest(text) };
 }
 
 /** Continuity must see corrections even when an intervening turn never ran a

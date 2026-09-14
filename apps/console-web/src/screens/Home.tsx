@@ -3,9 +3,15 @@
  * what got done. Chat is a separate door. A send from here hands off to the
  * conversation the moment the daemon acknowledges it.
  */
-import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { HomeMock } from './HomeMock';
+import { Button } from '@/components/ui/Button';
+import { Plus, SlidersHorizontal } from 'lucide-react';
+import { HomeBuilder } from '@/components/home/HomeBuilder';
+import { SpaceTile } from '@/components/home/SpaceTile';
+import { openCustomizeHome } from '@/components/home/CustomizePanel';
+import { useHomeLayout, type HomeTile } from '@/lib/home-layout';
 import { isHomeMockScreen } from '@/components/home/mock/screens';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
@@ -45,6 +51,8 @@ export function Home() {
 
 function LiveHome() {
   const navigate = useNavigate();
+  const layout = useHomeLayout();
+  const [building, setBuilding] = useState(false);
   const prefsQuery = useHomePreferences();
   const prefs = prefsQuery.data ?? DEFAULT_HOME_PREFERENCES;
 
@@ -174,27 +182,16 @@ function LiveHome() {
   };
 
   const order = visiblePanes(prefs);
-  const panes: ReactNode[] = [];
-  for (let i = 0; i < order.length; i += 1) {
-    const id = order[i];
-    const next = order[i + 1];
-    const paired = (id === 'needs_you' && next === 'running') || (id === 'running' && next === 'needs_you');
-    if (paired && next) {
-      panes.push(
-        <div key={`${id}+${next}`} className="grid gap-5 lg:grid-cols-2">
-          {renderPane(id)}
-          {renderPane(next)}
-        </div>,
-      );
-      i += 1;
-      continue;
-    }
-    panes.push(<Fragment key={id}>{renderPane(id)}</Fragment>);
-  }
+  const tileWidth = (tile: HomeTile) => tile.width === 'wide'
+    ? 'col-span-12' : tile.width === 'small' ? 'col-span-12 md:col-span-6 xl:col-span-4' : 'col-span-12 md:col-span-6';
+  const immediatePanes = order.filter(id => ['needs_you', 'running', 'while_away'].includes(id));
+  const remainingPanes = order.filter(id => !immediatePanes.includes(id));
+  const tilesIn = (zone: HomeTile['zone']) => layout.data?.tiles.filter(tile => tile.zone === zone) ?? [];
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
   const presence = ccLoading && workingNow.isLoading
     ? null
+    : ccError || (workingNow.isError && !workingNow.data) ? 'Live work status is unavailable.'
     : presenceLine({
         needsYou: needsYou.length,
         running: workingView.running,
@@ -203,13 +200,17 @@ function LiveHome() {
       });
 
   return (
-    <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-5 px-5 py-5 animate-fade-in sm:px-10 sm:py-6">
+    <div className="mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 py-5 animate-fade-in sm:px-10 sm:py-6">
       <section className="flex flex-col gap-3.5" aria-label="Ask Clementine">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h1 className="text-h1 text-fg">{greeting}</h1>
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="flex flex-col gap-1"><h1 className="text-h1 text-fg">{greeting}</h1>
           {presence === null
             ? <Skeleton className="h-4 w-64 self-center" />
-            : <p className="text-body text-muted" aria-live="polite">{presence}</p>}
+            : <p className="text-body text-muted" aria-live="polite">{presence}</p>}</div>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" size="sm" disabled={!layout.data} onClick={() => setBuilding(true)}><Plus className="h-4 w-4" /> Build home</Button>
+            <Button variant="ghost" size="sm" onClick={openCustomizeHome}><SlidersHorizontal className="h-4 w-4" /> Tune</Button>
+          </div>
         </div>
         <Composer
           inputRef={composerRef}
@@ -225,7 +226,29 @@ function LiveHome() {
         {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
       </section>
 
-      {panes}
+      {layout.isError && <div role="alert" className="flex items-center gap-3 rounded-md border border-warning/30 p-3 text-small text-muted">
+        <span>Couldn’t load your Home layout. {layout.data ? 'Your last saved tiles are shown.' : 'Your saved layout has not been changed.'}</span>
+        <Button size="sm" variant="ghost" onClick={() => { void layout.refetch(); }}>Retry</Button>
+      </div>}
+      <section className="flex flex-col gap-3" aria-label="Now">
+        <p className="text-caption font-semibold uppercase tracking-widest text-faint">Now</p>
+        <div className="grid grid-cols-12 items-start gap-5">
+          {immediatePanes.map(id => <div key={id} className="col-span-12 lg:col-span-6 xl:col-span-4">{renderPane(id)}</div>)}
+          {layout.data && tilesIn('now').map(tile => <div key={tile.spaceId} className={tileWidth(tile)}><SpaceTile tile={tile} layout={layout.data!} /></div>)}
+        </div>
+      </section>
+      <section className="flex flex-col gap-3" aria-label="Watching">
+        <p className="text-caption font-semibold uppercase tracking-widest text-faint">Watching</p>
+        {layout.data && tilesIn('watching').length > 0 ? <div className="grid grid-cols-12 items-start gap-5">
+          {tilesIn('watching').map(tile => <div key={tile.spaceId} className={tileWidth(tile)}><SpaceTile tile={tile} layout={layout.data!} /></div>)}
+        </div> : layout.isLoading ? <Skeleton className="h-28 w-full" /> : layout.data && <div className="flex flex-wrap items-center justify-between gap-4 rounded-md border border-dashed border-border px-5 py-7">
+          <div><h2 className="text-h3">Make this Home yours</h2><p className="mt-1 text-body text-muted">Bring a Space here, or ask Clem to build something you want to keep in view.</p></div>
+          <Button variant="secondary" onClick={() => setBuilding(true)}>Build home</Button>
+        </div>}
+      </section>
+      {remainingPanes.length > 0 && <div className="flex flex-col gap-5">{remainingPanes.map(renderPane)}</div>}
+      {building && layout.data && <HomeBuilder layout={layout.data} spaces={spaces.data ?? []} spacesUnavailable={spaces.isError && !spaces.data} spacesLoading={spaces.isLoading} onClose={() => setBuilding(false)}
+        onBuild={text => sendAndOpen({ text, attachmentIds: [], attachmentNames: [] })} />}
     </div>
   );
 }

@@ -445,6 +445,11 @@ export function reconstructShippedPortsForDurableSuccessors(): void {
     const current = currentCapabilityManifest(entry.manifest);
     if (!current || current.lifecycle.state !== 'current') continue;
     if (isPlaceholderBetaAccount(current.accountId)) continue;
+    // Native MCP owns its preparation hooks and live definition refresh. A
+    // generic invoke-only reconstruction claims its immutable port first,
+    // causing the real materializer to reject and retire the saved identity.
+    // Leave reconstruction to that owner when it reopens current tools/list.
+    if (current.providerKind === 'native_mcp') continue;
     const identity = productionPortIdentityFromManifest(current);
     if (peekProductionCapabilityPort(identity)) continue;
     const write = current.effect === 'external_write' || current.effect === 'local_write';

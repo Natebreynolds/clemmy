@@ -70,12 +70,12 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias' }) {
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias' }) {
   const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
   const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
     ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
   const args = payloadForWrite(1);
-  const operationId = providerFixture?.operationId ?? { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY' }[kind];
+  const operationId = providerFixture?.operationId ?? { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', opaque: 'api_request' }[kind];
   if (outerShape === 'args') FIXTURE_ALIAS_OPERATIONS.add(operationId);
   const capabilityId = `cap:resolved:${operationId.toLowerCase()}`;
   const accountId = 'account:direct:owner';
@@ -173,7 +173,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   const model = {
     async getResponse(request: { tools?: Array<{ name?: string }> }) {
       modelCalls += 1;
-      assert.ok(request.tools?.some((entry) => entry.name === carrierName));
+      assert.ok(request.tools?.some((entry) => entry.name === carrierName), JSON.stringify(request.tools?.map(t => t.name)));
       if (modelCalls === 1) {
         // Same shape as the tag canary: exact live capability is ready only
         // after the model request froze its empty catalog. Never make a plan.
@@ -189,22 +189,69 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
       };
     }, getStreamedResponse: modelStream,
   };
-  const agent = { model, tools: [carrier] };
+  let agent: any = { model, tools: [carrier] };
   const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [carrier], activeToolNames: [carrierName],
     policyHash: 'p3-direct-write', budget: { maxUncachedTokens: 10_000, maxModelCalls: writeCount + 2, maxToolCalls: writeCount + 2, maxElapsedMs: 60_000 } });
   assert.ok(sealed.ok);
   if (!sealed.ok) return;
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const useProductionAgent = async () => {
+    const { primePrimaryModelPlanningCatalog } = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+    const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+    factory.register(entry);
+    const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+    assert.ok(primed.ok, JSON.stringify(primed));
+    if (!primed.ok) throw new Error(primed.reason);
+    agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq,
+      userInput: prompt, hostFreshPlanning: primed.planning, allowToolJit: true, model: model as never });
+    return agent;
+  };
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('legacy Runner must remain unreachable'); } });
   const run = (input: any = [{ type: 'message', role: 'user', content: prompt }], extra: Record<string, unknown> = {}) => brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
     counter: new brackets.ToolCallsCounter(writeCount + 2), behaviorScopeId: `${session.id}::turn:1` },
   () => hostRunRunner(runner as never, agent as never, input,
     { maxTurns: writeCount + 2, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
-  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt,
+  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt, model, useProductionAgent,
     counts: () => ({ providerCalls, modelCalls, preparationCalls, carrierBodies }) };
 }
+
+test('the production approval wrapper rebuilds the original host source and continues after SQLite reopen', async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', 'production-resume', false, 'args_json', 1, {
+    operationId: 'PRODUCTION_APPROVAL_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS],
+  });
+  assert.ok(fixture);
+  const { runConversation, runConversationFromResume } = await import('./loop.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const agent = await fixture.useProductionAgent();
+  const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(paused.status, 'awaiting_approval', JSON.stringify({ paused, errors: eventlog.listEvents(fixture.session.id, { types: ['run_failed', 'guardrail_tripped'] }).map(e => e.data) }));
+  assert.equal(fixture.counts().providerCalls, 0);
+  const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  assert.ok(approval);
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'production-fixture').ok, true);
+  eventlog.closeEventLog();
+  const resumed = await runConversationFromResume({ sessionId: fixture.session.id,
+    approvalId: approval.approvalId, decision: 'approve', resolver: 'production-fixture', turnEngine: 'host_v1',
+    makeRunner: () => fixture.runner as never, maxTurns: 3,
+    judgeFn: async () => ({ done: true, reason: 'fixture operation completed' }),
+    buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+      ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+      model: fixture.model as never, allowToolJit: true,
+    }),
+  });
+  const detail = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).map(e => e.data);
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify({ resumed, detail }));
+  assert.equal(resumed.status, 'completed');
+  const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).at(-1);
+  assert.match(JSON.stringify(terminal?.data), /The draft was created/);
+  const settlements = eventlog.openEventLog().prepare('SELECT source_user_seq, outcome_kind FROM logical_call_settlements WHERE session_id = ? AND mutating = 1').all(fixture.session.id) as any[];
+  assert.deepEqual(settlements.map(row => [row.source_user_seq, row.outcome_kind]), [[fixture.source.seq, 'succeeded']]);
+});
 
 for (const carrierName of ['call_tool', 'work_call'] as const) test(`one exact ${carrierName} reversible write crosses in its model step without plan_task`, async () => {
   const fixture = await directWriteFixture(carrierName);
@@ -595,3 +642,31 @@ test('the real host approval reaches the public event with reducer effect, accou
   assert.deepEqual(metadata, (HostInterruptState.fromString(outcome.serializedState!).getInterruptions()[0] as any).consentCall);
   assert.equal(fixture.counts().providerCalls, 0);
 });
+
+for (const carrier of ['call_tool', 'work_call'] as const) {
+  test(`opaque external ${carrier} pauses for its exact action, reopens, and dispatches once after approval`, async () => {
+    const fixture = await directWriteFixture(carrier, 'opaque', 'exact-api', false, 'args_json', 1, {
+      operationId: 'api_request',
+      schema: { type: 'object', properties: { method: { type: 'string' }, path: { type: 'string' }, data: { type: 'array', items: { type: 'object' } } }, required: ['method', 'path', 'data'], additionalProperties: false },
+      payloads: [{ method: 'POST', path: '/v1/query', data: [{ query: 'fixture research' }] }],
+    });
+    assert.ok(fixture);
+    const paused = await fixture.run();
+    assert.equal(paused.hasInterruptions, true, 'valid opaque arguments must not enter an impossible repair loop');
+    assert.equal(fixture.counts().providerCalls, 0);
+    const interruption = paused.interruptions![0]!;
+    assert.deepEqual((interruption as any).consentCall.risk, { consequence: 'unknown', reversibility: 'unknown', destructive: false });
+    assert.ok(interruption.approvalResumeKey);
+    const approval = approvals.registerResumable({ sessionId: fixture.session.id,
+      subject: 'Review this exact research request.', tool: interruption.toolName, args: interruption.args,
+      resumeKey: interruption.approvalResumeKey! }).row;
+    assert.equal(approvals.resolve(approval.approvalId, 'approved', 'direct-host-fixture').ok, true);
+    eventlog.closeEventLog();
+    const state = HostInterruptState.fromString(paused.serializedState!);
+    state.approve(state.getInterruptions()[0]);
+    const resumed = await fixture.run(state, { hostApprovalIds: [approval.approvalId] });
+    assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(resumed.history));
+    assert.equal(Boolean(resumed.hasInterruptions), false);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
+  });
+}

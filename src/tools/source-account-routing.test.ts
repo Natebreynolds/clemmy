@@ -16,6 +16,7 @@ const resolution = await import('../runtime/harness/capability-resolution.js');
 const registry = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const { configuredBrainSemanticPort, semanticModelRoleForPurpose } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
 const routing = await import('./source-account-routing.js');
+const steering = await import('../runtime/harness/steer-notes.js');
 const provider = await import('./tool-search-provider-sources.js');
 const aliases = await import('../memory/account-alias-store.js');
 const composio = await import('../integrations/composio/client.js');
@@ -33,7 +34,7 @@ const nomination = { toolkit: 'outlook', identity: SCORPION, source_quote: 'for 
 let serial = 0;
 function source(text: string, sessionId?: string) {
   const session = sessionId ? eventlog.getSession(sessionId)!
-    : eventlog.createSession({ id: `source-account-${++serial}`, kind: 'chat', userId: 'fixture-owner' });
+    : eventlog.createSession({ id: `sess-source-account-${++serial}`, kind: 'chat', userId: 'fixture-owner' });
   const event = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
   return { sessionId: session.id, sourceUserSeq: event.seq };
 }
@@ -137,6 +138,63 @@ test('invented source evidence, absent accounts, and another principal never rea
   assert.equal(calls.length, 0);
   assert.equal((await routing.resolveSourceAccountRouting({ ...input(identity), toolkit: 'salesforce' })).kind, 'account_selection_required',
     'an Outlook nomination grants no route to another toolkit');
+});
+
+test('delivered account clarification routes across reopen; queued wording is not yet source evidence', async () => {
+  const identity = source('Prepare the outreach plan.');
+  const calls = installJudge();
+  const quote = 'Use my Scorpion mailbox for the drafts.';
+  const request = { ...input(identity), nomination: { ...nomination, source_quote: quote } };
+  steering.appendSteerNote(identity.sessionId, quote);
+  const queued = await routing.resolveSourceAccountRouting(request);
+  assert.equal(queued.kind, 'account_selection_required');
+  if (queued.kind === 'account_selection_required') assert.equal(queued.reason, 'quote_not_in_source');
+  assert.equal(calls.length, 0);
+
+  steering.takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+  eventlog.closeEventLog();
+  const selected = await routing.resolveSourceAccountRouting(request);
+  assert.equal(selected.kind, 'resolved');
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0]?.acceptedText.includes(quote));
+  assert.equal(calls[0]?.sourceQuote, quote);
+  persist(identity, 'Prepare the outreach plan.', selected);
+  eventlog.closeEventLog();
+  assert.equal((await routing.resolveSourceAccountRouting({ ...request, nomination: null })).kind, 'resolved');
+  assert.equal(calls.length, 1, 'persisted route survives reopen without another account review');
+});
+
+test('a delivered correction invalidates the earlier account judgment instead of reusing its digest', async () => {
+  const identity = source(ORIGINAL);
+  const correction = 'Use my personal mailbox instead of Scorpion.';
+  const calls = installJudge(call => call.acceptedText.includes(correction) ? { verdict: 'conflict' } : {});
+  const first = await routing.resolveSourceAccountRouting(input(identity));
+  persist(identity, ORIGINAL, first);
+  steering.appendSteerNote(identity.sessionId, correction);
+  assert.equal((await routing.resolveSourceAccountRouting(input(identity))).kind, 'resolved');
+  assert.equal(calls.length, 1, 'an undelivered note has not changed the source yet');
+  steering.takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+  const corrected = await routing.resolveSourceAccountRouting(input(identity));
+  assert.equal(corrected.kind, 'account_selection_required');
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0]?.proposalDigest, calls[1]?.proposalDigest);
+  assert.ok(calls[1]?.acceptedText.includes(correction));
+});
+
+test('a delivered note belonging to another source or session cannot nominate this source account', async () => {
+  const identity = source('Prepare the outreach plan.');
+  const later = source('Prepare another plan.', identity.sessionId);
+  const quote = 'Use my Scorpion mailbox for this plan.';
+  steering.appendSteerNote(later.sessionId, quote);
+  steering.takeUndeliveredSteerNotes(later.sessionId, later.sourceUserSeq);
+  const other = source('Separate conversation.');
+  steering.appendSteerNote(other.sessionId, quote);
+  steering.takeUndeliveredSteerNotes(other.sessionId, other.sourceUserSeq);
+  const calls = installJudge();
+  const result = await routing.resolveSourceAccountRouting({ ...input(identity), nomination: { ...nomination, source_quote: quote } });
+  assert.equal(result.kind, 'account_selection_required');
+  if (result.kind === 'account_selection_required') assert.equal(result.reason, 'quote_not_in_source');
+  assert.equal(calls.length, 0);
 });
 
 test('semantic conflicts, uncertainty, unavailable judge, and mismatched subject digest cannot select a route', async () => {
@@ -508,7 +566,7 @@ test('a later proven discovery clears the earlier account blocker and preserves 
   assert.deepEqual(provider.thisTurnSearchAccountSelectionBlockers(identity), []);
 });
 
-test('bounded account review returns its host blocker, then reuses the same completed judgment', async () => {
+test('a slow account review stays owned by discovery and its completed judgment is reusable', async () => {
   composio.__test__.setComposioApiKeyOverride('fixture-account-routing');
   composio.__test__.setConnectedAccountsLoader(async () => connections.map(c => ({
     id: c.connectionId, status: c.status, user_id: 'fixture-owner', toolkit: { slug: c.slug }, data: { user_info: { email: c.accountEmail } },
@@ -524,10 +582,14 @@ test('bounded account review returns its host blocker, then reuses the same comp
   } });
   const candidates = [{ name: 'OUTLOOK_CREATE_DRAFT', sourceKind: 'authorized_composio' as const, carrier: 'work_call' as const,
     schema: { type: 'object', properties: { subject: { type: 'string' } } }, summary: 'Create an unsent draft' }];
-  const blocked = await provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates, accountSelection: nomination, deadlineAt: Date.now() + 1_000 });
-  assert.equal(blocked.blockers.OUTLOOK_CREATE_DRAFT?.reason, 'review_unavailable');
+  let finished = false;
+  const pending = provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates, accountSelection: nomination, deadlineAt: Date.now() + 1_000 })
+    .then(result => { finished = true; return result; });
+  await new Promise(resolve => setTimeout(resolve, 1_050));
+  assert.equal(finished, false, 'a metadata timeout must not declare the running judge unavailable');
   assert.equal(resolution.provenCapabilityEntriesForTurn(identity).length, 0);
   release();
+  assertCheckedAccountWithoutLivePublication((await pending).blockers);
   const recovered = await provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates, accountSelection: nomination });
   assertCheckedAccountWithoutLivePublication(recovered.blockers);
   assert.equal(calls, 1, 'a retry consumes the cached verdict rather than starting another model review');

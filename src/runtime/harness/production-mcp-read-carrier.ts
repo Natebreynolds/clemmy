@@ -801,8 +801,20 @@ async function executeWithRuntime(
   const result = runtime.invokePreparedOperation
     ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, call.args)
     : await prepared.snapshot.server.callTool(call.operationId, call.args);
-  const metadata = result as unknown as { isError?: unknown };
-  if (metadata?.isError === true) throw new Error('native MCP operation returned isError');
+  const metadata = result as unknown as { isError?: unknown; content?: unknown; structuredContent?: unknown };
+  if (metadata?.isError === true) {
+    // The SDK can return an Array carrying MCP metadata as own properties.
+    // Keep the provider's repair explanation on both carrier shapes instead
+    // of reducing a missing argument or bad endpoint to an opaque isError.
+    // Only the typed error flag selects failure; message text is not authority.
+    const blocks = Array.isArray(result) ? result : metadata.content;
+    const text = Array.isArray(blocks) ? blocks.flatMap(block =>
+      block?.type === 'text' && typeof block.text === 'string' ? [block.text] : [],
+    ).join('\n').trim() : '';
+    const detail = text || (metadata.structuredContent !== undefined
+      ? JSON.stringify(metadata.structuredContent) : '');
+    throw new Error(detail ? `native MCP operation failed: ${detail}` : 'native MCP operation returned isError');
+  }
   if (!Array.isArray(result)) return result;
   // The Agents SDK represents tools/call content as an Array with MCP result
   // metadata assigned as own properties. JSON serialization would retain the

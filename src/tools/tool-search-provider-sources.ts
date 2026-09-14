@@ -1,3 +1,5 @@
+import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
@@ -1063,9 +1065,18 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
   accountSelection?: SourceAccountNomination | null;
+  awaitModelReview?: DiscoveryDeadline['awaitModelReview'];
 }): Promise<{ blockers: Readonly<Record<string, ToolSearchPlanningBlocker>> }> {
   const empty = () => ({ blockers: Object.freeze({}) });
-  const guard = { signal: input.signal, deadlineAt: input.deadlineAt };
+  // Non-broker callers use the same ownership rule. Metadata keeps its budget;
+  // account judging remains attached to the current cancellable invocation.
+  if (!input.awaitModelReview && input.deadlineAt !== undefined) {
+    return await withDiscoveryDeadline({ deadlineAt: input.deadlineAt,
+      signal: input.signal ?? currentToolAbortSignal() }, control =>
+      stageDisclosedPlanningProviderCandidates({ ...input, signal: control.signal,
+        get deadlineAt() { return control.deadlineAt; }, awaitModelReview: control.awaitModelReview })) ?? empty();
+  }
+  const guard = { signal: input.signal, get deadlineAt() { return input.deadlineAt; } };
   if (!discoveryStillActive(guard)) return empty();
   const composioCandidates = input.candidates.filter((candidate) => (
     candidate.sourceKind === 'authorized_composio'
@@ -1123,17 +1134,17 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
     const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
     let routing = routingByToolkit.get(toolkit);
     if (!routing) {
-      // Review shares the broker clock and leaves time to return its exact
-      // blocker. Many candidate operations use one checked account route.
-      const outcome = await awaitBounded({
+      // This is model work, not provider metadata I/O. Keep the current tool
+      // pending until the review returns or its invocation is cancelled.
+      const review = () => awaitBounded({
         start: () => resolveSourceAccountRouting({
           sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
           toolkit, operation: slug, connections, nomination: input.accountSelection,
           effect: classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write',
         }),
         signal: input.signal,
-        deadlineAt: Math.min(Date.now() + 8_000, (input.deadlineAt ?? Infinity) - 500),
       });
+      const outcome = input.awaitModelReview ? await input.awaitModelReview(review) : await review();
       if (!discoveryStillActive(guard)) return empty();
       routing = outcome.kind === 'settled' ? outcome.value : {
         kind: 'account_selection_required', reason: 'review_unavailable',
@@ -1718,16 +1729,9 @@ async function materializeIndexNominations(input: {
   planningIdentity?: { sessionId: string; sourceUserSeq: number };
   accountSelection?: SourceAccountNomination | null;
 }): Promise<ComposioBrokerCandidate[]> {
-  // This is an absolute budget for the whole nomination, including the fresh
-  // current-account snapshot. Starting it after that I/O made the nominal 4s
-  // bound additive and allowed already-late rows to warm schema authority.
-  let deadlineAt = exactDiscoveryDeadline(input.deadlineAt);
-  // Source review is a separate bounded phase that overlaps fuzzy discovery.
-  // Its result may unlock a fresh metadata budget, always inside the same
-  // outer source deadline. The initial snapshot still owns the original
-  // absolute four-second budget, including for callers without a source.
-  const reviewedDeadlineAt = Math.min(Date.now() + 8_000 + INDEX_NOMINATION_DEADLINE_MS,
-    (input.deadlineAt ?? Infinity) - PROVIDER_SOURCE_RETURN_MARGIN_MS);
+  // Nomination acquires definitions only. The selected account is checked by
+  // stageDisclosedPlanningProviderCandidates before an executable ref exists.
+  const deadlineAt = exactDiscoveryDeadline(input.deadlineAt);
   const guard = { signal: input.signal, deadlineAt };
   if (!discoveryStillActive(guard)) return [];
   const indexed = searchCapabilityOperations(input.query, {
@@ -1740,7 +1744,6 @@ async function materializeIndexNominations(input: {
 
   const requests: ExactMaterializationRequest[] = [];
   const requested = new Set<string>();
-  const checkedRoutes = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const hit of indexed) {
     if (!discoveryStillActive(guard)) return [];
     const slug = hit.identifier.trim().toUpperCase();
@@ -1753,32 +1756,7 @@ async function materializeIndexNominations(input: {
       || !indexedCarrier
       || slugToolkit !== indexedCarrier
     ) continue;
-    // Exact metadata acquisition retains its account boundary. A typed source
-    // route takes precedence over compatibility hints, just as at staging;
-    // an uncertain or failed review must never fall through to those hints.
-    let route = checkedRoutes.get(slugToolkit);
-    if (!route && input.planningIdentity) {
-      const outcome = await awaitBounded({
-        start: () => resolveSourceAccountRouting({
-          ...input.planningIdentity!, toolkit: slugToolkit, operation: slug,
-          connections: usable, nomination: input.accountSelection,
-        }),
-        signal: input.signal,
-        deadlineAt: Math.min(Date.now() + 8_000, reviewedDeadlineAt),
-      });
-      route = outcome.kind === 'settled' ? outcome.value : {
-        kind: 'account_selection_required', choices: [], reason: 'review_unavailable',
-      };
-      checkedRoutes.set(slugToolkit, route);
-      if (route.kind === 'resolved') {
-        deadlineAt = Math.min(Date.now() + INDEX_NOMINATION_DEADLINE_MS, reviewedDeadlineAt);
-        guard.deadlineAt = deadlineAt;
-      }
-    }
-    if (!discoveryStillActive(guard)) return [];
-    const selection = route && route.kind !== 'none' ? route
-      : planningConnectionForOperation(slug, input.query, usable);
-    if (selection.kind !== 'resolved') continue;
+    if (!usable.some(connection => connection.slug.trim().toLowerCase() === slugToolkit)) continue;
     requests.push({ slug, toolkit: slugToolkit });
     requested.add(slug);
     if (requests.length >= INDEX_NOMINATION_LIMIT) break;

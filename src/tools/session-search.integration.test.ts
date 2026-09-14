@@ -332,3 +332,26 @@ test('optional backfill command requires an explicit home and resumes bounded du
   assert.equal((log.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches').get() as { n: number }).n, 0);
   assert.deepEqual(log.openEventLog().prepare('PRAGMA foreign_key_check').all(), []);
 });
+
+
+test('a receipt plus max_turns is repairable without changing its source-bound snapshot', async () => {
+  reset();
+  const target = session('receipt-argument-target');
+  const initial = user(target.id, 'Review the orchid plan.');
+  answer(target.id, initial, 'The confirmed orchid plan ends with EXACT-TAIL.');
+  const requester = session('receipt-argument-requester');
+  const accepted = user(requester.id, 'Recall the orchid plan.');
+  const tools = handlers(requester.id, accepted.seq);
+  const found = json(await tools.get('session_search')!({ query: 'orchid' }));
+  const hit = found.hits.find(hit => hit.session_id === target.id)!;
+  const args = { session_id: target.id, search_receipt_id: found.search_receipt_id,
+    through_seq: hit.through_seq, snapshot_sha256: hit.snapshot_sha256 };
+  const conflict = await tools.get('session_history')!({ ...args, max_turns: 6 });
+  assert.match(text(conflict), /max_turns cannot be combined/);
+  assert.doesNotMatch(text(conflict), /not returned by this exact search/);
+  const { isInvalidArgumentsTextResult } = await import('./shared.js');
+  assert.equal(isInvalidArgumentsTextResult(conflict), true, 'the local bridge receives a nominal repairable refusal');
+  const repaired = await tools.get('session_history')!(args);
+  assert.ok(!repaired.isError);
+  assert.match(text(repaired), /EXACT-TAIL/);
+});

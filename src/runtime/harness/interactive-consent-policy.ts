@@ -429,10 +429,18 @@ export function evaluateInteractiveConsentV1(
     };
   }
 
-  // A genuinely mixed or noun-shaped mutation is a planning/retrieval defect,
-  // not a reason to ask the user for blind permission. It reaches this branch
-  // only after exact accepted-work coverage was re-opened above.
+  // A current external definition can describe a generic carrier whose exact
+  // consequences remain unknown. Changing otherwise valid arguments cannot
+  // repair that fact. Surface the existing exact-call consent path; do not
+  // infer safety, widen coverage, or auto-authorize from a tool name. Missing
+  // coverage, stale authority and uncertain prior effects were handled above.
   if (call.risk.reversibility === 'unknown' || call.risk.consequence === 'unknown') {
+    if (call.effect === 'external_write') return {
+      kind: 'needs_user',
+      need: 'approval',
+      subjectDigest: call.bindingDigest,
+      reason: 'The current tool definition cannot classify this exact external action. Review its arguments and destination before proceeding.',
+    };
     return { kind: 'repair', reason: 'risk_unknown' };
   }
 

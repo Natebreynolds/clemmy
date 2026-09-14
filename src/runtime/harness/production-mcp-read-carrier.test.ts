@@ -33,6 +33,7 @@ const kernel = await import('./workflow-read-only-call-kernel.js');
 const mcp = await import('./production-mcp-read-carrier.js');
 const externalRisk = await import('./external-capability-risk-loader.js');
 const consent = await import('./interactive-consent-policy.js');
+const durablePorts = await import('./production-capability-catalog.js');
 
 const digest = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 const generated = (label: string): string => `${label}_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
@@ -64,6 +65,7 @@ function generatedRuntime(input: {
   objective: string;
   tools?: ToolState[];
   result?: unknown;
+  rawResult?: unknown;
 }) {
   const server = input.server ?? generated('server').toLowerCase();
   const state: {
@@ -95,6 +97,7 @@ function generatedRuntime(input: {
     async callTool(name, args) {
       counts.call += 1;
       calls.push({ name, args });
+      if (input.rawResult !== undefined) return input.rawResult as Awaited<ReturnType<MCPServer['callTool']>>;
       const result = [{ type: 'text', text: JSON.stringify(input.result ?? { accepted: true, name, args }) }] as unknown as Awaited<ReturnType<MCPServer['callTool']>>;
       return result;
     },
@@ -759,6 +762,7 @@ for (const reacquire of [false, true]) test(`objective MCP discovery retains its
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore([], { durable: true }));
   ports.clearProductionCapabilityPorts();
   observations.clearIndependentCapabilityObservations();
+  durablePorts.reconstructShippedPortsForDurableSuccessors();
   const reopened = await discover();
   assert.equal(reopened.status, 'installed', JSON.stringify(reopened));
   if (reopened.status !== 'installed') return;
@@ -877,6 +881,7 @@ for (const effect of ['read', 'external_write'] as const) for (const reacquire o
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore([], { durable: true }));
   ports.clearProductionCapabilityPorts();
   observations.clearIndependentCapabilityObservations();
+  durablePorts.reconstructShippedPortsForDurableSuccessors();
   const reopened = await discover();
   assert.equal(reopened.status, 'installed', JSON.stringify(reopened));
   if (reopened.status === 'installed') assert.deepEqual(reopened.manifest, first.manifest);
@@ -1322,3 +1327,32 @@ test('unknown declarations, contradictory hints, schema drift, and definition dr
     });
   }
 });
+
+for (const shape of ['sdk_array', 'envelope', 'structured', 'empty', 'success_text'] as const) {
+  test(`native MCP ${shape} preserves provider repair details without treating text as authority`, async () => {
+    const detail = 'Missing required argument: path. Use the documented endpoint path.';
+    const blocks = [{ type: 'text', text: detail }];
+    const rawResult = shape === 'sdk_array' ? Object.assign(blocks, { isError: true })
+      : shape === 'envelope' ? { content: blocks, isError: true }
+      : shape === 'structured' ? { content: [], structuredContent: { error: detail }, isError: true }
+      : shape === 'empty' ? { content: [{ type: 'image', data: 'not-an-error-message' }], isError: true }
+      : { content: [{ type: 'text', text: 'A document that discusses an error.' }], isError: false };
+    const objective = generated('provider_error');
+    const runtime = generatedRuntime({ objective, rawResult });
+    const { factory } = resetAuthoritySurfaces();
+    const installed = await mcp.createProductionMcpReadCarrier({ serverName: runtime.server, runtime: runtime.runtime }).materialize(`retrieve ${objective}`);
+    assert.equal(installed.status, 'installed', JSON.stringify(installed));
+    if (installed.status !== 'installed') return;
+    const entry = factory.get(installed.manifest.manifestId)!;
+    const plan = invocationPlan(entry); const armed = arm(plan, 'provider-error-detail');
+    assert.equal(armed.status, 'armed', JSON.stringify(armed)); if (armed.status !== 'armed') return;
+    const result = await kernel.executeWorkflowReadOnlyCall({ activationId: armed.ref.activationId, invocationPlan: plan, args: { token: 'fixture' } });
+    assert.equal(runtime.counts.call, 1);
+    if (shape === 'success_text') assert.equal(result.status, 'completed', JSON.stringify(result));
+    else {
+      assert.notEqual(result.status, 'completed');
+      if (shape === 'empty') assert.match(JSON.stringify(result), /native MCP operation returned isError/);
+      else assert.match(JSON.stringify(result), /Missing required argument: path/, 'the actual provider explanation reaches the caller');
+    }
+  });
+}

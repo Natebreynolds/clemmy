@@ -31,7 +31,7 @@ test('Home renders the command center instead of redirecting to Chat', () => {
   assert.match(HOME, /headingId="home-running"/);
   assert.match(HOME, /headingId="home-made"/);
   assert.match(HOME, /MadePane/);
-  assert.match(HOME, /max-w-\[1080px\]/);
+  assert.match(HOME, /max-w-\[1180px\]/);
 });
 
 test('Chat empty state is a composer, not the briefing', () => {

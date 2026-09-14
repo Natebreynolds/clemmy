@@ -942,6 +942,13 @@ export interface StoredXaiOAuthTokens {
   lastRefresh?: string;
 }
 
+let xaiGrantVersion = 0;
+let inflightXaiRefresh: {
+  version: number;
+  grant: string;
+  promise: Promise<string | null>;
+} | null = null;
+
 /** Persist a fresh xAI grant. Merges into the existing state so connecting xAI
  *  cannot sign the user out of Codex — auth.json is written whole. */
 export function saveXaiOAuthTokens(tokens: StoredXaiOAuthTokens): void {
@@ -956,6 +963,7 @@ export function saveXaiOAuthTokens(tokens: StoredXaiOAuthTokens): void {
       lastRefresh: tokens.lastRefresh ?? new Date().toISOString(),
     },
   });
+  xaiGrantVersion += 1;
 }
 
 export function getStoredXaiOAuthTokens(): StoredXaiOAuthTokens | null {
@@ -975,6 +983,7 @@ export function clearXaiOAuthTokens(): void {
   const current = loadLocalAuthState();
   const { xaiOauth: _dropped, ...rest } = current;
   saveLocalAuthState(rest);
+  xaiGrantVersion += 1;
 }
 
 /** True when the stored access token is expired or within `skewMs` of it.
@@ -1005,9 +1014,32 @@ export async function getFreshXaiAccessToken(
   const stored = getStoredXaiOAuthTokens();
   if (!stored) return null;
   if (!xaiAccessTokenExpiresSoon()) return stored.accessToken;
-  const refreshed = await refresh(stored.refreshToken);
-  saveXaiOAuthTokens(refreshed);
-  return refreshed.accessToken;
+  const version = xaiGrantVersion;
+  const grant = JSON.stringify(stored);
+  if (inflightXaiRefresh?.version === version && inflightXaiRefresh.grant === grant) {
+    return inflightXaiRefresh.promise;
+  }
+  // One rotation per grant in this daemon. A replacement sign-in must not
+  // wait for the old grant, and a late result must never undo a disconnect.
+  // Re-read durable state too, so a grant replaced by another process wins.
+  const superseded = () => xaiGrantVersion !== version
+    || JSON.stringify(getStoredXaiOAuthTokens()) !== grant;
+  const promise = Promise.resolve().then(async () => {
+    let refreshed: StoredXaiOAuthTokens;
+    try {
+      refreshed = await refresh(stored.refreshToken);
+    } catch (error) {
+      if (superseded()) return getFreshXaiAccessToken(refresh);
+      throw error;
+    }
+    if (superseded()) return getFreshXaiAccessToken(refresh);
+    saveXaiOAuthTokens(refreshed);
+    return refreshed.accessToken;
+  }).finally(() => {
+    if (inflightXaiRefresh?.promise === promise) inflightXaiRefresh = null;
+  });
+  inflightXaiRefresh = { version, grant, promise };
+  return promise;
 }
 
 export function xaiOAuthConnected(): boolean {

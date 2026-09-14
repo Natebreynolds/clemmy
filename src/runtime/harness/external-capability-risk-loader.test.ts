@@ -29,6 +29,7 @@ import {
 import {
   deriveExternalCapabilityCallSignalsV1,
   loadCatalogManifestExternalRiskAttestationV1,
+  loadFreshCatalogManifestExternalRiskAttestationV1,
   loadExternalCapabilityRiskAttestationV1,
   type CatalogManifestExternalRiskAuthorityV1,
   type CatalogManifestExternalRiskBindingV1,
@@ -760,3 +761,56 @@ test('the loader is closed, canonical, and never evaluates accessors', () => {
   });
   assert.equal(getterRan, false);
 });
+
+for (const change of ['none', 'definition', 'account', 'catalog', 'outage'] as const) {
+  test(`native consent refreshes aged metadata and rechecks exact authority: ${change}`, async () => {
+    const input = fixture({ providerKind: 'native_mcp', semanticName: 'API_REQUEST',
+      hints: { readOnly: false, destructive: false, idempotent: false, openWorld: true } });
+    const { authority, binding } = catalogAuthority(input);
+    const initialObserve = authority.observe;
+    const acquiredAt = Date.now();
+    let now = acquiredAt + 81_000; // the measured Grok review outlived the 60s observation
+    let observedAt = acquiredAt;
+    let refreshed = false;
+    let metadataCalls = 0;
+    let businessCalls = 0;
+    const entry = authority.catalogFactory.get(binding.capabilityId)!;
+    authority.catalogFactory.register({ ...entry, invoke: async () => { businessCalls += 1; return {}; } });
+    authority.observe = manifest => {
+      if (now - observedAt > 60_000 || (refreshed && change === 'outage')) return 'unknown';
+      const live = initialObserve(manifest);
+      assert.notEqual(typeof live, 'string');
+      if (typeof live === 'string') return live;
+      return { ...live, observedAt,
+        ...(refreshed && change === 'definition' ? { definitionFingerprint: sha256('changed schema') } : {}),
+        ...(refreshed && change === 'account' ? { accountId: 'different-account' } : {}),
+      };
+    };
+    authority.refresh = async manifest => {
+      assert.equal(capabilityManifestDigest(manifest), binding.manifestDigest);
+      metadataCalls += 1;
+      await Promise.resolve();
+      refreshed = true;
+      observedAt = now;
+      if (change === 'catalog') authority.catalogFactory.forget(binding.capabilityId);
+    };
+    const request = { version: 1 as const, binding, inputSchema: input.currentDefinition.inputSchema,
+      destination: input.destination, callSignals: input.callSignals, safety: 'admissible' as const };
+    assert.deepEqual(loadCatalogManifestExternalRiskAttestationV1(request, authority), {
+      ok: false, reason: 'current_definition_unavailable',
+    }, 'reproduce the original consent refusal after a long review');
+    const result = await loadFreshCatalogManifestExternalRiskAttestationV1(request, authority);
+    assert.equal(metadataCalls, 1);
+    assert.equal(result.ok, change === 'none', JSON.stringify(result));
+    assert.equal(businessCalls, 0);
+    if (change === 'none') {
+      now += 100;
+      assert.equal((await loadFreshCatalogManifestExternalRiskAttestationV1(request, authority)).ok, true);
+      assert.equal(metadataCalls, 1, 'fresh evidence adds no metadata round-trip');
+      const wrongAccount = await loadFreshCatalogManifestExternalRiskAttestationV1({ ...request,
+        binding: { ...binding, accountId: 'unapproved-account' } }, authority);
+      assert.deepEqual(wrongAccount, { ok: false, reason: 'catalog_binding_mismatch' });
+      assert.equal(metadataCalls, 1, 'an invalid binding does not earn a refresh');
+    }
+  });
+}

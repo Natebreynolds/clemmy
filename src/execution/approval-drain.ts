@@ -116,6 +116,7 @@ export async function resolveDrainApproval(opts: {
         sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq,
         acceptedRoute: identity.route,
+        ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
       }),
       sessionId: args.sessionId,
       approvalId: args.approvalId,

@@ -1771,7 +1771,9 @@ export async function invokeHostToolCall<T>(
         let deadlineTimer: NodeJS.Timeout | undefined;
         let killTimer: NodeJS.Timeout | undefined;
 
-        const absoluteDeadlineAt = Date.now() + input.deadlineMs;
+        let absoluteDeadlineAt = Date.now() + input.deadlineMs;
+        let modelReviewsPending = 0;
+        let modelReviewStartedAt = 0;
         return new Promise<HostToolInvocationResult<T>>((resolve, reject) => {
           const cleanup = (): void => {
             if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -2101,6 +2103,20 @@ export async function invokeHostToolCall<T>(
             })();
           };
           const callerAbort = (): void => stop('caller');
+          const awaitModelReview = async <V>(work: () => Promise<V>): Promise<V> => {
+            controller.signal.throwIfAborted();
+            if (modelReviewsPending++ === 0) {
+              modelReviewStartedAt = Date.now();
+              clearTimeout(deadlineTimer);
+            }
+            try { return await work(); }
+            finally {
+              if (--modelReviewsPending === 0 && state === 'pending') {
+                absoluteDeadlineAt += Date.now() - modelReviewStartedAt;
+                deadlineTimer = setTimeout(() => stop('deadline'), Math.max(0, absoluteDeadlineAt - Date.now()));
+              }
+            }
+          };
           input.callerSignal?.addEventListener('abort', callerAbort, { once: true });
           deadlineTimer = setTimeout(() => stop('deadline'), input.deadlineMs);
           if (input.isKillRequested) {
@@ -2117,7 +2133,8 @@ export async function invokeHostToolCall<T>(
           Promise.resolve().then(() => runWithToolAbortSignal(
             controller.signal,
             () => input.invoke({ signal: controller.signal, lease: childLease }),
-            absoluteDeadlineAt,
+            () => modelReviewsPending ? undefined : absoluteDeadlineAt,
+            awaitModelReview,
           )).then(
             (value) => {
               if (state !== 'pending') return;

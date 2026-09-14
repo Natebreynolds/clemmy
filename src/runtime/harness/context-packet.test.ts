@@ -132,6 +132,7 @@ const {
   fanoutDirectiveLine,
 } = await import('./context-packet.js');
 const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
+const contextEventlog = await import('./eventlog.js');
 const capabilityHealth = await import('./capability-health.js');
 const {
   cancelProspectiveIntention,
@@ -1098,6 +1099,20 @@ test('repair-loop policy is scoped to repair work and cannot globally block unre
   assert.equal(repairPacket.multiItem.blockedByPolicy, true);
   assert.match(repairPacket.text, /Fan-out constrained by coordination policy/);
 
+  const executionSession = contextEventlog.createSession({ id: 'sess-context-reviewed-execute', kind: 'chat', userId: 'desktop' });
+  const executionSource = contextEventlog.appendEvent({ sessionId: executionSession.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Execute this reviewed research plan. Keep going through recoverable tool errors.',
+      taskMode: { version: 1, kind: 'execute', executeRef: { planId: 'context-only-plan', revision: 1, digest: 'a'.repeat(64) } } } });
+  const executionPacket = buildAgentContextPacket(
+    'Execute this exact reviewed plan. Research these 15 pages. Keep going through recoverable tool errors. The prior workflow run failed.',
+    NO_MEMORY, { sessionKind: 'chat', sessionId: executionSession.id, sourceUserSeq: executionSource.seq },
+  );
+  assert.equal(executionPacket.agentSystem.policy, null, 'global workflow failures cannot override the selected execution topology');
+  assert.equal(executionPacket.agentSystem.injected, false);
+  assert.equal(executionPacket.multiItem.blockedByPolicy, false);
+  assert.equal(executionPacket.multiItem.offered, false, 'the approved plan already owns its topology');
+  assert.doesNotMatch(executionPacket.text, /AGENT SYSTEM GUIDANCE|repair-loop|Fan-out directive|Fan-out constrained|External MCP scope/);
+
   const ordinaryRunPacket = buildAgentContextPacket(
     'Run the existing workflow named social-manager now and rely on its automatic report-back.',
     NO_MEMORY,
@@ -1205,7 +1220,7 @@ test('context packet states provider-access facts: no raw key -> OAuth-lane-only
   }
 });
 
-test('project commands: a matching ask surfaces the project_run route; unrelated asks pay no tax', (t) => {
+test('project commands remain contextual procedures, not forced execution routes', (t) => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), 'clemmy-packet-projects-'));
   const project = path.join(workspace, 'proposal-builder');
   mkdirSync(path.join(project, '.claude', 'commands'), { recursive: true });
@@ -1226,7 +1241,8 @@ test('project commands: a matching ask surfaces the project_run route; unrelated
   );
   assert.equal(matched.projectCommands.length, 1, 'the /seo-audit command should rank for an SEO-audit ask');
   assert.match(matched.projectCommands[0].name, /seo-audit in proposal-builder/);
-  assert.match(matched.projectCommands[0].description, /project_run/);
+  assert.match(matched.projectCommands[0].description, /inspect its instructions if relevant/);
+  assert.doesNotMatch(matched.projectCommands[0].description, /project_run|"action":"start"/);
 
   const unrelated = buildAgentContextPacket(
     'What is the capital of France?',
@@ -1241,7 +1257,8 @@ test('project commands: a matching ask surfaces the project_run route; unrelated
   const line = projectCommandsLineForInput('build me an seo audit for acme.com');
   assert.ok(line, 'parity export returns the block for a matching ask');
   assert.match(line!, /seo-audit in proposal-builder/);
-  assert.match(line!, /project_run/);
-  assert.match(line!, /Do NOT rebuild the deliverable by hand/);
+  assert.match(line!, /shared words do not establish/);
+  assert.match(line!, /does not prove that an executor is available/);
+  assert.doesNotMatch(line!, /project_run|real deliverable route|Do NOT rebuild/);
   assert.equal(projectCommandsLineForInput('What is the capital of France?'), null);
 });

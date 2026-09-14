@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import { BoundaryError } from '../boundary-error.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-host-turn-runner-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -10323,5 +10324,103 @@ for (const retries of [0, 1]) test(`mid-stream retirement preserves settled work
     }
   } finally {
     keys.forEach((key, index) => { if (prior[index] === undefined) delete process.env[key]; else process.env[key] = prior[index]; });
+  }
+});
+
+for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 'persistent', 'cancelled', 'unknown'] as const) {
+  test(`transport recovery retains completed writes and rejects partial model frames: ${failure}`, async () => {
+    const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
+    const caller = new AbortController();
+    let requests = 0, writes = 0, rejectedWrites = 0;
+    const inputs: string[] = [];
+    const model = {
+      async getResponse(): Promise<never> { throw new Error('stream required'); },
+      async *getStreamedResponse(request: { input: unknown }) {
+        requests++;
+        inputs.push(JSON.stringify(request.input));
+        if (requests > 1 && (requests === 2 || failure === 'persistent')) {
+          yield { type: 'output_text_delta', delta: 'UNACCEPTED_DRAFT' } as never;
+          yield { type: 'model', event: { type: 'response.output_item.done', item: {
+            type: 'function_call', call_id: 'unaccepted-write', name: 'rejected_write', arguments: '{}',
+          } } } as never;
+          if (failure === 'cancelled') caller.abort(new Error('owner stopped'));
+          if (failure === 'unknown') throw new Error('invalid model configuration');
+          if (failure === 'raw' || failure === 'cancelled') throw new TypeError('terminated');
+          throw new BoundaryError({
+            kind: failure === 'persistent' ? 'model.transport_timeout' : failure,
+            retryable: true, userMessage: 'Connection dropped.', operatorMessage: 'Codex fetch terminated by undici.',
+          });
+        }
+        yield { type: 'response_done', response: { usage: {}, output: requests === 1
+          ? [toolCall('settled-write', 'write_fixture', {})]
+          : [textMsg('The saved work is complete.')] } } as never;
+      },
+    };
+    const fixtureTool = (name: string, invoke: () => Promise<string>) => ({ type: 'function', name,
+      description: name, parameters: { type: 'object', properties: {} }, needsApproval: async () => false, invoke });
+    try {
+      const run = hostRunRunner(throwingRunner() as never, { model, tools: [
+        fixtureTool('write_fixture', async () => { writes++; return 'SAVED_RECEIPT'; }),
+        fixtureTool('rejected_write', async () => { rejectedWrites++; return 'must not execute'; }),
+      ] } as never, [] as never, { maxTurns: 5, signal: caller.signal });
+      if (failure === 'cancelled' || failure === 'unknown') {
+        await assert.rejects(run);
+        assert.equal(requests, 2, 'owner cancellation and permanent failures are not retried');
+      } else {
+        const outcome = await run;
+        assert.equal(requests, 3);
+        assert.match(inputs[2], /SAVED_RECEIPT/);
+        assert.doesNotMatch(inputs[2], /UNACCEPTED_DRAFT|unaccepted-write/);
+        assert.doesNotMatch(JSON.stringify(outcome.history), /UNACCEPTED_DRAFT|unaccepted-write/);
+        if (failure === 'persistent') {
+          assert.equal(outcome.terminal?.reason, 'model_transport_unavailable');
+          assert.equal(outcome.terminal?.status, 'awaiting_user_input');
+          assert.match(outcome.finalOutput!, /Would you like me to try continuing from here\?/);
+          assert.match(JSON.stringify(outcome.history), /SAVED_RECEIPT/, 'the waiting turn retains accepted work for continuation');
+        } else assert.equal(outcome.finalOutput, 'The saved work is complete.');
+      }
+      assert.equal(writes, 1, 'the accepted write executes only once');
+      assert.equal(rejectedWrites, 0, 'an incomplete response never dispatches its tool intent');
+    } finally {
+      if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+      else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
+    }
+  });
+}
+
+test('persistent transport failure becomes a visible continuation question with saved conversation history', async () => {
+  const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
+  const session = HarnessSession.create({ kind: 'chat', title: 'transport continuation' });
+  let requests = 0;
+  const model = {
+    async getResponse(): Promise<never> { throw new Error('stream required'); },
+    async *getStreamedResponse() {
+      requests++;
+      yield { type: 'output_text_delta', delta: 'UNACCEPTED_CONNECTION_OUTPUT' } as never;
+      throw new TypeError('terminated');
+    },
+  };
+  try {
+    const result = await runTurn({ sessionId: session.id, input: 'Continue the existing research.',
+      agent: { model, tools: [], instructions: 'Respond to the owner.' } as never,
+      makeRunner: throwingRunner as never, runRunner: productionHostRunRunner, maxTurns: 3 });
+    assert.equal(requests, 2);
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.match(String(result.finalOutput), /Would you like me to try continuing from here\?/);
+    const waiting = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+    assert.equal(waiting.length, 1);
+    assert.equal(waiting[0].data.source, 'model_transport_recovery');
+    assert.equal(waiting[0].data.reason, 'model_transport_unavailable');
+    assert.equal(eventlog.listEvents(session.id, { types: ['run_completed'] }).length, 0);
+    const reopened = HarnessSession.load(session.id);
+    assert.ok(reopened);
+    const history = JSON.stringify(reopened.toInputItems());
+    assert.match(history, /Continue the existing research/);
+    assert.doesNotMatch(history, /UNACCEPTED_CONNECTION_OUTPUT/);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
   }
 });

@@ -27,7 +27,8 @@ export function buildPlanningDisclosure(hostFreshPlanning: HostFreshPlanningCont
       ...hostFreshPlanning.identity,
       candidates,
       signal: control?.signal,
-      deadlineAt: control?.deadlineAt,
+      get deadlineAt() { return control?.deadlineAt; },
+      awaitModelReview: control?.awaitModelReview,
       accountSelection: control?.accountSelection,
     });
     if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {

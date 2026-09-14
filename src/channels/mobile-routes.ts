@@ -3323,6 +3323,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             sessionId: identity.sessionId,
             sourceUserSeq: identity.sourceUserSeq,
             acceptedRoute: identity.route,
+            ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
             allowToolJit: true,
           }),
           sessionId,
@@ -4839,6 +4840,26 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.json({ groups: listDeliveredGroups(Number.isFinite(limitRaw) ? limitRaw : 24) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/home/layout', requireMobileSession, async (_req, res) => {
+    try {
+      const { loadHomeLayout } = await import('../runtime/home-layout.js');
+      res.json({ layout: loadHomeLayout() });
+    } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  router.patch('/api/home/layout', requireMobileSession, async (req, res) => {
+    const { updateHomeLayout, HomeLayoutError, homeLayoutChangeSchema } = await import('../runtime/home-layout.js');
+    const parsed = homeLayoutChangeSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
+    try {
+      const { spaceStore } = await import('../spaces/store.js');
+      const { layout, changed } = updateHomeLayout(parsed.data, { spaceExists: id => Boolean(spaceStore.get(id)) });
+      res.json({ layout, changed });
+    } catch (error) {
+      res.status(error instanceof HomeLayoutError ? (error.code === 'layout_conflict' ? 409 : 400) : 500)
+        .json({ error: error instanceof Error ? error.message : String(error), ...(error instanceof HomeLayoutError ? { code: error.code, current: error.current } : {}) });
     }
   });
 

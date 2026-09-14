@@ -212,6 +212,8 @@ import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
 import { loadHomePreferences, saveHomePreferences } from '../runtime/home-preferences.js';
+import { loadHomeLayout, updateHomeLayout, HomeLayoutError, homeLayoutChangeSchema } from '../runtime/home-layout.js';
+import { spaceStore } from '../spaces/store.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
@@ -8628,6 +8630,24 @@ export function registerConsoleRoutes(
   // Home preferences: the one per-user record that shapes the main window on
   // desktop and phone (panes, nav, landing, quick actions). No execution
   // authority lives here — a quick action is a prompt/workflow the user taps.
+  app.get('/api/console/home/layout', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try { res.json({ layout: loadHomeLayout() }); }
+    catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.patch('/api/console/home/layout', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const parsed = homeLayoutChangeSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: parsed.error.message }); return; }
+    try {
+      const { layout, changed } = updateHomeLayout(parsed.data, { spaceExists: id => Boolean(spaceStore.get(id)) });
+      res.json({ layout, changed });
+    } catch (error) {
+      res.status(error instanceof HomeLayoutError ? (error.code === 'layout_conflict' ? 409 : 400) : 500)
+        .json({ error: error instanceof Error ? error.message : String(error), ...(error instanceof HomeLayoutError ? { code: error.code, current: error.current } : {}) });
+    }
+  });
+
   app.get('/api/console/settings/home', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     res.json({ home: loadHomePreferences() });
@@ -12851,6 +12871,7 @@ export function registerConsoleRoutes(
                 sessionId: identity.sessionId,
                 sourceUserSeq: identity.sourceUserSeq,
                 acceptedRoute: identity.route,
+                ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
                 allowToolJit: true,
               }),
               sessionId,
@@ -13342,6 +13363,7 @@ export function registerConsoleRoutes(
               sessionId: identity.sessionId,
               sourceUserSeq: identity.sourceUserSeq,
               acceptedRoute: identity.route,
+              ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
               allowToolJit: true,
             }),
             sessionId,
@@ -17063,6 +17085,7 @@ export function registerConsoleRoutes(
               sessionId: identity.sessionId,
               sourceUserSeq: identity.sourceUserSeq,
               acceptedRoute: identity.route,
+              ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
               allowToolJit: true,
             }),
             sessionId,

@@ -862,6 +862,42 @@ export interface PrimaryModelPlanningReadCapabilityV1 {
   readonly manifestDigest: string;
 }
 
+/** Rebuild a missing callable from this source's retained discovery. Restart
+ * can lose the process catalog while keeping its exact account and definition
+ * proof. Reuse normal provider revalidation; never make the model rediscover
+ * those same bytes or treat historical metadata as current authority. */
+export async function restoreSelectedPlanningCallable(input: {
+  authority: PrimaryModelPlanningCatalogAuthorityV1;
+  identity: Readonly<{ sessionId: string; sourceUserSeq: number }>;
+  capabilityRef: string;
+  publicationGuard: () => boolean;
+}): Promise<void> {
+  if (!input.publicationGuard() || peekHostCapabilityCatalogFactory()?.get(input.capabilityRef)) return;
+  const selected = snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: input.authority, identity: input.identity, selectedRefs: new Set([input.capabilityRef]),
+  });
+  if (selected.length !== 1) return;
+  const staged = primaryModelPlanningCatalogs.get(input.authority as object)?.stagedById.get(input.capabilityRef);
+  const definition = staged?.providerDefinition;
+  if (!staged || staged.providerKind !== 'composio' || !definition) return;
+  const restored = await registerProofProvisionedCapabilities(input.identity, {
+    allowedIdentifiers: [staged.identifier],
+    selectedDefinitions: [{
+      identifier: staged.identifier,
+      accountIdentity: staged.accountIdentity,
+      schemaDigest: definition.providerInputSchemaDigest,
+      definitionFingerprint: definition.definitionFingerprint,
+      outputSchemaDigest: definition.providerOutputSchemaDigest,
+      providerOperationVersion: definition.providerOperationVersion,
+      invokePortId: definition.invokePortId,
+      verificationContract: definition.verificationContract,
+      operationSemantics: definition.operationSemantics,
+    }],
+    publicationGuard: input.publicationGuard,
+  });
+  if (restored.refusal) throw new Error(`Cannot reopen ${staged.identifier}: ${restored.refusal.code}.`);
+}
+
 /** Resolve a same-source discovery to its current callable descriptor. A
  * resolution-proof digest is not a manifest digest. Compare the full staged
  * definition before upgrading that nomination; names alone cannot do it.
@@ -2465,6 +2501,23 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
         && exact.providerKind.toLowerCase() === 'native_mcp'
       );
       if (!sourceOwnsExact) continue;
+      // A current live operation can be outside the display card too. Keep
+      // the exact same-source selection in the staging ledger, just as for a
+      // newly materialized provider definition; returning its ref alone does
+      // not let plan completeness or selected-subset promotion find it.
+      const staged: StagedPrimaryModelPlanningCapabilityV1 = {
+        descriptor: exact.descriptor,
+        identifier: exact.identifier,
+        providerKind: exact.providerKind,
+        accountIdentity: exact.descriptor.accountScope,
+        ...(exact.providerDefinition ? { providerDefinition: exact.providerDefinition } : {}),
+      };
+      const prior = catalog.stagedById.get(exact.descriptor.id);
+      if (prior && (prior.identifier !== staged.identifier || prior.providerKind !== staged.providerKind
+        || prior.accountIdentity !== staged.accountIdentity
+        || !stagedProviderDefinitionsEqual(prior.providerDefinition, staged.providerDefinition)
+        || JSON.stringify(prior.descriptor) !== JSON.stringify(staged.descriptor))) continue;
+      catalog.stagedById.set(exact.descriptor.id, prior ?? staged);
       refs[name] = exact.descriptor.id;
       if (allowed.has(exact.descriptor.id)) continue;
       allowed.set(exact.descriptor.id, exact.descriptor);
@@ -2480,6 +2533,7 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
         manifestDigest: exact.descriptor.manifestDigest,
         accountIdentity: exact.descriptor.accountScope,
         providerKind: exact.providerKind,
+        descriptor: exact.descriptor,
         ...(exact.providerDefinition
           ? { providerDefinition: exact.providerDefinition }
           : {}),
@@ -3103,6 +3157,12 @@ export async function prepareDurableAcceptedTurnCompile(
       const stagedPublicationIdentifiers = new Set(
         [...primaryPlanningCatalog.stagedById.values()]
           .filter((entry) => entry.providerKind.toLowerCase() === 'composio')
+          .filter((entry) => {
+            const initial = primaryPlanningCatalog!.disclosureByName.get(entry.descriptor.id.toLowerCase());
+            return !initial || initial.identifier !== entry.identifier
+              || initial.descriptor.accountScope !== entry.accountIdentity
+              || !stagedProviderDefinitionsEqual(initial.providerDefinition, entry.providerDefinition);
+          })
           .map((entry) => entry.identifier),
       );
       const selectedPublicationIdentifiers = selectedComposioRefs

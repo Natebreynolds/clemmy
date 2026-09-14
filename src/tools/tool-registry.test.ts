@@ -316,6 +316,7 @@ test('workerBlockedToolNames (F1 + collision/commit vectors) == deriveWorkerBloc
     // would land in the parent's thread without the parent's judgement.
     'check_in',
     'publish_plan',
+    'plan_step_result',
     'run_batch',
     'request_approval',
     'pending_action_queue',
@@ -368,6 +369,7 @@ test('B1 guardrail sets: INVARIANT members after the derive flip (the runaway-wr
 
 test('host_v1 pure-local read execution is a small positive registry contract', () => {
   const expected = new Set([
+    'home_get',
     'list_files',
     // Reading an installed SKILL.md is the same pure-local file read as
     // list_files. Live 2026-09-04 blank-state canary: the user's request named

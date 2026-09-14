@@ -11600,7 +11600,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');
       session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
       safeAppend({ sessionId: options.sessionId, turn, role: 'Clem', type: 'awaiting_user_input',
-        data: { question, sourceUserSeq, source: 'completion_review', reason: outcome.terminal.reason } });
+        data: { question, sourceUserSeq, source: outcome.terminal.reason === 'model_transport_unavailable' ? 'model_transport_recovery' : 'completion_review', reason: outcome.terminal.reason } });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_user_input',
         finalOutput: question, toolCalls: toolCounter.currentCount };
@@ -11802,6 +11802,19 @@ export interface ResumePendingApprovalOptions {
  * If the session is not paused / has no saved RunState, returns
  * `completed` with no work done — callers can treat that as a no-op.
  */
+function pausedHostApprovalSource(state: HostInterruptState, sessionId: string): number | undefined {
+  const identities = state.pending.flatMap(call => call.consentSubject
+    ? [{ sessionId: call.consentSubject.sessionId, sourceUserSeq: call.consentSubject.sourceUserSeq }]
+    : []);
+  if (state.acceptedModelBatchRef) identities.push(state.acceptedModelBatchRef);
+  if (identities.length === 0) return undefined; // Historical host pauses predate exact-source capture.
+  if (identities.some(identity => identity.sessionId !== sessionId)
+    || new Set(identities.map(identity => identity.sourceUserSeq)).size !== 1) {
+    throw new Error('Paused host approvals do not share one exact accepted source.');
+  }
+  return identities[0]!.sourceUserSeq;
+}
+
 export async function resumePendingApproval(
   options: ResumePendingApprovalOptions,
 ): Promise<RunTurnResult> {
@@ -11893,30 +11906,20 @@ export async function resumePendingApproval(
   }
 
   if (state instanceof HostInterruptState) {
-    const consentSubjects = state.pending
-      .map((call) => call.consentSubject)
-      .filter((subject): subject is NonNullable<typeof subject> => Boolean(subject));
-    if (consentSubjects.length > 0) {
-      const exactSources = new Set(consentSubjects.map((subject) => (
-        `${subject.sessionId}\0${subject.sourceUserSeq}`
-      )));
-      if (
-        exactSources.size !== 1
-        || consentSubjects.some((subject) => subject.sessionId !== options.sessionId)
-      ) {
-        const message = 'Paused host approvals do not share one exact accepted source.';
-        safeAppend({
-          sessionId: options.sessionId,
-          turn,
-          role: 'system',
-          type: 'guardrail_tripped',
-          data: { kind: 'approval_authority_mismatch', reason: message },
-        });
-        session.markStatus('failed');
-        bumpTurnNumber(options.sessionId, turn);
-        return { sessionId: options.sessionId, turn, status: 'failed', error: message };
-      }
-      resumeSourceUserSeq = consentSubjects[0]!.sourceUserSeq;
+    try {
+      resumeSourceUserSeq = pausedHostApprovalSource(state, options.sessionId) ?? resumeSourceUserSeq;
+    } catch (error) {
+      const message = normalizeError(error);
+      safeAppend({
+        sessionId: options.sessionId,
+        turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: { kind: 'approval_authority_mismatch', reason: message },
+      });
+      session.markStatus('failed');
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'failed', error: message };
     }
   }
 
@@ -12419,7 +12422,7 @@ export async function resumePendingApproval(
       const question = publicReplyText(outcome.finalOutput, 'Awaiting your input.');
       session.recordTurnResult({ history: outcome.history, lastResponseId: outcome.lastResponseId, turn });
       safeAppend({ sessionId: options.sessionId, turn, role: 'Clem', type: 'awaiting_user_input',
-        data: { question, sourceUserSeq: resumeSourceUserSeq, source: 'completion_review', reason: outcome.terminal.reason } });
+        data: { question, sourceUserSeq: resumeSourceUserSeq, source: outcome.terminal.reason === 'model_transport_unavailable' ? 'model_transport_recovery' : 'completion_review', reason: outcome.terminal.reason } });
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_user_input',
         finalOutput: question, toolCalls: toolCounter.currentCount };
@@ -12566,6 +12569,7 @@ export async function runConversationFromResume(opts: {
     sessionId: string;
     sourceUserSeq: number;
     route: 'direct_reply' | 'retrieve' | 'act';
+    hostFreshPlanning?: HostFreshPlanningContextV1;
   }) => Promise<Agent<any, any>>;
   sessionId: string;
   /** Durable outer request attempt, retained across the resumed SDK state and
@@ -12613,7 +12617,7 @@ export async function runConversationFromResume(opts: {
     if (replay) return replay;
   }
   const sourceUserSeq = acceptResumeConversationInput(opts);
-  const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
+  let resumeAgentSourceUserSeq = sourceUserSeq;
   // A resume continues a turn the user already approved. Give it the same
   // ownership rule a fresh turn gets: when the host engine owns it, skip the
   // semantic compile exactly as runConversation does at its own seam. Compiling
@@ -12625,6 +12629,31 @@ export async function runConversationFromResume(opts: {
     opts.turnEngine ?? selectTurnEngine({ sessionKind: resumeSessionKind }),
   );
   const resumeHostOwns = opts.runRunner === undefined && isHostTurnEngine(resumeTurnEngine);
+  let resumePlanning: HostFreshPlanningContextV1 | undefined;
+  if (resumeHostOwns) {
+    // The approval click is an audit event, not a new business objective. Restore
+    // the parked source BEFORE constructing tools; doing this only inside
+    // resumePendingApproval rebuilt an empty direct-reply agent and poisoned
+    // the original root as "host surface changed after admission".
+    const blob = HarnessSession.load(opts.sessionId)?.loadInterruptState();
+    if (blob && HostInterruptState.isHostState(blob)) {
+      try {
+        const originalSource = pausedHostApprovalSource(HostInterruptState.fromString(blob), opts.sessionId);
+        if (originalSource) {
+          resumeAgentSourceUserSeq = originalSource;
+          if (opts.buildAgent) {
+            const primed = await primePrimaryModelPlanningCatalog({ sessionId: opts.sessionId, sourceUserSeq: originalSource });
+            if (!primed.ok) throw new Error(primed.reason);
+            resumePlanning = primed.planning;
+          }
+        }
+      } catch (error) {
+        return { sessionId: opts.sessionId, status: 'blocked', steps: 0, lastTurn: 0,
+          error: `The paused task could not be restored: ${normalizeError(error)}` };
+      }
+    }
+  }
+  const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
   const graphEvent = resumeHostOwns ? null : await recordAcceptedSourceGraph({
     identity: {
       sessionId: opts.sessionId,
@@ -12657,7 +12686,7 @@ export async function runConversationFromResume(opts: {
   // mobile approve, console, drain — seven callers) ran its tool dispatches
   // with the expected-work wall silently open: assertExpectedWorkLogicalAdmission
   // returns when no authority row exists (sweep-confirmed 2026-08-11).
-  let resumeCapabilityRoute = acceptedTurnGraph?.classification.route ?? 'direct_reply';
+  let resumeCapabilityRoute = acceptedTurnGraph?.classification.route ?? (resumePlanning ? 'act' : 'direct_reply');
   // The typed dispatcher consumes an admitted graph. When the host engine owns
   // this resume there is no graph by design, so this whole block is skipped --
   // the mirror of runConversation's own `if (!hostOwnsFreshTurn)` guard. Running
@@ -12738,8 +12767,9 @@ export async function runConversationFromResume(opts: {
     ? async () => {
         activeAgent = await opts.buildAgent!({
           sessionId: opts.sessionId,
-          sourceUserSeq,
+          sourceUserSeq: resumeAgentSourceUserSeq,
           route: resumeCapabilityRoute,
+          ...(resumePlanning ? { hostFreshPlanning: resumePlanning } : {}),
         });
       }
     : undefined;

@@ -44,6 +44,7 @@ import { registerProjectRunTools } from './project-run-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerSpaceTools } from './space-tools.js';
+import { registerHomeTools } from './home-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
@@ -560,6 +561,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerSkillTools(server);
   registerWorkflowScheduleTools(server);
   registerSpaceTools(server);
+  registerHomeTools(server);
   registerMcpStatusTools(server);
   registerMcpServerTools(server);
   registerToolChoiceTools(server);

@@ -27,7 +27,7 @@ Build/test logs are retained locally at `output/reviewer-monitor/2026-09-13-comb
 From this checkout, with Node22.22.0 on PATH:
 
 ```bash
-export PATH="/Users/nathan.reynolds/.nvm/versions/node/v22.22.0/bin:$PATH"
+export PATH="$HOME/.nvm/versions/node/v22.22.0/bin:$PATH"
 npm run build:console-web
 DEV_DISCORD=false bash scripts/dev-up.sh
 ```

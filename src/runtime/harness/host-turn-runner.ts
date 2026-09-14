@@ -60,6 +60,8 @@ import {
 } from '@openai/agents';
 import { toSmartString } from '@openai/agents-core/utils';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
+import { BoundaryError } from '../boundary-error.js';
+import { classifyModelError } from './resilient-model.js';
 import { compactAdvertisedJsonSchema, materializeStrictNullableFields } from '../schema-normalizer.js';
 import { getBuildInfo } from '../build-info.js';
 import type { Agent, AgentInputItem, ModelRequest } from '@openai/agents';
@@ -122,6 +124,7 @@ import {
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import {
   currentWatcherJudge,
+  lastCoveredWatcherReview,
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
   observeWorkerFanoutStart,
@@ -2844,6 +2847,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     const identity = exactHostIdentity();
     const freshPlan = freshPlanControlConfigured();
+    const investigationOnly = acceptedTaskMode(identity.sessionId, identity.sourceUserSeq)?.kind === 'plan';
     // `plan_task` is intentionally retired from the rebuilt model surface once
     // its exact winner activates expected work. That retirement is not a new
     // call-authority posture: the immutable host root was admitted under the
@@ -2854,7 +2858,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // The settled activation winner is durable, source-bound phase authority;
     // neither current tool membership nor prompt reconstruction may replace it.
     const settledPlanControl = settledFreshPlanControl(identity);
-    const progressivePlanningRoot = freshPlan || settledPlanControl;
+    const progressivePlanningRoot = freshPlan || settledPlanControl || investigationOnly;
     const planActivated = progressivePlanningRoot && actionExpectedWorkRequired(identity);
     const emptyModelSurface = tools.length === 0;
     // A fresh foreground action begins under a graph-neutral host call root.
@@ -2862,7 +2866,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // snapshot before plan_task can publish the model-selected manifests. The
     // one settled plan_task activates expected-work and is the sole transition
     // into the durable catalog snapshot used by later business calls.
-    const frozen = !emptyModelSurface && (!freshPlan || planActivated)
+    // Explicit Plan owns discovery and read-only investigation, not an
+    // execution catalog. Freezing the process-wide inventory here made a
+    // refreshed, unrelated tool invalidate the entire planning conversation.
+    // Reads still bind their current exact capability at the ordinary call
+    // edge; only accepted execution activates a frozen business-work catalog.
+    const discoveryPhase = investigationOnly || (freshPlan && !planActivated);
+    const frozen = !emptyModelSurface && !discoveryPhase
       ? peekHostCapabilityCatalogFactory()
         ? freezeCatalogSnapshotForSource({
             sessionId: identity.sessionId,
@@ -2879,7 +2889,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           digest: hostSurfaceDigest({ version: 1, entries: [] }),
           entries: [] as readonly RegisteredHostCapability[],
         }
-      : freshPlan && !planActivated
+      : discoveryPhase
       ? {
           phase: 'graph_neutral' as const,
           digest: hostSurfaceDigest({ version: 1, posture: 'foreground_plan_task_graph_neutral' }),
@@ -3259,11 +3269,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     recordWatcherReview('started', { reviewId, objectiveDigest, toolCallCount: watcherToolCalls });
     void (async () => {
       try {
-        const previous = listEvents(watcherIdentity.sessionId, { types: ['guardrail_tripped'], desc: true })
-          .reverse().find(event => event.data.kind === 'trajectory_review' && event.data.phase === 'completed'
-            && event.data.sourceUserSeq === watcherIdentity.sourceUserSeq
-            && event.data.objectiveDigest === objectiveDigest
-            && Number.isSafeInteger(event.data.readEvidenceCursor));
+        const previous = lastCoveredWatcherReview(
+          listEvents(watcherIdentity.sessionId, { types: ['guardrail_tripped'], desc: true }),
+          watcherIdentity.sourceUserSeq, objectiveDigest);
         const readEvidence = sourceSettledReadEvidence({ ...watcherIdentity,
           afterSettlementIndex: Number(previous?.data.readEvidenceCursor ?? 0) });
         const artifacts = settledSourceArtifacts(watcherIdentity);
@@ -3294,6 +3302,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         recordWatcherReview('completed', { reviewId, objectiveDigest,
           verdict: verdict ? (verdict.onTrack ? 'on_track' : 'drift') : 'unavailable',
           stale, miss: verdict?.miss, steer: verdict?.steer, review: verdict?.review,
+          ...(verdict?.coverage ? { coverage: verdict.coverage } : {}),
           ...(!verdict ? { unavailableReason: unavailableReason ?? 'watcher_no_verdict' } : {}),
           readEvidenceCursor: readEvidence.throughSettlementIndex,
           readEvidence: readEvidence.results, artifactEvidence: artifacts.artifacts,
@@ -8327,20 +8336,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // has no tool effects to replay. Retry from the accepted history using
       // the existing retry budget; retain settled siblings and discard partial
       // output. An outstanding buffered paid request remains non-replayable.
-      if (
-        error instanceof ModelStreamStalledError
-        && !error.bufferedProviderRequestInFlight
-        && remainingModelStallRetries > 0
-      ) {
+      const transportInterrupted = !(error instanceof ModelStreamStalledError) && (error instanceof BoundaryError
+        ? error.retryable && ['codex.transport_timeout', 'codex.sse_truncated', 'model.transport_timeout'].includes(error.kind)
+        : !(error instanceof KillRequested) && classifyModelError(error).kind === 'model.transport_timeout');
+      const bufferedRequestInFlight = error instanceof ModelStreamStalledError
+        ? error.bufferedProviderRequestInFlight
+        : [...(harnessRunContextStorage.getStore()?.bufferedProviderRequests ?? [])].some(request => request.active);
+      if (!signal?.aborted && !bufferedRequestInFlight
+        && (error instanceof ModelStreamStalledError || transportInterrupted)
+        && remainingModelStallRetries > 0) {
         remainingModelStallRetries -= 1;
         pendingHostModelDirective = 'The previous model response was interrupted and was not accepted. None of its tool calls executed. Continue the same task from the accepted history; previously settled tool work remains complete. Return the next complete tool call or answer without repeating settled work.';
-        journalHostGuide('model_stall_retry', { preContent: error.preContent,
+        journalHostGuide(transportInterrupted ? 'model_transport_retry' : 'model_stall_retry', {
+          ...(error instanceof ModelStreamStalledError ? { preContent: error.preContent } : {}),
           rejectedFrameExecuted: false, retriesRemaining: remainingModelStallRetries });
         stepIndex -= 1;
         continue;
       }
       if (error instanceof ModelStreamStalledError) {
         return blockedOutcome(HOST_MODEL_STALL_BLOCKED_TEXT, 'model_stalled');
+      }
+      if (transportInterrupted && !signal?.aborted && !bufferedRequestInFlight) {
+        const waiting = blockedOutcome(
+          'The connection to my model keeps dropping. I saved the completed work and have not run any tool calls from the interrupted response. Would you like me to try continuing from here?',
+          'model_transport_unavailable',
+        );
+        return { ...waiting, terminal: { status: 'awaiting_user_input', reason: 'model_transport_unavailable' } };
       }
       throw error;
     }

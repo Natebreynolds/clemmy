@@ -119,7 +119,9 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   });
   stores.installCapabilityManifestStore(stores.createCapabilityManifestStore([manifest], { durable: true }));
   const observation = { definitionFingerprint, providerVersion: manifest.providerVersion, operationVersion: '1', accountId: ACCOUNT, observedAt: Date.now() };
-  assert.equal(observations.registerIndependentCapabilityObservation({ operationId: OPERATION, ...observation, origin: 'independent', observe: () => ({ operationId: OPERATION, ...observation }) }).ok, true);
+  assert.equal(observations.registerIndependentCapabilityObservation({ operationId: OPERATION, ...observation, origin: 'independent',
+    observe: () => ({ operationId: OPERATION, ...observation, observedAt: Date.now() }),
+  }).ok, true);
   let modelCalls = 0;
   let providerCalls = 0;
   const providerResult = async (slug: string, body: Record<string, unknown>) => {
@@ -263,6 +265,13 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) throw new Error('Execute catalog missing');
   await reviewed.revalidateReviewedPlanPreparation(primed.planning);
+  const selectedForExecution = semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: primed.planning.authority, identity, selectedRefs: new Set([CAPABILITY]),
+  });
+  assert.equal(selectedForExecution.length, 1, 'the exact reviewed provider must be attached to this source even if the display card later displaces it');
+  assert.equal(selectedForExecution[0]!.accountScope, ACCOUNT);
+  assert.equal(selectedForExecution[0]!.effect, 'external_write');
+  assert.equal(providerCalls, 0, 'attaching reviewed preparation must not dispatch the business operation');
   if (delayedPublication === true) {
     // This fixture's provider observation has no reversibility declaration.
     // Qualify publication and exact reopen here; the separate registered
@@ -285,8 +294,15 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   const model = {
     async getResponse(request: unknown) {
       modelCalls += 1; frame += 1;
+      if (collectionCount && !replay && frame === 3) {
+        // Age the cached initial snapshot after the first batch. Crossing-time
+        // observation must read the unchanged fixture definition afresh, even
+        // when the batch outlives that snapshot's freshness window.
+        observation.observedAt = Date.now() - observations.INDEPENDENT_OBSERVATION_FRESHNESS_MS - 1;
+      }
       if (modelCalls === 2) {
-        assert.ok(eventlog.getTurnGraphEventForSource(session.id, source.seq), JSON.stringify(request));
+        assert.ok(eventlog.getTurnGraphEventForSource(session.id, source.seq), JSON.stringify(
+          (request as any).input?.filter((item: any) => item.type !== 'message')));
         assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'ok');
       }
       return { responseId: `planned-draft-${suffix}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
@@ -299,7 +315,9 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   };
   const agent = { model, tools: [plan, work] };
   const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [plan, work], activeToolNames: ['plan_task', 'work_call'],
-    policyHash: 'planned-draft-ack-fixture', budget: { maxUncachedTokens: 10_000, maxModelCalls: batches + 6, maxToolCalls: payloads.length + 8, maxElapsedMs: 60_000 } });
+    // This fixture proves member execution and replay, not a one-minute SLA.
+    // Real SQLite sealing for fifty writes must also finish under suite load.
+    policyHash: 'planned-draft-ack-fixture', budget: { maxUncachedTokens: 10_000, maxModelCalls: batches + 6, maxToolCalls: payloads.length + 8, maxElapsedMs: 600_000 } });
   assert.ok(sealed.ok);
   if (!sealed.ok) throw new Error('fixture surface must seal');
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
@@ -309,6 +327,7 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   const run = () => brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(payloads.length + 8), behaviorScopeId: `${session.id}::turn:${source.turn}` }, () => hostRunRunner(runner as never, agent as never, [...priorHistory, { type: 'message', role: 'user', content: executionContext.acceptedPlanExecutionText(session.id, source.seq)! }] as never,
     { maxTurns: batches + 6, hostTurnEngine: 'host_v1', context: identity } as never));
   const outcome = await run();
+  await reviewed.revalidateReviewedPlanPreparation(primed.planning);
   return { session, source, identity, outcome, artifact, ref, payloads, replay: async () => { eventlog.closeEventLog(); replay = true; frame = 0; return run(); }, counts: () => ({ providerCalls, modelCalls }) };
 }
 
@@ -355,7 +374,7 @@ test('reviewed real provider schema activates without reauthoring; three exact w
 
 test('one reviewed collection executes 50 exact drafts and refuses a completed member after SQLite reopen', async () => {
   const f = await plannedDraftFixture('collection-fifty', ['tool_result'], false, false, 50);
-  assert.equal(f.counts().providerCalls, 50, JSON.stringify({ results: f.outcome.history.filter((x: any) => x.type === 'function_call_result').slice(0, 2), contract: expectedWork.loadExpectedWorkContract(f.session.id, f.source.seq), outline: (f.artifact.structuredPlan as any).executionDraft.topology.universes }));
+  assert.equal(f.counts().providerCalls, 50, JSON.stringify({ terminal: f.outcome.terminal, results: f.outcome.history.filter((x: any) => x.type === 'function_call_result').slice(-2), contract: expectedWork.loadExpectedWorkContract(f.session.id, f.source.seq), outline: (f.artifact.structuredPlan as any).executionDraft.topology.universes }));
   assert.equal(f.outcome.terminal, undefined, JSON.stringify(f.outcome));
   const terminal = preparation.prepareAcceptedTaskTerminal({ ...f.identity, proposedReply: 'Created all 50 reviewed drafts once.' });
   assert.equal(terminal.status, 'ready', JSON.stringify(terminal));

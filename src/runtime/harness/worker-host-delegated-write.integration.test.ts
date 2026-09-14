@@ -78,6 +78,8 @@ async function run(parentKind: 'act' | 'execute'): Promise<void> {
   const graph = recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn } });
   assert.ok(graph);
   assert.equal((graph.data.graph as { classification: { route: string } }).classification.route, 'act', 'the parent ask is an action turn');
+  assert.equal((graph.data.graph as { effectCeiling: string }).effectCeiling, 'local_write',
+    'host consent guidance must not turn a reviewed local-file task into an external write');
   const activated = admission.activateActionExpectedWork({ sessionId: session.id, sourceUserSeq: source.seq });
   assert.ok(activated.status === 'activated' || activated.status === 'replayed', JSON.stringify(activated));
   const frozen = contracts.freezeActionExpectedWorkContract({ sessionId: session.id, sourceUserSeq: source.seq, proposal: parentProposal() });
@@ -222,4 +224,3 @@ test('a delegated child that never writes credits the parent nothing', async () 
     .find((entry) => entry.requirementId === 'write_note');
   assert.equal(line?.settledInstances, 0, 'the parent line is untouched');
 });
-

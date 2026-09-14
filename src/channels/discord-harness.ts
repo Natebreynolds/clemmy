@@ -5293,6 +5293,7 @@ async function runDiscordHarnessResume(opts: {
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           acceptedRoute: identity.route,
+          ...(identity.hostFreshPlanning ? { hostFreshPlanning: identity.hostFreshPlanning } : {}),
           allowToolJit: true,
         }),
         sessionId,
