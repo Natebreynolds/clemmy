@@ -655,8 +655,8 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   assert.equal(reviewRef.policyEvidence, 'captured');
   assert.equal(reviewRef.deliveredTextIsJudgedText, false);
   assert.equal(completion.data.verificationDetail, 'completion_review_failed_open');
-  assert.equal(completion.data.delivered, false, 'business success does not become reviewed terminal acceptance');
-  assert.equal(completion.data.reason, 'blocked');
+  assert.equal(completion.data.delivered, true, 'completed reads are delivered with the explicit unreviewed disposition');
+  assert.equal(completion.data.reason, 'success');
   assert.equal(events.filter((event) => event.type === 'conversation_completed'
     && event.data.sourceUserSeq === sourceUserSeq).length, 1);
   assert.equal(events.some((event) => event.type === 'turn_graph_compiled'

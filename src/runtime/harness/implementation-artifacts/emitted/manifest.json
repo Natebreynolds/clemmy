@@ -51,7 +51,7 @@
           "bytes": 1850
         },
         "src/runtime/tool-abort-context.ts": {
-          "bytes": 2025
+          "bytes": 2847
         },
         "src/integrations/composio/identity-cache.ts": {
           "bytes": 4136
@@ -420,7 +420,7 @@
           "bytes": 16739
         },
         "src/runtime/harness/production-capability-catalog.ts": {
-          "bytes": 18514
+          "bytes": 18878
         },
         "src/runtime/harness/proof-provider-args.ts": {
           "bytes": 37356
@@ -507,10 +507,10 @@
           "bytes": 22447
         },
         "src/runtime/harness/external-capability-risk-loader.ts": {
-          "bytes": 47630
+          "bytes": 49674
         },
         "src/runtime/harness/interactive-consent-policy.ts": {
-          "bytes": 16118
+          "bytes": 16576
         },
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
@@ -659,8 +659,11 @@
         "src/runtime/harness/plan-execution-bridge.ts": {
           "bytes": 4121
         },
+        "src/tools/discovery-deadline.ts": {
+          "bytes": 2333
+        },
         "src/spaces/workspace-context.ts": {
-          "bytes": 5123
+          "bytes": 5152
         },
         "src/agents/tool-jit.ts": {
           "bytes": 19768
@@ -693,7 +696,7 @@
           "bytes": 7927
         },
         "src/tools/source-account-routing.ts": {
-          "bytes": 29117
+          "bytes": 29675
         },
         "src/integrations/composio/mcp-scope-adapter.ts": {
           "bytes": 5046
@@ -945,7 +948,7 @@
           "bytes": 54983
         },
         "src/runtime/harness/production-mcp-read-carrier.ts": {
-          "bytes": 54485
+          "bytes": 55034
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 14185
@@ -963,10 +966,10 @@
           "bytes": 10226
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 95988
+          "bytes": 95592
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 101414
+          "bytes": 101186
         },
         "src/runtime/read-path/capability-candidates.ts": {
           "bytes": 49653
@@ -984,7 +987,7 @@
           "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 25056
+          "bytes": 25531
         },
         "src/runtime/harness/held-inventory.ts": {
           "bytes": 5975
@@ -1014,7 +1017,7 @@
           "bytes": 1578
         },
         "src/runtime/harness/plan-publication-review.ts": {
-          "bytes": 1322
+          "bytes": 1446
         },
         "src/runtime/harness/codex-one-step.ts": {
           "bytes": 36807
@@ -1043,8 +1046,11 @@
         "src/runtime/harness/turn-steer.ts": {
           "bytes": 7809
         },
+        "src/runtime/harness/evidence-portions.ts": {
+          "bytes": 1371
+        },
         "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 17430
+          "bytes": 20199
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
@@ -1077,7 +1083,7 @@
           "bytes": 7162
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 60088
+          "bytes": 60104
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 27857
@@ -1116,13 +1122,13 @@
           "bytes": 18898
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 91398
+          "bytes": 92193
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
-          "bytes": 26949
+          "bytes": 27688
         },
         "src/runtime/harness/host-local-workspace-derivation.ts": {
-          "bytes": 53079
+          "bytes": 53947
         },
         "src/runtime/harness/tool-policy.ts": {
           "bytes": 4173
@@ -1356,10 +1362,10 @@
           "bytes": 3482
         },
         "src/runtime/harness/session-history-search.ts": {
-          "bytes": 27016
+          "bytes": 27147
         },
         "src/tools/session-tools.ts": {
-          "bytes": 20630
+          "bytes": 20931
         },
         "src/tools/dynamic-tools.ts": {
           "bytes": 4535
@@ -1554,7 +1560,7 @@
           "bytes": 5022
         },
         "src/tools/plan-step-result.ts": {
-          "bytes": 4410
+          "bytes": 4650
         },
         "src/runtime/harness/plan-preparation-draft.ts": {
           "bytes": 3921
@@ -1563,7 +1569,7 @@
           "bytes": 5587
         },
         "src/tools/publish-plan.ts": {
-          "bytes": 38517
+          "bytes": 41060
         },
         "src/runtime/harness/session-role-overrides.ts": {
           "bytes": 1342
@@ -1572,7 +1578,7 @@
           "bytes": 20745
         },
         "src/agents/worker-planning-disclosure.ts": {
-          "bytes": 2316
+          "bytes": 2384
         },
         "src/agents/worker-job-packet.ts": {
           "bytes": 20190
@@ -1617,7 +1623,7 @@
           "bytes": 3019
         },
         "src/runtime/harness/context-packet.ts": {
-          "bytes": 43514
+          "bytes": 43689
         },
         "src/runtime/harness/host-local-call-preparation.ts": {
           "bytes": 2861
@@ -1677,7 +1683,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 222314
+          "bytes": 222649
         },
         "src/execution/workflow-diagnosis.ts": {
           "bytes": 66436
@@ -2295,7 +2301,7 @@
           "bytes": 7572
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 476900
+          "bytes": 478673
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 73771
@@ -2445,7 +2451,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 712582
+          "bytes": 714489
         },
         "src/runtime/harness/session-tool-index.ts": {
           "bytes": 5876
@@ -2496,7 +2502,7 @@
           "bytes": 12765
         },
         "src/execution/approval-drain.ts": {
-          "bytes": 8409
+          "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
           "bytes": 287346
@@ -2553,7 +2559,7 @@
           "bytes": 46268
         },
         "src/runtime/harness/reviewed-plan-runtime.ts": {
-          "bytes": 16243
+          "bytes": 17243
         },
         "src/runtime/harness/native-revision-commit-proof.ts": {
           "bytes": 5311
@@ -2637,7 +2643,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 170982
+          "bytes": 174521
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -2733,7 +2739,7 @@
           "bytes": 1850
         },
         "src/runtime/tool-abort-context.ts": {
-          "bytes": 2025
+          "bytes": 2847
         },
         "src/integrations/composio/identity-cache.ts": {
           "bytes": 4136
@@ -3102,7 +3108,7 @@
           "bytes": 16739
         },
         "src/runtime/harness/production-capability-catalog.ts": {
-          "bytes": 18514
+          "bytes": 18878
         },
         "src/runtime/harness/proof-provider-args.ts": {
           "bytes": 37356
@@ -3189,10 +3195,10 @@
           "bytes": 22447
         },
         "src/runtime/harness/external-capability-risk-loader.ts": {
-          "bytes": 47630
+          "bytes": 49674
         },
         "src/runtime/harness/interactive-consent-policy.ts": {
-          "bytes": 16118
+          "bytes": 16576
         },
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
@@ -3341,8 +3347,11 @@
         "src/runtime/harness/plan-execution-bridge.ts": {
           "bytes": 4121
         },
+        "src/tools/discovery-deadline.ts": {
+          "bytes": 2333
+        },
         "src/spaces/workspace-context.ts": {
-          "bytes": 5123
+          "bytes": 5152
         },
         "src/agents/tool-jit.ts": {
           "bytes": 19768
@@ -3375,7 +3384,7 @@
           "bytes": 7927
         },
         "src/tools/source-account-routing.ts": {
-          "bytes": 29117
+          "bytes": 29675
         },
         "src/integrations/composio/mcp-scope-adapter.ts": {
           "bytes": 5046
@@ -3627,7 +3636,7 @@
           "bytes": 54983
         },
         "src/runtime/harness/production-mcp-read-carrier.ts": {
-          "bytes": 54485
+          "bytes": 55034
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 14185
@@ -3645,10 +3654,10 @@
           "bytes": 10226
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 95988
+          "bytes": 95592
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 101414
+          "bytes": 101186
         },
         "src/runtime/read-path/capability-candidates.ts": {
           "bytes": 49653
@@ -3666,7 +3675,7 @@
           "bytes": 94681
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 25056
+          "bytes": 25531
         },
         "src/runtime/harness/held-inventory.ts": {
           "bytes": 5975
@@ -3696,7 +3705,7 @@
           "bytes": 1578
         },
         "src/runtime/harness/plan-publication-review.ts": {
-          "bytes": 1322
+          "bytes": 1446
         },
         "src/runtime/harness/codex-one-step.ts": {
           "bytes": 36807
@@ -3725,8 +3734,11 @@
         "src/runtime/harness/turn-steer.ts": {
           "bytes": 7809
         },
+        "src/runtime/harness/evidence-portions.ts": {
+          "bytes": 1371
+        },
         "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 17430
+          "bytes": 20199
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
@@ -3759,7 +3771,7 @@
           "bytes": 7162
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 60088
+          "bytes": 60104
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 27857
@@ -3798,13 +3810,13 @@
           "bytes": 18898
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 91398
+          "bytes": 92193
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
-          "bytes": 26949
+          "bytes": 27688
         },
         "src/runtime/harness/host-local-workspace-derivation.ts": {
-          "bytes": 53079
+          "bytes": 53947
         },
         "src/runtime/harness/tool-policy.ts": {
           "bytes": 4173
@@ -4038,10 +4050,10 @@
           "bytes": 3482
         },
         "src/runtime/harness/session-history-search.ts": {
-          "bytes": 27016
+          "bytes": 27147
         },
         "src/tools/session-tools.ts": {
-          "bytes": 20630
+          "bytes": 20931
         },
         "src/tools/dynamic-tools.ts": {
           "bytes": 4535
@@ -4236,7 +4248,7 @@
           "bytes": 5022
         },
         "src/tools/plan-step-result.ts": {
-          "bytes": 4410
+          "bytes": 4650
         },
         "src/runtime/harness/plan-preparation-draft.ts": {
           "bytes": 3921
@@ -4245,7 +4257,7 @@
           "bytes": 5587
         },
         "src/tools/publish-plan.ts": {
-          "bytes": 38517
+          "bytes": 41060
         },
         "src/runtime/harness/session-role-overrides.ts": {
           "bytes": 1342
@@ -4254,7 +4266,7 @@
           "bytes": 20745
         },
         "src/agents/worker-planning-disclosure.ts": {
-          "bytes": 2316
+          "bytes": 2384
         },
         "src/agents/worker-job-packet.ts": {
           "bytes": 20190
@@ -4299,7 +4311,7 @@
           "bytes": 3019
         },
         "src/runtime/harness/context-packet.ts": {
-          "bytes": 43514
+          "bytes": 43689
         },
         "src/runtime/harness/host-local-call-preparation.ts": {
           "bytes": 2861
@@ -4359,7 +4371,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 222314
+          "bytes": 222649
         },
         "src/execution/workflow-diagnosis.ts": {
           "bytes": 66436
@@ -4977,7 +4989,7 @@
           "bytes": 7572
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 476900
+          "bytes": 478673
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 73771
@@ -5127,7 +5139,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 712582
+          "bytes": 714489
         },
         "src/runtime/harness/session-tool-index.ts": {
           "bytes": 5876
@@ -5178,7 +5190,7 @@
           "bytes": 12765
         },
         "src/execution/approval-drain.ts": {
-          "bytes": 8409
+          "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
           "bytes": 287346
@@ -5235,7 +5247,7 @@
           "bytes": 46268
         },
         "src/runtime/harness/reviewed-plan-runtime.ts": {
-          "bytes": 16243
+          "bytes": 17243
         },
         "src/runtime/harness/native-revision-commit-proof.ts": {
           "bytes": 5311
@@ -5319,7 +5331,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 170982
+          "bytes": 174521
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544

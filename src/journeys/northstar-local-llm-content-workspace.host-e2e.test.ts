@@ -1539,6 +1539,14 @@ test('the exact prompt executes Search → verified Batch refinement → one vis
   assert.equal(mobile.total, 5);
   assert.ok(mobile.records.every((record) => record.body.length >= 80 && record.links.length === 3));
   const db = eventlog.openEventLog();
+  const verifiedHandles = db.prepare(`
+    SELECT completeness, continuation_ref FROM durable_result_handles
+     WHERE session_id = ? AND json_extract(raw_payload_json, '$.protocol') = ?
+  `).all(sessionId, 'clementine.verified_recent_articles.v1');
+  assert.ok(verifiedHandles.length > 0);
+  assert.ok(verifiedHandles.every(row => (row as { completeness: string; continuation_ref: string | null }).completeness === 'complete'
+    && (row as { continuation_ref: string | null }).continuation_ref === null),
+  'the finite verified selection declares completeness without inventing a provider continuation');
   const physical = db.prepare(`
     SELECT lower(tool_name) AS tool, state, execution_site AS site, COUNT(*) AS n
       FROM physical_dispatches

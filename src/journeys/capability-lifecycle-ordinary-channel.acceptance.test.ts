@@ -626,10 +626,8 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
   const renamedCurrent = store.list().filter((entry) => entry.manifest.lifecycle.state === 'current');
   assert.equal(renamedCurrent.length, 1);
   assert.equal(renamedCurrent[0]!.manifest.operationId, renamedOperation);
-  assert.deepEqual(store.get(changedManifestId)?.manifest.lifecycle, {
-    state: 'superseded',
-    supersededBy: renamedCurrent[0]!.manifest.manifestId,
-  });
+  // A new operation is independently discovered, not an inferred rename alias.
+  assert.equal(store.get(changedManifestId)?.manifest.lifecycle.state, 'revoked');
   assert.equal(factory.get(changedManifestId), undefined);
   assert.ok(factory.get(renamedCurrent[0]!.manifest.manifestId));
   const renamedManifestId = renamedCurrent[0]!.manifest.manifestId;

@@ -1120,7 +1120,19 @@ export function proveHostLocalWorkspaceDerivation(input: {
       || Array.isArray(workspaceArgs)
     ) return unavailable('compound Workspace carrier contradicts the exact requirement');
     const logical = durableLogicalCallContract(input.acceptedTaskId, 'space_save', workspaceArgs);
-    if (!logical || logical.argumentDigest !== write.argument_digest) {
+    // The accepted frame retains the model's arguments. Admission may fill
+    // omitted nullable fields before binding the actual write. Reopen the same
+    // call's immutable raw identity rather than comparing raw and refined
+    // digests as if they described different writes.
+    const admitted = input.db.prepare(`
+      SELECT raw_argument_digest, argument_digest FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+         AND accepted_task_id = ? AND tool_name = 'space_save'
+    `).get(input.sessionId, input.sourceUserSeq, input.writeLogicalToolCallId,
+      input.acceptedTaskId) as { raw_argument_digest: string; argument_digest: string } | undefined;
+    if (!logical || !admitted || admitted.argument_digest !== write.argument_digest
+      || (logical.argumentDigest !== admitted.argument_digest
+        && logical.argumentDigest !== admitted.raw_argument_digest)) {
       return unavailable('compound Workspace accepted arguments do not match the write binding');
     }
 

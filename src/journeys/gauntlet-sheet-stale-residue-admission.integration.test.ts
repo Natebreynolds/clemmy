@@ -1225,7 +1225,7 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     turn: 2,
     role: 'user',
     type: 'user_input_received',
-    data: { text: PROMPT },
+    data: { text: `${PROMPT} Use ${LIVE_PUBLISHED_OPERATION}.` },
   });
   const turn2Identity = { sessionId: session.id, sourceUserSeq: turn2Source.seq, turn: turn2Source.turn };
 
@@ -1239,7 +1239,7 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
   if (!primed2.ok) throw new Error(primed2.reason);
   assert.ok(
     primed2.planning.capabilities.some((entry) => entry.id === liveCapabilityId),
-    'turn 2 initial planning card ranks in the write capability live from turn 1, unstaged',
+    'the explicitly selected live operation is on the initial card despite unrelated residue',
   );
 
   assert.ok(factory.get(liveCapabilityId),

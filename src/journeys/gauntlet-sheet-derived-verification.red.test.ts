@@ -601,7 +601,7 @@ function settledVerifierCalls(sessionId: string): string[] {
     .map((data) => String(data.logicalToolCallId));
 }
 
-if (!PROCESS_RESTART_FIXTURE) test('missing account reviewer publishes no provider capability and performs no write', { timeout: 180_000 }, async () => {
+if (!PROCESS_RESTART_FIXTURE) test('missing write-account reviewer preserves read discovery and performs no write', { timeout: 180_000 }, async () => {
   const result = await runTurn({ sessionId: 'derived-missing-account-reviewer',
     discloseVerifier: true, updateTargetId: SHEET_ID, omitAccountReviewer: true });
   assert.deepEqual(result.bodies, [], 'an unavailable reviewer grants no provider crossing');
@@ -609,18 +609,20 @@ if (!PROCESS_RESTART_FIXTURE) test('missing account reviewer publishes no provid
   const returnedRows = events.filter(event => event.type === 'tool_returned'
     && event.data.sourceUserSeq === result.sourceUserSeq && event.data.tool === 'tool_search')
     .flatMap(event => {
-      const raw = event.data.result;
+      const raw = eventlog.getToolOutput(result.sessionId, String(event.data.callId))?.output;
       const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       return Array.isArray(parsed?.results) ? parsed.results : [];
     });
-  const sheetRows = returnedRows.filter(row => [CREATE_OPERATION, UPDATE_OPERATION, READ_OPERATION].includes(row.name));
+  const sheetRows = returnedRows.filter(row => [CREATE_OPERATION, UPDATE_OPERATION].includes(row.name));
+  assert.ok(returnedRows.some(row => row.name === READ_OPERATION && row.capabilityRef),
+    'read routing remains usable when the write reviewer is unavailable');
   assert.ok(sheetRows.length > 0, 'metadata must still be exposed, not hidden to make the negative pass');
   assert.ok(sheetRows.every(row => row.planningRefStatus === 'account_selection_required'
     && row.accountSelectionReason === 'review_unavailable' && !row.capabilityRef));
   assert.equal(events.filter(event => event.type === 'capability_resolution'
     && event.data.sourceUserSeq === result.sourceUserSeq)
     .flatMap(event => Array.isArray(event.data.entries) ? event.data.entries : [])
-    .some(entry => entry.kind === 'composio' && entry.status === 'proven'), false);
+    .some(entry => entry.kind === 'composio' && entry.status === 'proven' && [CREATE_OPERATION, UPDATE_OPERATION].includes(entry.identifier)), false);
   assert.equal((capabilityCatalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [])
     .some(entry => [CREATE_REF, UPDATE_REF].includes(entry.capabilityId)), false);
 });

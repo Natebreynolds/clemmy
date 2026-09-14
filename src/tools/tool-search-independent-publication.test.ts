@@ -167,6 +167,26 @@ test('an invalid exact discovery choice does not suppress its valid neighbor or 
   assert.equal(entries.some(entry => entry.toolName === bad), false);
 });
 
+test('simultaneous searches preserve both source proofs and disclose both exact refs', async () => {
+  setup();
+  schemas._setToolSchemaLoaderForTests(async () => definition());
+  const identity = source('Read both exact sources.');
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const candidates = [TARGET, OPERATIONS[0]!].map(name => ({
+    name, sourceKind: 'authorized_composio' as const, carrier: 'work_call' as const, schema: INPUT,
+  }));
+  await Promise.all(candidates.map(candidate => sources.stageDisclosedPlanningProviderCandidates({
+    ...identity, candidates: [candidate],
+  })));
+  const proof = resolution.provenCapabilityEntriesForTurn(identity);
+  assert.deepEqual(proof.map(entry => entry.identifier).sort(), candidates.map(candidate => candidate.name).sort());
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority, candidates });
+  assert.deepEqual(Object.keys(refs).sort(), candidates.map(candidate => candidate.name).sort());
+  assert.equal(businessCalls, 0);
+});
+
 test('an immutable selected plan still publishes nothing when one selected definition drifts', async () => {
   setup();
   const bad = OPERATIONS[0]!;

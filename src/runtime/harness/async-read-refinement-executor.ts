@@ -249,6 +249,16 @@ function settleVerifiedOwner(input: {
   parentLease: DispatchLeaseRef;
   turn?: number;
 }): { duplicate: boolean } {
+  // A completed owner already has immutable bytes, including older envelopes
+  // without a completeness flag. Reuse that settlement instead of rewriting it.
+  const prior = redeemDurableLogicalCallSettlementForHost({
+    sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId, logicalToolCallId: input.ownerLogicalToolCallId,
+  });
+  if (prior.status === 'ok'
+    && (prior.settlement.outcome.kind === 'succeeded' || prior.settlement.outcome.kind === 'empty_result')) {
+    return { duplicate: true };
+  }
   const settlement = settleToolAttempt({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -261,7 +271,9 @@ function settleVerifiedOwner(input: {
     mutating: false,
     businessCall: true,
     dispatchLease: input.parentLease,
-    result: input.evidence,
+    // This is the finite host-verified selection after the completed getter,
+    // not a provider page. Publish that fact for generic collection consumers.
+    result: { ...input.evidence, complete: true },
   });
   if (settlement.outcome.kind !== 'succeeded' && settlement.outcome.kind !== 'empty_result') {
     throw new AsyncReadRefinementAuthorityError(

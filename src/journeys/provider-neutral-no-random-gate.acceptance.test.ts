@@ -762,7 +762,7 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
           SELECT outcome_kind, business_call, mutating FROM logical_call_settlements
            WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
         `).all(session.id, result.source.seq, callId), [{
-          outcome_kind: 'succeeded', business_call: 1, mutating: 1,
+          outcome_kind: 'succeeded', business_call: 0, mutating: 1,
         }]);
         assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM accepted_task_work_contracts
           WHERE session_id = ? AND source_user_seq = ?`).get(session.id, result.source.seq) as { n: number }).n, 0,
@@ -1946,8 +1946,9 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       },
     },
     {
-      label: 'unknown external mutation repairs before I/O',
-      expected: 'repair',
+      label: 'unknown external mutation requests exact approval before I/O',
+      expected: 'needs_user',
+      resumeScenario: 'approve_restart',
       operation: 'FIXTURE_SYNC_RESOURCE',
       destinationFamily: 'fixture',
       prompt: 'Synchronize one new fixture resource from this exact payload.',
@@ -4189,17 +4190,18 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
     } as never,
   ));
   assert.equal(bodies, 0);
-  assert.equal(sourceAModel.calls(), 4,
-    'one initial refusal and all three existing repair opportunities exhaust before a fifth call');
-  assert.deepEqual(functionCallIds(outcomeA.history), sourceACallIds);
-  assert.deepEqual(functionResultIds(outcomeA.history), sourceACallIds);
+  assert.equal(sourceAModel.calls(), 3,
+    'two identical refused frames retire; the third request receives a paired do-not-retry result');
+  const attemptedSourceACallIds = sourceACallIds.slice(0, 3);
+  assert.deepEqual(functionCallIds(outcomeA.history), attemptedSourceACallIds);
+  assert.deepEqual(functionResultIds(outcomeA.history), attemptedSourceACallIds);
   assert.deepEqual(unmatchedFunctionCallIds({ input: outcomeA.history }), []);
-  const sourceAResults = sourceACallIds.map(callId => JSON.parse(functionResultTextFor(outcomeA.history, callId)!));
-  assert.deepEqual(sourceAResults.map(result => result.retry), ['replan', 'replan', 'replan', 'replan']);
+  const sourceAResults = attemptedSourceACallIds.map(callId => JSON.parse(functionResultTextFor(outcomeA.history, callId)!));
+  assert.deepEqual(sourceAResults.map(result => result.retry), ['replan', 'replan', 'do_not_retry']);
   const sourceARepairs = eventlog.listEvents(retirementSession.id, { types: ['guardrail_tripped'] })
     .filter(event => event.data.sourceUserSeq === sourceA.seq && event.data.kind === 'no_progress_decision');
-  assert.deepEqual(sourceARepairs.map(event => event.data.retriesRemaining), [2, 1, 0, 0]);
-  assert.deepEqual(sourceARepairs.map(event => event.data.action), ['continue', 'continue', 'continue', 'terminalize']);
+  assert.deepEqual(sourceARepairs.map(event => event.data.retriesRemaining), [2, 1]);
+  assert.deepEqual(sourceARepairs.map(event => event.data.action), ['continue', 'continue']);
   assert.ok(sourceARepairs.every(event => event.data.attemptClass === 'zero_crossing_repair'));
   assert.ok(sourceARepairs.every(event => Array.isArray(event.data.gained) && event.data.gained.length === 0));
   assert.equal(new Set(sourceARepairs.map(event => event.data.consequenceKey)).size, 1);
@@ -4222,8 +4224,8 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   eventlog.closeEventLog();
   const reopenedRetirement = HarnessSession.load(retirementSession.id);
   assert.ok(reopenedRetirement);
-  assert.deepEqual(functionCallIds(reopenedRetirement.toInputItems()), sourceACallIds);
-  assert.deepEqual(functionResultIds(reopenedRetirement.toInputItems()), sourceACallIds);
+  assert.deepEqual(functionCallIds(reopenedRetirement.toInputItems()), attemptedSourceACallIds);
+  assert.deepEqual(functionResultIds(reopenedRetirement.toInputItems()), attemptedSourceACallIds);
   assert.deepEqual(unmatchedFunctionCallIds({ input: reopenedRetirement.toInputItems() }), []);
 
   const sourceBCallId = 'retirement-source-b-identical';
@@ -4259,9 +4261,8 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   assert.ok(sourceB && sourceB.seq > sourceA.seq);
   const sourceBRepairs = eventlog.listEvents(retirementSession.id, { types: ['guardrail_tripped'] })
     .filter(event => event.data.sourceUserSeq === sourceB.seq && event.data.kind === 'no_progress_decision');
-  assert.deepEqual(sourceBRepairs.map(event => event.data.retriesRemaining), [2],
-    'the new accepted source receives its independent existing repair budget');
-  assert.deepEqual(sourceBRepairs.map(event => event.data.action), ['continue']);
+  assert.deepEqual(sourceBRepairs, [],
+    'the accepted Act path repairs through its own call result, without the ambient no-progress governor');
   assert.deepEqual(unmatchedFunctionCallIds({ input: sourceBSecondInput }), []);
   assert.equal(bodies, 0);
 });

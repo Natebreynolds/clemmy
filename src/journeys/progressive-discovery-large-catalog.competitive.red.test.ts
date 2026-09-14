@@ -789,8 +789,8 @@ async function preparePermutation(
   if (mutation === 'missing-version') {
     assert.equal(sourceRefs.includes(sourceRef), false,
       'the selected unversioned source definition cannot mint a capability ref');
-    assert.ok(destinationRefs.includes(destinationRef),
-      'the staged write keeps its planning ref until plan-time exact revalidation');
+    assert.equal(destinationRefs.includes(destinationRef), false,
+      'an unversioned destination cannot publish a current callable ref either');
   } else {
     assert.ok(sourceRefs.includes(sourceRef), `source ref missing for seed ${catalog.seed}`);
     assert.ok(destinationRefs.includes(destinationRef), `destination ref missing for seed ${catalog.seed}`);
@@ -841,8 +841,8 @@ async function preparePermutation(
     factory.snapshot().map((entry) => entry.capabilityId).sort(),
     (mutation === 'missing-version'
       ? []
-      : [sourceRef, 'cap:resolved:host_transform']).sort(),
-    'tool_search publishes only its independently proven read and the host transform; the write stays staged',
+      : [sourceRef, destinationRef, 'cap:resolved:host_transform']).sort(),
+    'discovery publishes independently proven reads and writes without admitting a plan',
   );
   assert.deepEqual(
     ports.listProductionCapabilityPorts()
@@ -851,8 +851,8 @@ async function preparePermutation(
       .sort(),
     (mutation === 'missing-version'
       ? []
-      : [sourceRef, 'cap:resolved:host_transform']).sort(),
-    'only the independently proven read path may become executable during discovery',
+      : [sourceRef, destinationRef, 'cap:resolved:host_transform']).sort(),
+    'published operations keep their exact independent definitions; discovery performs no business I/O',
   );
   assert.equal(eventlog.getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq), null,
     'search/ref disclosure cannot admit a plan');
@@ -978,14 +978,14 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
       (catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [])
         .map((entry) => entry.capabilityId)
         .sort(),
-      [run.sourceRef, 'cap:resolved:host_transform'].sort(),
+      [run.sourceRef, run.destinationRef, 'cap:resolved:host_transform'].sort(),
     );
     assert.deepEqual(
       ports.listProductionCapabilityPorts()
         .map((entry) => entry.identity.manifestId)
         .filter((manifestId) => manifestId.startsWith('cap:resolved:'))
         .sort(),
-      [run.sourceRef, 'cap:resolved:host_transform'].sort(),
+      [run.sourceRef, run.destinationRef, 'cap:resolved:host_transform'].sort(),
     );
     assert.deepEqual(run.deliveredPreambles, []);
     assert.equal(businessCrossings, 0);
@@ -1012,8 +1012,8 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     assert.equal(businessCrossings, 0,
       'metadata discovery and plan admission perform zero business/provider execution');
     run.metrics.exactDefinitionReads = run.readExactDefinitionCount();
-    assert.equal(run.metrics.exactDefinitionReads, 3,
-      'read publication validates the source once, then plan freeze revalidates both selected definitions');
+    assert.equal(run.metrics.exactDefinitionReads, 2 * MAX_RETURNED_REFS_PER_ROLE + 2,
+      'each disclosed choice is checked; plan freeze revalidates the two selected definitions');
     run.metrics.businessCrossings = businessCrossings;
     allMetrics.push(run.metrics);
   }
@@ -1036,7 +1036,7 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     maxReturnedRefsPerRole: 8,
     totalProviderSearches: 200,
     maxProviderMetadataRowsPerTask: 16,
-    exactDefinitionReadsPerTask: [3],
+    exactDefinitionReadsPerTask: [2 * MAX_RETURNED_REFS_PER_ROLE + 2],
     businessCrossings: 0,
     successRate: 1,
   });
@@ -1165,12 +1165,12 @@ test('GATE: removal, rename, schema drift, and missing operation version fail ty
     const body = JSON.parse(output) as { ok?: boolean; code?: string; detail?: string };
     assert.deepEqual({ ok: body.ok, code: body.code }, {
       ok: false,
-      code: 'plan_not_admitted',
+      code: mutation === 'missing-version' ? 'plan_incomplete_missing_write' : 'plan_not_admitted',
     }, `${mutation} did not fail through the typed plan boundary: ${output}`);
     assert.match(
       String(body.detail ?? ''),
       mutation === 'missing-version'
-        ? /not disclosed/i
+        ? /not attested/i
         : /changed|frozen host catalog|selected provider capability|published|selected_definition_/i,
     );
     assert.equal(eventlog.getTurnGraphEventForSource(run.identity.sessionId, run.identity.sourceUserSeq), null);

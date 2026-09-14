@@ -1109,30 +1109,16 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   const entries = new Map<string, CapabilityResolutionEntry>();
   const blockers: Record<string, ToolSearchPlanningBlocker> = {};
   const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
-  // A task may resolve source and destination in separate foreground searches.
-  // Keep the newest accepted-task resolution cumulative so the existing
-  // proof publisher can materialize the model-selected subset at plan time.
-  for (const event of listEvents(input.sessionId, { types: ['capability_resolution'] })) {
-    if (!discoveryStillActive(guard)) return empty();
-    if (event.data.sourceUserSeq !== input.sourceUserSeq || event.data.authoritativeForTask === false) continue;
-    const prior = Array.isArray(event.data.entries)
-      ? event.data.entries as CapabilityResolutionEntry[]
-      : [];
-    for (const entry of prior) {
-      if (
-        entry.kind !== 'composio'
-        || entry.status !== 'proven'
-        || entry.connection === 'missing'
-        || !entry.identifier?.trim()
-      ) continue;
-      entries.set(`composio:${entry.identifier.trim().toLowerCase()}`, { ...entry });
-    }
-  }
   for (const candidate of composioCandidates.slice(0, 20)) {
     if (!discoveryStillActive(guard)) return empty();
     const slug = candidate.name.trim();
     const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
-    let routing = routingByToolkit.get(toolkit);
+    const routingEffect = classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write';
+    // Read routing deliberately does not require a semantic account review.
+    // A mixed search must not reuse that read-only decision for a write (or
+    // let an unavailable write review suppress an otherwise usable read).
+    const routingKey = `${toolkit}:${routingEffect}`;
+    let routing = routingByToolkit.get(routingKey);
     if (!routing) {
       // This is model work, not provider metadata I/O. Keep the current tool
       // pending until the review returns or its invocation is cancelled.
@@ -1140,7 +1126,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         start: () => resolveSourceAccountRouting({
           sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
           toolkit, operation: slug, connections, nomination: input.accountSelection,
-          effect: classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write',
+          effect: routingEffect,
         }),
         signal: input.signal,
       });
@@ -1152,7 +1138,7 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         choices: [...new Set(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)
           .map(connection => normalizedAccountEmail(connection.accountEmail) || connection.connectionId))],
       };
-      routingByToolkit.set(toolkit, routing);
+      routingByToolkit.set(routingKey, routing);
     }
     // Checked nominations and established routes precede legacy prose hints;
     // uncertainty never silently falls back to grammar or account memory.
@@ -1197,6 +1183,22 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       ...(routing.kind === 'resolved' ? { sourceAccountRouting: routing.evidence } : {}),
       effectClass,
     });
+  }
+  // Merge at publication time, after asynchronous account checks. Concurrent
+  // searches may have published another role while this search was waiting.
+  // This synchronous read/append preserves both; candidates this search checked
+  // keep their own outcome, including removal after a failed account check.
+  const checkedKeys = new Set(composioCandidates.slice(0, 20)
+    .map(candidate => `composio:${candidate.name.trim().toLowerCase()}`));
+  for (const event of listEvents(input.sessionId, { types: ['capability_resolution'] })) {
+    if (event.data.sourceUserSeq !== input.sourceUserSeq || event.data.authoritativeForTask === false) continue;
+    const prior = Array.isArray(event.data.entries) ? event.data.entries as CapabilityResolutionEntry[] : [];
+    for (const entry of prior) {
+      if (entry.kind !== 'composio' || entry.status !== 'proven'
+        || entry.connection === 'missing' || !entry.identifier?.trim()) continue;
+      const key = `composio:${entry.identifier.trim().toLowerCase()}`;
+      if (!checkedKeys.has(key)) entries.set(key, { ...entry });
+    }
   }
   if (entries.size > 0) {
     if (!discoveryStillActive(guard)) return empty();
@@ -1868,6 +1870,10 @@ export function buildAuthorizedToolSearchCandidateSources(
         }
       }
       const server = getOrCreateExternalMcpServers(mcpToolDiscoveryScope(scope));
+      // Search is the recovery path after an exact invocation detects drift.
+      // Its namespace view can differ from the invocation's per-server view;
+      // refresh this view too, otherwise it keeps advertising the retired name.
+      await server.invalidateToolsCache();
       const tools = await server.listTools();
       if (signal?.aborted) return [];
       const ranked = rankCatalogEntriesLexically(query, tools.map(tool => ({

@@ -699,6 +699,14 @@ export async function prepareProductionMcpInvocation(
     serverSlug: parsed.serverSlug,
     operationId: current.manifest.operationId,
   });
+  // A fresh, complete list can retire a missing exact operation. Do not infer
+  // a renamed successor from descriptions: discovery proves that independently.
+  if (snapshot.providerIdentity === current.manifest.providerIdentity
+    && snapshot.accountId === current.manifest.accountId
+    && !snapshot.definitions.some(entry => entry.definition.operationId === current.manifest.operationId)) {
+    peekCapabilityManifestStore()?.revoke(current.manifest.manifestId);
+    peekHostCapabilityCatalogFactory()?.forget(current.manifest.manifestId);
+  }
   if (!snapshotMatchesManifest(snapshot, current.manifest)) {
     throw new CurrentCapabilityDefinitionUnavailableError(
       'native MCP preparation refused: live definition drifted',
