@@ -465,3 +465,44 @@ test('call-target fallback refuses more than one concrete target', () => {
   }
   assert.equal(bindingCount(task, logicalToolCallId), 0);
 });
+
+for (const variant of ['unknown-read', 'unsupported-read', 'uncertain-write'] as const) {
+  test(`recovery keeps unresolved work honest: ${variant}`, () => {
+    const task = acceptAction(`recovery-${variant}`, 'Read the current records, then update one approved record.');
+    const isRead = variant !== 'uncertain-write';
+    const tool = isRead ? READ_OPERATION : OPERATION;
+    const args = isRead ? { scope: 'current' } : ARGS;
+    const requirementId = isRead ? 'read-source' : CAPABILITY_REQUIREMENT;
+    const first = openExactCall(task, 'first', tool, args);
+    const p = { version: 1 as const, operations: [
+      ...(isRead ? [{ id: 'read-source', effect: 'read' as const, coverage: 'single' as const, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' as const } }] : []),
+      ...proposal().operations,
+    ], universes: [] };
+    const admitted = admission.admitExpectedWorkInvocation({ ...task, logicalToolCallId: first,
+      proposal: p, requirementId, tool, args });
+    assert.equal(admitted.status, 'bound', JSON.stringify(admitted));
+    const begun = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: first,
+      physicalDispatchId: `dispatch:${first}`, ordinal: 1 }, tool, args });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('dispatch missing');
+    dispatch.settlePhysicalDispatch({ identity: begun.identity, tool, outcome: 'returned' });
+    const outcome = outcomes.classifyAttemptOutcome(variant === 'unknown-read'
+      ? { providerEnvelopeContradicted: true, mutating: false }
+      : variant === 'unsupported-read' ? { capabilityDefinitionUnavailable: true }
+      : { mutating: true, acknowledged: false });
+    const settled = settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId: first },
+      contract: { toolName: tool, args }, execution: { kind: 'provider_execution' }, outcome,
+      recovery: { businessCall: true, mutating: !isRead, requirementId },
+      observer: { lane: 'native_mcp', turn: task.turn } });
+    assert.equal(settled.status, 'committed', JSON.stringify(settled));
+    const retried = admission.admitExpectedWorkInvocation({ ...task,
+      logicalToolCallId: openExactCall(task, 'retry', tool, args), proposal: null, requirementId, tool, args });
+    if (variant === 'unknown-read') {
+      assert.equal(retried.status, 'bound', JSON.stringify(retried));
+      assert.notEqual(admission.expectedWorkPlanLines(task).find(row => row.requirementId === requirementId)?.state, 'satisfied');
+    } else {
+      assert.equal(retried.status, 'refused', JSON.stringify(retried));
+      if (retried.status === 'refused') assert.notEqual(retried.kind, 'work_already_satisfied');
+    }
+  });
+}

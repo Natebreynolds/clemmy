@@ -10084,6 +10084,7 @@ for (const variant of ['drift', 'unavailable', 'disabled', 'stale'] as const) te
   if (variant === 'disabled') { assert.equal(seen.length, 0); assert.equal(reviews.length, 0); return; }
   assert.equal(seen.length, 1);
   assert.match(seen[0].sourceEvidence ?? '', /Remembered owner preference: lead with the recommendation/);
+  assert.match(seen[0].sourceEvidence ?? '', /Current execution dependencies/);
   assert.ok(seen[0].sourceEvidence?.includes(sourceText), 'whole receipt-owned source reaches the reviewer');
   assert.equal(seen[0].latestAssistantNote, 'I am comparing the source versions.');
   assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.verdict, variant === 'unavailable' ? 'unavailable' : 'drift');

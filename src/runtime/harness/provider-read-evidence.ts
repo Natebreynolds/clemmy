@@ -244,6 +244,7 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     node: unknown,
     currentDepth: number,
     mcpPayloadRootDepth: number | null,
+    collectionItem = false,
   ): Contradiction | null => {
     if (!node || typeof node !== 'object') return null;
     visited += 1;
@@ -258,7 +259,7 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     if (Array.isArray(node)) {
       if (node.length > CONTRADICTION_MAX_ENTRIES) markUninspected('entry_limit');
       for (const entry of node.slice(0, CONTRADICTION_MAX_ENTRIES)) {
-        const contradiction = visit(entry, currentDepth + 1, mcpPayloadRootDepth);
+        const contradiction = visit(entry, currentDepth + 1, mcpPayloadRootDepth, true);
         if (contradiction) return contradiction;
       }
       return null;
@@ -270,6 +271,9 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     const inspectedEntries = entries.slice(0, CONTRADICTION_MAX_ENTRIES);
     const normalizedKeys = inspectedEntries.map(([key]) => normalizedEnvelopeKey(key));
     const businessEntity = normalizedKeys.some((key) => BUSINESS_IDENTITY_KEYS.has(key));
+    const identifiedCollectionItem = collectionItem && inspectedEntries.some(([key, value]) =>
+      (BUSINESS_IDENTITY_KEYS.has(normalizedEnvelopeKey(key)) || normalizedEnvelopeKey(key) === 'url')
+      && ((typeof value === 'string' && value.length > 0) || typeof value === 'number'));
     for (const [rawKey, child] of inspectedEntries) {
       const key = normalizedEnvelopeKey(rawKey);
       if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) {
@@ -326,6 +330,10 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
       // that are unmistakably request/input echoes.
       if (providerRequestEchoKey(rawKey) && key !== 'payload') continue;
       if (Array.isArray(child) && CONTRADICTION_RESULT_ARRAY_KEYS.has(key)) continue;
+      // Metadata on an identified returned item describes that item's retrieval,
+      // not the containing call. Preserve it for content-quality review. Direct
+      // item failure flags and envelope-level errors are still inspected.
+      if (identifiedCollectionItem && (key === 'metadata' || key === 'meta')) continue;
       const nestedMcpPayloadRootDepth = key === 'structuredcontent'
         && explicitMcpSuccessOwnsStructuredPayload(record)
         ? currentDepth + 1

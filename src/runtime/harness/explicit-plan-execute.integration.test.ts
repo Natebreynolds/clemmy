@@ -801,7 +801,12 @@ test('a reviewed runtime collection uses the complete current read and keeps mem
     if (frame === 3) {
       eventlog.closeEventLog();
       assert.equal(readFileSync(records[0]!.path, 'utf8'), records[0]!.content);
-      assert.throws(() => results.resolveReviewedPlanStepResult(identity, 'save'), /not complete/);
+      assert.throws(() => results.resolveReviewedPlanStepResult(identity, 'save'), error => {
+        assert.match(String(error), /not complete/);
+        assert.match(String(error), /memberId/);
+        assert.match(String(error), /Resolve these upstream results/);
+        return true;
+      });
     }
     const output = frames[Math.min(frame++, frames.length - 1)];
     return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 }, output, responseId: `collection-${frame}` };

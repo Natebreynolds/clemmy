@@ -786,3 +786,17 @@ test('pagination contradictions fail closed while a continuation always outranks
   assert.equal(genericUnknown.completeness, 'unknown');
   assert.equal(genericUnknown.cursor, null);
 });
+
+
+test('partial item retrieval errors retain the successful read across SQLite reopen', () => {
+  const payload = { successful: true, error: null, data: { success: true, data: { matches: [
+    { url: 'https://example.test/available', text: 'Supported fact', metadata: { statusCode: 200 } },
+    { url: 'https://example.test/unavailable', metadata: { error: 'page unavailable', statusCode: 500 } },
+  ] } } };
+  const result = settleStandalone({ label: 'partial-item-metadata', tool: 'account_search', args: { query: 'current' }, payload, mutating: false });
+  assert.equal(result.settled.outcome.kind, 'succeeded');
+  eventlog.closeEventLog();
+  const redeemed = resultHandles.redeemSuccessfulSettlementResultForHost({ ...result.task, logicalToolCallId: result.logicalToolCallId });
+  assert.equal(redeemed.status, 'ok', JSON.stringify(redeemed));
+  if (redeemed.status === 'ok') assert.deepEqual(redeemed.value.rawPayload, payload, 'errors and usable siblings both survive recovery');
+});

@@ -89,7 +89,7 @@ export function UpdaterBanner() {
     action = { label: 'Move to Applications', fn: () => b!.updaterMoveToApplications!() };
   } else if (installBlocker === 'app-not-writable') {
     tone = 'error';
-    text = "Updates can't apply — Clementine's app bundle isn't writable.";
+    text = error || "Updates can't apply — Clementine's app bundle isn't writable.";
     action = { label: 'Repair & enable updates', fn: () => b!.updaterRepairOwnership!() };
   } else if (state === 'available') {
     text = `An update${v} is available.`;

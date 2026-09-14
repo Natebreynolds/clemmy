@@ -2021,7 +2021,7 @@ function priorRequirementAllowsAdmission(
   }
   if (relevant.length === 0) return { ok: true };
   if (relevant.some((row) => row.state === 'open' || row.outcome_kind === null)) {
-    return { ok: false, reason: 'this requirement instance already has an open logical call' };
+    return { ok: false, refusalKind: 'work_dependency_pending', reason: 'this requirement instance already has an open logical call; wait for its result' };
   }
   if (operation.effect === 'local_write' && operation.cardinality.kind === 'once'
     && reviewedFileCorrectionForCall(contract.identity, operation.id, currentInvocation.tool, currentInvocation.args)) {
@@ -2122,8 +2122,12 @@ function priorRequirementAllowsAdmission(
     };
   }
   if (latest.outcome_kind === 'uncertain_write' || latest.requires_reconciliation === 1) {
-    return { ok: false, reason: 'an uncertain mutation must be reconciled before any retry' };
+    return { ok: false, refusalKind: 'work_effect_already_executed', reason: 'an uncertain mutation must be reconciled before any retry' };
   }
+  // An unknown read is not an ambiguous write or a completed requirement.
+  // Let the model recover the same read; ordinary progress accounting still
+  // observes repeated failures, and no evidence is discharged by this retry.
+  if (operation.effect === 'read' && latest.outcome_kind === 'unknown') return { ok: true };
   // `repair_arguments` authorizes a corrected attempt, not a byte-equivalent
   // replay.  The binding digest is the frozen effective logical contract, so
   // this comparison stays provider-neutral even when an outer carrier was
@@ -2156,6 +2160,7 @@ function priorRequirementAllowsAdmission(
   if (!sameCandidateRepair && !siblingRecovery) {
     return {
       ok: false,
+      refusalKind: 'work_authority_unavailable',
       reason: `the prior ${latest.outcome_kind ?? 'unknown'} outcome authorizes no retry for this requirement`,
     };
   }

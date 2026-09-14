@@ -1182,6 +1182,8 @@ function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
     case 'work_contract_required':
     case 'work_contract_invalid':
       return 'Retry work_call with one corrected complete semantic proposal and the same intended inner call. The plan array (when present) lists the already-frozen requirements — reuse their ids and shapes exactly.';
+    case 'work_authority_unavailable':
+      return 'This requirement is unresolved, not completed. Follow the specific failure in detail; recover with a supported operation when allowed, or explain the actual blocker. Do not repeat an uncertain mutation.';
     case 'work_already_satisfied':
       return 'This requirement is already complete — its stored result is included under `result`. Use it; do NOT re-run this requirement. Continue with the next `open` entry in `plan`.';
     case 'work_evidence_incomplete':

@@ -176,3 +176,23 @@ test('nonempty diagnostic collections remain auxiliary even beneath a result env
     hasNonEmptyResult: false,
   });
 });
+
+test('identified collection item metadata does not reverse the call verdict', () => {
+  for (const collection of ['web', 'accounts', 'arbitraryResults']) {
+    const payload = { successful: true, error: null, data: { success: true, data: {
+      [collection]: [
+        { url: 'https://example.test/good', text: 'usable evidence', metadata: { statusCode: 200 } },
+        { url: 'https://example.test/blocked', metadata: { error: 'retrieval failed', statusCode: 500 } },
+      ],
+    } } };
+    const before = JSON.stringify(payload);
+    assert.equal(inspectProviderEnvelope(payload).verdict, 'clean');
+    assert.equal(JSON.stringify(payload), before, 'item failure evidence remains intact');
+    assert.equal(inspectProviderEnvelope({ ...payload, successful: false }).verdict, 'contradicted');
+    assert.equal(inspectProviderEnvelope({ ...payload, error: 'request failed' }).verdict, 'contradicted');
+  }
+  assert.equal(inspectProviderEnvelope({ data: { shards: [{ id: 'one', metadata: { error: 'shard unavailable' } }] } }).verdict, 'clean');
+  assert.equal(inspectProviderEnvelope({ data: { shards: [{ id: 'one', success: false }] } }).verdict, 'contradicted', 'explicit nested operation failure stays visible');
+  assert.equal(inspectProviderEnvelope({ data: { metadata: { error: 'envelope failure' } } }).verdict, 'contradicted');
+  assert.equal(inspectProviderEnvelope({ data: { wrappers: [{ metadata: { error: 'unidentified envelope failure' } }] } }).verdict, 'contradicted');
+});

@@ -75,7 +75,23 @@ export function resolveReviewedPlanStepResult(identity: Identity, stepId: string
     if (!step.forEach) return toolResult(identity, stepId);
     const members = reviewedCollectionMembers(step.forEach, resolveReviewedPlanCollectionRecords(identity, step.forEach));
     const results = toolResults(identity, stepId);
-    if (results.length !== members.length) throw new Error(`Reviewed collection ${stepId} is not complete.`);
+    const gaps = members.filter(member => results.filter(result => result.memberId === member.id).length !== 1);
+    if (gaps.length || results.length !== members.length) {
+      const observed = openEventLog().prepare(`SELECT b.universe_item_id AS memberId,
+          s.outcome_kind AS outcome, s.outcome_detail AS detail
+        FROM expected_work_call_bindings b LEFT JOIN logical_call_settlements s
+          USING (session_id, source_user_seq, logical_tool_call_id)
+        WHERE b.session_id = ? AND b.source_user_seq = ? AND b.requirement_id = ?
+        ORDER BY s.rowid DESC`).all(identity.sessionId, identity.sourceUserSeq, stepId) as
+        Array<{ memberId: string | null; outcome: string | null; detail: string | null }>;
+      const missing = gaps.map(member => {
+        const count = results.filter(result => result.memberId === member.id).length;
+        const latest = observed.find(row => row.memberId === member.id);
+        return { memberId: member.id, usableResults: count,
+          outcome: latest?.outcome ?? 'not_settled', detail: latest?.detail ?? null };
+      });
+      throw new Error(`Reviewed collection ${stepId} is not complete. Member evidence: ${JSON.stringify(missing)}. Resolve these upstream results before resubmitting synthesis; changing synthesis content cannot repair a missing input. Preserve completed members and reconcile any uncertain write before repeating it.`);
+    }
     return { items: members.map(member => {
       const matches = results.filter(result => result.memberId === member.id);
       if (matches.length !== 1) throw new Error(`Reviewed member ${member.id} needs one settled result.`);

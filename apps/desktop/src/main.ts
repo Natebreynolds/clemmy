@@ -2108,10 +2108,9 @@ async function repairUpdateOwnershipFromUi(): Promise<ReturnType<typeof getUpdat
       silent: true,
     }).show();
   } else {
-    dialog.showErrorBox(
-      'Clementine could not repair updates',
-      result.reason || 'Ownership repair failed. Reinstall Clementine from the latest DMG, then try again.',
-    );
+    // Return the error through the updater bridge/banner. A synchronous
+    // NSAlert from the child-exit callback can deadlock the live desktop.
+    logNonFatal('update ownership repair failed', result.reason || 'Ownership repair failed.');
   }
   rebuildTrayMenu();
   return { ...getUpdaterStatus(), repairResult: result };
