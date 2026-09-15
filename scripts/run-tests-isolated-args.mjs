@@ -1,3 +1,5 @@
+import { availableParallelism } from 'node:os';
+
 export const DEFAULT_TEST_TARGETS = Object.freeze([
   // Performance-sensitive end-to-end journeys have their own serialized
   // `npm run journeys` gate. Running them again in the broad concurrent unit
@@ -142,13 +144,42 @@ export function createIsolatedRunnerProgressTracker(startedAt = Date.now()) {
   };
 }
 
+/**
+ * Ceiling on how many test files run at once when the caller does not say.
+ *
+ * Node's own default is `availableParallelism() - 1`, which is a reasonable
+ * answer for a suite whose processes are cheap. This suite's are not: the
+ * preload mints a private CLEMENTINE_HOME per process precisely so concurrent
+ * files stop contending on one set of SQLite databases, and that isolation is
+ * paid for in memory, once per worker. The default therefore scales the cost
+ * with the size of the developer's machine while CI -- four cores, so three
+ * workers -- never exercises the wide end of it. An eighteen-core laptop fans
+ * out to seventeen, and two checkouts running at once took one to 118 GB and
+ * stalled the machine.
+ *
+ * Four keeps the widest local run near what CI actually proves, and leaves CI
+ * itself untouched. Pass --test-concurrency explicitly to ask for more.
+ */
+export const DEFAULT_TEST_CONCURRENCY_CEILING = 4;
+
+/**
+ * Only ever narrows Node's own answer -- a two-core machine still gets one
+ * worker, not four. The ceiling is a cap, never a floor.
+ */
+export const DEFAULT_TEST_CONCURRENCY = Math.max(
+  1,
+  Math.min(DEFAULT_TEST_CONCURRENCY_CEILING, availableParallelism() - 1),
+);
+
 export function isolatedTestArgs(forwarded) {
   const hasTimeout = forwarded.some((argument) => argument === '--test-timeout' || argument.startsWith('--test-timeout='));
+  const hasConcurrency = forwarded.some((argument) => argument === '--test-concurrency' || argument.startsWith('--test-concurrency='));
   return [
     '--import',
     TEST_ISOLATION_PRELOAD,
     '--test',
     ...(hasTimeout ? [] : ['--test-timeout', '600000']),
+    ...(hasConcurrency ? [] : ['--test-concurrency', String(DEFAULT_TEST_CONCURRENCY)]),
     ...forwarded,
     ...(hasExplicitTestTarget(forwarded) ? [] : DEFAULT_TEST_TARGETS),
   ];
