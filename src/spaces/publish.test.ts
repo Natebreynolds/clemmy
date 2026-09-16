@@ -48,7 +48,7 @@ test('buildPublishSnapshot: self-contained export — data inlined, _meta stripp
 
   // Dataset inlined; provenance stripped.
   assert.match(html, /law firm seo/, 'dataset rows are inlined');
-  assert.ok(!html.includes('_meta'), 'reserved _meta provenance is stripped');
+  assert.ok(!/\\"_meta\\"/.test(html), 'reserved _meta provenance is stripped from the inlined dataset');
   assert.ok(!html.includes('/local/private/path'), 'runner paths never leak into the export');
 
   // Static bridge: same window.clem surface, side effects frozen, marked snapshot.
@@ -59,6 +59,11 @@ test('buildPublishSnapshot: self-contained export — data inlined, _meta stripp
   );
   assert.ok(html.indexOf('window.clem=') < html.indexOf('<body>'), 'published bridge starts in <head>, matching live views');
   assert.match(html, /published snapshot/, 'frozen actions explain themselves');
+  // The framework design layer travels with the export, so a snapshot looks
+  // like the live view in either theme and the helper kit keeps working.
+  assert.ok(html.indexOf('<style id="clem-view-design">') > 0, 'design stylesheet inlined');
+  assert.ok(html.indexOf('window.__clemKit=') < html.indexOf('window.clem='), 'kit precedes the static bridge');
+  assert.match(html, /window\.clem\.fmt=K\.fmt;window\.clem\.ui=K\.ui/, 'static bridge adopts the kit');
   assert.ok(!html.includes('/api/console/spaces'), 'no live data-plane URLs in the export');
   assert.match(html, /clementine-snapshot/, 'snapshot marker present');
 
@@ -126,7 +131,8 @@ test('buildPublishSnapshot: hostile external data cannot break out of the bridge
   if (!result.ok) return;
   const html = readFileSync(path.join(result.dir, 'index.html'), 'utf-8');
 
-  assert.equal((html.match(/<script\b/gi) ?? []).length, 2, 'data cannot mint an executable script element');
+  // Exactly the framework kit, the static bridge, and the authored script.
+  assert.equal((html.match(/<script\b/gi) ?? []).length, 3, 'data cannot mint an executable script element');
   assert.ok(!html.includes('</script><script>window.__PUBLISHED_DATA_EXECUTED__'), 'literal script boundary is absent');
   assert.match(html, /\\u003c\/script>/, 'HTML-significant less-than signs are escaped in script source');
 

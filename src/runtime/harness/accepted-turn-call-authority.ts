@@ -33,7 +33,9 @@ import { capabilityManifestDigest, currentCapabilityManifest } from './capabilit
 import {
   independentlyObserveCapability,
   observationIsFresh,
+  registerIndependentCapabilityObservation,
 } from './independent-capability-observation.js';
+import { peekProductionCapabilityAdapter } from './production-capability-adapter.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { parseWorkflowNodeInvocationPlan } from '../../memory/workflow-node-invocation-plan.js';
@@ -3976,17 +3978,69 @@ export function mintWorkflowReadOnlyCallAttestation(input: {
     if (!resolveProductionPortsForManifest(capability.manifest)) {
       return { status: 'missing', reason: 'workflow call exact immutable invoke port is missing' };
     }
-    const observation = independentlyObserveCapability(binding.operationId, binding.accountId);
-    if (
-      !observation
-      || observation.origin !== 'independent'
-      || !observationIsFresh(observation)
-      || observation.operationId !== binding.operationId
-      || observation.operationVersion !== binding.operationVersion
-      || observation.providerVersion !== binding.providerVersion
-      || workflowCapabilityDigest(observation.definitionFingerprint) !== binding.liveFingerprint
-      || observation.accountId !== binding.accountId
-    ) return { status: 'conflict', reason: 'workflow call independent live observation differs from its plan' };
+    let observation = independentlyObserveCapability(binding.operationId, binding.accountId);
+    // An operation nobody has dispatched since boot has no observation yet.
+    // That is not a conflict with the plan; it is work the host can do
+    // itself: observe the manifest live through the production adapter,
+    // register it, and read it back. A refusal stays for a real mismatch.
+    let onDemandNote = '';
+    if (!observation) {
+      const adapter = peekProductionCapabilityAdapter();
+      const manifest = capability.manifest;
+      const observer = adapter?.observe?.[manifest.providerKind];
+      if (!adapter) onDemandNote = 'adapter:none';
+      else if (!observer) onDemandNote = `observer:none:${manifest.providerKind}`;
+      if (adapter && observer) {
+        try {
+          const live = observer(manifest);
+          if (typeof live === 'string') onDemandNote = `observed:${live}`;
+          if (live && typeof live === 'object') {
+            const registered = registerIndependentCapabilityObservation({
+              operationId: binding.operationId,
+              accountId: live.accountId,
+              definitionFingerprint: live.definitionFingerprint,
+              providerVersion: live.providerVersion,
+              operationVersion: live.operationVersion,
+              observedAt: live.observedAt,
+              origin: 'independent',
+              observe: () => {
+                const again = observer(manifest);
+                return typeof again === 'string'
+                  ? { operationId: binding.operationId, accountId: live.accountId, definitionFingerprint: live.definitionFingerprint, providerVersion: live.providerVersion, operationVersion: live.operationVersion, observedAt: 0 }
+                  : { operationId: binding.operationId, accountId: again.accountId, definitionFingerprint: again.definitionFingerprint, providerVersion: again.providerVersion, operationVersion: again.operationVersion, observedAt: again.observedAt };
+              },
+            });
+            if (!registered.ok) onDemandNote = `register:${registered.reason}`;
+            observation = independentlyObserveCapability(binding.operationId, binding.accountId);
+            if (!observation) onDemandNote = onDemandNote || `account:${live.accountId}≠${binding.accountId}`;
+          }
+        } catch (error) {
+          onDemandNote = `observer_threw:${error instanceof Error ? error.message.slice(0, 80) : String(error).slice(0, 80)}`;
+        }
+      }
+    }
+    // The refusal names the check that failed. "Differs" alone sent a
+    // Workspace's first refresh into a dead end nobody could read.
+    const observationMismatch = !observation
+      ? `no_observation${onDemandNote ? `;${onDemandNote}` : ''}`
+      : observation.origin !== 'independent'
+        ? `origin:${observation.origin}`
+        : !observationIsFresh(observation)
+          ? 'stale'
+          : observation.operationId !== binding.operationId
+            ? 'operation_id'
+            : observation.operationVersion !== binding.operationVersion
+              ? 'operation_version'
+              : observation.providerVersion !== binding.providerVersion
+                ? 'provider_version'
+                : workflowCapabilityDigest(observation.definitionFingerprint) !== binding.liveFingerprint
+                  ? 'definition_fingerprint'
+                  : observation.accountId !== binding.accountId
+                    ? `account:${observation.accountId}≠${binding.accountId}`
+                    : null;
+    if (observationMismatch) {
+      return { status: 'conflict', reason: `workflow call independent live observation differs from its plan (${observationMismatch})` };
+    }
     const contract = durableLogicalCallContract(ref.authorityRootId, binding.operationId, input.args);
     if (!contract) return { status: 'conflict', reason: 'workflow call arguments do not form a canonical logical contract' };
     const attestation = Object.freeze<WorkflowReadOnlyCallAttestation>({

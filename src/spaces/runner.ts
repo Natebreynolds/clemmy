@@ -33,7 +33,12 @@ import {
   authorizeInstalledDataRunner,
   registerRunnerTrustRefreshHandler,
 } from './space-data-runner-trust.js';
-import { prepareAndAcquireSpaceReadAuthority } from './space-read-authority.js';
+import {
+  prepareAndAcquireSpaceReadAuthority,
+  prepareAndAcquireSpaceReviewedCliReadAuthority,
+} from './space-read-authority.js';
+import { compileReviewedCliArgv } from '../runtime/harness/reviewed-cli-shell-match.js';
+import { readHostCliEnvelope } from '../runtime/harness/json-repair.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr {
@@ -149,21 +154,23 @@ export async function runScript(
 }
 
 /**
- * Retired raw CLI boundary. The exact argv trust record remains useful
+ * A command line that is not a reviewed CLI read has no executor: the harness
+ * never spawns a frozen argv. The exact argv trust record remains useful
  * declaration/migration metadata, but cannot mint shared-kernel authority.
+ * A reviewed read never reaches here; it is compiled into its operation.
  */
 async function runCliSource(slug: string, cliArgv: string[]): Promise<RunSourceResult> {
   const commandLabel = cliArgv.join(' ');
   return {
     ok: false,
-    error: `Workspace "${slug}" local CLI "${commandLabel}" is unavailable: no shared durable call authority was supplied. The process was not started.`,
+    error: `Workspace "${slug}" local CLI "${commandLabel}" is unavailable: it is not a reviewed CLI read from the catalog, so no shared durable call authority can be minted for it. The process was not started.`,
     provenNoDispatch: true,
   };
 }
 
 /**
- * Space Composio execution may only redeem an authority root owned by the
- * shared durable workflow kernel. Space routes do not fall back to the raw
+ * Space provider execution (a Composio operation or a reviewed CLI read) may
+ * only redeem an authority root owned by the shared durable workflow kernel. Space routes do not fall back to the raw
  * gateway and do not wrap that gateway in the legacy workflow-mutation receipt
  * helper: neither path carries accepted-source lineage or physical authority.
  */
@@ -237,6 +244,33 @@ async function runSpaceComposio(
   };
 }
 
+const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+/**
+ * A reviewed CLI read comes back from the kernel as the carrier's execution
+ * envelope (argv, exit code, stdout text). A Space stores what the command
+ * PRODUCED: a clean JSON run stores its parsed payload, so the view reads the
+ * command's own shape; a run that did not exit cleanly is a failed refresh
+ * that names the exit and the stderr tail, never a stored envelope the view
+ * would render as text.
+ */
+export function reviewedCliSourceResult(run: RunSourceResult): RunSourceResult {
+  if (!run.ok) return run;
+  const envelope = readHostCliEnvelope(run.data);
+  if (!envelope) return run;
+  if (envelope.kind === 'failed') {
+    const stderr = envelope.stderr.replace(ANSI_ESCAPE_RE, '').trim().slice(-400);
+    return {
+      ok: false,
+      error: `reviewed read ${envelope.operationId} ${envelope.status}${
+        envelope.exitCode !== null ? ` (exit ${envelope.exitCode})` : ''
+      }${stderr ? `: ${stderr}` : ''}`,
+    };
+  }
+  if (envelope.kind === 'clean') return { ok: true, data: envelope.stdoutJson };
+  return run;
+}
+
 /** Run a single declared data source (no persistence). */
 export async function runSpaceDataSource(
   slug: string,
@@ -272,6 +306,27 @@ export async function runSpaceDataSource(
         error: trust.error,
         provenNoDispatch: true,
         ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
+      };
+    }
+    const reviewed = compileReviewedCliArgv(trust.cliArgv);
+    if (reviewed.status === 'matched') {
+      try {
+        return reviewedCliSourceResult(await runSpaceComposio(
+          slug,
+          reviewed.operationId,
+          reviewed.args,
+          opts.composioAuthority,
+          'read',
+        ));
+      } catch (err) {
+        return { ok: false, error: `reviewed read call failed: ${(err as Error).message}` };
+      }
+    }
+    if (reviewed.status === 'refused') {
+      return {
+        ok: false,
+        error: `Workspace "${slug}" local CLI "${trust.cliArgv.join(' ')}" names the reviewed read ${reviewed.operationId} but cannot be carried by it: ${reviewed.reason}. The process was not started.`,
+        provenNoDispatch: true,
       };
     }
     return runCliSource(slug, trust.cliArgv);
@@ -473,21 +528,29 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     // authority always wins; a mint refusal leaves the gate's zero-body
     // refusal in place and is surfaced beside it below.
     let mintRefusal: string | undefined;
-    if (
-      !composioAuthority
-      && source.composioSlug?.trim()
-      && !source.runner?.trim()
-      && !source.cliArgv?.length
-    ) {
-      const minted = await prepareAndAcquireSpaceReadAuthority({
-        slug,
-        sourceId: source.id,
-        toolSlug: source.composioSlug.trim(),
-        args: source.composioArgs ?? {},
-        cause,
-      });
-      if (minted.ok) composioAuthority = minted.authority;
-      else mintRefusal = minted.error;
+    if (!composioAuthority && !source.runner?.trim()) {
+      const reviewed = source.cliArgv?.length ? compileReviewedCliArgv(source.cliArgv) : null;
+      if (reviewed?.status === 'matched') {
+        const minted = await prepareAndAcquireSpaceReviewedCliReadAuthority({
+          slug,
+          sourceId: source.id,
+          operationId: reviewed.operationId,
+          args: reviewed.args,
+          cause,
+        });
+        if (minted.ok) composioAuthority = minted.authority;
+        else mintRefusal = minted.error;
+      } else if (!source.cliArgv?.length && source.composioSlug?.trim()) {
+        const minted = await prepareAndAcquireSpaceReadAuthority({
+          slug,
+          sourceId: source.id,
+          toolSlug: source.composioSlug.trim(),
+          args: source.composioArgs ?? {},
+          cause,
+        });
+        if (minted.ok) composioAuthority = minted.authority;
+        else mintRefusal = minted.error;
+      }
     }
     const run = await runSpaceDataSource(slug, source, {
       composioAuthority,

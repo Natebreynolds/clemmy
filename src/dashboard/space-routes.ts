@@ -77,6 +77,7 @@ import {
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { injectWorkspaceBootstrap } from '../spaces/view-html.js';
+import { clemViewDesignLayer } from '../spaces/view-design-layer.js';
 import { appendWiringHealthBanner, spaceWiringHealth } from '../spaces/wiring-health.js';
 import { availableStarterRecipes } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
@@ -351,7 +352,8 @@ lock('fetch',legacyFetch);
 try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
 function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
 ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
-window.clem=Object.freeze({slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
+var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
+window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
 })();</script>`;
 };
 
@@ -430,7 +432,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // ask that has Clem repair it. Advisory: dismissible, never blocks.
       const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
       res.send(appendWiringHealthBanner(
-        injectWorkspaceBootstrap(html, CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
+        injectWorkspaceBootstrap(html, clemViewDesignLayer() + CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
         wiring,
       ));
       return;

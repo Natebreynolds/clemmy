@@ -133,3 +133,54 @@ test('surfaces every configured BYO provider generically without leaking keys', 
     }
   });
 });
+
+test('reports the Grok account with its captured limits and today\'s spend per provider', async () => {
+  __resetRateLimitStoreForTests();
+  const { saveXaiOAuthTokens, clearXaiOAuthTokens } = await import('../runtime/auth-store.js');
+  const { recordByoRateLimit } = await import('../runtime/harness/rate-limit-store.js');
+  const { __resetModelStatusCacheForTests, providerForSpend } = await import('../runtime/harness/model-status.js');
+  saveXaiOAuthTokens({ accessToken: 'xai-access-token-test', refreshToken: 'xai-refresh-test' });
+  recordByoRateLimit('xai', {
+    'x-ratelimit-limit-requests': '600',
+    'x-ratelimit-remaining-requests': '590',
+    'x-ratelimit-limit-tokens': '12000000',
+    'x-ratelimit-remaining-tokens': '11000000',
+  });
+  __resetModelStatusCacheForTests();
+  const h = await boot();
+  try {
+    const raw = await (await fetch(`${h.url}/api/console/model-status`)).text();
+    assert.doesNotMatch(raw, /xai-access-token-test|xai-refresh-test/, 'no secret may leave the route');
+    const body = JSON.parse(raw) as {
+      xai: { connected: boolean; requests?: { limit: number; remaining: number }; tokens?: { limit: number } };
+      spendToday: { date: string; byProvider: Record<string, { tokens: number; calls: number }> };
+    };
+    assert.equal(body.xai.connected, true);
+    assert.deepEqual(body.xai.requests, { limit: 600, remaining: 590 });
+    assert.equal(body.xai.tokens?.limit, 12_000_000);
+    assert.match(body.spendToday.date, /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(typeof body.spendToday.byProvider, 'object');
+  } finally {
+    await h.close();
+    clearXaiOAuthTokens();
+  }
+  // Ledger rows land on the account that paid for them.
+  assert.equal(providerForSpend('gpt-5.6-sol', []), 'codex');
+  assert.equal(providerForSpend('claude-sonnet-5', []), 'claude');
+  assert.equal(providerForSpend('grok-4-1-fast-non-reasoning', []), 'xai');
+  assert.equal(providerForSpend('glm-5.3', [{ id: 'glm', modelIds: ['glm-5.3'] }]), 'glm');
+});
+
+test('a Grok account that is not connected is reported as such without limits', async () => {
+  __resetRateLimitStoreForTests();
+  const { __resetModelStatusCacheForTests } = await import('../runtime/harness/model-status.js');
+  __resetModelStatusCacheForTests();
+  const h = await boot();
+  try {
+    const body = await (await fetch(`${h.url}/api/console/model-status`)).json() as { xai: { connected: boolean; requests?: unknown } };
+    assert.equal(body.xai.connected, false);
+    assert.equal(body.xai.requests, undefined);
+  } finally {
+    await h.close();
+  }
+});

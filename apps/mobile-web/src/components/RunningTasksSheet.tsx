@@ -21,6 +21,7 @@ const MAX_VISIBLE_TASKS = 12;
 export function RunningTasksSheet({
   composerRef,
   onOpenRun,
+  compact = false,
 }: {
   /** Optional: only the Chat screen has a composer to return focus to. The
    *  sheet is mounted in the app shell so running work is visible on EVERY
@@ -29,6 +30,11 @@ export function RunningTasksSheet({
   /** Open the run's own screen. Expanding a row in place shows the three facts
    *  this DTO carries; the run itself is where what it CHANGED lives. */
   onOpenRun?: (sessionId: string) => void;
+  /** The header fits two signals beside a title, not three. When the
+   *  Needs-you pill is also showing, the chip keeps only its spinner — a
+   *  glyph that still means "work is happening" — and the words move into
+   *  its accessible name and the sheet it opens. */
+  compact?: boolean;
 }) {
   // ONE snapshot for the whole app: the shell keeps the poll alive and Home
   // renders from this same store, so the chip and the page cannot disagree.
@@ -90,7 +96,16 @@ export function RunningTasksSheet({
 
   // Presenter contract: the chip exists only while there is current work —
   // at zero the entire affordance is absent from the header.
-  if (view.total === 0) return null;
+  // Digits alone ("8·7·22") name nothing. The chip says the one thing the
+  // header is for: work happening right now. With nothing running it names
+  // the stalled work instead, and when neither exists it steps aside — the
+  // Needs-you pill beside it already carries what is waiting on the user.
+  const chipText = view.running > 0
+    ? `${view.running} running`
+    : view.stalled > 0
+      ? `${view.stalled} stalled`
+      : null;
+  if (view.total === 0 || chipText === null) return null;
   // "37 current tasks" (live 2026-08-25) counted every needs-attention
   // remnant as current work. The presenter's label says what is true: how
   // many are actually RUNNING and how many are waiting on the user.
@@ -102,14 +117,13 @@ export function RunningTasksSheet({
   // Every group the sheet LISTS gets a digit, stalled included: the sheet
   // shows all three, so a chip that counted two of them under-reported the
   // list it opens.
-  const compact = [view.running, view.needsYou, view.stalled].filter((n) => n > 0).join('·');
 
   return (
     <div class="running-tasks-affordance">
       <button
         ref={triggerRef}
         type="button"
-        class="running-tasks-trigger"
+        class={`running-tasks-trigger${compact ? ' running-tasks-trigger-compact' : ''}`}
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => { haptic('light'); setOpen(true); }}
@@ -124,7 +138,7 @@ export function RunningTasksSheet({
             <path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5" />
           </svg>
         </span>
-        <span aria-hidden="true">{compact}</span>
+        {compact ? null : <span aria-hidden="true">{chipText}</span>}
         <span class="sr-only">{pillLabel}</span>
       </button>
 

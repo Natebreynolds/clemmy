@@ -1,4 +1,5 @@
-import { readCompletionReviewResponse, type TaskMode, type ReplayPayload } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
  * served by the Clementine daemon at /m/), so the session cookie is sent
@@ -148,10 +149,18 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
       clearLastGood();
       window.dispatchEvent(new Event('clem:needs-login'));
     } else {
-      void fetch('/m/auth/status', { credentials: 'include' })
+      // The probe must be a LIVE answer (never a cached or remembered copy):
+      // a session that is alive but refusing proofs was signing over a
+      // fingerprint the daemon no longer holds, and the fingerprint in this
+      // answer is the one that heals it.
+      void fetch('/m/auth/status', { credentials: 'include', cache: 'no-store' })
         .then((probe) => (probe.ok ? probe.json() : { authenticated: false }))
-        .then((status: { authenticated?: boolean }) => {
-          if (status?.authenticated) return;
+        .then((status: LiveAuthStatus) => {
+          const recovery = recoverFromUnauthorized(status);
+          if (recovery.kind === 'session_alive') {
+            if (recovery.adoptFingerprint) sessionFingerprint = recovery.adoptFingerprint;
+            return;
+          }
           // A CONFIRMED dead session, not a rotation race: drop the remembered
           // reads with it. A transient 401 keeps them, which is the point.
           clearLastGood();
@@ -1641,6 +1650,36 @@ export async function setCompletionReview(enabled: boolean) {
 
 export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
+}
+
+/** Tidy: the one door for clearing clutter. Plan first (exact counts, nothing
+ *  changes), then apply the classes the person chose. Same module as desktop. */
+export type TidyClass = 'updates' | 'staleAsks' | 'stuckRuns' | 'oldConversations';
+export interface TidyCounts { updates: number; staleAsks: number; stuckRuns: number; oldConversations: number }
+export interface TidyResult {
+  appliedAt: string;
+  updatesCleared: number;
+  updatesHeld: number;
+  asksCancelled: number;
+  runsStopped: number;
+  conversationsArchived: number;
+  errors: string[];
+}
+export type TidyScope = 'stale' | 'all';
+export async function getTidyPlan(scope: TidyScope = 'stale'): Promise<{ counts: TidyCounts; scope: TidyScope }> {
+  return api<{ counts: TidyCounts; scope: TidyScope }>(`/m/api/tidy/plan?scope=${scope}`);
+}
+export async function applyTidy(classes: TidyClass[], scope: TidyScope = 'stale'): Promise<{ result: TidyResult; planned: TidyCounts }> {
+  return api<{ result: TidyResult; planned: TidyCounts }>('/m/api/tidy/apply', {
+    method: 'POST', body: JSON.stringify({ classes, scope }),
+  });
+}
+
+/** Usage meters for every connected model account — the same daemon builder
+ *  the desktop reads, so the phone never shows a different number. */
+export type UsageStatus = UsageStatusLike & { updatedAt: number };
+export async function getUsageStatus(): Promise<UsageStatus> {
+  return api<UsageStatus>('/m/api/settings/usage');
 }
 
 /** sessionId is the conversation the switch was made FROM, when there is one

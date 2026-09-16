@@ -8,6 +8,7 @@ import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { CodexLoginForm } from './CodexLoginForm';
 import { XaiLoginForm } from './XaiLoginForm';
 import { ConnectedModelsStrip } from './ConnectedModelsStrip';
+import { UsageMetersPanel } from '@/components/ModelStatusChips';
 
 /** Settings › Models: who thinks, who does the legwork, who checks. */
 export function ModelsSection({ sessionId }: { sessionId?: string } = {}) {
@@ -40,6 +41,9 @@ export function ConnectedSection() {
     <section id="connected" className="scroll-mt-16">
       <h2 className="mb-1 text-h2 text-fg">Connected</h2>
       <p className="mb-3 text-small text-muted">Sign in once; every model from that account shows up above.</p>
+      <div className="mb-4">
+        <UsageMetersPanel />
+      </div>
       <div className="flex flex-wrap gap-2">
         {chips.map((c) => (
           <span key={c.key} className={cn('inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1.5 pl-2.5 pr-3 text-small', !c.on && 'text-faint')}>

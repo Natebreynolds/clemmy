@@ -438,7 +438,7 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
 test('the header row is fed by the chrome rule, and Home is handed the age the pill used to carry', () => {
   const app = read('../app.tsx');
   assert.match(app, /const headerChrome = phoneHeaderChrome\(\{ tab, needsYouSignal: needsYou\.show \}\)/);
-  assert.match(app, /\{headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\} \/> : null\}/);
+  assert.match(app, /\{headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\} compact=\{headerChrome\.needsPill\} \/> : null\}/);
   assert.match(app, /\{headerChrome\.needsPill \? \(/);
   assert.doesNotMatch(app, /tab === 'home' && needsYou\.show/,
     'the pill no longer appears only on the one screen that already says it');

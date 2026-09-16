@@ -967,3 +967,25 @@ test('the served view is seeded with its dataset before authored script runs, sc
   assert.ok(!seedScript.includes('<'), 'no "<" survives inside the seed, so no dataset can close it');
   assert.ok(seedScript.includes('\\u003c/script'), 'the hostile subject is escaped, not dropped');
 });
+
+test('every served view carries the framework design layer and helper kit ahead of the authored document', async () => {
+  const slug = 'design-layer';
+  store.spaceStore.save({ id: slug, title: 'Design Layer', viewEntry: 'view/index.html' });
+  mkdirSync(path.join(store.resolveSpaceDir(slug), 'view'), { recursive: true });
+  writeFileSync(
+    path.join(store.resolveSpaceDir(slug), 'view', 'index.html'),
+    '<!doctype html><html><head><style>body{margin:4px}</style></head><body><script>window.__KIT__=typeof clem.ui.kpis;</script></body></html>',
+    'utf-8',
+  );
+  const html = await (await fetch(`${base}/console/spaces/${slug}/view/?theme=dark`)).text();
+  const kitAt = html.indexOf('window.__clemKit=');
+  const styleAt = html.indexOf('<style id="clem-view-design">');
+  const bridgeAt = html.indexOf('window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,');
+  const authoredAt = html.indexOf('body{margin:4px}');
+  assert.ok(kitAt > 0, 'the helper kit is planted');
+  assert.ok(styleAt > 0, 'the design stylesheet is planted');
+  assert.ok(bridgeAt > 0, 'the bridge merges the kit into the frozen clem');
+  assert.ok(kitAt < styleAt && styleAt < bridgeAt && bridgeAt < authoredAt, 'kit, then style, then bridge, all before the authored document');
+  assert.match(html, /:root\[data-theme=dark\]/, 'dark tokens travel with the view');
+  assert.ok(html.indexOf('data-theme') > 0, 'the theme handoff is read from the query string by the kit');
+});

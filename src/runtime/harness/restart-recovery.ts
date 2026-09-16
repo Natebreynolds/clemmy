@@ -1092,6 +1092,35 @@ function commitRestartRecoveryTerminal(
  * send a bounded notification where appropriate, and clear the marker. Returns
  * a structured recovery summary. Never throws.
  */
+/**
+ * True when the newest recovery event of this type already records this exact
+ * interruption with the same decision. Recovery runs at every boot and on a
+ * timer. A checkpoint the reconciler cannot release — a prepared workflow
+ * dispatch still owns its source, or an exact owner the terminal cannot name —
+ * would otherwise be re-recorded and re-announced each time, which floats a
+ * weeks-old conversation to the top of every list on every restart and pings
+ * the user about the same interruption again. The first record is the honest
+ * one; a repeat says nothing new.
+ */
+function recoveryEventAlreadyRecorded(
+  sessionId: string,
+  type: 'run_paused' | 'restart_recovery_decision',
+  interruptedAt: string,
+  match: { phase?: string; reason?: string },
+): boolean {
+  try {
+    const latest = listEvents(sessionId, { types: [type], desc: true, limit: 1 })[0];
+    if (!latest) return false;
+    const data = objectRecord(latest.data) ?? {};
+    if (data.interruptedAt !== interruptedAt) return false;
+    if (match.phase !== undefined && data.phase !== match.phase) return false;
+    if (match.reason !== undefined && data.reason !== match.reason) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function recoverInterruptedChatRuns(
   now: () => number = Date.now,
   dispatchResume?: ResumeDispatcher,
@@ -1258,7 +1287,7 @@ export function recoverInterruptedChatRuns(
         record.errors.push(`checkpoint_clear: ${err instanceof Error ? err.message : String(err)}`);
       }
       try {
-        appendEvent({
+        if (!recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, { phase: 'terminal_reconciled' })) appendEvent({
           sessionId: row.id,
           turn: 0,
           role: 'system',
@@ -1422,13 +1451,14 @@ export function recoverInterruptedChatRuns(
     // the visible notice below: consumers can reconstruct why a run auto-resumed
     // or stayed manual without parsing human-facing copy or daemon boot logs.
     try {
-      appendEvent({
+      const decisionPhase = willAutoResume && exactCheckpointRecovery ? 'dispatch_claimed' : 'policy_decided';
+      if (decisionPhase === 'dispatch_claimed' || !recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, { phase: decisionPhase })) appendEvent({
         sessionId: row.id,
         turn: 0,
         role: 'system',
         type: 'restart_recovery_decision',
         data: {
-          phase: willAutoResume && exactCheckpointRecovery ? 'dispatch_claimed' : 'policy_decided',
+          phase: decisionPhase,
           interruptedAt: since,
           ageMs: Number.isFinite(ageMs) ? ageMs : null,
           eligible: willAutoResume,
@@ -1522,6 +1552,9 @@ export function recoverInterruptedChatRuns(
       : userStopped
         ? 'stopped_before_restart'
         : 'interrupted_by_restart';
+    // A notice already on record for this exact interruption is not repeated
+    // and does not ping the user again.
+    let noticeRepeated = false;
     try {
       if (!willAutoResume && recoveryIdentity && pendingDispatchOwnership) {
         // A needs-input TurnOutcome is terminal for this accepted source. It
@@ -1529,7 +1562,8 @@ export function recoverInterruptedChatRuns(
         // that same source, because the next boot would reconcile the terminal
         // and erase the only restart handle. Publish guidance as nonterminal
         // pause state and retain the original marker/attempt instead.
-        appendEvent({
+        noticeRepeated = recoveryEventAlreadyRecorded(row.id, 'run_paused', since, { reason: noticeReason });
+        if (!noticeRepeated) appendEvent({
           sessionId: row.id,
           turn: recoveryIdentity.turn,
           role: 'system',
@@ -1574,7 +1608,8 @@ export function recoverInterruptedChatRuns(
         // A pre-attempt legacy marker with no durable accepted user event has no
         // honest TurnIdentity. Keep the recovery state visible without
         // inventing ownership or publishing a fake terminal.
-        appendEvent({
+        noticeRepeated = recoveryEventAlreadyRecorded(row.id, 'run_paused', since, { reason: 'restart_recovery_identity_missing' });
+        if (!noticeRepeated) appendEvent({
           sessionId: row.id,
           turn: 0,
           role: 'system',
@@ -1600,7 +1635,7 @@ export function recoverInterruptedChatRuns(
     // An auto-resumed run notifies only if the resume FAILS (below) — a
     // successful resume delivers its own answer, and "it broke + it's fixed"
     // as two pings is noise.
-    if (!willAutoResume && notified < MAX_NOTIFICATIONS) {
+    if (!willAutoResume && !noticeRepeated && notified < MAX_NOTIFICATIONS) {
       try {
         addNotification({
           id: `${tick}-chat-interrupted-${row.id}`,

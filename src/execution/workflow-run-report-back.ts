@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { humanizeStepOutput } from './workflow-diagnosis.js';
 import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -1326,6 +1327,24 @@ export function attemptWorkflowRunReportBack(filePath: string, now: number = Dat
   return attemptWorkflowRunReportBackInternal(filePath, now, false);
 }
 
+/**
+ * A report-back is prose a person reads on Slack, Discord or the desktop. A
+ * final step that hands back a JSON object carrying its message (a
+ * `{"message": "…"}` envelope, a `summary`, a `text`) is not a different
+ * report — it is that message. The object is read for its text here, once,
+ * so no surface prints braces at the person. Anything that is not a JSON
+ * object passes through untouched.
+ */
+export function humanReportDetail(detail: string): string {
+  const trimmed = (detail ?? '').trim();
+  if (!trimmed.startsWith('{')) return detail;
+  let parsed: unknown;
+  try { parsed = JSON.parse(trimmed); } catch { return detail; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return detail;
+  const rendered = humanizeStepOutput(parsed).trim();
+  return rendered.length > 0 ? rendered : detail;
+}
+
 export function recordAndAttemptWorkflowRunReportBack(
   filePath: string,
   input: Omit<
@@ -1336,6 +1355,7 @@ export function recordAndAttemptWorkflowRunReportBack(
     | 'acknowledgedOriginObserverSettlements'
   >,
 ): boolean {
+  input = { ...input, detail: humanReportDetail(input.detail) };
   const checkpointed = checkpointWorkflowRunReportBack(filePath, input);
   if (!checkpointed) return false;
   const run = readRunRecordUnlocked(filePath);

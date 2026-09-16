@@ -1629,3 +1629,69 @@ test('inherited capability evidence still empties for a plain decline through th
     'validInheritedEvidence decides through the exported predicate, not an inline decline check');
   assert.doesNotMatch(body, /disposition === 'declined'/);
 });
+
+test('a later request that is not an answer dismisses the open question even after a re-offer, instead of wedging the session', async () => {
+  const sessionId = 'sess-moved-on-after-reoffer';
+  const origin = accepted(sessionId, 'Build me a daily workspace.');
+  continuity.createTaskContinuityPacket({
+    sessionId,
+    originatingSourceUserSeq: origin.seq,
+    pause: {
+      kind: 'clarification',
+      question: 'Could you open the workspace directly and check if there is an approval prompt visible?',
+      options: [],
+      slot: { goalId: `goal:${sessionId}:${origin.seq}`, revision: 0, questionId: `question:${origin.seq}`, slotKey: 'reply' },
+    },
+  });
+  // The first message after the question was itself not readable as an
+  // answer and the question was re-offered; the packet stayed available.
+  accepted(sessionId, 'Update my existing workspace and add the two data sources back with the frozen Salesforce query and the Slack channel history, then refresh all three sources and make it active. '.repeat(3));
+  assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+
+  // The person sends the same instruction again. It is not an answer, and it
+  // is no longer the very next message — the question must still give way.
+  const later = accepted(sessionId, 'Update my existing workspace and add the two data sources back with the frozen Salesforce query and the Slack channel history, then refresh all three sources and make it active. '.repeat(3));
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: later.seq,
+    message: later.data.text as string,
+  }, later.seq);
+  assert.equal(enriched.taskContinuation, undefined, 'a moved-on request carries no continuation');
+  assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', 'the stale question is dismissed as topic_changed');
+});
+
+test('an admitted goal amendment while a clarification is pending dismisses the question instead of refusing the turn', async () => {
+  const sessionId = 'sess-amend-goal-moves-on';
+  const origin = accepted(sessionId, 'Build me a daily workspace.');
+  continuity.createTaskContinuityPacket({
+    sessionId,
+    originatingSourceUserSeq: origin.seq,
+    pause: {
+      kind: 'clarification',
+      question: 'Could you open the workspace directly and check if there is an approval prompt visible?',
+      options: [],
+      slot: { goalId: `goal:${sessionId}:${origin.seq}`, revision: 0, questionId: `question:${origin.seq}`, slotKey: 'reply' },
+    },
+  });
+  accepted(sessionId, 'Update my existing workspace and add the two data sources back, then refresh all three and make it active.');
+  const later = accepted(sessionId, 'Update my existing workspace and add the two data sources back, then refresh all three and make it active.');
+  const event = eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'turn_semantics_interpreted',
+    data: {
+      purpose: 'turn_semantics', sourceUserSeq: later.seq, inputHash: 'a', audienceHash: 'b', policyRevision: 'c',
+      validationOutcome: 'admitted',
+      raw: { version: 1, relation: 'amend_goal', targetGoal: { goalId: `goal:${sessionId}:${origin.seq}`, baseRevision: 0 }, goal: { openSlots: [] }, work: { kind: 'x' }, slotAnswers: [] },
+    },
+  });
+  const db = eventlog.openEventLog();
+  db.prepare(`INSERT INTO turn_semantics_claims (session_id, source_user_seq, owner, created_at, event_id, input_hash, audience_hash, policy_revision)
+              VALUES (?, ?, 'test', ?, ?, 'a', 'b', 'c')`).run(sessionId, later.seq, new Date().toISOString(), event.id);
+
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: later.seq,
+    message: later.data.text as string,
+  }, later.seq);
+  assert.equal(enriched.taskContinuation, undefined);
+  assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', 'the pending question gives way to the amended goal');
+});

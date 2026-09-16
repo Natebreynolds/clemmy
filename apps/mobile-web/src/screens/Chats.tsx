@@ -129,9 +129,17 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
           }}>
             <div class="min-w-0">
               <div class="card-title-sm truncate">{session.title || 'Untitled'}</div>
+              {/* Nearly every conversation is "active" (not terminal), so
+                  that word is noise on a list. Only a terminal state earns a
+                  word and a dot; an ordinary conversation shows when it was
+                  last touched. */}
               <div class="card-when">
-                <span class={`status-dot status-${session.status}`} aria-hidden="true" />
-                {session.status.replace(/_/g, ' ')} · {relativeTime(session.updatedAt)}
+                {session.status === 'failed' || session.status === 'cancelled' ? (
+                  <>
+                    <span class={`status-dot status-${session.status}`} aria-hidden="true" />
+                    {session.status.replace(/_/g, ' ')} · {relativeTime(session.updatedAt)}
+                  </>
+                ) : relativeTime(session.updatedAt)}
               </div>
             </div>
             <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">

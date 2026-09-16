@@ -44,6 +44,17 @@ test('a run that keeps restarting without progressing parks at the cap', () => {
   const rec = readRun('run-loop');
   assert.equal(rec.status, 'parked');
   assert.match(String(rec.error), /automatic restarts/);
+  // The cap's park is not a person's approval hold. It is marked so the
+  // scheduler never holds the next occurrence for it.
+  assert.match(String(rec.bootResumeParkedAt), /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('a cap-parked run does not hold the schedule; an approval-parked run does', async () => {
+  const { workflowSchedulerInternalsForTest: seam } = await import('./workflow-scheduler.js');
+  seedRun('sched-cap-parked', { status: 'parked', bootResumeParkedAt: '2026-09-16T15:26:10.000Z', workflow: 'sched-demo' });
+  seedRun('sched-approval-parked', { status: 'parked', workflow: 'sched-demo' });
+  const counts = seam.countActiveRunsFor('sched-demo');
+  assert.equal(counts.parked, 1, 'only the approval-parked run counts as parked');
 });
 
 test('a parked run is excluded from the resume set, not merely flagged', () => {

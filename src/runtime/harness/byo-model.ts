@@ -27,6 +27,7 @@
  * every call site and the harness loop untouched.
  */
 import OpenAI from 'openai';
+import { recordByoRateLimit } from './rate-limit-store.js';
 import { createHash } from 'node:crypto';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
@@ -864,10 +865,22 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // client's own 2 retries so they don't STACK (otherwise a persistently-down
   // backend makes ~(1+3)×(1+2) attempts with two backoff schedules). Parity off
   // keeps the SDK default (2) — byte-identical legacy behavior.
+  // Every answer carries the provider's own limit headers when it has them;
+  // reading them here is what the usage meters run on. A provider with no
+  // headers costs one no-op per call.
+  const limitKey = byo.providerId || '';
+  const baseFetch: typeof fetch = bearerRefreshingFetch ?? fetch;
+  const capturingFetch: typeof fetch | undefined = limitKey
+    ? (async (url, init) => {
+        const res = await baseFetch(url as never, init as never);
+        recordByoRateLimit(limitKey, res.headers);
+        return res;
+      }) as typeof fetch
+    : bearerRefreshingFetch;
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,
-    ...(bearerRefreshingFetch ? { fetch: bearerRefreshingFetch } : {}),
+    ...(capturingFetch ? { fetch: capturingFetch } : {}),
     ...(modelParityEnabled() ? { maxRetries: 0 } : {}),
   });
   const completions = client.chat.completions;

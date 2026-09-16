@@ -31,7 +31,21 @@ export interface CodexRateLimit {
    *  time or by any later capture showing head-room. */
   exhaustedUntil?: number;
 }
-export interface RateLimitSnapshot { codex?: CodexRateLimit }
+/** A limit/remaining pair as OpenAI-compatible providers report it in
+ *  `x-ratelimit-{limit,remaining}-{requests,tokens}` headers (xAI ships all
+ *  four on every completion). The window is the provider's, usually a minute;
+ *  no reset header is promised, so `resetAt` is optional. */
+export interface ByoRateLimitWindow { limit: number; remaining: number; resetAt?: number }
+export interface ByoRateLimit {
+  requests?: ByoRateLimitWindow;
+  tokens?: ByoRateLimitWindow;
+  capturedAt: number;
+}
+export interface RateLimitSnapshot {
+  codex?: CodexRateLimit;
+  /** Keyed by BYO provider id (e.g. the xAI grant). */
+  byo?: Record<string, ByoRateLimit>;
+}
 
 const STORE_PATH = path.join(BASE_DIR, 'state', 'model-rate-limits.json');
 // Read dynamically (not a const at import) so a test setting NODE_ENV after this
@@ -213,6 +227,35 @@ export function codexQuotaExhausted(now: number = Date.now()): boolean {
     return false;
   } catch {
     return false;
+  }
+}
+
+/** Capture the generic OpenAI-style limit headers a BYO provider returns.
+ *  No-op when neither remaining header is present, so a streaming response
+ *  that dropped them keeps the last-known reading. */
+export function recordByoRateLimit(providerId: string, headers: HeaderLike): void {
+  try {
+    if (!providerId) return;
+    loadOnce();
+    const now = Date.now();
+    const window = (kind: 'requests' | 'tokens'): ByoRateLimitWindow | undefined => {
+      const remaining = numFrom(headers, `x-ratelimit-remaining-${kind}`);
+      const limit = numFrom(headers, `x-ratelimit-limit-${kind}`);
+      if (remaining == null || limit == null || limit <= 0) return undefined;
+      const resetAt = resetToEpochMs(headers, [], [`x-ratelimit-reset-${kind}`], now);
+      return {
+        limit: Math.round(limit),
+        remaining: Math.max(0, Math.min(Math.round(limit), Math.round(remaining))),
+        ...(resetAt ? { resetAt } : {}),
+      };
+    };
+    const requests = window('requests');
+    const tokens = window('tokens');
+    if (!requests && !tokens) return;
+    snapshot.byo = { ...(snapshot.byo ?? {}), [providerId]: { requests, tokens, capturedAt: now } };
+    persist();
+  } catch {
+    /* never break the model path */
   }
 }
 

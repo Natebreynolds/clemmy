@@ -25,6 +25,7 @@ import path from 'node:path';
 import { isValidSpaceSlug, resolveInSpace, resolveSpaceDir, spaceStore } from './store.js';
 import { readData, appendAudit } from './data-store.js';
 import { injectWorkspaceBootstrap } from './view-html.js';
+import { clemViewDesignLayer } from './view-design-layer.js';
 
 export interface PublishSnapshotOk {
   ok: true;
@@ -64,7 +65,8 @@ function staticClemBridge(slug: string, datasetJson: string, publishedAt: string
     + `data:async function(){return D;},`
     + `refresh:async function(){return {ok:true,snapshot:true,data:D};},`
     + `note:frozen('notes'),compose:frozen('compose'),action:frozen('actions')`
-    + `};})();</script>`;
+    + `};var K=window.__clemKit;if(K){window.clem.fmt=K.fmt;window.clem.ui=K.ui;window.clem.sources=K.sources;window.clem.theme=K.theme;try{delete window.__clemKit;}catch(_){}}`
+    + `})();</script>`;
 }
 
 function countRows(value: unknown): number | null {
@@ -137,7 +139,7 @@ export function buildPublishSnapshot(slug: string): PublishSnapshotResult {
       const marker = `<meta name="clementine-snapshot" content="${publishedAt}">`;
       // The live route and static export use the same document-start injection
       // rule: clem exists before any authored inline or external script runs.
-      const injected = injectWorkspaceBootstrap(html, bridge + marker);
+      const injected = injectWorkspaceBootstrap(html, clemViewDesignLayer() + bridge + marker);
       writeFileSync(dst, injected, 'utf-8');
       bytes += Buffer.byteLength(injected);
     } else {

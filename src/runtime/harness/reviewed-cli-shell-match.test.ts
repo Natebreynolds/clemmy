@@ -18,6 +18,7 @@ const { CLI_CATALOG } = await import('../../integrations/cli-catalog/catalog.js'
 const manifests = await import('./capability-manifest.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const {
+  compileReviewedCliArgv,
   renderReviewedCliArgumentMap,
   renderReviewedCliWorkCallExample,
   reviewedCliArgumentMapForOperation,
@@ -142,4 +143,56 @@ test('the argument map is recoverable from the operation id alone, for a refusal
   assert.ok(map);
   assert.deepEqual(map!.map((argument) => argument.name), reviewedRead.arguments.map((argument) => argument.name));
   assert.equal(reviewedCliArgumentMapForOperation('not_a_reviewed_read'), null);
+});
+
+test('a frozen argv whose head is a reviewed read compiles into that operation and its arguments', () => {
+  const entry = CLI_CATALOG.find((candidate) => candidate.reviewedRead);
+  assert.ok(entry?.reviewedRead, 'the catalog declares at least one reviewed read');
+  const reviewed = entry.reviewedRead;
+  const required = reviewed.arguments.find((argument) => argument.required);
+  assert.ok(required?.token, 'the reviewed read declares a required option');
+  const optional = reviewed.arguments.find((argument) => !argument.required);
+  const prefixFlags = reviewed.argvPrefix.filter((token) => token.startsWith('-'));
+  const head = [entry.command, ...reviewed.argvPrefix.filter((token) => !token.startsWith('-'))];
+
+  // Prefix flags the carrier adds itself are accepted and dropped; a value
+  // with spaces is one argv element, exactly as a Space freezes it.
+  const compiled = compileReviewedCliArgv([
+    ...head,
+    required.token, 'SELECT Id FROM Opportunity LIMIT 5',
+    ...prefixFlags,
+    ...(optional?.token ? [`${optional.token}=me`] : []),
+  ]);
+  assert.equal(compiled.status, 'matched');
+  if (compiled.status !== 'matched') return;
+  assert.equal(compiled.operationId, reviewed.operationId);
+  assert.equal(compiled.descriptorId, reviewed.descriptorId);
+  assert.equal(compiled.args[required.name], 'SELECT Id FROM Opportunity LIMIT 5');
+  if (optional) assert.equal(compiled.args[optional.name], 'me');
+
+  // An option the reviewed read does not declare is refused by name: the
+  // operation cannot carry it, so nothing pretends to.
+  const stray = compileReviewedCliArgv([...head, required.token, 'SELECT Id FROM Lead', '--result-format', 'csv']);
+  assert.equal(stray.status, 'refused');
+  if (stray.status === 'refused') {
+    assert.equal(stray.operationId, reviewed.operationId);
+    assert.match(stray.reason, /option "--result-format" is not part of/);
+  }
+
+  const missing = compileReviewedCliArgv([...head, ...prefixFlags]);
+  assert.equal(missing.status, 'refused');
+  if (missing.status === 'refused') assert.match(missing.reason, new RegExp(`required option "${required.token}" is missing`));
+
+  const noValue = compileReviewedCliArgv([...head, required.token]);
+  assert.equal(noValue.status, 'refused');
+  if (noValue.status === 'refused') assert.match(noValue.reason, /has no value/);
+
+  const positional = compileReviewedCliArgv([...head, required.token, 'SELECT Id FROM Lead', 'extra']);
+  assert.equal(positional.status, 'refused');
+  if (positional.status === 'refused') assert.match(positional.reason, /unexpected argument "extra"/);
+
+  // Anything else stays an ad-hoc command line with no executor.
+  assert.deepEqual(compileReviewedCliArgv(['node', '-e', 'console.log(1)']), { status: 'unmatched' });
+  assert.deepEqual(compileReviewedCliArgv([entry.command, 'org', 'display', '--json']), { status: 'unmatched' });
+  assert.deepEqual(compileReviewedCliArgv([]), { status: 'unmatched' });
 });

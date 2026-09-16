@@ -499,6 +499,9 @@ export interface ByoBackendConfig {
   primaryId: string;
   judgeId: string;
   providerLabel: string;
+  /** Stable provider id (the BYO_PROVIDERS entry id); the default env-backed
+   *  backend has none. Keys captured rate limits per provider. */
+  providerId?: string;
   /** OAuth-backed providers (xAI): resolve a FRESH bearer per request so an
    *  expired access token refreshes instead of 401-ing the brain into a
    *  false auth-dead cooldown (live 2026-08-19: grok stolen by codex). */

@@ -28,6 +28,7 @@ const {
   projectForegroundWorkingNowSnapshot,
   projectWorkingNowSnapshot,
   projectWorkflowRunActivity,
+  projectChatAttemptActivity,
   shouldSurfaceInWorkingNow,
   WORKING_NOW_FOREGROUND_MS,
 } = await import('./activity-projection.js');
@@ -720,4 +721,49 @@ test('Working Now shows a workflow rewrite session the moment it starts, named b
   assert.equal(row?.presentationLane, 'scheduled');
   assert.match(row?.headline ?? '', /Rewriting workflow "team-activity-slack-updates" into exact steps \(attempt 1 of 3\)/);
   assert.doesNotMatch(row?.headline ?? '', /definition file/, 'the prompt\'s first line is not a headline');
+});
+
+test('a run waiting on a workspace binding is blocked on a person, never counted as running', () => {
+  const observedAt = '2026-09-16T16:00:00.000Z';
+  const projected = projectWorkflowRunActivity({
+    id: 'needs-binding',
+    workflow: 'team-activity-slack-updates',
+    status: 'blocked_readiness',
+    createdAt: '2026-09-01T23:03:04.482Z',
+  }, observedAt)!;
+  assert.equal(projected.lifecycle, 'blocked');
+  assert.equal(projected.needsAttention, true);
+  assert.notEqual(projected.liveness, 'live');
+});
+
+test('an unfinished chat attempt nobody has leased for half an hour reads stale, a fresh one reads unknown', () => {
+  const base = {
+    sessionId: 'sess-unleased',
+    headline: 'a chat',
+    revision: 1,
+  };
+  const attempt = (startedAt: string) => ({
+    attemptId: 'attempt-1',
+    sessionId: 'sess-unleased',
+    runId: null,
+    startedAt,
+    finishedAt: null,
+    status: 'active' as const,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    sourceUserSeq: 1,
+  });
+  const stale = projectChatAttemptActivity({
+    ...base,
+    attempt: attempt('2026-09-15T18:21:00.000Z') as never,
+    observedAt: '2026-09-16T16:00:00.000Z',
+  });
+  assert.equal(stale.liveness, 'stale', 'an attempt no runner has held for a day is not running');
+
+  const fresh = projectChatAttemptActivity({
+    ...base,
+    attempt: attempt('2026-09-16T15:59:30.000Z') as never,
+    observedAt: '2026-09-16T16:00:00.000Z',
+  });
+  assert.equal(fresh.liveness, 'unknown', 'a just-started attempt gets its grace before a lease is claimed');
 });

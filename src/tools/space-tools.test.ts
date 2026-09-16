@@ -1218,3 +1218,43 @@ test('space_get_runner errors cleanly for a missing runner + lists what IS decla
   assert.match(out, /has no runner "data\/ghost\.mjs"/);
   assert.match(out, /deepwhy\.mjs/);
 });
+
+test('re-saving an existing Workspace merges data sources by id; only an explicit list drops one', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-merge.html');
+  writeFileSync(draft, '<html><script>clem.data().then(data => render(data.cal, data.tasks))</script></html>', 'utf-8');
+  await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS', 'SALESFORCE_GET_TASKS'], async () => {
+    const created = text(await tools.space_save({
+      slug: 'merge-board',
+      title: 'Merge Board',
+      view_path: draft,
+      data_sources: [
+        { id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{"max":10}' },
+        { id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true },
+      ],
+    }));
+    assert.match(created, /Created workspace/, created);
+    assert.equal(store.spaceStore.get('merge-board')?.dataSources.length, 2);
+
+    // A save that names one source updates that source and keeps the other —
+    // it used to replace the whole set and silently drop "tasks".
+    await tools.space_save({
+      slug: 'merge-board',
+      title: 'Merge Board',
+      data_sources: [{ id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{"max":25}' }],
+    });
+    const merged = store.spaceStore.get('merge-board')!;
+    assert.deepEqual(merged.dataSources.map((s) => s.id), ['cal', 'tasks']);
+    assert.deepEqual(merged.dataSources[0].composioArgs, { max: 25 });
+
+    // Dropping is explicit.
+    await tools.space_save({ slug: 'merge-board', title: 'Merge Board', remove_data_sources: ['tasks'] });
+    assert.deepEqual(store.spaceStore.get('merge-board')!.dataSources.map((s) => s.id), ['cal']);
+
+    const unknown = text(await tools.space_save({ slug: 'merge-board', title: 'Merge Board', remove_data_sources: ['nope'] }));
+    assert.match(unknown, /does not have/);
+
+    // An explicit empty list is the one partial that cannot be partial.
+    await tools.space_save({ slug: 'merge-board', title: 'Merge Board', data_sources: [] });
+    assert.equal(store.spaceStore.get('merge-board')!.dataSources.length, 0);
+  });
+});

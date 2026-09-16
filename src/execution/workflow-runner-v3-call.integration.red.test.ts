@@ -810,7 +810,13 @@ test('BARE CALL RECOVERY — a mutating body that commits then loses its respons
   assert.equal(installed.bodies(), 1, 'durable reentry never repeats the provider mutation');
 });
 
-test('BARE CALL CONSENT — a durable queue source string is presentation metadata, not mutation authority', async () => {
+test('BARE CALL CONSENT — a human-triggered run is the approval for its ordinary writes; the queue source string adds nothing', async () => {
+  // The person who queued the run already decided it. The runner mints the
+  // write authorization from the exact human-run receipt for THIS run id
+  // (manual_run_authority) — never from the queue's display source string,
+  // and never as a parked human card. The decision is recorded as a resolved
+  // approval row so the audit shows who answered. A send, a destructive
+  // carrier declaration, or an explicit checkpoint still asks (pinned below).
   const installed = bareFixture('bare-source-string-nonauthority', 'external_write');
   installed.workflow.enabled = true;
   workflowStore.writeWorkflow(installed.workflow.name, installed.workflow);
@@ -824,23 +830,15 @@ test('BARE CALL CONSENT — a durable queue source string is presentation metada
   installed.ctx.runId = queued.id!;
   const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
 
-  let parked: unknown;
-  try {
-    await runner.executeStep(installed.step, installed.ctx);
-  } catch (error) {
-    parked = error;
-  }
-  assert.ok(parked instanceof runner.ParkRunSignal, String(parked));
-  assert.equal(installed.bodies(), 0);
-  const pending = approvals.listPending({ sessionId, status: 'pending' });
-  assert.equal(pending.length, 1);
-  assert.equal(pending[0].resolution, null);
-  assert.equal(pending[0].resolver, null);
-  assert.equal(
-    approvals.listPending({ sessionId, status: 'any' })
-      .some((row) => row.resolver === 'system:workflow-autonomous_default_mutation'),
-    false,
+  await runner.executeStep(installed.step, installed.ctx);
+  assert.equal(installed.bodies(), 1, 'the ordinary write crossed exactly once');
+  assert.equal(approvals.listPending({ sessionId, status: 'pending' }).length, 0, 'nothing parked on a human card');
+  assert.deepEqual(
+    approvals.listPending({ sessionId, status: 'any' }).map((row) => [row.tool, row.status, row.resolution, row.resolver]),
+    [['workflow_v3_call', 'resolved', 'approved', 'system:workflow-manual_run_authority']],
+    'the harness recorded the human-run decision itself; no autonomous default and no queue-source resolver',
   );
+  assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
 });
 
 test('BARE CALL CONSENT — exact scheduled-send authority still crosses once and settled replay adds zero bodies', async () => {

@@ -395,3 +395,61 @@ test('composio Space ACTIONS keep the stricter demand: the read mint does not ar
     store.spaceStore.archive(slug);
   }
 });
+
+test('a reviewed-CLI Workspace refresh acquires the reviewed read just in time and mints through the same kernel', async () => {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const approvals = await import('../runtime/harness/approval-registry.js');
+  const entry = CLI_CATALOG.find((candidate) => candidate.reviewedRead);
+  assert.ok(entry?.reviewedRead);
+  const reviewed = entry.reviewedRead;
+  const required = reviewed.arguments.find((argument) => argument.required)!;
+  const argv = [
+    entry.command,
+    ...reviewed.argvPrefix,
+    required.token, 'SELECT Id FROM Opportunity LIMIT 5',
+  ];
+  const slug = 'authority-reviewed-cli-read';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Reviewed CLI read',
+    dataSources: [{ id: 'opportunities', cliArgv: argv }],
+  });
+  const acquisitions: Array<{ ownerId: string; nodeId: string; operationId: string }> = [];
+  readAuthority._setReviewedCliReadAcquirerForTests(async (input) => {
+    acquisitions.push({ ownerId: input.ownerId, nodeId: input.nodeId, operationId: input.operationId });
+    return { status: 'present' };
+  });
+  try {
+    // Trust first (no descriptor registry in this home, so the card asks once).
+    await runner.refreshSpaceData(slug, 'opportunities', { cause: 'manual' });
+    const card = approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
+    assert.ok(card, 'the frozen line asks for trust once');
+    assert.equal(approvals.resolve(card.approvalId, 'approved', 'reviewed-read-test').ok, true);
+    acquisitions.length = 0;
+
+    const result = await runner.refreshSpaceData(slug, 'opportunities', { cause: 'scheduled' });
+    assert.equal(result.length, 1);
+    // Approving the card also auto-resumes the blocked refresh, so more than
+    // one refresh may have minted; every mint names the reviewed operation.
+    assert.ok(acquisitions.length >= 1, 'the refresh acquires the reviewed read');
+    for (const acquisition of acquisitions) {
+      assert.deepEqual(acquisition, {
+        ownerId: `workspace:${slug}`,
+        nodeId: 'source:opportunities',
+        operationId: reviewed.operationId,
+      }, 'the refresh acquires the reviewed read by operation id, like a workflow step');
+    }
+    // No current catalog entry for the reviewed read is installed here, so the
+    // kernel refuses the mint by operation id: proof the frozen line reached
+    // the shared kernel as its operation, not a local process.
+    assert.equal(result[0]?.ok, false);
+    assert.match(
+      result[0]?.error ?? '',
+      new RegExp(`Durable read authority could not be minted: no current read capability is registered for "${reviewed.operationId}"`),
+    );
+    assert.doesNotMatch(result[0]?.error ?? '', /local CLI/);
+  } finally {
+    readAuthority._setReviewedCliReadAcquirerForTests(null);
+    store.spaceStore.archive(slug);
+  }
+});

@@ -276,6 +276,43 @@ for (const scenario of [
   });
 }
 
+test('a checkpoint recovery cannot release is recorded once, not at every boot', async () => {
+  const nowMs = Date.now();
+  const since = new Date(nowMs - 60_000).toISOString();
+  const fixture = interruptedPreparedWorkflowSession(since);
+  // An external write after the interruption keeps auto-resume off, so the
+  // checkpoint is preserved for a person rather than dispatched.
+  appendEvent({
+    sessionId: fixture.sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { tool: 'composio_execute_tool', callId: `prepared-write:${fixture.sessionId}` },
+  });
+
+  const first = recoverInterruptedChatRuns(() => nowMs, async () => {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(first.recovered, 1);
+  assert.equal(first.records[0]?.markerCleared, false, 'the prepared dispatch still owns the source');
+  const pausedAfterFirst = listEvents(fixture.sessionId, { types: ['run_paused'] }).length;
+  const decisionsAfterFirst = listEvents(fixture.sessionId, { types: ['restart_recovery_decision'] }).length;
+  const seqAfterFirst = listEvents(fixture.sessionId, { desc: true, limit: 1 })[0]?.seq;
+  assert.equal(pausedAfterFirst, 1);
+  assert.ok(seqAfterFirst);
+
+  // Second boot, same unreleased checkpoint: nothing new is true, so nothing
+  // new is written — no event (which would float the conversation to the top
+  // of every list) and no second notification about the same interruption.
+  const second = recoverInterruptedChatRuns(() => nowMs + 5_000, async () => {});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(second.recovered, 1, 'the checkpoint is still scanned and preserved');
+  assert.equal(second.notified, 0, 'the same interruption is never announced twice');
+  assert.equal(listEvents(fixture.sessionId, { types: ['run_paused'] }).length, pausedAfterFirst);
+  assert.equal(listEvents(fixture.sessionId, { types: ['restart_recovery_decision'] }).length, decisionsAfterFirst);
+  assert.equal(listEvents(fixture.sessionId, { desc: true, limit: 1 })[0]?.seq, seqAfterFirst, 'no event of any kind was appended');
+  assert.ok(HarnessSession.load(fixture.sessionId)?.runInFlightSince(), 'chat ownership remains armed');
+});
+
 test('a clean interrupted run is auto-resumed with nonterminal progress only', async () => {
   const id = interruptedChatSession();
   const dispatched: RestartResumeDispatch[] = [];

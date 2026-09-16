@@ -258,27 +258,57 @@ export interface StoredToolOutputShell {
  * failed executions keep their original shape. This is data extraction, not
  * evidence authority: each reader still applies its own occurrence/settlement
  * checks before using the result to authorize a later action. */
-function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredToolOutputJson {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return { value, via };
+export type HostCliEnvelopeReading =
+  /** A clean run whose stdout is JSON: the payload the command produced. */
+  | { kind: 'clean'; operationId: string; stdoutJson: unknown }
+  /** A clean run whose stdout is not JSON (or was cut): keep the envelope. */
+  | { kind: 'clean_text'; operationId: string; stdout: string; stdoutTruncated: boolean }
+  /** The command did not complete cleanly; the reason is the envelope's own. */
+  | { kind: 'failed'; operationId: string; status: string; exitCode: number | null; stderr: string };
+
+/**
+ * Read the host CLI adapter's execution envelope (bare, or wrapped as the
+ * kernel's `{complete, result}`) without pretending about it: a clean JSON
+ * run yields its payload, a clean non-JSON run keeps its text, and any other
+ * exit is reported as the failure it was. Not an envelope → null.
+ */
+export function readHostCliEnvelope(value: unknown): HostCliEnvelopeReading | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const outer = value as Record<string, unknown>;
   const wrapped = outer.result && typeof outer.result === 'object' && !Array.isArray(outer.result)
     ? outer.result as Record<string, unknown> : null;
   const envelope = wrapped ?? outer;
   if (
     (wrapped !== null && outer.complete !== true)
-    || envelope.version !== 1 || envelope.status !== 'exited'
+    || envelope.version !== 1 || typeof envelope.status !== 'string'
     || typeof envelope.operationId !== 'string' || !envelope.operationId
     || typeof envelope.executableRealpath !== 'string' || !envelope.executableRealpath
     || !Array.isArray(envelope.argv) || !envelope.argv.every(arg => typeof arg === 'string')
-    || envelope.exitCode !== 0 || envelope.stdoutTruncated !== false
     || typeof envelope.stdout !== 'string'
-  ) return { value, via };
-  try {
-    const stdout: unknown = JSON.parse(envelope.stdout);
-    return { value: stdout, via: 'host_cli_stdout' };
-  } catch {
-    return { value, via };
+  ) return null;
+  const operationId = envelope.operationId;
+  if (envelope.status !== 'exited' || envelope.exitCode !== 0) {
+    return {
+      kind: 'failed',
+      operationId,
+      status: envelope.status,
+      exitCode: typeof envelope.exitCode === 'number' ? envelope.exitCode : null,
+      stderr: typeof envelope.stderr === 'string' ? envelope.stderr : '',
+    };
   }
+  const stdoutTruncated = envelope.stdoutTruncated !== false;
+  if (!stdoutTruncated) {
+    try {
+      return { kind: 'clean', operationId, stdoutJson: JSON.parse(envelope.stdout) as unknown };
+    } catch { /* not JSON: keep the text */ }
+  }
+  return { kind: 'clean_text', operationId, stdout: envelope.stdout, stdoutTruncated };
+}
+
+function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredToolOutputJson {
+  const envelope = readHostCliEnvelope(value);
+  if (envelope?.kind === 'clean') return { value: envelope.stdoutJson, via: 'host_cli_stdout' };
+  return { value, via };
 }
 
 /**

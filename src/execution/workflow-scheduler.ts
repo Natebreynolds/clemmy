@@ -1123,6 +1123,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       }
       if (activeRuns.parked > 0) {
         result.deduped.push(workflowName);
+        emitParkedSkipNotice(workflowName, activeRuns.parked);
         recordOperationalEvent({
           source: 'workflow',
           type: 'workflow_trigger_deduped',
@@ -1465,6 +1466,7 @@ function countActiveRunsFor(workflowName: string, workflowSlug = workflowName): 
         workflowSlug?: unknown;
         workflowDefinitionSnapshot?: { workflowSlug?: unknown };
         status?: string;
+        bootResumeParkedAt?: unknown;
         capabilityBlock?: { state?: unknown; provenNoDispatch?: unknown };
       };
       const projectedSlug = typeof raw.workflowSlug === 'string'
@@ -1484,7 +1486,11 @@ function countActiveRunsFor(workflowName: string, workflowSlug = workflowName): 
           raw.capabilityBlock.state === 'retrying'
           || raw.capabilityBlock.state === 'consumed'
         );
-      if (raw.status === 'parked') parked += 1;
+      if (raw.status === 'parked') {
+        // A run the boot-resume cap parked is not waiting on anyone; holding
+        // the schedule for it silently skipped every later occurrence.
+        if (typeof raw.bootResumeParkedAt !== 'string') parked += 1;
+      }
       else if (raw.status === 'blocked_capability' || capabilityRetryInFlight) capabilityBlocked += 1;
       else if (raw.status === 'blocked_mutation') mutationBlocked += 1;
       else if (
@@ -1633,6 +1639,30 @@ function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
     logger.warn(
       { err: noticeErr instanceof Error ? noticeErr.message : String(noticeErr), workflow: workflowName },
       'Failed to emit enqueue-failure notice (best-effort, ignored)',
+    );
+  }
+}
+
+/** A skipped occurrence is a missed post; the person must hear it once a
+ *  day, not discover it from an empty channel. */
+function emitParkedSkipNotice(workflowName: string, parked: number): void {
+  try {
+    const dayKey = new Date().toISOString().slice(0, 10);
+    const id = `system-workflow-parked-skip-${workflowName}-${dayKey}`;
+    if (getNotification(id)) return;
+    addNotification({
+      id,
+      kind: 'workflow',
+      title: `Skipped a scheduled run of "${workflowName}"`,
+      body: `${parked} earlier run${parked === 1 ? ' is' : 's are'} parked waiting on you, so this occurrence did not start. Resume or stop the parked run in Running and the next occurrence fires normally.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { errorCategory: 'workflow_parked_skip', workflow: workflowName, parked },
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
+      'Failed to emit parked-skip notice (best-effort, ignored)',
     );
   }
 }

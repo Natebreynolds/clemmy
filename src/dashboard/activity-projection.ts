@@ -114,6 +114,10 @@ const LIFECYCLES: Record<string, SurfaceLifecycle> = {
   awaiting_project_bind: 'awaiting_approval',
   parked: 'awaiting_approval',
   blocked: 'blocked',
+  // A run that will not start until a person binds a workspace is blocked
+  // on that person, not accepted work. Left unmapped it fell through to
+  // 'accepted' and was counted as running for weeks.
+  blocked_readiness: 'blocked',
   completed: 'completed',
   failed: 'failed',
   error: 'failed',
@@ -470,12 +474,25 @@ function nextActionFor(lifecycle: SurfaceLifecycle, terminal?: SurfaceTerminal):
  * lease truth — the projection says `unknown` rather than guessing in either
  * direction.
  */
-function leaseFacts(attempt: RunAttemptRecord): { leaseHeld?: boolean; leaseExpiresAt?: string } {
+/** How long an unfinished attempt may sit with no lease holder before that
+ *  absence is itself the fact. A runner claims its lease at start, so after
+ *  this grace "nobody holds it" means nobody is running it. */
+const UNLEASED_ATTEMPT_GRACE_MS = 30 * 60_000;
+
+function leaseFacts(
+  attempt: RunAttemptRecord,
+  observedAt?: string,
+): { leaseHeld?: boolean; leaseExpiresAt?: string } {
   if (attempt.finishedAt) return {};
   if (attempt.leaseOwner) {
     return { leaseHeld: true, ...(attempt.leaseExpiresAt ? { leaseExpiresAt: attempt.leaseExpiresAt } : {}) };
   }
   if (attempt.leaseExpiresAt) return { leaseHeld: false, leaseExpiresAt: attempt.leaseExpiresAt };
+  const started = Date.parse(attempt.startedAt ?? '');
+  const observed = Date.parse(observedAt ?? '');
+  if (Number.isFinite(started) && Number.isFinite(observed) && observed - started > UNLEASED_ATTEMPT_GRACE_MS) {
+    return { leaseHeld: false };
+  }
   return {};
 }
 
@@ -542,7 +559,7 @@ export function projectChatAttemptActivity(input: ChatActivityInput): ActivityEn
     connectivity: 'connected',
     observedAt: input.observedAt,
     revision: input.revision,
-    ...(attempt ? leaseFacts(attempt) : {}),
+    ...(attempt ? leaseFacts(attempt, input.observedAt) : {}),
     ...(input.activityLabel ? { activityLabel: input.activityLabel } : {}),
     ...(terminal ? { typedTerminal: terminal } : {}),
   });

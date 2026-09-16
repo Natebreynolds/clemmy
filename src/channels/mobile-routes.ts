@@ -1475,12 +1475,28 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // the code here rather than annotating each site means a refusal added
     // later is logged without anyone remembering to instrument it.
     let refusal: string | undefined;
+    let reason: string | undefined;
     const json = res.json.bind(res);
     res.json = (body: unknown) => {
       const code = (body as { error?: unknown } | null)?.error;
       if (typeof code === 'string') refusal = code;
+      const why = (body as { reason?: unknown } | null)?.reason;
+      if (typeof why === 'string') reason = why;
       return json(body);
     };
+    // An authenticated mobile answer is never served from a cache. When a
+    // browser revalidates a stored copy and gets 304, the page receives the
+    // STORED headers merged with the new ones — including a session
+    // fingerprint header captured at an earlier token rotation. The client
+    // then signs every later proof over a retired fingerprint and the whole
+    // visit is refused while the status probe still reads "authenticated".
+    // Dropping the conditional headers means the daemon never answers 304;
+    // no-store means the next visit holds nothing to revalidate.
+    if (req.path.startsWith('/api/') || req.path.startsWith('/auth/') || req.path.startsWith('/push/')) {
+      delete req.headers['if-none-match'];
+      delete req.headers['if-modified-since'];
+      res.setHeader('Cache-Control', 'no-store');
+    }
     res.on('finish', () => {
       try {
         if (res.statusCode < 400 && req.path.startsWith('/assets/')) return;
@@ -1491,6 +1507,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           ingress: req.clemIngress ?? 'direct',
           deviceId: req.mobileSession?.record.deviceId,
           refusal,
+          reason,
           ms: Date.now() - startedAt,
         }, 'mobile door');
       } catch { /* logging must never break the door */ }
@@ -3611,7 +3628,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // (token budget, plan IDs, raw metadata) to keep payloads small.
 
   router.get('/api/chat/sessions', requireMobileSession, (_req, res) => {
-    const sessions = harnessListSessions({ limit: 80 })
+    const sessions = harnessListSessions({ limit: 80, archived: false })
       // Only chat-like sessions land on the phone — workflow / execution
       // sessions belong on the dashboard, not in the mobile chat list.
       .filter((session) => session.kind === 'chat')
@@ -5111,6 +5128,32 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * that already reached a terminal is a successful no-op: the group is no
    * longer running, while any live siblings are still stopped in this call.
   */
+  // Tidy on the phone: the same planner and the same apply as the desktop.
+  router.get('/api/tidy/plan', requireMobileSession, async (req, res) => {
+    try {
+      const { planTidy, summarizeTidyPlan, parseTidyScope } = await import('../runtime/tidy.js');
+      const scope = parseTidyScope(req.query.scope);
+      const plan = await planTidy({}, Date.now(), scope);
+      res.json({ plan, counts: summarizeTidyPlan(plan), scope });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  router.post('/api/tidy/apply', requireMobileSession, async (req, res) => {
+    try {
+      const { planTidy, applyTidy, parseTidyClasses, summarizeTidyPlan } = await import('../runtime/tidy.js');
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const classes = parseTidyClasses(body.classes);
+      const { parseTidyScope } = await import('../runtime/tidy.js');
+      const scope = parseTidyScope(body.scope);
+      const plan = await planTidy({}, Date.now(), scope);
+      const result = await applyTidy(plan, classes);
+      res.json({ result, planned: summarizeTidyPlan(plan), classes, scope });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.post('/api/workflow-runs/cancel', requireMobileSession, async (req, res) => {
     const rawRunIds: unknown[] | null = Array.isArray(req.body?.runIds)
       ? req.body.runIds as unknown[]
@@ -5554,6 +5597,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.json({ deleted: deleteAgent(String(req.params.id ?? '')) });
     } catch (error) {
       res.status(500).json({ error: String((error as Error)?.message ?? error) });
+    }
+  });
+
+  // The phone reads the same usage meters as the desktop: one builder owns
+  // connection state, provider windows and today's spend, so the two never
+  // disagree about a number.
+  router.get('/api/settings/usage', requireMobileSession, async (_req, res) => {
+    try {
+      const { buildModelStatus } = await import('../runtime/harness/model-status.js');
+      res.json(buildModelStatus());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

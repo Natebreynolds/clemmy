@@ -790,6 +790,9 @@ export interface ListSessionsOptions {
    * run-in-flight marker. This prevents periodic recovery from walking every
    * historical chat merely to discover that it has no owner. */
   runInFlightOnly?: boolean;
+  /** `false` hides archived sessions (a list a person reads); undefined keeps
+   *  every row (internal readers). */
+  archived?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -1185,6 +1188,11 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
     // abort the whole interrupted-chat scan (mirrors the data_json guard).
     clauses.push("json_valid(metadata_json) AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL");
   }
+  if (options.archived === false) {
+    clauses.push("(NOT json_valid(metadata_json) OR COALESCE(json_extract(metadata_json, '$.archived'), 0) != 1)");
+  } else if (options.archived === true) {
+    clauses.push("json_valid(metadata_json) AND json_extract(metadata_json, '$.archived') = 1");
+  }
   let sql = 'SELECT * FROM sessions';
   if (clauses.length > 0) {
     sql += ` WHERE ${clauses.join(' AND ')}`;
@@ -1198,6 +1206,35 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   params.push(limit);
   params.push(offset);
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
+  return rows.map(rowToSession);
+}
+
+/**
+ * Chat sessions nobody has spoken in since `idleBefore` — the honest clock for
+ * "old conversation". `updated_at` is not it: system events (recovery, a
+ * background tick) touch it without anyone talking. A session with no user
+ * input at all counts from its creation. Pinned, archived and still-running
+ * sessions are never candidates.
+ */
+export function listIdleChatSessions(input: { idleBefore: string; limit?: number }): SessionRow[] {
+  const db = openEventLog();
+  const rawLimit = Math.trunc(input.limit ?? 500);
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(2000, rawLimit)) : 500;
+  const rows = db.prepare(
+    `SELECT s.*
+       FROM sessions s
+      WHERE s.kind = 'chat'
+        AND COALESCE(
+              (SELECT MAX(e.created_at) FROM events e WHERE e.session_id = s.id AND e.type = 'user_input_received'),
+              s.created_at
+            ) < ?
+        AND (NOT json_valid(s.metadata_json) OR (
+              COALESCE(json_extract(s.metadata_json, '$.archived'), 0) != 1
+          AND COALESCE(json_extract(s.metadata_json, '$.pinned'), 0) != 1
+          AND json_type(s.metadata_json, '$.__run_in_flight') IS NULL))
+      ORDER BY s.updated_at ASC
+      LIMIT ?`,
+  ).all(input.idleBefore, limit) as RawSessionRow[];
   return rows.map(rowToSession);
 }
 

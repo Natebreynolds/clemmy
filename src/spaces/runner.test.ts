@@ -1091,3 +1091,84 @@ test('runner path traversal is refused even if the target file exists inside the
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /runner must be a filename under data\//);
 });
+
+test('a frozen CLI source that is a reviewed read is compiled into its operation and redeemed at the shared kernel door', async () => {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const entry = CLI_CATALOG.find((candidate) => candidate.reviewedRead);
+  assert.ok(entry?.reviewedRead);
+  const reviewed = entry.reviewedRead;
+  const required = reviewed.arguments.find((argument) => argument.required)!;
+  const head = [entry.command, ...reviewed.argvPrefix.filter((token) => !token.startsWith('-'))];
+  const argv = [...head, required.token, 'SELECT Id FROM Opportunity LIMIT 5', ...reviewed.argvPrefix.filter((token) => token.startsWith('-'))];
+
+  const slug = 'cli-source-reviewed-read';
+  const source = { id: 'opportunities', cliArgv: argv };
+  store.spaceStore.save({ id: slug, title: 'Reviewed read source', dataSources: [source] });
+
+  // No reviewed-CLI descriptor registry exists in this isolated home, so the
+  // trust card still asks once; the executor question is separate from trust.
+  const first = await runner.runSpaceDataSource(slug, source);
+  assert.equal(first.ok, false);
+  const cards = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' });
+  assert.equal(cards.length, 1);
+  assert.equal(approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'cli-reviewed-test').ok, true);
+
+  // Once trusted, the frozen line is the reviewed OPERATION: without a minted
+  // authority it is refused at the kernel door by operation id, never as an
+  // unavailable local CLI, and nothing is spawned.
+  const approved = await runner.runSpaceDataSource(slug, source);
+  assert.equal(approved.ok, false);
+  assert.equal(approved.ok ? undefined : approved.provenNoDispatch, true);
+  assert.match(
+    approved.ok ? '' : approved.error,
+    new RegExp(`refresh "${reviewed.operationId}" is unavailable: no shared durable call authority`),
+  );
+  assert.doesNotMatch(approved.ok ? '' : approved.error, /local CLI/);
+
+  // A line the reviewed read cannot carry is refused by the exact token.
+  const stray = { id: 'stray', cliArgv: [...head, required.token, 'SELECT Id FROM Lead', '--result-format', 'csv'] };
+  store.spaceStore.save({ id: slug, title: 'Reviewed read source', dataSources: [source, stray] });
+  await runner.runSpaceDataSource(slug, stray);
+  const strayCard = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
+  assert.ok(strayCard);
+  assert.equal(approvalRegistry.resolve(strayCard.approvalId, 'approved', 'cli-reviewed-test').ok, true);
+  const refused = await runner.runSpaceDataSource(slug, stray);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.ok ? undefined : refused.provenNoDispatch, true);
+  assert.match(refused.ok ? '' : refused.error, new RegExp(`names the reviewed read ${reviewed.operationId} but cannot be carried by it: option "--result-format"`));
+});
+
+test('a reviewed read stores what the command produced: parsed JSON on a clean exit, a named failure otherwise', () => {
+  const ESC = String.fromCharCode(27);
+  const envelope = {
+    version: 1,
+    status: 'exited',
+    operationId: 'salesforce_sf_soql_query',
+    executableRealpath: '/usr/local/lib/sf/bin/sf',
+    argv: ['data', 'query', '--json', '--query', 'SELECT Id FROM Opportunity'],
+    exitCode: 0,
+    signal: null,
+    stdout: '{"status":0,"result":{"records":[{"Id":"006"}],"totalSize":1,"done":true}}',
+    stderr: ` >   Warning: ${ESC}[92mupdate available${ESC}[39m\n`,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  };
+  // The kernel hands the carrier envelope back wrapped; the Space keeps the payload.
+  const clean = runner.reviewedCliSourceResult({ ok: true, data: { complete: true, result: envelope } });
+  assert.equal(clean.ok, true);
+  assert.deepEqual(clean.ok ? clean.data : null, { status: 0, result: { records: [{ Id: '006' }], totalSize: 1, done: true } });
+
+  // A non-zero exit is a failed refresh that names the exit and the stderr tail, ANSI stripped.
+  const failed = runner.reviewedCliSourceResult({
+    ok: true,
+    data: { complete: true, result: { ...envelope, status: 'nonzero_exit', exitCode: 1, stderr: `${ESC}[31mERROR${ESC}[39m: No default org found` } },
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.ok ? '' : failed.error, 'reviewed read salesforce_sf_soql_query nonzero_exit (exit 1): ERROR: No default org found');
+
+  // Anything that is not the carrier envelope passes through unchanged.
+  const composio = runner.reviewedCliSourceResult({ ok: true, data: { complete: true, result: { data: { value: [] } } } });
+  assert.deepEqual(composio, { ok: true, data: { complete: true, result: { data: { value: [] } } } });
+  const refused = runner.reviewedCliSourceResult({ ok: false, error: 'refused', provenNoDispatch: true });
+  assert.deepEqual(refused, { ok: false, error: 'refused', provenNoDispatch: true });
+});

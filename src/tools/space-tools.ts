@@ -450,7 +450,10 @@ export function registerSpaceTools(server: McpServer): void {
       'Create or update a Workspace — a persistent HTML surface with stored data and phone content. Pass an existing slug to update it. For a static board record edit, read space_get, then pass replacement_data_json, its expected_revision and updated view_html here: data, phone content and view commit together.',
       `For an ordinary view, pass the complete self-contained HTML directly as view_html (maximum ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes; inline CSS/JS only — external CDNs are blocked by CSP). This keeps creation to one authoritative, versioned space_save commit.`,
       `view_path is legacy / oversized-file compatibility for an already-authored file inside ${BASE_DIR}; pass exactly one of view_html or view_path when replacing the view.`,
-      'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
+      'The view runs sandboxed: no network except the injected `clem` bridge (data/history/diff/refresh/note/compose/action). External links open through the desktop; nothing else leaves the frame.',
+      'DESIGN LAYER (auto-injected into every served view; use it instead of writing CSS): semantic tokens --clem-ink/-ink-muted/-ink-subtle, --clem-primary (fill) / --clem-primary-ink (text), --clem-success/-warning/-danger/-info (+ -tint), surfaces --clem-bg-canvas/-surface/-subtle/-hover/-raised, --clem-border, --clem-radius; a system font and base typography; light AND dark themes that follow the desktop automatically (never hardcode colors); and components: .clem-app (page), .clem-header (+ .clem-sub), .clem-kpis > .clem-kpi (-ok/-warn/-danger/-info), .clem-grid, .clem-card, .clem-section > .clem-section-head/.clem-section-body, .clem-list > .clem-item (-urgent/-warn; .clem-item-title/-meta/-body/-tags), .clem-table (.clem-right), .clem-tag (-ok/-warn/-danger/-info/-primary), .clem-btn (-primary/-ghost/-danger/-sm), .clem-empty, .clem-pending, .clem-error, .clem-src, .clem-skeleton, .clem-progress, utilities .clem-row/.clem-stack/.clem-muted/.clem-num/.clem-small/.clem-mono.',
+      'HELPER KIT on `clem` (pure, return strings, escape every field): clem.fmt.{money(n,cur?), number(n,dec?), percent, date(v,"long"?), time, relative(v), daysUntil(v), plural(n,one,many?), truncate(s,n), initials, esc}; clem.ui.{kpis([{label,value,hint?,tone?}]), section(title, bodyHtml, {count?, meta?, actions?}), list([{title, meta?, body?, html?, href?, tags?:[{text,tone}], urgent?, warn?, attrs?}], {empty?}), table(rows, [{key|render, label, align?, html?}], {empty?, rowAttrs?}), card(bodyHtml,{title?}), tag(text,tone?), empty(text,hint?), pending(text?), error(text), sourceStrip()}; clem.sources() → [{id, ok, error, refreshedAt, ageHours, stale}]; clem.theme() → {name,isDark}.',
+      'VIEW STANDARD (what a good Workspace shows, in this order): the view fills the whole frame — never a centered narrow column, no max-width on the page; use .clem-grid so sections sit side by side on a wide screen and stack on a narrow one. (1) a .clem-header with the title and clem.ui.sourceStrip(); (2) clem.ui.kpis with the 3-6 numbers the user would ask for first; (3) WHAT NEEDS THE USER TODAY — items that need a reply, decision or are overdue, most urgent first, each with a deadline/age and a one-line why; (4) context sections in a .clem-grid. Every list gets an empty state; every source renders its stale/error state from clem.sources() while keeping the last good data on screen; every write shows clem.ui.pending() until it actually ran; render row-level buttons for the actions you declare (Draft reply, Open, Mark done). Compute derived signals the data does not carry (no activity in 14 days, closing this week, amount at risk) — that is the value of the view. Interpolate external text only through clem.fmt.esc or the ui helpers.',
       'The dataset is planted in every served view as `window.__SPACE_DATA__` BEFORE your script runs, so render straight from it — no await, no polling, no empty first paint. A helper `clem` is auto-injected too, for data that changed since load: `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
       'Optionally declare NEW data_sources as PROVABLY READ-ONLY Composio operations so the workspace can refresh server-side without spending tokens. Only GET/LIST/SEARCH/FETCH/READ-class actions are accepted. Unknown or mutating slugs and new arbitrary runner scripts are refused.',
@@ -476,14 +479,15 @@ export function registerSpaceTools(server: McpServer): void {
       initial_data_json: z.string().min(1).max(SPACE_INITIAL_DATA_MAX_BYTES).nullish().describe(`Create-only complete JSON document for a one-off static Workspace, maximum ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes. Include top-level _mobile so the substantive content is visible on the phone. Cannot be combined with data_sources; exact retry of the same committed create is idempotent.`),
       replacement_data_json: z.string().min(1).max(SPACE_INITIAL_DATA_MAX_BYTES).nullish().describe('Complete replacement root JSON document for an EXISTING static Workspace; preserve unrelated content and its authored _mobile projection. Pair with expected_revision from space_get. Optional view_html commits in the same revision. Cannot combine with initial_data_json or data sources.'),
       expected_revision: z.string().regex(/^[a-f0-9]{64}$/).nullish().describe('Exact snapshot revision returned by space_get or space_get_view. Required only with replacement_data_json; rejects an edit of a stale board without changing it.'),
-      data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh.'),
+      data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh. On an EXISTING Workspace a non-empty list is merged by id: a source with a known id is updated, a new id is added, and every other source is kept. To drop one source, name it in remove_data_sources; an explicit empty list [] clears them all.'),
+      remove_data_sources: z.array(z.string().min(1)).nullish().describe('Ids of existing data sources to remove from this Workspace. The only way a source is removed — an omitted source is kept.'),
       actions: z.array(actionShape).nullish().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
       reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullish().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),
       reengage_guidance: z.string().max(2000).nullish().describe('What you should do when re-engaged (e.g. "draft a follow-up for any deal stalled >14 days").'),
       origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
     async ({
-      slug, title, objective, success_criteria, invariants, view_html, view_path, initial_data_json, replacement_data_json, expected_revision, data_sources, actions,
+      slug, title, objective, success_criteria, invariants, view_html, view_path, initial_data_json, replacement_data_json, expected_revision, data_sources, remove_data_sources, actions,
       reengage_triggers, reengage_guidance, origin_session_id,
     }) => {
       if (!isValidSpaceSlug(slug)) {
@@ -580,7 +584,24 @@ export function registerSpaceTools(server: McpServer): void {
 
       const parseErrors: string[] = [];
       const stagedRunners: StagedRunner[] = [];
-      const dsList = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors, stagedRunners)) : (existing?.dataSources ?? []);
+      // Sources merge by id on an existing Workspace. A partial list used to
+      // REPLACE the whole set, so a save that touched one source silently
+      // dropped the others; a drop is now an explicit removal.
+      const removeIds = new Set((remove_data_sources ?? []).map((id) => id.trim()).filter(Boolean));
+      const passedSources = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors, stagedRunners)) : [];
+      const passedById = new Map(passedSources.map((src) => [src.id, src] as const));
+      // An explicit empty list is the one partial that cannot be a partial:
+      // it clears every source. Anything else merges.
+      const clearsAllSources = Array.isArray(data_sources) && data_sources.length === 0;
+      const dsList = existing && !clearsAllSources
+        ? [
+            ...existing.dataSources.filter((src) => !removeIds.has(src.id)).map((src) => passedById.get(src.id) ?? src),
+            ...passedSources.filter((src) => !existing.dataSources.some((prior) => prior.id === src.id)),
+          ]
+        : passedSources;
+      for (const id of removeIds) {
+        if (!existing?.dataSources.some((src) => src.id === id)) parseErrors.push(`remove_data_sources names "${id}", which this Workspace does not have.`);
+      }
       const actList = actions ? actions.map((act) => toAction(act, parseErrors, stagedRunners)) : (existing?.actions ?? []);
       const runnerSources = new Map<string, StagedRunner>();
       for (const staged of stagedRunners) {

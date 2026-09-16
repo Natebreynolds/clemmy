@@ -202,6 +202,38 @@ export function reviewedPlanMemberReadArgumentsMatch(input: { sessionId: string;
   } catch { return false; }
 }
 
+/**
+ * A reviewed step bound to a local tool whose result can say "not done yet —
+ * fix this" (a workflow creation test that found issues) is completed by the
+ * tools that fix it, not by calling the same tool again. Those calls belong
+ * to the same step: refusing them as substitutions stopped an Execute turn
+ * at the first "left DISABLED" result with every later step unrun. The set is
+ * closed and local: nothing here reaches a provider.
+ */
+const REVIEWED_REPAIR_COMPANIONS: Readonly<Record<string, readonly string[]>> = {
+  workflow_create: [
+    'workflow_update', 'workflow_edit_step', 'workflow_apply_contract_fixes', 'workflow_capability_resolve',
+    'workflow_set_enabled', 'workflow_get', 'workflow_state',
+  ],
+  workflow_from_session: [
+    'workflow_update', 'workflow_edit_step', 'workflow_apply_contract_fixes', 'workflow_capability_resolve',
+    'workflow_set_enabled', 'workflow_get', 'workflow_state',
+  ],
+  // A Workspace is created and then made to work: its creation smoke can
+  // park it paused, a data source can wait on a grant, the view can need an
+  // edit. Reads, refreshes and view edits of the same Workspace are the step.
+  space_save: [
+    'space_refresh', 'space_set_data', 'space_edit_view', 'space_get_view', 'space_get', 'space_list',
+    'space_history', 'space_diff', 'space_get_runner', 'space_edit_runner', 'space_try_runner',
+    'space_action_prepare', 'space_publish', 'pending_action_list', 'pending_action_get',
+  ],
+};
+
+export function reviewedRepairCompanion(boundToolName: string | undefined, calledToolName: string | undefined): boolean {
+  if (!boundToolName || !calledToolName) return false;
+  return (REVIEWED_REPAIR_COMPANIONS[boundToolName] ?? []).includes(calledToolName);
+}
+
 export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSeq: number; toolName: string; args: unknown; effect: RuntimeToolEffect; attestation?: HostCallAttestation; effectiveArgs?: unknown; authorityIssue?: string }): string | undefined {
   const execution = acceptedPlanExecution(input.sessionId, input.sourceUserSeq);
   if (!execution || ['compute', 'host_only'].includes(input.effect)) return undefined;
@@ -222,6 +254,11 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
     const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
     if (loaded.status !== 'ok') throw new Error('Activate the exact reviewed plan with plan_task before its business calls.');
     const requestedBinding = outline.bindings.find(row => row.stepId === requestedId);
+    if (
+      requestedBinding
+      && requestedBinding.identity?.kind === 'local_registry'
+      && reviewedRepairCompanion(requestedBinding.identity.definition?.name, toolName)
+    ) return undefined;
     if (requestedBinding && requestedBinding.identity?.kind !== 'local_registry' && !input.attestation) {
       // Name the mismatch the model can act on. A reviewed step is bound to
       // one operation; a call that names a different one for that step is the

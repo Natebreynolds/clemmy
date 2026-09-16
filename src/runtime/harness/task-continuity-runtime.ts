@@ -1134,6 +1134,17 @@ function consumeContinuationContext(input: {
     return null;
   }
   if (!input.typedClassification && semanticPortParticipated(input.sessionId, input.sourceUserSeq)) {
+    // The port read this message as a goal — amended, new, or abandoned —
+    // not as an answer to the open question. That is the person moving on.
+    // Leaving the question pending here wedged the session: every later
+    // request was refused as "continuation unresolved".
+    const relation = taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
+    if (
+      (relation === 'amend_goal' || relation === 'new_goal' || relation === 'abandon_goal')
+      && input.sourceUserSeq > packet.originatingSourceUserSeq
+    ) {
+      dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'topic_changed' });
+    }
     return null;
   }
   // A source-strategy reply may identify the already-bound structural role
@@ -1153,11 +1164,12 @@ function consumeContinuationContext(input: {
     ?? classifyClarificationAnswer(input.answer, packet.pause)
     ?? (durableSourceSelection ? { disposition: 'affirmed' as const } : null);
   if (!classification) {
-    if (nextRealSourceIs({
-      sessionId: input.sessionId,
-      originatingSourceUserSeq: packet.originatingSourceUserSeq,
-      consumingSourceUserSeq: input.sourceUserSeq,
-    })) {
+    // A message that is not an answer, arriving after the question, means the
+    // person moved on — whether it is the very next message or the one after
+    // a re-offer. Holding the question open past that point wedged a session:
+    // every later request was refused as "continuation unresolved" and the
+    // only fallback re-asked the same question.
+    if (input.sourceUserSeq > packet.originatingSourceUserSeq) {
       dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'topic_changed' });
     }
     return null;

@@ -178,11 +178,17 @@ input, textarea, select { font: inherit; font-size: 16px; }
   z-index: 10;
 }
 .app-header > .brand-mark { filter: none; border-radius: 8px; }
+/* Inside a conversation the chat header (back, title, brain) is the only
+   header; the section row would just stack a second title above it. */
+.app-header[hidden] { display: none; }
 .app-title {
   display: flex;
   margin: 0;
   min-width: 0;
-  flex: 0 1 auto;
+  /* The title is what the row is for. It grows into the space the meta
+     cluster leaves and is the last thing to shrink, so it never reads as
+     "Ch…" beside a chip. */
+  flex: 1 1 auto;
   font-size: inherit;
 }
 .app-title:focus { outline: none; }
@@ -1181,7 +1187,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   padding-bottom: 0;
   overflow: hidden;
 }
-.chat-header { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-3); padding-bottom: var(--sp-3); min-width: 0; }
+.chat-header { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0 var(--sp-3); min-width: 0; }
 .chat-header .brain-chip { flex: 0 0 auto; }
 .chat-back {
   display: inline-flex;
@@ -1914,6 +1920,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   text-align: left;
 }
 .running-tasks-trigger:active { transform: scale(0.98); }
+.running-tasks-trigger-compact { width: 44px; padding: 0; justify-content: center; }
 /* Visually hidden, present for assistive tech — the chip shows digits, the
    full presenter label remains its spoken name. */
 .sr-only {
@@ -4000,3 +4007,50 @@ textarea.cz-input { resize: vertical; }
    default; warning tint only when the harness itself says stopped/uncertain. */
 .reply-state { margin: 6px 0 0; font-size: 13px; color: var(--fg-2); }
 .reply-state-blocked, .reply-state-uncertain { color: var(--accent-deep); }
+
+/* ── press feedback on touch screens ─────────────────────────────────
+   A finger has no hover. On a touch screen the :active rules above fire on
+   touch-down and can hang for the length of a scroll, so a scale, a filter or
+   a gradient reads as a stray highlight rather than a press. One quiet dim is
+   the whole press vocabulary here; pointers keep the richer treatment. */
+@media (hover: none) and (pointer: coarse) {
+  :is(button, a, [role='button'], .card-tap, .chat-row, .workflow-row, .work-line, .home-row-tap,
+      .memory-fact-tap, .drawer-item, .settings-row, .switcher-row, .agent-card-main, .title-switch,
+      .running-tasks-trigger, .icon-btn, .btn, .btn-new, .chat-jump, .brain-chip):active {
+    transform: none;
+    filter: none;
+    background-image: none;
+    opacity: 0.72;
+  }
+  :is(.needs-pill, .needs-pill-stale):active .needs-pill-face { transform: none; filter: none; opacity: 0.72; }
+  :is(.chat-send, .chat-stop, .ask-capsule-send, .home-btn, .home-btn-primary, .qa-chip, .cz-done):active:not(:disabled) {
+    transform: none;
+    filter: none;
+    opacity: 0.72;
+  }
+}
+
+/* ── usage meters (Settings) ─────────────────────────────────────────── */
+.usage-meter { padding: var(--sp-3) 0; border-top: 1px solid var(--line); }
+.usage-meter:first-of-type { border-top: 0; }
+.usage-meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
+.usage-meter-compact { font-size: var(--t-xs); color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.usage-window { margin-top: var(--sp-2); }
+.usage-window-line { display: flex; justify-content: space-between; font-size: var(--t-xs); color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.usage-bar { height: 6px; margin-top: 4px; border-radius: 999px; background: var(--bg-3); overflow: hidden; }
+.usage-bar-fill { height: 100%; border-radius: 999px; background: var(--accent-2); }
+.usage-fill-warning { background: var(--accent); }
+.usage-fill-danger { background: var(--accent-fail); }
+.usage-tone-warning { color: var(--accent); font-weight: 650; }
+.usage-tone-danger { color: var(--accent-fail); font-weight: 650; }
+
+/* ── clean up (Settings) ─────────────────────────────────────────────── */
+.tidy-row { padding: var(--sp-3) 0; border-top: 1px solid var(--line); }
+.tidy-row:first-of-type { border-top: 0; }
+.tidy-actions { display: flex; gap: var(--sp-4); margin-top: var(--sp-1); }
+.tidy-action { background: none; border: 0; color: var(--accent); font-weight: 650; padding: 0; min-height: 44px; font-size: var(--t-sm); }
+.tidy-action:disabled { color: var(--fg-3); opacity: 0.6; }
+.tidy-confirm { margin-top: var(--sp-3); }
+.tidy-confirm-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+.tidy-confirm-actions > * { flex: 1 1 0; }
+.tidy-all { min-height: 44px; }

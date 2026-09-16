@@ -130,6 +130,78 @@ export async function prepareAndAcquireSpaceReadAuthority(
   return acquireSpaceReadAuthority({ ...input, toolSlug: operationId });
 }
 
+type ReviewedCliReadAcquirer = (input: {
+  ownerId: string;
+  nodeId: string;
+  operationId: string;
+  expectedEffect: 'read';
+  deadlineAt: number;
+}) => Promise<{ status: 'present' | 'acquired' | 'unavailable'; detail?: string }>;
+
+const productionReviewedCliReadAcquirer: ReviewedCliReadAcquirer = async (input) => {
+  const { ensureLiveReadCapabilityForOperation } = await import(
+    '../execution/workflow-live-call-compiler.js'
+  );
+  return ensureLiveReadCapabilityForOperation(input);
+};
+let reviewedCliReadAcquirer: ReviewedCliReadAcquirer = productionReviewedCliReadAcquirer;
+
+export function _setReviewedCliReadAcquirerForTests(
+  acquirer: ReviewedCliReadAcquirer | null,
+): void {
+  if (!isolatedTestContractActive()) {
+    throw new Error('space reviewed read acquirer overrides are isolated-test only');
+  }
+  reviewedCliReadAcquirer = acquirer ?? productionReviewedCliReadAcquirer;
+}
+
+/** A reviewed CLI read is a local binary; connecting it is fast or fails fast. */
+const REVIEWED_CLI_READ_ACQUIRE_BUDGET_MS = 30_000;
+
+/**
+ * A Space data source whose frozen command line is a reviewed CLI read runs as
+ * that operation: the same just-in-time live-read acquisition a workflow step
+ * uses installs the reviewed carrier's current catalog entry when it is not
+ * present yet, and the same read-only kernel activation carries the call.
+ * There is no second executor for command lines.
+ */
+export async function prepareAndAcquireSpaceReviewedCliReadAuthority(input: {
+  slug: string;
+  sourceId: string;
+  operationId: string;
+  args: Record<string, unknown>;
+  cause: string;
+}): Promise<AcquireSpaceReadAuthorityResult> {
+  const operationId = input.operationId.trim();
+  if (!operationId) return { ok: false, error: 'workspace reviewed read operation is blank' };
+  let acquisition: Awaited<ReturnType<ReviewedCliReadAcquirer>>;
+  try {
+    acquisition = await reviewedCliReadAcquirer({
+      ownerId: `workspace:${input.slug}`,
+      nodeId: `source:${input.sourceId}`,
+      operationId,
+      expectedEffect: 'read',
+      deadlineAt: Date.now() + REVIEWED_CLI_READ_ACQUIRE_BUDGET_MS,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: `reviewed read "${operationId}" could not be prepared: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  if (acquisition.status === 'unavailable') {
+    return {
+      ok: false,
+      error: `reviewed read "${operationId}" is not available on this machine${
+        acquisition.detail ? `: ${acquisition.detail}` : ''
+      }`,
+    };
+  }
+  return acquireSpaceReadAuthority({ ...input, toolSlug: operationId });
+}
+
 export function acquireSpaceReadAuthority(input: {
   slug: string;
   sourceId: string;

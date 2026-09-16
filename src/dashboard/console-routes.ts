@@ -9024,42 +9024,11 @@ export function registerConsoleRoutes(
   // (captured from provider rate-limit headers) + connection status for OpenAI and
   // every connected BYO provider (GLM/Z.ai, DeepSeek, MiniMax, Together, ...).
   // Returns only booleans + percentages + reset times + non-secret provider ids.
-  app.get('/api/console/model-status', (req, res) => {
+  app.get('/api/console/model-status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const rl = getRateLimitSnapshot();
-      const claudeConnected = claudeModelsAvailable();
-      // Claude windows come from the dedicated oauth/usage endpoint (cached,
-      // lazily refreshed) — only poke it when Claude is actually connected.
-      const claudeUsage = claudeConnected ? getClaudeUsageSnapshot() : null;
-      const byoProviders = getByoProviderSnapshots()
-        .filter((p) => p.configured)
-        .map((p) => ({
-          id: p.id,
-          label: p.label || p.id,
-          modelIds: p.modelIds,
-          connected: true,
-        }));
-      const togetherConnected = byoProviders.some(
-        (p) => p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label),
-      );
-      // Window slots assigned by DURATION, not header position — the provider
-      // has shipped weekly as "primary" (see classifyCodexQuota). Wire names
-      // stay primary=5h-slot / secondary=weekly-slot for renderer compat.
-      const codexQuota = classifyCodexQuota(rl.codex);
-      res.json({
-        codex: {
-          connected: codexModelsAvailable(),
-          primary: codexQuota.fiveHour,
-          secondary: codexQuota.weekly,
-          capturedAt: codexQuota.capturedAt,
-        },
-        claude: { connected: claudeConnected, ...(claudeUsage ?? {}) },
-        openai: { connected: Boolean(getOpenAiApiKey()) },
-        byoProviders,
-        together: { connected: togetherConnected },
-        updatedAt: Date.now(),
-      });
+      const { buildModelStatus } = await import('../runtime/harness/model-status.js');
+      res.json(buildModelStatus());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -13175,6 +13144,34 @@ export function registerConsoleRoutes(
    * the cancellation on its next pump and either retry or fail
    * gracefully (per the runtime's resolveApproval contract).
    */
+  // Tidy: one door for clearing clutter. GET plans (exact counts and ids,
+  // nothing changes); POST applies the plan the surface just showed, for the
+  // classes it chose. Desktop and phone share the module.
+  app.get('/api/console/tidy/plan', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { planTidy, summarizeTidyPlan, parseTidyScope } = await import('../runtime/tidy.js');
+      const scope = parseTidyScope(req.query.scope);
+      const plan = await planTidy({}, Date.now(), scope);
+      res.json({ plan, counts: summarizeTidyPlan(plan), scope });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  app.post('/api/console/tidy/apply', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { planTidy, applyTidy, parseTidyClasses, parseTidyScope, summarizeTidyPlan } = await import('../runtime/tidy.js');
+      const classes = parseTidyClasses((req.body ?? {}).classes);
+      const scope = parseTidyScope((req.body ?? {}).scope);
+      const plan = await planTidy({}, Date.now(), scope);
+      const result = await applyTidy(plan, classes);
+      res.json({ result, planned: summarizeTidyPlan(plan), classes, scope });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/approvals/cancel-stale', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

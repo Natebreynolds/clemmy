@@ -3,6 +3,7 @@
  * state — eventlog/packet reads happen in the caller.
  */
 import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
+import { HOST_LABEL_MAX_CHARS } from './turn-semantic-proposal.js';
 import type { DurableSemanticSnapshotV1 } from './build-semantic-host-view.js';
 import type { OpenQuestionViewV1, ResumableGoalViewV1 } from './turn-semantic-proposal.js';
 import { currentInputSuppressesPriorTask } from '../harness/current-task-authority.js';
@@ -41,6 +42,14 @@ export function snapshotFromAcceptedSource(input: {
     : input.parentGraph?.nodes.find((node) => node.kind === 'await_input')?.awaitInput;
   const resumableGoals: ResumableGoalViewV1[] = [];
   const openQuestions: OpenQuestionViewV1[] = [];
+  // A delivered question can run long (a status report that ends in a
+  // question). The port's view of it is a label, capped; the full text
+  // stays in the transcript the person already read.
+  const clipLabel = (text: string): string => {
+    const trimmed = (text ?? '').trim();
+    if (trimmed.length <= HOST_LABEL_MAX_CHARS) return trimmed;
+    return `${trimmed.slice(0, HOST_LABEL_MAX_CHARS - 1).trimEnd()}…`;
+  };
   if (awaitInput) {
     resumableGoals.push({
       goalId: awaitInput.goalId,
@@ -53,8 +62,8 @@ export function snapshotFromAcceptedSource(input: {
       goalId: awaitInput.goalId,
       goalRevision: awaitInput.revision,
       slotKey: awaitInput.slotId,
-      question: awaitInput.deliveredQuestion,
-      options: awaitInput.visibleOptions.map((option) => ({ ...option })),
+      question: clipLabel(awaitInput.deliveredQuestion),
+      options: awaitInput.visibleOptions.map((option) => ({ ...option, label: clipLabel(option.label) })),
       // An await_input node is an ordinary semantic clarification. Its public
       // renderer explicitly tells the user that the visible choices are only
       // shortcuts and that they may answer in their own words. Preserve that
@@ -75,11 +84,11 @@ export function snapshotFromAcceptedSource(input: {
       goalId,
       goalRevision: revision,
       slotKey: input.packet.slotKey ?? 'reply',
-      question: input.packet.question,
+      question: clipLabel(input.packet.question),
       options: input.packet.options.map((option, index) => {
         const visible = typeof option === 'string'
-          ? { optionId: `opt-${index + 1}`, label: option }
-          : option;
+          ? { optionId: `opt-${index + 1}`, label: clipLabel(option) }
+          : { ...option, label: clipLabel(option.label) };
         const metaAction = input.packet?.optionIntents
           ?.find((intent) => intent.optionIndex === index)?.action;
         return { ...visible, ...(metaAction ? { metaAction } : {}) };

@@ -31,6 +31,8 @@ import {
   type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
+import { reviewedCliShellMatch } from '../runtime/harness/reviewed-cli-shell-match.js';
+import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
 import { createSession, getSession } from '../runtime/harness/eventlog.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
@@ -636,6 +638,47 @@ export function authorizeCliDataSource(
   if (latest?.status === 'pending' && isExpired(latest, new Date(now))) {
     resolve(latest.approvalId, 'expired', 'space-cli-source-trust');
     latest = matchingRows()[0];
+  }
+
+  // A frozen command that IS a reviewed CLI read (the same descriptor the
+  // chat lane dispatches without a card) is already decided: the harness
+  // grants it itself, durably, so the source refreshes unattended. A card
+  // already raised for it is settled the same way. Only a command the
+  // catalog does not review still asks a person.
+  // Matched on the catalog declaration, then proven dispatchable by the
+  // reviewed-CLI read carrier's own descriptor list (the CLI is connected on
+  // this machine) — a Space refresh runs outside any chat objective, so the
+  // chat lane's per-objective callable entry is not the right proof here.
+  const declared = reviewedCliShellMatch(commandLabel, { requireCallable: false });
+  const reviewed = declared.status === 'matched'
+    && listReviewedCliReadDescriptors().some((descriptor) => descriptor.operationId === declared.operationId)
+    ? declared
+    : { status: 'unmatched' as const };
+  if (reviewed.status === 'matched') {
+    if (latest?.status === 'pending') {
+      resolve(latest.approvalId, 'approved', `harness:reviewed_cli_read:${reviewed.operationId}`);
+      latest = matchingRows()[0];
+    }
+    if (!(latest?.status === 'resolved' && latest.resolution === 'approved' && Date.parse(latest.expiresAt) > now)) {
+      const { row: granted } = registerResumable({
+        sessionId,
+        resumeKey: `space-cli-source-trust:v${SPACE_CLI_SOURCE_TRUST_VERSION}:${trustKey}`,
+        ttlMs: RUNNER_TRUST_TTL_MS,
+        subject: `Reviewed read ${reviewed.operationId} refreshes “${rec.title}”`,
+        tool: SPACE_CLI_SOURCE_TRUST_TOOL,
+        args: { ...snapshot, trustKey, reviewedOperationId: reviewed.operationId },
+      });
+      if (granted.status === 'pending') {
+        resolve(granted.approvalId, 'approved', `harness:reviewed_cli_read:${reviewed.operationId}`);
+      }
+      latest = matchingRows()[0];
+    }
+    appendNote(rec.id, {
+      text: `Data source “${snapshot.sourceId}” runs the reviewed read ${reviewed.operationId}; no approval was needed.`,
+      kind: 'data-source',
+      meta: { kind: SPACE_CLI_SOURCE_TRUST_TOOL, sourceId: snapshot.sourceId, cliArgv: snapshot.cliArgv, approvalId: latest?.approvalId ?? null, status: 'approved', reviewedOperationId: reviewed.operationId },
+    });
+    return { state: 'approved', cliArgv: snapshot.cliArgv, approvalId: latest?.approvalId ?? `reviewed:${reviewed.operationId}` };
   }
 
   if (

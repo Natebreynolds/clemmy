@@ -264,6 +264,7 @@ export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
     primaryId: p.modelIds[0] || '',
     judgeId: p.modelIds[0] || '',
     providerLabel: p.label,
+    providerId: p.id,
     ...(oauthBacked
       ? {
           refreshBearer: async () => {

@@ -16,6 +16,7 @@ const {
   codexQuotaExhausted,
   recordCodexUsageExhausted,
   recordCodexRateLimit,
+  recordByoRateLimit,
   getRateLimitSnapshot,
   classifyCodexQuota,
   __resetRateLimitStoreForTests,
@@ -155,4 +156,28 @@ test('codexQuotaExhausted: header truth, the 429 latch, and self-healing', () =>
   });
   assert.equal(codexQuotaExhausted(), false);
   __resetRateLimitStoreForTests();
+});
+
+test('a BYO provider\'s limit headers are captured per provider and a header-less answer keeps the last reading', () => {
+  __resetRateLimitStoreForTests();
+  recordByoRateLimit('xai', {
+    'x-ratelimit-limit-requests': '600',
+    'x-ratelimit-remaining-requests': '598',
+    'x-ratelimit-limit-tokens': '12000000',
+    'x-ratelimit-remaining-tokens': '11999814',
+  });
+  const first = getRateLimitSnapshot().byo?.xai;
+  assert.deepEqual(first?.requests, { limit: 600, remaining: 598 });
+  assert.deepEqual(first?.tokens, { limit: 12_000_000, remaining: 11_999_814 });
+  assert.ok(first?.capturedAt);
+
+  // A streamed answer that dropped the headers is not a reset to zero.
+  recordByoRateLimit('xai', {});
+  assert.deepEqual(getRateLimitSnapshot().byo?.xai?.requests, { limit: 600, remaining: 598 });
+
+  // Providers never share a reading, and a malformed header never throws.
+  recordByoRateLimit('glm', { 'x-ratelimit-limit-requests': 'lots', 'x-ratelimit-remaining-requests': '3' });
+  assert.equal(getRateLimitSnapshot().byo?.glm, undefined);
+  recordByoRateLimit('', { 'x-ratelimit-limit-requests': '1', 'x-ratelimit-remaining-requests': '1' });
+  assert.deepEqual(Object.keys(getRateLimitSnapshot().byo ?? {}), ['xai']);
 });

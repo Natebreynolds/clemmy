@@ -607,7 +607,7 @@ export function App() {
 
   return (
     <>
-      <header class="app-header">
+      <header class="app-header" hidden={tab === 'chats' && !chatsListVisible}>
         <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
         <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
           <button
@@ -635,7 +635,7 @@ export function App() {
               float at the bottom now that the dock is gone. Absent at zero
               (presenter contract: the pill disappears when total is 0), and
               absent on the screens that already list the work themselves. */}
-          {headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} /> : null}
+          {headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} compact={headerChrome.needsPill} /> : null}
           {/* The pill has no room for a banner, so it discloses the age in the
               space it has: "Needs you · 3 · 6h ago" when the number came off
               the worker's shelf or a poll stopped answering. It is the standing

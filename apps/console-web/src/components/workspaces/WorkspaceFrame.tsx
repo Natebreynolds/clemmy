@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type CSSProperties } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { clemmy } from '@/lib/clemmy';
 import {
   addSpaceNote,
@@ -133,6 +133,10 @@ async function runWorkspaceGesture(request: WorkspaceGestureRequest): Promise<un
  * intentionally omits allow-same-origin, forms, popups and top navigation.
  * Gallery previews reuse the same boundary in read-only mode.
  */
+function readShellTheme(): 'light' | 'dark' {
+  return typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+}
+
 export function WorkspaceFrame({
   id,
   title,
@@ -145,6 +149,17 @@ export function WorkspaceFrame({
   onError,
 }: WorkspaceFrameProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
+  // The shell's resolved theme, handed into the frame as `?theme=`. A change
+  // remounts the iframe (new document) and re-runs the bootstrap below: the
+  // RPC is pinned to the first document a frame ever showed, so a theme flip
+  // must be a new frame, never a navigation inside the old one.
+  const [shellTheme, setShellTheme] = useState<'light' | 'dark'>(readShellTheme);
+  useEffect(() => {
+    if (typeof MutationObserver === 'undefined') return;
+    const observer = new MutationObserver(() => setShellTheme(readShellTheme()));
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    return () => observer.disconnect();
+  }, []);
   const onMutationRef = useRef(onMutation);
   const onErrorRef = useRef(onError);
   onMutationRef.current = onMutation;
@@ -314,13 +329,14 @@ export function WorkspaceFrame({
         gesturePort.close();
       }
     };
-  }, [id, readOnly]);
+  }, [id, readOnly, shellTheme]);
 
   return (
     <iframe
+      key={shellTheme}
       ref={frameRef}
       title={title}
-      src={spaceViewUrl(id)}
+      src={spaceViewUrl(id, shellTheme)}
       sandbox={WORKSPACE_IFRAME_SANDBOX}
       referrerPolicy="no-referrer"
       className={className}

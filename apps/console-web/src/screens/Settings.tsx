@@ -14,6 +14,7 @@ import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ConnectedSection, ModelsSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { NotchSettingsCard } from './settings/NotchSettingsCard';
+import { CleanupCard } from './settings/CleanupCard';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -27,6 +28,7 @@ const NAV: { id: string; label: string }[] = [
   { id: 'connected', label: 'Connected' },
   { id: 'profile', label: 'Profile' },
   { id: 'notifications', label: 'Notifications' },
+  { id: 'cleanup', label: 'Clean up' },
   { id: 'appearance', label: 'Appearance' },
   { id: 'notch', label: 'In the notch' },
   { id: 'home', label: 'Home layout' },
@@ -54,6 +56,11 @@ export function Settings() {
           <ConnectedSection />
           <section id="profile" className="scroll-mt-16"><h2 className="mb-3 text-h2 text-fg">Profile</h2><ProfileForm /></section>
           <section id="notifications" className="scroll-mt-16"><NotificationsEditor /></section>
+          <section id="cleanup" className="scroll-mt-16">
+            <h2 className="mb-1 text-h2 text-fg">Clean up</h2>
+            <p className="mb-3 text-small text-muted">Clear what is only taking up room. Nothing is deleted: updates are marked read, stale asks cancelled, stuck runs stopped, old conversations archived.</p>
+            <CleanupCard />
+          </section>
           <section id="appearance" className="scroll-mt-16">
             <h2 className="mb-3 text-h2 text-fg">Appearance</h2>
             <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-surface px-4 py-3">

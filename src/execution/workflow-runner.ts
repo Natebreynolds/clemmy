@@ -851,6 +851,10 @@ export interface QueuedRunRecord {
    *  restarts WITHOUT progressing, never punish a long job that legitimately
    *  outlives a few daemon restarts. */
   bootResumeMark?: string;
+  /** Set when the boot-resume cap parked this run. A run parked this way is
+   *  dead weight for the schedule, not a person's pending approval, so the
+   *  scheduler must not hold the next occurrence for it. */
+  bootResumeParkedAt?: string;
   /** Optional review only; captured before execution and immutable on resume. */
   targetReviewPolicy?: WorkflowTargetReviewPolicy;
   inputs?: Record<string, string>;
@@ -16363,6 +16367,7 @@ export function parkRunsExceedingBootResumeCap(
           ...(overCap
             ? {
                 status: 'parked',
+                bootResumeParkedAt: new Date().toISOString(),
                 error: `Paused after ${next} automatic restarts. Clementine stopped re-running this so a restart loop could not repeat its work. Resume it when you're ready.`,
               }
             : {}),

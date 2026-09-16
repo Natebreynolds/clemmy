@@ -122,9 +122,13 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
     'the running-tasks chip lives in the sticky header, not a bottom float');
   assert.match(appShell, /<RunningTasksSheet onOpenRun=\{openRun\}/,
     'a run listed in the sheet must open the run, not only expand in place');
-  // Presenter contract: the chip exists ONLY while view.total > 0 — the
-  // pill disappearing at zero is pinned behavior.
-  assert.match(component, /if \(view\.total === 0\) return null/);
+  // Presenter contract: the chip exists ONLY while something is running or
+  // stalled — it disappears at zero, and it never shows a bare digit code:
+  // the header says "3 running" / "2 stalled", never "8·7·22".
+  assert.match(component, /if \(view\.total === 0 \|\| chipText === null\) return null/);
+  assert.match(component, /\$\{view\.running\} running/);
+  assert.match(component, /\$\{view\.stalled\} stalled/);
+  assert.doesNotMatch(component, /\.join\('·'\)/, 'the chip must be words, not a digit code');
 
   const css = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
   assert.match(css, /\.running-tasks-trigger \{[\s\S]*?min-height: 44px/);

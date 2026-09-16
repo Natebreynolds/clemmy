@@ -1,9 +1,17 @@
 import { CompletionReviewCard } from '../components/CompletionReviewCard';
 import { useEffect, useState } from 'preact/hooks';
+import { compactUsageText, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
 import {
   getConnectionsHealth,
   getDaemonStatus,
   getModelSettings,
+  getTidyPlan,
+  applyTidy,
+  getUsageStatus,
+  type TidyClass,
+  type TidyCounts,
+  type TidyResult,
+  type TidyScope,
   listDevices,
   revokeAllDevices,
   revokeDevice,
@@ -99,6 +107,10 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
       />
 
       <CompletionReviewCard />
+
+      <UsageCard />
+
+      <CleanupCard />
 
       <ConnectionsCard
         rows={connections.data?.connections}
@@ -268,6 +280,157 @@ function BrainCard({ currentLabel, provider, inactive, actualModelId, codexRescu
       ) : null}
       {codexRescue ? <CodexRescueRow settings={codexRescue} onChanged={onChanged} /> : null}
       <BrainSheet open={open} onClose={() => setOpen(false)} onChanged={onChanged} />
+    </section>
+  );
+}
+
+const TIDY_ROWS: Array<{ id: TidyClass; label: string; note: string; verb: (n: number) => string }> = [
+  { id: 'updates', label: 'Updates', note: 'Unread updates from finished work. Open questions are never touched.', verb: (n) => `${n} marked read` },
+  { id: 'staleAsks', label: 'Asks', note: 'Approval cards, plan and trust proposals, check-in questions. Stale = unanswered for a day.', verb: (n) => `${n} cancelled` },
+  { id: 'stuckRuns', label: 'Stuck runs', note: 'Blocked or parked workflow runs, and chat turns no runner holds. Stale = over a day.', verb: (n) => `${n} stopped` },
+  { id: 'oldConversations', label: 'Conversations', note: 'Stale = quiet for two weeks; all = every unpinned conversation. Archived, never deleted.', verb: (n) => `${n} archived` },
+];
+
+/** Clean up: exact counts for what is stale and for everything, a button per
+ *  class per scope, and "clear everything" behind one confirmation. Nothing
+ *  is deleted; updates are read, asks cancelled, runs stopped, conversations
+ *  archived. */
+function CleanupCard() {
+  const stale = useScreenData(() => getTidyPlan('stale'), { intervalMs: 60_000, resourceKey: 'tidy:stale' });
+  const all = useScreenData(() => getTidyPlan('all'), { intervalMs: 60_000, resourceKey: 'tidy:all' });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirmAll, setConfirmAll] = useState(false);
+  const [outcome, setOutcome] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const sum = (c?: TidyCounts) => (c ? c.updates + c.staleAsks + c.stuckRuns + c.oldConversations : 0);
+  const staleCounts = stale.data?.counts;
+  const allCounts = all.data?.counts;
+
+  const run = async (classes: TidyClass[], scope: TidyScope, key: string) => {
+    setBusy(key);
+    setError(null);
+    setOutcome(null);
+    setConfirmAll(false);
+    try {
+      const { result } = await applyTidy(classes, scope);
+      haptic('light');
+      setOutcome(describeTidy(result));
+      await Promise.allSettled([stale.refresh(), all.refresh()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not tidy up right now.');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (!stale.data && !stale.error) return null;
+  return (
+    <section class="card settings-card" aria-label="Clean up">
+      <h2 class="settings-card-title">Clean up</h2>
+      {stale.error && !stale.data ? <p class="card-note">Could not check for clutter right now.</p> : null}
+      {staleCounts ? TIDY_ROWS.map((row) => {
+        const s = staleCounts[row.id];
+        const a = allCounts?.[row.id] ?? 0;
+        return (
+          <div class="tidy-row" key={row.id}>
+            <div class="settings-row-main">
+              <span class="settings-row-label">{row.label}</span>
+              <span class="settings-row-note">{row.note}</span>
+            </div>
+            <div class="tidy-actions">
+              <button type="button" class="tidy-action" disabled={s === 0 || busy !== null} onClick={() => void run([row.id], 'stale', `${row.id}:stale`)}>
+                {busy === `${row.id}:stale` ? 'Clearing…' : `Clear stale${s > 0 ? ` (${s})` : ''}`}
+              </button>
+              <button type="button" class="tidy-action" disabled={a === 0 || busy !== null} onClick={() => void run([row.id], 'all', `${row.id}:all`)}>
+                {busy === `${row.id}:all` ? 'Clearing…' : `Clear all${a > 0 ? ` (${a})` : ''}`}
+              </button>
+            </div>
+          </div>
+        );
+      }) : null}
+      {staleCounts ? (
+        confirmAll ? (
+          <div class="tidy-confirm">
+            <p class="card-note">Clear every item above — {sum(allCounts)} in total, including today's? Nothing is deleted.</p>
+            <div class="tidy-confirm-actions">
+              <button type="button" class="btn-approve" disabled={busy !== null} onClick={() => void run(TIDY_ROWS.map((r) => r.id), 'all', 'all:all')}>
+                {busy === 'all:all' ? 'Clearing…' : `Yes, clear ${sum(allCounts)}`}
+              </button>
+              <button type="button" class="btn-reject" disabled={busy !== null} onClick={() => setConfirmAll(false)}>Keep</button>
+            </div>
+          </div>
+        ) : (
+          <div class="tidy-confirm-actions">
+            <button type="button" class="btn tidy-all" disabled={sum(staleCounts) === 0 || busy !== null} onClick={() => void run(TIDY_ROWS.map((r) => r.id), 'stale', 'all:stale')}>
+              {busy === 'all:stale' ? 'Tidying…' : `Tidy up stale${sum(staleCounts) > 0 ? ` (${sum(staleCounts)})` : ''}`}
+            </button>
+            <button type="button" class="btn tidy-all" disabled={sum(allCounts) === 0 || busy !== null} onClick={() => setConfirmAll(true)}>
+              {`Clear everything${sum(allCounts) > 0 ? ` (${sum(allCounts)})` : ''}`}
+            </button>
+          </div>
+        )
+      ) : null}
+      {outcome ? <p class="card-note">{outcome}</p> : null}
+      {error ? <p class="warning card-note">{error}</p> : null}
+    </section>
+  );
+}
+
+function describeTidy(result: TidyResult): string {
+  const parts = [
+    result.updatesCleared > 0 ? TIDY_ROWS[0].verb(result.updatesCleared) : '',
+    result.asksCancelled > 0 ? TIDY_ROWS[1].verb(result.asksCancelled) : '',
+    result.runsStopped > 0 ? TIDY_ROWS[2].verb(result.runsStopped) : '',
+    result.conversationsArchived > 0 ? TIDY_ROWS[3].verb(result.conversationsArchived) : '',
+  ].filter(Boolean);
+  const held = result.updatesHeld > 0 ? ` ${result.updatesHeld} update${result.updatesHeld === 1 ? '' : 's'} still need an answer and were kept.` : '';
+  const errors = result.errors.length > 0 ? ` ${result.errors.length} item${result.errors.length === 1 ? '' : 's'} could not be cleared.` : '';
+  return (parts.length > 0 ? `Done: ${parts.join(', ')}.` : 'Nothing needed clearing.') + held + errors;
+}
+
+/** Usage meters: one row per connected model account, read from the same
+ *  daemon builder as the desktop. An account whose provider publishes no
+ *  window still shows today's spend, so a connected account is never blank. */
+function UsageCard() {
+  const usage = useScreenData(getUsageStatus, { intervalMs: 30_000 });
+  const meters = presentUsageMeters(usage.data);
+  const now = Date.now();
+  if (!usage.data && !usage.error) return null;
+  return (
+    <section class="card settings-card" aria-label="Usage">
+      <h2 class="settings-card-title">Usage</h2>
+      {usage.error && !usage.data ? (
+        <p class="card-note">Could not load usage right now.</p>
+      ) : meters.length === 0 ? (
+        <p class="card-note">No model account is connected yet.</p>
+      ) : meters.map((meter) => (
+        <div key={meter.id} class="usage-meter">
+          <div class="usage-meter-head">
+            <span class="settings-row-label">{meter.label}</span>
+            <span class="usage-meter-compact">{compactUsageText(meter)}</span>
+          </div>
+          {meter.windows.map((w) => {
+            const reset = resetsInText(w.resetAt, now);
+            return (
+              <div key={w.id} class="usage-window">
+                <div class="usage-window-line">
+                  <span>{w.label}</span>
+                  <span class={`usage-tone-${w.tone}`}>{w.usedPercent}%{reset ? ` · ${reset}` : ''}</span>
+                </div>
+                <div class="usage-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={w.usedPercent} aria-label={`${meter.label} ${w.label}`}>
+                  <div class={`usage-bar-fill usage-fill-${w.tone}`} style={{ width: `${w.usedPercent}%` }} />
+                </div>
+              </div>
+            );
+          })}
+          <p class="settings-row-note">
+            {meter.windows.length === 0 && meter.note ? `${meter.note} ` : ''}
+            {meter.spend
+              ? `Today: ${formatTokenCount(meter.spend.tokens)} tokens · ${meter.spend.calls} call${meter.spend.calls === 1 ? '' : 's'}`
+              : 'Today: nothing yet'}
+          </p>
+        </div>
+      ))}
     </section>
   );
 }

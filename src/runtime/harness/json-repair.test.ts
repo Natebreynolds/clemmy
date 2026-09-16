@@ -7,6 +7,7 @@ import {
   repairToParseableJson,
   isParseableJson,
   conformsToJsonSchemaShape,
+  readHostCliEnvelope,
 } from './json-repair.js';
 
 test('repair: ```json fenced object is unwrapped and parses', () => {
@@ -266,4 +267,54 @@ test('stored output: the shell-wrapper precedence is unchanged', () => {
 test('stored output: genuinely non-JSON text recovers nothing (and must say so honestly)', () => {
   assert.equal(parseStoredToolOutputJson('just some prose, no payload here'), null);
   assert.equal(parseStoredToolOutputJson(''), null);
+});
+
+const HOST_CLI_ENVELOPE = {
+  version: 1,
+  status: 'exited',
+  operationId: 'vendor_tool_read',
+  executableRealpath: '/usr/local/bin/vendor',
+  argv: ['read', '--json'],
+  exitCode: 0,
+  signal: null,
+  stdout: '{"status":0,"result":{"records":[{"Id":"1"}],"totalSize":1}}',
+  stderr: ' ›   Warning: update available\n',
+  stdoutTruncated: false,
+  stderrTruncated: false,
+};
+
+test('host CLI envelope: a clean JSON run reads as its payload, bare or kernel-wrapped', () => {
+  const bare = readHostCliEnvelope(HOST_CLI_ENVELOPE);
+  assert.equal(bare?.kind, 'clean');
+  if (bare?.kind === 'clean') {
+    assert.equal(bare.operationId, 'vendor_tool_read');
+    assert.deepEqual(bare.stdoutJson, { status: 0, result: { records: [{ Id: '1' }], totalSize: 1 } });
+  }
+  const wrapped = readHostCliEnvelope({ complete: true, result: HOST_CLI_ENVELOPE });
+  assert.equal(wrapped?.kind, 'clean');
+  // An incomplete kernel wrapper is not a finished envelope.
+  assert.equal(readHostCliEnvelope({ complete: false, result: HOST_CLI_ENVELOPE }), null);
+  // The stored-output reader keeps unwrapping the same shape the same way.
+  const stored = parseStoredToolOutputJson(JSON.stringify({ complete: true, result: HOST_CLI_ENVELOPE }));
+  assert.equal(stored?.via, 'host_cli_stdout');
+  assert.deepEqual(stored?.value, { status: 0, result: { records: [{ Id: '1' }], totalSize: 1 } });
+});
+
+test('host CLI envelope: a failed or non-JSON run is reported as what it was, never unwrapped', () => {
+  const failed = readHostCliEnvelope({ ...HOST_CLI_ENVELOPE, status: 'nonzero_exit', exitCode: 1, stderr: 'ERROR: no default org' });
+  assert.deepEqual(failed, {
+    kind: 'failed', operationId: 'vendor_tool_read', status: 'nonzero_exit', exitCode: 1, stderr: 'ERROR: no default org',
+  });
+  const text = readHostCliEnvelope({ ...HOST_CLI_ENVELOPE, stdout: 'plain text' });
+  assert.equal(text?.kind, 'clean_text');
+  const cut = readHostCliEnvelope({ ...HOST_CLI_ENVELOPE, stdoutTruncated: true });
+  assert.equal(cut?.kind, 'clean_text');
+  if (cut?.kind === 'clean_text') assert.equal(cut.stdoutTruncated, true);
+  // The stored-output reader leaves those values untouched.
+  const storedFailed = parseStoredToolOutputJson(JSON.stringify({ ...HOST_CLI_ENVELOPE, exitCode: 1, status: 'nonzero_exit' }));
+  assert.equal(storedFailed?.via, 'exact');
+  // Ordinary provider payloads are not envelopes.
+  assert.equal(readHostCliEnvelope({ complete: true, result: { data: { value: [] } } }), null);
+  assert.equal(readHostCliEnvelope('{"status":0}'), null);
+  assert.equal(readHostCliEnvelope(null), null);
 });

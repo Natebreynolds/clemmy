@@ -10,6 +10,7 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { setWorkflowEnabled } from '@/lib/automate';
 import { usePoll } from '@/lib/poll';
+import { applyTidy, describeTidy } from '@/lib/tidy';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
@@ -216,6 +217,36 @@ export function Inbox() {
       invalidate('approvals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
+  // "Clear all" on Needs you goes through tidy with the all scope: every
+  // approval card, plan and trust proposal and check-in is settled as
+  // declined. It asks once, because it decides things.
+  const [confirmClearAsks, setConfirmClearAsks] = useState(false);
+  const onClearAsks = async () => {
+    setConfirmClearAsks(false);
+    setDecisionNotice(null);
+    try {
+      const { result } = await applyTidy(['staleAsks'], 'all');
+      setDecisionNotice({ tone: 'success', text: describeTidy(result) });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not clear the asks.') });
+    } finally {
+      invalidate('approvals', 'approvals-count', 'plan-proposals', 'trust-proposals', 'inbox-questions', 'working-now-badge', 'command-center');
+    }
+  };
+  // "Clear all" on Updates goes through tidy: every unread update that is
+  // not still a question is marked read, in one call, with the same live
+  // guards the phone uses. Nothing is deleted.
+  const onClearUpdates = async () => {
+    setDecisionNotice(null);
+    try {
+      const { result } = await applyTidy(['updates']);
+      setDecisionNotice({ tone: 'success', text: describeTidy(result) });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not clear the updates.') });
+    } finally {
+      invalidate('notifications', 'command-center');
+    }
+  };
   const onCancelStale = async () => {
     setDecisionNotice(null);
     try {
@@ -403,9 +434,13 @@ export function Inbox() {
     <Page
       title="Needs you"
       subtitle="Decisions waiting on you, and updates from finished work"
-      actions={tab === 'needs' && approvalRows.length > 0
-        ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button>
-        : undefined}
+      actions={tab === 'needs' && needsCount > 0
+        ? (confirmClearAsks
+          ? <span className="inline-flex items-center gap-2 text-small text-muted">Decline all {needsCount}? <Button variant="danger" size="sm" onClick={onClearAsks}>Yes, clear all</Button><Button variant="ghost" size="sm" onClick={() => setConfirmClearAsks(false)}>Keep</Button></span>
+          : <span className="inline-flex items-center gap-2">{approvalRows.length > 0 ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button> : null}<Button variant="secondary" size="sm" onClick={() => setConfirmClearAsks(true)}><X className="h-4 w-4" aria-hidden /> Clear all ({needsCount})</Button></span>)
+        : tab === 'notifications' && unread > 0
+          ? <Button variant="secondary" size="sm" onClick={onClearUpdates}><Check className="h-4 w-4" aria-hidden /> Clear all ({unread})</Button>
+          : undefined}
     >
       <div className="mb-4 flex gap-1 border-b border-border">
         {tabs.map((t) => {

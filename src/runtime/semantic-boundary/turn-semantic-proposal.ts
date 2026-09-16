@@ -57,7 +57,12 @@ const MAX_CRITERIA = 64;
 const MAX_CRITERION_CHARS = 2_000;
 const MAX_OPEN_SLOTS = 8;
 const MAX_OPTIONS_PER_SLOT = 8;
-const MAX_LABEL_CHARS = 1_000;
+/** Longest question or option label the host may expose to the semantic
+ *  port. The host builds these from its own delivered questions, so the
+ *  builder clips to this cap; a longer text would fail every interpretation
+ *  in the session and re-ask the same question forever. */
+export const HOST_LABEL_MAX_CHARS = 1_000;
+const MAX_LABEL_CHARS = HOST_LABEL_MAX_CHARS;
 const MAX_CANDIDATES = 128;
 const MAX_SLOT_ANSWERS = 1;
 const MAX_SLOT_VALUE_CHARS = 4_000;

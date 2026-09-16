@@ -55,11 +55,15 @@ function argumentMapOf(reviewedRead: CatalogReviewedReadV1): ReviewedCliArgument
 }
 
 /** Every reviewed read the catalog declares, keyed by its head. */
-function reviewedReads(): Array<{ head: string; reviewedRead: CatalogReviewedReadV1 }> {
-  const out: Array<{ head: string; reviewedRead: CatalogReviewedReadV1 }> = [];
+function reviewedReads(): Array<{ head: string; command: string; reviewedRead: CatalogReviewedReadV1 }> {
+  const out: Array<{ head: string; command: string; reviewedRead: CatalogReviewedReadV1 }> = [];
   for (const entry of CLI_CATALOG) {
     if (!entry.reviewedRead) continue;
-    out.push({ head: expectedHeadOf(entry.command, entry.reviewedRead), reviewedRead: entry.reviewedRead });
+    out.push({
+      head: expectedHeadOf(entry.command, entry.reviewedRead),
+      command: entry.command,
+      reviewedRead: entry.reviewedRead,
+    });
   }
   return out;
 }
@@ -83,12 +87,21 @@ export function reviewedCliOperationIsCallable(operationId: string): boolean {
  * shared command-head normaliser, so `sf data query --query … --json` and the
  * memory key for the same command agree on `sf data query`.
  */
-export function reviewedCliShellMatch(command: string): ReviewedCliShellMatch {
+export function reviewedCliShellMatch(
+  command: string,
+  options: {
+    /** Default true: only a read the installed host catalog can call right now
+     *  matches. False matches on the catalog declaration alone — for a caller
+     *  that proves connection its own way (the workflow/Space reviewed-CLI
+     *  carrier), outside any chat objective's materialized manifest. */
+    requireCallable?: boolean;
+  } = {},
+): ReviewedCliShellMatch {
   const head = cliCommandHead(command ?? '');
   if (!head) return { status: 'unmatched' };
   for (const candidate of reviewedReads()) {
     if (candidate.head !== head) continue;
-    if (!reviewedCliOperationIsCallable(candidate.reviewedRead.operationId)) continue;
+    if (options.requireCallable !== false && !reviewedCliOperationIsCallable(candidate.reviewedRead.operationId)) continue;
     return {
       status: 'matched',
       operationId: candidate.reviewedRead.operationId,
@@ -131,4 +144,73 @@ export function renderReviewedCliWorkCallExample(
   const required = argumentMap.filter((entry) => entry.required);
   const shape = `{${required.map((entry) => `${JSON.stringify(entry.name)}: "<string>"`).join(', ')}}`;
   return `work_call name=${operationId} args_json=${shape}`;
+}
+
+export type ReviewedCliArgvCompilation =
+  | { status: 'unmatched' }
+  | {
+    status: 'matched';
+    operationId: string;
+    descriptorId: string;
+    /** Structured arguments in the reviewed read's own vocabulary. */
+    args: Record<string, string>;
+  }
+  | { status: 'refused'; operationId: string; descriptorId: string; reason: string };
+
+/**
+ * Compile a frozen argv vector into the reviewed read it names. A Space data
+ * source declares a command line; the harness never spawns that line. When
+ * its head is a reviewed read, the line is a spelling of that operation and
+ * runs through the same shared durable kernel as every other read, with the
+ * carrier composing the real argv from these structured arguments. Flags the
+ * catalog's argv prefix already carries (for example a JSON output flag) are
+ * accepted and dropped; any option the reviewed read does not declare, a
+ * missing value, or a stray positional refuses with the exact token, since
+ * the reviewed operation cannot carry it. Generic over the CLI catalog.
+ */
+export function compileReviewedCliArgv(argv: readonly string[]): ReviewedCliArgvCompilation {
+  const tokens = argv.map((token) => String(token ?? '').trim()).filter(Boolean);
+  if (tokens.length === 0) return { status: 'unmatched' };
+  const head = cliCommandHead(tokens.join(' '));
+  const candidate = reviewedReads().find((entry) => entry.head === head);
+  if (!candidate) return { status: 'unmatched' };
+  const { command, reviewedRead } = candidate;
+  const operationId = reviewedRead.operationId;
+  const descriptorId = reviewedRead.descriptorId;
+  const refuse = (reason: string): ReviewedCliArgvCompilation => (
+    { status: 'refused', operationId, descriptorId, reason }
+  );
+  const argumentMap = argumentMapOf(reviewedRead);
+  const byToken = new Map(argumentMap.map((entry) => [entry.token, entry]));
+  const prefixFlags = new Set(reviewedRead.argvPrefix.filter((token) => token.startsWith('-')));
+  const headTokens = [command, ...reviewedRead.argvPrefix.filter((token) => !token.startsWith('-'))];
+  const accepted = argumentMap.map((entry) => entry.token).join(', ');
+  const args: Record<string, string> = {};
+  for (let index = headTokens.length; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (prefixFlags.has(token)) continue;
+    if (!token.startsWith('-')) {
+      return refuse(`unexpected argument "${token}"; ${operationId} accepts only ${accepted}`);
+    }
+    const equals = token.indexOf('=');
+    const name = equals > 0 ? token.slice(0, equals) : token;
+    const entry = byToken.get(name);
+    if (!entry) return refuse(`option "${name}" is not part of ${operationId}; it accepts ${accepted}`);
+    let value: string | undefined = equals > 0 ? token.slice(equals + 1) : undefined;
+    if (value === undefined) {
+      index += 1;
+      value = tokens[index];
+    }
+    if (value === undefined) return refuse(`option "${name}" has no value`);
+    if (Object.prototype.hasOwnProperty.call(args, entry.name)) {
+      return refuse(`option "${name}" is given twice`);
+    }
+    args[entry.name] = value;
+  }
+  for (const entry of argumentMap) {
+    if (entry.required && !Object.prototype.hasOwnProperty.call(args, entry.name)) {
+      return refuse(`required option "${entry.token}" is missing`);
+    }
+  }
+  return { status: 'matched', operationId, descriptorId, args };
 }

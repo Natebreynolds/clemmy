@@ -374,7 +374,10 @@ export function buildWorkspaceFixPrompt(input: {
 /** Absolute URL the daemon serves the view at. The request is cookie-authenticated
  *  by the parent navigation, then the response CSP forces authored HTML into an
  *  opaque-origin sandbox. */
-export const spaceViewUrl = (id: string) => `/console/spaces/${encodeURIComponent(id)}/view/`;
+/** The served view honours `?theme=` so the framework design layer inside the
+ * frame follows the desktop's explicit choice instead of only the system. */
+export const spaceViewUrl = (id: string, theme?: 'light' | 'dark') =>
+  `/console/spaces/${encodeURIComponent(id)}/view/${theme ? `?theme=${theme}` : ''}`;
 
 /** The dedicated chat thread for a workspace's floating dock + re-engage. */
 export const spaceSessionId = (id: string) => `space-${id}`;

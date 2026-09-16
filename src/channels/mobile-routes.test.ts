@@ -1697,6 +1697,56 @@ test('a key-bound session requires a valid device proof on every request', async
   } finally { await h.close(); }
 });
 
+test('an authenticated mobile answer is never served from a cache', async () => {
+  // The client folds any session-fingerprint header it sees into its signing
+  // state. A 304 hands the page the STORED headers of an older copy, so a
+  // fingerprint captured at an earlier rotation would poison every later
+  // proof. The door therefore never answers a conditional request with 304
+  // and marks every authenticated answer no-store.
+  const h = await startHarness();
+  try {
+    const { pair, publicJwk } = await makeDeviceKey();
+    const { token: pairToken } = await createMobilePairingCode({}, { stateDir: h.stateDir });
+    const paired = await fetch(`${h.url}/m/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairToken, devicePublicKeyJwk: publicJwk }),
+    });
+    assert.equal(paired.status, 200);
+    const body = await paired.json() as { sessionFingerprint: string };
+    const cookie = cookieFrom(paired);
+
+    const first = await fetch(`${h.url}/m/api/whoami`, {
+      headers: { cookie, 'x-clem-device-proof': await deviceProof(pair, 'GET', '/m/api/whoami', body.sessionFingerprint) },
+    });
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('cache-control'), 'no-store', 'an API answer must not be storable');
+    const etag = first.headers.get('etag');
+
+    const conditional = await fetch(`${h.url}/m/api/whoami`, {
+      headers: {
+        cookie,
+        'x-clem-device-proof': await deviceProof(pair, 'GET', '/m/api/whoami', body.sessionFingerprint),
+        ...(etag ? { 'if-none-match': etag } : {}),
+        'if-modified-since': new Date().toUTCString(),
+      },
+    });
+    assert.equal(conditional.status, 200, 'a conditional request must never be answered 304');
+    assert.ok((await conditional.text()).length > 0, 'the body is always the live answer');
+
+    const status = await fetch(`${h.url}/m/auth/status`, {
+      headers: { cookie, ...(etag ? { 'if-none-match': etag } : {}) },
+    });
+    assert.equal(status.status, 200);
+    assert.equal(status.headers.get('cache-control'), 'no-store', 'the status probe carries the fingerprint; it must be live');
+    const statusEtag = status.headers.get('etag');
+    const statusConditional = await fetch(`${h.url}/m/auth/status`, {
+      headers: { cookie, ...(statusEtag ? { 'if-none-match': statusEtag } : {}) },
+    });
+    assert.equal(statusConditional.status, 200, 'the status probe must never be answered 304');
+  } finally { await h.close(); }
+});
+
 test('a stream ticket minted for the full client path attaches the stream once', async () => {
   // Tickets are minted for the client's '/m/api/…' path but were consumed
   // against the router-relative req.path — never equal, so EVERY SSE attach
@@ -4339,11 +4389,11 @@ test('mobile chat cancel rejects a stale exact id and stops the exact live attem
 test('mobile settings routes are session-gated: anon requests get 401 at every door', async () => {
   const h = await startHarness();
   try {
-    for (const p of ['/m/api/settings/models', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/devices']) {
+    for (const p of ['/m/api/settings/models', '/m/api/settings/usage', '/m/api/tidy/plan', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/devices']) {
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }
-    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/codex-rescue', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
+    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/codex-rescue', '/m/api/tidy/apply', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
       const anon = await fetch(`${h.url}${p}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
