@@ -76,7 +76,7 @@ and memory hits.
 
 ## Live invite test (21:18 PDT, mobile, patched build): two defects
 
-Owner: "Add time on Adam Long's calendar tomorrow at 9am for 1 hour to discuss
+Owner: "Add time on [the invitee]'s calendar tomorrow at 9am for 1 hour to discuss
 Clementine" → Clem asked invite-vs-delegated → owner answered "Scorpion cal" →
 approval card → approved → event created with NO attendee → reply "Added … to
 your Scorpion calendar" → judge (grok-4.6) passed it.
@@ -108,7 +108,7 @@ your Scorpion calendar" → judge (grok-4.6) passed it.
 
 ## Second invite test (21:35 PDT): "Yes" re-asked the identical question
 
-Clem asked "…invite Adam Long (recommended), or create it directly…?"; the
+Clem asked "…invite [the invitee] (recommended), or create it directly…?"; the
 owner answered "Yes"; the semantic port ruled it ambiguous ("does not identify
 either visible calendar option") and the host re-offered the same question with
 zero work. Owner direction: the model reasons about the answer; the harness
@@ -127,11 +127,11 @@ preference is the north-star "quieter over time" slice, still open.
 
 Flow: calendar question → "send him a meeting invite and add my zoom link" (semantic
 port selected opt-2 "Send Adam an invite from my Scorpion calendar") → model
-nominated nathan.reynolds@scorpion.co to tool_search → host account judge
+nominated the owner's Scorpion address to tool_search → host account judge
 (grok-4.6, 32 s) did not entail → tool_search told the model "the quoted user
 wording did not name this account… Ask the user which one" → she asked "Which
 Outlook account should send the invite?" → owner: "my scorpion one like you just
-mentioned" → approval card → event created WITH adam.long@scorpion.co and the
+mentioned" → approval card → event created WITH the invitee's address and the
 Zoom link in the body.
 
 Two evidence defects in what the judge was handed, both fixed here:
@@ -776,7 +776,7 @@ Five `publish_plan` attempts:
 
 **Root cause of the question (the one the owner hit this morning):** three
 searches carried `account_selection {toolkit outlook, identity
-nathan.reynolds@scorpion.co}` and every one came back
+<owner scorpion address>}` and every one came back
 `account_selection_required / not_entailed`. Outlook has two mailboxes, no
 "default send account" alias, and a "default read account" alias = Scorpion.
 With no nomination the write asks; with the Scorpion nomination the judge
