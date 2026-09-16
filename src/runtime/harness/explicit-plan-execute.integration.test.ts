@@ -742,7 +742,7 @@ for (const [wholeText, repair, review] of [[false, false, false], [true, false, 
     status: 'done', resumable: false, presentation: { kind: 'answer', text: 'The briefing is saved.' } });
   assert.equal(committed.presentation.status, 'done', JSON.stringify(committed.presentation));
   writeFileSync(outputPath, 'An intervening owner edit.');
-  assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue('changed after effect')), /successful write/, 'an intervening edit prevents automatic replacement');
+  assert.throws(() => results.recordReviewedPlanStepResult(identity, 'synthesize', resultValue('changed after effect')), /already ran on it/, 'an intervening edit prevents automatic replacement');
   assert.equal(readFileSync(outputPath, 'utf8'), 'An intervening owner edit.');
   assert.throws(() => results.recordReviewedPlanStepResult(identity, 'save', resultValue(content)), /Only a reviewed compute/);
   assert.throws(() => results.resolveReviewedPlanStepResult({ ...identity, sourceUserSeq: artifact.sourceUserSeq }, 'synthesize'), /selected ready plan/);

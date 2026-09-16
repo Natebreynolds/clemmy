@@ -25,7 +25,9 @@ import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
-import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
+import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
@@ -38,6 +40,11 @@ import {
   type AuthorizedLiveReadPlanningAuthorityV1,
 } from '../runtime/harness/live-read-planning-authority.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import {
+  reviewedPlanReceiptAnswersQuery,
+  reviewedPlanSearchReceiptsForCurrentTurn,
+  type ReviewedPlanSearchReceipt,
+} from '../runtime/harness/reviewed-plan-search-receipts.js';
 import type { ProofProvisionResult } from '../runtime/harness/proof-provisioned-catalog.js';
 import {
   readToolSearchContinuation,
@@ -45,6 +52,7 @@ import {
   TOOL_SEARCH_CONTINUATION_MAX_ENTRY_BYTES,
   TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES,
   writeToolSearchContinuation,
+  appendEvent,
 } from '../runtime/harness/eventlog.js';
 
 /**
@@ -612,6 +620,9 @@ export interface ToolSearchPlanningDisclosureCandidate {
   name: string;
   carrier: ToolSearchDispatchCarrier;
   schema?: unknown;
+  /** The tool_search query that disclosed this candidate. Match evidence for
+   * the staged row's `matchedTokens`; never authority. */
+  query?: string;
   /** Exact adapter that produced this visible result. Candidate text cannot
    * manufacture this value; the broker attaches it while flattening the
    * configured host sources. */
@@ -761,6 +772,59 @@ function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
   return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(query);
 }
 
+/** When memory has no callable match, fetch these exact slugs — not fuzzy page-1. */
+export function emptyMemoryFetchSlugs(
+  query: string,
+  rows: ReadonlyArray<{ name: string; summary?: string; lifecycleSuccessor?: boolean }>,
+): string[] {
+  const slugs: string[] = [];
+  const add = (raw: string | undefined): void => {
+    const slug = raw?.trim().toUpperCase() ?? '';
+    if (!slug || slugs.includes(slug) || !composioSlugLooksWellFormed(slug)) return;
+    slugs.push(slug);
+  };
+  for (const row of rows) {
+    if (row.lifecycleSuccessor) add(row.name);
+    for (const successor of successorSlugsFromProse(row.summary ?? '')) add(successor);
+  }
+  for (const match of query.matchAll(/(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)/g)) {
+    add(match[1]);
+  }
+  return slugs.slice(0, 2);
+}
+
+function isBroadProviderDiscoverySource(kind: ToolSearchCandidateSourceKind): boolean {
+  return kind === 'authorized_composio' || kind === 'authorized_external_mcp';
+}
+
+const GENERIC_LIVE_READ_NAME_TOKENS = new Set([
+  'sf', 'cli', 'get', 'list', 'read', 'query', 'run', 'tool', 'call',
+]);
+
+/** A sealed CLI/live-read already answers this read query. Provider fuzzy
+ * search must not run in parallel — live 2026-09-14 "team activity today"
+ * found salesforce_sf_soql_query then spent 49s disclosing Firecrawl. */
+export function acquiredLiveReadAnswersQuery(
+  query: string,
+  candidates: ReadonlyArray<Pick<ToolSearchBrokerCandidate, 'name' | 'planningAuthority'> & {
+    sourceKind?: ToolSearchCandidateSourceKind;
+  }>,
+): boolean {
+  const effect = requestedCapabilityEffectScope(query);
+  if (effect === 'write' || effect === 'mixed') return false;
+  const haystack = query.toLowerCase();
+  return candidates.some((candidate) => {
+    if (!isAcquiredLiveReadCandidate(candidate)) return false;
+    if (queryExplicitlyNamesTool(query, candidate.name)) return true;
+    const tokens = candidate.name.toLowerCase().split(/[^a-z0-9]+/).filter((token) => (
+      token.length >= 3 && !GENERIC_LIVE_READ_NAME_TOKENS.has(token)
+    ));
+    if (tokens.length < 2) return false;
+    const hits = tokens.filter((token) => haystack.includes(token)).length;
+    return hits >= Math.min(2, tokens.length);
+  });
+}
+
 const JSON_SCHEMA_ANNOTATION_KEYS = new Set([
   '$schema',
   'description',
@@ -894,6 +958,10 @@ export function registerToolSearchTool(
     ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
       | Readonly<Record<string, string>>
       | ToolSearchPlanningDisclosureOutcome;
+    /** Execute receipts: already-reviewed operations, revalidated before use.
+     * Omitting this uses the accepted Execute artifact for the current turn. */
+    planSearchReceipts?: (query: string) =>
+      ReadonlyArray<ReviewedPlanSearchReceipt> | Promise<ReadonlyArray<ReviewedPlanSearchReceipt>>;
   } = {},
 ): void {
   const continuations = new ToolSearchContinuationStore();
@@ -975,6 +1043,7 @@ export function registerToolSearchTool(
       if (structuralControl) return textResult(JSON.stringify(structuralControl));
       let brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
+      let skippedBroadDiscovery = false;
       // An exact tool name is an explicit selection, not another fuzzy search
       // term. Resolve it against the policy-filtered catalog BEFORE semantic
       // ranking so a selected name never pays a cold embedding/model detour.
@@ -1013,6 +1082,18 @@ export function registerToolSearchTool(
         reason: string;
         dependencySubject?: ToolSearchUnavailableConnectionSubjectV1;
       }> = [];
+      // Per-source ledger for the durable discovery_source_outcome row.
+      const sourceOutcomes: Array<{
+        kind: ToolSearchCandidateSourceKind;
+        count: number;
+        elapsedMs: number;
+        code?: CandidateSourceUnavailableCode;
+        detail?: string;
+      }> = [];
+      // An operation the query names outright (a provider slug). When its
+      // source fails, that failure is the headline, never a local tool that
+      // happened to rank.
+      const requestedOperationInQuery = (query.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}\b/) ?? [])[0] ?? '';
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -1023,7 +1104,9 @@ export function registerToolSearchTool(
           } as ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind }))
         : exactNamedHit || exactKnownButDenied
         ? []
-        : (await Promise.all((opts.candidateSources ?? []).map(async (source) => {
+        : await (async () => {
+          const discoverFromSource = async (source: NonNullable<typeof opts.candidateSources>[number]) => {
+            const sourceStartedAt = Date.now();
             // A candidate source is advisory breadth, never load-bearing: the
             // local catalog always answers. Live 2026-08-25 (platform-49): a
             // provider-side search hung and held this READ for ten minutes —
@@ -1107,6 +1190,7 @@ export function registerToolSearchTool(
                   summary: candidate.summary.trim(),
                   sourceKind: source.kind,
                 }));
+              sourceOutcomes.push({ kind: source.kind, count: sourced.length, elapsedMs: Date.now() - sourceStartedAt });
               return [
                 ...sourced.filter((candidate) => isAcquiredLiveReadCandidate(candidate)),
                 ...sourced.filter((candidate) => !isAcquiredLiveReadCandidate(candidate)),
@@ -1115,12 +1199,16 @@ export function registerToolSearchTool(
               const code: CandidateSourceUnavailableCode = error instanceof CandidateSourceUnavailableError
                 ? error.code
                 : 'search_failed';
+              const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').slice(0, 240);
+              sourceOutcomes.push({ kind: source.kind, count: 0, elapsedMs: Date.now() - sourceStartedAt, code, detail });
               unavailable.push({
                 source: source.kind,
                 code,
+                // The real message, clipped. "raised an unexpected error" told
+                // nobody anything (live 2026-09-15).
                 reason: error instanceof CandidateSourceUnavailableError
                   ? error.message
-                  : `${source.kind} raised an unexpected error during discovery.`,
+                  : `${source.kind} raised an unexpected error during discovery: ${detail}`,
                 ...(() => {
                   const dependencySubject = canonicalUnavailableConnectionSubject({
                     source: source.kind,
@@ -1138,7 +1226,46 @@ export function registerToolSearchTool(
             } finally {
               if (deadline) clearTimeout(deadline);
             }
-          }))).flat();
+          };
+          const sources = opts.candidateSources ?? [];
+          const preferred = sources.filter((source) => !isBroadProviderDiscoverySource(source.kind));
+          const broad = sources.filter((source) => isBroadProviderDiscoverySource(source.kind));
+          const loadReceipts = opts.planSearchReceipts ?? reviewedPlanSearchReceiptsForCurrentTurn;
+          const receiptRows = [...await loadReceipts(query)];
+          const preferredRows = [
+            ...receiptRows,
+            ...(await Promise.all(preferred.map(discoverFromSource))).flat(),
+          ];
+          if (
+            acquiredLiveReadAnswersQuery(query, preferredRows)
+            || reviewedPlanReceiptAnswersQuery(query, receiptRows)
+          ) {
+            skippedBroadDiscovery = true;
+            return preferredRows;
+          }
+          return [...preferredRows, ...(await Promise.all(broad.map(discoverFromSource))).flat()];
+        })();
+      if (!deferredPage) {
+        try {
+          const context = getToolOutputContext();
+          if (context?.sessionId) {
+            appendEvent({
+              sessionId: context.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'discovery_source_outcome',
+              data: {
+                ...(context.sourceUserSeq != null ? { sourceUserSeq: context.sourceUserSeq } : {}),
+                query: query.slice(0, 200),
+                ...(requestedOperationInQuery ? { requestedOperation: requestedOperationInQuery } : {}),
+                skippedBroadDiscovery,
+                sources: sourceOutcomes,
+                candidateCount: sourceCandidates.length,
+              },
+            });
+          }
+        } catch { /* a journal miss never blocks discovery */ }
+      }
       const exactSourceMatches = (deferredPage ? [] : sourceCandidates).filter((candidate) =>
         queryExplicitlyNamesTool(query, candidate.name));
       const exactSourceHit = exactSourceMatches.length === 1
@@ -1272,6 +1399,7 @@ export function registerToolSearchTool(
                 name: sourced.name,
                 carrier: sourced.carrier,
                 sourceKind: sourced.sourceKind,
+                query,
                 ...(sourced.schema !== undefined ? { schema: sourced.schema } : {}),
                 ...(sourced.planningAuthority
                   ? { planningAuthority: sourced.planningAuthority }
@@ -1416,15 +1544,101 @@ export function registerToolSearchTool(
             });
           })()
         : Object.freeze({ version: 1, refs: Object.freeze({}), blockers: Object.freeze({}) });
-      const planningBlockers: Readonly<Record<string, ToolSearchPlanningBlocker>> = { ...planningDisclosure.blockers, ...preparationBlockers };
+      let planningBlockers: Record<string, ToolSearchPlanningBlocker> = { ...planningDisclosure.blockers, ...preparationBlockers };
       // A previous catalog definition cannot override this page's current
       // account or publication refusal. Never disclose both a blocker and an
       // executable-looking ref for the same selected operation.
-      const planningRefs: Readonly<Record<string, string>> = Object.fromEntries(
+      let planningRefs: Record<string, string> = Object.fromEntries(
         Object.entries(planningDisclosure.refs).filter((entry): entry is [string, string] => (
           !planningBlockers[entry[0]] && typeof entry[1] === 'string' && entry[1].trim().length > 0
         )),
       );
+
+      // Empty memory: fuzzy page-1 is not a match. Fetch the named successor
+      // (or the one exact slug in the query) once and proceed only if it
+      // materializes a capabilityRef. Live 2026-09-14: "OUTLOOK update calendar
+      // event by event ID" returned OUTLOOK_OUTLOOK_UPDATE… with no ref; the
+      // model dispatched a deprecated sibling instead of getting the tool.
+      if (
+        opts.discloseForPlanning
+        && !skippedBroadDiscovery
+        && Object.keys(planningRefs).length === 0
+        && remainingBrokerMs() > 500
+      ) {
+        const composio = (opts.candidateSources ?? []).find((source) => source.kind === 'authorized_composio');
+        const fetchSlugs = emptyMemoryFetchSlugs(
+          query,
+          rankedWindow.map((row) => ({
+            name: row.name,
+            summary: 'summary' in row ? String((row as { summary?: string }).summary ?? '') : '',
+            lifecycleSuccessor: 'lifecycleSuccessor' in row && (row as { lifecycleSuccessor?: boolean }).lifecycleSuccessor === true,
+          })),
+        ).filter((slug) => !planningRefs[slug] && !queryExplicitlyNamesTool(query, slug));
+        if (composio && fetchSlugs.length > 0) {
+          const extra: Array<ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind }> = [];
+          for (const slug of fetchSlugs) {
+            if (remainingBrokerMs() <= 500) break;
+            const found = await composio.search({
+              query: slug,
+              limit: 3,
+              signal: currentToolAbortSignal(),
+              deadlineAt: Date.now() + Math.min(remainingBrokerMs(), CANDIDATE_SOURCE_SEARCH_DEADLINE_MS),
+              accountSelection: account_selection,
+            }).catch(() => [] as ToolSearchBrokerCandidate[]);
+            extra.push(...found
+              .filter((row) => row.name.trim().toUpperCase() === slug)
+              .map((row) => ({ ...row, sourceKind: 'authorized_composio' as const })));
+          }
+          if (extra.length > 0 && remainingBrokerMs() > 500) {
+            const extraCandidates = extra.map((row) => ({
+              name: row.name,
+              carrier: (row.carrier ?? 'work_call') as 'work_call' | 'call_tool',
+              sourceKind: 'authorized_composio' as const,
+              query,
+              ...(row.schema !== undefined ? { schema: row.schema } : {}),
+            }));
+            const extraOutcome = await withDiscoveryDeadline({
+              deadlineAt: Date.now() + Math.min(PLANNING_DISCLOSURE_DEADLINE_MS, remainingBrokerMs()),
+              signal: currentToolAbortSignal(),
+            }, async (control) => opts.discloseForPlanning!(extraCandidates, {
+              signal: control.signal,
+              get deadlineAt() { return control.deadlineAt; },
+              awaitModelReview: control.awaitModelReview,
+              accountSelection: account_selection,
+            })).catch(() => null);
+            if (extraOutcome) {
+              if (isPlanningDisclosureOutcome(extraOutcome)) {
+                for (const [name, ref] of Object.entries(extraOutcome.refs)) {
+                  if (typeof ref === 'string' && ref.trim() && !planningBlockers[name]) {
+                    planningRefs[name] = ref;
+                  }
+                }
+                planningBlockers = { ...extraOutcome.blockers, ...planningBlockers };
+              } else {
+                planningRefs = { ...planningRefs, ...extraOutcome };
+              }
+            }
+            const fetchedNames = extra.map((row) => row.name);
+            rankedWindow = [
+              ...extra.map((row) => ({ ...row, oneLiner: row.summary, score: 1 })),
+              ...rankedWindow.filter((row) => !fetchedNames.includes(row.name)),
+            ];
+            for (const name of fetchedNames) selectedNames.add(name);
+            sourceCandidates = [
+              ...extra,
+              ...sourceCandidates.filter((row) => !fetchedNames.includes(row.name)),
+            ];
+            for (const row of extra) {
+              planningCandidateByName.set(row.name, {
+                name: row.name,
+                carrier: (row.carrier ?? 'work_call') as 'work_call' | 'call_tool',
+                sourceKind: 'authorized_composio',
+                ...(row.schema !== undefined ? { schema: row.schema } : {}),
+              });
+            }
+          }
+        }
+      }
 
       const schemaForName = (name: string): unknown => {
         const localPlanning = planningCandidateByName.get(name);
@@ -1484,13 +1698,18 @@ export function registerToolSearchTool(
         // that does not exist. Lead with this only when it plausibly explains
         // an otherwise-empty result — an exact/built-in hit already answered
         // the question and outranks a co-occurring unrelated outage.
+        const namedOperationMissing = Boolean(requestedOperationInQuery)
+          && !rows.some((row) => row.name.trim().toUpperCase() === requestedOperationInQuery);
         if (
           unavailable.length > 0
-          && sourceCandidates.length === 0
+          && (sourceCandidates.length === 0 || namedOperationMissing)
           && !exactNamedHit
           && !exactKnownButDenied
         ) {
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
+          if (namedOperationMissing) {
+            return `Could not reach: ${causes}. ${requestedOperationInQuery} was named but its source did not answer, so it is absent from these results; the other results are NOT substitutes for it. Retry tool_search once for ${requestedOperationInQuery}; if the source still does not answer, report that exact provider problem rather than using a different tool.`;
+          }
           return `Could not reach: ${causes}. This is a provider/connection problem, not evidence the capability is missing — do not conclude it does not exist or invent a reference for it. Retry this search once, or tell the user the connection could not be reached if it keeps failing.`;
         }
         // Disclosure covers the retained window, while a model sees one page.

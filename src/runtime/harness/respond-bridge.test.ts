@@ -5063,3 +5063,87 @@ test('a dispatched turn delivers the model\'s own words, with the canned line as
   });
   assert.equal(composeDispatchedReplyText(bare, 'Started — canned.'), 'Started — canned.');
 });
+
+test('a fresh Execute whose reviewed capability is not current stops before the claim: no source, attempt or claim, and the same revision then Executes', async () => {
+  const plans = await import('./plan-artifacts.js');
+  const catalogs = await import('./host-capability-catalog-factory.js');
+  const manifests = await import('./capability-manifest.js');
+  const { providerInputSchemaDigestOf } = await import('./reviewed-provider-identity.js');
+  const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const operationId = 'reviewed_cli_bridge_preflight_fixture';
+  const manifest = manifests.attachSemanticContract({
+    version: 1, manifestId: `cap:fixture:reviewed-cli:${operationId}`, providerKind: 'reviewed_cli', operationId,
+    providerIdentity: '/usr/bin/fixture-cli', providerVersion: 'fixture-v1', operationVersion: '1',
+    definitionFingerprint: sha256(`definition:${operationId}`), effect: 'read', accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' }, evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-09-01T00:00:00.000Z', trusted: true }, lifecycle: { state: 'current' },
+  });
+  const schema = { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false };
+  schemaCache.rememberToolSchema(operationId, schema, Date.now());
+  const cached = schemaCache.getCachedToolSchema(operationId)!;
+  const entry = {
+    capabilityId: manifest.manifestId, toolName: manifest.operationId, schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint, effect: manifest.effect, account: manifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest), providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint, providerInputSchemaDigest: providerInputSchemaDigestOf(cached),
+    manifest, invoke: async () => ({ records: [], has_more: false }),
+  };
+  const previousFactory = catalogs.peekHostCapabilityCatalogFactory();
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  factory.register(entry);
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  const sessionId = 'bridge-execute-preflight';
+  createSession({ id: sessionId, kind: 'chat', userId: 'owner' });
+  const planSource = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan the query.', taskMode: { version: 1, kind: 'plan' } } });
+  const structuredPlan = {
+    steps: [{ id: 'query', action: 'Run the reviewed query.', effect: 'read', capabilityRef: manifest.manifestId, staticArguments: { query: 'SELECT Id FROM Account' },
+      dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Rows returned.' }],
+    successCriteria: ['Rows returned.'], subagents: [], executionDraft: null,
+    preparedBindings: [{ stepId: 'query', capabilityRef: manifest.manifestId, identity: catalogs.canonicalCatalogIdentityOf(entry), inputSchema: cached,
+      argumentValidation: 'static_schema_checked', source: { sessionId, sourceUserSeq: planSource.seq } }],
+    preparationIssues: [],
+  } as never;
+  const artifact = plans.publishPlanRevision({ sessionId, sourceUserSeq: planSource.seq, principalId: 'owner', fullText: 'Run the reviewed query.', structuredPlan, readiness: 'ready' });
+  const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  const scope = { sessionId, principalId: 'owner', ref };
+  const conversations: number[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (options: { sessionId: string; sourceUserSeq?: number }) => {
+      conversations.push(options.sourceUserSeq ?? -1);
+      const source = listEvents(options.sessionId, { types: ['user_input_received'] }).find(event => event.seq === options.sourceUserSeq)!;
+      return {
+        sessionId: options.sessionId, status: 'completed', steps: 1, lastTurn: source.turn,
+        lastDecision: { summary: 'ran', reply: 'Ran the reviewed query.', done: true, nextAction: 'completed', reason: null },
+        publicPresentation: { version: 1, id: `turn:${source.seq}:presentation`, outcomeId: `turn:${source.seq}`, audience: 'user', phase: 'final',
+          identity: { sessionId: options.sessionId, turn: source.turn, sourceUserSeq: source.seq }, status: 'done', kind: 'answer', text: 'Ran the reviewed query.', resumable: false },
+      };
+    }) as never,
+  });
+  try {
+    // The capability is momentarily not current (evicted from the catalog).
+    factory.forget(entry.capabilityId);
+    const stopped = await respondViaHarness('home', { sessionId, message: 'Execute this plan.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } as never);
+    assert.match(stopped.text, /I could not start executing this plan: .*Nothing was started; this revision is still ready, so retry Execute once the capability is current\./);
+    assert.equal(stopped.stoppedReason, 'awaiting-input');
+    assert.equal((stopped.raw as { reviewedPlanExecutionPreflightRefused?: boolean }).reviewedPlanExecutionPreflightRefused, true);
+    assert.deepEqual(conversations, [], 'no model turn started');
+    assert.equal(plans.getPlanExecutionClaim(scope), null, 'no claim was spent');
+    assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 1, 'no Execute source was recorded');
+    assert.equal(getLatestRunAttempt(sessionId), null, 'no attempt');
+    // The capability is current again: the SAME revision Executes.
+    factory.register(entry);
+    const ran = await respondViaHarness('home', { sessionId, message: 'Execute this plan.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } as never);
+    assert.equal((ran.raw as { reviewedPlanExecutionPreflightRefused?: boolean } | undefined)?.reviewedPlanExecutionPreflightRefused, undefined, JSON.stringify(ran));
+    assert.equal(conversations.length, 1, 'the model turn ran once');
+    const claim = plans.getPlanExecutionClaim(scope);
+    assert.ok(claim, 'the claim is minted only for the Execute that actually started');
+    assert.equal(claim.ref.revision, artifact.revision);
+    assert.equal(claim.sourceUserSeq, conversations[0]);
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(previousFactory);
+    _setBridgeImplsForTests({});
+  }
+});

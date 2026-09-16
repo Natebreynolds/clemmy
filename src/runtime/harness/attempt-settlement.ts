@@ -53,6 +53,8 @@ import {
 } from './accepted-turn-call-authority.js';
 import { currentHostToolInvocationObservation } from './tool-invocation-observation-context.js';
 import { ExternalWritePreDispatchResult } from './external-write-admission.js';
+import { loadJournaledConsentBasis } from './host-consent-evidence.js';
+import type { InteractiveConsentProceedBasis } from './interactive-consent-policy.js';
 import { CurrentCapabilityDefinitionUnavailableError } from './production-capability-ports.js';
 
 export { normalizeCallableArguments, toResultHandle };
@@ -316,6 +318,10 @@ export interface SettleToolAttemptInput {
   requirementId?: string;
   /** True when this attempt continues an obligation rather than completing it. */
   continuesRequirement?: boolean;
+  /** The consent basis the host admitted this call under. A planning turn's
+   * preparation probe settles like a read crossing; the journaled receipt is
+   * verified here, so the claim alone changes nothing. */
+  consentBasis?: InteractiveConsentProceedBasis;
 }
 
 export interface SettledToolAttempt {
@@ -1182,10 +1188,19 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // binding, while the same graph-neutral control call remains control. The
   // durable effect also outranks the wrappers' legacy external-only mutating
   // bit, which otherwise mislabels local writes as non-mutating at settlement.
-  const settlementMutating = binding
-    ? runtimeEffectIsMutation(binding.effect)
-    : input.mutating === true;
-  if (binding) extracted.mutating = settlementMutating;
+  // A PREPARATION PROBE IS ACCOUNTED LIKE A READ. A planning turn exercised a
+  // carrier-bounded call once so the plan binds arguments that worked; its
+  // returned bytes are ordinary retained evidence, never an unproven mutation
+  // the model must stop and explain. The journaled consent receipt, not the
+  // caller's claim, is the authority for that basis.
+  const preparationProbe = input.consentBasis === 'plan_preparation_probe'
+    && loadJournaledConsentBasis(identity) === 'plan_preparation_probe';
+  const settlementMutating = preparationProbe
+    ? false
+    : binding
+      ? runtimeEffectIsMutation(binding.effect)
+      : input.mutating === true;
+  if (binding || preparationProbe) extracted.mutating = settlementMutating;
   if (settlementMutating && extracted.acknowledged === undefined) {
     // A mutation that threw was never acknowledged — and a mutation whose
     // envelope merely says "not successful" has not proved that nothing landed
@@ -1289,6 +1304,17 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       ...(typedNegative.status ? { hostFailureStatus: typedNegative.status } : {}),
     });
   } else if (returnedLocalResult && outcome.kind === 'unknown' && extracted.executionFailed !== true) {
+    outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
+  } else if (
+    preparationProbe
+    && input.thrown === undefined
+    && Object.prototype.hasOwnProperty.call(input, 'result')
+    && outcome.kind === 'unknown'
+    && extracted.executionFailed !== true
+  ) {
+    // The probe's crossing returned. The host holds the exact bytes that came
+    // back and the call had no mutation to prove, so the completed call is
+    // its own evidence, exactly as a host-executed read is above.
     outcome = classifyAttemptOutcome({ ...extracted, hostExecuted: true });
   }
 

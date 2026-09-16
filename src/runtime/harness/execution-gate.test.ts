@@ -903,3 +903,19 @@ test('a stale callable row cannot supply manifest semantics or lower unknown ris
     installHostCapabilityCatalogFactory(null);
   }
 });
+
+test('a server-declared non-destructive mutating tool is still a mutation at the frame; consent answers, the frame never lowers', async () => {
+  const {
+    recordDeclaredMcpToolEffect,
+    _resetDeclaredMcpToolEffectsForTest,
+  } = await import('../mcp-declared-effects.js');
+  _resetDeclaredMcpToolEffectsForTest();
+  try {
+    recordDeclaredMcpToolEffect('mcp__vendor__generic_call', { readOnlyHint: false, destructiveHint: false });
+    const declared = classifyCanonicalExternalEffect('mcp__vendor__generic_call', { method: 'POST' });
+    assert.equal(declared.mutating, true);
+    assert.equal(isMutatingExternalWrite('mcp__vendor__generic_call', { method: 'GET' }), true);
+  } finally {
+    _resetDeclaredMcpToolEffectsForTest();
+  }
+});

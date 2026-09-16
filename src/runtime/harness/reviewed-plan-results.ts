@@ -199,8 +199,12 @@ export function recordReviewedPlanStepResult(identity: Identity, stepId: string,
           AND b.source_user_seq = s.source_user_seq AND b.logical_tool_call_id = s.logical_tool_call_id
         WHERE s.session_id = ? AND s.source_user_seq = ? AND s.mutating = 1 AND s.outcome_kind = 'succeeded'`)
         .all(identity.sessionId, identity.sourceUserSeq) as Array<{ requirement_id: string }>;
-      if (writes.some(write => consumers.has(write.requirement_id)
-        && !canReviseReviewedFileStep(identity, write.requirement_id, stepId))) throw new Error('The prior synthesis has already accompanied a successful write that cannot be safely revised as this request\'s own local file. Keep its evidence and revise the remaining work explicitly.');
+      // Stop at the first consumer that cannot be revised: the revise check
+      // may replace an owned file as a side effect, so it runs at most once
+      // per blocking write, in order, exactly as a short-circuit does.
+      const blocking = writes.find(write => consumers.has(write.requirement_id)
+        && !canReviseReviewedFileStep(identity, write.requirement_id, stepId));
+      if (blocking) throw new Error(`Step ${stepId} already has a recorded result, and ${blocking.requirement_id} already ran on it, so that record stands. Continue from the next unfinished step using the recorded result; if that data must change, ask for a plan revision.`);
     }
     if (!replayed) db.prepare(`INSERT INTO reviewed_plan_step_results_v1
       (session_id, source_user_seq, plan_digest, step_id, result_digest, result_json, inputs_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)

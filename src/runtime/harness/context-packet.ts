@@ -39,6 +39,8 @@ import {
   buildProspectiveIntentionContext,
   prospectiveCaptureDirective,
 } from '../prospective-intentions.js';
+import { openLoopsForSession, renderOpenLoops } from './open-loops.js';
+import { renderSessionConstraints, sessionConstraintsForSession } from './session-constraints.js';
 import { standingRuleCaptureDirective } from '../../memory/rule-capture.js';
 import {
   BATCH_RE,
@@ -91,6 +93,14 @@ export interface AgentContextPacket {
     bytes: number;
     captureSuggested: boolean;
   };
+  /** Questions Clem asked this principal in OTHER recent conversations that
+   *  are still unanswered (open-loops.ts). Advisory: the model decides whether
+   *  the current message answers one. */
+  openLoops: { count: number; bytes: number; sessionIds: string[] };
+  /** Explicit "remember …" instructions the owner gave earlier in THIS
+   *  conversation (session-constraints.ts), quoted verbatim on every request
+   *  of the same conversation. Data in force, never effect authority. */
+  sessionConstraints: { count: number; bytes: number; seqs: number[] };
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
   /** Local project slash commands (proposal-builder's /seo-audit, …) whose
@@ -687,6 +697,32 @@ export function buildAgentContextPacket(
       : 'Memory preflight: disabled.';
   let prospective = { text: '', count: 0, ids: [] as string[], bytes: 0 };
   let prospectiveCapture: string | null = null;
+  // Open loops: what she asked this person elsewhere and never heard back on.
+  // A new conversation from the same principal (live 2026-09-15: three blank
+  // rooms, three unanswered questions) must not start as if nothing is open.
+  let openLoopsText = '';
+  let openLoopSessionIds: string[] = [];
+  if (opts?.sessionId && !constrainedWorkflowNode && !suppressSemanticEnrichment && opts?.sessionKind !== 'workflow') {
+    try {
+      const loops = openLoopsForSession(opts.sessionId);
+      openLoopsText = renderOpenLoops(loops);
+      openLoopSessionIds = loops.map((loop) => loop.sessionId);
+    } catch { /* advisory context, never turn authority */ }
+  }
+  // Session constraints: what the owner asked her to remember earlier in this
+  // conversation. A new accepted source is a new turn and a new packet, so the
+  // block is re-carried here, verbatim; the packet is the one copy. Not gated
+  // on a declined proposal: declining one proposal does not cancel a standing
+  // subject. Workflow nodes and non-chat sessions never carry it.
+  let sessionConstraintsText = '';
+  let sessionConstraintSeqs: number[] = [];
+  if (opts?.sessionId && opts?.sessionKind === 'chat' && !constrainedWorkflowNode) {
+    try {
+      const constraints = sessionConstraintsForSession(opts.sessionId);
+      sessionConstraintsText = renderSessionConstraints(constraints);
+      sessionConstraintSeqs = constraints.map((item) => item.seq);
+    } catch { /* advisory context, never turn authority */ }
+  }
   // Standing-rule capture steer (2026-07-31): a rule-shaped user statement
   // ("we ONLY use the sf CLI for Salesforce") must become a pinned constraint
   // at the moment it is said, not stay chat prose the next session forgets.
@@ -837,6 +873,8 @@ export function buildAgentContextPacket(
     focus,
     memoryStatusLine,
     prospective.text,
+    openLoopsText,
+    sessionConstraintsText,
     prospectiveCapture,
     ruleCapture,
     mcpScopeLine,
@@ -878,6 +916,16 @@ export function buildAgentContextPacket(
       count: prospective.count,
       bytes: prospective.bytes,
       captureSuggested: Boolean(prospectiveCapture),
+    },
+    openLoops: {
+      count: openLoopSessionIds.length,
+      bytes: Buffer.byteLength(openLoopsText, 'utf8'),
+      sessionIds: openLoopSessionIds,
+    },
+    sessionConstraints: {
+      count: sessionConstraintSeqs.length,
+      bytes: Buffer.byteLength(sessionConstraintsText, 'utf8'),
+      seqs: sessionConstraintSeqs,
     },
     skills,
     workflows,

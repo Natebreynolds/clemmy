@@ -312,3 +312,78 @@ test('opaque external work uses exact consent without inventing safe semantics o
   assert.deepEqual(evaluateInteractiveConsentV1(input(opaque, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
   assert.deepEqual(evaluateInteractiveConsentV1(input(opaque, { crossing: 'possibly_started' })), { kind: 'reconcile', reason: 'possible_effect', retry: 'never_blind' });
 });
+
+test('a carrier-bounded unnamed consequence with exact coverage is ordinary accepted work; every other gate still stands', () => {
+  const bounded = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded)), {
+    kind: 'proceed',
+    basis: 'exact_carrier_bounded_work',
+    authorityDigest: digest('1'),
+    reservationKey: 'contract-1\0requirement-1',
+  });
+  // Carrier silent: the exact-call card stays.
+  const silent = call({ ...bounded, risk: { ...bounded.risk, reversibility: 'unknown' } });
+  const carded = evaluateInteractiveConsentV1(input(silent));
+  assert.equal(carded.kind, 'needs_user');
+  if (carded.kind === 'needs_user') assert.match(carded.reason, /cannot classify/i);
+  // High consequence outranks the bound.
+  const send = evaluateInteractiveConsentV1(input(call({ ...bounded, risk: { ...bounded.risk, consequence: 'send' } })));
+  assert.equal(send.kind, 'needs_user');
+  if (send.kind === 'needs_user') assert.equal(send.need, 'approval');
+  const bulk = evaluateInteractiveConsentV1(input(call({ ...bounded, cardinality: { kind: 'set', count: 3 } as never })));
+  assert.equal(bulk.kind, 'needs_user');
+  // An explicit checkpoint is human-owned regardless of risk.
+  const checkpoint = evaluateInteractiveConsentV1(input(bounded, {
+    explicitHumanCheckpoint: { subjectDigest: digest('3') } as never,
+  }));
+  assert.equal(checkpoint.kind, 'needs_user');
+  if (checkpoint.kind === 'needs_user') assert.equal(checkpoint.need, 'approval');
+  // No coverage: a surprise write repairs, it is never auto-answered.
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
+  // A local write with the same risk shape is not an external carrier bound.
+  const local = evaluateInteractiveConsentV1(input(call({ ...bounded, effect: 'local_write', accountId: null,
+    semanticBasis: { kind: 'local_registry', digest: digest('e') } })));
+  assert.equal(local.kind, 'repair');
+});
+
+test('a planning source probes a carrier-bounded call once without coverage and refuses every other external effect without a card', () => {
+  const bounded = call({ effect: 'external_write', accountId: 'selected-account',
+    risk: { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false },
+    semanticBasis: { kind: 'current_external_definition', digest: digest('8') } });
+  // Plan holds no expected-work graph: the probe proceeds with no coverage at all.
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true })), {
+    kind: 'proceed', basis: 'plan_preparation_probe', authorityDigest: bounded.bindingDigest,
+  });
+  // The same shape with coverage present still answers as a probe, never as accepted work.
+  assert.equal(evaluateInteractiveConsentV1(input(bounded, { preparationProbe: true })).kind, 'proceed');
+  assert.equal((evaluateInteractiveConsentV1(input(bounded, { preparationProbe: true })) as { basis?: string }).basis, 'plan_preparation_probe');
+  // Creates, updates, sends, deletes, admin, carrier-silent and sealed sets are typed refusals: never needs_user, never repair.
+  for (const other of [
+    call({ ...bounded, risk: { reversibility: 'ordinary_non_destructive', consequence: 'create', destructive: false } }),
+    call({ ...bounded, risk: { reversibility: 'ordinary_non_destructive', consequence: 'update', destructive: false } }),
+    call({ ...bounded, risk: { reversibility: 'reversible', consequence: 'create', destructive: false } }),
+    call({ ...bounded, risk: { reversibility: 'irreversible', consequence: 'send', destructive: false } }),
+    call({ ...bounded, risk: { reversibility: 'unknown', consequence: 'delete', destructive: true } }),
+    call({ ...bounded, effect: 'admin', risk: { reversibility: 'unknown', consequence: 'admin', destructive: false } }),
+    call({ ...bounded, risk: { reversibility: 'unknown', consequence: 'unknown', destructive: false } }),
+    call({ ...bounded, risk: { ...bounded.risk, destructive: true } }),
+    call({ ...bounded, cardinality: { kind: 'set', universeDigest: digest('9') } }),
+    call({ ...bounded, effect: 'local_write', accountId: null, semanticBasis: { kind: 'local_registry', digest: digest('e') } }),
+  ]) {
+    for (const cov of [null, coverage(other)]) {
+      assert.deepEqual(evaluateInteractiveConsentV1(input(other, { coverage: cov, preparationProbe: true })),
+        { kind: 'refuse', reason: 'plan_mode_external_effect' }, `${other.effect}/${other.risk.consequence}/${other.cardinality.kind}`);
+    }
+  }
+  // Reads still proceed as no_effect in Plan; safety and crossing gates still outrank the probe.
+  assert.equal(evaluateInteractiveConsentV1(input(call({ effect: 'read',
+    risk: { reversibility: 'read_only', consequence: 'read', destructive: false } }), { coverage: null, preparationProbe: true })).kind, 'proceed');
+  assert.deepEqual(evaluateInteractiveConsentV1(input(call({ ...bounded, safety: 'protected' }), { coverage: null, preparationProbe: true })),
+    { kind: 'refuse', reason: 'protected_target' });
+  assert.equal(evaluateInteractiveConsentV1(input(bounded, { coverage: null, preparationProbe: true, crossing: 'started' })).kind, 'reconcile');
+  // Without the planning flag nothing changed: no coverage repairs, coverage proceeds on the carrier bound.
+  assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
+  assert.equal((evaluateInteractiveConsentV1(input(bounded)) as { basis?: string }).basis, 'exact_carrier_bounded_work');
+});

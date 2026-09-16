@@ -274,6 +274,15 @@ function proofForegroundValidatorForManifest(
   }
 }
 
+function sealedContractSchemaDigest(operationId: string): string | undefined {
+  try {
+    const schema = getCachedToolSchema(operationId);
+    return schema ? digestSchema(schema) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function registeredCapabilityFromManifest(input: {
   manifest: CapabilityManifestV1;
   observation: LiveCapabilityObservation;
@@ -292,12 +301,15 @@ export function registeredCapabilityFromManifest(input: {
     advisoryRoles: input.manifest.advisoryRoles,
     manifestDigest: capabilityManifestDigest(input.manifest),
     providerKind: input.manifest.providerKind,
-    ...(input.manifest.externalDefinition
-      ? {
-          providerInputSchemaDigest:
-            input.manifest.externalDefinition.providerInputSchemaDigest,
-        }
-      : {}),
+    ...(() => {
+      // Seal the provider input schema digest on every registration. A
+      // manifest carries no input schema; when it also carries no external
+      // definition, the exact schema its materializer installed in the
+      // durable contract store is the producer's form for this operation.
+      const digest = input.manifest.externalDefinition?.providerInputSchemaDigest
+        ?? sealedContractSchemaDigest(input.manifest.operationId);
+      return digest ? { providerInputSchemaDigest: digest } : {};
+    })(),
     liveFingerprint: input.observation.definitionFingerprint,
     delegatedFrom: input.manifest.delegatedFrom,
     manifest: input.manifest,

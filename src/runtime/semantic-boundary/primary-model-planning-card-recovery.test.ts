@@ -588,3 +588,295 @@ test('every refusal exit of priming routes through the durable recorder (connect
   assert.match(body, /const refuse = \(stage: PrimaryModelPlanningPrimeStage/,
     'the local recorder closure is still the one door for refusals');
 });
+
+test('same-id advisory drift (purpose wording) reopens the stored card; only identity drift refuses', async () => {
+  // Restart class: purpose text and advisory roles are re-derived per process.
+  // A card whose capability keeps its id, effect, account and manifest must
+  // reopen after a restart even when that wording changed, or every Execute
+  // that follows a daemon restart parks on "capability drifted".
+  const factory = resetFixture();
+  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const { session, source } = freshSource('advisory-drift');
+  const first = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(first.ok, true, first.ok ? '' : first.reason);
+  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'look up the latest news for a topic' });
+  const replay = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(replay.ok, true, replay.ok ? '' : replay.reason);
+});
+
+// ─── A continuation answer inherits its parent's disclosures ────────────────
+//
+// Answering a Plan question is a new accepted source. The exact refs its
+// parent already disclosed (durable `capability_discovered` rows) must stay
+// citable for the answer, or every answer pays tool_search plus
+// discover-and-cite from zero. The card is saturated here on purpose: the
+// inherited ref is a live entry the bounded card withholds, so the staged
+// ledger — what plan_task may cite beyond the card — is the evidence, exactly
+// as it is for a same-source tool_search on a full card. Only an undeclined
+// continuation inherits; the session is never relaxed; every inherited row is
+// re-proven against the current catalog.
+
+const adapters = await import('../harness/production-capability-adapter.js');
+
+function nativeMcpRead(input: { label: string; operationId: string; purpose: string }) {
+  const configDigest = sha256(`mcp-config:${input.label}`);
+  const providerIdentity = `mcp-config:${input.label}:${configDigest}`;
+  const accountId = `native_mcp:${input.label}:${configDigest}`;
+  const definitionFingerprint = sha256(`mcp-definition:${input.label}:${input.operationId}:${accountId}`);
+  const scopeDigest = sha256(JSON.stringify({
+    domain: 'native-mcp-live-operation-scope', version: 1, providerIdentity, operationId: input.operationId, accountId,
+  })).slice(0, 24);
+  return manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:live:mcp:v1:${scopeDigest}:${definitionFingerprint}`,
+    providerKind: 'native_mcp',
+    operationId: input.operationId,
+    providerIdentity,
+    providerVersion: `mcp-catalog-v1:${sha256(`catalog:${input.label}`)}`,
+    operationVersion: `mcp-tool-v1:${sha256(`tool:${input.label}`)}`,
+    definitionFingerprint,
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: sha256(`input-schema:${input.label}`),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: sha256(`output-schema:${input.label}`),
+      semanticName: input.operationId.split('__').at(-1) ?? input.operationId,
+      behaviorHints: { readOnly: true, destructive: false, idempotent: true, openWorld: false },
+    },
+    effect: 'read',
+    accountId,
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'result' },
+    purpose: input.purpose,
+    acceptedInputKinds: ['arguments'],
+    producedOutputKinds: ['result'],
+    applicableDeliverableKinds: ['result'],
+    evidenceContract: { kinds: ['result'], readbackRequired: false },
+    provenance: { issuer: 'host:native-mcp-live-materializer:v1', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source', 'collection', 'lookup'],
+    argumentCompiler: { id: 'compile:native-mcp-closed-schema:v1', version: '1' },
+    invokePortId: `host:native-mcp-read:${sha256(`port:${input.label}`)}`,
+  });
+}
+
+const PARENT_REQUEST = 'Assemble the current cobalt constellation telemetry snapshot';
+
+/** A session whose parent source disclosed one exact live read that the
+ * saturated card withholds. Returns the parent seq and the withheld ref. */
+function registerLive(
+  factory: ReturnType<typeof catalogs.createHostCapabilityCatalogFactory>,
+  manifest: ReturnType<typeof nativeMcpRead>,
+) {
+  const entry = adapters.registeredCapabilityFromManifest({
+    manifest,
+    observation: {
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+      accountId: manifest.accountId,
+      observedAt: Date.now(),
+    },
+    invoke: async () => ({ data: [] }),
+  });
+  factory.register(entry);
+  return entry;
+}
+
+function parentWithWithheldDisclosure(label: string) {
+  const factory = resetFixture();
+  for (let index = 0; index < 8; index += 1) {
+    registerLive(factory, nativeMcpRead({
+      label: `${label}-cobalt-${index}`,
+      operationId: `mcp__cobalt_${index}__read_constellation_telemetry`,
+      purpose: 'assemble current cobalt constellation telemetry snapshot',
+    }));
+  }
+  const target = nativeMcpRead({
+    label: `${label}-archive`,
+    operationId: 'mcp__zenith__read_unrelated_archive',
+    purpose: 'unrelated_archive_lookup',
+  });
+  const entry = registerLive(factory, target);
+  const descriptor = semantic.hostDescriptorFromRegistered(entry);
+  assert.ok(descriptor, 'the withheld target has a planning descriptor');
+  const session = eventlog.createSession({ id: `primary-card-inherit-${label}`, kind: 'chat' });
+  const parent = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: PARENT_REQUEST },
+  });
+  eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: {
+      sourceUserSeq: parent.seq,
+      capabilities: [{
+        kind: 'mcp',
+        identifier: target.operationId,
+        effectClass: 'read',
+        capabilityRef: target.manifestId,
+        manifestDigest: descriptor!.manifestDigest,
+        accountIdentity: descriptor!.accountScope,
+        providerKind: target.providerKind,
+        descriptor,
+        providerDefinition: {
+          version: 1,
+          providerInputSchemaDigest: target.externalDefinition!.providerInputSchemaDigest,
+          definitionFingerprint: target.definitionFingerprint,
+          providerOperationVersion: target.operationVersion,
+          providerOutputSchemaDigest: target.externalDefinition!.providerOutputSchemaDigest!,
+          invokePortId: target.invokePortId,
+          verificationContract: null,
+          operationSemantics: null,
+        },
+      }],
+    },
+  });
+  return { session, parent, ref: target.manifestId };
+}
+
+async function answerContinuation(input: {
+  sessionId: string;
+  parentSeq: number;
+  text: string;
+  classification: { disposition: 'affirmed' } | { disposition: 'declined_with_new_task'; activeTaskInput: string };
+}) {
+  continuityStore.createTaskContinuityPacket({
+    sessionId: input.sessionId,
+    originatingSourceUserSeq: input.parentSeq,
+    pause: { kind: 'clarification', question: 'Should the snapshot include the archived constellations too?', options: [] },
+    capabilities: [],
+  });
+  const answer = eventlog.appendEvent({
+    sessionId: input.sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: input.text, displayText: input.text },
+  });
+  const enriched = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId: input.sessionId,
+    sourceUserSeq: answer.seq,
+    message: input.text,
+  }, answer.seq, { typedClassification: input.classification });
+  assert.equal(enriched.taskContinuationResolved, true);
+  assert.equal(enriched.taskContinuation?.disposition, input.classification.disposition);
+  return answer;
+}
+
+function stagedForSource(planning: { authority: Parameters<typeof semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors>[0]['authority'] }, identity: { sessionId: string; sourceUserSeq: number }, ref: string) {
+  return semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: planning.authority, identity, selectedRefs: new Set([ref]),
+  }).map((entry) => entry.id);
+}
+
+test('a plain later source in the same session does not inherit an earlier disclosure', async () => {
+  const { session, ref } = parentWithWithheldDisclosure('plain');
+  const later = eventlog.appendEvent({
+    sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: PARENT_REQUEST },
+  });
+  const primed = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: later.seq });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.equal(primed.planning.capabilities.length, 8, 'the live ranking saturates the card');
+  assert.equal(primed.planning.capabilities.some((entry) => entry.id === ref), false, 'the target is withheld');
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], []);
+  assert.deepEqual(stagedForSource(primed.planning, { sessionId: session.id, sourceUserSeq: later.seq }, ref), [],
+    'without a continuation, another source\'s disclosure is not staged');
+});
+
+test('an affirmed continuation answer inherits the parent source\'s disclosed ref into its staged ledger', async () => {
+  const { session, parent, ref } = parentWithWithheldDisclosure('affirmed');
+  const answer = await answerContinuation({
+    sessionId: session.id, parentSeq: parent.seq, text: 'Yes', classification: { disposition: 'affirmed' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: answer.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], [parent.seq],
+    'the snapshot names exactly the parent source it inherited from');
+  assert.equal(primed.planning.digest, sha256(JSON.stringify(primed.planning.capabilities)));
+  assert.deepEqual(stagedForSource(primed.planning, identity, ref), [ref],
+    'the parent disclosure is staged for the answer without a new tool_search');
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['capability_discovered'] })
+      .filter((event) => event.data.sourceUserSeq === answer.seq).length,
+    0,
+    'inheritance replays the parent row; it does not forge a disclosure row under the answering source',
+  );
+  // Restart class: the staged inheritance is rebuilt from durable facts alone.
+  eventlog.closeEventLog();
+  const rePrimed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(rePrimed.ok, true, rePrimed.ok ? '' : rePrimed.reason);
+  if (!rePrimed.ok) return;
+  assert.deepEqual(stagedForSource(rePrimed.planning, identity, ref), [ref]);
+});
+
+test('a decline with new work inherits nothing from the parent source', async () => {
+  const { session, parent, ref } = parentWithWithheldDisclosure('declined');
+  const text = 'No, leave the snapshot alone. Instead, what is 15 × 9?';
+  const answer = await answerContinuation({
+    sessionId: session.id, parentSeq: parent.seq, text,
+    classification: { disposition: 'declined_with_new_task', activeTaskInput: 'what is 15 × 9?' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: answer.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], []);
+  assert.deepEqual(stagedForSource(primed.planning, identity, ref), [],
+    'a declined parent lends no disclosure to the fresh clause');
+});
+
+test('a continuation in another session never reaches the first session\'s parent disclosures', async () => {
+  const { session: disclosing, ref } = parentWithWithheldDisclosure('other-session');
+  const other = eventlog.createSession({ id: 'primary-card-inherit-other-session-b', kind: 'chat' });
+  const parent = eventlog.appendEvent({
+    sessionId: other.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: PARENT_REQUEST },
+  });
+  const answer = await answerContinuation({
+    sessionId: other.id, parentSeq: parent.seq, text: 'Yes', classification: { disposition: 'affirmed' },
+  });
+  const identity = { sessionId: other.id, sourceUserSeq: answer.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], [parent.seq],
+    'inheritance is bound to this session\'s own parent');
+  assert.ok(eventlog.listEvents(disclosing.id, { types: ['capability_discovered'] }).length > 0,
+    'the other session\'s disclosure row still exists');
+  assert.deepEqual(stagedForSource(primed.planning, identity, ref), [], 'the session boundary is never relaxed');
+});
+
+test('an inherited parent row whose manifest digest drifted is dropped like an own-source row', async () => {
+  const { session, parent, ref } = parentWithWithheldDisclosure('drift');
+  const db = eventlog.openEventLog();
+  const rows = db.prepare(`
+    SELECT id, data_json FROM events WHERE session_id = ? AND type = 'capability_discovered'
+  `).all(session.id) as Array<{ id: string; data_json: string }>;
+  let drifted = 0;
+  for (const row of rows) {
+    const data = JSON.parse(row.data_json) as { sourceUserSeq?: number; capabilities?: Array<Record<string, unknown>> };
+    if (data.sourceUserSeq !== parent.seq) continue;
+    for (const capability of data.capabilities ?? []) {
+      if (capability.capabilityRef !== ref) continue;
+      capability.manifestDigest = sha256('drifted-parent-manifest');
+      drifted += 1;
+    }
+    db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), row.id);
+  }
+  assert.equal(drifted, 1, 'the parent row was rewritten with a drifted digest');
+  const answer = await answerContinuation({
+    sessionId: session.id, parentSeq: parent.seq, text: 'Yes', classification: { disposition: 'affirmed' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: answer.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], [parent.seq]);
+  assert.deepEqual(stagedForSource(primed.planning, identity, ref), [],
+    'a drifted inherited row is re-proven against the current catalog and dropped');
+});

@@ -27,9 +27,9 @@ test('Agents SDK tracing is quiet by default when no export API key exists', () 
 });
 
 test('MODELS reads model tier changes from the runtime env file', () => {
-  assert.equal(config.MODELS.fast, 'gpt-5.4-mini');
-  assert.equal(config.MODELS.primary, 'gpt-5.4');
-  assert.equal(config.MODELS.deep, 'gpt-5.4');
+  assert.equal(config.MODELS.fast, 'gpt-5.6-luna');
+  assert.equal(config.MODELS.primary, 'gpt-5.6-terra');
+  assert.equal(config.MODELS.deep, 'gpt-5.6-sol');
 
   writeFileSync(
     path.join(TMP_HOME, '.env'),
@@ -103,8 +103,8 @@ test('Codex rescue is explicit when configured and otherwise follows only a Code
     process.env.OPENAI_MODEL_PRIMARY = 'glm-5.3';
     delete process.env.OPENAI_MODEL_RESCUE;
     assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
-      modelId: 'gpt-5.4',
-      inheritedModelId: 'gpt-5.4',
+      modelId: 'gpt-5.6-terra',
+      inheritedModelId: 'gpt-5.6-terra',
       envKey: 'OPENAI_MODEL_RESCUE',
       configured: false,
     }, 'a BYO primary cannot become the claimed Codex rescue target');
@@ -112,7 +112,7 @@ test('Codex rescue is explicit when configured and otherwise follows only a Code
     process.env.OPENAI_MODEL_RESCUE = 'gpt-5.6-luna';
     assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
       modelId: 'gpt-5.6-luna',
-      inheritedModelId: 'gpt-5.4',
+      inheritedModelId: 'gpt-5.6-terra',
       envKey: 'OPENAI_MODEL_RESCUE',
       configured: true,
     }, 'an explicit validated Codex selection still outranks safe inheritance');

@@ -23,6 +23,7 @@ import {
   productionPortIdentityFromManifest,
   registerProductionCapabilityPort,
   resolveProductionPortsForManifest,
+  replaceProductionCapabilityPort,
 } from './production-capability-ports.js';
 import {
   isShippedInvoke,
@@ -233,14 +234,24 @@ export function createProductionReviewedCliReadCarrier(): ProductionReviewedCliR
               || existing.argv.some((token, index) => token !== expectedArgv[index])
               ? 'argv_mismatch'
               : null;
-      if (failed) {
+      // A shipped invoke with NO argv and NO observer is not a reviewed port
+      // at all: it is the generic placeholder restart reconstruction claims
+      // for every current durable manifest. Refusing it retired the identity
+      // and re-minted it on the next attempt — live 2026-09-14/15 the Friday
+      // dashboard's five Salesforce reads failed "observe_missing" on the
+      // first attempt after every daemon restart and passed 65 s later on a
+      // fresh manifest. The exact reviewed port replaces the placeholder.
+      const placeholder = failed !== 'invoke_not_shipped'
+        && typeof existing.observe !== 'function'
+        && !Array.isArray(existing.argv);
+      if (failed && !placeholder) {
         const existingArgv = Array.isArray(existing.argv) ? existing.argv.join(' ') : '(none)';
         return {
           ok: false,
           reason: `the exact reviewed CLI port is not a shipped implementation (${failed}; existing: ${existingArgv.slice(0, 200)}; expected: ${expectedArgv.join(' ').slice(0, 200)})`,
         };
       }
-      return { ok: true };
+      if (!failed) return { ok: true };
     }
     let shipped: ReturnType<typeof loadShippedImplementations>;
     try {
@@ -252,7 +263,8 @@ export function createProductionReviewedCliReadCarrier(): ProductionReviewedCliR
       shipped.bindIsolatedTransport((call) => executeReviewedCliRead(call));
     }
     const invoke = shipped.invokeForSealedManifest(manifest);
-    const registered = registerProductionCapabilityPort(
+    const register = existing ? replaceProductionCapabilityPort : registerProductionCapabilityPort;
+    const registered = register(
       productionPortIdentityFromManifest(manifest),
       Object.freeze({
         invoke,

@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
+const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
 
 test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
   assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
@@ -131,11 +131,38 @@ test('gate: FIRES for a promise-shaped reply even when it looks low-effort (the 
   );
 });
 
+test('gate: a status/discovery call is not enough to judge a non-action Act turn', () => {
+  // The live shape: mcp_status is a host control tool, so no business call.
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: false,
+    meaningfulToolEvidence: false,
+    sourceWorkAttempted: true,
+  }), false);
+  // A lookup that made a real business read stays review-eligible.
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: false,
+    meaningfulToolEvidence: true,
+    sourceWorkAttempted: true,
+  }), true);
+});
+
+test('gate: claiming the work is done without a write still judges an action turn', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: true,
+    meaningfulToolEvidence: true,
+    claimedCompletedWork: true,
+  }), true);
+});
+
 test('isPromiseShapedReply: future-tense promise with no artifact → true', () => {
   for (const p of [
     "Got it. I'll prep them as review-ready drafts, not send them yet.",
     'Going to put that report together for you.',
     "Let me go pull all the data and build the file.",
+    'The check-in landed; next I’ll actually run the posts scraper against Scorpion’s Facebook page.',
   ]) {
     assert.equal(isPromiseShapedReply(p), true, `promise: ${p}`);
   }
@@ -494,4 +521,38 @@ test('the goal judge has its own deadline, off the 25 s boundary wall, and the e
     if (prior === undefined) delete process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS;
     else process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS = prior;
   }
+});
+
+test('the judge is told a reported provider failure needs a matching provider call in the evidence', () => {
+  const prompt = buildObjectiveJudgePrompt(
+    'edit this event and add a brief description',
+    "I couldn't update the existing invite — the Outlook API can locate it but won't accept its event ID for editing.",
+  );
+  assert.match(prompt, /counts as evidence only when a matching provider call appears in the evidence above/);
+  assert.match(prompt, /treat the reported failure as unverified: the objective is not fulfilled/);
+});
+
+test('an honest failure report settles after one bounce; claims and promises still get judged', () => {
+  const honest = "I couldn't update the invite because the calendar connector rejected the operation. No changes were made.";
+  assert.equal(honestFailureReportSettles({ verdictDone: false, continuationsUsed: 1, reply: honest, settledWrites: 0 }), true);
+  assert.equal(honestFailureReportSettles({ verdictDone: false, continuationsUsed: 0, reply: honest, settledWrites: 0 }), false, 'the first negative verdict still bounces once');
+  assert.equal(honestFailureReportSettles({ verdictDone: false, continuationsUsed: 1, reply: 'Done — the invite was updated.', settledWrites: 0 }), false, 'a claim is judged');
+  assert.equal(honestFailureReportSettles({ verdictDone: false, continuationsUsed: 1, reply: "I'll update it next.", settledWrites: 0 }), false, 'a promise is judged');
+  assert.equal(honestFailureReportSettles({ verdictDone: false, continuationsUsed: 1, reply: honest, settledWrites: 1 }), false, 'a settled write is verified, not settled by wording');
+  assert.equal(honestFailureReportSettles({ verdictDone: true, continuationsUsed: 1, reply: honest, settledWrites: 0 }), false);
+});
+
+test('a verdict records the model that answered after a mid-call fallover, keeping the pin as requested', () => {
+  const startedAt = Date.parse('2026-09-15T07:59:40.000Z');
+  const rows = [
+    { createdAt: '2026-09-15T08:00:15.000Z', data: { fallover: true, fromModel: 'grok-4.6', model: 'gpt-5.6-luna', provider: 'codex', reason: 'model.http_5xx' } },
+    { createdAt: '2026-09-15T07:50:00.000Z', data: { fallover: true, fromModel: 'grok-4.6', model: 'gpt-5.6-terra', provider: 'codex', reason: 'earlier' } },
+  ];
+  assert.deepEqual(resolveJudgeResponder({ requested: { judgeModelId: 'grok-4.6', judgeProvider: 'byo' }, judgeStartedAt: startedAt, routedRows: rows }), {
+    judgeModelId: 'gpt-5.6-luna', judgeProvider: 'codex', substituteForExactPin: true, requestedJudgeModelId: 'grok-4.6', substituteReason: 'fallover:model.http_5xx',
+  });
+  // No fallover in the window: the pin answered.
+  assert.deepEqual(resolveJudgeResponder({ requested: { judgeModelId: 'grok-4.6', judgeProvider: 'byo' }, judgeStartedAt: Date.parse('2026-09-15T08:05:00.000Z'), routedRows: rows }), { judgeModelId: 'grok-4.6', judgeProvider: 'byo' });
+  // A fallover of a different model is not this judge's.
+  assert.deepEqual(resolveJudgeResponder({ requested: { judgeModelId: 'claude-haiku-4-5' }, judgeStartedAt: startedAt, routedRows: rows }), { judgeModelId: 'claude-haiku-4-5' });
 });

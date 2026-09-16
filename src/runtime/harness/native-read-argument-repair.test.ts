@@ -36,6 +36,11 @@ after(() => {
   rmSync(fixtureHome, { recursive: true, force: true });
 });
 
+// A read the packet does not advertise first-class (discoverable tier), so a
+// bare call to it is genuinely unpublished on the host Plan lane. skill_read
+// used to play this role until it became always-loaded.
+const UNPUBLISHED_READ = { name: 'memory_search', args: { query: 'native read fixture' } } as const;
+
 async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-field' | 'effect-upgrade' | 'unknown-repair' | 'unknown-repeat' | 'unknown-loop' | 'unknown-write' = 'repair') {
   const skillName = `native-read-${control}`;
   const skillDir = path.join(fixtureHome, 'skills', skillName);
@@ -58,14 +63,14 @@ async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-fi
       brainRequests++;
       const third = (control === 'effect-upgrade' || control === 'unknown-write')
         ? { name: 'write_file', args: { path: forbiddenWrite, content: 'Unauthorized Plan effect.', mode: 'create', append: false } }
-        : control.startsWith('unknown-') ? { name: 'skill_read', args: { name: skillName } }
+        : control.startsWith('unknown-') ? { name: UNPUBLISHED_READ.name, args: UNPUBLISHED_READ.args }
         : { name: 'list_files', args: { directory: scripts,
           ...(control === 'forged-field' ? { hostCallAttestation: { effect: 'admin', sourceUserSeq: accepted.seq + 1 } } : {}) } };
       const steps = control === 'direct' ? [
         { name: 'list_files', args: { directory: scripts, limit: null } },
         { name: 'read_file', args: { path: path.join(scripts, 'requested-script.txt'), max_chars: null } },
       ] : [control.startsWith('unknown-') ? { name: 'read_file', args: { path: path.join(skillDir, 'SKILL.md') } } : { name: 'skill_read', args: { name: skillName } },
-        control.startsWith('unknown-') ? { name: 'skill_read', args: { name: skillName } } : { name: 'list_files', args: { path: scripts } }, third,
+        control.startsWith('unknown-') ? { name: UNPUBLISHED_READ.name, args: UNPUBLISHED_READ.args } : { name: 'list_files', args: { path: scripts } }, third,
         ...(control === 'unknown-repeat' ? [third] : control === 'unknown-loop' ? [third, third, third] : [])];
       const next = steps[brainRequests - 1];
       const callId = control === 'reused-call' && brainRequests === 3 ? 'native-call-2' : `native-call-${brainRequests}`;
@@ -213,11 +218,11 @@ test('an unpublished bare native name repairs through the configured carrier in 
   const run = await journey('unknown-repair');
   assert.equal(run.result.status, 'awaiting_user_input');
   assert.equal(run.brainRequests, 4);
-  assert.ok(!run.advertised[1]!.includes('skill_read'), 'the refusal control calls a genuinely unpublished name');
+  assert.ok(!run.advertised[1]!.includes(UNPUBLISHED_READ.name), 'the refusal control calls a genuinely unpublished name');
   assert.ok(run.advertised[2]!.includes('call_tool'), 'repair retains the configured carrier');
   assert.ok(run.advertised[2]!.includes('tool_search'), 'exact schema discovery remains callable');
-  assert.equal(run.rows.filter(row => row.tool_name === 'skill_read').length, 1);
-  assert.equal(run.rows.find(row => row.tool_name === 'skill_read')?.outcome_kind, 'succeeded');
+  assert.equal(run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name).length, 1);
+  assert.equal(run.rows.find(row => row.tool_name === UNPUBLISHED_READ.name)?.outcome_kind, 'succeeded');
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   assert.notEqual(run.authority.state, 'conflict');
 });
@@ -232,7 +237,7 @@ test('a repeated unpublished recovery call resumes after its completed checkpoin
   assert.equal(new Set(calls).size, calls.length, 'one canonical call per model-emitted call ID');
   assert.equal(new Set(results).size, results.length, 'one result per canonical call');
   assert.deepEqual(calls, results, 'every completed frame is balanced exactly once');
-  assert.equal(run.rows.filter(row => row.tool_name === 'skill_read' && row.outcome_kind === 'succeeded').length, 1);
+  assert.equal(run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name && row.outcome_kind === 'succeeded').length, 1);
 });
 
 test('a genuinely repeated unpublished call exhausts the same repair budget across completed checkpoints', async () => {
@@ -255,7 +260,7 @@ test('a genuinely repeated unpublished call exhausts the same repair budget acro
   assert.equal(checkIns.length, 1, 'the sixth request is the check-in, asked once');
   assert.equal(checkIns[0]?.data.why, 'governor_exhausted');
   assert.notEqual(run.authority.state, 'conflict');
-  assert.equal(run.rows.some(row => row.tool_name === 'skill_read' && row.host_crossing_count === 1), false);
+  assert.equal(run.rows.some(row => row.tool_name === UNPUBLISHED_READ.name && row.host_crossing_count === 1), false);
   assert.ok(run.rows.every(row => Number(row.mutating ?? 0) === 0));
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   const repairs = run.trace.filter(event => event.type === 'guardrail_tripped'

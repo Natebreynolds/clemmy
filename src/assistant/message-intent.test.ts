@@ -356,6 +356,20 @@ test('memoryBudgetFor: conversation keeps continuity without a fresh vault searc
   assert.equal(b.vaultSearchTopK, 0);
 });
 
+test('simple Act chat does not budget a vault primer', () => {
+  for (const msg of ['thanks', 'what is 6 + 7', 'ok', 'hi']) {
+    assert.equal(
+      memoryBudgetFor(classifyMessageIntent(msg).intent).vaultSearchTopK,
+      0,
+      `"${msg}" should not pay unified recall before answering`,
+    );
+  }
+  assert.ok(
+    memoryBudgetFor(classifyMessageIntent('set up an hourly comment monitor on this doc').intent).vaultSearchTopK > 0,
+    'an action still loads remembered procedures',
+  );
+});
+
 // ─── reasons ───────────────────────────────────────────────────
 
 test('classifier returns human-readable reasons', () => {

@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldRunObjectiveJudge } from './objective-judge.js';
+import { isPromiseShapedReply, replyClaimsCompletedWork, shouldRunObjectiveJudge } from './objective-judge.js';
 
 const base = {
   optIn: true,
@@ -47,6 +47,26 @@ test('a promise-shaped reply is still judged regardless of effects', () => {
   assert.equal(shouldRunObjectiveJudge({ ...base, promiseShaped: true, settledSourceEffects: 0 }), true);
 });
 
+test('a simple Act lookup that only called a status/discovery tool is NOT judged', () => {
+  // Live 2026-09-14: "do you have access to seismic" → mcp_status → 29s Grok
+  // completion review of a yes/no. sourceWorkAttempted used to arm the judge.
+  assert.equal(shouldRunObjectiveJudge({
+    ...base,
+    actionIntent: false,
+    meaningfulToolEvidence: false,
+    sourceWorkAttempted: true,
+    settledSourceEffects: 0,
+  }), false);
+});
+
+test('an action that CLAIMS it finished with no write is still judged', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...base,
+    claimedCompletedWork: true,
+    settledSourceEffects: 0,
+  }), true);
+});
+
 test('NEGATIVE: an open approval card still suppresses judging', () => {
   assert.equal(
     shouldRunObjectiveJudge({ ...base, settledSourceEffects: 3, openApprovalCard: true }), false,
@@ -71,4 +91,35 @@ test('NEGATIVE: the continuation cap still bounds verification', () => {
 
 test('NEGATIVE: a caller that did not opt in is never judged', () => {
   assert.equal(shouldRunObjectiveJudge({ ...base, optIn: false, settledSourceEffects: 5 }), false);
+});
+
+test('REGRESSION: an action turn whose attempted write never settled is judged however the reply is worded', () => {
+  // Review 2026-09-14: after `sourceWorkAttempted` stopped arming the judge on
+  // its own, these replies ended an action turn with zero settled writes
+  // unjudged. Only "updated"/"created"/URL wording was still caught.
+  for (const reply of [
+    'All set on the Sheets side.',
+    'That is taken care of.',
+    'Looks like it went through.',
+    'I hit an error writing the row; the API rejected the range.',
+    'Row 12 was updated.',
+  ]) {
+    assert.equal(shouldRunObjectiveJudge({
+      ...base,
+      sourceWorkAttempted: true,
+      settledSourceEffects: 0,
+      promiseShaped: isPromiseShapedReply(reply),
+      claimedCompletedWork: replyClaimsCompletedWork(reply),
+    }), true, reply);
+  }
+  // A lookup that merely attempted a status/discovery call keeps the cheap path.
+  assert.equal(shouldRunObjectiveJudge({
+    ...base,
+    actionIntent: false,
+    meaningfulToolEvidence: false,
+    sourceWorkAttempted: true,
+    settledSourceEffects: 0,
+  }), false);
+  // A settled write on an action turn is still the verification path, unchanged.
+  assert.equal(shouldRunObjectiveJudge({ ...base, sourceWorkAttempted: true, settledSourceEffects: 1 }), true);
 });

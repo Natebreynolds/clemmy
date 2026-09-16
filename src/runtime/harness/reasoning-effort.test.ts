@@ -27,13 +27,13 @@ test('interactive leaves simple/moderate unchanged (cap only bites at high)', ()
   assert.equal(selectReasoningEffort('moderate', { interactive: true }).effort, 'medium');
 });
 
-test('explicit Plan requests high across complexity and foreground/background posture', () => {
+test('explicit Plan requests medium across complexity and foreground/background posture', () => {
   for (const complexity of ['simple', 'moderate', 'complex'] as const) {
     for (const interactive of [true, false]) {
       const signals = reasoningEffortSignalsForTurn({ taskMode: 'plan', interactive,
         turnIntent: 'action', multiItem: false, text: 'Continue.' });
       assert.deepEqual(selectReasoningEffort(complexity, signals),
-        { effort: 'high', reason: 'explicit-plan' });
+        { effort: 'medium', reason: 'explicit-plan' });
     }
   }
 });

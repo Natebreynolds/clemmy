@@ -26,6 +26,8 @@ const {
   getModelRoutingMode,
   judgeChoice,
   MODELS,
+  DEFAULT_CODEX_FAST_MODEL,
+  DEFAULT_CODEX_MODEL,
 } = await import('../../config.js');
 const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled, judgeDefaultModel, codexSafeFast } = await import('./model-roles.js');
 const { resolveProvider } = await import('./model-wire-registry.js');
@@ -89,7 +91,7 @@ test('worker default follows the active brain unless worker BYO offload is enabl
 // (feedback_judge_different_family). judgeDefaultModel is the PURE decision.
 test('judgeDefaultModel: a Claude brain defaults to a cheap CODEX judge when Codex is logged in', () => {
   const m = judgeDefaultModel('claude', { claude: true, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: '' });
-  assert.equal(m, 'gpt-5.4-mini', 'cross-family cheap judge, not Claude-on-Claude');
+  assert.equal(m, DEFAULT_CODEX_FAST_MODEL, 'cross-family cheap judge, not Claude-on-Claude');
 });
 
 test('judgeDefaultModel: a Codex brain defaults to a cheap CLAUDE judge when Claude is logged in', () => {
@@ -387,7 +389,7 @@ test('defaultForRole matches resolveRoleModel default path for every role', () =
 test('codex_oauth brain: a BYO id polluting OPENAI_MODEL_PRIMARY falls back to the Codex default', () => {
   withEnv({ AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'glm-5.2', MODEL_ROUTING_MODE: 'off' }, () => {
     assert.equal(getActiveAuthMode(), 'codex_oauth');
-    assert.equal(defaultForRole('brain'), 'gpt-5.4', 'brain steers to the Codex default, not glm-5.2');
+    assert.equal(defaultForRole('brain'), DEFAULT_CODEX_MODEL, 'brain steers to the Codex default, not glm-5.2');
     assert.equal(resolveProvider(defaultForRole('brain')), 'codex', 'and it actually routes to Codex');
     // worker default follows the same guard
     assert.equal(resolveProvider(defaultForRole('worker')), 'codex', 'untagged worker also runs on Codex');
@@ -416,7 +418,7 @@ test('codexSafeFast: codex brain + a repurposed GLM fast slot NEVER fails open t
     assert.equal(resolveProvider(MODELS.fast), 'byo', 'precondition: the fast slot holds a GLM/BYO id');
     const fast = codexSafeFast();
     assert.equal(resolveProvider(fast), 'codex', 'the judge/warmup fail-open stays on the Codex family, never BYO');
-    assert.equal(fast, 'gpt-5.4-mini', 'uses the cheap code-level Codex judge id');
+    assert.equal(fast, DEFAULT_CODEX_FAST_MODEL, 'uses the cheap code-level Codex judge id');
   });
 });
 

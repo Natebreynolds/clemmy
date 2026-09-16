@@ -227,8 +227,9 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
 });
 
 for (const builder of ['orchestrator', 'workflow-step'] as const) {
+for (const scopeMode of builder === 'workflow-step' ? ['catalog', 'default', 'wildcard', 'none'] as const : ['catalog', 'default'] as const) {
 for (const restricted of [false, true]) {
-  test(`${builder} workflow discovery keeps its external catalog and actual carrier (local-only=${restricted})`, async () => {
+  test(`${builder} workflow discovery keeps its external catalog and actual carrier (scope=${scopeMode}, local-only=${restricted})`, async () => {
     businessExecutions = 0;
     process.env.CLEMMY_CODEX_TOOL_SEARCH = 'on';
     process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
@@ -270,12 +271,16 @@ for (const restricted of [false, true]) {
     const options = {
       userInput: prompt, sessionId: session.id, sourceUserSeq: source.seq,
       allowToolJit: true,
-      mcpToolScope: { reason: 'workflow discovery fixture', authority: 'catalog' as const, maxTools: 0 },
+      ...(scopeMode === 'catalog' ? {
+        mcpToolScope: { reason: 'workflow discovery fixture', authority: 'catalog' as const, maxTools: 0 },
+      } : {}),
       ...(restricted ? { allowedToolNames: ['tool_search', 'call_tool', 'workflow_get'] } : {}),
     };
     const agent = builder === 'orchestrator' ? await buildOrchestratorAgent(options)
       : await (await import('../agents/workflow-step-agent.js')).buildWorkflowStepAgent({
           ...options, ...(restricted ? { lockTools: ['tool_search', 'call_tool', 'read_file'] } : {}),
+          ...(scopeMode === 'wildcard' && !restricted ? { lockTools: ['*'] } : {}),
+          ...(scopeMode === 'none' ? { mcpToolScope: null } : {}),
         });
     const search = agent.tools.find(t => t.name === 'tool_search') as unknown as {
       invoke(context: unknown, args: string, details?: unknown): Promise<unknown>;
@@ -291,7 +296,7 @@ for (const restricted of [false, true]) {
     )));
     assert.ok(raw.startsWith('{'), raw);
     const body = JSON.parse(raw);
-    if (restricted) {
+    if (restricted || scopeMode === 'none') {
       assert.equal(body.brokerCoverage, 'builtins_only', raw);
       assert.ok(!body.results.some((r: { name: string }) => r.name === OPERATION));
     } else {
@@ -308,7 +313,7 @@ for (const restricted of [false, true]) {
       assert.doesNotMatch(body.guidance?.[OPERATION] ?? '', /For work_call execution/);
     }
     assert.equal(businessExecutions, 0, 'discovery performs no business operation');
-    if (!restricted) {
+    if (!restricted && scopeMode !== 'none') {
       readDispatchEnabled = true;
       const caller = agent.tools.find(t => t.name === 'call_tool') as unknown as typeof search;
       assert.ok(caller);
@@ -325,5 +330,6 @@ for (const restricted of [false, true]) {
       assert.equal(businessExecutions, 1, 'the discovered read is callable through the same workflow carrier');
     }
   });
+}
 }
 }

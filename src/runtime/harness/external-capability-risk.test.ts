@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   projectExternalCapabilityRiskV1,
+  structuralDestinationPosture,
   type ExternalCapabilityEffect,
   type ExternalCapabilityRiskInputV1,
 } from './external-capability-risk.js';
@@ -19,6 +20,8 @@ function riskInput(options: {
   idempotent?: boolean | null;
   openWorld?: boolean | null;
   outboundDelivery?: boolean | null;
+  recipientsPresent?: boolean | null;
+  requestMethod?: 'safe' | 'post' | 'update' | 'delete' | null;
 } = {}): ExternalCapabilityRiskInputV1 {
   const semanticName = options.semanticName ?? 'CREATE_RECORD';
   const effect = options.effect ?? 'external_write';
@@ -71,6 +74,8 @@ function riskInput(options: {
     },
     callSignals: {
       outboundDelivery: options.outboundDelivery ?? null,
+      recipientsPresent: options.recipientsPresent ?? null,
+      requestMethod: options.requestMethod ?? null,
     },
     documentedSemantic: options.documentedSemantic ?? null,
     safety: 'admissible',
@@ -324,4 +329,66 @@ test('the projector accepts only the closed data shape and never evaluates acces
     ok: false, reason: 'malformed_input',
   });
   assert.equal(getterRan, false);
+});
+
+test('a created event with no recipients supplied is an ordinary create, with recipients it is a send', () => {
+  const none = projectExternalCapabilityRiskV1(riskInput({ semanticName: 'CREATE_EVENT', recipientsPresent: false }));
+  assert.ok(none.ok);
+  if (none.ok) assert.deepEqual(none.projection.risk, { consequence: 'create', reversibility: 'ordinary_non_destructive', destructive: false });
+  const some = projectExternalCapabilityRiskV1(riskInput({ semanticName: 'CREATE_EVENT', recipientsPresent: true }));
+  assert.ok(some.ok);
+  if (some.ok) assert.equal(some.projection.risk.consequence, 'send');
+  // Unknown stays conservative.
+  const unknown = projectExternalCapabilityRiskV1(riskInput({ semanticName: 'CREATE_EVENT', recipientsPresent: null }));
+  assert.ok(unknown.ok);
+  if (unknown.ok) assert.equal(unknown.projection.risk.consequence, 'send');
+});
+
+test('an operation declares its own destination posture through its verb, never through request nouns', () => {
+  // Live 2026-09-15: OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR was minted create_new.
+  assert.equal(structuralDestinationPosture('OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR'), 'named_existing');
+  assert.equal(structuralDestinationPosture('GOOGLESHEETS_BATCH_UPDATE'), 'named_existing');
+  assert.equal(structuralDestinationPosture('OUTLOOK_DELETE_CALENDAR_EVENT'), 'named_existing');
+  assert.equal(structuralDestinationPosture('OUTLOOK_CALENDAR_CREATE_EVENT'), 'create_new');
+  assert.equal(structuralDestinationPosture('SLACK_SEND_MESSAGE'), 'create_new');
+  assert.equal(structuralDestinationPosture('OUTLOOK_GET_CALENDAR_VIEW'), null, 'a read has no posture');
+  assert.equal(structuralDestinationPosture('FIXTURE_THING'), null, 'no verb, caller keeps its default');
+});
+
+test('a carrier that declares an unnamed operation non-destructive bounds it to ordinary work; argument evidence only raises', () => {
+  // A generic request-shaped operation: no action verb, so the host cannot
+  // name the consequence. The carrier's own destructive:false bounds it.
+  const bounded = projected(riskInput({
+    semanticName: 'SYNC_RESOURCE',
+    readOnly: false,
+    destructive: false,
+    requestMethod: 'post',
+  })).risk;
+  assert.deepEqual(bounded, {
+    reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false,
+  });
+  // The bound is the carrier's claim: an absent hint bounds nothing.
+  assert.deepEqual(projected(riskInput({
+    semanticName: 'SYNC_RESOURCE', readOnly: false, destructive: null, requestMethod: 'post',
+  })).risk, { reversibility: 'unknown', consequence: 'unknown', destructive: false });
+  // A DELETE method in the bound arguments is a deletion regardless of the claim.
+  assert.deepEqual(projected(riskInput({
+    semanticName: 'SYNC_RESOURCE', readOnly: false, destructive: false, requestMethod: 'delete',
+  })).risk, { reversibility: 'unknown', consequence: 'delete', destructive: true });
+  // Outbound delivery in the arguments is a send regardless of the claim.
+  assert.deepEqual(projected(riskInput({
+    semanticName: 'SYNC_RESOURCE', readOnly: false, destructive: false, outboundDelivery: true,
+  })).risk, { reversibility: 'irreversible', consequence: 'send', destructive: false });
+  // PUT/PATCH with no action of its own is an ordinary update.
+  assert.deepEqual(projected(riskInput({
+    semanticName: 'SYNC_RESOURCE', readOnly: false, destructive: null, requestMethod: 'update',
+  })).risk, { reversibility: 'ordinary_non_destructive', consequence: 'update', destructive: false });
+  // A safe method never lowers a named mutation.
+  assert.deepEqual(projected(riskInput({
+    semanticName: 'DELETE_RECORD', destructive: false, requestMethod: 'safe',
+  })).risk, { reversibility: 'unknown', consequence: 'delete', destructive: true });
+  // The signal shape is closed: an unknown method class is a malformed input.
+  const malformed = riskInput({ semanticName: 'SYNC_RESOURCE' });
+  (malformed.callSignals as { requestMethod: unknown }).requestMethod = 'CONNECT';
+  assert.deepEqual(projectExternalCapabilityRiskV1(malformed), { ok: false, reason: 'malformed_input' });
 });

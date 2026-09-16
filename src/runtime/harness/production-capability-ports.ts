@@ -117,6 +117,25 @@ export function registerProductionCapabilityPort(
   return { ok: true };
 }
 
+/**
+ * Replace a port for an identity the caller OWNS. Restart reconstruction
+ * (production-capability-catalog) claims a generic invoke-only port for every
+ * current durable manifest; a live carrier that later materializes the same
+ * manifest must be able to install its exact port (reviewed CLI: argv +
+ * observer) over that placeholder instead of refusing and retiring the
+ * identity. The shipped-implementation checks are identical to registration;
+ * only the "identity already exists" refusal is waived.
+ */
+export function replaceProductionCapabilityPort(
+  identity: ProductionPortIdentity,
+  port: ProductionCapabilityPort,
+): { ok: true } | { ok: false; reason: 'not_shipped_implementation' } {
+  if (!isShippedInvoke(port.invoke)) return { ok: false, reason: 'not_shipped_implementation' };
+  if (port.reconcile && !isShippedReconcile(port.reconcile)) return { ok: false, reason: 'not_shipped_implementation' };
+  ports.set(identityKey(identity), { identity, port });
+  return { ok: true };
+}
+
 export function registerFixtureCapabilityPort(
   identity: ProductionPortIdentity,
   port: ProductionCapabilityPort,

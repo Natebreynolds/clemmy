@@ -63,6 +63,72 @@ test('configured brain receives bounded host capability descriptors, not only ID
   assert.equal(payload.host.capabilities[0]?.id, 'cap:host_create:destination');
 });
 
+test('the interpreter is told that an affirmative accepts the one recommended option', async () => {
+  // Live 2026-09-14: "Yes" to "…invite Adam (recommended), or create it
+  // directly…?" was ruled ambiguous and the identical question was re-asked
+  // with zero work. The model reasons about the wording; the host does not
+  // pattern-match "yes" versus "heck yeah let's do it".
+  let system = '';
+  const port = configuredBrainSemanticPort(async (input) => {
+    system = input.system;
+    return { raw: { version: 1 }, modelIdentity: 'test', inputTokens: 1, outputTokens: 1, latencyMs: 1 };
+  });
+  await port.interpret({
+    purpose: 'turn_semantics',
+    host: {
+      source: { sessionId: 'sess-rec', sourceUserSeq: 1, inputHash: 'a'.repeat(64), audienceHash: 'b'.repeat(64) },
+      policyRevision: 'c'.repeat(64),
+      resumableGoals: [],
+      openQuestions: [],
+      catalog: { capabilityIds: new Set(), workflowIds: new Set(), capabilities: [] },
+    },
+    acceptedText: 'Yes',
+  });
+  assert.match(system, /exactly one visible option is marked recommended or default/);
+  assert.match(system, /any affirmative wording — selects that option/);
+  assert.match(system, /more than one is marked, an affirmative alone stays ambiguous/);
+});
+
+test('the account judge is told a chosen option may imply the account even when the question was not about accounts', async () => {
+  // Live 2026-09-14: the user chose "Send Adam an invite from my Scorpion
+  // calendar"; the judge still could not entail the scorpion-labeled account
+  // and the host made the model ask "which Outlook account should send?".
+  let system = '';
+  const port = configuredBrainSemanticPort(async (input) => {
+    system = input.system;
+    return { raw: { verdict: 'uncertain', proposalDigest: 'f'.repeat(64) }, modelIdentity: 'test', inputTokens: 1, outputTokens: 1, latencyMs: 1 };
+  });
+  await port.judgeAccountSelection?.({
+    purpose: 'turn_semantics_account_selection',
+    mode: 'explicit_selection',
+    sessionId: 'sess-acct',
+    sourceUserSeq: 2,
+    acceptedText: 'send him a meeting invite',
+    sourceQuote: 'send him a meeting invite',
+    toolkit: 'outlook',
+    accountIdentity: 'owner@example.com',
+    accountLabel: 'scorpion',
+    establishedSource: null,
+    interveningAcceptedSources: [],
+    clarification: {
+      question: 'Create it directly, or send an invite from your Scorpion calendar?',
+      options: ['Create directly (recommended)', 'Send an invite from my Scorpion calendar'],
+      answer: 'send him a meeting invite',
+      selectedOption: 'Send an invite from my Scorpion calendar',
+    },
+    proposalDigest: 'f'.repeat(64),
+  });
+  assert.match(system, /it may be about something else whose options name or imply an account/);
+  assert.match(system, /When selectedOption is supplied, the host has already recorded that option as the user's choice/);
+  assert.match(system, /identifies the supplied account by its address, label, domain, or workspace name, return entailed/);
+  assert.match(system, /When rememberedDefault is supplied in current_source_default mode/);
+  assert.match(system, /A remembered preference never overrides current wording/);
+  // Wording that selects the very account the host remembered is agreement,
+  // not an explicit selection to bounce back as uncertain.
+  assert.match(system, /except when rememberedDefault names that same identity/);
+  assert.match(system, /or when they select this same remembered account/);
+});
+
 test('tokensFromAgentRun reads real Agents SDK and wire usage instead of reporting zero', () => {
   assert.deepEqual(tokensFromAgentRun({
     state: { usage: { inputTokens: 2100, outputTokens: 854 } },

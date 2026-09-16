@@ -1076,6 +1076,21 @@ function boundedProjection(records: unknown[]): unknown[] {
  */
 export function recordsAtRecordPath(payload: unknown, recordPath: string | null): unknown[] | null {
   if (recordPath === null) return null;
+  // A reviewed-CLI observation keeps its records in the stdout JSON document;
+  // handle creation counted them through that document with the exact path
+  // prefix. Walk the same document here, or a redeemed path resolves to
+  // nothing and the audit reports a count mismatch against a complete read
+  // (live 2026-09-15 23:47: a 50-record SOQL read audited as zero).
+  const cli = reviewedCliObservationPayload(payload);
+  if (cli) {
+    if (cli.payload === null) return null;
+    const relativePath = recordPath === cli.pathPrefix
+      ? ''
+      : recordPath.startsWith(`${cli.pathPrefix}.`)
+        ? recordPath.slice(cli.pathPrefix.length + 1)
+        : null;
+    return relativePath === null ? null : recordsAtPlainPath(cli.payload, relativePath);
+  }
   const mcp = exactMcpResultPayload(payload);
   if (mcp) {
     if (mcp.malformed || mcp.payload === null || mcp.pathPrefix === null) return null;

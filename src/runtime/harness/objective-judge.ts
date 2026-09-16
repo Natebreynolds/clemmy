@@ -175,6 +175,13 @@ export interface ObjectiveJudgeGateInput {
    * NEVER fires while a card is open.
    */
   openApprovalCard?: boolean;
+  /**
+   * The reply CLAIMS completed work (created/sent/saved/URL…) without a
+   * settled source-bound write. Distinct from promise-shaped ("I'll…"): a
+   * false "done" still needs a judge; a lookup that merely called mcp_status
+   * does not.
+   */
+  claimedCompletedWork?: boolean;
 }
 
 /**
@@ -185,6 +192,12 @@ export interface ObjectiveJudgeGateInput {
  * durable evidence and must not be bounced into repeating those tools. A
  * zero-tool ACTION claim still needs proof.
  *
+ * Discovery, status, and retained reads (`sourceWorkAttempted`) are work, not
+ * a reason to spend a cross-family judge on a simple Act lookup. Live
+ * 2026-09-14: "do you have access to seismic" called mcp_status then waited
+ * ~29s for Grok to certify a yes/no. Writes, promises, and false "done"
+ * claims still get the judge — after a receipt, not instead of the tool.
+ *
  * PLUS: a PROMISE-SHAPED reply (future-tense intent, no artifact) is always
  * judged even when it looks low-effort — that is the precise turn where the
  * model says "I'll do that next" and completes without doing it. The judge's
@@ -193,20 +206,31 @@ export interface ObjectiveJudgeGateInput {
  * positive costs one cheap judge call, never a wedge.
  */
 export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean {
+  const settledWrites = input.settledSourceEffects ?? 0;
   return (
     input.optIn &&
     input.nextAction === 'completed' &&
     !input.openApprovalCard &&
     (input.continuationsUsed < input.maxContinuations
       || (input.reviewAtContinuationLimit === true && input.continuationsUsed === input.maxContinuations)) &&
-    (input.sourceWorkAttempted === true
-      || Boolean(input.promiseShaped)
+    (Boolean(input.promiseShaped)
+      // Attempted work on an ACTION turn, or an attempted BUSINESS call on any
+      // turn, is review-eligible however the reply is worded (repair verdicts,
+      // inspection-once, warm reads all rest on this). The only exemption is a
+      // non-action turn whose calls were all host control/status tools — the
+      // 2026-09-14 "do you have access to seismic" → mcp_status → 29 s judge
+      // of a yes/no. Review 2026-09-14: dropping attempted work outright let
+      // "All set." after a failed write end an action turn unjudged and broke
+      // five continuation/repair contracts.
+      || (input.sourceWorkAttempted === true && (input.actionIntent || Boolean(input.meaningfulToolEvidence)))
       // VERIFICATION path: this source actually settled an effect, so the
       // produced artifact can be checked against the objective. Previously this
       // exact condition caused a SKIP.
-      || (input.actionIntent && (input.settledSourceEffects ?? 0) > 0)
+      || (input.actionIntent && settledWrites > 0)
       // Evidence we could not read is not evidence of nothing.
       || (input.actionIntent && input.settledEvidenceAvailable === false)
+      // "I created/sent it" with no receipt is still a completion claim.
+      || (input.actionIntent && input.claimedCompletedWork === true && settledWrites === 0)
       || (!input.acceptedExecutionEvidence
         && input.actionIntent
         && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
@@ -221,8 +245,16 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
  * on turns that actually delivered something. English-only (a backstop after the
  * existing observed-work gate, not the primary signal).
  */
-const PROMISE_PHRASE_RE =
-  /\b(?:i'?ll|i will|i'?m going to|i am going to|going to|about to|let me|let'?s|i can (?:now )?(?:go|start|begin|prep|put together|pull)|once you|next i'?ll|then i'?ll|i'?ll go (?:ahead|and))\b/i;
+// Straight or curly apostrophes (Grok/model replies often emit U+2019).
+const APOS = "['\u2019]";
+const PROMISE_PHRASE_RE = new RegExp(
+  String.raw`\b(?:i${APOS}?ll|i will|i${APOS}?m going to|i am going to|going to|about to|let me|let${APOS}?s|i can (?:now )?(?:go|start|begin|prep|put together|pull)|once you|next i${APOS}?ll|then i${APOS}?ll|i${APOS}?ll go (?:ahead|and))\b`,
+  'i',
+);
+const GOING_FORWARD_PROMISE_RE = new RegExp(
+  String.raw`\b(?:going forward|from now on)\s+i${APOS}?ll\b`,
+  'i',
+);
 const ARTIFACT_EVIDENCE_RE =
   /\b(?:done|completed|finished|created|drafted|generated|saved|wrote|written|sent|posted|updated|added|attached|here'?s|here is|i'?ve (?:created|drafted|saved|sent|added|updated|built|put together)|https?:\/\/|\/[\w.-]+\/)/i;
 
@@ -235,6 +267,56 @@ const ARTIFACT_EVIDENCE_RE =
  * classified action-intent and the plain reply was replaced by the
  * verification hold).
  */
+/** After one negative verdict and one bounce, a reply that neither claims the
+ * work nor promises it, with no settled write, is an honest failure report.
+ * A second judge pass cannot change that; it only costs a judge round trip
+ * (live 2026-09-15: three identical negative verdicts, ~66 s, on one honest
+ * "I couldn't update it"). The turn settles as a typed stop instead. */
+export function honestFailureReportSettles(input: {
+  verdictDone: boolean;
+  continuationsUsed: number;
+  reply: string | null | undefined;
+  settledWrites: number;
+}): boolean {
+  if (input.verdictDone || input.continuationsUsed < 1 || input.settledWrites > 0) return false;
+  const text = (input.reply ?? '').trim();
+  if (!text) return false;
+  return !replyClaimsCompletedWork(text) && !isPromiseShapedReply(text);
+}
+
+/** The model that actually answered a judge call. The fallover wrapper writes
+ * a `turn_model_routed` row (fallover:true, fromModel, model) when it benches
+ * the pinned judge mid-call; the verdict must record that responder, not the
+ * pin. Live 2026-09-15: grok-4.6 returned 503 three times, Codex answered,
+ * and the verdict row still said grok-4.6 with no substitute flag. */
+export function resolveJudgeResponder(input: {
+  requested: { judgeModelId?: string; judgeProvider?: string };
+  judgeStartedAt: number;
+  routedRows: ReadonlyArray<{ createdAt: string; data: Record<string, unknown> }>;
+}): { judgeModelId?: string; judgeProvider?: string; substituteForExactPin?: true; requestedJudgeModelId?: string; substituteReason?: string } {
+  const pinned = input.requested.judgeModelId?.trim();
+  const requested = {
+    ...(input.requested.judgeModelId ? { judgeModelId: input.requested.judgeModelId } : {}),
+    ...(input.requested.judgeProvider ? { judgeProvider: input.requested.judgeProvider } : {}),
+  };
+  if (!pinned) return requested;
+  const since = new Date(input.judgeStartedAt - 1000).toISOString();
+  const fallover = [...input.routedRows]
+    .filter((row) => row.data.fallover === true && row.createdAt >= since
+      && typeof row.data.fromModel === 'string' && row.data.fromModel.trim() === pinned
+      && typeof row.data.model === 'string' && row.data.model.trim())
+    .sort((left, right) => (left.createdAt < right.createdAt ? 1 : -1))[0];
+  if (!fallover) return requested;
+  const provider = fallover.data.provider;
+  return {
+    judgeModelId: String(fallover.data.model).trim(),
+    ...(typeof provider === 'string' && provider.trim() ? { judgeProvider: provider } : {}),
+    substituteForExactPin: true,
+    requestedJudgeModelId: pinned,
+    substituteReason: `fallover:${typeof fallover.data.reason === 'string' ? fallover.data.reason : 'unknown'}`,
+  };
+}
+
 export function replyClaimsCompletedWork(reply?: string | null): boolean {
   const text = (reply ?? '').trim();
   if (!text) return false;
@@ -246,7 +328,7 @@ export function isPromiseShapedReply(reply?: string | null): boolean {
   if (!text) return false;
   // Conversational alignment: "going forward I'll treat X as Y" is a durable
   // correction/acknowledgement, not a promise to perform this turn's work.
-  if (/\b(?:going forward|from now on)\s+i'?ll\b/i.test(text)) return false;
+  if (GOING_FORWARD_PROMISE_RE.test(text)) return false;
   return PROMISE_PHRASE_RE.test(text) && !ARTIFACT_EVIDENCE_RE.test(text);
 }
 
@@ -525,6 +607,15 @@ export function buildObjectiveJudgePrompt(
       ...skillContext.skills.map(renderSkillReference),
     );
   }
+  // Live 2026-09-14: the host refused a stale call before dispatch, no
+  // provider call was made, and the reply said "the Outlook API won't accept
+  // its event ID". The judge marked that fulfilled. A provider outcome the
+  // evidence does not show is a claim, not a result.
+  parts.push(
+    '',
+    'A statement that a provider or API rejected, could not find, or failed the work counts as evidence only when a matching provider call appears in the evidence above. '
+    + 'With no such call, treat the reported failure as unverified: the objective is not fulfilled, and the response must not be credited for explaining a failure that the evidence does not show.',
+  );
   parts.push('', 'Audit it against the objective and respond with exactly one verdict line.');
   return parts.join('\n');
 }

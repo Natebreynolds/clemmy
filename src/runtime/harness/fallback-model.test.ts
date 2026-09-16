@@ -65,6 +65,11 @@ test('isFalloverError: overload/5xx/TRANSPORT-TIMEOUT yes; 429 + 4xx no (the tim
   // The load-bearing case: Anthropic at capacity HANGS → transport_timeout.
   assert.equal(isFalloverError(new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: '' })), true);
   assert.equal(isFalloverError(new BoundaryError({ kind: 'model.empty_completion', retryable: true, userMessage: '', operatorMessage: '' })), true);
+  // The Codex adapter throws its own kinds; the chain decides on the class
+  // they belong to, so a dead Codex socket switches brains like any other.
+  assert.equal(isFalloverError(new BoundaryError({ kind: 'codex.transport_timeout', retryable: true, userMessage: '', operatorMessage: '' })), true, 'codex transport timeout');
+  assert.equal(isFalloverError(new BoundaryError({ kind: 'codex.sse_truncated', retryable: true, userMessage: '', operatorMessage: '' })), true, 'codex stream ended before content');
+  assert.equal(isFalloverError(new BoundaryError({ kind: 'codex.http_5xx', retryable: true, userMessage: '', operatorMessage: '' })), true, 'codex 5xx');
   assert.equal(isFalloverError({ message: 'fetch failed' }), true, 'a transport error classifies as transport_timeout');
   assert.equal(
     isFalloverError(new Error('Internal error during token generation')),
@@ -85,6 +90,33 @@ test('getStreamedResponse: a TRANSPORT TIMEOUT (the Anthropic-hang case) falls o
   const out = await collect(withModelFallback([target('opus', opus), target('codex', codex)]).getStreamedResponse(req()));
   assert.equal(codexCalls, 1, 'a transport timeout fell over to Codex');
   assert.ok(out.length > 0);
+});
+
+test('getStreamedResponse: a dead Codex socket falls over to the next brain and the ledger names the switch with the normalized reason', async () => {
+  const { HarnessSession } = await import('./session.js');
+  const { listEvents } = await import('./eventlog.js');
+  const session = HarnessSession.create({ kind: 'chat', title: 'codex fallover ledger' });
+  let claudeCalls = 0;
+  const codex = model({ getStreamedResponse: async function* () {
+    throw new BoundaryError({ kind: 'codex.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'dead socket', context: { undiciCode: 'UND_ERR_BODY_TIMEOUT' } });
+  } });
+  const claude = model({ getStreamedResponse: async function* () {
+    claudeCalls++;
+    yield { type: 'response_done', response: { output: [{ type: 'message', content: 'from claude' }] } } as any;
+  } });
+  const out = await collect(withModelFallback(
+    [{ label: 'codex-primary', provider: 'codex', model: 'codex-primary', getModel: () => codex },
+      { label: 'claude-rescue', provider: 'claude', model: 'claude-rescue', getModel: () => claude }],
+    { sessionId: session.id },
+  ).getStreamedResponse(req()));
+  assert.equal(claudeCalls, 1, 'the codex transport timeout fell over');
+  assert.ok(out.length > 0);
+  const routed = listEvents(session.id, { types: ['turn_model_routed'] }).filter((row) => row.data.fallover === true);
+  assert.equal(routed.length, 1);
+  assert.equal(routed[0].data.reason, 'model.transport_timeout', 'the ledger carries the provider-neutral class');
+  assert.equal(routed[0].data.fromProvider, 'codex');
+  assert.equal(routed[0].data.provider, 'claude');
+  assert.equal(routed[0].data.model, 'claude-rescue');
 });
 
 test('single-element chain keeps the completion invariant instead of bypassing the wrapper', async () => {
@@ -910,6 +942,37 @@ test('silent cooldown: repeated transport timeouts skip the quiet brain briefly'
   }
 });
 
+test('silent cooldown: repeated Codex transport timeouts bench the quiet brain under the normalized reason', async () => {
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let quietCalls = 0, liveCalls = 0;
+    const quiet = model({ getResponse: async () => {
+      quietCalls++;
+      throw new BoundaryError({ kind: 'codex.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'dead socket' });
+    } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('codex-quiet-primary', quiet), target('codex-quiet-live', live)]);
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 1);
+    assert.equal(liveCalls, 1);
+    assert.equal(isBrainSilenced('codex-quiet-primary'), false, 'one timeout is still treated as transient');
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 2);
+    assert.equal(liveCalls, 2);
+    assert.equal(isBrainSilenced('codex-quiet-primary'), true, 'the second timeout opens the short cooldown');
+    assert.equal(__test__.getSilentBrainEntryForTests('codex-quiet-primary')?.reason, 'model.transport_timeout');
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 2, 'cooldown skipped the repeatedly silent brain');
+    assert.equal(liveCalls, 3);
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
 test('silent cooldown: marker survives daemon restart and skips the quiet brain', async () => {
   const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
   reviveDeadBrains();
@@ -1447,4 +1510,25 @@ for (const transport of ['stream', 'buffered'] as const) test(`retired ${transpo
     else for await (const event of wrapped.getStreamedResponse(request)) observed.push(event);
   }, error => error === reason);
   assert.ok(!observed.some(event => event.type === 'response_done'), 'late synthetic completion never escapes its retired attempt');
+});
+
+test('auth-dead: a credential that failed to READ locally pauses the brain briefly; a provider rejection keeps the full cooldown', async () => {
+  const { reviveDeadBrains, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    const localFailure = Object.assign(new Error('Your sign-in has expired.'), { name: 'ClaudeAuthError', kind: 'expired' });
+    const local = model({ getResponse: async () => { throw localFailure; } });
+    const rejected = model({ getResponse: async () => { throw new Error('HTTP 401 Unauthorized'); } });
+    const live = model({ getResponse: async () => resp('from live') });
+    await withModelFallback([target('local-read-failed', local), target('live-a', live)]).getResponse(req());
+    await withModelFallback([target('provider-rejected', rejected), target('live-b', live)]).getResponse(req());
+    assert.equal(isBrainAuthDead('local-read-failed'), true);
+    assert.equal(isBrainAuthDead('provider-rejected'), true);
+    const localEntry = __test__.getDeadBrainEntryForTests('local-read-failed')!;
+    const rejectedEntry = __test__.getDeadBrainEntryForTests('provider-rejected')!;
+    assert.ok(localEntry.until - localEntry.since <= 60_000, 'a local read failure can heal any second');
+    assert.ok(rejectedEntry.until - rejectedEntry.since >= 10 * 60_000, 'a provider rejection needs the user');
+  } finally {
+    reviveDeadBrains();
+  }
 });

@@ -18,10 +18,14 @@ import type {
 } from './interactive-consent-policy.js';
 
 export const EXTERNAL_CAPABILITY_RISK_INPUT_VERSION = 1 as const;
-export const EXTERNAL_CAPABILITY_RISK_CLASSIFIER_VERSION = 1 as const;
+export const EXTERNAL_CAPABILITY_RISK_CLASSIFIER_VERSION = 3 as const;
 
 export type ExternalCapabilityProviderKind = 'composio' | 'native_mcp';
 export type ExternalCapabilityEffect = 'read' | 'external_write' | 'admin';
+/** Protocol-method class read from the exact bound arguments when the schema
+ * exposes a method surface: safe (GET/HEAD/OPTIONS), post, update (PUT/PATCH)
+ * or delete. Never a provider vocabulary. */
+export type ExternalCapabilityRequestMethodClass = 'safe' | 'post' | 'update' | 'delete';
 
 export interface ExternalCapabilityRiskInputV1 {
   version: typeof EXTERNAL_CAPABILITY_RISK_INPUT_VERSION;
@@ -60,6 +64,11 @@ export interface ExternalCapabilityRiskInputV1 {
   /** Host-derived from the exact bound arguments, never model-authored. */
   callSignals: {
     outboundDelivery: boolean | null;
+    /** Exposed recipient collections: true = some supplied, false = none, null = none exposed. */
+    recipientsPresent: boolean | null;
+    /** Method class this call selects on an exposed method surface; null when
+     * none is exposed, unreadable, or two surfaces disagree. */
+    requestMethod: ExternalCapabilityRequestMethodClass | null;
   };
   documentedSemantic: null | {
     sourceDigest: string;
@@ -136,7 +145,8 @@ const LIVE_DEFINITION_KEYS = new Set([
   'semanticName',
 ]);
 const HINT_KEYS = new Set(['readOnly', 'destructive', 'idempotent', 'openWorld']);
-const CALL_SIGNAL_KEYS = new Set(['outboundDelivery']);
+const CALL_SIGNAL_KEYS = new Set(['outboundDelivery', 'recipientsPresent', 'requestMethod']);
+const REQUEST_METHOD_CLASSES = new Set<ExternalCapabilityRequestMethodClass>(['safe', 'post', 'update', 'delete']);
 const DOCUMENTED_KEYS = new Set([
   'sourceDigest',
   'effect',
@@ -242,6 +252,11 @@ function nullableBoolean(value: unknown): value is boolean | null {
   return value === null || typeof value === 'boolean';
 }
 
+function nullableMethodClass(value: unknown): value is ExternalCapabilityRequestMethodClass | null {
+  return value === null
+    || (typeof value === 'string' && REQUEST_METHOD_CLASSES.has(value as ExternalCapabilityRequestMethodClass));
+}
+
 function validDestination(value: unknown): value is InteractiveConsentDestination {
   return isRecord(value)
     && hasExactKeys(value, DESTINATION_KEYS)
@@ -333,6 +348,8 @@ function parseClosedInput(raw: unknown): ExternalCapabilityRiskInputV1 | null {
     !isRecord(signals)
     || !hasExactKeys(signals, CALL_SIGNAL_KEYS)
     || !nullableBoolean(signals.outboundDelivery)
+    || !nullableBoolean(signals.recipientsPresent)
+    || !nullableMethodClass(signals.requestMethod)
   ) return null;
   if (parsed.documentedSemantic !== null && !validDocumentedSemantic(parsed.documentedSemantic)) {
     return null;
@@ -372,6 +389,22 @@ function actionClass(token: string): StructuralConsequence | null {
   if (UPDATE_ACTIONS.has(token)) return 'update';
   if (READ_ACTIONS.has(token)) return 'read';
   if (EXECUTE_ACTIONS.has(token)) return 'execute';
+  return null;
+}
+
+/** The destination posture the OPERATION declares through its own verb: an
+ * update/delete addresses a record that already exists; a create/send/post
+ * produces a new one. Derived from the operation identity (the tool Clem is
+ * calling), never from request wording. null when the verb is not a write
+ * verb, so callers keep their own default. Live 2026-09-15: every Composio
+ * write manifest carried posture create_new, so "edit this event" could only
+ * be admitted as a create. */
+export function structuralDestinationPosture(operationId: string): 'create_new' | 'named_existing' | null {
+  const primary = operationTokens(operationId)
+    .map((token) => actionClass(token))
+    .find((consequence) => consequence !== null) ?? null;
+  if (primary === 'update' || primary === 'delete') return 'named_existing';
+  if (primary === 'create' || primary === 'send' || primary === 'post') return 'create_new';
   return null;
 }
 
@@ -419,7 +452,11 @@ function structuralClassification(
     };
   }
 
-  const deletion = primary?.consequence === 'delete' || connected.includes('delete');
+  // Argument evidence only raises risk: a DELETE method selected on an
+  // exposed method surface is a deletion whatever the operation is called.
+  const deletion = primary?.consequence === 'delete'
+    || connected.includes('delete')
+    || signals.requestMethod === 'delete';
   if (deletion) {
     return {
       consequence: 'delete',
@@ -435,11 +472,15 @@ function structuralClassification(
   const postDelivery = primary?.consequence === 'post'
     && !postReadTransport
     && communicationObject;
+  // A created event/message with an exposed recipient collection that this
+  // call leaves empty delivers to nobody (2026-09-14: a no-attendee calendar
+  // event is an ordinary create, not an irreversible send).
   const createDelivery = primary?.consequence === 'create'
     && communicationObject
     && !draft
     && !shieldedCreate
-    && signals.outboundDelivery !== false;
+    && signals.outboundDelivery !== false
+    && signals.recipientsPresent !== false;
   if (signals.outboundDelivery === true || explicitSend || postDelivery || createDelivery) {
     return {
       consequence: 'send',
@@ -491,6 +532,16 @@ function structuralClassification(
       affirmativeMutation: true,
     };
   }
+  // A PUT/PATCH selected on an exposed method surface is an ordinary update
+  // when the name carries no action of its own (raise only, never lower).
+  if (!primary && signals.requestMethod === 'update') {
+    return {
+      consequence: 'update',
+      reversibility: 'ordinary_non_destructive',
+      destructive: false,
+      affirmativeMutation: true,
+    };
+  }
   // Conditional read-or-mutate operations are mutations, but retain the one
   // concrete mutation consequence when it is structurally unique.
   if (primaryConsequence === 'read' && connectedMutations.length === 1) {
@@ -513,6 +564,20 @@ function structuralClassification(
     return {
       consequence: 'execute',
       reversibility: 'unknown',
+      destructive: false,
+      affirmativeMutation: false,
+    };
+  }
+  // A carrier that declares the operation non-destructive bounds an otherwise
+  // unnamed consequence. The host still cannot name what the call does, so the
+  // consequence stays unknown; the carrier's own claim, with no outbound
+  // delivery and no DELETE method in the arguments, bounds its reversibility
+  // to ordinary non-destructive work. An absent hint is not a claim. Outbound
+  // delivery and a DELETE method already returned above as send/delete.
+  if (hints.destructive === false) {
+    return {
+      consequence: 'unknown',
+      reversibility: 'ordinary_non_destructive',
       destructive: false,
       affirmativeMutation: false,
     };

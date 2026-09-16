@@ -1091,6 +1091,10 @@ function catalogEntry(input: {
   manifest: CapabilityManifestV1;
   port: ProductionCapabilityPort;
   sourceSchemaFingerprint: string;
+  /** Sealed digest of the exact attested input schema. Every callable
+   * registration carries it, whether or not the manifest has an external
+   * definition; consumers compare it strictly and never fill it from a cache. */
+  providerInputSchemaDigest: string;
 }): RegisteredHostCapability {
   return {
     capabilityId: input.manifest.manifestId,
@@ -1106,12 +1110,7 @@ function catalogEntry(input: {
     // the latter is the selector-visible input-schema fingerprint.
     liveFingerprint: input.manifest.definitionFingerprint,
     sourceSchemaFingerprint: input.sourceSchemaFingerprint,
-    ...(input.manifest.externalDefinition
-      ? {
-          providerInputSchemaDigest:
-            input.manifest.externalDefinition.providerInputSchemaDigest,
-        }
-      : {}),
+    providerInputSchemaDigest: input.providerInputSchemaDigest,
     manifest: input.manifest,
     invoke: input.port.invoke,
     implementationDigest: portImplementationDigest(input.port),
@@ -1421,6 +1420,7 @@ export async function materializeLiveReadCapability(input: {
       manifest,
       port,
       sourceSchemaFingerprint: final.attestation.schemaFingerprint,
+      providerInputSchemaDigest: digestSchema(final.attestation.inputSchema),
     }));
   } catch (error) {
     factory.forget(manifest.manifestId);

@@ -38,6 +38,7 @@ const {
   deepSelfReportedFailure,
   detectProseSelfReportedFailure,
   diagnoseWorkflowBlock,
+  workflowDoctorModelId,
   prependRootCauseBlock,
   workflowTriggerContextLine,
   _testOnly_sanitizeWorkflowDiagnosisOutput,
@@ -325,6 +326,32 @@ test('workflow diagnosis sanitizer accepts fenced schema-drifted JSON', () => {
   assert.equal(diagnosis.fix.autoApplicable, true);
   assert.deepEqual(sanitizeOutputContract(diagnosis.fix.newOutputContractJson), { type: 'array', min_items: { '': 1 } });
   assert.equal(fixIsAutoApplicable(diagnosis.fix), true);
+});
+
+test('workflowDoctorModelId ignores a retired FAST slot and remaps retired Codex 5.4 ids', () => {
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    OPENAI_MODEL_FAST: process.env.OPENAI_MODEL_FAST,
+    OPENAI_MODEL_PRIMARY: process.env.OPENAI_MODEL_PRIMARY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+  };
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.MODEL_ROUTING_MODE = 'off';
+    delete process.env.CLEMMY_MODEL_ROLES;
+    process.env.OPENAI_MODEL_FAST = 'gpt-5.4';
+    process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-terra';
+    assert.equal(workflowDoctorModelId(), 'gpt-5.6-terra', 'does not dispatch MODELS.fast when it is a retired 5.4 id');
+
+    process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.4';
+    assert.equal(workflowDoctorModelId(), 'gpt-5.6-terra', 'a retired primary is remapped to the current Codex default');
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('diagnoseWorkflowBlock classifies missing local MCP tools as runtime/manual, not reconnect_service', async () => {

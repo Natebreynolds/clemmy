@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -124,13 +124,17 @@ test('an unresolved question publishes without inventing an executable outline a
 test('wrong native arguments and mismatched effects/dependencies cannot be called ready', async () => {
   const f = await fixture();
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: outline(f.capabilityRef, { name: 'Missing graph' }), ready: true }), /static arguments/);
+  // A stale executionDraft on the outline is never a gate: the host derives
+  // the only draft from the reviewed steps, and a wrong step effect is
+  // corrected from the selected capability rather than refused.
   const wrongEffect = outline(f.capabilityRef, {}); wrongEffect.steps[0]!.effect = 'external_write';
-  await assert.rejects(publisher.preparePlanOutline({ ...f, raw: wrongEffect, ready: true }), /disagrees/);
   wrongEffect.executionDraft.topology.operations[0].effect = 'external_write';
+  wrongEffect.executionDraft.criteria = ['Stale submitted criterion.'];
   wrongEffect.steps[0].staticArguments = { name: 'Derived effect', description: 'Compute a fixture result.', steps: [{ id: 'compute', prompt: 'Return complete.', sideEffect: 'read' }] };
   const corrected = await publisher.preparePlanOutline({ ...f, raw: wrongEffect, ready: true }) as any;
   assert.equal(corrected.steps[0].effect, 'local_write');
-  assert.equal(corrected.executionDraft.topology.operations[0].effect, 'local_write');
+  assert.equal(corrected.executionDraft.topology.operations[0].effect, 'local_write', 'the draft is host-derived, not the stale submission');
+  assert.deepEqual(corrected.executionDraft.criteria, wrongEffect.successCriteria, 'the stale submitted draft is ignored');
   const cycle = outline(f.capabilityRef, {}); cycle.steps[0]!.dependsOn = ['create_workflow'];
   await assert.rejects(publisher.preparePlanOutline({ ...f, raw: cycle, ready: true }), /cycle/);
 });
@@ -269,6 +273,9 @@ test('failed preparation retains the full outline across reopen and exhaustion p
   const outcome = await modelCheckInForExhaustedTurn(stop, { ...f, run: async () => { throw new Error('No additional model request is needed.'); } });
   assert.equal(outcome.status, 'blocked');
   assert.equal(outcome.blockedReason, 'plan_preparation_incomplete');
+  // The outline is published: the stop says so, never "stopped before publishing".
+  assert.match(String(outcome.error ?? ''), /I published the outline as far as it goes/);
+  assert.doesNotMatch(String(outcome.error ?? ''), /stopped before publishing/);
   assert.ok(outcome.finalOutput?.startsWith(fullText));
   const artifact = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId });
   assert.equal(artifact?.readiness, 'needs_input');
@@ -445,7 +452,11 @@ test('an interpreted collection can be repaired to a single bound input without 
       verification: 'Read the saved briefing.' },
   ], successCriteria: ['Complete briefing saved.'] } });
   assert.equal(first.ok, false);
-  assert.match(first.message, /collection producer must be a tool step/);
+  assert.match(first.message, /cannot supply a reviewed member set/);
+  assert.match(first.message, /items: \[one object per member/, 'the repair names the inline-member shape');
+  assert.match(first.message, /tool step in this plan the producerStepId/, 'and the tool-producer shape');
+  assert.match(first.message, /never left to be written at execute time/, 'a reviewed write carries its exact arguments');
+  assert.match(first.message, /unroll into one single-call step per member/, 'the unrolled shape is named');
   assert.equal(typeof first.draft_digest, 'string');
   log.closeEventLog();
   const fixed = await invoke({ draft_digest: first.draft_digest, step_patches: [{ step_id: 'save', changes: {
@@ -483,4 +494,229 @@ for (const ownerRefuses of [false, true]) test(`Execute scope reads durable owne
     const old = scope.resolveMcpToolScope({ userInput: expanded, configuredServerNames: ['research-lab'] });
     assert.ok(old.deniedServerSlugs?.includes('research_lab'), 'the retained clause must reproduce the original false exclusion');
   }
+});
+
+test('a reviewed-CLI step publishes the sealed catalog digest, revalidates against it, and refuses a mutated schema as a provider change', async () => {
+  const { createHash } = await import('node:crypto');
+  const schemas = await import('./composio-schema-cache.js');
+  const identity = await import('../runtime/harness/reviewed-provider-identity.js');
+  const reviewed = await import('../runtime/harness/reviewed-plan-runtime.js');
+  const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const operationId = 'reviewed_cli_publish_fixture';
+  // Reviewed CLI: providerKind reviewed_cli, NO externalDefinition on the
+  // manifest, the exact schema deposited in the contract cache, digest sealed
+  // at registration by the producer.
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1, manifestId: `cap:fixture:reviewed-cli:${operationId}`, providerKind: 'reviewed_cli', operationId,
+    providerIdentity: '/usr/bin/fixture-cli', providerVersion: 'fixture-v1', operationVersion: '1',
+    definitionFingerprint: sha256(`definition:${operationId}`), effect: 'read', accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' }, evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-09-01T00:00:00.000Z', trusted: true }, lifecycle: { state: 'current' },
+    advisoryRoles: ['collection'],
+  });
+  assert.equal(manifest.externalDefinition, undefined);
+  const schema = { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false };
+  schemas.rememberToolSchema(operationId, schema, Date.now());
+  const cached = schemas.getCachedToolSchema(operationId)!;
+  const entry = {
+    capabilityId: manifest.manifestId, toolName: manifest.operationId, schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint, effect: manifest.effect, account: manifest.accountId, advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest), providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint, providerInputSchemaDigest: identity.providerInputSchemaDigestOf(cached),
+    manifest, invoke: async () => ({ records: [], has_more: false }),
+  };
+  log.resetEventLog();
+  const factory = catalog.createHostCapabilityCatalogFactory();
+  factory.register(entry);
+  catalog.installHostCapabilityCatalogFactory(factory);
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  const session = log.createSession({ id: 'reviewed-cli-publication', kind: 'chat' });
+  const source = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan the reviewed CLI query.', taskMode: { version: 1, kind: 'plan' } } });
+  const f = { sessionId: session.id, sourceUserSeq: source.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(f);
+  assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) return;
+  const raw = () => ({ steps: [{ id: 'query', action: 'Run the reviewed query.', effect: 'read', capabilityRef: manifest.manifestId, staticArguments: { query: 'SELECT Id FROM Account' },
+    dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Rows returned.' }], successCriteria: ['Rows returned.'], subagents: [] });
+  const prepared = await publisher.preparePlanOutline({ ...f, planning: primed.planning, raw: raw(), ready: true });
+  const binding = (prepared.preparedBindings as any[])[0];
+  assert.ok(binding, JSON.stringify(prepared));
+  const canonical = catalog.canonicalCatalogIdentityOf(entry)!;
+  assert.equal(binding.identity.providerInputSchemaDigest, identity.providerInputSchemaDigestOf(cached));
+  assert.equal(binding.identity.providerInputSchemaDigest, canonical.providerInputSchemaDigest, 'publish binding digest === producer digest === canonical digest');
+  assert.deepEqual(binding.identity, JSON.parse(JSON.stringify(canonical)), 'the recorded identity is the canonical identity, never a filled copy');
+  // Revalidation and admission compare the same identity strictly.
+  const artifact = plans.publishPlanRevision({ ...f, principalId: session.id, fullText: 'Run the reviewed query.', structuredPlan: prepared, readiness: 'ready' });
+  const checked = await reviewed.checkReviewedPlanPreparation(artifact);
+  assert.deepEqual(checked.map(row => row.kind), ['provider']);
+  const attestation = { capabilityId: canonical.capabilityId, manifestDigest: canonical.manifestDigest, accountId: canonical.account,
+    providerInputSchemaDigest: canonical.providerInputSchemaDigest, operationId: canonical.operationId } as never;
+  assert.equal(identity.attestationMatchesReviewedIdentity(attestation, binding.identity), true);
+  // A mutated cached schema is a provider change at publish and at revalidation.
+  schemas.rememberToolSchema(operationId, { ...schema, properties: { query: { type: 'string' }, limit: { type: 'number' } } }, Date.now());
+  await assert.rejects(publisher.preparePlanOutline({ ...f, planning: primed.planning, raw: raw(), ready: true }), /provider schema changed after discovery/);
+  await assert.rejects(reviewed.checkReviewedPlanPreparation(artifact), /changed or is unavailable/);
+  assert.equal(log.listEvents(session.id, { types: ['guardrail_tripped'] }).find(event => event.data.kind === 'plan_execution_revalidation_refused')?.data.reason, 'schema_digest_mismatch');
+  // A callable row with no sealed digest cannot anchor a reviewed plan; nothing fills it from the cache.
+  schemas.rememberToolSchema(operationId, schema, Date.now());
+  factory.forget(entry.capabilityId);
+  factory.register({ ...entry, providerInputSchemaDigest: undefined });
+  await assert.rejects(publisher.preparePlanOutline({ ...f, planning: primed.planning, raw: raw(), ready: true }), /catalog entry has no current callable attestation/);
+  assert.equal(log.listEvents(session.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('every structural problem in a plan is reported in one response', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  const first = await invoke({ full_text: 'Two repeated steps over interpreted sets.', structured_plan: { steps: [
+    { id: 'synthesize', action: 'Produce the members.', effect: 'compute', verification: 'Members listed.' },
+    { id: 'save_a', action: 'Save each.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'a.md') },
+      forEach: { producerStepId: 'synthesize', memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] },
+      verification: 'Read a.' },
+    { id: 'save_b', action: 'Save each again.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'b.md') },
+      forEach: { producerStepId: 'synthesize', memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] },
+      verification: 'Read b.' },
+  ], successCriteria: ['Both saved.'] } });
+  assert.equal(first.ok, false);
+  assert.match(first.message, /Step save_a: synthesize records an output/);
+  assert.match(first.message, /Step save_b: synthesize records an output/, 'the second problem is reported in the same response');
+  // Structural: a duplicate step ID and an undefined subagent assignment are
+  // batched into the same single refusal instead of one throw per round.
+  const structural = await invoke({ full_text: 'Two structural problems.', structured_plan: { steps: [
+    { id: 'save', action: 'Save.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 's.md'), content: 'x' }, subagentRole: 'ghost', verification: 'Read s.' },
+    { id: 'save', action: 'Save again.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 't.md'), content: 'y' }, verification: 'Read t.' },
+  ], successCriteria: ['Saved.'] } });
+  assert.equal(structural.ok, false);
+  assert.match(structural.message, /Plan step IDs must be unique/);
+  assert.match(structural.message, /undefined subagent assignment/, 'the subagent problem rides the same response as the duplicate ID');
+  // Preparation: a collection over a non-read producer and an unresolvable
+  // step are reported together; on the live path (ready:false) the collection
+  // line is a returned preparation issue, not a lone throw.
+  const preparation = await invoke({ full_text: 'Collection over a write.', structured_plan: { steps: [
+    { id: 'seed', action: 'Write the seed.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'seed.md'), content: 'seed' }, verification: 'Read seed.' },
+    { id: 'fan_out', action: 'Save each.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'fan.md') },
+      forEach: { producerStepId: 'seed', memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] }, verification: 'Read fan.' },
+    { id: 'orphan', action: 'Use an unknown tool.', capabilityRef: 'cap:local:invented', staticArguments: {}, verification: 'Never.' },
+  ], successCriteria: ['Saved.'] } });
+  assert.equal(preparation.ok, false);
+  assert.match(preparation.message, /a new collection requires a complete read/);
+  assert.match(preparation.message, /Step orphan: discover and cite/, 'the collection requirement joins the other preparation issues in ONE response');
+  const draft = await publisher.preparePlanOutline({ ...f, ready: false, raw: {
+    steps: [
+      { id: 'seed', action: 'Write the seed.', effect: 'local_write', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'seed.md'), content: 'seed' }, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Read seed.' },
+      { id: 'fan_out', action: 'Save each.', effect: 'local_write', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'fan.md') }, dynamicBindings: [], dependsOn: [], subagentRole: null,
+        forEach: { producerStepId: 'seed', memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] }, verification: 'Read fan.' },
+    ], successCriteria: ['Saved.'], subagents: [] } });
+  assert.ok((draft.preparationIssues as string[]).some(line => /Step fan_out: a new collection requires a complete read/.test(line)), JSON.stringify(draft.preparationIssues));
+});
+
+test('a scalar bound where the schema wants a list of that scalar is completed by the host, not refused', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  // write_file's `content` is a string; bind a list where a string is wanted
+  // to prove the completion is one-directional (scalar → list only).
+  const refused = await invoke({ full_text: 'Save each member.', structured_plan: { steps: [
+    { id: 'save', action: 'Save each.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'm.md') },
+      forEach: { items: [{ id: 'a', content: ['not a string'] }], memberIdPath: '/id', bindings: [{ itemPath: '/content', targetPath: '/content' }] },
+      verification: 'Read it.' },
+  ], successCriteria: ['Saved.'] } });
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /collection member arguments fail/);
+});
+
+test('two reviewer send-backs are the budget: the third sound candidate publishes with the reviewer note advisory', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const { withPlanCompletionReview } = await import('../runtime/harness/plan-publication-review.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => withPlanCompletionReview(async () => 'continue', () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args))))));
+  const plan = { full_text: 'Save the briefing.', structured_plan: { steps: [
+    { id: 'save', action: 'Save the briefing.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'b.md'), content: 'hello' }, verification: 'Read it.' },
+  ], successCriteria: ['Saved.'] } };
+  const first = await invoke(plan);
+  assert.equal(first.published, false);
+  assert.equal(first.status, 'review_feedback', 'a reviewer send-back with no spent budget still holds');
+  for (let round = 0; round < 2; round += 1) {
+    log.appendEvent({ sessionId: f.sessionId, turn: 1, role: 'system', type: 'goal_alignment_judged',
+      data: { kind: 'completion', fulfills: false, sourceUserSeq: f.sourceUserSeq, reason: `send-back ${round + 1}` } });
+  }
+  log.closeEventLog();
+  const third = await invoke(plan);
+  assert.equal(third.ok, true, JSON.stringify(third));
+  assert.equal(third.readiness, 'ready');
+  assert.ok(third.planArtifactRef, 'the sound plan published despite a would-be third send-back');
+  const spent = log.listEvents(f.sessionId, { types: ['guardrail_tripped'] }).find(event => event.data.kind === 'plan_review_budget_spent');
+  assert.ok(spent, 'the spent budget is journaled');
+});
+
+test('a complete outline paired with a retained digest publishes as a full submission, not a malformed repair', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(f,
+    () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify(args)))));
+  const broken = await invoke({ full_text: 'Save it.', structured_plan: { steps: [
+    { id: 'save', action: 'Save.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'x.md') }, verification: 'Read it.' },
+  ], successCriteria: ['Saved.'] } });
+  assert.equal(broken.ok, false);
+  assert.equal(typeof broken.draft_digest, 'string');
+  log.closeEventLog();
+  const full = await invoke({ draft_digest: broken.draft_digest, full_text: 'Save it, complete.', structured_plan: { steps: [
+    { id: 'save', action: 'Save.', capabilityRef: f.capabilityRef, staticArguments: { path: path.join(home, 'x.md'), content: 'complete' }, verification: 'Read it.' },
+  ], successCriteria: ['Saved.'] } });
+  assert.equal(full.ok, true, JSON.stringify(full));
+  assert.ok(full.planArtifactRef);
+});
+
+test('an affirmed continuation answer publishes a ready plan citing the parent source\'s disclosed ref without rediscovery', async () => {
+  // Answering a Plan question is a new accepted source. The ref its parent
+  // already disclosed must be citable from the answering card, or every answer
+  // pays tool_search plus "discover and cite" from zero.
+  const f = await fixture();
+  const continuityStore = await import('../memory/task-continuity.js');
+  const continuityRuntime = await import('../runtime/harness/task-continuity-runtime.js');
+  continuityStore.createTaskContinuityPacket({
+    sessionId: f.sessionId, originatingSourceUserSeq: f.sourceUserSeq,
+    pause: { kind: 'clarification', question: 'Should the compute step return the literal complete?', options: [] }, capabilities: [],
+  });
+  const answer = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Yes', displayText: 'Yes', taskMode: { version: 1, kind: 'plan' } } });
+  const enriched = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity(
+    { sessionId: f.sessionId, sourceUserSeq: answer.seq, message: 'Yes' }, answer.seq, { typedClassification: { disposition: 'affirmed' } });
+  assert.equal(enriched.taskContinuation?.disposition, 'affirmed');
+  const primed = await semantic.primePrimaryModelPlanningCatalog({ sessionId: f.sessionId, sourceUserSeq: answer.seq });
+  assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) return;
+  assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], [f.sourceUserSeq]);
+  assert.ok(primed.planning.capabilities.some(entry => entry.id === f.capabilityRef), 'the parent disclosure is on the answering card');
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_returned'] }).filter(event => event.data.sourceUserSeq === answer.seq).length, 0,
+    'the answering source ran no tool_search');
+  const args = { name: 'Reviewed Workflow', description: 'Compute a fixture result.', steps: [{ id: 'compute', prompt: 'Return the literal complete.', sideEffect: 'read' }] };
+  const prepared = await publisher.preparePlanOutline({ sessionId: f.sessionId, sourceUserSeq: answer.seq, planning: primed.planning, raw: outline(f.capabilityRef, args), ready: true });
+  const binding = (prepared.preparedBindings as any[])[0];
+  assert.equal(binding.identity.kind, 'local_registry');
+  assert.equal(binding.identity.definition.capabilityRef, f.capabilityRef);
+  assert.deepEqual(prepared.preparedBindings.length, 1);
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0, 'preparation still invokes nothing');
+});
+
+test('a published step without an id is completed from its position, and referenced ids are never touched', async () => {
+  const { completedPlanStepIds, decodePublishedPlanOutline, PlanPublicationOutlineSchema } = await import('./publish-plan.js');
+  const outline = PlanPublicationOutlineSchema.parse({
+    steps: [
+      { id: 'read_accounts', action: 'Read the accounts', effect: 'read', capabilityRef: 'cap:x', verification: 'records returned' },
+      { action: 'Draft one email per account', effect: 'compute', dependsOn: ['read_accounts'], verification: 'drafts recorded' },
+      { id: 'step_2', action: 'Already named like the host would', effect: 'compute', verification: 'ok' },
+    ],
+    successCriteria: ['done'],
+  });
+  assert.deepEqual(completedPlanStepIds(outline), [{ index: 1, id: 'step_2_2' }], 'position-based, never colliding with an authored id');
+  const decoded = decodePublishedPlanOutline(outline) as { steps: Array<{ id: string; dependsOn: string[] }> };
+  assert.deepEqual(decoded.steps.map((step) => step.id), ['read_accounts', 'step_2_2', 'step_2']);
+  assert.deepEqual(decoded.steps[1]!.dependsOn, ['read_accounts']);
+  assert.deepEqual(completedPlanStepIds({ steps: [{ id: 'a' }, { id: 'b' }] }), []);
 });

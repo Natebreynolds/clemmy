@@ -1,5 +1,7 @@
 import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
+import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';
+import { checkReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { parseTaskMode, taskModeDigest, taskModeFields } from './task-mode.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
 /**
@@ -1431,6 +1433,28 @@ export async function respondViaHarness(
   const sourceMode = acceptedTaskMode(sessionId, acceptedSourceUserSeq);
   if (acceptedSourceUserSeq !== undefined && providedMode && taskModeDigest(providedMode) !== taskModeDigest(sourceMode)) throw new Error('accepted task mode mismatch');
   const requestedMode = providedMode ?? sourceMode;
+  // A fresh Execute runs the pure preparation check BEFORE its one-per-revision
+  // claim is minted. The claim is spent by insertion and can never be released,
+  // so a capability that is momentarily not current used to burn the revision
+  // and force a re-publish. A refusal here starts nothing: no source, no
+  // attempt, no claim; the same revision Executes once the capability is back.
+  // A re-entered source already owns its claim and keeps the post-claim check.
+  if (requestedMode?.kind === 'execute' && acceptedSourceUserSeq === undefined) {
+    const session = getSession(sessionId);
+    let artifact: PlanArtifactV1 | null = null;
+    try {
+      artifact = session ? getPlanRevision({ sessionId, principalId: session.userId ?? session.id, ref: requestedMode.executeRef }) : null;
+    } catch { artifact = null; /* admission below reports the typed revision error */ }
+    if (artifact && artifact.readiness === 'ready' && !artifact.missingPrerequisites.length) {
+      try {
+        await checkReviewedPlanPreparation(artifact, { sessionId });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'Reviewed plan preparation is unavailable.';
+        return { sessionId, text: `I could not start executing this plan: ${detail} Nothing was started; this revision is still ready, so retry Execute once the capability is current.`, stoppedReason: 'awaiting-input',
+          raw: { reviewedPlanExecutionPreflightRefused: true, planId: artifact.planId, revision: artifact.revision, detail } };
+      }
+    }
+  }
   const reviewedAdmission = requestedMode?.kind === 'execute' ? admitPlanExecutionBridgeSource({
     sessionId, sourceUserSeq: acceptedSourceUserSeq, runId: request.runId, mode: requestedMode,
     displayText: displayMessage, modelDirectiveApplied: displayMessage !== request.message, surface,

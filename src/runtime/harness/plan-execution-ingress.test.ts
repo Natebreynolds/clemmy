@@ -118,3 +118,22 @@ test('Stop through an existing alias cancels the canonical reservation and every
   assert.throws(() => ingress.claimPlanExecutionIngress({ ...f.request, requestId: 'new-after-stop' }, f.create), /stopped/);
   assert.equal(f.created(), 1);
 });
+
+test('a second tap after a preflight stop aliases onto the reservation and runs again; no source, attempt or claim was spent', () => {
+  const f = fixture();
+  const first = ingress.claimPlanExecutionIngress(f.request, f.create);
+  assert.equal(first.joined, false);
+  // A preflight stop: the owner run returned before accepting a source, so the
+  // reservation has no accepted source, no attempt and no execution claim.
+  assert.equal(log.getActiveRunAttempt(f.scope.sessionId), null);
+  assert.equal(plans.getPlanExecutionClaim({ ...f.scope, ref: f.request.ref }), null);
+  assert.equal(log.listEvents(f.scope.sessionId, { types: ['user_input_received'] }).length, 1, 'only the Plan source exists');
+  log.closeEventLog();
+  const second = ingress.claimPlanExecutionIngress({ ...f.request, requestId: 'tap-after-preflight-stop' }, f.create);
+  assert.equal(second.joined, true, 'the later tap aliases onto the same reservation');
+  assert.equal(second.receipt.runId, first.receipt.runId);
+  assert.equal(f.created(), 1);
+  assert.equal(log.getHarnessChatCancellation(f.request.requestId), null, 'a preflight stop is not a Stop');
+  assert.equal(log.getActiveRunAttempt(f.scope.sessionId), null, 'the aliased request may re-run the bridge under the same reservation');
+  assert.equal(plans.getPlanExecutionClaim({ ...f.scope, ref: f.request.ref }), null, 'the revision is still unclaimed and ready');
+});

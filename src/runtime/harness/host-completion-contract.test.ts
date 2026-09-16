@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -667,7 +668,7 @@ test('large file and all Space components reach the actual completion request wi
   assert.equal(host.settledSourceArtifacts({ ...identity, sourceUserSeq: identity.sourceUserSeq + 1 }).count, 0);
 });
 
-async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void }) {
+async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void }) {
   const identity = accepted(options.text);
   if (options.policyData) {
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_policy_captured',
@@ -691,7 +692,7 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
       if (calls === 1 && options.readResult !== undefined) {
         retainedRead(identity, 'read_file', options.readResult, false, true);
       }
-      const text = options.reply ?? (calls === 1 ? promise : 'The lookup returned no accessible posts. No report data was changed.');
+      const text = options.reply ?? (calls === 1 ? promise : options.secondReply ?? 'The lookup returned no accessible posts. No report data was changed.');
       return { responseId: `reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] };
     },
     async *getStreamedResponse() {
@@ -721,14 +722,48 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
 test('host reviews the exact refresh objective and curly-apostrophe promise, then continues on the named gap', async () => {
   const result = await runHost({ captured: true, incoming: true });
   assert.equal(result.calls, 2);
-  assert.equal(result.judged.length, 2);
+  assert.equal(result.judged.length, 1, 'the honest follow-up answer is not judged again');
   assert.equal(result.judged[0]?.objective, request);
   assert.equal(result.judged[0]?.reply, promise);
   assert.match(result.judged[0]?.evidence ?? '', /Retained READ results for THIS accepted source/);
   assert.doesNotMatch(result.judged[0]?.evidence ?? '', /Session tool-call counts/);
   const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0]?.data.continuation, true);
+});
+
+test('an honest continuation that added no evidence settles on the standing verdict without a second judge call', async () => {
+  // Live 2026-09-15 ("edit this event and add a description"): the first
+  // verdict said not done, the continuation made no further call and answered
+  // "I still can't update it", and the pinned judge was asked again on
+  // identical evidence — 23–58 s per verdict, three identical negatives in
+  // one turn. On an ACTION objective the second honest reply is judge-eligible
+  // (the refresh fixture above is tool_intent, so it never was), and the
+  // standing verdict is carried onto it instead of bought twice.
+  const request = 'Update the team calendar invite and add a short description about Clem.';
+  const honest = 'I could not reach a working calendar update operation, so the invite is unchanged.';
+  const result = await runHost({ captured: true, incoming: true, text: request, secondReply: honest });
+  assert.equal(result.calls, 2, 'the continuation still gets its model step');
+  assert.equal(result.judged.length, 1, 'no second judge call on identical evidence');
+  const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
   assert.equal(verdicts.length, 2);
   assert.equal(verdicts[0]?.data.continuation, true);
+  assert.equal(verdicts[0]?.data.fulfills, false);
+  assert.equal(verdicts[1]?.data.carriedVerdict, true, 'the settle row says no reviewer answered it');
+  assert.equal(verdicts[1]?.data.fulfills, false);
+  assert.equal(verdicts[1]?.data.continuation, false);
+  assert.equal(verdicts[1]?.data.continuationsUsed, 1);
+  assert.equal(verdicts[1]?.data.reason, verdicts[0]?.data.reason, 'the standing verdict is carried, not rewritten');
+  assert.equal(verdicts[1]?.data.judgeModelId, undefined);
+  assert.equal(verdicts[1]?.data.replyDigest, createHash('sha256').update(honest, 'utf8').digest('hex'));
+  assert.equal(result.outcome.finalOutput, honest, 'the honest report reaches the person');
+
+  // NEGATIVE: a continuation that CLAIMS the work still buys a fresh verdict.
+  const claiming = await runHost({ captured: true, incoming: true, text: request, secondReply: 'Done — the invite now carries the description.' });
+  assert.equal(claiming.judged.length, 2, 'an unverified claim is judged, never carried');
+  const claimingVerdicts = events.listEvents(claiming.identity.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(claimingVerdicts.length, 2);
+  assert.equal(claimingVerdicts.every((row) => row.data.carriedVerdict !== true), true);
 });
 
 test('the host sends decisive middle records to the judge, not just the evidence collector', async () => {
@@ -758,7 +793,7 @@ test('captured OFF makes zero judge calls despite incoming ON', async () => {
 
 test('captured ON remains eligible despite incoming OFF after re-entry', async () => {
   const result = await runHost({ captured: true, incoming: false });
-  assert.equal(result.judged.length, 2);
+  assert.equal(result.judged.length, 1);
 });
 
 test('ordinary chat without source work still uses one brain turn and zero judge calls', async () => {
@@ -813,7 +848,7 @@ test('the production host completion seam forwards the same accepted selection a
     const read = host.readCapturedCompletionPolicy(result.identity);
     assert.equal(read.status, 'captured');
     if (read.status !== 'captured') throw new Error('capture missing');
-    assert.equal(result.judged.length, 2);
+    assert.equal(result.judged.length, 1);
     for (const attempt of result.judged) assert.deepEqual(attempt.selection, read.policy.judgeSelection);
     assert.equal(read.policy.judgeModelId, 'claude-opus-5');
   } finally {

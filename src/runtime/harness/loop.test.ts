@@ -2034,7 +2034,7 @@ test('dynamic reasoning effort: background (workflow) complex turn → high (no 
   assert.equal(listEvents(sess.id, { types: ['reasoning_effort'] })[0].data.effort, 'high');
 });
 
-test('explicit Plan carries high effort from the accepted source even on a short continuation with dynamic selection off', async () => {
+test('explicit Plan carries medium effort from the accepted source even on a short continuation with dynamic selection off', async () => {
   resetEventLog();
   const prev = process.env.CLEMMY_DYNAMIC_REASONING;
   process.env.CLEMMY_DYNAMIC_REASONING = 'off';
@@ -2046,14 +2046,14 @@ test('explicit Plan carries high effort from the accepted source even on a short
       const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user',
         type: 'user_input_received', data: { text: 'Continue.', taskMode: { version: 1, kind: 'plan' } } });
       const runRunner: RunRunnerFn = async (_runner, selectedAgent, items) => {
-        assert.equal((selectedAgent as any).modelSettings?.reasoning?.effort, priorEffort ?? 'high');
+        assert.equal((selectedAgent as any).modelSettings?.reasoning?.effort, priorEffort ?? 'medium');
         return { history: items, lastResponseId: 'plan-effort', finalOutput: { ok: true } };
       };
       await runTurn({ agent, sessionId: session.id, sourceUserSeq: source.seq,
         input: 'Continue.', makeRunner: makeRunnerStub, runRunner });
       const event = listEvents(session.id, { types: ['reasoning_effort'] })[0];
       assert.ok(event, 'the real loop must select effort before entering the model');
-      assert.equal(event.data.effort, priorEffort ?? 'high');
+      assert.equal(event.data.effort, priorEffort ?? 'medium');
       assert.equal(event.data.taskMode, 'plan');
       assert.equal(event.data.sourceUserSeq, source.seq);
       assert.match(String(event.data.reason), /^explicit-plan/);
@@ -9089,13 +9089,17 @@ test('runConversation: one request materializes distinct queued payloads and col
     runRunner,
   });
 
+  // Several pending cards for one turn are one approval pause naming the
+  // oldest card; each card keeps its own authority. Typing this as a
+  // question tried to close a host call authority that still owned the
+  // unsettled calls and failed the turn at publication.
   assert.equal(
     result.status,
-    'awaiting_user_input',
-    'multiple approval cards require an explicit user choice; no singular approval authority is invented',
+    'awaiting_approval',
+    'multiple approval cards pause as an approval pause; no card is invented and none is dropped',
   );
-  assert.equal(result.publicPresentation?.kind, 'question');
-  assert.equal(result.publicPresentation?.approvalId, undefined);
+  assert.equal(result.publicPresentation?.kind, 'approval');
+  assert.ok(result.publicPresentation?.approvalId, 'the pause names an exact pending card');
   assert.equal(calls, 1, 'all distinct approval edges materialize without another model turn');
   assert.equal(
     listEvents(sess.id, { types: ['heartbeat'] })
@@ -14594,5 +14598,78 @@ test('recall budget defaults scale with the routed window; env overrides stay ab
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_RECALL_MAX_CALLS;
     else process.env.CLEMMY_RECALL_MAX_CALLS = prev;
+  }
+});
+
+test('an Execute stop after the claim still commits the typed blocked terminal and burns the claimed revision', async () => {
+  resetEventLog();
+  const plans = await import('./plan-artifacts.js');
+  const executionContext = await import('./accepted-plan-execution.js');
+  const schemas = await import('../../tools/composio-schema-cache.js');
+  const { providerInputSchemaDigestOf } = await import('./reviewed-provider-identity.js');
+  const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const operationId = 'reviewed_cli_loop_stop_fixture';
+  const manifest = fixtureCapabilityManifest.attachSemanticContract({
+    version: 1, manifestId: `cap:fixture:reviewed-cli:${operationId}`, providerKind: 'reviewed_cli', operationId,
+    providerIdentity: '/usr/bin/fixture-cli', providerVersion: 'fixture-v1', operationVersion: '1',
+    definitionFingerprint: sha256(`definition:${operationId}`), effect: 'read', accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' }, evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-09-01T00:00:00.000Z', trusted: true }, lifecycle: { state: 'current' },
+  });
+  const schema = { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false };
+  schemas.rememberToolSchema(operationId, schema, Date.now());
+  const cached = schemas.getCachedToolSchema(operationId)!;
+  const entry = {
+    capabilityId: manifest.manifestId, toolName: manifest.operationId, schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint, effect: manifest.effect, account: manifest.accountId,
+    manifestDigest: fixtureCapabilityManifest.capabilityManifestDigest(manifest), providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint, providerInputSchemaDigest: providerInputSchemaDigestOf(cached),
+    manifest, invoke: async () => ({ records: [], has_more: false }),
+  };
+  const previousFactory = fixtureCapabilityCatalog.peekHostCapabilityCatalogFactory();
+  const factory = fixtureCapabilityCatalog.createHostCapabilityCatalogFactory();
+  factory.register(entry);
+  fixtureCapabilityCatalog.installHostCapabilityCatalogFactory(factory);
+  try {
+    const sess = HarnessSession.create({ kind: 'chat', title: 'post-claim execute stop' });
+    const planSource = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan the query.', taskMode: { version: 1, kind: 'plan' } } });
+    const structuredPlan = {
+      steps: [{ id: 'query', action: 'Run the reviewed query.', effect: 'read', capabilityRef: manifest.manifestId, staticArguments: { query: 'SELECT Id FROM Account' },
+        dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Rows returned.' }],
+      successCriteria: ['Rows returned.'], subagents: [], executionDraft: null,
+      preparedBindings: [{ stepId: 'query', capabilityRef: manifest.manifestId, identity: fixtureCapabilityCatalog.canonicalCatalogIdentityOf(entry), inputSchema: cached,
+        argumentValidation: 'static_schema_checked', source: { sessionId: sess.id, sourceUserSeq: planSource.seq } }],
+      preparationIssues: [],
+    } as never;
+    const artifact = plans.publishPlanRevision({ sessionId: sess.id, sourceUserSeq: planSource.seq, principalId: sess.id, fullText: 'Run the reviewed query.', structuredPlan, readiness: 'ready' });
+    const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+    const executeSource = appendEvent({ sessionId: sess.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute this plan.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
+    // The claim is already spent (the bridge admitted this source), and only
+    // then does the capability stop being current.
+    plans.claimPlanExecution({ sessionId: sess.id, sourceUserSeq: executeSource.seq, principalId: sess.id, executeRef: ref });
+    factory.forget(entry.capabilityId);
+    let builds = 0;
+    const result = await runConversation({
+      sessionId: sess.id,
+      sourceUserSeq: executeSource.seq,
+      input: executionContext.acceptedPlanExecutionText(sess.id, executeSource.seq)!,
+      turnEngine: 'host_v1',
+      buildAgent: async () => { builds += 1; throw new Error('no model turn may start after a pre-turn stop'); },
+    });
+    assert.equal(result.status, 'blocked', JSON.stringify(result));
+    assert.match(result.error ?? '', /I could not start executing this plan: .*Nothing was started\. A reviewed revision runs once/);
+    assert.equal(builds, 0, 'the stop happens before capability construction');
+    const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).filter(event => event.data.sourceUserSeq === executeSource.seq).at(-1);
+    assert.ok(terminal, 'the post-claim stop commits a typed terminal instead of leaving a spinner');
+    assert.equal(terminal.data.reason, 'plan_execution_revalidation_refused');
+    assert.equal(terminal.data.delivered, false);
+    const claim = plans.getPlanExecutionClaim({ sessionId: sess.id, principalId: sess.id, ref });
+    assert.ok(claim, 'the claim spent before the stop is immutable: this revision is burned (stated residual)');
+    assert.equal(claim.sourceUserSeq, executeSource.seq);
+    const refusal = listEvents(sess.id, { types: ['guardrail_tripped'] }).find(event => event.data.kind === 'plan_execution_revalidation_refused');
+    assert.equal(refusal?.data.reason, 'entry_missing');
+  } finally {
+    fixtureCapabilityCatalog.installHostCapabilityCatalogFactory(previousFactory);
   }
 });

@@ -6,6 +6,7 @@
  * catalog entry. Dispatch still requires an adapter-attested contract,
  * a fresh observation, and live revalidation.
  */
+import { structuralDestinationPosture } from './external-capability-risk.js';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
 import {
@@ -98,7 +99,7 @@ function descriptorFromHit(hit: CapabilityOperationHit): HostCapabilityDescripto
     outputShape: write ? 'created_resource' : 'records',
     outputKind: write ? 'created_resource' : 'records',
     deliverableKind: write ? (family || 'artifact') : 'records',
-    destinationPosture: write ? 'create_new' : null,
+    destinationPosture: write ? (structuralDestinationPosture(identifier) ?? 'create_new') : null,
     evidenceKinds: write ? ['receipt', 'readback'] : ['payload'],
     handleRequired: write,
     readbackRequired: write,

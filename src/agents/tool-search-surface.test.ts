@@ -125,7 +125,7 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.ok((data.firstClassCount ?? 0) > 0, 'firstClassCount recorded');
   assert.ok((data.catalogCount ?? 0) > 0, 'catalogCount recorded');
   assert.ok((data.estCatalogTokens ?? 0) > 0, 'estCatalogTokens recorded');
-  assert.ok((data.firstClassCount ?? 999) <= 15, 'the small schema kernel includes the three native filesystem readers');
+  assert.ok((data.firstClassCount ?? 999) <= 16, 'the small schema kernel includes the three native filesystem readers');
 });
 
 test('ON: an excluded tool is absent from both first-class and deferred reachability', async () => {
@@ -242,7 +242,7 @@ test('explicit local-memory-only turns load a bounded read surface and honor no-
   // Clementine local memory, list the 8 people…") it is the instrument, not
   // bloat. Live C11 sources 135212/135311 show the turn failing precisely
   // because it was invisible. The guard still holds the surface bounded.
-  assert.ok((scope?.firstClassCount ?? 999) <= 13, 'the model-facing schema surface stays bounded');
+  assert.ok((scope?.firstClassCount ?? 999) <= 14, 'the model-facing schema surface stays bounded');
   const catalog = (await renderInstructions(agent)).split('[tool-catalog]')[1] ?? '';
   assert.doesNotMatch(catalog, /workflow_run|focus_clear|memory_remember/);
 });

@@ -170,6 +170,10 @@ export type InteractiveConsentDecisionV1 =
         | 'no_effect'
         | 'exact_reversible_work'
         | 'exact_ordinary_work'
+        | 'exact_carrier_bounded_work'
+        /** A planning turn exercised a carrier-bounded call once as
+         * preparation; the plan binds the arguments that worked. */
+        | 'plan_preparation_probe'
         | 'exact_user_grant'
         | 'settled_replay';
       authorityDigest: string;
@@ -194,8 +198,19 @@ export type InteractiveConsentDecisionV1 =
   | { kind: 'reconcile'; reason: 'possible_effect'; retry: 'never_blind' }
   | {
       kind: 'refuse';
-      reason: 'protected_target' | 'untrusted_execution' | 'malformed_call' | 'policy_denied';
+      reason:
+        | 'protected_target'
+        | 'untrusted_execution'
+        | 'malformed_call'
+        | 'policy_denied'
+        /** A planning turn proposes this effect; it never performs it. */
+        | 'plan_mode_external_effect';
     };
+
+/** The basis a proceed decision carries. Dispatch and settlement read it so a
+ * planning turn's preparation probe is accounted like a read crossing. */
+export type InteractiveConsentProceedBasis =
+  Extract<InteractiveConsentDecisionV1, { kind: 'proceed' }>['basis'];
 
 export interface EvaluateInteractiveConsentInputV1 {
   call: CapabilityRiskAttestationV1;
@@ -205,6 +220,12 @@ export interface EvaluateInteractiveConsentInputV1 {
   crossing: InteractiveConsentCrossing;
   explicitHumanCheckpoint?: { subjectDigest: string };
   reservationAlreadyClaimed: boolean;
+  /**
+   * The accepted source is a planning turn. Planning holds no expected-work
+   * graph, so no coverage can exist; the adapter sets this from the durable
+   * task mode, never from model text.
+   */
+  preparationProbe?: boolean;
 }
 
 function sameDestination(
@@ -387,6 +408,34 @@ export function evaluateInteractiveConsentV1(
     };
   }
 
+  // A PLANNING TURN VALIDATES WHAT IT WILL CALL.
+  //
+  // Planning has no expected-work graph, so the coverage gate below could
+  // only ever repair; the ceiling that matters here is external consequence.
+  // A carrier-bounded call (the current definition declares it
+  // non-destructive, the arguments carry no send or delete evidence, and it
+  // addresses one occurrence) may run once as preparation, so the published
+  // plan binds arguments that actually worked instead of a guess the
+  // execution turn discovers. Every other external effect is refused as a
+  // typed planning boundary: never a card, never a coverage repair, because a
+  // plan proposes that action and the reviewed revision performs it.
+  if (input.preparationProbe) {
+    if (
+      call.effect === 'external_write'
+      && call.risk.consequence === 'unknown'
+      && call.risk.reversibility === 'ordinary_non_destructive'
+      && !call.risk.destructive
+      && call.cardinality.kind !== 'set'
+    ) {
+      return {
+        kind: 'proceed',
+        basis: 'plan_preparation_probe',
+        authorityDigest: call.bindingDigest,
+      };
+    }
+    return { kind: 'refuse', reason: 'plan_mode_external_effect' };
+  }
+
   // Every mutation must first belong to exact accepted work. A surprise
   // model-authored write is a planning defect to repair, not a permission
   // question to hand to the user.
@@ -426,6 +475,24 @@ export function evaluateInteractiveConsentV1(
       need: 'approval',
       subjectDigest: call.bindingDigest,
       reason: 'This exact accepted call is destructive, irreversible, administrative, or a sealed bulk mutation.',
+    };
+  }
+
+  // A carrier that declares the operation non-destructive bounds an otherwise
+  // unnamed consequence; with exact coverage, no send/delete evidence in the
+  // arguments, and no explicit checkpoint, that is ordinary accepted work.
+  // Every gate above (safety, crossing, readiness, checkpoint, coverage,
+  // reservation, grant, high consequence) has already been answered.
+  if (
+    call.effect === 'external_write'
+    && call.risk.consequence === 'unknown'
+    && call.risk.reversibility === 'ordinary_non_destructive'
+  ) {
+    return {
+      kind: 'proceed',
+      basis: 'exact_carrier_bounded_work',
+      authorityDigest: input.coverage.requirementDigest,
+      reservationKey: input.coverage.reservationKey,
     };
   }
 

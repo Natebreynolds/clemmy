@@ -436,6 +436,11 @@ export const EVENT_TYPES = [
   // proves the judge fired BEFORE a YOLO silent-proceed (the 2026-06-22
   // CLEMMY_GOAL_ALIGNMENT_GATE fix). Pure telemetry; never alters behavior.
   'goal_alignment_judged',
+  // Per tool_search call: what each candidate source returned, how long it
+  // took, and the real error when one failed. Live 2026-09-15: the Composio
+  // source threw, the message was discarded, the model saw local tools ranked
+  // over the operation it named, and the turn ended as "capability unavailable".
+  'discovery_source_outcome',
   // The numeric/output-grounding gate ran on a deliverable (a chat-delivered
   // report or an irreversible-write payload) and reached a verdict — pass,
   // advisory (a load-bearing figure could not be traced to a tool result), or
@@ -616,6 +621,10 @@ export const EVENT_TYPES = [
   // never has to masquerade as a hidden human approval. The v3 authority
   // transaction appends this receipt and the activation atomically.
   'workflow_v3_auto_consent_decided',
+  // Private receipt that the harness answered one exact external mutation on
+  // the carrier's own non-destructive declaration instead of minting a card.
+  // Operational evidence for the write boundary; never a public projection.
+  'interactive_consent_decided',
   'workflow_node_invocation_activated',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is

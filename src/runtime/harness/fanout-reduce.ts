@@ -38,7 +38,7 @@ import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from 
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { Agent, Runner } from '@openai/agents';
-import { BASE_DIR, MODELS, getRuntimeEnv } from '../../config.js';
+import { BASE_DIR, DEFAULT_CODEX_FAST_MODEL, MODELS, getRuntimeEnv } from '../../config.js';
 import { findExactToolOutputCallId, listEvents, writeToolOutput } from './eventlog.js';
 import { summarizeFanoutCoverage } from './fanout-ledger.js';
 import { toolCallHint } from './tool-call-hint.js';
@@ -351,7 +351,7 @@ export function _setShardReducerForTests(fn: ShardReducerFn | null): void {
 }
 
 function reducerModel(): string {
-  return MODELS.fast || MODELS.primary || 'gpt-5.4-mini';
+  return MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL;
 }
 
 /** Bound one reducer member without destroying its final fields. Structural

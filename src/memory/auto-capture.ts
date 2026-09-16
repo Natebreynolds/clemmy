@@ -134,8 +134,16 @@ export function isEligibleAutoCaptureSourceProvenance(
 ): boolean {
   if (!provenance || provenance.role !== 'user') return false;
   if (provenance.authority === 'accepted_user_input') {
+    // Two durable user rows carry owner words: the accepted source and a
+    // mid-run steer note. Each binds its own source-event identity so a
+    // capture request cannot present one row's sequence as the other's.
+    const expectedSourceEventId = provenance.type === 'user_input_received'
+      ? `user-source:${provenance.seq}`
+      : provenance.type === 'user_steer_note'
+        ? `user-steer:${provenance.seq}`
+        : null;
     if (
-      provenance.type !== 'user_input_received'
+      expectedSourceEventId === null
       || !provenance.sessionId
       || !provenance.eventId
       || !Number.isSafeInteger(provenance.seq)
@@ -146,7 +154,7 @@ export function isEligibleAutoCaptureSourceProvenance(
     // is not sufficient authority by itself.
     if (!expected.sessionId || !expected.sourceEventId) return false;
     if (provenance.sessionId !== expected.sessionId) return false;
-    if (expected.sourceEventId !== `user-source:${provenance.seq}`) return false;
+    if (expected.sourceEventId !== expectedSourceEventId) return false;
   } else if (provenance.data.synthetic !== false) {
     // A direct boundary has no event row to re-read, so it must positively
     // attest that the input came from the user-facing request boundary.
@@ -565,6 +573,16 @@ export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryI
   };
 }
 
+/** The one gate every caller shares for "is this message an explicit memory
+ * instruction": the parse, minus a same-turn opt-out. Detection only — the
+ * caller decides what to do with the message, and never reads its subject. */
+export function explicitMemoryInstructionFor(message: string): ExplicitMemoryInstructionParse | null {
+  const text = clean(message, Infinity);
+  if (!text) return null;
+  const parsed = parseExplicitMemoryInstruction(text);
+  return parsed && !explicitMemoryInstructionIsSuppressed(text, parsed) ? parsed : null;
+}
+
 function explicitRememberKind(content: string): ConsolidatedFactKind {
   // A literal project/tooling context should not be mislabeled as a personal
   // preference merely because the user used the word "remember".
@@ -643,11 +661,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // heuristics. The parser isolates a separate "remember X" clause, while the
   // suppression check keeps same-content and turn-wide privacy language
   // authoritative.
-  const parsedExplicitMemoryInstruction = parseExplicitMemoryInstruction(text);
-  const explicitMemoryInstruction = parsedExplicitMemoryInstruction
-    && !explicitMemoryInstructionIsSuppressed(text, parsedExplicitMemoryInstruction)
-    ? parsedExplicitMemoryInstruction
-    : null;
+  const explicitMemoryInstruction = explicitMemoryInstructionFor(text);
   // One-off validation/probe prompts often contain durable-looking words such as
   // "instead of" or "must", but they describe this smoke turn, not user memory.
   if (isOneOffValidationOrToolProbe(text) && !explicitMemoryInstruction) return [];

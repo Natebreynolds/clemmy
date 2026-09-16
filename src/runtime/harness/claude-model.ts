@@ -744,8 +744,9 @@ export function withClaudeInputSanitizer(inner: Model): Model {
 /** Apply Clementine's Claude output allowance before the AI SDK adapter gets
  * the request. The adapter defaults unknown/new Claude model ids to 4,096,
  * which can strand a long-horizon turn in repeated reasoning-only responses.
- * Caller-supplied values remain authoritative; only an omitted setting gets a
- * capability-bounded default. */
+ * Caller-supplied values remain authoritative; an omitted setting gets the
+ * model's full declared output window (thinking counts inside it), and the
+ * fixed default only when the registry does not know the model. */
 class ClaudeRequestDefaultsModel implements Model {
   constructor(
     private readonly inner: Model,
@@ -754,14 +755,14 @@ class ClaudeRequestDefaultsModel implements Model {
 
   private apply(request: ModelRequest): ModelRequest {
     if (typeof request.modelSettings?.maxTokens === 'number') return request;
-    const capabilityMax = Number.isFinite(this.capability.maxOutput)
-      ? Math.max(1, Math.floor(this.capability.maxOutput))
+    const capabilityMax = Number.isFinite(this.capability.maxOutput) && this.capability.maxOutput > 0
+      ? Math.floor(this.capability.maxOutput)
       : CLAUDE_DEFAULT_MAX_TOKENS;
     return {
       ...request,
       modelSettings: {
         ...request.modelSettings,
-        maxTokens: Math.min(CLAUDE_DEFAULT_MAX_TOKENS, capabilityMax),
+        maxTokens: capabilityMax,
       },
     } as ModelRequest;
   }

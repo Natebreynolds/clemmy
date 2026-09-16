@@ -29,7 +29,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
-import { MODELS, getRuntimeEnv } from '../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, DEFAULT_CODEX_MODEL, MODELS, getRuntimeEnv } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { STATE_DIR } from '../memory/db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isSecretLikeKey } from '../runtime/security.js';
@@ -41,6 +42,25 @@ const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
 
 export function selfHealEnabled(): boolean {
   return (getRuntimeEnv('WORKFLOW_SELF_HEAL', 'on') ?? 'on').toLowerCase() === 'on';
+}
+
+/** Retired ChatGPT Codex OAuth ids. Keep them selectable in the picker, but
+ *  never dispatch them from an auxiliary lane (WorkflowDoctor, heal judge). */
+function servedCodexModelId(modelId: string): string {
+  if (modelId === 'gpt-5.4') return DEFAULT_CODEX_MODEL;
+  if (modelId === 'gpt-5.4-mini' || modelId === 'gpt-5.4-nano') return DEFAULT_CODEX_FAST_MODEL;
+  return modelId;
+}
+
+/** Cheap classifier for a blocked run. Follow the worker role (the live cheap
+ *  Codex assignment) instead of MODELS.fast, which still holds a retired 5.4
+ *  id on homes that never retuned the FAST slot. */
+export function workflowDoctorModelId(): string {
+  try {
+    const worker = resolveRoleModel('worker');
+    if (worker.modelId) return servedCodexModelId(worker.modelId);
+  } catch { /* fall through to the current Codex primary */ }
+  return servedCodexModelId(MODELS.primary);
 }
 
 // ─── 1. Detect blocked steps ─────────────────────────────────────────
@@ -607,7 +627,7 @@ export async function judgeHealCrossFamily(
     const { judgeCrossFamilyEnabled, withJudgeTimeout } = await import('../runtime/harness/judge-family.js');
     if (!judgeCrossFamilyEnabled()) return { verdict: 'unavailable', reason: 'cross-family judging disabled' };
     const judge = resolveRoleModel('judge');
-    const doctorProvider = resolveProvider(MODELS.fast);
+    const doctorProvider = resolveProvider(workflowDoctorModelId());
     if (!judge?.modelId || String(judge.provider) === String(doctorProvider)) {
       return { verdict: 'unavailable', reason: 'no different-family judge bound' };
     }
@@ -680,7 +700,7 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
     // A structured blocked-step classifier — the fast tier handles it well and
     // keeps post-failure diagnosis cheap (it runs on every blocked run).
     instructions: DOCTOR_INSTRUCTIONS,
-    model: MODELS.fast,
+    model: workflowDoctorModelId(),
     modelSettings: { reasoning: { effort: 'low' } },
     tools: [],
   });

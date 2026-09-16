@@ -152,17 +152,25 @@ function objectiveAffinityTokens(objective: string): string[] {
   return cachedObjectiveTokens;
 }
 
-function goalAffinity(slug: string, objective: string): { overlap: number; foreign: number } {
+/** `matched` lists the slug's own tokens (as written, before plural folding)
+ *  that the objective connected to, so a selected entry can carry the exact
+ *  match evidence forward as `matchedTokens`. */
+function goalAffinity(slug: string, objective: string): { overlap: number; foreign: number; matched: string[] } {
   const objectiveTokens = objectiveAffinityTokens(objective);
-  let overlap = 0;
+  const matched: string[] = [];
   let foreign = 0;
-  for (const token of new Set(slugTokens(slug))) {
+  const seen = new Set<string>();
+  for (const raw of slug.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3) continue;
+    const token = raw.replace(/s$/, '');
+    if (seen.has(token)) continue;
+    seen.add(token);
     if (GENERIC_SLUG_TOKENS.has(token)) continue;
-    const matched = objectiveTokens.some((word) => token.includes(word) || word.includes(token));
-    if (matched) overlap += 1;
+    const connected = objectiveTokens.some((word) => token.includes(word) || word.includes(token));
+    if (connected) matched.push(raw);
     else foreign += 1;
   }
-  return { overlap, foreign };
+  return { overlap: matched.length, foreign, matched };
 }
 
 function affinityRank(slug: string, objective: string): number {
@@ -215,8 +223,8 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
   const readEffect = (slug: string): 'read' | 'write' =>
     (classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write');
 
-  const searchCandidates: Array<{ slug: string; rank: number }> = [];
-  const createCandidates: Array<{ slug: string; rank: number; toolkit: string }> = [];
+  const searchCandidates: Array<{ slug: string; rank: number; matched: string[] }> = [];
+  const createCandidates: Array<{ slug: string; rank: number; toolkit: string; matched: string[] }> = [];
   for (const tool of view.tools) {
     const effect = readEffect(tool.slug);
     // Zero-evidence floor: when no token of the slug connects to the objective
@@ -251,6 +259,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
           rank: (SEARCH_NAME_RE.test(tool.slug) ? 0 : 10)
             + requiredOf(tool.schema).length
             + affinityRank(tool.slug, objective),
+          matched: affinity.matched,
         });
       }
     } else {
@@ -279,6 +288,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
           slug: tool.slug,
           rank: required.length + affinityRank(tool.slug, objective),
           toolkit: registeredToolkitOfSlug(tool.slug).trim().toLowerCase(),
+          matched: affinity.matched,
         });
       }
     }
@@ -290,9 +300,9 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
 
   // Readback: a read on the CREATE's toolkit whose required fields are
   // id-shaped (fillable from the created resource id).
-  let readback: { slug: string } | undefined;
+  let readback: { slug: string; matched: string[] } | undefined;
   if (create) {
-    const readbackCandidates: Array<{ slug: string; rank: number }> = [];
+    const readbackCandidates: Array<{ slug: string; rank: number; matched: string[] }> = [];
     for (const tool of view.tools) {
       if (readEffect(tool.slug) !== 'read') continue;
       if (registeredToolkitOfSlug(tool.slug).trim().toLowerCase() !== create.toolkit) continue;
@@ -305,7 +315,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
         envelope: probeEnvelope(objective, [{ nodeId: 'probe-create', role: 'create', value: { id: 'probe-id' } }]),
       });
       if (args !== null && required.some((key) => ID_KEY_RE.test(key))) {
-        readbackCandidates.push({ slug: tool.slug, rank: required.length });
+        readbackCandidates.push({ slug: tool.slug, rank: required.length, matched: goalAffinity(tool.slug, objective).matched });
       }
     }
     readbackCandidates.sort((a, b) => a.rank - b.rank || a.slug.localeCompare(b.slug));
@@ -326,6 +336,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
       status: 'proven',
       connection: 'active',
       effectClass: 'read',
+      matchedTokens: search.matched,
     });
   }
   if (create) {
@@ -336,6 +347,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
       status: 'proven',
       connection: 'active',
       effectClass: 'write',
+      matchedTokens: create.matched,
     });
   }
   if (readback) {
@@ -346,6 +358,7 @@ export function selectGoalCatalog(objective: string): GoalCatalogSelection {
       status: 'proven',
       connection: 'active',
       effectClass: 'read',
+      matchedTokens: readback.matched,
     });
   }
   return { entries, gaps };

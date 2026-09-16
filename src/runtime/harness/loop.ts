@@ -69,11 +69,13 @@ import {
   type HarnessRunContext,
 } from './brackets.js';
 import { recoverSettledPlanTaskActivation } from './plan-task-post-settlement.js';
+import { markTurnClock, startTurnClock, takeTurnClock } from './turn-clock.js';
 import {
   compactInFlightToolContext,
   inFlightCompactionThresholds,
   compactSessionIfNeeded,
   compactionBudgetForModel,
+  layer1CompactionBudgetForModel,
   checkpointGoalStage,
 } from './compaction.js';
 import { windowScaleForModel } from './model-window-observations.js';
@@ -166,7 +168,7 @@ import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateG
 import { recordVerdictEvent } from '../../execution/verdict.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroundingChatRetry } from './output-grounding-gate.js';
-import { classifyMessageIntent } from '../../assistant/message-intent.js';
+import { classifyMessageIntent, memoryBudgetFor } from '../../assistant/message-intent.js';
 import {
   attachEventLogHooks,
   extractSessionIdFromContext,
@@ -527,6 +529,7 @@ function requireFreshHostTurnOwnership(input: {
       resumed: false,
     },
   });
+  startTurnClock(input.sessionId);
   if (!assertExact(rows())) {
     throw new Error('Fresh host turn ownership could not be sealed exactly.');
   }
@@ -964,9 +967,28 @@ function exactPendingApprovalForTerminal(input: {
       && row.sessionId === input.result.sessionId
       && approvalRegistry.isActionable(row),
     ));
-  // A public approval outcome names one exact authority. Multiple candidates
-  // need a choice question; selecting one implicitly would widen authority.
-  return rows.length === 1 ? rows[0] : null;
+  // A public approval outcome names one exact authority. Several pending
+  // approvals for the same turn each keep their own card; the terminal names
+  // the OLDEST so the pause is typed as an approval pause (the host call
+  // authority stays open while its calls wait) instead of a question that
+  // tries to close an authority still owning unsettled work — which threw at
+  // publication and failed the turn the moment a plan batched four writes.
+  if (rows.length === 0) return null;
+  return rows[rows.length - 1] ?? null;
+}
+
+function pendingApprovalCountForTurn(result: RunConversationResult): number {
+  try {
+    const ids = new Set<string>();
+    for (const event of listEvents(result.sessionId, { types: ['approval_requested'], desc: true, limit: 80 })) {
+      if (event.turn !== result.lastTurn) continue;
+      const approvalId = typeof event.data.approvalId === 'string' ? event.data.approvalId.trim() : '';
+      if (!approvalId) continue;
+      const row = approvalRegistry.get(approvalId);
+      if (row && row.sessionId === result.sessionId && approvalRegistry.isActionable(row)) ids.add(approvalId);
+    }
+    return ids.size;
+  } catch { return 0; }
 }
 
 interface DeferredToolCallsLimitAuthority {
@@ -1098,9 +1120,12 @@ function reduceStandardConversationTerminal(input: {
       });
       const question = terminalQuestionText(result);
       if (approval) {
+        const pendingCount = pendingApprovalCountForTurn(result);
         const approvalText = publicReplyText(
           result.lastDecision?.reply,
-          `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
+          pendingCount > 1
+            ? `${pendingCount} approvals are waiting, starting with ${approval.subject} (${approval.approvalId}). Approve or reject each and I'll continue.`
+            : `Approval required for ${approval.subject}. Review ${approval.approvalId} to continue.`,
         );
         outcome = {
           version: 2,
@@ -1534,7 +1559,17 @@ export async function modelCheckInForExhaustedTurn(
   try {
     const { publishRetainedPlanDraft } = await import('./plan-preparation-draft.js');
     const partial = publishRetainedPlanDraft({ sessionId: input.sessionId, sourceUserSeq: sourceUserSeq! });
-    if (partial) return { ...turnResult, finalOutput: partial.fullText, blockedReason: 'plan_preparation_incomplete' };
+    if (partial) {
+      // The outline IS published now; a stop that still says "I stopped
+      // before publishing" beside the plan card contradicts it. Say what was
+      // published and what it still needs.
+      const gaps = partial.missingPrerequisites ?? [];
+      const steps = partial.structuredPlan?.steps;
+      const stepCount = Array.isArray(steps) ? steps.length : 0;
+      const text = `I published the outline as far as it goes${stepCount ? ` (${stepCount} steps)` : ''}. Nothing was executed.`
+        + (gaps.length ? ` It still needs: ${gaps.join(' ')}` : ' Review it, then answer in the composer or ask me to revise it.');
+      return { ...turnResult, finalOutput: partial.fullText, error: text, blockedReason: 'plan_preparation_incomplete' };
+    }
   } catch (error) {
     logger.warn({ err: error }, 'retained plan publication unavailable');
   }
@@ -5321,6 +5356,13 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
       skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
     };
   }
+  // Casual / conversation / meta Act turns do not need a vault search. Live
+  // 2026-09-14: "what is 6+7" still paid the unified primer before answering.
+  // Action and lookup keep the evidence-backed path — that is how she gets
+  // better with use. Skipping here is budget, not a memory grant.
+  if (memoryBudgetFor(classifyMessageIntent(query).intent).vaultSearchTopK <= 0) {
+    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'intent_budget' };
+  }
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
 
   try {
@@ -5846,18 +5888,38 @@ async function runConversationWithinRuntimeConfig(
       });
       if (reoffered) return reoffered;
     }
+    // Same rule as the revalidation stop below: a pre-turn stop commits the
+    // typed blocked terminal, or the person watches a spinner.
+    const catalogStopText = acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute'
+      ? 'I could not load the capability catalog to start this plan. Nothing was started. A reviewed revision runs once, so ask me to publish the plan again and Execute that new revision.'
+      : 'I could not safely load the current capability catalog for this request. Nothing was started. Please retry.';
+    try {
+      commitStandardBlockedTerminal({ sessionId: options.sessionId, sourceUserSeq, turn: acceptedSource.turn, text: catalogStopText,
+        legacyReason: 'planning_catalog_unavailable' });
+    } catch { /* the blocked result below still carries the reason */ }
     return {
       sessionId: options.sessionId,
       status: 'blocked',
       steps: 0,
       lastTurn: acceptedSource.turn,
-      error: 'I could not safely load the current capability catalog for this request. Please retry.',
+      error: catalogStopText,
     };
   }
   if (hostPlanningCatalog?.ok && acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute') {
     try { await revalidateReviewedPlanPreparation(hostPlanningCatalog.planning); }
     catch (error) {
-      return { sessionId: options.sessionId, status: 'blocked', steps: 0, lastTurn: acceptedSource.turn, error: error instanceof Error ? error.message : 'Reviewed plan preparation is unavailable.' };
+      // A pre-turn stop is still a turn the person is waiting on. Without a
+      // committed terminal the chat surface showed a spinner until the run
+      // watchdog gave up (live 2026-09-15 19:35 and 22:11). Say what stopped
+      // it and what to do, through the same typed terminal every other stop
+      // uses; nothing was started.
+      const detail = error instanceof Error ? error.message : 'Reviewed plan preparation is unavailable.';
+      const text = `I could not start executing this plan: ${detail} Nothing was started. A reviewed revision runs once, so ask me to publish the plan again and Execute that new revision.`;
+      try {
+        commitStandardBlockedTerminal({ sessionId: options.sessionId, sourceUserSeq, turn: acceptedSource.turn, text,
+          legacyReason: 'plan_execution_revalidation_refused' });
+      } catch { /* the blocked result below still carries the reason */ }
+      return { sessionId: options.sessionId, status: 'blocked', steps: 0, lastTurn: acceptedSource.turn, error: text };
     }
   }
   const graphEvent = hostOwnsFreshTurn ? null : await recordAcceptedSourceGraph({
@@ -10172,6 +10234,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     type: 'turn_started',
     data: { input: clip(options.input, 200) },
   });
+  markTurnClock(options.sessionId, 'turn_started');
   if (!persistedRecoveryState && !options.reuseRecordedUserInput && !sourceUserSeq) {
     const recorded = session.recordUserInput(options.authoritativeUserInput ?? options.input, turn);
     sourceUserSeq ??= recorded.seq;
@@ -10453,6 +10516,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     && !automaticMemoryOptedOut) {
     void primeTurnRecallVector(memoryPrimerInput).catch(() => {});
   }
+  markTurnClock(options.sessionId, 'assembly_launched');
   const assemblyPromise: Promise<TurnMemoryPrimer | null> = options.skipAutomaticMemoryPrimer
     ? Promise.resolve({
         enabled: true,
@@ -10534,6 +10598,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       ? MODELS.primary
       : undefined;
   const turnInputBudgetTokens = compactionBudgetForModel(routedModelIdForBudget);
+  // Layer 1 (lossless) is measured against prefill cost, which is absolute on
+  // a wire that does not serve a cached prefix in practice; Layers 2/3 keep
+  // the window above. See layer1CompactionBudgetForModel.
+  const turnLayer1BudgetTokens = layer1CompactionBudgetForModel(routedModelIdForBudget);
   // Idle gap since the last turn (read BEFORE this turn writes back, so it's the
   // previous turn's completion → now). Feeds age/idle-aware compaction so a stale
   // thread summarizes its old turns instead of dragging the full transcript in.
@@ -10543,8 +10611,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (Number.isFinite(last)) idleMs = Math.max(0, Date.now() - last);
   } catch { /* no idle signal → no idle trigger (byte-identical to before) */ }
   try {
-    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens });
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens, layer1BudgetTokens: turnLayer1BudgetTokens });
     compactedItems = nextItems;
+    markTurnClock(options.sessionId, 'compaction_done');
     if (result.modified) {
       session.updateConversationSnapshot(compactedItems);
     }
@@ -10800,7 +10869,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // Await the settled result here, at its original consumption site — the 15s
   // hard outer timeout was started at launch, so on timeout we proceed with a
   // degraded (no-primer) turn exactly as before.
+  markTurnClock(options.sessionId, 'assembly_awaited');
   const assemblySettled = await assemblyPromise;
+  markTurnClock(options.sessionId, 'assembly_settled');
   const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
     ? assemblySettled
       : {
@@ -10995,6 +11066,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       recallElapsedMs: turnMemoryPrimer.recallElapsedMs ?? null,
     },
   });
+  markTurnClock(options.sessionId, 'primer_recorded');
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -11019,6 +11091,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         diagnostics: canonicalContext.diagnostics,
       },
       injectedBytes: contextPacket.text.length,
+      // Where the pre-model ceremony's time went, as offsets (ms) from the
+      // daemon's engine selection: see turn-clock.ts.
+      stages: takeTurnClock(options.sessionId),
     },
   });
   if (contextPacket.multiItem.detected) {

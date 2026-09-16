@@ -149,9 +149,11 @@ test('fresh accepted action subtracts dormant controls without opening archaeolo
 
   assert.ok(names.has('work_call'), 'business work keeps its one semantic carrier');
   assert.ok(names.has('call_tool'), 'deferred controls retain a same-turn carrier');
+  assert.ok(names.has('skill_read'),
+    'the context packet advertises call skill_read; the host lane must expose it first-class');
   assert.match(String(invokable(fixture.agent, 'call_tool').description ?? ''), /control/i);
   assert.match(String(invokable(fixture.agent, 'call_tool').description ?? ''), /business.*work_call/i);
-  assert.ok((scope?.firstClassCount ?? 999) <= 15, `action surface regrew to ${scope?.firstClassCount}`);
+  assert.ok((scope?.firstClassCount ?? 999) <= 16, `action surface regrew to ${scope?.firstClassCount}`);
   assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 6_000,
     `action schema proxy regrew to ${scope?.estFirstClassTokens} tokens`);
   assert.ok((scope?.catalogCount ?? 0) > 90, 'subtracted controls must remain in the same-turn catalog');
@@ -162,7 +164,8 @@ test('fresh accepted action subtracts dormant controls without opening archaeolo
     // Workspace create/read/edit.
     'space_save', 'space_get', 'space_edit_view',
     // Durable memory + learned procedure recall remain independent of history.
-    'memory_recall', 'skill_read', 'session_history',
+    // skill_read is first-class: the context packet advertises `call skill_read`.
+    'memory_recall', 'session_history',
     // Explicit current-task writes are ordinary fresh controls, not archaeology.
     'focus_set', 'focus_update', 'focus_clear', 'focus_park',
   ];
@@ -275,10 +278,11 @@ test('typed continuation admits exactly one bounded recovery carrier', async () 
   const alternateOwner = await searchExact(fixture, 'execution_create');
   assert.equal(alternateOwner.results.some((entry) => entry.name === 'execution_create'), false,
     'a continuation must not acquire a second action owner');
-  for (const name of ['workflow_create', 'space_get', 'memory_recall', 'skill_read']) {
+  for (const name of ['workflow_create', 'space_get', 'memory_recall']) {
     const found = await searchExact(fixture, name);
     assert.equal(found.results[0]?.name, name, `${name} disappeared when recovery opened`);
   }
+  assert.ok(names.has('skill_read'), 'packet-advertised skill_read stays first-class when recovery opens');
   const business = await searchExact(fixture, 'composio_execute_tool');
   assert.equal(business.results[0]?.carrier, 'work_call', 'recovery carrier cannot become business owner');
 });
@@ -321,7 +325,7 @@ test('resolved control capabilities load directly without an extra discovery dec
     firstClassCount?: number;
     estFirstClassTokens?: number;
   } | undefined;
-  assert.ok((scope?.firstClassCount ?? 999) <= 16);
+  assert.ok((scope?.firstClassCount ?? 999) <= 17, `resolved-control surface regrew to ${scope?.firstClassCount}`);
   assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 10_000);
 });
 

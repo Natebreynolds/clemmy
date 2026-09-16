@@ -70,12 +70,12 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias' }) {
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown }) {
   const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
   const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
     ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
   const args = payloadForWrite(1);
-  const operationId = providerFixture?.operationId ?? { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', opaque: 'api_request' }[kind];
+  const operationId = providerFixture?.operationId ?? { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', opaque: 'api_request', bounded: 'api_request' }[kind];
   if (outerShape === 'args') FIXTURE_ALIAS_OPERATIONS.add(operationId);
   const capabilityId = `cap:resolved:${operationId.toLowerCase()}`;
   const accountId = 'account:direct:owner';
@@ -86,7 +86,11 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     version: 1, manifestId: capabilityId, providerKind: 'native_mcp', operationId,
     providerIdentity: 'native:direct-write-fixture', providerVersion: 'catalog-v1', operationVersion: '1', definitionFingerprint,
     externalDefinition: { version: 1, providerInputSchemaDigest, semanticName: operationId,
-      behaviorHints: { readOnly: false, destructive: kind === 'delete', idempotent: null, openWorld: false } },
+      // An opaque call is carrier-silent (no destructive claim either way), so
+      // its consequence stays unnamed and it still pauses for the person. A
+      // bounded call is the same operation whose carrier declares it
+      // non-destructive; the harness answers that one itself.
+      behaviorHints: { readOnly: false, destructive: kind === 'delete' ? true : kind === 'opaque' ? null : false, idempotent: null, openWorld: false } },
     effect: kind === 'admin' ? 'admin' : 'external_write', accountId,
     ...(kind === 'draft' ? { operationSemantics: { version: 1 as const, reversibility: 'reversible' as const } } : {}),
     destination: { family: 'external_resource', posture: kind === 'draft' ? 'create_new' : 'named_existing' },
@@ -111,6 +115,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     assert.equal(request.binding.account, accountId);
     assert.ok(request.authority, 'the existing adapter receives the exact consent grant');
     if (uncertain) throw new Error('fixture transport outcome unknown after possible write');
+    if (providerFixture && Object.prototype.hasOwnProperty.call(providerFixture, 'result')) return providerFixture.result;
     return { successful: true, data: { id: `draft-${carrierName}-${providerCalls}`, ...payloadForWrite(providerCalls) } };
   };
   ports.clearProductionCapabilityPorts();
@@ -131,7 +136,8 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     ? `Create ${writeCount} independent reversible drafts on my connected owner account from this validated content. Do not send anything.`
     : `Perform the exact ${kind} operation on my connected owner account from this validated content.`;
   const session = eventlog.createSession({ id: `p3-direct-write-${carrierName}-${kind}-${suffix}`, kind: 'chat' });
-  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, ...(providerFixture?.taskMode ? { taskMode: providerFixture.taskMode } : {}) } });
   let carrierBodies = 0;
   const carrier = brackets.wrapToolForHarness(carrierName === 'work_call'
     ? buildWorkCall({ requireHostPlan: true, hostPlanningReady: () => true }) as never
@@ -170,9 +176,11 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
         ? { args: payloadForWrite(ordinal) }
         : { args_json: JSON.stringify(payloadForWrite(ordinal)) }) };
   };
+  const modelInputs: unknown[] = [];
   const model = {
-    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+    async getResponse(request: { tools?: Array<{ name?: string }>; input?: unknown }) {
       modelCalls += 1;
+      modelInputs.push(request.input);
       assert.ok(request.tools?.some((entry) => entry.name === carrierName), JSON.stringify(request.tools?.map(t => t.name)));
       if (modelCalls === 1) {
         // Same shape as the tag canary: exact live capability is ready only
@@ -213,7 +221,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     counter: new brackets.ToolCallsCounter(writeCount + 2), behaviorScopeId: `${session.id}::turn:1` },
   () => hostRunRunner(runner as never, agent as never, input,
     { maxTurns: writeCount + 2, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
-  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt, model, useProductionAgent,
+  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt, model, useProductionAgent, modelInputs,
     counts: () => ({ providerCalls, modelCalls, preparationCalls, carrierBodies }) };
 }
 
@@ -670,3 +678,64 @@ for (const carrier of ['call_tool', 'work_call'] as const) {
     assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
   });
 }
+
+test('a carrier-declared non-destructive generic call is answered by the harness and dispatches once without a card', async () => {
+  const fixture = await directWriteFixture('work_call', 'bounded', 'bounded-api', false, 'args_json', 1, {
+    operationId: 'generic_request',
+    schema: { type: 'object', properties: { method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, path: { type: 'string' }, data: { type: 'array', items: { type: 'object' } } }, required: ['method', 'path', 'data'], additionalProperties: false },
+    payloads: [{ method: 'POST', path: '/v1/query', data: [{ query: 'fixture research' }] }],
+  });
+  assert.ok(fixture);
+  const outcome = await fixture.run();
+  assert.equal(Boolean(outcome.hasInterruptions), false, 'no human card for a carrier-bounded call');
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(outcome.history));
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
+  const decided = eventlog.listEvents(fixture.session.id, { types: ['interactive_consent_decided'] });
+  assert.equal(decided.length, 1, 'the harness journals the decision it answered');
+  assert.equal(decided[0]!.data.basis, 'exact_carrier_bounded_work');
+  assert.equal(decided[0]!.data.requestMethod, 'post');
+});
+
+// A PLANNING TURN'S PROBE IS PREPARATION, NOT A MUTATION. The same
+// carrier-bounded shape in Plan proceeds once as a preparation probe and is
+// accounted like a read crossing: no write reservation, no orphan projection,
+// a non-mutating settlement whose returned text is ordinary retained evidence,
+// and the turn continues to the next model round. The Act-mode case above
+// keeps reserving and settling the identical call as a write.
+test('a carrier-bounded call in Plan mode dispatches once as a preparation probe and is accounted like a read', async () => {
+  const providerText = 'Ok. 20000 rows returned for the fixture research query.';
+  const fixture = await directWriteFixture('call_tool', 'bounded', 'plan-probe', false, 'args_json', 1, {
+    operationId: 'generic_request',
+    schema: { type: 'object', properties: { method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, path: { type: 'string' }, data: { type: 'array', items: { type: 'object' } } }, required: ['method', 'path', 'data'], additionalProperties: false },
+    payloads: [{ method: 'POST', path: '/v1/query', data: [{ query: 'fixture research' }] }],
+    taskMode: { version: 1, kind: 'plan' },
+    result: providerText,
+  });
+  assert.ok(fixture);
+  const outcome = await fixture.run();
+  const detail = () => JSON.stringify({ terminal: outcome.terminal, output: outcome.finalOutput, history: outcome.history });
+  assert.equal(Boolean(outcome.hasInterruptions), false, 'no human card for a preparation probe');
+  assert.notEqual(outcome.terminal, 'exact_checkpoint_admission_exhausted', detail());
+  assert.equal(fixture.counts().providerCalls, 1, detail());
+  assert.equal(fixture.counts().modelCalls, 2, 'the turn proceeds to the next model round');
+  assert.ok(JSON.stringify(fixture.modelInputs[1]).includes(providerText), 'the provider text reaches the model unchanged');
+  const decided = eventlog.listEvents(fixture.session.id, { types: ['interactive_consent_decided'] });
+  assert.equal(decided.length, 1, 'the consent journal row stays');
+  assert.equal(decided[0]!.data.basis, 'plan_preparation_probe');
+  for (const type of ['external_write', 'external_write_orphaned', 'external_write_succeeded', 'external_write_failed'] as const) {
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: [type] }).length, 0, `${type} is never booked for a probe`);
+  }
+  const settledAll = eventlog.listEvents(fixture.session.id, { types: ['tool_attempt_settled'] });
+  const settled = settledAll.filter((event) => event.data.callId === 'exact-draft');
+  assert.equal(settled.length, 1, JSON.stringify(settledAll.map(e => e.data)));
+  assert.equal(settled[0]!.data.mutating, false);
+  assert.equal(settled[0]!.data.kind, 'succeeded');
+  assert.notEqual(settled[0]!.data.action, 'stop_and_explain');
+  const row = eventlog.openEventLog().prepare(`SELECT outcome_kind, mutating, recovery_action FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .get(fixture.session.id, fixture.source.seq, 'exact-draft') as Record<string, unknown> | undefined;
+  assert.ok(row, 'the settlement is durable');
+  assert.equal(row.outcome_kind, 'succeeded');
+  assert.equal(row.mutating, 0);
+  assert.notEqual(row.recovery_action, 'stop_and_explain');
+});

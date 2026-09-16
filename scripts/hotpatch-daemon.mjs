@@ -34,6 +34,34 @@ export function inspectDaemonBuild(sourceDist) {
   return { stamp, digest: treeDigest(sourceDist) };
 }
 
+/** The owner's install has lived in both /Applications and ~/Applications
+ * (2026-09-14: the running 3.18.7 was ~/Applications while /Applications held a
+ * root-owned 3.18.6). Patch the newest existing bundle; CLEMENTINE_APP_PATH
+ * overrides. Never patch a bundle that is not the one the owner launches. */
+export function resolveInstalledAppBundle(candidates, readDaemonVersion) {
+  const found = [];
+  for (const bundle of candidates) {
+    let version = null;
+    try { version = readDaemonVersion(bundle); } catch { continue; }
+    if (typeof version === 'string' && version.trim()) found.push({ bundle, version: version.trim() });
+  }
+  if (found.length === 0) throw new Error(`No installed Clementine bundle among: ${candidates.join(', ')}`);
+  const parse = (v) => v.split(/[.-]/).map((part) => (/^\d+$/.test(part) ? Number(part) : part));
+  found.sort((a, b) => {
+    const left = parse(a.version); const right = parse(b.version);
+    for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+      const l = left[index]; const r = right[index];
+      if (l === r) continue;
+      if (l === undefined) return 1;
+      if (r === undefined) return -1;
+      if (typeof l === 'number' && typeof r === 'number') return r - l;
+      return String(r).localeCompare(String(l));
+    }
+    return 0;
+  });
+  return found[0];
+}
+
 export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
   const source = path.resolve(sourceDist);
   const target = path.resolve(targetDist);
@@ -87,14 +115,21 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (args.includes('--check')) {
       console.log(JSON.stringify({ ready: true, sourceFingerprint: stamp.sourceFingerprint, distDigest: digest }));
     } else {
+      const home = process.env.HOME ?? '';
+      const candidates = process.env.CLEMENTINE_APP_PATH
+        ? [process.env.CLEMENTINE_APP_PATH]
+        : ['/Applications/Clementine.app', path.join(home, 'Applications', 'Clementine.app')];
+      const installed = resolveInstalledAppBundle(candidates, (bundle) => (
+        JSON.parse(fs.readFileSync(path.join(bundle, 'Contents/Resources/daemon/package.json'), 'utf8')).version
+      ));
       let running = false;
       try {
-        execFileSync('pgrep', ['-f', '^/Applications/Clementine\\.app/Contents/'], { stdio: 'ignore' });
+        execFileSync('pgrep', ['-f', 'Clementine\\.app/Contents/'], { stdio: 'ignore' });
         running = true;
       } catch (error) { if (error.status !== 1) throw error; }
       if (running) throw new Error('Quit Clementine before patching so the active run can finish cleanly.');
-      const result = installDaemonPatch({ sourceDist, targetDist: '/Applications/Clementine.app/Contents/Resources/daemon/dist' });
-      console.log(`Daemon patched: ${result.stamp.sourceFingerprint}\nPrior daemon retained: ${result.backup}\nDesktop and web UI unchanged. Launch Clementine to test.`);
+      const result = installDaemonPatch({ sourceDist, targetDist: path.join(installed.bundle, 'Contents/Resources/daemon/dist') });
+      console.log(`Daemon patched (${installed.bundle}, was ${installed.version}): ${result.stamp.sourceFingerprint}\nPrior daemon retained: ${result.backup}\nDesktop and web UI unchanged. Launch Clementine to test.`);
     }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

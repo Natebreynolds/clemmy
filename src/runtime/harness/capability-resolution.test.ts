@@ -100,6 +100,33 @@ test('a proven memo resolves proven; an invalidated memo resolves previously_fai
   assert.ok(failed.failureReason && /auto-invalidated/.test(failed.failureReason));
 });
 
+test('a proven memo entry carries the memo\'s matched tokens; caller-constructed rows keep their shape', async () => {
+  const { lexicalCapabilityMatchesForRequest } = await import('../read-path/lexical-capability-matches.js');
+  const ask = 'whats on my outlook calendar view for tomorrow';
+  const memo = lexicalCapabilityMatchesForRequest({ userInput: ask, limit: 4 })
+    .find((m) => m.identifier === 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW');
+  assert.ok(memo && memo.matched.length > 0, 'the fixture memo matches on its own distinctive tokens');
+  const entry = resolveTurnCapabilities(ask).entries
+    .find((e) => e.identifier === 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW');
+  assert.ok(entry);
+  assert.deepEqual(entry.matchedTokens, memo.matched, 'the entry records exactly what the request contained');
+  assert.ok(entry.matchedTokens!.map((t) => t.toLowerCase()).includes('outlook'), 'the toolkit token the ask named is among them');
+  // A row built by a caller without the field is unchanged: no default is
+  // invented, so a consumer can tell legacy rows from unmatched ones.
+  const legacy = { intent: 'x', kind: 'cli' as const, identifier: 'netlify', status: 'proven' as const, connection: 'not_applicable' as const };
+  assert.equal('matchedTokens' in legacy, false);
+});
+
+test('identifierTokensMatchedBy keeps only the identifier\'s own tokens the text contained', async () => {
+  const { identifierTokensMatchedBy } = await import('./capability-resolution.js');
+  assert.deepEqual(identifierTokensMatchedBy('FIXTUREKIT_SEND_MESSAGE', 'send a fixturekit message now'), ['fixturekit', 'send', 'message']);
+  assert.deepEqual(identifierTokensMatchedBy('OTHERKIT_SEND_MESSAGE', 'send a fixturekit message now'), ['send', 'message'],
+    'a neighbouring toolkit matches on generic verbs only, never on its own name');
+  assert.deepEqual(identifierTokensMatchedBy('SHEETKIT_ADD_ROWS', 'add the rows to sheetkit'), ['sheetkit', 'add', 'rows'],
+    'plural folding lets rows/row meet; the identifier token is returned as written');
+  assert.deepEqual(identifierTokensMatchedBy('FIXTUREKIT_GET_BY_ID', ''), []);
+});
+
 test('no registry snapshot → connection is unknown, never disconnected', () => {
   const r = resolveTurnCapabilities('whats on my outlook calendar view for tomorrow');
   assert.equal(r.registryAvailable, false);
@@ -653,4 +680,94 @@ test('a proven identifier with a missing connection does not remap', () => {
     sourceUserSeq: 7,
     requestedTarget: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW',
   }), null);
+});
+
+// ── reviewed CLI reads render their operation id, never the shell ────────────
+//
+// A proven cli memo whose command is a callable reviewed read used to render
+// "; invoke via run_shell_command" plus a rule telling the model to type it.
+// The shell path meets a pre-dispatch refusal that names no door; the reviewed
+// operation carries its own proof. The packet now names the operation.
+test('a proven cli row that is a callable reviewed read renders the operation id, not run_shell_command', async () => {
+  const { CLI_CATALOG } = await import('../../integrations/cli-catalog/catalog.js');
+  const manifests = await import('./capability-manifest.js');
+  const catalogs = await import('./host-capability-catalog-factory.js');
+  const reviewedEntry = CLI_CATALOG.find((entry) => entry.reviewedRead);
+  assert.ok(reviewedEntry?.reviewedRead);
+  const reviewedRead = reviewedEntry!.reviewedRead!;
+  const command = [
+    reviewedEntry!.command,
+    ...reviewedRead.argvPrefix.filter((token) => !token.startsWith('-')),
+    '--query "SELECT Id FROM Account"',
+    ...reviewedRead.argvPrefix.filter((token) => token.startsWith('-')),
+  ].join(' ');
+  const manifest = manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:reviewed_cli:${reviewedRead.operationId}`,
+    providerKind: 'reviewed_cli',
+    operationId: reviewedRead.operationId,
+    providerIdentity: 'reviewed_cli:fixture',
+    providerVersion: 'provider-b',
+    operationVersion: 'operation-b',
+    definitionFingerprint: 'b'.repeat(64),
+    effect: 'read',
+    accountId: 'reviewed_cli:account:bbbbbbbb',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: 'collect_records',
+    acceptedInputKinds: ['arguments'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:reviewed-cli-fixture:v1', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source', 'collection'],
+    argumentCompiler: { id: 'compile:reviewed_cli:fixture:v1', version: '1' },
+    invokePortId: 'port:reviewed_cli:fixture:bbbbbbbb',
+  });
+  const entry = {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    providerKind: manifest.providerKind,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({ records: [] }),
+  };
+  const resolution = {
+    registryAvailable: false,
+    entries: [
+      { intent: 'crm.records.query', kind: 'cli' as const, identifier: reviewedEntry!.command,
+        command, status: 'proven' as const, connection: 'not_applicable' as const },
+      { intent: 'repo.status', kind: 'cli' as const, identifier: 'gh',
+        command: 'gh pr list --json number', status: 'proven' as const, connection: 'not_applicable' as const },
+    ],
+  };
+  // Without a callable entry the shell render is unchanged.
+  catalogs.installHostCapabilityCatalogFactory(null);
+  const before = renderCapabilityResolutionForContext(resolution);
+  assert.match(before, /proven execution path: cli:[^\n]*; invoke via run_shell_command/);
+  assert.doesNotMatch(before, new RegExp(reviewedRead.operationId));
+  assert.match(before, /Execution rule: for a proven cli path, call run_shell_command/);
+
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory([entry]));
+  try {
+    const block = renderCapabilityResolutionForContext(resolution);
+    const reviewedLine = block.split('\n').find((line) => line.includes('crm.records.query'));
+    assert.ok(reviewedLine, block);
+    assert.match(reviewedLine!, new RegExp(`; invoke via work_call name=${reviewedRead.operationId} args_json=\\{`));
+    assert.doesNotMatch(reviewedLine!, /run_shell_command/);
+    const shellLine = block.split('\n').find((line) => line.includes('repo.status'));
+    assert.match(shellLine!, /; invoke via run_shell_command/, 'an unmatched cli row keeps the shell');
+    assert.match(block, /Execution rule: a reviewed CLI read is called by its operation id shown above/);
+    assert.match(block, /do not type it through run_shell_command/);
+    assert.match(block, /Other proven cli paths: call run_shell_command with that command/);
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
 });

@@ -38,6 +38,7 @@ import { getRuntimeEnv } from '../../config.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import { resolveActiveTaskContext } from './active-task-context.js';
 import { recallLearnedContracts, renderLearnedContracts } from '../../tools/tool-contract-recall.js';
+import { renderReviewedCliWorkCallExample, reviewedCliShellMatch } from './reviewed-cli-shell-match.js';
 import { lexicalCapabilityMatchesForRequest } from '../read-path/lexical-capability-matches.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
@@ -63,6 +64,34 @@ export interface CapabilityResolutionEntry {
   /** Private continuity pointer. Persisted for the runtime resolver but never
    * rendered to the model or projected onto the public event plane. */
   verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
+  /** Distinctive tokens of the identifier that the producing query or request
+   * actually contained. Match evidence only: a proven row stays proven and
+   * callable whether or not the ask named it, and no score or threshold
+   * derives from this list. Absent on legacy rows. */
+  matchedTokens?: string[];
+}
+
+/** Lowercased tokens of three or more characters, plural-insensitive so a
+ * request's "sheets" still names an identifier's SHEET segment. */
+function matchTokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3)
+    .map((token) => token.replace(/s$/, ''));
+}
+
+/** The identifier's own tokens (in identifier order, deduplicated) that `text`
+ * also contains. Used by mint sites to stamp `matchedTokens` from the query or
+ * request that produced the row. */
+export function identifierTokensMatchedBy(identifier: string, text: string): string[] {
+  const present = new Set(matchTokens(text));
+  const matched: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of identifier.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3 || seen.has(raw)) continue;
+    seen.add(raw);
+    if (present.has(raw.replace(/s$/, ''))) matched.push(raw);
+  }
+  return matched;
 }
 
 export interface CapabilityResolution {
@@ -297,6 +326,7 @@ export function resolveTurnCapabilities(
         ...(m.effectClass ? { effectClass: m.effectClass } : {}),
         ...(m.command ? { command: m.command } : {}),
         ...(m.verifiedReadOrigin ? { verifiedReadOrigin: m.verifiedReadOrigin } : {}),
+        matchedTokens: [...m.matched],
       });
     }
   } catch { /* resolution is additive context, never turn authority */ }
@@ -521,17 +551,31 @@ export function renderCapabilityResolutionForContext(
   const contractBlock = opts?.focusInput ? renderContractRecall(opts.focusInput) : null;
   if (resolution.entries.length === 0) return contractBlock ?? '';
   const lines: string[] = ['[capability resolution — runtime-resolved facts about THIS request]'];
+  // A proven cli row whose command is a callable reviewed read is called by
+  // its operation id, not typed through the shell: the shell path meets a
+  // refusal that names no door, while the operation carries its own proof.
+  let hasReviewedCli = false;
+  let hasShellCli = false;
   for (const e of resolution.entries) {
     const conn = e.connection === 'active' ? 'connection active'
       : e.connection === 'missing' ? 'NO ACTIVE CONNECTION'
         : e.connection === 'unknown' ? 'connection unverified'
           : null;
     if (e.status === 'proven') {
-      const invoke = e.kind === 'cli'
-        ? '; invoke via run_shell_command'
-        : e.kind === 'mcp'
-          ? `; invoke the namespaced tool ${e.identifier}`
-          : '';
+      const reviewed = e.kind === 'cli'
+        ? reviewedCliShellMatch(e.command ?? e.identifier)
+        : { status: 'unmatched' as const };
+      if (e.kind === 'cli') {
+        if (reviewed.status === 'matched') hasReviewedCli = true;
+        else hasShellCli = true;
+      }
+      const invoke = reviewed.status === 'matched'
+        ? `; invoke via ${renderReviewedCliWorkCallExample(reviewed.operationId, reviewed.argumentMap)}`
+        : e.kind === 'cli'
+          ? '; invoke via run_shell_command'
+          : e.kind === 'mcp'
+            ? `; invoke the namespaced tool ${e.identifier}`
+            : '';
       lines.push(`✓ proven execution path: ${e.kind}:${e.identifier}${invoke}`
         + `; learned intent label (metadata only, NOT callable): ${JSON.stringify(e.intent)}`
         + `${e.accountIdentity ? ` (${e.accountIdentity})` : ''}${conn ? ` [${conn}]` : ''}`);
@@ -541,11 +585,18 @@ export function renderCapabilityResolutionForContext(
         + `${e.failureReason ? `; ${e.failureReason}` : ''}${e.failedAt ? ')' : ''}${conn ? ` [${conn}]` : ''}`);
     }
   }
-  const hasCli = resolution.entries.some((entry) => entry.kind === 'cli' && entry.status === 'proven');
   const hasComposio = resolution.entries.some((entry) => entry.kind === 'composio' && entry.status === 'proven');
+  const reviewedRule = hasReviewedCli
+    ? 'Execution rule: a reviewed CLI read is called by its operation id shown above (work_call with that name and args_json); do not type it through run_shell_command. '
+    : '';
+  const shellRule = hasShellCli
+    ? (hasReviewedCli
+      ? 'Other proven cli paths: call run_shell_command with that command. Do not rediscover via Composio or MCP. '
+      : 'Execution rule: for a proven cli path, call run_shell_command with that command. Do not rediscover via Composio or MCP. ')
+    : '';
   lines.push(
-    hasCli
-      ? 'Execution rule: for a proven cli path, call run_shell_command with that command. Do not rediscover via Composio or MCP. '
+    hasReviewedCli || hasShellCli
+      ? `${reviewedRule}${shellRule}`
       : hasComposio
         ? 'Execution rule: for a proven composio path, call composio_execute_tool with the exact identifier as tool_slug. '
         : 'Execution rule: invoke the proven identifier directly. ',

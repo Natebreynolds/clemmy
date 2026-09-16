@@ -247,3 +247,4 @@ test('immutable artifact/claim rows reject edits and corrupted mirror events can
   }
   assert.ok(store.getPlanExecutionClaim({ ...scope, ref: ref(artifact) }));
 });
+

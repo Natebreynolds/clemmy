@@ -90,6 +90,12 @@ test('resolveHotSet still promotes a sibling door the user named', () => {
   assert.ok(hot.has('composio_search_tools'), 'an explicit name is still a first-class request');
 });
 
+test('skill_read stays in the schema kernel so the packet instruction is callable', () => {
+  assert.ok(TOOL_SEARCH_ALWAYS_LOADED.has('skill_read'));
+  const hot = resolveHotSet('sess-skill-read-kernel', 'hello there');
+  assert.ok(hot.has('skill_read'), 'call skill_read must be first-class without a discovery round');
+});
+
 test('resolveHotSet does not inherit the broad legacy JIT core', () => {
   const hot = resolveHotSet('sess-lean-kernel', 'hello there');
   assert.deepEqual(

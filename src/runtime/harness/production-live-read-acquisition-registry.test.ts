@@ -484,6 +484,38 @@ test('two matching configured servers are ambiguous with zero materialization', 
   }
 });
 
+test('an exact identifier from one observed carrier still acquires when a sibling adapter is down', async () => {
+  const exactIdentifier = 'salesforce_sf_soql_query';
+  let materialized = 0;
+  const cli = genericCliNominationAdapter({
+    rows: [{
+      identifier: exactIdentifier,
+      accountIdentity: 'reviewed_cli:host',
+      description: 'Read-only SOQL via the local Salesforce sf CLI.',
+    }],
+    onMaterialize: () => { materialized += 1; },
+  });
+  const unavailable = generatedRuntime({ objective: generated('unrelated') });
+  unavailable.state.unavailable = true;
+  resetAuthoritySurfaces();
+  const acquisition = registry.createProductionLiveReadAcquisitionRegistry({
+    configuredAdapters: () => [cli, adapter(unavailable)],
+  });
+  const result = await acquisition.acquire({
+    requirementId: generated('requirement'),
+    objective: exactIdentifier,
+    effect: 'read',
+  });
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') {
+    assert.notEqual(result.reason, 'carrier_unavailable',
+      'an exact CLI identifier must not fail because an unrelated MCP could not enumerate');
+    assert.equal(result.reason, 'missing', JSON.stringify(result));
+  }
+  assert.equal(materialized, 1, 'the exact observed CLI nomination must reach materialize');
+  assert.equal(unavailable.counts.call, 0);
+});
+
 test('one unavailable carrier plus one match is unavailable because global uniqueness is unproven', async () => {
   const objective = generated('objective');
   const unavailable = generatedRuntime({ objective });

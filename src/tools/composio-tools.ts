@@ -131,6 +131,11 @@ import {
   saveToolContractExample,
 } from './tool-contract-store.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import {
+  locateBeforeEditRefusal,
+  locateResourceArgs,
+  type SessionWriteReceipt,
+} from '../runtime/harness/session-resource-locator.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import {
   classifyComposioActionConsequence,
@@ -4051,6 +4056,57 @@ async function runComposioExecute(
   return runComposioExecuteInner(toolSlug, args, connectedAccountId, options, hooks);
 }
 
+function composioSlugFromCall(tool: unknown, rawArgs: unknown): string | null {
+  try {
+    const parsed = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+    const outer = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+    if (!outer) return null;
+    if (tool === 'composio_execute_tool' && typeof outer.tool_slug === 'string') {
+      return outer.tool_slug.trim().toUpperCase() || null;
+    }
+    if (tool === 'work_call' && outer.name === 'composio_execute_tool') {
+      const inner = typeof outer.args_json === 'string' ? JSON.parse(outer.args_json) : outer.args;
+      const slug = inner && typeof inner === 'object' ? (inner as { tool_slug?: unknown }).tool_slug : null;
+      return typeof slug === 'string' && slug.trim() ? slug.trim().toUpperCase() : null;
+    }
+  } catch { /* not a provider call */ }
+  return null;
+}
+
+function resultLooksFailed(result: unknown): boolean {
+  if (result == null) return true;
+  let body: unknown = result;
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch { return /fail|error|not found/i.test(String(result)); }
+  }
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    const rec = body as Record<string, unknown>;
+    if (rec.successful === false || rec.error) return true;
+  }
+  return false;
+}
+
+function collectSessionWriteReceipts(sessionId: string): SessionWriteReceipt[] {
+  if (!sessionId) return [];
+  try {
+    const returned = listEvents(sessionId, { types: ['tool_returned'] });
+    const calls = listEvents(sessionId, { types: ['tool_called'] });
+    const receipts: SessionWriteReceipt[] = [];
+    for (const ret of returned) {
+      const callId = ret.data?.callId;
+      const call = callId ? calls.find((row) => row.data?.callId === callId) : undefined;
+      const slug = composioSlugFromCall(call?.data?.tool, call?.data?.arguments);
+      if (!slug || resultLooksFailed(ret.data?.result)) continue;
+      receipts.push({ slug, result: ret.data?.result });
+    }
+    return receipts;
+  } catch {
+    return [];
+  }
+}
+
 async function runComposioExecuteInner(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -4065,8 +4121,23 @@ async function runComposioExecuteInner(
   } = {},
 ): Promise<string> {
   const runSid = sessionIdFromRunContext(options.context);
-  const admittedArgs = args;
-  const gatewayArgs = { ...args };
+  const located = locateResourceArgs({
+    toolSlug,
+    args,
+    receipts: runSid ? collectSessionWriteReceipts(runSid) : [],
+    schema: getCachedToolSchema(toolSlug),
+  });
+  if (located.missingRequired.length > 0) {
+    const message = locateBeforeEditRefusal({
+      toolSlug,
+      missingRequired: located.missingRequired,
+      locatedEventId: located.locatedEventId,
+    });
+    settleComposioPreDispatchRefusal(toolSlug, 'invalid-args', located.args);
+    return new ExternalWritePreDispatchResult(message, 'provider-dispatch:not-started:invalid-args') as unknown as string;
+  }
+  const admittedArgs = located.args;
+  const gatewayArgs = { ...located.args };
   const wait = hooks.delay ?? delayMs;
   const testSchemaIdentity = hooks.skipGateway
     ? exactProviderInputSchemaIdentity(toolSlug, getCachedToolSchema(toolSlug))

@@ -8,8 +8,9 @@ import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering } from '../run
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
-import { aliasLabelFor, resolveAccountAlias, rememberAccountAlias } from '../memory/account-alias-store.js';
+import { aliasLabelFor, listAccountAliases, resolveAccountAlias, rememberAccountAlias } from '../memory/account-alias-store.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
+import { structuralDestinationPosture } from '../runtime/harness/external-capability-risk.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'source-account-routing' });
@@ -64,6 +65,11 @@ export type SourceAccountRoutingResolution =
 /** The alias label under which an answered "which account?" for a READ is
  *  remembered, so the same question is never asked twice for that toolkit. */
 export const READ_DEFAULT_ACCOUNT_LABEL = 'default read account';
+/** The alias label under which an answered "which account should send?" for a
+ *  WRITE is remembered. Unlike the read default it never routes by itself:
+ *  the account judge reviews the current wording against it (2026-09-14:
+ *  the owner answered "Scorpion" for invites three times in four days). */
+export const SEND_DEFAULT_ACCOUNT_LABEL = 'default send account';
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const emailOf = (connection: Connection): string => String(connection.accountEmail ?? '')
   .trim().toLowerCase().replace(/^smtp:/, '');
@@ -190,6 +196,7 @@ function newestEstablishedRoute(input: {
     if (typeof eventSource !== 'number' || eventSource > input.sourceUserSeq) continue;
     const found = new Map<string, ExplicitRoutingEvidence>();
     let checkedDefault = false;
+    const defaultIdentities = new Set<string>();
     for (const entry of event.data.entries) {
       if (!entry || typeof entry !== 'object') continue;
       const parsed = z.union([RoutingEvidenceSchema, DefaultRoutingEvidenceSchema]).safeParse(entry.sourceAccountRouting);
@@ -208,11 +215,20 @@ function newestEstablishedRoute(input: {
         if (route.sourceSessionId !== route.sessionId || route.sourceUserSeq !== eventSource
           || route.sourceDigest !== route.checkedForSourceDigest) continue;
         checkedDefault = true;
+        defaultIdentities.add(route.identity);
       } else if (origin.text.includes(route.sourceQuote)) found.set(route.identity, route);
     }
     // Conflicting identities at the newest checked source never fall through
-    // to an older convenient account.
-    if (checkedDefault) return found.size > 0 ? 'conflict' : null;
+    // to an older convenient account. A checked default and an explicit route
+    // that name the SAME account are one selection, not a conflict: a read
+    // routed on the owner's words and a write reviewed against the remembered
+    // default both land in the same mailbox (live 2026-09-15 23:14, a Drafts
+    // read beside a draft create at one source made the next write ask).
+    if (checkedDefault) {
+      const others = [...found.keys()].filter(identity => !defaultIdentities.has(identity));
+      if (others.length > 0 || defaultIdentities.size > 1) return 'conflict';
+      return null;
+    }
     if (found.size > 0) return found.size === 1 ? [...found.values()][0]! : 'conflict';
   }
   return null;
@@ -231,6 +247,25 @@ function sourceAnsweredAQuestion(sessionId: string, sourceUserSeq: number): bool
   }
 }
 
+/** The semantic port records a chosen option as `opt-N` (1-based). The judge
+ * reads options by wording, so hand it the label the user actually chose.
+ * Live 2026-09-14: "opt-2" hid "Send Adam an invite from my Scorpion calendar"
+ * from the account judge, which then could not entail the Scorpion account. */
+export function clarificationSelectedOptionLabel(
+  selectedOption: string | null | undefined,
+  options: readonly string[],
+): string | null {
+  const raw = typeof selectedOption === 'string' ? selectedOption.trim() : '';
+  if (!raw) return null;
+  if (options.includes(raw)) return raw;
+  const ordinal = /^opt-(\d{1,3})$/.exec(raw);
+  if (ordinal) {
+    const label = options[Number(ordinal[1]) - 1];
+    return typeof label === 'string' && label.trim() ? label : null;
+  }
+  return raw;
+}
+
 function consumedAccountClarification(
   sessionId: string,
   sourceUserSeq: number,
@@ -246,7 +281,9 @@ function consumedAccountClarification(
       question: consumed.packet.pause.question,
       options,
       answer: resolution.activeTaskInput?.trim() || answer,
-      selectedOption: resolution.disposition === 'selected' && resolution.selectedOption ? resolution.selectedOption : null,
+      selectedOption: resolution.disposition === 'selected'
+        ? clarificationSelectedOptionLabel(resolution.selectedOption, options)
+        : null,
     };
   } catch {
     return null;
@@ -356,17 +393,65 @@ export async function resolveSourceAccountRouting(input: {
     && nominatedIdentity.length > 0
     && (source.text.toLowerCase().includes(nominatedIdentity.toLowerCase())
       || supplied.data.source_quote.toLowerCase().includes(nominatedIdentity.toLowerCase()));
-  const nomination = supplied?.success
+  let nomination = supplied?.success
     && (nominationNamesALiveIdentity || ownersWordsNameTheIdentity)
     ? supplied.data
     : null;
+  // THE REMEMBERED DEFAULT FOR A WRITE: the send default the owner answered
+  // with, or — when none was ever asked — the read default. A draft, an
+  // event, a note lands in the store the owner reads from; only the judge's
+  // review of the current wording, never the host, binds it.
+  const matchRemembered = (label: string): Connection | null => {
+    const remembered = resolveAccountAlias(label, toolkit);
+    return remembered ? relevant.find((connection) => (
+      (remembered.connectionId && connection.connectionId === remembered.connectionId)
+      || (remembered.email && emailOf(connection) === remembered.email.toLowerCase())
+    )) ?? null : null;
+  };
+  const rememberedSendDefault = input.effect !== 'read' && choices.length !== 1
+    ? matchRemembered(SEND_DEFAULT_ACCOUNT_LABEL)
+    : null;
+  const rememberedForWrite = input.effect !== 'read' && choices.length !== 1
+    ? rememberedSendDefault ?? matchRemembered(READ_DEFAULT_ACCOUNT_LABEL)
+    : null;
+  const nominatesSendDefault = Boolean(nomination && rememberedSendDefault && (
+    rememberedSendDefault.connectionId === nomination.identity.trim()
+    || emailOf(rememberedSendDefault) === nomination.identity.trim().toLowerCase()
+  ));
+  // A nomination that merely repeats the remembered default is the owner's
+  // established choice, not a new explicit selection: review it as the
+  // default (the judge sees the remembered preference) instead of demanding
+  // that the current wording name the account.
+  if (nomination && rememberedForWrite && (
+    rememberedForWrite.connectionId === nomination.identity.trim()
+    || emailOf(rememberedForWrite) === nomination.identity.trim().toLowerCase()
+  )) nomination = null;
   const latest = newestEstablishedRoute({ ...input, principalId, toolkit });
   if (!nomination && latest === 'conflict') return blocked();
   let established = !nomination && latest !== 'conflict' ? latest : null;
   const connectionRevision = digest(JSON.stringify(relevant.map((candidate) => ({
     id: candidate.connectionId, identity: identityOf(candidate), status: candidate.status,
   })).sort((a, b) => a.id.localeCompare(b.id))));
+  // THE OWNER'S OWN ANSWER, ECHOED. The send default is the account the owner
+  // named when the host asked "which account should send?". A nomination that
+  // repeats it is agreement with that standing answer, not a selection the
+  // current wording must justify, so the host resolves it — unless the wording
+  // names a different connected account of this toolkit by its address or its
+  // recorded alias label (recorded data, never a reading of the prose); then
+  // the judge reviews the wording exactly as before. The write itself still
+  // meets its own gate; this binds only which mailbox it is addressed to.
+  if (nominatesSendDefault && rememberedSendDefault
+    && !namesAnotherConnectedAccount(source.text, relevant, rememberedSendDefault, toolkit)) {
+    return { kind: 'resolved', connection: rememberedSendDefault, evidence: {
+      version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit,
+      identity: identityOf(rememberedSendDefault),
+      sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
+      checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
+      connectionRevision, judgeModelIdentity: 'host:send_default_nominated',
+    } };
+  }
   const defaultMode = !nomination && !established;
+  let rememberedSend: Connection | null = null;
   if (defaultMode && choices.length !== 1) {
     // NOTHING WAS LEARNED was the gap: after the host's own "which account?"
     // she asked again next conversation. For a READ, the answer the user gave
@@ -387,9 +472,43 @@ export async function resolveSourceAccountRouting(input: {
         } };
       }
     }
-    return blocked();
+    // A WRITE with a remembered send default is not asked again either — but
+    // it is not bound by the host: the judge below reviews the current
+    // wording against the remembered preference and can still refuse.
+    if (input.effect !== 'read') {
+      rememberedSend = matchRemembered(SEND_DEFAULT_ACCOUNT_LABEL);
+      // A write that CHANGES AN EXISTING record (update/delete — the
+      // operation's own posture, never the request's wording) has no account
+      // preference to ask about: the record lives where it is read from, so
+      // the toolkit's remembered read account is where it is changed. A wrong
+      // guess is a provider "not found", never a misdirected send. Live
+      // 2026-09-15: an event edit was disclosed account_selection_required with
+      // the read default on file, and the model asked about wording instead.
+      if (!rememberedSend && structuralDestinationPosture(input.operation) === 'named_existing') {
+        const readDefault = resolveAccountAlias(READ_DEFAULT_ACCOUNT_LABEL, toolkit);
+        const match = readDefault ? relevant.find((connection) => (
+          (readDefault.connectionId && connection.connectionId === readDefault.connectionId)
+          || (readDefault.email && emailOf(connection) === readDefault.email.toLowerCase())
+        )) : undefined;
+        if (match) {
+          return { kind: 'resolved', connection: match, evidence: {
+            version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit,
+            identity: identityOf(match),
+            sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
+            checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
+            connectionRevision, judgeModelIdentity: 'host:read_default_named_existing',
+          } };
+        }
+      }
+    }
+    // No send default was ever answered: the read default is where the
+    // owner's own store lives. Reviewed by the judge below like a send
+    // default; a wording that names another account still conflicts.
+    if (!rememberedSend) rememberedSend = rememberedForWrite;
+    if (!rememberedSend) return blocked();
   }
-  const proposedIdentity = nomination?.identity.trim() ?? established?.identity ?? choices[0]!;
+  const proposedIdentity = nomination?.identity.trim() ?? established?.identity
+    ?? (rememberedSend ? identityOf(rememberedSend) : choices[0]!);
   const exact = relevant.filter((connection) => connection.connectionId === proposedIdentity
     || emailOf(connection) === proposedIdentity.toLowerCase());
   if (exact.length === 0) return blocked();
@@ -486,6 +605,9 @@ export async function resolveSourceAccountRouting(input: {
   const result = await judge({
     purpose: 'turn_semantics_account_selection',
     ...(clarification ? { clarification } : {}),
+    ...(rememberedSend
+      ? { rememberedDefault: { identity, label: aliasLabelFor(toolkit, emailOf(rememberedSend) || undefined, rememberedSend.connectionId) ?? null } }
+      : {}),
     mode,
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -511,6 +633,13 @@ export async function resolveSourceAccountRouting(input: {
     checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
     connectionRevision, judgeModelIdentity: result.modelIdentity,
   } };
+  if (sourceAnsweredAQuestion(input.sessionId, input.sourceUserSeq)) {
+    // The user just answered "which account should send?" and the judge
+    // entailed it. Remember the preference; the judge still reviews next time.
+    try {
+      rememberAccountAlias({ toolkit, label: SEND_DEFAULT_ACCOUNT_LABEL, email: emailOf(connection) || undefined, connectionId: connection.connectionId });
+    } catch { /* memory is a convenience, never a gate */ }
+  }
   return { kind: 'resolved', connection, evidence: {
     version: 1, sessionId: input.sessionId, principalId, toolkit, identity,
     sourceSessionId: origin.sessionId, sourceUserSeq: origin.seq,
@@ -519,4 +648,31 @@ export async function resolveSourceAccountRouting(input: {
     checkedForSourceDigest: source.digest,
     judgeModelIdentity: result.modelIdentity,
   } };
+}
+
+/** True when the accepted wording names a connected account of this toolkit
+ *  other than `chosen`: by its address, or by an alias label the owner recorded
+ *  for it. Reserved default labels are not names. Recorded identifiers only. */
+function namesAnotherConnectedAccount(
+  text: string,
+  connections: readonly Connection[],
+  chosen: Connection,
+  toolkit: string,
+): boolean {
+  const haystack = text.toLowerCase();
+  const chosenIdentity = identityOf(chosen);
+  const reserved = new Set([SEND_DEFAULT_ACCOUNT_LABEL, READ_DEFAULT_ACCOUNT_LABEL].map((label) => label.toLowerCase()));
+  const aliases = listAccountAliases(toolkit);
+  for (const connection of connections) {
+    if (identityOf(connection) === chosenIdentity) continue;
+    const email = emailOf(connection);
+    if (email && haystack.includes(email.toLowerCase())) return true;
+    const labels = aliases
+      .filter((alias) => (alias.connectionId && alias.connectionId === connection.connectionId)
+        || (alias.email && email && alias.email.toLowerCase() === email.toLowerCase()))
+      .map((alias) => alias.label.trim().toLowerCase())
+      .filter((label) => label.length >= 3 && !reserved.has(label));
+    if (labels.some((label) => haystack.includes(label))) return true;
+  }
+  return false;
 }

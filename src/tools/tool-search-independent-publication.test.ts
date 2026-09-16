@@ -205,6 +205,74 @@ test('an immutable selected plan still publishes nothing when one selected defin
   assert.equal(catalogs.peekHostCapabilityCatalogFactory()!.snapshot().length, 0);
 });
 
+test('a scheduled READ with one connected account provisions without the account reviewer', async () => {
+  // Live 2026-09-15: platform-49's Sheets read (one connected account) was
+  // routed through the WRITE review because the workflow provisioning path
+  // passed no effect; the pinned cross-family reviewer took 20–60 s inside the
+  // 30 s provisioning deadline and every run failed "proof_publication_expired".
+  // The discovery path already resolves a single-account read directly; the
+  // scheduled path now says what it is. A write keeps its review.
+  setup();
+  semanticPorts.installTurnSemanticModelPort(null); // no reviewer available at all
+  const connected = [{ slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL }];
+  const text = 'Read the exact message named in the schedule.';
+  const identity = source(text);
+  let published = 0;
+  const deps = {
+    materializeExact: async () => [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }],
+    freshConnections: async () => connected,
+    registerProof: async () => { published += 1; return { registered: [`cap:resolved:${TARGET.toLowerCase()}`] }; },
+  };
+  const result = await sources.provisionExactWorkflowProviderOperations({ ...identity, acceptedInput: text, operationIds: [TARGET] }, deps);
+  assert.deepEqual(result, { ok: true }, JSON.stringify(result));
+  assert.equal(published, 1);
+  const proof = resolution.provenCapabilityEntriesForTurn(identity).find(entry => entry.identifier === TARGET);
+  assert.equal(proof?.sourceAccountRouting?.judgeModelIdentity, 'host:read_single_account');
+
+  // NEGATIVE: a scheduled WRITE with one account still needs its review.
+  const writeSlug = 'OUTLOOK_CREATE_DRAFT';
+  const writeText = 'Create the exact draft named in the schedule.';
+  const writeIdentity = source(writeText);
+  const writeResult = await sources.provisionExactWorkflowProviderOperations({ ...writeIdentity, acceptedInput: writeText, operationIds: [writeSlug] }, {
+    ...deps, materializeExact: async () => [{ toolkit: 'outlook', slug: writeSlug, name: writeSlug, score: 1, inputParameters: INPUT }],
+  });
+  assert.equal(writeResult.ok, false);
+  if (!writeResult.ok) assert.equal(writeResult.code, 'account_selection_required');
+});
+
+test('a scheduled step\'s own deadline governs its account review, not the chat search budget', async () => {
+  // platform-49, 2026-09-15: the write review (model work, 20–60 s on the
+  // pinned reviewer) ran inside the 30 s search budget and expired every run.
+  setup();
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('no hidden work plan'); },
+    async judgeAccountSelection(call) {
+      await new Promise(resolve => setTimeout(resolve, 120));
+      return { verdict: 'default_compatible', proposalDigest: call.proposalDigest, modelIdentity: 'slow-fixture-judge' };
+    },
+  });
+  const connected = [{ slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL }];
+  const writeSlug = 'OUTLOOK_CREATE_DRAFT';
+  const text = 'Create the exact draft named in the schedule.';
+  const deps = {
+    materializeExact: async () => [{ toolkit: 'outlook', slug: writeSlug, name: writeSlug, score: 1, inputParameters: INPUT }],
+    freshConnections: async () => connected,
+    registerProof: async () => ({ registered: [`cap:resolved:${writeSlug.toLowerCase()}`] }),
+    totalDeadlineMs: 40,
+  };
+  // The scheduled caller names its wall clock: the review completes inside it.
+  const scheduled = source(text);
+  const ok = await sources.provisionExactWorkflowProviderOperations(
+    { ...scheduled, acceptedInput: text, operationIds: [writeSlug], deadlineAt: Date.now() + 5_000 }, deps);
+  assert.deepEqual(ok, { ok: true }, JSON.stringify(ok));
+  // With no caller deadline the search budget still bounds the whole pass.
+  const bare = source(text);
+  const expired = await sources.provisionExactWorkflowProviderOperations(
+    { ...bare, acceptedInput: text, operationIds: [writeSlug] }, deps);
+  assert.equal(expired.ok, false);
+  if (!expired.ok) assert.equal(expired.code, 'proof_publication_expired');
+});
+
 test('exact JIT read provisioning uses checked conversation account continuity without new nomination', async () => {
   setup();
   const other = { slug: 'outlook', connectionId: 'fixture-other-outlook', status: 'ACTIVE', accountEmail: 'owner@other.invalid' };

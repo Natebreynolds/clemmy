@@ -139,6 +139,11 @@ export interface SourceAccountJudgeCall {
     answer: string;
     selectedOption: string | null;
   } | null;
+  /** current_source_default only: the identity the owner previously answered
+   *  the host's "which account should send?" with, for this toolkit's writes.
+   *  Evidence of a standing preference, never a selection for this request;
+   *  the judge still rules on the current wording. */
+  rememberedDefault?: { identity: string; label: string | null } | null;
   proposalDigest: string;
 }
 

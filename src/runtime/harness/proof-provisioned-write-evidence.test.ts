@@ -259,3 +259,39 @@ test('a fresh initial card withholds the legacy default until exact discovery pu
   assert.deepEqual(catalogs.persistedCatalogSnapshotManifestIdsForSource(fixture.identity), frozenIdentity,
     'fresh discovery does not rewrite the prior frozen identity');
 });
+
+test('a write manifest takes its destination posture from the operation verb, and a stale posture is superseded', async () => {
+  // Live 2026-09-15: OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR was installed with
+  // posture create_new, so the model's named_existing edit plan was refused.
+  const updated = await seed('FIXTURE_UPDATE_ITEM_IN_LIST', 'posture-update');
+  assert.equal(updated.manifest.destination?.posture, 'named_existing', JSON.stringify(updated.manifest.destination));
+  const created = await seed('FIXTURE_CREATE_ITEM_IN_LIST', 'posture-create');
+  assert.equal(created.manifest.destination?.posture, 'create_new', JSON.stringify(created.manifest.destination));
+
+  // An installed manifest carrying the old posture forks the identity: the
+  // next proof from a fresh source supersedes it under a successor id.
+  const slug = 'FIXTURE_UPDATE_STALE_POSTURE';
+  const stale: CapabilityManifestV1 = {
+    ...updated.manifest,
+    manifestId: `cap:resolved:${slug.toLowerCase()}`,
+    operationId: slug,
+    externalDefinition: { ...updated.manifest.externalDefinition!, semanticName: slug },
+    destination: { ...updated.manifest.destination!, posture: 'create_new' },
+  };
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  const store = stores.createCapabilityManifestStore([]);
+  assert.equal(store.install(stale).ok, true);
+  stores.installCapabilityManifestStore(store);
+  const identity = turn(slug, 'posture-stale');
+  const result = await provisioning.registerProofProvisionedCapabilities(identity, selected(slug));
+  assert.equal(result.refusal, undefined, JSON.stringify(result));
+  const successor = store.list().find((installed) => (
+    installed.manifest.operationId === slug && installed.manifest.lifecycle.state === 'current'
+  ));
+  assert.ok(successor, `a current successor manifest is installed: ${JSON.stringify(store.list().map((row) => [row.manifest.manifestId, row.manifest.lifecycle.state]))}`);
+  assert.notEqual(successor!.manifest.manifestId, stale.manifestId, 'the successor has its own id');
+  assert.equal(successor!.manifest.destination?.posture, 'named_existing', 'the fresh proof carries the operation-derived posture');
+  assert.equal(factory.get(successor!.manifest.manifestId)?.manifest?.destination?.posture, 'named_existing');
+  assert.equal(store.get(stale.manifestId)?.manifest.lifecycle.state, 'superseded', 'the stale manifest is superseded, not silently reused');
+});

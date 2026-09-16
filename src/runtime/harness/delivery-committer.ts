@@ -1362,7 +1362,8 @@ export function commitTurnOutcome(
         'Verification note: no completion review was recorded for this request, so nothing '
         + 'has confirmed the result. Ask me to check it.',
       completion_review_failed_open:
-        'Verification note: no completion verdict was obtained. This result remains unreviewed.',
+        'Verification note: I could not get this result independently reviewed, so it stands unreviewed. '
+        + 'The review model is not reachable with the current model setup; the console has the details.',
       completion_review_negative:
         'Verification note: the completion review found this did not meet the request. Ask '
         + 'me what is missing before relying on it.',
@@ -1386,13 +1387,10 @@ export function commitTurnOutcome(
         'Verification note: the completion review did not stand for this result, so it is '
         + 'unconfirmed. Ask me to re-check it.',
     };
-    const reviewReason = detail === 'completion_review_failed_open' && publishedVerdict?.reviewUnavailableReason
-      // Older durable verdicts used this internal fail-open label. It never
-      // meant a review accepted the result, including when reopened today.
-      ? redactSensitiveText(publishedVerdict.reviewUnavailableReason)
-        .replace(' — accepting completion', '; no review was completed').trim().slice(0, 800) : '';
-    const note = reviewReason ? `Verification note: ${reviewReason} This result remains unreviewed.`
-      : NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
+    // The reviewer's unavailability reason is operator diagnosis (model ids,
+    // routing modes, settings to change). It is recorded on the verdict row
+    // for the console; the person in the chat gets one plain sentence.
+    const note = NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
     const authored = effectiveOutcome.presentation.text.trim();
     const withNote = {
       ...effectiveOutcome,

@@ -36,6 +36,7 @@ import {
   selectToolkitConnection,
 } from '../integrations/composio/client.js';
 import {
+  getCachedToolSchema,
   liveComposioOperationVersion,
   liveComposioOutputSchema,
   liveComposioSchemaFingerprint,
@@ -49,11 +50,16 @@ import {
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { accountChoiceLabels } from './source-account-routing.js';
 import {
+  invalidateToolChoice,
+  listToolChoices,
   recallComposioAccountIdentity,
   recallComposioForSearch,
+  recordToolProcedureImpression,
+  rememberToolChoice,
   type RememberedComposioMatch,
 } from '../memory/tool-choice-store.js';
 import {
+  identifierTokensMatchedBy,
   recordAdmissionCapabilityResolution,
   type CapabilityResolutionEntry,
 } from '../runtime/harness/capability-resolution.js';
@@ -935,14 +941,22 @@ export function thisTurnAccountBlockedSearchCount(input: {
   return count;
 }
 
+/** Account blockers still open across this source's tool_search returns.
+ * `inheritedSourceUserSeqs` widens the scan to the same-session parent sources
+ * of an undeclined continuation (the planning snapshot's list): rows are read
+ * in durable order, so a parent's later resolved return clears its own earlier
+ * blocker, and an account the parent already settled is not re-asked on the
+ * answering turn. */
 export function thisTurnSearchAccountSelectionBlockers(input: {
   sessionId: string;
   sourceUserSeq: number;
+  inheritedSourceUserSeqs?: readonly number[];
 }): Array<{ name: string; choices: readonly string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> {
   const byName = new Map<string, { name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }>();
+  const sources = new Set<number>([input.sourceUserSeq, ...(input.inheritedSourceUserSeqs ?? [])]);
   try {
     for (const event of listEvents(input.sessionId, { types: ['tool_returned'] })) {
-      if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
+      if (typeof event.data.sourceUserSeq !== 'number' || !sources.has(event.data.sourceUserSeq)) continue;
       if (event.data.tool !== 'tool_search') continue;
       for (const row of toolSearchResultRows(event.data.result)) {
         if (!row || typeof row !== 'object') continue;
@@ -1062,6 +1076,10 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   sessionId: string;
   sourceUserSeq: number;
   candidates: readonly ToolSearchPlanningDisclosureCandidate[];
+  /** The tool_search query that disclosed these candidates, when the caller
+   * has it. Match evidence for `matchedTokens` only; a candidate may also
+   * carry its own disclosing query. Grants nothing. */
+  query?: string;
   signal?: AbortSignal;
   deadlineAt?: number;
   accountSelection?: SourceAccountNomination | null;
@@ -1174,6 +1192,11 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       connectionId: selection.connection.connectionId,
     });
     const effectClass = classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write';
+    // Every disclosed candidate in the window is a proven, callable row —
+    // including the requested toolkit's neighbours. The row also records
+    // which of its own tokens the disclosing query or the accepted request
+    // contained, so a presentation surface can tell "asked for" from "rode
+    // along" without changing what is proven or how discovery ranks.
     entries.set(`composio:${slug.toLowerCase()}`, {
       intent: 'foreground tool_search disclosed this exact live operation',
       kind: 'composio',
@@ -1183,6 +1206,10 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       accountIdentity: selection.connection.connectionId,
       ...(routing.kind === 'resolved' ? { sourceAccountRouting: routing.evidence } : {}),
       effectClass,
+      matchedTokens: identifierTokensMatchedBy(
+        slug,
+        [input.query, candidate.query, acceptedText].filter((text): text is string => Boolean(text)).join(' '),
+      ),
     });
   }
   // Merge at publication time, after asynchronous account checks. Concurrent
@@ -1449,6 +1476,8 @@ export type ExactWorkflowProviderProvisionResult =
     };
 
 export interface ExactWorkflowProviderProvisionDependencies {
+  /** Test-only override of the search-budget fallback used when the caller gives no deadline. */
+  totalDeadlineMs?: number;
   materializeExact?: (input: {
     requests: readonly ExactMaterializationRequest[];
     signal?: AbortSignal;
@@ -1537,11 +1566,25 @@ export async function provisionExactWorkflowProviderOperations(input: {
   // One aggregate deadline covers definition lookup, account refresh, proof,
   // and publication. A late provider promise is consumed by awaitBounded, and
   // publicationGuard prevents it from mutating authority after expiry.
-  const ownDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
+  //
+  // THE CALLER'S DEADLINE GOVERNS WHEN IT GIVES ONE. The 30 s search budget is
+  // a chat-latency bound for provider metadata I/O; a scheduled step carries
+  // its own wall clock (15 min) and its account review is MODEL work — the
+  // pinned cross-family reviewer answers in 20–60 s live. Clamping the step to
+  // the search budget made every scheduled write fail "proof_publication_
+  // expired" mid-review (platform-49, 2026-09-15, one connected account).
+  const totalDeadlineMs = dependencies.totalDeadlineMs ?? TOOL_SEARCH_TOTAL_DEADLINE_MS;
+  const ownDeadlineAt = Date.now() + totalDeadlineMs;
+  // Provider metadata I/O keeps the search budget, and never exceeds a
+  // shorter caller deadline (a nested host call's 3 s stays 3 s).
   const deadlineAt = input.deadlineAt === undefined
     ? ownDeadlineAt
     : Math.min(ownDeadlineAt, input.deadlineAt);
   const guard = { signal: input.signal, deadlineAt };
+  // The account REVIEW is model work: it runs inside the caller's own deadline
+  // when one is given (a scheduled step's wall clock), and publication after
+  // it gets a fresh search budget, still capped by the caller.
+  const reviewGuard = { signal: input.signal, deadlineAt: input.deadlineAt ?? ownDeadlineAt };
   if (!discoveryStillActive(guard)) {
     return {
       ok: false,
@@ -1582,20 +1625,35 @@ export async function provisionExactWorkflowProviderOperations(input: {
   const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const operation of operationIds) {
     const toolkit = registeredToolkitOfSlug(operation).trim().toLowerCase();
-    let selection = routingByToolkit.get(toolkit);
+    // The operation's own effect decides the review, exactly as the discovery
+    // path above does: a READ with one connected account resolves without the
+    // cross-family reviewer. Omitting it routed every scheduled read through
+    // the write review — live 2026-09-15 platform-49's Sheets read waited on
+    // the pinned judge (20–60 s) inside the 30 s provisioning deadline and
+    // failed every run as "proof_publication_expired", with one connection.
+    const routingEffect = classifyComposioSlugEffect(operation) === 'read' ? 'read' : 'write';
+    const routingKey = `${toolkit}:${routingEffect}`;
+    let selection = routingByToolkit.get(routingKey);
     if (!selection) {
+      const reviewStartedAt = Date.now();
       const routing = await awaitBounded({
         start: () => resolveSourceAccountRouting({
           sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
-          toolkit, operation, connections,
+          toolkit, operation, connections, effect: routingEffect,
         }),
-        ...guard,
+        ...reviewGuard,
       });
-      if (routing.kind !== 'settled' || !discoveryStillActive(guard)) {
+      // Review time is not provider I/O time: give the I/O budget back what
+      // the review consumed, never past the caller's own deadline.
+      guard.deadlineAt = Math.min(
+        input.deadlineAt ?? Number.POSITIVE_INFINITY,
+        guard.deadlineAt + (Date.now() - reviewStartedAt),
+      );
+      if (routing.kind !== 'settled' || !discoveryStillActive(reviewGuard)) {
         return { ok: false, code: 'proof_publication_expired', identifier: operation };
       }
       selection = routing.value;
-      routingByToolkit.set(toolkit, selection);
+      routingByToolkit.set(routingKey, selection);
     }
     if (selection.kind === 'account_selection_required') {
       return {
@@ -1618,6 +1676,8 @@ export async function provisionExactWorkflowProviderOperations(input: {
       accountIdentity: selection.connection.connectionId,
       sourceAccountRouting: selection.evidence,
       effectClass: classifyComposioSlugEffect(operation) === 'read' ? 'read' : 'write',
+      // An authored workflow step names its operation outright.
+      matchedTokens: [toolkit],
     });
   }
 
@@ -1686,6 +1746,102 @@ export async function provisionExactWorkflowProviderOperations(input: {
     };
   }
   return { ok: true };
+}
+
+/** A current 30-minute provider-observation lease. Hydrates disk into the
+ * session map; a validation-only contract (no observation) is not a lease. */
+function rememberedExactComposioLease(slug: string): {
+  schema: Record<string, unknown>;
+  fingerprint: string;
+} | null {
+  const identifier = slug.trim().toUpperCase();
+  if (!identifier) return null;
+  const schema = getCachedToolSchema(identifier);
+  const fingerprint = liveComposioSchemaFingerprint(identifier);
+  if (!schema || !fingerprint) return null;
+  try {
+    if (fingerprintSchema(schema) !== fingerprint) return null;
+  } catch {
+    return null;
+  }
+  return { schema, fingerprint };
+}
+
+function composioMemoriesForSlug(slug: string) {
+  const needle = slug.trim().toUpperCase();
+  return listToolChoices().filter((record) => (
+    record.choice?.kind === 'composio'
+    && record.choice.identifier.trim().toUpperCase() === needle
+  ));
+}
+
+/** Stamp a matching live fingerprint onto existing memos; retire drifted ones.
+ * Does not create a new procedure from search itself. */
+export function reconcileExactSlugMemory(slug: string, liveFingerprint: string): void {
+  for (const record of composioMemoriesForSlug(slug)) {
+    // Memory bookkeeping is a convenience, never load-bearing for discovery.
+    // Live 2026-09-15: re-saving one remembered record whose intent was 82
+    // chars threw "intents are short canonical slugs (max 80)", the whole
+    // Composio source reported search_failed, the operation the query named
+    // vanished from the results, and the turn ended as "capability
+    // unavailable". One bad memo must never hide a live operation.
+    try {
+      reconcileOneExactSlugRecord(record, liveFingerprint);
+    } catch {
+      // Skipped record; the live operation still discloses. The store's own
+      // validation message is what the memory tab reports for that record.
+    }
+  }
+}
+
+export function reconcileOneExactSlugRecord(
+  record: ReturnType<typeof composioMemoriesForSlug>[number],
+  liveFingerprint: string,
+): void {
+  {
+    const stored = record.choice?.schemaFingerprint?.trim();
+    if (stored && stored !== liveFingerprint) {
+      invalidateToolChoice(record.intent, `schema_drifted: live contract ${liveFingerprint.slice(0, 16)} does not match remembered ${stored.slice(0, 16)}`);
+      return;
+    }
+    if (record.procedureId) recordToolProcedureImpression(record.procedureId);
+    if (!stored && record.choice) {
+      rememberToolChoice({
+        intent: record.intent,
+        ...(record.description ? { description: record.description } : {}),
+        choice: {
+          kind: record.choice.kind,
+          identifier: record.choice.identifier,
+          invocationTemplate: record.choice.invocationTemplate,
+          accountIdentity: record.choice.accountIdentity,
+          testEvidence: record.choice.testEvidence,
+          schemaFingerprint: liveFingerprint,
+        },
+        schemaFingerprint: liveFingerprint,
+      });
+    }
+  }
+}
+
+function exactComposioSearchCandidate(
+  slug: string,
+  schema: Record<string, unknown>,
+  summary?: string,
+): ToolSearchBrokerCandidate {
+  const toolkit = registeredToolkitOfSlug(slug);
+  return {
+    name: slug,
+    summary: summary?.trim() || `Remembered ${slug}`,
+    schema,
+    carrier: 'work_call',
+    score: composioDiscoveryScore(1, toolkit, slug),
+    invocation: {
+      name: 'composio_execute_tool',
+      fixedArgs: { tool_slug: slug },
+      payloadField: 'arguments',
+    },
+    guidance: `For publish_plan, staticArgumentsJson contains only the direct ${slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${slug}, and serialize those direct action fields into the carrier arguments field.`,
+  };
 }
 
 async function materializeNamedComposioOperation(input: {
@@ -2000,12 +2156,31 @@ export function buildAuthorizedToolSearchCandidateSources(
             },
           );
         }
+        // A current schema lease plus a live connection is the remembered
+        // contract. Re-fetching the same slug from the provider is how
+        // the Outlook create-event operation still cost 32s after the first
+        // discovery in the same session. Drift retires the memo; it does
+        // not mint a capabilityRef.
+        if (currentConnections) {
+          const lease = rememberedExactComposioLease(exactOperation);
+          if (lease) {
+            reconcileExactSlugMemory(exactOperation, lease.fingerprint);
+            const memo = composioMemoriesForSlug(exactOperation)[0];
+            return [rememberPreparedSearchCandidate(exactComposioSearchCandidate(
+              exactOperation,
+              lease.schema,
+              memo?.description,
+            ))];
+          }
+        }
         const exact = await materializeNamedComposioOperation({
           operation: exactOperation,
           signal,
           deadlineAt,
         });
         if (signal?.aborted) return [];
+        const liveFingerprint = liveComposioSchemaFingerprint(exactOperation);
+        if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint);
         return exact.map((candidate): ToolSearchBrokerCandidate => ({
           name: candidate.slug,
           summary: candidate.description?.trim()
@@ -2033,6 +2208,15 @@ export function buildAuthorizedToolSearchCandidateSources(
         && requestEffectScope !== 'write'
         && requestEffectScope !== 'mixed'
       ) {
+        const lease = rememberedExactComposioLease(rememberedWinner.slug);
+        if (lease) {
+          reconcileExactSlugMemory(rememberedWinner.slug, lease.fingerprint);
+          return [rememberPreparedSearchCandidate(exactComposioSearchCandidate(
+            rememberedWinner.slug,
+            lease.schema,
+            rememberedWinner.intent,
+          ))];
+        }
         const exact = await materializeRememberedComposioOperations({
           matches: [rememberedWinner],
           signal,
@@ -2040,6 +2224,8 @@ export function buildAuthorizedToolSearchCandidateSources(
         });
         if (signal?.aborted) return [];
         if (exact.length > 0) {
+          const liveFingerprint = liveComposioSchemaFingerprint(rememberedWinner.slug);
+          if (liveFingerprint) reconcileExactSlugMemory(rememberedWinner.slug, liveFingerprint);
           return exact.map((candidate, index): ToolSearchBrokerCandidate => ({
             name: candidate.slug,
             summary: candidate.description?.trim()

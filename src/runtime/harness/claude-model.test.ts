@@ -136,7 +136,7 @@ test('Claude request defaults reach the adapter on both paths, preserve explicit
   }
 
   assert.deepEqual(seen, [
-    { maxTokens: 16_384 },
+    { maxTokens: resolveModelCapability('claude-sonnet-5').maxOutput },
     { maxTokens: 512, temperature: 0.2 },
     { maxTokens: 8_192 },
   ]);

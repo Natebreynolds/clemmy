@@ -143,8 +143,16 @@ test('a non-caching seed flips only after the wire proves it, repeatedly', async
   obs._resetModelWindowObservationCacheForTests();
   assert.equal(obs.effectivePromptCacheSupport(id), false, 'one hit is not proof');
 
-  // Repeated hits are the provider demonstrating its contract.
+  // Five hits against eight misses is a wire that mostly re-prefills: the
+  // budgets that protect a cached prefix would cost more than they save.
   for (let i = 0; i < 5; i += 1) obs.recordCacheObservation(id, 5_000, 2_000);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(id), false,
+    'hits that are outnumbered by misses do not make a caching wire');
+
+  // Once the wire serves a cached prefix at least as often as it misses, it
+  // has demonstrated its contract in practice and the seed no longer governs.
+  for (let i = 0; i < 3; i += 1) obs.recordCacheObservation(id, 5_000, 2_000);
   obs._resetModelWindowObservationCacheForTests();
   assert.equal(obs.effectivePromptCacheSupport(id), true,
     'the wire demonstrated caching; the seed no longer governs');
@@ -163,6 +171,32 @@ test('a seeded caching wire is never un-learned by a cold conversation', async (
   for (let i = 0; i < 20; i += 1) obs.recordCacheObservation('claude-sonnet-5', 9_000, 0);
   obs._resetModelWindowObservationCacheForTests();
   assert.equal(obs.effectivePromptCacheSupport('claude-sonnet-5'), true);
+});
+
+test('a wire that misses more than it hits stays non-caching however many hits it collects', async () => {
+  // Live 2026-09-15, the Codex OAuth brain: 124 cache reads in 367 calls over
+  // three days (0 of 22 when the tool list changed, 3 of 27 when history was
+  // rewritten, ~40% otherwise). Five lifetime hits had flipped it to "caches",
+  // which scaled every compaction threshold to its 880k window — so a 67k
+  // history was re-prefilled on six calls in ten and never compacted.
+  const obs = await import('./model-window-observations.js');
+  const { layer1CompactionBudgetForModel, inFlightPromptCacheScale } = await import('./compaction.js');
+  const id = 'fixture-sometimes-cached-brain';
+  obs.recordCatalogWindow(id, 880_000, 'https://fixture.example.test/v1');
+  for (let i = 0; i < 367; i += 1) obs.recordCacheObservation(id, 60_000, i % 3 === 0 ? 40_000 : 0);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(id), false, '124 of 367 is not a wire that caches');
+  assert.equal(inFlightPromptCacheScale(id), 1, 'mid-turn thresholds stay absolute');
+  assert.equal(compactionBudgetForModel(id), 880_000, 'lossy layers still fork inside the real window');
+  assert.equal(layer1CompactionBudgetForModel(id), 200_000, 'lossless Layer 1 is held to prefill cost');
+
+  // The same wire serving a cached prefix on most calls earns its window back.
+  const steady = 'fixture-steadily-cached-brain';
+  obs.recordCatalogWindow(steady, 880_000, 'https://fixture.example.test/v1');
+  for (let i = 0; i < 40; i += 1) obs.recordCacheObservation(steady, 60_000, i % 10 === 0 ? 0 : 50_000);
+  obs._resetModelWindowObservationCacheForTests();
+  assert.equal(obs.effectivePromptCacheSupport(steady), true);
+  assert.equal(layer1CompactionBudgetForModel(steady), 880_000);
 });
 
 test('observation recording never throws on junk', async () => {

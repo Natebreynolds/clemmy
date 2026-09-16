@@ -6,7 +6,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -44,8 +44,26 @@ export function realDefaultClementineHome() {
   return path.resolve(path.join(realUserHome(), '.clementine-next'));
 }
 
+// Streamed in fixed chunks: a whole-file read throws ERR_FS_FILE_TOO_LARGE
+// once the live DB passes 2 GiB, which took the entire test runner down with
+// it. Synchronous on purpose — the sentinel runs before any test process.
+const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
 function hashFile(filePath) {
-  return createHash('sha256').update(readFileSync(filePath)).digest('hex');
+  const hash = createHash('sha256');
+  const fd = openSync(filePath, 'r');
+  try {
+    const chunk = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+    let position = 0;
+    for (;;) {
+      const read = readSync(fd, chunk, 0, chunk.length, position);
+      if (read === 0) break;
+      hash.update(read === chunk.length ? chunk : chunk.subarray(0, read));
+      position += read;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 function fileProof(filePath, { allowEmpty = true } = {}) {

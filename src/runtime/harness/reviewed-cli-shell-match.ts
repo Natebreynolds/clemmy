@@ -1,0 +1,134 @@
+/**
+ * Reviewed-CLI shell match — recognises a shell command whose head is the
+ * argv of a human-reviewed CLI read that the host already holds as a callable
+ * operation.
+ *
+ * A reviewed read is a closed contract: the catalog entry names the program,
+ * the argv prefix, and the structured arguments, and the host provisions it
+ * as a callable operation with its own descriptor, binary, and argv proof. A
+ * model that types the same command through the shell is asking for that
+ * work without that proof, and the refusal it meets names nothing. This
+ * module is the one place that turns the typed command back into the
+ * operation id and its argument map, so the packet can steer to the operation
+ * before the call and the pre-dispatch refusal can name it after.
+ *
+ * Generic over the CLI catalog: every entry with a `reviewedRead` is a
+ * candidate; nothing here names a toolkit or product. A head match with no
+ * current callable entry is `unmatched` — the shell stays an ordinary ad-hoc
+ * command when the host has nothing better to offer. This grants nothing; the
+ * reviewed carrier still re-proves the call on its own.
+ */
+import { cliCommandHead } from '../../memory/capability-effect-scope.js';
+import { CLI_CATALOG, type CatalogReviewedReadV1 } from '../../integrations/cli-catalog/catalog.js';
+import {
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+} from './host-capability-catalog-factory.js';
+
+export interface ReviewedCliArgumentMapEntry {
+  /** Structured argument name (the `args_json` key). */
+  name: string;
+  /** The shell token that carried it (`--query`); the name for positionals. */
+  token: string;
+  required: boolean;
+}
+
+export type ReviewedCliShellMatch =
+  | { status: 'unmatched' }
+  | {
+    status: 'matched';
+    operationId: string;
+    descriptorId: string;
+    argumentMap: ReadonlyArray<ReviewedCliArgumentMapEntry>;
+  };
+
+function expectedHeadOf(command: string, reviewedRead: CatalogReviewedReadV1): string {
+  return [command, ...reviewedRead.argvPrefix.filter((token) => !token.startsWith('-'))].join(' ');
+}
+
+function argumentMapOf(reviewedRead: CatalogReviewedReadV1): ReviewedCliArgumentMapEntry[] {
+  return reviewedRead.arguments.map((argument) => ({
+    name: argument.name,
+    token: argument.token ?? argument.name,
+    required: argument.required,
+  }));
+}
+
+/** Every reviewed read the catalog declares, keyed by its head. */
+function reviewedReads(): Array<{ head: string; reviewedRead: CatalogReviewedReadV1 }> {
+  const out: Array<{ head: string; reviewedRead: CatalogReviewedReadV1 }> = [];
+  for (const entry of CLI_CATALOG) {
+    if (!entry.reviewedRead) continue;
+    out.push({ head: expectedHeadOf(entry.command, entry.reviewedRead), reviewedRead: entry.reviewedRead });
+  }
+  return out;
+}
+
+/** True when the installed host catalog holds a current callable entry for
+ * this operation. No installed factory means no callable entry. */
+export function reviewedCliOperationIsCallable(operationId: string): boolean {
+  const factory = peekHostCapabilityCatalogFactory();
+  if (!factory) return false;
+  try {
+    return factory.snapshot().some((entry) => isCurrentCallableCatalogEntry(entry)
+      && entry.manifest.operationId === operationId
+      && entry.manifest.lifecycle.state === 'current');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Match a shell command against the callable reviewed reads. The head is the
+ * shared command-head normaliser, so `sf data query --query … --json` and the
+ * memory key for the same command agree on `sf data query`.
+ */
+export function reviewedCliShellMatch(command: string): ReviewedCliShellMatch {
+  const head = cliCommandHead(command ?? '');
+  if (!head) return { status: 'unmatched' };
+  for (const candidate of reviewedReads()) {
+    if (candidate.head !== head) continue;
+    if (!reviewedCliOperationIsCallable(candidate.reviewedRead.operationId)) continue;
+    return {
+      status: 'matched',
+      operationId: candidate.reviewedRead.operationId,
+      descriptorId: candidate.reviewedRead.descriptorId,
+      argumentMap: argumentMapOf(candidate.reviewedRead),
+    };
+  }
+  return { status: 'unmatched' };
+}
+
+/** The argument map of a reviewed read by its operation id, from the catalog
+ * declaration alone (no callable check). Used to render a refusal that already
+ * knows the operation id. */
+export function reviewedCliArgumentMapForOperation(
+  operationId: string,
+): ReadonlyArray<ReviewedCliArgumentMapEntry> | null {
+  const wanted = operationId.trim();
+  for (const candidate of reviewedReads()) {
+    if (candidate.reviewedRead.operationId === wanted) return argumentMapOf(candidate.reviewedRead);
+  }
+  return null;
+}
+
+/** `"query" ← --query, "target_org" ← --target-org (optional)` */
+export function renderReviewedCliArgumentMap(
+  argumentMap: ReadonlyArray<ReviewedCliArgumentMapEntry>,
+): string {
+  return argumentMap
+    .map((entry) => `${JSON.stringify(entry.name)} ← ${entry.token}${entry.required ? '' : ' (optional)'}`)
+    .join(', ');
+}
+
+/** `work_call name=<operationId> args_json={"query": "<string>"}` — the
+ * callable shape a packet renders in place of the shell command. Optional
+ * arguments are omitted so the example is directly reusable. */
+export function renderReviewedCliWorkCallExample(
+  operationId: string,
+  argumentMap: ReadonlyArray<ReviewedCliArgumentMapEntry>,
+): string {
+  const required = argumentMap.filter((entry) => entry.required);
+  const shape = `{${required.map((entry) => `${JSON.stringify(entry.name)}: "<string>"`).join(', ')}}`;
+  return `work_call name=${operationId} args_json=${shape}`;
+}

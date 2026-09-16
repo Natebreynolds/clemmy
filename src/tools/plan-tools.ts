@@ -1385,7 +1385,11 @@ async function executePlanTask(
   // against the index card then called it undisclosed and offered
   // greenhouse/airtable (live 2026-08-29 seq 98118). Ask. Do not substitute.
   const citedCapabilityRefs = input.draft.bindings.map((binding) => binding.capabilityRef);
-  const accountBlockers = thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq });
+  const accountBlockers = thisTurnSearchAccountSelectionBlockers({
+    sessionId,
+    sourceUserSeq,
+    inheritedSourceUserSeqs: planning.inheritedSourceUserSeqs,
+  });
   const accountSelection = accountSelectionForCitedWrite({
     citedRefs: citedCapabilityRefs,
     blockers: accountBlockers,

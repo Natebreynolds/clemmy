@@ -23,6 +23,35 @@ export function workflowStepPinIntent(workflowName: string, stepId: string): str
   return `workflow:${workflowName}:${stepId}`;
 }
 
+const MAX_SHAPE_POINTERS = 24;
+
+/** Nested field paths from a settled invocation template. Values are not
+ * authority; the paths are the shape a later run must not rediscover. */
+export function settledPinArgumentShape(template: string | undefined): string[] {
+  if (!template?.trim()) return [];
+  try {
+    return jsonShapePointers(JSON.parse(template)).slice(0, MAX_SHAPE_POINTERS);
+  } catch {
+    return [];
+  }
+}
+
+function jsonShapePointers(value: unknown, prefix = ''): string[] {
+  if (Array.isArray(value)) {
+    return value.length > 0 ? jsonShapePointers(value[0], `${prefix}/0`) : prefix ? [prefix] : [];
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return prefix ? [prefix] : [];
+    return entries.flatMap(([key, child]) => {
+      const path = `${prefix}/${key}`;
+      const nested = jsonShapePointers(child, path);
+      return nested.length > 0 ? nested : [path];
+    });
+  }
+  return prefix ? [prefix] : [];
+}
+
 export function identityKeysFromContract(contract: WorkflowStepOutputContract | undefined): string[] {
   const keys = contract?.verify?.url_present;
   if (!Array.isArray(keys)) return [];

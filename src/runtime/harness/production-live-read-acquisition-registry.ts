@@ -890,13 +890,6 @@ export function createProductionLiveReadAcquisitionRegistry(
     const unavailable = observed.flatMap((result, index) => (
       result.status === 'unavailable' ? [adapters[index]!.adapterId] : []
     )).sort();
-    if (unavailable.length > 0) {
-      return block(
-        requirement,
-        'carrier_unavailable',
-        `configured carrier adapters could not be fully observed: ${unavailable.join(', ')}`,
-      );
-    }
     const allNominated = observed.flatMap((result) => (
       result.status === 'nominated' ? [...result.nominations] : []
     )).sort((left, right) => nominationKey(left).localeCompare(nominationKey(right)));
@@ -908,6 +901,19 @@ export function createProductionLiveReadAcquisitionRegistry(
     const exactNominated = allNominated.filter((nomination) => (
       normalizeText(nomination.identity.reference.identifier) === normalizedObjective
     ));
+    // An exact current identifier from a fully observed carrier is enough.
+    // Unrelated MCP adapters that fail to enumerate cannot disprove that
+    // identity, and failing closed here retired friday-dashboard's
+    // salesforce_sf_soql_query every 14:00 because one MCP was down
+    // (live 2026-09-14). Compile still refuses genuine account ambiguity.
+    // Fuzzy uniqueness still requires a complete observation: an unobserved
+    // sibling might have been a second match.
+    if (unavailable.length > 0 && exactNominated.length !== 1) {
+      return refuseWithoutRetiring(
+        'carrier_unavailable',
+        `configured carrier adapters could not be fully observed: ${unavailable.join(', ')}`,
+      );
+    }
     const nominated = exactNominated.length > 0 ? exactNominated : allNominated;
     let nominationPolicyExcluded = 0;
     let nominations: ProductionLiveReadNominationV1[];

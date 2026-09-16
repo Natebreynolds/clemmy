@@ -2288,7 +2288,7 @@ function queueWorkflowRunUnlocked(
   const workflowSlug = catchupHold?.workflowSlug
     ?? scheduledReadinessBlock?.workflowSlug
     ?? requestedWorkflowSlug
-    ?? (source === 'schedule' ? workflowEntry?.name : undefined);
+    ?? workflowEntry?.name;
   if (typeof triggerReceiptId === 'string' && triggerReceiptId.startsWith('workflow-schedule:v1:')) {
     const scheduledReceipt = /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(triggerReceiptId);
     if (
@@ -2690,7 +2690,9 @@ function queueWorkflowRunUnlocked(
       mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
       ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
       createdAt,
-      ...(source ? { source } : {}),
+      ...((source ?? (originObserver || origin ? 'chat' : undefined))
+        ? { source: source ?? 'chat' }
+        : {}),
       ...(triggerReceiptId ? { triggerReceiptId } : {}),
       ...(targetStepId ? { targetStepId } : {}),
       ...(opts?.acceptDisabled === true ? { acceptDisabled: true } : {}),

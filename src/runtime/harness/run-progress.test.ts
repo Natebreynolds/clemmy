@@ -112,3 +112,33 @@ test('a broken ledger falls back rather than inventing progress', () => {
   assert.equal(composeRunProgressLine({ sessionId: 'no-such-session', fallback: 'FALLBACK' }), 'FALLBACK');
   assert.equal(composeRunProgressLine({ sessionId: '', fallback: 'FALLBACK' }), 'FALLBACK');
 });
+
+test('the parenthetical names the toolkits the ask named, while the count stays complete', () => {
+  // A search for one service returns its neighbours in the same window, and
+  // every neighbour lands as a proven row. The count is honest about that;
+  // the names must not read as "she went off to something never asked for".
+  const id = turn('send the summary as a dataforseo report');
+  events.appendEvent({
+    sessionId: id.sessionId, turn: 1, role: 'system', type: 'capability_resolution',
+    data: {
+      sourceUserSeq: id.sourceUserSeq,
+      entries: [
+        { kind: 'composio', identifier: 'DATAFORSEO_SEND_REPORT', status: 'proven', connection: 'active', matchedTokens: ['dataforseo'] },
+        { kind: 'composio', identifier: 'SLACK_SEND_MESSAGE', status: 'proven', connection: 'active', matchedTokens: ['message'] },
+      ],
+    },
+  });
+  const line = composeRunProgressLine({ ...id, fallback: '' });
+  assert.match(line, /2 toolkits identified/, 'the total counts the neighbour too');
+  assert.match(line, /\(dataforseo\)/, 'only the named toolkit is advertised');
+  assert.doesNotMatch(line, /slack/);
+  assert.match(line, /2 operations identified/);
+});
+
+test('with nothing named, the line lists what is held — breadth is all there is to show', () => {
+  const id = turn();
+  bind(id, 'DATAFORSEO', 2);
+  bind(id, 'APIFY', 1);
+  const line = composeRunProgressLine({ ...id, fallback: '' });
+  assert.match(line, /2 toolkits identified \(dataforseo, apify\)/);
+});

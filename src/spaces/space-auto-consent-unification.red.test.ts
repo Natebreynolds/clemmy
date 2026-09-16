@@ -245,7 +245,7 @@ function canonicalOrdinaryCreateDecision(input: {
         manifest: capability.manifestDigest,
       }),
     },
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
     safety: 'admissible',
   });
   assert.equal(loaded.ok, true, JSON.stringify(loaded));

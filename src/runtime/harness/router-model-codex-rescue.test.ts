@@ -11,6 +11,7 @@ import { mkdtempSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { DEFAULT_CODEX_MODEL } from '../../config.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-router-rescue-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -167,12 +168,12 @@ test('an unset rescue with a BYO primary targets and reports the canonical Codex
   }, async () => router.getModel('glm-5.3').getResponse(request()));
 
   assert.equal((result.output[0] as { content?: string }).content, 'rescued by the Codex default');
-  assert.deepEqual(requestedCodexModels, ['gpt-5.4']);
+  assert.deepEqual(requestedCodexModels, [DEFAULT_CODEX_MODEL]);
   assert.deepEqual(fallbackRouteResolution(result), {
     initialLabel: 'glm-5.3',
     resolvedLabel: 'codex:rescue',
     provider: 'codex',
-    model: 'gpt-5.4',
+    model: DEFAULT_CODEX_MODEL,
     fellOver: true,
     reason: 'model.transport_timeout',
   });
@@ -183,7 +184,7 @@ test('an unset rescue with a BYO primary targets and reports the canonical Codex
     WHERE session_id = ? AND source = 'fallback'
   `).get(sessionId) as { resolvedModel?: string; provider?: string; source?: string } | undefined;
   assert.deepEqual(rescueDecision, {
-    resolvedModel: 'gpt-5.4',
+    resolvedModel: DEFAULT_CODEX_MODEL,
     provider: 'codex',
     source: 'fallback',
   });
@@ -191,8 +192,8 @@ test('an unset rescue with a BYO primary targets and reports the canonical Codex
   const [fallover] = listOperationalEvents({ sessionId, limit: 20 })
     .filter((event) => event.type === 'model_fallover');
   assert.ok(fallover);
-  assert.equal((fallover.payload as Record<string, unknown>).toModel, 'gpt-5.4');
-  assert.equal((fallover.payload as Record<string, unknown>).resolvedModel, 'gpt-5.4');
+  assert.equal((fallover.payload as Record<string, unknown>).toModel, DEFAULT_CODEX_MODEL);
+  assert.equal((fallover.payload as Record<string, unknown>).resolvedModel, DEFAULT_CODEX_MODEL);
 });
 
 test('the router applies the absolute pre-actionable wall only to an interactive foreground context', async () => {

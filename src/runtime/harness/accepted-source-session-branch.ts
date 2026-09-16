@@ -481,6 +481,32 @@ function ensurePointer(
   return row;
 }
 
+/** The independent principal root an earlier identity split minted for this
+ *  continuity under `parentSessionId`, newest first; null when none exists. */
+function independentPrincipalRootFor(
+  db: Database.Database,
+  parentSessionId: string,
+  continuity: string,
+  workspaceSlug: string | null,
+): string | null {
+  // A row with unreadable metadata is not a candidate (json_extract would
+  // throw on it); a mounted request continues only a root with the same
+  // mount, an unmounted one only a chat root.
+  const row = db.prepare(`
+    SELECT id
+      FROM sessions
+     WHERE json_valid(metadata_json)
+       AND json_extract(metadata_json, '$.${BRANCH_META}.version') = ?
+       AND json_extract(metadata_json, '$.${BRANCH_META}.parentSessionId') = ?
+       AND json_extract(metadata_json, '$.${BRANCH_META}.continuityDigest') = ?
+       AND json_extract(metadata_json, '$.${BRANCH_META}.rootSessionId') = id
+       AND COALESCE(json_extract(metadata_json, '$.spaceSlug'), '') = ?
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1
+  `).get(POINTER_PROTOCOL, parentSessionId, continuity, workspaceSlug ?? '') as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
 function readPointer(
   db: Database.Database,
   rootSessionId: string,
@@ -739,6 +765,22 @@ function selectInTransaction(
   const entry = sessionRow(db, input.entrySessionId);
   let rootSessionId = rootSessionIdFor(entry);
   let pointer = readPointer(db, rootSessionId, continuityKey);
+  if (!pointer) {
+    // An identity split roots the audience's conversation in its own child and
+    // writes the pointer under THAT root. A later source from the same
+    // audience still enters through the shared entry session, whose root has
+    // no pointer for this continuity — so every differently-worded message
+    // split again into an empty successor and only a byte-identical retry
+    // (same durable source) found its way back (live 2026-09-15, mobile
+    // mirror of a desktop session: five roots in a day, the fifth asked
+    // "which event?" with no history). The continuity's own root is resolved
+    // from the entry first; the ordinary reuse/branch path then continues it.
+    const owned = independentPrincipalRootFor(db, entry.id, continuityKey, validatedMount?.workspaceSlug ?? null);
+    if (owned) {
+      rootSessionId = owned;
+      pointer = readPointer(db, rootSessionId, continuityKey);
+    }
+  }
   const head = pointer ? sessionRow(db, pointer.head_session_id) : entry;
   const identitySplit = !sessionAudienceMatches(head, continuity);
   if (identitySplit) {

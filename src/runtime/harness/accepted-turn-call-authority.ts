@@ -61,7 +61,7 @@ import {
   type InteractiveConsentDecisionV1,
 } from './interactive-consent-policy.js';
 import { workflowCapabilityDigest } from '../../execution/workflow-capability-digest.js';
-import { buildHostConsentEvidence } from './host-consent-evidence.js';
+import { buildHostConsentEvidence, journalInteractiveConsentDecision } from './host-consent-evidence.js';
 
 export const HOST_READ_ONLY_CALL_AUTHORITY_ENGINE_VERSION = 'host_v1_read_only' as const;
 export const HOST_READ_ONLY_EFFECT_CEILING = 'read_compute_host_only' as const;
@@ -2638,7 +2638,8 @@ function workflowV3AutoReceiptMatchesAuthority(
     if (
       reproduced.kind !== 'proceed'
       || (reproduced.basis !== 'exact_ordinary_work'
-        && reproduced.basis !== 'exact_reversible_work')
+        && reproduced.basis !== 'exact_reversible_work'
+        && reproduced.basis !== 'exact_carrier_bounded_work')
       || closedCanonicalJson(reproduced) !== closedCanonicalJson(receipt.decision)
     ) return false;
     return closedCanonicalJson(workflowV3AutoReceipt({
@@ -2854,10 +2855,18 @@ export function evaluateWorkflowV3AutoConsent(input: {
     crossing: 'not_started',
     reservationAlreadyClaimed: false,
   });
+  journalInteractiveConsentDecision({
+    sessionId: authority.sessionId, sourceUserSeq: null, call, decision,
+    carrier: {
+      destructive: loaded.attestation.currentDefinition.behaviorHints.destructive,
+      requestMethod: signals.callSignals.requestMethod,
+    },
+  });
   if (
     decision.kind !== 'proceed'
     || (decision.basis !== 'exact_ordinary_work'
-      && decision.basis !== 'exact_reversible_work')
+      && decision.basis !== 'exact_reversible_work'
+      && decision.basis !== 'exact_carrier_bounded_work')
   ) return { status: 'decided', decision, call, coverage };
 
   const receipt = workflowV3AutoReceipt({ authority, call, coverage, decision });

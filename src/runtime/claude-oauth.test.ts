@@ -496,3 +496,47 @@ test('aged healthy CLI access refreshes the positive cache once without waiting 
     assert.equal(probes, 2);
   } finally { resetKeychainFixture(); }
 });
+
+test('a keychain probe that times out keeps the credential it already handed us', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let now = Date.now();
+  let probes = 0;
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    if (probes === 1) return { raw: cliPayload(FUTURE, 'sk-ant-oat01-retained') };
+    return new Promise(() => { /* the store never answers */ });
+  }, { now: () => now, timeoutMs: 25 });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-retained');
+    now += 6 * 60_000; // past the refresh cadence: the next read re-probes
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-retained', 'a slow store is not an absent credential');
+    assert.equal(probes, 2);
+    assert.equal(getClaudeAuthSnapshot().configured, true);
+  } finally { resetKeychainFixture(); }
+});
+
+test('an expired CLI-owned credential waits briefly for the CLI refresh instead of failing the call', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  let probes = 0;
+  __test__.setKeychainProbeForTests(async () => {
+    probes += 1;
+    if (probes < 3) return { raw: cliPayload(Date.now() - 1, 'sk-ant-oat01-stale') };
+    return { raw: cliPayload(FUTURE, 'sk-ant-oat01-refreshed-by-cli') };
+  }, { cliRefreshWaitMs: 500, cliRefreshPollMs: 10 });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-refreshed-by-cli');
+    assert.ok(probes >= 3, `re-probed until the refresh landed (${probes})`);
+  } finally { resetKeychainFixture(); }
+});
+
+test('an expired CLI-owned credential still fails closed once the bounded wait ends', async () => {
+  resetKeychainFixture();
+  __test__.setVaultTokenReaderForTests(() => null);
+  __test__.setKeychainProbeForTests(async () => ({ raw: cliPayload(Date.now() - 1, 'sk-ant-oat01-stale') }),
+    { cliRefreshWaitMs: 40, cliRefreshPollMs: 10 });
+  try {
+    await assert.rejects(() => loadFreshClaudeAccessToken(), (e) => e instanceof ClaudeAuthError && e.kind === 'expired');
+  } finally { resetKeychainFixture(); }
+});

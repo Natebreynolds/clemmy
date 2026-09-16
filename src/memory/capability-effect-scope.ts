@@ -27,7 +27,16 @@ export interface EffectClassifiableChoice {
   invocationTemplate?: string;
 }
 
-function cliCommandHead(command: string): string {
+/**
+ * The IDENTITY portion of a CLI command — the program + subcommands BEFORE the
+ * first flag (`-x`/`--x`), quoted or `=` argument, shell operator, command
+ * substitution, or path token. A tool's identity is `sf data query`, NOT its
+ * query string: ingesting argument VALUES lets generic words leak into the
+ * identity and false-match unrelated asks. This is the ONE head normaliser;
+ * memory keys, effect scoping, and reviewed-CLI matching all read it so the
+ * same command can never carry two identities.
+ */
+export function cliCommandHead(command: string): string {
   const keep: string[] = [];
   for (const raw of command.trim().split(/\s+/)) {
     const token = raw.trim();

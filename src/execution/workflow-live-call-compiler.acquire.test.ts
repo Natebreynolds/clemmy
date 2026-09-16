@@ -105,6 +105,46 @@ test('a saved reviewed-CLI READ with no durable manifest is acquired for the cal
   assert.equal(again.status, 'present');
 });
 
+test('after a restart, the generic placeholder port does not block the first scheduled read', async () => {
+  // Live 2026-09-14/15: every daemon restart reconstructs a generic
+  // invoke-only port for each current durable manifest, reviewed CLI
+  // included. The first scheduled Salesforce read after a restart then found
+  // that placeholder ("observe_missing; existing: (none)"), the acquisition
+  // refused, the identity was retired, and the retry 65 s later passed on a
+  // freshly minted manifest — five failed nodes and a "Needs You" card every
+  // morning. The exact reviewed port now replaces the placeholder.
+  const production = await import('../runtime/harness/production-capability-catalog.js');
+  const manifests = await import('../runtime/harness/capability-manifest-store.js');
+  const before = manifests.resolveCapabilityManifestStore().list()
+    .filter((entry) => entry.manifest.operationId === 'salesforce_sf_soql_query' && entry.manifest.lifecycle.state === 'current').length;
+  assert.ok(before >= 1, 'the first test left a current reviewed-CLI manifest behind');
+
+  // Restart: ports are process memory; reconstruction claims placeholders.
+  ports.clearProductionCapabilityPorts();
+  production.reconstructShippedPortsForDurableSuccessors();
+  const placeholder = ports.listProductionCapabilityPorts().find((entry) => entry.identity.operationId === 'salesforce_sf_soql_query');
+  assert.ok(placeholder, 'reconstruction registered a port for the reviewed manifest');
+  assert.equal(Array.isArray(placeholder!.port.argv), false, 'the reconstructed port is the generic placeholder (no argv)');
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+
+  const acquisition = await compiler.ensureLiveReadCapabilityForOperation({
+    ownerId: 'crm-dashboard-refresh', nodeId: 'closed_this_week', operationId: 'salesforce_sf_soql_query',
+    expectedEffect: 'read', deadlineAt: Date.now() + 30_000,
+  });
+  assert.notEqual(acquisition.status, 'unavailable', JSON.stringify(acquisition));
+  const compiled = compiler.compileLiveCatalogWorkflowCallPlan({
+    ownerId: 'crm-dashboard-refresh', nodeId: 'closed_this_week', operationId: 'salesforce_sf_soql_query',
+    args: { query: 'SELECT Id FROM Opportunity' }, expectedEffect: 'read',
+  });
+  assert.equal(compiled.ok, true, JSON.stringify(compiled));
+  const exact = ports.listProductionCapabilityPorts().find((entry) => entry.identity.operationId === 'salesforce_sf_soql_query' && Array.isArray(entry.port.argv));
+  assert.ok(exact, 'the exact reviewed port (with argv and observer) replaced the placeholder');
+  assert.equal(typeof exact!.port.observe, 'function');
+  const after = manifests.resolveCapabilityManifestStore().list()
+    .filter((entry) => entry.manifest.operationId === 'salesforce_sf_soql_query' && entry.manifest.lifecycle.state === 'current').length;
+  assert.equal(after, before, 'no identity was retired and re-minted to get there');
+});
+
 test('writes are never acquired through the read path', async () => {
   const outcome = await compiler.ensureLiveReadCapabilityForOperation({
     ownerId: 'crm-dashboard-refresh',

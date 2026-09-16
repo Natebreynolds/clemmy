@@ -54,7 +54,11 @@ import {
 } from './accepted-model-batch-checkpoint.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { HostInteractiveConsentResult } from './host-interactive-consent.js';
-import { buildHostConsentEvidence, type HostConsentCoverageScope } from './host-consent-evidence.js';
+import {
+  buildHostConsentEvidence,
+  journalInteractiveConsentDecision,
+  type HostConsentCoverageScope,
+} from './host-consent-evidence.js';
 
 const VERSION = 1 as const;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -1020,6 +1024,13 @@ async function evaluateAuthoredCatalogWrite(input: {
     crossing,
     reservationAlreadyClaimed,
   });
+  journalInteractiveConsentDecision({
+    sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq, call, decision,
+    carrier: {
+      destructive: risk.attestation.currentDefinition.behaviorHints.destructive,
+      requestMethod: callSignals.callSignals.requestMethod,
+    },
+  });
   if (decision.kind === 'proceed' && ['exact_user_grant', 'settled_replay'].includes(decision.basis)) {
     if (gate === 'send' && decision.basis === 'exact_user_grant') {
       rememberSendGrant({
@@ -1193,6 +1204,9 @@ async function evaluateAuthoredLocalWrite(input: {
     readiness: { kind: 'ready' },
     crossing,
     reservationAlreadyClaimed: false,
+  });
+  journalInteractiveConsentDecision({
+    sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq, call, decision, carrier: null,
   });
   if (
     decision.kind !== 'proceed'

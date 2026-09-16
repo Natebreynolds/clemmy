@@ -22,6 +22,7 @@ import {
   resetJudgeMetricsForTests,
   withJudgeTimeout,
 } from './judge-family.js';
+import { DEFAULT_CODEX_FAST_MODEL } from '../../config.js';
 
 test('cross-family judging is DEFAULT ON (2026-07-12) with a =off kill-switch', () => {
   const prev = process.env.CLEMMY_JUDGE_CROSS_FAMILY;
@@ -55,7 +56,7 @@ test('codex brain + only claude logged in → claude judge', () => {
 test('claude brain + both families → cheap CODEX (gpt-fast) judge (already cross-family today, now explicit)', () => {
   const t = chooseBoundaryJudgeFamily('claude', true, true);
   assert.equal(t?.provider, 'codex');
-  assert.equal(t?.modelId, 'gpt-5.4-mini');
+  assert.equal(t?.modelId, DEFAULT_CODEX_FAST_MODEL);
 });
 
 test('claude brain + only claude logged in → null (no different family → fail open)', () => {
@@ -69,7 +70,7 @@ test('byo (GLM all_in) brain + both → prefers cheap CLAUDE (the all_in self-ju
 test('byo brain + only codex → codex judge (any different family beats self-grading)', () => {
   const t = chooseBoundaryJudgeFamily('byo', false, true);
   assert.equal(t?.provider, 'codex');
-  assert.equal(t?.modelId, 'gpt-5.4-mini');
+  assert.equal(t?.modelId, DEFAULT_CODEX_FAST_MODEL);
 });
 
 test('byo brain + no flagship logged in → null (fail open same-family, tagged)', () => {

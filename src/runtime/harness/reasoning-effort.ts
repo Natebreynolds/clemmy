@@ -8,7 +8,8 @@
  * minimum effort; there is no over-reasoning to cut on a calendar lookup. This
  * feature only ever RAISES effort above that baseline, and only where it helps.
  *
- * Explicit Plan requests high effort: the owner chose to invest in preparation.
+ * Explicit Plan requests medium effort: the owner chose to invest in preparation,
+ * but a Plan turn discovers rather than executes (see the note at the selector).
  * Approved Execute uses the task's complexity tier, even in a chat session.
  * Otherwise the axis is "is a human waiting on this turn?" (real traffic:
  * across 1271 turns, 83% of `complex` turns were background WORKFLOW turns where
@@ -24,7 +25,7 @@
  * is one source of truth, not a duplicate classifier.
  *
  * CLEMMY_DYNAMIC_REASONING=off disables automatic complexity-based selection.
- * Explicit Plan still requests high effort. Provider adapters translate only
+ * Explicit Plan still requests medium effort. Provider adapters translate only
  * supported controls; selecting a tier is not proof it reached the wire.
  */
 import { getRuntimeEnv } from '../../config.js';
@@ -126,7 +127,10 @@ export function selectReasoningEffort(
   signals: EffortSignals = {},
 ): { effort: ReasoningEffort; reason: string } {
   if (signals.taskMode === 'plan') {
-    return { effort: 'high', reason: 'explicit-plan' };
+    // Plan discovers tools, schemas and arguments; it never does the business
+    // work. Medium keeps preparation depth without letting a single emission
+    // consume the output allowance.
+    return { effort: 'medium', reason: 'explicit-plan' };
   }
   const base = baseEffort(complexity);
   if (signals.taskMode === 'execute') {

@@ -16,8 +16,16 @@ export function acceptedTaskModeIdentity(sessionId: string, sourceUserSeq: numbe
   if (!session) throw new Error('task mode source session missing');
   return { mode, digest: taskModeDigest(mode), principalId: session.userId || session.id };
 }
+/** The one Plan-mode refusal sentence, shared by every seam that answers it. */
+export function planModeReadOnlyRefusalText(name: string): string {
+  return `PLAN_MODE_READ_ONLY: ${name} cannot execute in Plan mode. Investigate its schema and required arguments, then include the proposed action in publish_plan. The user can Execute the reviewed revision; no business effect or approval was started.`;
+}
 export function planModeCallRefusal(input: {
   mode: TaskMode | undefined; toolName: string; args: unknown; attestedEffect?: RuntimeToolEffect;
+  /** The production host sealed this exact call (catalog entry, account,
+   * schema), so consent can read its current risk. Unattested calls carry no
+   * such fact and keep the plain effect ceiling. */
+  attested?: boolean;
   /** Retained for callers that also enforce exact source authority. */
   identity?: { sessionId: string; sourceUserSeq: number };
   argumentsJson?: string;
@@ -74,5 +82,14 @@ export function planModeCallRefusal(input: {
   // and every business/external effect is untouched below.
   if (effect === 'host_only' && !identity.composioCarrier
     && registeredToolSideEffect(name) === 'read') return undefined;
-  return `PLAN_MODE_READ_ONLY: ${name} cannot execute in Plan mode. Investigate its schema and required arguments, then include the proposed action in publish_plan. The user can Execute the reviewed revision; no business effect or approval was started.`;
+  // A PLANNING TURN VALIDATES WHAT IT WILL CALL.
+  //
+  // This gate is synchronous and sees only an effect label. An external write
+  // the production host has sealed carries a current definition whose risk
+  // consent can read: a carrier-bounded, non-destructive call may run once as
+  // preparation so the plan binds arguments that worked, while a create, send,
+  // delete or admin effect is refused there with this same sentence. An
+  // unattested external write has no such fact and stays refused here.
+  if (effect === 'external_write' && input.attested) return undefined;
+  return planModeReadOnlyRefusalText(name);
 }

@@ -1497,7 +1497,7 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
         // Use a REAL Codex id, not MODELS.primary — the OPENAI_MODEL_PRIMARY slot can
         // be repurposed to a BYO/GLM id (glm-5.2), which the router then sends to the
         // BYO endpoint and storms with 429s (labelled provider:'codex' but wired to
-        // BYO). boundaryCodexJudgeModel() (gpt-5.4-mini) is a guaranteed-Codex checker.
+        // BYO). boundaryCodexJudgeModel() is a guaranteed-Codex checker.
         checker = { modelId: boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
       } else if (choice === 'claude' && claudeAvailable() && brain.provider !== 'claude') {
         checker = { modelId: getDebateCheckerModel(), provider: 'claude', source: 'default' };

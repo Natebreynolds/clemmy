@@ -263,12 +263,17 @@ test('the actual readback nomination retains the same checked account and stages
     name, sourceKind: 'authorized_composio' as const, carrier: 'work_call' as const,
     schema: { type: 'object', properties: { message_id: { type: 'string' } } }, summary: 'Read an exact saved message',
   }));
-  const staged = await provider.stageDisclosedPlanningProviderCandidates({ ...read, candidates, accountSelection: readNomination });
+  const staged = await provider.stageDisclosedPlanningProviderCandidates({ ...read, candidates, accountSelection: readNomination, query: 'read the saved outlook message by id' });
   assertCheckedAccountWithoutLivePublication(staged.blockers);
   const proven = resolution.provenCapabilityEntriesForTurn(read);
   assert.equal(proven.length, 2);
   for (const entry of proven) {
     assert.equal(entry.accountIdentity, 'fixture-scorpion');
+    // The disclosed row records which of its own tokens the query contained:
+    // the toolkit and the object, never the whole slug.
+    assert.ok(entry.matchedTokens!.includes('outlook') && entry.matchedTokens!.includes('message'),
+      `disclosure carries the query's matching tokens, got ${JSON.stringify(entry.matchedTokens)}`);
+    assert.ok(!entry.matchedTokens!.includes('folder'), 'a segment the query never said is not match evidence');
     assert.equal(entry.sourceAccountRouting?.sourceUserSeq, first.sourceUserSeq);
     assert.equal(entry.sourceAccountRouting?.sourceQuote, saveText, 'the durable account fact retains its actual explicit origin');
     assert.equal(entry.sourceAccountRouting?.checkedForSourceUserSeq, read.sourceUserSeq);
@@ -823,4 +828,205 @@ test('an account the OWNER named that is no longer connected still asks — it i
   assert.equal(invented.kind, 'resolved',
     'the same absent identity, never spoken by the owner, is discarded rather than reported gone');
   if (invented.kind === 'resolved') assert.equal(invented.connection.connectionId, 'fixture-personal');
+});
+
+test('the account judge is handed the chosen option label, never the semantic port\'s opt-N id', () => {
+  // Live 2026-09-14: the calendar question's chosen option "Send Adam an invite
+  // from my Scorpion calendar" reached the judge as "opt-2".
+  const options = ['Create directly on Adam’s shared calendar (recommended)', 'Send Adam an invite from my Scorpion calendar'];
+  assert.equal(routing.clarificationSelectedOptionLabel('opt-2', options), options[1]);
+  assert.equal(routing.clarificationSelectedOptionLabel('opt-1', options), options[0]);
+  assert.equal(routing.clarificationSelectedOptionLabel(options[1], options), options[1]);
+  assert.equal(routing.clarificationSelectedOptionLabel('opt-3', options), null);
+  assert.equal(routing.clarificationSelectedOptionLabel(null, options), null);
+  assert.equal(routing.clarificationSelectedOptionLabel('', options), null);
+});
+
+test('a write that changes an existing record resolves to the remembered read account without asking', async () => {
+  // Live 2026-09-15: "add a description to the discussion with Adam tomorrow"
+  // disclosed the calendar UPDATE as account_selection_required while the
+  // toolkit's read default was on file, and the model — told to pick an
+  // account it had no words for — asked about wording instead. An existing
+  // record lives where it is read from; changing it through that account is
+  // a fact about the record, not a send preference. A create still asks.
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
+  const calls = installJudge();
+  rememberAccountAlias({ toolkit: 'outlook', label: READ_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  const update = await routing.resolveSourceAccountRouting({
+    ...source('Add a two-sentence description to the discussion with Adam tomorrow at 9'), toolkit: 'outlook',
+    operation: 'OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(update.kind, 'resolved', JSON.stringify(update));
+  if (update.kind === 'resolved') {
+    assert.equal(update.connection.connectionId, 'fixture-scorpion');
+    assert.equal(update.evidence.judgeModelIdentity, 'host:read_default_named_existing');
+    assert.equal(update.evidence.selectionKind, 'current_source_default');
+  }
+  assert.equal(calls.length, 0, 'no judge round trip: the record\'s home is a fact, not a preference');
+  // Creating a NEW record has no home yet: with no send default answered,
+  // the read default is where the owner's own store lives — reviewed by the
+  // judge against the current wording, never bound by the host.
+  const create = await routing.resolveSourceAccountRouting({
+    ...source('Put time on the calendar with Adam tomorrow at 9'), toolkit: 'outlook',
+    operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(create.kind, 'resolved', JSON.stringify(create));
+  assert.equal(calls.length, 1, 'a create is reviewed, not bound');
+  assert.equal(calls[0]!.mode, 'current_source_default');
+  assert.equal(calls[0]!.rememberedDefault?.identity, SCORPION);
+  resetAccountAliasesForTest();
+});
+
+test('a remembered send default is reviewed by the judge instead of asking again, and the judge can still refuse', async () => {
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { SEND_DEFAULT_ACCOUNT_LABEL } = routing;
+  const calls = installJudge();
+  const before = await routing.resolveSourceAccountRouting({
+    ...source('Send Adam the invite'), toolkit: 'outlook', operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(before.kind, 'account_selection_required', 'two accounts, no nomination, nothing remembered: the host asks');
+  assert.equal(calls.length, 0);
+  rememberAccountAlias({ toolkit: 'outlook', label: SEND_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  const after = await routing.resolveSourceAccountRouting({
+    ...source('Send Adam the invite'), toolkit: 'outlook', operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(after.kind, 'resolved', JSON.stringify(after));
+  if (after.kind === 'resolved') {
+    assert.equal(after.connection.connectionId, 'fixture-scorpion');
+    assert.equal(after.evidence.version, 2);
+    assert.equal(after.evidence.judgeModelIdentity, 'fixture-independent-judge');
+  }
+  const reviewed = calls.at(-1)!;
+  assert.equal(reviewed.mode, 'current_source_default', 'a remembered preference is reviewed, never bound by the host');
+  assert.equal(reviewed.rememberedDefault?.identity, SCORPION);
+  assert.equal(reviewed.accountIdentity, SCORPION);
+  // Current wording can override the memory: the judge says conflict.
+  installJudge(() => ({ verdict: 'conflict' }));
+  const override = await routing.resolveSourceAccountRouting({
+    ...source('Send it from my personal mailbox this time'), toolkit: 'outlook', operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(override.kind, 'account_selection_required', `override: ${JSON.stringify(override)}`);
+  resetAccountAliasesForTest();
+});
+
+test('a write with only a READ default remembered is reviewed against that default instead of asking', async () => {
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
+  resetAccountAliasesForTest();
+  const calls = installJudge();
+  const asked = await routing.resolveSourceAccountRouting({
+    ...source('Draft the five emails and put them in my Outlook drafts folder'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(asked.kind, 'account_selection_required', 'nothing remembered: the host asks once');
+  rememberAccountAlias({ toolkit: 'outlook', label: READ_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  const routed = await routing.resolveSourceAccountRouting({
+    ...source('Draft the five emails and put them in my Outlook drafts folder'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(routed.kind, 'resolved', JSON.stringify(routed));
+  if (routed.kind === 'resolved') assert.equal(routed.connection.connectionId, 'fixture-scorpion');
+  const reviewed = calls.at(-1)!;
+  assert.equal(reviewed.mode, 'current_source_default', 'the read default is reviewed like a send default, never bound by the host');
+  assert.equal(reviewed.rememberedDefault?.identity, SCORPION);
+  // Wording that names another account still wins at the judge.
+  installJudge(() => ({ verdict: 'conflict' }));
+  const override = await routing.resolveSourceAccountRouting({
+    ...source('Put the drafts in my personal mailbox this time'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write',
+  });
+  assert.equal(override.kind, 'account_selection_required', JSON.stringify(override));
+  resetAccountAliasesForTest();
+});
+
+test('a nomination that repeats the remembered default is reviewed as the default, not as a fresh explicit selection', async () => {
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
+  resetAccountAliasesForTest();
+  rememberAccountAlias({ toolkit: 'outlook', label: READ_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  const calls = installJudge();
+  const routed = await routing.resolveSourceAccountRouting({
+    ...source('Draft the five emails and put them in my Outlook drafts folder'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'put them in my Outlook drafts folder' }, effect: 'write',
+  });
+  assert.equal(routed.kind, 'resolved', JSON.stringify(routed));
+  const reviewed = calls.at(-1)!;
+  assert.equal(reviewed.mode, 'current_source_default', 'echoing the owner\'s established default is not a new selection the wording must name');
+  assert.equal(reviewed.rememberedDefault?.identity, SCORPION);
+  // A nomination of the OTHER account is still an explicit selection under full review.
+  const other = await routing.resolveSourceAccountRouting({
+    ...source('Draft the five emails and put them in my Outlook drafts folder'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: PERSONAL, source_quote: 'put them in my Outlook drafts folder' }, effect: 'write',
+  });
+  assert.equal(calls.at(-1)!.mode, 'explicit_selection');
+  assert.ok(other.kind === 'resolved' || other.kind === 'account_selection_required');
+  resetAccountAliasesForTest();
+});
+
+test('a read routed on the owner\'s words beside a write reviewed against the read default is one selection, not a conflict', async () => {
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { READ_DEFAULT_ACCOUNT_LABEL } = routing;
+  resetAccountAliasesForTest();
+  rememberAccountAlias({ toolkit: 'outlook', label: READ_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  installJudge();
+  const first = source('Draft the five emails and put them in my Outlook drafts folder for my Scorpion mailbox');
+  const read = await routing.resolveSourceAccountRouting({ ...first, toolkit: 'outlook', operation: 'OUTLOOK_GET_DRAFTS_MAIL_FOLDER', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'for my Scorpion mailbox' }, effect: 'read' });
+  const write = await routing.resolveSourceAccountRouting({ ...first, toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write' });
+  assert.equal(read.kind, 'resolved'); assert.equal(write.kind, 'resolved');
+  // Record both as the checked routes of that source, the way tool_search does.
+  eventlog.appendEvent({ sessionId: first.sessionId, turn: 1, role: 'system', type: 'capability_resolution', data: {
+    sourceUserSeq: first.sourceUserSeq, authoritativeForTask: true,
+    entries: [
+      { identifier: 'OUTLOOK_GET_DRAFTS_MAIL_FOLDER', sourceAccountRouting: read.kind === 'resolved' ? read.evidence : null },
+      { identifier: 'OUTLOOK_CREATE_DRAFT', sourceAccountRouting: write.kind === 'resolved' ? write.evidence : null },
+    ] } });
+  // The next source in the same conversation: a write with no nomination must
+  // not be told the account is ambiguous.
+  const next = source('Publish the ready plan.', first.sessionId);
+  const later = await routing.resolveSourceAccountRouting({ ...next, toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections, nomination: null, effect: 'write' });
+  assert.equal(later.kind, 'resolved', JSON.stringify(later));
+  resetAccountAliasesForTest();
+});
+
+test('a nomination that echoes the remembered SEND default is resolved by the host; naming another account still goes to the judge', async () => {
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const { SEND_DEFAULT_ACCOUNT_LABEL } = routing;
+  resetAccountAliasesForTest();
+  rememberAccountAlias({ toolkit: 'outlook', label: SEND_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  rememberAccountAlias({ toolkit: 'outlook', label: 'personal', email: PERSONAL, connectionId: 'fixture-personal' });
+  const calls = installJudge();
+  // The model nominates the account the owner already answered with, and the
+  // wording even names it: agreement, not a selection to review.
+  const echoed = await routing.resolveSourceAccountRouting({
+    ...source('Draft a short custom email per account into my Scorpion Outlook drafts'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'into my Scorpion Outlook drafts' }, effect: 'write',
+  });
+  assert.equal(echoed.kind, 'resolved', JSON.stringify(echoed));
+  if (echoed.kind === 'resolved') {
+    assert.equal(echoed.connection.connectionId, 'fixture-scorpion');
+    assert.equal(echoed.evidence.judgeModelIdentity, 'host:send_default_nominated');
+    assert.equal(echoed.evidence.selectionKind, 'current_source_default');
+  }
+  assert.equal(calls.length, 0, 'no judge round trip when the nomination echoes the owner\'s own answer');
+  // Wording that names the OTHER connected account by its recorded alias label
+  // is a possible override: the judge reviews it exactly as before.
+  const byLabel = await routing.resolveSourceAccountRouting({
+    ...source('Draft the emails into my personal drafts folder this time'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'Draft the emails' }, effect: 'write',
+  });
+  assert.equal(calls.length, 1, 'another account named by label: the judge reviews');
+  assert.ok(byLabel.kind === 'resolved' || byLabel.kind === 'account_selection_required');
+  // ... and by its address.
+  await routing.resolveSourceAccountRouting({
+    ...source(`Draft the emails from ${PERSONAL}`), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'Draft the emails' }, effect: 'write',
+  });
+  assert.equal(calls.length, 2, 'another account named by address: the judge reviews');
+  // A reserved default label is not a name.
+  const reservedOnly = await routing.resolveSourceAccountRouting({
+    ...source('Use the default send account for these drafts'), toolkit: 'outlook', operation: 'OUTLOOK_CREATE_DRAFT', connections,
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'these drafts' }, effect: 'write',
+  });
+  assert.equal(reservedOnly.kind, 'resolved');
+  assert.equal(calls.length, 2);
+  resetAccountAliasesForTest();
 });

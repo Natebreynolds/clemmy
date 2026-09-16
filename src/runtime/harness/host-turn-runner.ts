@@ -2,7 +2,8 @@ import { expectedWorkPlanLines } from './expected-work-admission.js';
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from './reviewed-plan-runtime.js';
-import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, formatSteerBlock } from './steer-notes.js';
+import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, formatSteerBlock, type SteerNote } from './steer-notes.js';
+import { autoCaptureProvenanceFromAcceptedEvent, captureInteractionSignals, explicitMemoryInstructionFor } from '../../memory/auto-capture.js';
 import { TOOL_REGISTRY,
   toolReadsRetainedOutput,
 } from '../../tools/tool-registry.js';
@@ -17,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecution, acceptedPlanExecutionText } from './accepted-plan-execution.js';
-import { acceptedTaskMode, acceptedTaskModeIdentity, planModeCallRefusal } from './accepted-task-mode.js';
+import { acceptedTaskMode, acceptedTaskModeIdentity, planModeCallRefusal, planModeReadOnlyRefusalText } from './accepted-task-mode.js';
 import { getPlanRevision } from './plan-artifacts.js';
 import { normalizeCallableArguments } from './callable-contract.js';
 import { parseModelToolArgumentObject } from './model-tool-argument-json.js';
@@ -117,8 +118,11 @@ import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-
 import * as approvalRegistry from './approval-registry.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import {
+  honestFailureReportSettles,
+  resolveJudgeResponder,
   isPromiseShapedReply,
   judgeObjectiveComplete,
+  replyClaimsCompletedWork,
   shouldRunObjectiveJudge,
   type ObjectiveJudgeVerdict,
 } from './objective-judge.js';
@@ -536,6 +540,9 @@ export function settledSourceArtifacts(input: {
 
 const HOST_JUDGE_CONTROL_TOOL_NAMES: ReadonlySet<string> = new Set([
   'tool_search', 'recall_tool_result', 'workflow_step_result', 'plan_task', 'ask_user_question', 'retry_host',
+  // Host status is not business work: a lookup answered from it alone must not
+  // pay a cross-family judge (live 2026-09-14, ~29 s to certify a yes/no).
+  'mcp_status',
 ]);
 import {
   ModelStreamStalledError,
@@ -617,6 +624,11 @@ import {
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 import {
+  renderReviewedCliArgumentMap,
+  reviewedCliArgumentMapForOperation,
+  reviewedCliShellMatch,
+} from './reviewed-cli-shell-match.js';
+import {
   capabilityManifestDigest,
   currentCapabilityManifest,
   type CapabilityManifestV1,
@@ -635,7 +647,7 @@ import {
 } from './host-model-frame-policy.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { loadShippedImplementations } from './shipped-implementation-identity.js';
-import { inspectDurableMaterialSourceContinuation } from './task-continuity-runtime.js';
+import { inspectDurableMaterialSourceContinuation, rehydrateConsumedClarificationContext } from './task-continuity-runtime.js';
 import {
   sourceStrategyBindingsEqual,
   turnPreflightDecisionsEqual,
@@ -664,7 +676,7 @@ import {
 } from './host-interactive-consent.js';
 import { evaluateAuthoredWorkflowMutationConsent } from './authored-workflow-write-authority.js';
 import { mintHostConsentCallAuthority } from './authored-call-authority.js';
-import type { CapabilityRiskAttestationV1 } from './interactive-consent-policy.js';
+import type { CapabilityRiskAttestationV1, InteractiveConsentProceedBasis } from './interactive-consent-policy.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
 import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
 import {
@@ -978,6 +990,12 @@ const PLAN_NO_PROGRESS_RECOVERY_DIRECTIVE = [
   'Do not claim an unread input was inspected or execute the proposed business work in Plan mode.',
 ].join(' ');
 
+const PLAN_FINAL_PUBLISH_DIRECTIVE = [
+  'PUBLISH NOW — this is the last step of this Plan turn and only publish_plan and ask_user_question are available.',
+  'Publish the plan with what you have already gathered and investigated; name anything still unresolved as needs_input or a verification step inside the plan rather than searching for it again.',
+  'Do not execute business work here.',
+].join(' ');
+
 const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
   'BOUNDED CONTROL RECOVERY — the prior fully settled control step did not establish a new executable path.',
   'Use retained results and available tools to resolve the next unfinished requirement or change approach.',
@@ -1070,6 +1088,35 @@ export function hostNoProgressRecoveryToolNames(
  * So rank the proven set by the toolkit prefix the call names, and when that
  * toolkit has nothing proven, say exactly that instead of offering the others.
  * No toolkit is named here; the prefix comes from the call at runtime. */
+/** A carrier whose `args_json` is a string that does not parse. The generic
+ * miss reads `effective_inner_name_missing`, which tells the model to correct
+ * an inner NAME it can see is present. Live 2026-09-15: a 736-char args_json
+ * was cut mid-body (HTML with quotes), the host refused twice with that
+ * sentence, and the model reported a provider rejection that never happened.
+ * Name the actual defect so the next call can repair it. */
+export function carrierInnerJsonProblem(args: unknown): string | null {
+  const record = args && typeof args === 'object' && !Array.isArray(args)
+    ? args as Record<string, unknown>
+    : null;
+  const inner = record?.args_json;
+  if (typeof inner !== 'string') return null;
+  const trimmed = inner.trim();
+  if (!trimmed) return 'args_json is an empty string';
+  try {
+    JSON.parse(trimmed);
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `args_json is not valid JSON (${inner.length} chars; ${message})`;
+  }
+}
+
+export function hostCarrierInnerJsonRepair(name: string, problem: string): string {
+  return `Tool '${name}' was refused before dispatch: ${problem}. The inner operation and arguments could not be read, so no provider call was made.`
+    + ' Reissue the same call once with args_json as ONE complete, valid JSON string containing tool_slug and arguments; keep the requirement_id.'
+    + ' If the arguments carry HTML or quoted text, escape it correctly or shorten the body; do not switch operations or report a provider error.';
+}
+
 export function hostProvenOperationRepair(input: {
   requestedOperation: string;
   provenOperations: readonly string[];
@@ -1079,10 +1126,22 @@ export function hostProvenOperationRepair(input: {
   /** Human label per choice when the disclosure carried one. */
   accountChoiceLabels?: Readonly<Record<string, string>>;
   accountReviewUnavailable?: boolean;
+  /** The exact pre-dispatch miss, when known (e.g. `catalog_entry_or_manifest_missing:…`). */
+  missReason?: string;
 }): string {
   const toolkitOf = (operationId: string): string => operationId.split('_')[0] ?? '';
-  const requested = input.requestedOperation.trim().toUpperCase();
+  const trimmed = input.requestedOperation.trim();
+  // A reviewed-CLI identity is lowercase by definition; uppercasing it names an
+  // operation that does not exist.
+  const requested = isReviewedLiveReadIdentity(trimmed) ? trimmed : trimmed.toUpperCase();
   const requestedToolkit = toolkitOf(requested);
+  const missReason = input.missReason ?? '';
+  if (missReason.startsWith('reviewed_cli_shell_matched:')) {
+    const operationId = missReason.slice('reviewed_cli_shell_matched:'.length).trim() || requested;
+    const argumentMap = reviewedCliArgumentMapForOperation(operationId);
+    const rendered = argumentMap ? renderReviewedCliArgumentMap(argumentMap) : '';
+    return ` Use ${operationId} instead of run_shell_command for this read: call work_call with name ${operationId} and args_json {${rendered}}; keep the requirement_id. The operation is already current; no tool_search is needed.`;
+  }
   const proven = input.provenOperations.filter((operationId) => operationId.trim().length > 0);
   const sameToolkit = requestedToolkit
     ? proven.filter((operationId) => toolkitOf(operationId) === requestedToolkit)
@@ -1116,6 +1175,17 @@ export function hostProvenOperationRepair(input: {
   }
   const requestedIsProven = requested.length > 0
     && proven.some((operationId) => operationId.trim().toUpperCase() === requested);
+  // The named operation WAS discovered earlier in this conversation, but its
+  // executable ref is not current for this request. Live 2026-09-14: "edit
+  // this event" reused the previous turn's requirement_id, the catalog check
+  // refused it twice, and the old sentence below ("do not repeat unchanged
+  // discovery") left the model no door — it reported a provider failure that
+  // never happened. Name the door: one fresh tool_search for this request.
+  if (requestedIsProven && (input.missReason ?? '').startsWith('catalog_entry_or_manifest_missing')) {
+    return ` ${requested} was discovered for an earlier request in this conversation, but its executable ref is not current for this request.`
+      + ` Call tool_search for ${requested} once now (keep the same account_selection) and copy the capabilityRef and work_call example it publishes for THIS request;`
+      + ' do not reuse the earlier requirement_id. If tool_search does not publish an executable ref, report that exact host blocker; no provider call was made.';
+  }
   if (requested.length > 0 && !requestedIsProven) {
     const context = ranked.length > 0
       ? ` Proven for this step so far: ${ranked.join(', ')}.`
@@ -2805,6 +2875,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // call id. The port invoke mints the adapter's call authority from this
   // grant plus the exact manifest and the schema-validated arguments.
   const consentCallGrants = new Map<string, { coverageContractId: string }>();
+  // The basis each `proceed` decision carried, by logical call id. The host
+  // invocation books a planning turn's preparation probe like a read from
+  // this; every other basis leaves the effect-derived accounting untouched.
+  const consentBases = new Map<string, InteractiveConsentProceedBasis>();
   const freshPlanControlConfigured = (): boolean => {
     const controls = [...configuredToolRefs].filter((tool) => (
       tool.name === 'plan_task'
@@ -3360,6 +3434,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     || itemsOrState instanceof HostRecoveryState
     ? itemsOrState.objectiveJudgeContinuations
     : 0;
+  /** Business-call count at the last negative verdict that armed a
+   *  continuation, so a continuation that added no evidence is recognisable
+   *  before a second identical verdict is bought. */
+  let judgedBusinessCallsAtLastVerdict: number | undefined;
   let completionReviewFeedback = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? parseHostCompletionReviewFeedback(itemsOrState.completionReviewFeedback)
@@ -3379,6 +3457,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let noProgressHistoryCursor = resumedNoProgressCheckpoint?.historyCursor
     ?? history.length;
   let noProgressRecoveryOnly = resumedNoProgressCheckpoint?.recoveryOnly ?? false;
+  /** A Plan turn whose governor has exhausted gets ONE publish-only step
+   *  before it stops (see the terminalize branch); this records that it was
+   *  spent so the second exhaustion stops for real. */
+  let planFinalPublishStepSpent = false;
+  let planFinalPublishStep = false;
   let noProgressRecoveryDirectiveWritten =
     resumedNoProgressCheckpoint?.recoveryDirectiveWritten ?? false;
   const currentNoProgressCheckpoint = (): HostNoProgressCheckpoint | undefined => (
@@ -3519,15 +3602,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const lastConcreteToolError = (): string | null => {
     try {
       const identity = exactHostIdentity();
-      for (const event of listEvents(identity.sessionId, { types: ['tool_returned'], desc: true, limit: 40 })) {
-        if (event.data.sourceUserSeq !== identity.sourceUserSeq) continue;
-        const raw = event.data.result;
-        const text = typeof raw === 'string' ? raw : typeof raw === 'object' && raw && typeof (raw as { preview?: unknown }).preview === 'string' ? String((raw as { preview: string }).preview) : '';
-        const m = /An error occurred while running the tool\.?\s*(?:Please try again\.)?\s*Error:\s*([\s\S]+)/i.exec(text);
-        if (!m) continue;
-        const cleaned = redactSensitiveText(m[1]!).replace(/\s+/g, ' ').trim();
-        if (cleaned) return cleaned.length > 240 ? `${cleaned.slice(0, 237)}…` : cleaned;
-      }
+      const rows = listEvents(identity.sessionId, { types: ['tool_returned'], desc: true, limit: 40 })
+        .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq)
+        .map((event) => ({ tool: String(event.data.effectiveTool ?? event.data.tool ?? ''), result: event.data.result }));
+      return concreteBlockerFromNewestToolResult(rows);
     } catch { /* advisory only */ }
     return null;
   };
@@ -3613,6 +3691,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // Current-source work makes the existing reviewer eligible regardless of
     // wording or whether one business call happened to succeed. Keep the
     // legacy zero-tool fallback, but never let it waive attempted work.
+    const judgedText = decision?.reply ?? replyText;
     const gate = shouldRunObjectiveJudge({
       optIn: true,
       actionIntent: classifyMessageIntent(objective).intent === 'action',
@@ -3628,13 +3707,67 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // A plain reply with no marker or envelope IS the done shape
       // (turn-decision.ts returns null for it); ASK: keeps its own reading.
       nextAction: decision?.nextAction ?? 'completed',
-      promiseShaped: isPromiseShapedReply(decision?.reply ?? replyText),
+      promiseShaped: isPromiseShapedReply(judgedText),
+      claimedCompletedWork: replyClaimsCompletedWork(judgedText),
       openApprovalCard,
     });
     if (!gate && !planCandidate) return 'done';
     const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate) });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
+    // A continuation that made no further business call, settled nothing,
+    // and answers honestly cannot move the standing verdict: the reviewer
+    // would rule on the same source evidence and the same absence of a claim.
+    // Live 2026-09-15: after "I couldn't update it", the pinned judge was
+    // asked again on identical evidence and took 23–58 s to say the same
+    // thing (three identical negatives, ~66 s, on one honest report). The
+    // standing verdict settles the turn now; a new call, a settled write, a
+    // claim or a promise still buys a fresh verdict.
+    if (!planCandidate && completionReviewFeedback && objectiveJudgeContinuations >= 1
+      && judgedBusinessCallsAtLastVerdict === businessCalls.length
+      && honestFailureReportSettles({
+        verdictDone: false,
+        continuationsUsed: objectiveJudgeContinuations,
+        reply: judgedReply,
+        settledWrites: settled.count,
+      })) {
+      const carried = completionReviewFeedback;
+      try {
+        appendEvent({
+          sessionId: identity.sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'goal_alignment_judged',
+          data: {
+            lane: 'host_v1',
+            kind: 'completion',
+            fulfills: false,
+            reason: carried.reason.slice(0, 600),
+            // No reviewer answered this row: it carries the last verdict onto
+            // an honest continuation that added no evidence to judge.
+            carriedVerdict: true,
+            sourceUserSeq: identity.sourceUserSeq,
+            settledEffectCount: settled.count,
+            settledEvidenceAvailable: settled.evidenceAvailable && readEvidence.evidenceAvailable,
+            judgedReadResults: readEvidence.results,
+            objectiveDigest: carried.objectiveDigest,
+            replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
+            continuation: false,
+            continuationsUsed: objectiveJudgeContinuations,
+          },
+        });
+      } catch { /* telemetry never blocks the reply */ }
+      hostTurnLogger.info({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        done: false,
+        carriedVerdict: true,
+        continuation: false,
+        reason: carried.reason.slice(0, 200),
+      }, 'host completion judge');
+      return 'done';
+    }
     let verdict: ObjectiveJudgeVerdict;
+    const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
@@ -3650,7 +3783,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // ran BEFORE the write is not evidence of the write.
         toolCallSummary: [
           acceptedModelMemoryEvidence(identity),
-          planCandidate ? `THIS IS A PLAN TURN. Judge the investigated plan, not future execution. No proposed business effects should have run. Review the prose AND its prepared graph below. structuredPlan.steps is the complete reviewed graph, including synthesis and its dynamicBindings. executionDraft is a host-derived tool-only projection: compute steps intentionally do not appear there, and their transitive tool prerequisites become ordering edges. Their absence from executionDraft is not a missing step or data binding. Judge synthesis and the consuming write against structuredPlan.steps and dynamicBindings. preparedBindings includes the selected local tool descriptions; use that actual behavior instead of inventing prerequisite steps. Do dependencies actually supply the discovered results to their consumers, are unknown values prepared at execution time instead of guessed, and do verification criteria cover the accepted objective? Do the proposed evidence sources and comparison criteria support the decisions requested, with a useful response to missing or conflicting facts? Separate source claims from verified facts. Check the selected operation’s own contract when it is carried inside a generic tool: batch, pagination and per-item settings must still cover the intended scope after repairs. Compare coverage and dependencies against the whole objective, not merely valid argument shapes. Do not require every optional tool or demand unrelated work, and do not require execution findings during Plan. Preserve the owner’s deferred-work boundary when suggesting repairs: specify an execution method for unknown future evidence, not a probe that performs the deferred work during Plan. Empty or irrelevant memory is not a missing prerequisite; require memory-derived assumptions to be disclosed only when they influence this plan. A compute step can investigate contextual read-only sources, extract/transform evidence and bind its recorded output to a later tool. Graph dependencies require successful results: an optional lookup plus its fallback must not both be indispensable producers, since the intended recovery could never complete. Conditional investigation can live in the compute method while truly required input reads remain graph steps. Report all material gaps supported by this evidence together, so a repair can address the whole finding. Optional improvements are not completion failures. Successful tool_search result dumps are omitted here; the prepared graph includes the exact selected operation contracts, while actual input reads and unsuccessful attempts remain below.\nComplete candidate plan:\n${JSON.stringify(planCandidate)}` : undefined,
+          planCandidate ? `THIS IS A PLAN TURN. Judge the investigated plan, not future execution. Reads, discovery and carrier-bounded probes performed during planning are preparation, never a gap: a plan may hold members, facts and authored content gathered this turn as inline data, may bind the arguments a probe proved, and it need not re-read at execution what it already holds. Creates, sends and deletes must still not have run. Whether inputs were gathered during planning or are deferred to execution as read steps is the planner's choice; neither is a gap. This candidate is reviewed BEFORE it is published, by design: earlier publish_plan refusals, retained drafts and review feedback in the history are the road to this candidate, never gaps in it. Review the prose AND its prepared graph below. structuredPlan.steps is the complete reviewed graph, including synthesis and its dynamicBindings. executionDraft is a host-derived tool-only projection: compute steps intentionally do not appear there, and their transitive tool prerequisites become ordering edges. Their absence from executionDraft is not a missing step or data binding. Judge synthesis and the consuming write against structuredPlan.steps and dynamicBindings. preparedBindings includes the selected local tool descriptions; use that actual behavior instead of inventing prerequisite steps. Do dependencies actually supply the discovered results to their consumers, are unknown values prepared at execution time instead of guessed, and do verification criteria cover the accepted objective? Do the proposed evidence sources and comparison criteria support the decisions requested, with a useful response to missing or conflicting facts? Separate source claims from verified facts. Check the selected operation’s own contract when it is carried inside a generic tool: batch, pagination and per-item settings must still cover the intended scope after repairs. Compare coverage and dependencies against the whole objective, not merely valid argument shapes. Do not require every optional tool or demand unrelated work. A step carried by a generic request tool whose path and arguments were neither exercised successfully this turn nor cited from documentation read this turn is a material gap: name the exact unverified argument. Evidence that only a create, send or delete can produce belongs to execution: specify its execution method rather than asking Plan to perform it. Empty or irrelevant memory is not a missing prerequisite; require memory-derived assumptions to be disclosed only when they influence this plan. A compute step can investigate contextual read-only sources, extract/transform evidence and bind its recorded output to a later tool. Graph dependencies require successful results: an optional lookup plus its fallback must not both be indispensable producers, since the intended recovery could never complete. Conditional investigation can live in the compute method while truly required input reads remain graph steps. Report all material gaps supported by this evidence together, so a repair can address the whole finding. Optional improvements are not completion failures. Successful tool_search result dumps are omitted here; the prepared graph includes the exact selected operation contracts, while actual input reads and unsuccessful attempts remain below.\nComplete candidate plan:\n${JSON.stringify(planCandidate)}` : undefined,
           completionReviewFeedback ? hostCompletionReviewFeedbackContext(completionReviewFeedback) : undefined,
           settled.count > 0
             ? `Artifacts written by THIS request, with their current saved content:\n${settled.summary}\n`
@@ -3683,7 +3816,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
     }
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
-    const continuation = ((!verdict.done && !awaitingInput)
+    const honestStop = !planCandidate && honestFailureReportSettles({
+      verdictDone: verdict.done,
+      continuationsUsed: objectiveJudgeContinuations,
+      reply: judgedReply,
+      settledWrites: settled.count,
+    });
+    const continuation = !honestStop && ((!verdict.done && !awaitingInput)
       || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
       && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
     try {
@@ -3700,14 +3839,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
-          // substitute is never read back as the pinned model's judgment.
-          ...(verdict.judgeModelId ? { judgeModelId: verdict.judgeModelId } : {}),
-          ...(verdict.judgeProvider ? { judgeProvider: verdict.judgeProvider } : {}),
-          ...(verdict.judgeProviderId ? { judgeProviderId: verdict.judgeProviderId } : {}),
-          ...(verdict.substituteForExactPin ? { substituteForExactPin: true } : {}),
-          ...(verdict.requestedJudgeModelId
-            ? { requestedJudgeModelId: verdict.requestedJudgeModelId } : {}),
-          ...(verdict.substituteReason ? { substituteReason: verdict.substituteReason } : {}),
+          // substitute is never read back as the pinned model's judgment. A
+          // mid-call fallover (503 on the pin) is read from the routed ledger.
+          ...((): Record<string, unknown> => {
+            let responder: ReturnType<typeof resolveJudgeResponder> = {
+              ...(verdict.judgeModelId ? { judgeModelId: verdict.judgeModelId } : {}),
+              ...(verdict.judgeProvider ? { judgeProvider: verdict.judgeProvider } : {}),
+            };
+            try {
+              responder = resolveJudgeResponder({
+                requested: verdict,
+                judgeStartedAt,
+                routedRows: listEvents(identity.sessionId, { types: ['turn_model_routed'], desc: true, limit: 8 })
+                  .map((row) => ({ createdAt: row.createdAt, data: row.data })),
+              });
+            } catch { /* ledger read is best-effort */ }
+            return {
+              ...(responder.judgeModelId ? { judgeModelId: responder.judgeModelId } : {}),
+              ...(responder.judgeProvider ? { judgeProvider: responder.judgeProvider } : {}),
+              ...(verdict.judgeProviderId && !responder.substituteForExactPin ? { judgeProviderId: verdict.judgeProviderId } : {}),
+              ...(responder.substituteForExactPin || verdict.substituteForExactPin ? { substituteForExactPin: true } : {}),
+              ...(responder.requestedJudgeModelId ?? verdict.requestedJudgeModelId
+                ? { requestedJudgeModelId: responder.requestedJudgeModelId ?? verdict.requestedJudgeModelId } : {}),
+              ...(responder.substituteReason ?? verdict.substituteReason
+                ? { substituteReason: responder.substituteReason ?? verdict.substituteReason } : {}),
+            };
+          })(),
           ...(verdict.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
           // Bind the verdict to the exact source and the artifacts it judged, so
           // a completion claim can be re-checked later against real effects.
@@ -3762,6 +3919,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (awaitingInput && !continuation) return 'awaiting_user_input';
     if (!continuation) return 'done';
     objectiveJudgeContinuations += 1;
+    judgedBusinessCallsAtLastVerdict = businessCalls.length;
     // A rejected final draft has no accepted tool-batch checkpoint. Putting
     // it in canonical history breaks the next batch's exact prehistory. Keep
     // both draft and finding in source-bound request projection state instead;
@@ -4599,6 +4757,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const decision = classifyRuntimeToolEffect(name, args);
     const effective = unwrapRuntimeEffectiveToolIdentity(name, args);
     const effectiveName = effective.toolName?.trim() ?? '';
+    // A shell command whose head is a callable reviewed CLI read is refused by
+    // name: the reviewed operation carries its own descriptor, binary and argv
+    // proof; the shell path carries none. The refusal names the operation and
+    // its argument map so the next call is the attested door.
+    if (effectiveName === 'run_shell_command') {
+      const shellArgs = effective.args;
+      const command = shellArgs && typeof shellArgs === 'object' && !Array.isArray(shellArgs)
+        && typeof (shellArgs as Record<string, unknown>).command === 'string'
+        ? (shellArgs as Record<string, unknown>).command as string
+        : '';
+      const reviewed = reviewedCliShellMatch(command);
+      if (reviewed.status === 'matched') return miss(`reviewed_cli_shell_matched:${reviewed.operationId}`);
+    }
     const root = acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
     const acceptedTaskId = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
     const contract = durableLogicalCallContract(acceptedTaskId, name, args);
@@ -4654,10 +4825,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ) as { capabilityRef: string } | undefined
       : undefined;
     const reviewedCapabilityRef = reviewedBinding?.capabilityRef;
-    const candidates = decision.effect === 'unknown'
+    const exactCandidates = decision.effect === 'unknown'
       ? []
       : surface.snapshot.entries.filter(entry => exactEntryMatches(entry)
         && (!reviewedCapabilityRef || entry.capabilityId === reviewedCapabilityRef));
+    // The live materializer scopes a reviewed read's manifest to the wording
+    // of the search that disclosed it, so one operation accrues one current
+    // manifest per distinct wording since boot. Those are the same capability;
+    // ambiguity is reserved for different transports, accounts or definitions.
+    const candidates = collapseSameCapabilityIdentity(
+      exactCandidates,
+      sameSourceDisclosedCapabilityIds(identity),
+    );
     if (candidates.length > 1) return miss('catalog_snapshot_ambiguous');
     // THE READ BAR (owner 2026-09-01: "simplify read vs write once and for
     // all"). A snapshot miss opens the read path: the current callable read
@@ -4754,15 +4933,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         );
       }
       const port = resolveProductionPortsForManifest(manifest);
-      if (!port || manifest.invokePortId !== canonicalCatalogIdentityOf(catalogEntry)?.invokePortId) {
+      const canonicalIdentity = canonicalCatalogIdentityOf(catalogEntry);
+      if (!port || !canonicalIdentity || manifest.invokePortId !== canonicalIdentity.invokePortId) {
         return miss('production_port_or_invoke_identity_mismatch');
       }
       const manifestDigest = capabilityManifestDigest(manifest);
+      // The canonical identity is the one authority for the sealed provider
+      // input schema digest; the attestation carries exactly that value.
       const binding = {
         bindingKind: 'catalog_manifest' as const,
         capabilityId: catalogEntry.capabilityId,
-        ...(catalogEntry.providerInputSchemaDigest
-          ? { providerInputSchemaDigest: catalogEntry.providerInputSchemaDigest }
+        ...(canonicalIdentity.providerInputSchemaDigest
+          ? { providerInputSchemaDigest: canonicalIdentity.providerInputSchemaDigest }
           : {}),
         schemaFingerprint: manifest.definitionFingerprint,
         accountId: manifest.accountId,
@@ -5166,6 +5348,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const attested = exactProductionHostCall(name, args, argumentsJson, tool, logicalToolCallId, runContext, details);
       const refusal = planModeCallRefusal({
         mode, toolName: name, args, attestedEffect: attested?.effect,
+        attested: Boolean(attested?.attestation),
         // The accepted planning source is what makes "the owner named this
         // input" answerable, so the plan-first boundary can tell his document
         // apart from the research it is supposed to be proposing.
@@ -5249,6 +5432,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // accepted graph, never model text, and naming them grants nothing —
       // every gate still runs on the next call.
       const refusalIdentity = exactHostIdentity();
+      if (lastExactProductionMiss === 'effective_inner_name_missing') {
+        const problem = carrierInnerJsonProblem(args ?? parsedArgs(argumentsJson));
+        if (problem) return hostCarrierInnerJsonRepair(name, problem);
+      }
       const boundOperations = plannedWriteOperationIds(
         refusalIdentity.sessionId,
         refusalIdentity.sourceUserSeq,
@@ -5275,8 +5462,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
       const requestedOperation = (() => {
         try {
-          const carried = (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim().toUpperCase();
-          if (carried) return carried;
+          const carried = (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim();
+          // A reviewed-CLI identity stays lowercase; only a provider slug is uppercased.
+          if (carried) return isReviewedLiveReadIdentity(carried) ? carried : carried.toUpperCase();
           // The model also names an operation in its carrier-prefixed form or
           // as a slug-shaped requirement_id. Live 2026-09-08: those refusals lost
           // the operation and therefore the account blocker that would have
@@ -5308,6 +5496,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         : hostProvenOperationRepair({
           requestedOperation,
           provenOperations,
+          missReason: lastExactProductionMiss,
           accountChoices: accountBlockerForRequest?.choices,
           accountChoiceLabels: (accountBlockerForRequest as { labels?: Record<string, string> } | undefined)?.labels,
           accountReviewUnavailable: accountBlockerForRequest?.reason === 'review_unavailable',
@@ -5673,6 +5862,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             effect,
             boundary,
             businessCall,
+            ...(consentBases.has(call.callId)
+              ? { consentBasis: consentBases.get(call.callId)! }
+              : {}),
             trustedEffectCarrier: exactProduction?.trustedEffectCarrier,
             deadlineMs,
             callerSignal: signal,
@@ -6913,11 +7105,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const source = acceptedTaskModeIdentity(scope.sessionId, scope.sourceUserSeq);
       const artifact = getPlanRevision({ ...scope, principalId: source.principalId,
         ref: (output as { planArtifactRef: { planId: string; revision: number; digest: string } }).planArtifactRef });
-      if (artifact.sourceUserSeq === scope.sourceUserSeq) return { text: artifact.fullText, needsInput: artifact.readiness === 'needs_input' };
+      const cardRendered = sessionRendersPlanCard(getSession(scope.sessionId));
+      const needsInput = artifact.readiness === 'needs_input';
+      if (artifact.sourceUserSeq === scope.sourceUserSeq) {
+        return { text: publishedPlanReplyText({ fullText: artifact.fullText, needsInput, missingPrerequisites: artifact.missingPrerequisites, cardRendered }), needsInput };
+      }
       const args = 'argumentsJson' in result && typeof result.argumentsJson === 'string' ? parsedArgs(result.argumentsJson) : null;
       const fullText = args && typeof args.full_text === 'string' && args.full_text.trim() ? args.full_text.trim() : '';
       const message = typeof (output as { message?: unknown }).message === 'string' ? (output as { message: string }).message : '';
-      return { text: fullText || message || 'The plan is published for review.', needsInput: artifact.readiness === 'needs_input' };
+      const text = fullText
+        ? publishedPlanReplyText({ fullText, needsInput, missingPrerequisites: artifact.missingPrerequisites, cardRendered })
+        : message || 'The plan is published for review.';
+      return { text, needsInput };
     }
     return undefined;
   };
@@ -7691,6 +7890,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (consent.nestedAdmission) {
         nestedCallAdmissions.set(pending.callId, consent.nestedAdmission);
       }
+      consentBases.set(pending.callId, consent.decision.basis);
       if (exactProduction.boundary === 'host_owned_external' && consent.coverage) {
         consentCallGrants.set(pending.callId, { coverageContractId: consent.coverage.contractId });
       }
@@ -7712,7 +7912,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             : 'approval_scope_changed_before_dispatch',
         )
       )));
-      for (const pending of pendingFromResume) nestedCallAdmissions.delete(pending.callId);
+      for (const pending of pendingFromResume) {
+        nestedCallAdmissions.delete(pending.callId);
+        consentBases.delete(pending.callId);
+      }
       if (!released) {
         return approvalRecoveryOutcome(
           'resumed_prepared_frame_release_failed',
@@ -8060,9 +8263,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               gained: (decision.gained ?? []).slice(0, 8),
             });
             if (decision.action === 'terminalize') {
-              // The retained ledger already supplies the factual stop. A
-              // final model call cannot add execution evidence to that stop.
-              return stopNoProgress(attempt.consequence?.stage ?? `${attempt.attemptClass}:no_new_evidence`);
+              // A PLAN TURN OWES AN OUTLINE, NOT A STOP. publish_plan has been
+              // admissible on every recovery surface since 2026-09-11, and the
+              // model still drained its budget hunting for one more
+              // capability (live 2026-09-15: ten accounts pulled, the
+              // research call refused as Plan-mode read-only, a discovery
+              // timeout spent the last retry, and the turn ended "I stopped
+              // before publishing" with a plan the model itself called ready).
+              // Exhaustion on a Plan turn therefore buys exactly one more step
+              // whose surface is publish_plan and the question control, with a
+              // steer to publish what it has and name the gaps. A second
+              // exhaustion stops as before.
+              // Only a Plan turn that ran out of DISCOVERY buys the step: a
+              // repair loop on an unpublished call already hands its checkpoint
+              // hops to durable recovery (held), and that contract stands.
+              if (turnIsPlanMode() && !planFinalPublishStepSpent
+                && attempt.attemptClass === 'authority_acquisition') {
+                planFinalPublishStepSpent = true;
+                planFinalPublishStep = true;
+                noProgressRecoveryOnly = true;
+                noProgressRecoveryDirectiveWritten = false;
+                appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+                  kind: 'plan_final_publish_step', sourceUserSeq: identity.sourceUserSeq,
+                  stage: attempt.consequence?.stage ?? `${attempt.attemptClass}:no_new_evidence`,
+                } });
+              } else {
+                // The retained ledger already supplies the factual stop. A
+                // final model call cannot add execution evidence to that stop.
+                return stopNoProgress(attempt.consequence?.stage ?? `${attempt.attemptClass}:no_new_evidence`);
+              }
             }
             // ONE CLARIFYING BEAT, HOST-OWNED. When discovery has twice come back
             // "which account?" for the same operation with more than one connected
@@ -8187,12 +8416,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             .map((entry) => entry.identifier),
           ...settledReadToolNamesForSource(identity),
         ])];
-        permittedNoProgressRecoveryToolNames = hostNoProgressRecoveryToolNames(
-          consequence ?? null,
-          tools.map((tool) => tool.name),
-          provenReads,
-          turnIsPlanMode(),
-        );
+        permittedNoProgressRecoveryToolNames = planFinalPublishStep
+          ? new Set(tools.map((tool) => tool.name).filter((name) => {
+            const bare = bareTerminalToolName(name);
+            return bare === 'publish_plan' || bare === 'ask_user_question';
+          }))
+          : hostNoProgressRecoveryToolNames(
+            consequence ?? null,
+            tools.map((tool) => tool.name),
+            provenReads,
+            turnIsPlanMode(),
+          );
         admissibleRecoveryToolNames = permittedNoProgressRecoveryToolNames;
         const recoveryTools = tools.filter((tool) => permittedNoProgressRecoveryToolNames!.has(tool.name));
         modelStepSchemas = serializedTools(recoveryTools);
@@ -8200,7 +8434,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // The model-facing steer, like the owner-facing copy above, must not
           // send a Plan turn hunting for another executable step. It owes an
           // outline, and "I could not find X" is a legitimate line in one.
-          const recoveryDirective = turnIsPlanMode()
+          const recoveryDirective = planFinalPublishStep
+            ? PLAN_FINAL_PUBLISH_DIRECTIVE
+            : turnIsPlanMode()
             ? PLAN_NO_PROGRESS_RECOVERY_DIRECTIVE
             : noProgressState
               ? hostNoProgressRecoveryDirective(noProgressState)
@@ -8264,7 +8500,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let adoptedSteering = '';
       if (hostProduction) {
         const steerIdentity = exactHostIdentity();
-        takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq);
+        const deliveredNotes = takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq);
+        captureExplicitSteerInstructions(steerIdentity.sessionId, deliveredNotes);
         adoptedSteering = formatSteerBlock(adoptedSteerNotesForSource(steerIdentity));
         if (turnIsPlanMode()) {
           const discoveries = sourceDiscoveryContext(steerIdentity);
@@ -8356,9 +8593,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && remainingModelStallRetries > 0) {
         remainingModelStallRetries -= 1;
         pendingHostModelDirective = 'The previous model response was interrupted and was not accepted. None of its tool calls executed. Continue the same task from the accepted history; previously settled tool work remains complete. Return the next complete tool call or answer without repeating settled work.';
+        const failureKind = error instanceof BoundaryError ? error.kind : classifyModelError(error).kind;
+        const undiciCode = error instanceof BoundaryError && typeof error.context?.undiciCode === 'string'
+          ? error.context.undiciCode
+          : null;
         journalHostGuide(transportInterrupted ? 'model_transport_retry' : 'model_stall_retry', {
           ...(error instanceof ModelStreamStalledError ? { preContent: error.preContent } : {}),
-          rejectedFrameExecuted: false, retriesRemaining: remainingModelStallRetries });
+          rejectedFrameExecuted: false, retriesRemaining: remainingModelStallRetries,
+          failureKind, undiciCode });
+        // Public twin of the private row: the owner surface names a model
+        // backend that did not respond instead of showing silence. The public
+        // projection publishes only `kind`.
+        if (transportInterrupted && hostProduction) {
+          try {
+            const identity = exactHostIdentity();
+            appendEvent({
+              sessionId: identity.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'stall_retry_attempted',
+              data: {
+                kind: 'model_transport_retry', layer: 'host', failureKind, undiciCode,
+                attempt: modelStreamStallRetries() - remainingModelStallRetries,
+                maxAttempts: modelStreamStallRetries() + 1,
+                retriesRemaining: remainingModelStallRetries,
+                sourceUserSeq: identity.sourceUserSeq,
+              },
+            });
+          } catch { /* telemetry never blocks the retry */ }
+        }
         stepIndex -= 1;
         continue;
       }
@@ -9332,6 +9595,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             if (consent.nestedAdmission) {
               nestedCallAdmissions.set(call.callId, consent.nestedAdmission);
             }
+            consentBases.set(call.callId, consent.decision.basis);
             // Both authored and exact accepted-call consent use the same
             // existing adapter authority. The ledger owns dispatch lineage.
             if (
@@ -9355,9 +9619,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           case 'repair':
           case 'refuse':
           case 'reconcile':
-            preApprovalRepairDiagnostics.set(call.callId, {
-              diagnostic: `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
-            });
+            if (consent.decision.kind === 'refuse'
+              && consent.decision.reason === 'plan_mode_external_effect') {
+              // The same typed planning boundary the synchronous gate answers,
+              // now naming the exact sealed operation consent classified. It
+              // instructs a current capability rather than proving one absent.
+              preApprovalRepairDiagnostics.set(call.callId, {
+                diagnostic: planModeReadOnlyRefusalText(consent.call.operationId),
+              });
+              preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
+            } else {
+              preApprovalRepairDiagnostics.set(call.callId, {
+                diagnostic: `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
+              });
+            }
             preApprovalRefused = true;
             break;
         }
@@ -9418,7 +9693,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           arguments: materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson),
         },
       }, 'sibling_frame_replanned_before_dispatch'));
-      for (const call of canonicalCalls) nestedCallAdmissions.delete(call.callId);
+      for (const call of canonicalCalls) {
+        nestedCallAdmissions.delete(call.callId);
+        consentBases.delete(call.callId);
+      }
       if (!released) {
         throw new HostCallAuthorityBoundaryError('prepared_frame_release_failed');
       }
@@ -9860,6 +10138,24 @@ export function capturedCompletionPolicy(input: {
 // The effective objective folds in steering the owner sent mid-run; see
 // steer-notes.ts for why a judge that only sees the opening request rules
 // against an objective the owner already moved on from.
+function clarificationJudgeObjective(
+  identity: { sessionId: string; sourceUserSeq: number },
+  answer: string,
+): string | null {
+  try {
+    const context = rehydrateConsumedClarificationContext({ ...identity, answer });
+    if (!context?.parentInput.trim()) return null;
+    return [
+      context.parentInput.trim(),
+      '',
+      `Clarification asked before proceeding: ${context.question.trim()}`,
+      `User's answer: ${context.answer.trim()}`,
+    ].join('\n');
+  } catch {
+    return null;
+  }
+}
+
 export function acceptedObjectiveForSource(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -9874,7 +10170,13 @@ export function acceptedObjectiveForSource(input: {
     const text = display.trim() ? display : (typeof accepted?.data.text === 'string' ? accepted.data.text : '');
     if (!text.trim()) return null;
     const mode = acceptedTaskMode(input.sessionId, input.sourceUserSeq);
-    const base = mode?.kind === 'plan'
+    // A clarification answer is not the objective. Live 2026-09-14: "Add time
+    // on Adam Long's calendar…" paused on a question, the owner answered
+    // "Scorpion cal", the event was created with NO attendee, and the judge —
+    // measuring "Scorpion cal" — passed it. The judged objective on a consumed
+    // clarification continuation is the parent task plus the exchange.
+    const clarified = mode?.kind === 'plan' ? null : clarificationJudgeObjective(input, text);
+    const base = clarified ?? (mode?.kind === 'plan'
       // A Plan turn's DELIVERABLE is the plan. "Investigate" led this
       // sentence until 2026-09-10, and a live run took it literally: it read
       // the owner's brief, then spent the rest of the turn doing the research
@@ -9889,7 +10191,7 @@ export function acceptedObjectiveForSource(input: {
         + `those inputs told you, the steps you intend to fan out, what each step produces, and in what order. Explain relevant remembered context that shaped the plan, distinguishing confirmed facts, established preferences and unverified assumptions. Do `
         + `not carry out the research in this turn. If you genuinely cannot plan without a fact you do not have, `
         + `ask the user that exact question. The user decides when to execute. User's planning objective: ${text}`
-      : acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq) ?? text;
+      : acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq) ?? text);
     // The EFFECTIVE objective, not just the opening request. Steering the owner
     // sent mid-run is part of the job; a judge that never sees it rules against
     // an objective the owner already moved on from.
@@ -9993,4 +10295,161 @@ export function completionVerdictForAcceptedSource(input: {
   } catch {
     return null;
   }
+}
+
+/** A mid-run "remember …" reaches durable memory exactly as an accepted source
+ *  would: the one explicit-memory gate decides, the same provenance predicate
+ *  admits under the note's own identity. Deferred off the model path; a
+ *  capture failure never breaks a turn. Host completion is keyed on the
+ *  accepted source, so the row is conversation-only. */
+function captureExplicitSteerInstructions(sessionId: string, notes: readonly SteerNote[]): void {
+  for (const note of notes) {
+    if (!explicitMemoryInstructionFor(note.text)) continue;
+    queueMicrotask(() => {
+      try {
+        const row = listEvents(sessionId, { sinceSeq: note.seq - 1, types: ['user_steer_note'], limit: 1 })
+          .find((candidate) => candidate.seq === note.seq);
+        if (!row) return;
+        const captured = captureInteractionSignals({
+          message: note.text,
+          sessionId,
+          sourceEventId: `user-steer:${note.seq}`,
+          sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(row),
+        });
+        if (captured.candidates.length > 0 || captured.profilePatch) {
+          appendEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'memory_signals_captured',
+            data: {
+              factCount: captured.candidates.length,
+              queuedCandidateCount: captured.queuedCandidateIds?.length ?? 0,
+              episodeId: captured.episodeId ?? null,
+              profilePatch: captured.profilePatch ?? null,
+              reasons: captured.candidates.map((c) => c.reason),
+              sourceUserSeq: null,
+              sourceSteerSeq: note.seq,
+              conversationOnly: true,
+              hostReceiptId: null,
+            },
+          });
+        }
+      } catch { /* memory capture never breaks a turn */ }
+    });
+  }
+}
+
+/** Two current catalog entries that name the same operation on the same
+ *  account, definition, schema, effect and invoke port are one capability
+ *  recorded under two objective scopes, not two capabilities. Keep one per
+ *  identity: the entry this source was shown when there is one, otherwise the
+ *  newest issuance. Entries that differ on any compared field stay apart. */
+export function collapseSameCapabilityIdentity<T extends RegisteredHostCapability>(
+  entries: readonly T[],
+  preferredCapabilityIds: ReadonlySet<string> = new Set<string>(),
+): T[] {
+  const groups = new Map<string, T[]>();
+  for (const entry of entries) {
+    const manifest = entry.manifest;
+    const key = [
+      entry.toolName,
+      entry.account ?? manifest?.accountId ?? '',
+      entry.schemaVersion,
+      entry.schemaDigest,
+      String(entry.effect),
+      manifest?.invokePortId ?? '',
+      entry.providerInputSchemaDigest ?? '',
+    ].join('\0');
+    const group = groups.get(key);
+    if (group) group.push(entry);
+    else groups.set(key, [entry]);
+  }
+  const issuedAt = (entry: T): string => entry.manifest?.provenance?.issuedAt ?? '';
+  return [...groups.values()].map((group) => group
+    .slice()
+    .sort((a, b) => (
+      Number(preferredCapabilityIds.has(b.capabilityId)) - Number(preferredCapabilityIds.has(a.capabilityId))
+      || issuedAt(b).localeCompare(issuedAt(a))
+      || b.capabilityId.localeCompare(a.capabilityId)
+    ))[0]!);
+}
+
+/** Capability refs the accepted source was shown by discovery. A tiebreak for
+ *  same-identity catalog entries only; it grants nothing. */
+function sameSourceDisclosedCapabilityIds(identity: { sessionId: string; sourceUserSeq: number }): Set<string> {
+  const ids = new Set<string>();
+  try {
+    for (const event of listEvents(identity.sessionId, { types: ['capability_discovered'] })) {
+      if (event.data.sourceUserSeq !== identity.sourceUserSeq) continue;
+      const rows = Array.isArray(event.data.capabilities) ? event.data.capabilities : [];
+      for (const raw of rows) {
+        const ref = raw && typeof raw === 'object' ? (raw as { capabilityRef?: unknown }).capabilityRef : undefined;
+        if (typeof ref === 'string' && ref) ids.add(ref);
+      }
+    }
+  } catch { /* advisory tiebreak only */ }
+  return ids;
+}
+
+/** What stopped the turn is the NEWEST tool result of this source, and only
+ *  when it failed: a concrete provider error, or a host refusal carrying a
+ *  message. An earlier error that later results moved past was recovered
+ *  from and is not the cause of the stop. Redacted and bounded. */
+export function concreteBlockerFromNewestToolResult(
+  rowsNewestFirst: ReadonlyArray<{ tool: string; result: unknown }>,
+): string | null {
+  const newest = rowsNewestFirst[0];
+  if (!newest) return null;
+  const raw = newest.result;
+  const text = typeof raw === 'string'
+    ? raw
+    : typeof raw === 'object' && raw && typeof (raw as { preview?: unknown }).preview === 'string'
+      ? String((raw as { preview: string }).preview)
+      : '';
+  const bounded = (value: string): string | null => {
+    const cleaned = redactSensitiveText(value).replace(/\s+/g, ' ').trim();
+    if (!cleaned) return null;
+    return cleaned.length > 240 ? `${cleaned.slice(0, 237)}…` : cleaned;
+  };
+  const error = /An error occurred while running the tool\.?\s*(?:Please try again\.)?\s*Error:\s*([\s\S]+)/i.exec(text);
+  if (error) return bounded(error[1]!);
+  try {
+    const parsed = JSON.parse(text) as { ok?: unknown; message?: unknown; error?: unknown };
+    if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+      const message = typeof parsed.message === 'string' ? parsed.message : typeof parsed.error === 'string' ? parsed.error : '';
+      if (message) return bounded(newest.tool ? `${newest.tool}: ${message}` : message);
+    }
+  } catch { /* not a host refusal envelope */ }
+  return null;
+}
+
+/** Surfaces that render a published plan as its own card beside the reply.
+ *  The card carries the full plan text, so the reply on these surfaces is a
+ *  lead, not a second copy. Any other channel gets the full text, because it
+ *  has no card to show. Read from the session's recorded source. */
+export function sessionRendersPlanCard(session: { channel?: string | null; metadata?: Record<string, unknown> } | null | undefined): boolean {
+  if (!session) return false;
+  const source = String(session.metadata?.source ?? '').trim().toLowerCase();
+  const channel = String(session.channel ?? '').trim().toLowerCase();
+  return source === 'desktop' || source === 'mobile' || channel === 'desktop' || channel === 'mobile';
+}
+
+/** The reply for a turn that published a plan. On a card surface: the plan's
+ *  own title line (the model's words) and one sentence pointing at the card,
+ *  plus the gaps when the plan still needs input. Elsewhere: the full plan. */
+export function publishedPlanReplyText(input: {
+  fullText: string;
+  needsInput: boolean;
+  missingPrerequisites?: readonly string[];
+  cardRendered: boolean;
+}): string {
+  const full = input.fullText.trim();
+  if (!input.cardRendered || !full) return full;
+  const title = (full.split('\n').map((line) => line.trim()).find(Boolean) ?? '').replace(/^#+\s*/, '').slice(0, 160);
+  const gaps = (input.missingPrerequisites ?? []).map((gap) => gap.trim()).filter(Boolean);
+  const tail = input.needsInput
+    ? gaps.length ? `It still needs: ${gaps.join(' ')}` : 'It still needs your input; answer in the composer.'
+    : 'Review it and Execute when you are ready.';
+  return `${title ? `${title}\n\n` : ''}The full plan is in the card below. ${tail}`;
 }

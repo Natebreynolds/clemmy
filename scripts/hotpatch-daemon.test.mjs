@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { installDaemonPatch } from './hotpatch-daemon.mjs';
+import { installDaemonPatch, resolveInstalledAppBundle } from './hotpatch-daemon.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-patch-'));
@@ -58,4 +58,15 @@ test('invalid source is rejected before staging', t => {
   fs.writeFileSync(path.join(f.sourceDist, 'runtime/build-stamp.json'), '{}');
   assert.throws(() => installDaemonPatch(f), /stamp/);
   assert.equal(fs.readFileSync(path.join(f.targetDist, 'index.js'), 'utf8'), 'old daemon');
+});
+
+test('the newest existing bundle is patched, not a hardcoded /Applications path', () => {
+  const versions = { '/Applications/Clementine.app': '3.18.6', '/Users/o/Applications/Clementine.app': '3.18.7' };
+  const read = (bundle) => { if (!(bundle in versions)) throw new Error('missing'); return versions[bundle]; };
+  assert.deepEqual(
+    resolveInstalledAppBundle(['/Applications/Clementine.app', '/Users/o/Applications/Clementine.app', '/nowhere/Clementine.app'], read),
+    { bundle: '/Users/o/Applications/Clementine.app', version: '3.18.7' },
+  );
+  assert.deepEqual(resolveInstalledAppBundle(['/Applications/Clementine.app'], read), { bundle: '/Applications/Clementine.app', version: '3.18.6' });
+  assert.throws(() => resolveInstalledAppBundle(['/nowhere/Clementine.app'], read), /No installed Clementine bundle/);
 });

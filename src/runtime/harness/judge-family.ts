@@ -14,7 +14,7 @@
  * decision into a live Model.
  */
 import { codexQuotaExhausted } from './rate-limit-store.js';
-import { getRuntimeEnv } from '../../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { classifyModelError } from './resilient-model.js';
@@ -392,7 +392,7 @@ export function boundaryClaudeJudgeModel(): string {
  *  BYO/GLM model (e.g. glm-5.2), which would mis-route a "codex" judge onto the
  *  wrong provider. Tunable; defaults to the canonical cheap gpt id. */
 export function boundaryCodexJudgeModel(): string {
-  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL', '') || '').trim() || 'gpt-5.4-mini';
+  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL', '') || '').trim() || DEFAULT_CODEX_FAST_MODEL;
 }
 
 /** PURE family decision: the cheapest model+provider from a family DIFFERENT than

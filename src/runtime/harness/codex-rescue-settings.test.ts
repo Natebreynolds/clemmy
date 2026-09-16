@@ -7,6 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRoleOptionCatalogSnapshot } from './model-role-options.js';
+import { DEFAULT_CODEX_MODEL } from '../../config.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-codex-rescue-settings-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -40,14 +41,14 @@ test('settings reports a truthful Codex default when the primary slot belongs to
 
     const inherited = codexRescueSettingsSnapshot(catalog);
     assert.equal(inherited.configured, false);
-    assert.equal(inherited.modelId, 'gpt-5.4');
-    assert.equal(inherited.inheritedModelId, 'gpt-5.4');
+    assert.equal(inherited.modelId, DEFAULT_CODEX_MODEL);
+    assert.equal(inherited.inheritedModelId, DEFAULT_CODEX_MODEL);
 
     process.env.OPENAI_MODEL_RESCUE = 'gpt-5.6-luna';
     const explicit = codexRescueSettingsSnapshot(catalog);
     assert.equal(explicit.configured, true);
     assert.equal(explicit.modelId, 'gpt-5.6-luna');
-    assert.equal(explicit.inheritedModelId, 'gpt-5.4');
+    assert.equal(explicit.inheritedModelId, DEFAULT_CODEX_MODEL);
 
     assert.throws(
       () => persistCodexRescueModel('glm-5.3', catalog),

@@ -20,6 +20,7 @@ const {
   normalizeCertifiedIdentityValue,
   pinDispatchFromChoice,
   resolveCertifiedStepOutput,
+  settledPinArgumentShape,
   workflowStepPinIntent,
 } = await import('./workflow-certified-binding.js');
 
@@ -238,6 +239,27 @@ test('workflowStepPinIntent is the existing tool-choice key', () => {
     workflowStepPinIntent('scorpion-facebook-trends', 'scrape_and_analyze'),
     'workflow:scorpion-facebook-trends:scrape_and_analyze',
   );
+});
+
+test('settledPinArgumentShape names nested write fields without copying values', () => {
+  const template = JSON.stringify({
+    spreadsheet_id: 'sheet-secret',
+    insert_dimension: {
+      range: { sheet_id: 7, dimension: 'ROWS', start_index: 1, end_index: 2 },
+      inherit_from_before: false,
+    },
+  });
+  const shape = settledPinArgumentShape(template);
+  assert.deepEqual(shape, [
+    '/spreadsheet_id',
+    '/insert_dimension/range/sheet_id',
+    '/insert_dimension/range/dimension',
+    '/insert_dimension/range/start_index',
+    '/insert_dimension/range/end_index',
+    '/insert_dimension/inherit_from_before',
+  ]);
+  assert.equal(shape.join(' ').includes('sheet-secret'), false);
+  assert.deepEqual(settledPinArgumentShape('{not json'), []);
 });
 
 test('cleanup tmp home', () => {

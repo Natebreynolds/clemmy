@@ -52,6 +52,8 @@ interface PlanContext {
   maxSchemaSteps: number;
   maxFileNodes: number;
   schemaSteps: number;
+  /** false when no annotation exists anywhere: provider regexes are then inert. */
+  grantsFileAuthority: boolean;
 }
 
 const DEFAULT_MAX_DEPTH = 64;
@@ -192,6 +194,13 @@ function resolveInternalRef(ref: unknown, context: PlanContext, pointer: string)
   return asSchema(current, pointer);
 }
 
+/** Schema keywords whose object VALUE is a map of names → subschemas. Keys
+ * under them are property/definition names, not keywords: a provider property
+ * literally called "pattern" (Outlook's recurrence.pattern) is data, not a
+ * regular expression. Live 2026-09-15: every calendar-event update was refused
+ * pre-dispatch as unsupported_pattern although the call never sent recurrence. */
+const SCHEMA_NAME_MAP_KEYWORDS = new Set(['properties', '$defs', 'definitions', 'dependentSchemas']);
+
 function preflightClosedGraph(
   value: unknown,
   context: PlanContext,
@@ -199,6 +208,7 @@ function preflightClosedGraph(
   depth: number,
   graphKind: 'schema' | 'runtime',
   active: Set<object>,
+  keysAreNames = false,
 ): void {
   bump(context, pointer, depth);
   if (value === null || typeof value !== 'object') return;
@@ -250,7 +260,10 @@ function preflightClosedGraph(
     for (const key of Object.keys(value).sort(compareUtf8)) {
       assertAllowedPointerSegment(key, pointer);
       const nextPointer = childPointer(pointer, key);
-      if (graphKind === 'schema' && (key === 'pattern' || key === 'patternProperties')) {
+      if (graphKind === 'schema' && !keysAreNames && (key === 'pattern' || key === 'patternProperties')) {
+        // Provider regexes are refused only where they could shape FILE
+        // authority. A schema that grants none is not a hoop to trip on.
+        if (!context.grantsFileAuthority) continue;
         throw new StagedFileTransferPlanError(
           'unsupported_pattern',
           'provider regular expressions are not accepted for staged file authority',
@@ -272,7 +285,10 @@ function preflightClosedGraph(
           }
         }
       }
-      preflightClosedGraph(child.value, context, nextPointer, depth + 1, graphKind, active);
+      preflightClosedGraph(
+        child.value, context, nextPointer, depth + 1, graphKind, active,
+        graphKind === 'schema' && !keysAreNames && SCHEMA_NAME_MAP_KEYWORDS.has(key),
+      );
     }
   } finally {
     active.delete(value);
@@ -287,7 +303,7 @@ function schemaList(value: unknown, pointer: string): JsonSchema[] {
   return value.map((entry) => asSchema(entry, pointer));
 }
 
-function assertNoUnsupportedSchemaAuthority(schema: Record<string, unknown>, pointer: string): void {
+function assertNoUnsupportedSchemaAuthority(schema: Record<string, unknown>, pointer: string, context?: PlanContext): void {
   for (const key of [
     '$dynamicRef',
     '$recursiveRef',
@@ -303,6 +319,7 @@ function assertNoUnsupportedSchemaAuthority(schema: Record<string, unknown>, poi
     }
   }
   for (const key of ['pattern', 'patternProperties']) {
+    if (context && !context.grantsFileAuthority) break;
     if (Object.prototype.hasOwnProperty.call(schema, key)) {
       throw new StagedFileTransferPlanError(
         'unsupported_pattern',
@@ -375,7 +392,7 @@ function matchesSchema(
 ): boolean {
   bump(context, pointer, depth);
   if (typeof schema === 'boolean') return schema;
-  assertNoUnsupportedSchemaAuthority(schema, pointer);
+  assertNoUnsupportedSchemaAuthority(schema, pointer, context);
 
   const ref = schemaProperty(schema, '$ref', pointer);
   if (ref !== undefined && !matchesSchema(resolveInternalRef(ref, context, pointer), value, context, pointer, depth + 1)) {
@@ -624,7 +641,7 @@ function walkSchema(
   const pointer = encodePointer(tokens);
   bump(context, pointer, depth);
   if (typeof schema === 'boolean') return;
-  assertNoUnsupportedSchemaAuthority(schema, pointer);
+  assertNoUnsupportedSchemaAuthority(schema, pointer, context);
 
   const ref = schemaProperty(schema, '$ref', pointer);
   if (ref !== undefined) {
@@ -758,6 +775,23 @@ function walkSchema(
   }
 }
 
+/** Bounded, cycle-safe: does this schema graph mention the annotation key
+ * anywhere? A schema that never grants file authority has nothing for the
+ * strict preflight to protect; refusing such a call over an unrelated schema
+ * feature is a hoop (live 2026-09-15: every Outlook event update was refused
+ * over a property named "pattern" with no file argument in play). */
+function schemaMentionsAnnotation(value: unknown, annotation: StagedFileAnnotation, seen = new Set<object>(), depth = 0): boolean {
+  if (depth > DEFAULT_MAX_DEPTH || value === null || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((entry) => schemaMentionsAnnotation(entry, annotation, seen, depth + 1));
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (key === annotation && child) return true;
+    if (schemaMentionsAnnotation(child, annotation, seen, depth + 1)) return true;
+  }
+  return false;
+}
+
 function buildPlan(
   annotation: StagedFileAnnotation,
   schemaValue: unknown,
@@ -772,6 +806,7 @@ function buildPlan(
     maxSchemaSteps: positiveLimit(options.maxSchemaSteps, DEFAULT_MAX_SCHEMA_STEPS),
     maxFileNodes: positiveLimit(options.maxFileNodes, DEFAULT_MAX_FILE_NODES),
     schemaSteps: 0,
+    grantsFileAuthority: schemaMentionsAnnotation(rootSchema, annotation),
   };
   preflightClosedGraph(rootSchema, context, '', 0, 'schema', new Set<object>());
   context.schemaSteps = 0;

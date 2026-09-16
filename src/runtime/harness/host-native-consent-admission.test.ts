@@ -123,7 +123,14 @@ test('native admission refuses forged tokens, changed arguments, source mutation
   assert.notEqual(changedSource.status, 'decided');
   const planning = await fixture('plan');
   const planned = await consent.evaluateUncoveredHostMutationConsent(planning.request);
-  assert.equal(planned.status, 'conflict', 'Plan can never mint this ordinary native execution handoff');
+  // Plan can never mint this ordinary native execution handoff: it is a typed
+  // refusal the model can act on (never a card, never a nested admission).
+  assert.equal(planned.status, 'decided', JSON.stringify(planned));
+  if (planned.status === 'decided') {
+    assert.equal(planned.decision.kind, 'refuse');
+    assert.equal((planned.decision as { reason?: string }).reason, 'plan_mode_external_effect');
+    assert.equal(planned.nestedAdmission, undefined);
+  }
 });
 
 test('current schema is revalidated at invocation; reopen can reevaluate only the same disclosed source', async () => {

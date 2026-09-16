@@ -184,3 +184,67 @@ test('another accepted source does not enter this source preview', () => {
   assert.equal(heldInventory(id.sessionId, id.sourceUserSeq).total, 1);
   assert.equal(heldInventory(id.sessionId, other.sourceUserSeq).total, 1);
 });
+
+// NAMED vs MERELY HELD. A discovery window returns the requested toolkit's
+// neighbours as a matter of course, and every one of them lands here as a
+// proven row. Counting them is honest; advertising them is not — a watching
+// person read a neighbour's name as "she went off to a service I never asked
+// for". `named` is the evidence that separates the two: the producing query
+// contained the toolkit's own token, or a read already used the toolkit.
+test('a toolkit is named only when the query contained its token or a read used it', () => {
+  const id = turn();
+  eventlog.appendEvent({
+    sessionId: id.sessionId, turn: 1, role: 'system', type: 'capability_resolution',
+    data: {
+      sourceUserSeq: id.sourceUserSeq,
+      entries: [
+        { kind: 'composio', identifier: 'ASKEDKIT_SEND_MESSAGE', status: 'proven', connection: 'active', matchedTokens: ['askedkit', 'send', 'message'] },
+        { kind: 'composio', identifier: 'NEIGHBOURKIT_SEND_MESSAGE', status: 'proven', connection: 'active', matchedTokens: ['send', 'message'] },
+      ],
+    },
+  });
+  const held = heldInventory(id.sessionId, id.sourceUserSeq);
+  assert.equal(held.total, 2, 'both operations are counted — the total never hides what was resolved');
+  assert.equal(held.toolkitCount, 2);
+  const byName = Object.fromEntries(held.toolkits.map((entry) => [entry.toolkit, entry.named]));
+  assert.equal(byName.ASKEDKIT, true, 'the query contained this toolkit\'s own token');
+  assert.equal(byName.NEIGHBOURKIT, false, 'generic verbs in common do not name a toolkit');
+
+  // Actually using the neighbour names it: a read receipt is stronger
+  // evidence than any query token.
+  eventlog.appendEvent({
+    sessionId: id.sessionId, turn: 1, role: 'system', type: 'read_receipt',
+    data: { sourceUserSeq: id.sourceUserSeq, record: { identifier: 'NEIGHBOURKIT_GET_CHANNEL', effectClass: 'read', dispatchOutcome: 'succeeded', receiptId: 'fixture-neighbour', readEvidenceRef: 'evt:neighbour' } },
+  });
+  const used = heldInventory(id.sessionId, id.sourceUserSeq);
+  assert.equal(Object.fromEntries(used.toolkits.map((entry) => [entry.toolkit, entry.named])).NEIGHBOURKIT, true);
+  assert.equal(used.total, 2, 'a read receipt is not a resolved operation');
+});
+
+test('legacy rows without match evidence are held but never named', () => {
+  const id = turn();
+  prove(id, 'LEGACYKIT_OP_A', 'LEGACYKIT_OP_B');
+  const held = heldInventory(id.sessionId, id.sourceUserSeq);
+  assert.equal(held.total, 2);
+  assert.deepEqual(held.toolkits.map((entry) => entry.named), [false]);
+  // Case is not evidence: the stamped token is compared case-insensitively.
+  eventlog.appendEvent({
+    sessionId: id.sessionId, turn: 1, role: 'system', type: 'capability_resolution',
+    data: { sourceUserSeq: id.sourceUserSeq, entries: [
+      { kind: 'composio', identifier: 'LEGACYKIT_OP_C', status: 'proven', connection: 'active', matchedTokens: ['LegacyKit'] },
+    ] },
+  });
+  assert.deepEqual(heldInventory(id.sessionId, id.sourceUserSeq).toolkits.map((entry) => entry.named), [true]);
+});
+
+test('naming is sticky per operation across a later carry-forward without the field', () => {
+  const id = turn();
+  eventlog.appendEvent({
+    sessionId: id.sessionId, turn: 1, role: 'system', type: 'capability_resolution',
+    data: { sourceUserSeq: id.sourceUserSeq, entries: [
+      { kind: 'composio', identifier: 'STICKYKIT_OP', status: 'proven', connection: 'active', matchedTokens: ['stickykit'] },
+    ] },
+  });
+  prove(id, 'STICKYKIT_OP');
+  assert.deepEqual(heldInventory(id.sessionId, id.sourceUserSeq).toolkits.map((entry) => entry.named), [true]);
+});

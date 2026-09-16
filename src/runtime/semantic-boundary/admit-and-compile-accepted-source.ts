@@ -4,6 +4,7 @@
  * text or constructed authority.
  */
 import { createHash } from 'node:crypto';
+import { markTurnClock } from '../harness/turn-clock.js';
 import type Database from 'better-sqlite3';
 import { getRuntimeEnv } from '../../config.js';
 import {
@@ -70,6 +71,7 @@ import {
   turnGraphFromShadowEvent,
 } from '../graph/turn-graph-shadow.js';
 import {
+  continuationInheritsParentCapabilities,
   rehydrateConsumedClarificationContext,
   verifyDurableClarificationContext,
 } from '../harness/task-continuity-runtime.js';
@@ -732,6 +734,9 @@ function upgradeLegacyComposioProviderDefinition(input: {
 const primaryModelPlanningCatalogs = new WeakMap<object, {
   sessionId: string;
   sourceUserSeq: number;
+  /** Parent sources (same session) whose durable disclosures this source
+   * replays because it answers their undeclined continuation. */
+  inheritedSourceUserSeqs: readonly number[];
   objective: string;
   effectCeiling: HostCapabilityDescriptorV1['effect'];
   withheld: PlanningCardWithheldV1[];
@@ -753,6 +758,11 @@ export interface PrimaryModelPlanningCatalogAuthorityV1 {
 export interface HostFreshPlanningContextV1 {
   readonly authority: PrimaryModelPlanningCatalogAuthorityV1;
   readonly identity: Readonly<{ sessionId: string; sourceUserSeq: number }>;
+  /** Same-session parent sources whose durable disclosures this source
+   * inherited (an undeclined continuation answer). Readers keyed on
+   * `sourceUserSeq` widen to these so an inherited disclosure and its
+   * settled account choice are not re-asked on the answering turn. */
+  readonly inheritedSourceUserSeqs?: readonly number[];
   readonly capabilities: readonly HostCapabilityDescriptorV1[];
   readonly digest: string;
   readonly effectCeiling: HostCapabilityDescriptorV1['effect'];
@@ -781,6 +791,7 @@ export function snapshotPrimaryModelPlanningContext(
       sessionId: catalog.sessionId,
       sourceUserSeq: catalog.sourceUserSeq,
     }),
+    inheritedSourceUserSeqs: Object.freeze([...catalog.inheritedSourceUserSeqs]),
     capabilities: Object.freeze(catalog.capabilities.map((descriptor) => Object.freeze({
       ...descriptor,
       acceptedInputKinds: Object.freeze([...descriptor.acceptedInputKinds]),
@@ -1429,17 +1440,32 @@ function replayedLocalPlanningDefinition(value: unknown): AuthorizedLocalPlannin
   };
 }
 
+/** Replay the durable `capability_discovered` rows this source may cite: its
+ * own, plus the parent sources of an undeclined continuation it answers
+ * (`inheritedSourceUserSeqs`, always session-scoped). Every row, own or
+ * inherited, is re-proven below against the CURRENT catalog — a parent row
+ * whose manifest or definition drifted drops exactly like an own-source row.
+ * The `capability_resolution` proof set stays own-source: an inherited
+ * provider row not known to the live catalog is not promoted on the parent's
+ * proof. */
 async function durablePlanningDisclosures(input: {
   sessionId: string;
   sourceUserSeq: number;
+  inheritedSourceUserSeqs?: readonly number[];
   byName: ReadonlyMap<string, PrimaryModelPlanningDisclosureV1>;
 }): Promise<{
   descriptors: HostCapabilityDescriptorV1[];
   stagedById: Map<string, StagedPrimaryModelPlanningCapabilityV1>;
+  /** Ids replayed from this source's OWN rows. Inherited rows are staged for
+   * planning but leave no durable row under this source, so a callable the
+   * index re-observes must still be published for it. */
+  ownDurableIds: Set<string>;
 }> {
   const out = new Map<string, HostCapabilityDescriptorV1>();
   const stagedById = new Map<string, StagedPrimaryModelPlanningCapabilityV1>();
+  const ownDurableIds = new Set<string>();
   const proven = new Set<string>();
+  const disclosingSources = new Set<number>([input.sourceUserSeq, ...(input.inheritedSourceUserSeqs ?? [])]);
   for (const event of listEvents(input.sessionId, { types: ['capability_resolution'] })) {
     if (event.data.sourceUserSeq !== input.sourceUserSeq || event.data.authoritativeForTask === false) continue;
     const entries = Array.isArray(event.data.entries) ? event.data.entries : [];
@@ -1461,7 +1487,8 @@ async function durablePlanningDisclosures(input: {
     }
   }
   for (const event of listEvents(input.sessionId, { types: ['capability_discovered'] })) {
-    if (event.data.sourceUserSeq !== input.sourceUserSeq) continue;
+    if (typeof event.data.sourceUserSeq !== 'number' || !disclosingSources.has(event.data.sourceUserSeq)) continue;
+    const ownRow = event.data.sourceUserSeq === input.sourceUserSeq;
     const rows = Array.isArray(event.data.capabilities) ? event.data.capabilities : [];
     for (const raw of rows) {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
@@ -1487,6 +1514,7 @@ async function durablePlanningDisclosures(input: {
         };
         stagedById.set(staged.descriptor.id, staged);
         out.set(staged.descriptor.id, staged.descriptor);
+        if (ownRow) ownDurableIds.add(staged.descriptor.id);
         continue;
       }
       const match = input.byName.get(identifier);
@@ -1530,6 +1558,7 @@ async function durablePlanningDisclosures(input: {
             : {}),
         });
         out.set(match.descriptor.id, match.descriptor);
+        if (ownRow) ownDurableIds.add(match.descriptor.id);
         continue;
       }
       const descriptor = replayedPlanningDescriptor(row.descriptor);
@@ -1575,9 +1604,27 @@ async function durablePlanningDisclosures(input: {
       };
       stagedById.set(descriptor.id, staged);
       out.set(descriptor.id, descriptor);
+      if (ownRow) ownDurableIds.add(descriptor.id);
     }
   }
-  return { descriptors: [...out.values()], stagedById };
+  return { descriptors: [...out.values()], stagedById, ownDurableIds };
+}
+
+/** Parent sources whose durable disclosures an answering source replays:
+ * the consumed packet's originating source and, on a chained question, its
+ * root. Only a consumed continuation whose disposition inherits (never a
+ * decline) widens; the packet's own capability evidence is never consulted —
+ * every inherited row is re-proven by durablePlanningDisclosures. */
+function inheritedPlanningSourceSeqs(
+  consumed: ReturnType<typeof readConsumedTaskContinuityPacket>,
+  continuation: TaskContinuationContext | null,
+): number[] {
+  if (consumed.status !== 'consumed' || !continuation) return [];
+  if (!continuationInheritsParentCapabilities(continuation.disposition)) return [];
+  const originating = consumed.packet.originatingSourceUserSeq;
+  const root = consumed.packet.rootSourceUserSeq ?? originating;
+  return [...new Set([originating, root])]
+    .filter((seq) => Number.isSafeInteger(seq) && seq > 0);
 }
 
 interface DurableInitialPlanningCardV1 {
@@ -1724,7 +1771,26 @@ function parseDurableInitialPlanningCard(input: {
 
   for (const descriptor of exactCapabilities) {
     const current = input.currentById.get(descriptor.id);
-    if (!current || JSON.stringify(current) !== JSON.stringify(descriptor)) {
+    // Identity is what the card admitted: the capability, its effect, the
+    // account it operates in, the manifest it was attested under, and its
+    // destination/deliverable contract. Advisory fields (purpose wording,
+    // advisory roles, shape summaries) are re-derived per process and may
+    // differ after a restart without any change to what the model may call.
+    // Refusing on those parked every Execute that followed a daemon restart.
+    if (!current) {
+      // No live row yet — the process just started and the provider carrier
+      // has not re-attested this manifest (the resume ran two seconds after
+      // boot). The durable manifest under the same id, digest and current
+      // lifecycle IS the identity the card admitted; callability is proven
+      // again at revalidation and at dispatch, never here.
+      const durable = peekCapabilityManifestStore()?.get(descriptor.id);
+      if (durable && durable.digest === descriptor.manifestDigest && durable.manifest.lifecycle?.state === 'current') continue;
+      return {
+        ok: false,
+        reason: `durable initial planning card capability drifted: ${descriptor.id} (no current row)`,
+      };
+    }
+    if (!planningDescriptorIdentityMatches(current, descriptor)) {
       return {
         ok: false,
         reason: `durable initial planning card capability drifted: ${descriptor.id}`,
@@ -1757,10 +1823,25 @@ function parseDurableInitialPlanningCard(input: {
   };
 }
 
+const PLANNING_DESCRIPTOR_IDENTITY_FIELDS = [
+  'id', 'effect', 'accountScope', 'manifestDigest', 'destinationPosture', 'destinationPostures',
+  'deliverableKind', 'handleRequired', 'readbackRequired', 'evidenceKinds',
+] as const;
+
+function planningDescriptorIdentityMatches(current: HostCapabilityDescriptorV1, stored: HostCapabilityDescriptorV1): boolean {
+  const pick = (descriptor: HostCapabilityDescriptorV1) =>
+    JSON.stringify(PLANNING_DESCRIPTOR_IDENTITY_FIELDS.map((key) => (descriptor as unknown as Record<string, unknown>)[key] ?? null));
+  return pick(current) === pick(stored);
+}
+
 /** The one bounded repack rule for same-source disclosures, shared by the
  * in-process foreground tool_search lane and a re-prime that replays this
  * source's durable disclosures (a resumed source in another process must see
- * the same card the model was already shown). The admitted card is the base
+ * the same card the model was already shown). "Same source" means the
+ * source's own disclosures plus an undeclined continuation's parent sources:
+ * an answer to a Plan question is a new accepted source, and it must reach
+ * the card its parent already earned instead of discovering from zero. The
+ * admitted card is the base
  * and the advisory ordering; disclosed rows are preferred so unrelated live
  * rows cannot displace them; only disclosed writes may lift the ceiling (an
  * unrelated factory write must not turn a read ask into a write card); every
@@ -1895,8 +1976,9 @@ export async function primePrimaryModelPlanningCatalog(input: {
     reason,
   });
   let durableContinuation: TaskContinuationContext | null;
+  let consumed: ReturnType<typeof readConsumedTaskContinuityPacket> = { status: 'none' };
   try {
-    const consumed = readConsumedTaskContinuityPacket({
+    consumed = readConsumedTaskContinuityPacket({
       sessionId: input.sessionId,
       consumingSourceUserSeq: input.sourceUserSeq,
     });
@@ -2137,9 +2219,11 @@ export async function primePrimaryModelPlanningCatalog(input: {
     preferredLiveIds: learnedCurrentIds,
     effectCeiling: planningEffectCeilingForAcceptedRequest(objective),
   });
+  const inheritedSourceUserSeqs = inheritedPlanningSourceSeqs(consumed, durableContinuation);
   const replayed = await durablePlanningDisclosures({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
+    inheritedSourceUserSeqs,
     byName: disclosureByName,
   });
   // Staging alone is not enough to make a primed operation CALLABLE. The direct
@@ -2170,7 +2254,7 @@ export async function primePrimaryModelPlanningCatalog(input: {
     localAuthority: AuthorizedLocalPlanningDefinitionV1;
   }> = [];
   for (const definition of indexedLocalDefinitions) {
-    const alreadyDurable = replayed.stagedById.has(definition.capabilityRef);
+    const alreadyDurable = replayed.ownDurableIds.has(definition.capabilityRef);
     replayed.stagedById.set(definition.capabilityRef, {
       descriptor: definition.descriptor,
       identifier: definition.name,
@@ -2200,6 +2284,7 @@ export async function primePrimaryModelPlanningCatalog(input: {
       type: 'capability_discovered',
       data: { sourceUserSeq: input.sourceUserSeq, capabilities: primedLocalAuthority },
     });
+    markTurnClock(input.sessionId, 'capability_discovered');
   }
   const allowedById = new Map<string, HostCapabilityDescriptorV1>();
   for (const descriptor of [...ranked.capabilities, ...replayed.descriptors]) {
@@ -2279,6 +2364,7 @@ export async function primePrimaryModelPlanningCatalog(input: {
   primaryModelPlanningCatalogs.set(authority, {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
+    inheritedSourceUserSeqs: Object.freeze([...inheritedSourceUserSeqs]),
     objective,
     effectCeiling: card.effectCeiling,
     withheld: card.withheld,
@@ -2727,7 +2813,7 @@ export type PrepareDurableAcceptedTurnCompileResult =
     }
   | { ok: false; reason: string };
 
-function carryExactDestinationBinding(input: {
+export function carryExactDestinationBinding(input: {
   clamped: AdmittedClampedSemanticsV1;
   binding: CanonicalDestinationBindingV1;
   /** One additional exactly-bound destination per FURTHER planned write.
@@ -2743,14 +2829,22 @@ function carryExactDestinationBinding(input: {
     family: string;
   }[];
 }): { ok: true; clamped: AdmittedClampedSemanticsV1 } | { ok: false; reason: string } {
-  const destination = input.clamped.destination;
-  const destinations = input.clamped.destinations;
-  if (!destination) {
+  const admittedDestination = input.clamped.destination;
+  if (!admittedDestination) {
     return { ok: false, reason: 'destination binding has no admitted destination' };
   }
-  if (destination.posture !== input.binding.posture) {
-    return { ok: false, reason: 'destination binding posture does not match admitted destination' };
-  }
+  // The bound operation's posture wins. The admitted posture is derived from
+  // request wording; the binding's comes from the operation the plan actually
+  // selected (its verb, or its verified mutation target). A mismatch is
+  // shape, not safety: live 2026-09-15 "edit this event" was admitted as
+  // create_new and the model's correct named_existing plan was refused, so it
+  // re-planned the edit as a create. Adopt, never refuse.
+  const destination = admittedDestination.posture === input.binding.posture
+    ? admittedDestination
+    : { ...admittedDestination, posture: input.binding.posture };
+  const destinations = input.clamped.destinations?.map((entry) => (
+    entry.posture === input.binding.posture ? entry : { ...entry, posture: input.binding.posture }
+  ));
   if (destinations && destinations.length !== 1) {
     return { ok: false, reason: 'one destination binding cannot authorize multiple admitted destinations' };
   }

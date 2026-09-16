@@ -512,6 +512,21 @@ test('reduceActivity never pins a compiled-graph plan row', () => {
   assert.equal(next.length, 0);
 });
 
+test('progressLabel names a model transport retry as the backend not responding, and keeps the malformed-reply wording otherwise', () => {
+  assert.equal(
+    progressLabel(ev('stall_retry_attempted', { kind: 'model_transport_retry' })),
+    'The model backend didn’t respond — retrying…',
+  );
+  assert.equal(
+    progressLabel(ev('stall_retry_attempted', { kind: 'structured_decision' })),
+    'That reply came back malformed — retrying…',
+  );
+  assert.equal(
+    progressLabel(ev('stall_retry_attempted', {})),
+    'That reply came back malformed — retrying…',
+  );
+});
+
 test('progressLabel names the live work, not the compiled topology', () => {
   assert.equal(
     progressLabel(ev('turn_graph_compiled', { route: 'retrieve', fastPath: 'single_retrieval', nodeCount: 10 })),

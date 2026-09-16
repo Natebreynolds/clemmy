@@ -553,6 +553,13 @@ export function withTimeout<T>(
  */
 export const DEFAULT_TIMEOUTS_MS = {
   default: 60_000,
+  /**
+   * tool_search is a READ. Its broker budget is 30s. The host used to use
+   * `default` (60s), so a missed/hung search sat until the wrapper killed it
+   * (live Platform 49: two `timed_out` rows at ~60s). Keep a small settlement
+   * margin above the broker clock; never a work-budget 60s.
+   */
+  discovery: 35_000,
   shell: 600_000,
   externalApi: 300_000,
   mcp: 600_000,
@@ -618,6 +625,7 @@ function nestedDispatchCarrierInputIsStructurallyValid(
 /** Pick a default timeout from the tool name. */
 export function timeoutForTool(toolName: string): number {
   if (isNestedDispatchCarrier(toolName)) return DEFAULT_TIMEOUTS_MS.dispatcher;
+  if (toolName === 'tool_search') return DEFAULT_TIMEOUTS_MS.discovery;
   if (toolName === 'run_shell_command') return DEFAULT_TIMEOUTS_MS.shell;
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
@@ -2790,7 +2798,15 @@ export function wrapToolForHarness<T extends WrappableTool>(
   ): Promise<BracketOutcome | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
-    const modeRefusal = planModeCallRefusal({ mode: acceptedTaskMode(ctx.sessionId, ctx.sourceUserSeq), toolName: tool.name, args: parsedInput });
+    // The production host seals an exact call before invoking it here, and
+    // consent has already answered a sealed external write in Plan mode
+    // (probe once, or the typed refusal). Hand that fact to the gate so this
+    // inner seam does not re-refuse the one call consent admitted.
+    const sealed = currentHostCallAttestation();
+    const modeRefusal = planModeCallRefusal({
+      mode: acceptedTaskMode(ctx.sessionId, ctx.sourceUserSeq), toolName: tool.name, args: parsedInput,
+      ...(sealed ? { attestedEffect: sealed.effect, attested: true } : {}),
+    });
     if (modeRefusal) throw new Error(modeRefusal);
 
     // 0. Physical-attempt authority. This must precede counters, artifact

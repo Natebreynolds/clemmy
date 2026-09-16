@@ -106,7 +106,7 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   // reads offered in place of a write. It re-searched eighteen times and the
   // turn died. Proven writes now share the read discovery path; planning is
   // for work topology, not a second capability-acquisition door.
-  const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
+  const { hostProvenOperationRepair, carrierInnerJsonProblem, hostCarrierInnerJsonRepair } = await import('./host-turn-runner.js');
   const foreign = [
     'GREENHOUSE_CREATE_USER_EMAIL', 'OPENAI_CREATE_MESSAGE', 'AIRTABLE_CREATE_RECORD',
     'SLACK_GET_WORKSPACE_CONNECTIONS_FOR_CHANNEL', 'FIRECRAWL_SEARCH',
@@ -128,6 +128,26 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
 
   // No same-toolkit proof at all: still names the door, still refuses to
   // substitute another provider.
+  // Live 2026-09-14: a requirement_id reused from the previous turn was
+  // refused (catalog_entry_or_manifest_missing) while the operation sat in the
+  // proven list; the sentence "do not repeat unchanged discovery" left no door.
+  const staleRef = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR',
+    provenOperations: ['OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR', 'OUTLOOK_GET_CALENDAR_VIEW'],
+    missReason: 'catalog_entry_or_manifest_missing:candidates=0:proven=none',
+  });
+  assert.match(staleRef, /discovered for an earlier request in this conversation/);
+  assert.match(staleRef, /Call tool_search for OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR once now/);
+  assert.doesNotMatch(staleRef, /do not guess a requirement_id or repeat unchanged discovery/);
+  // Live 2026-09-15: a truncated args_json was refused as "inner name missing".
+  const broken = { requirement_id: 'update_adam_invite', name: 'composio_execute_tool', args_json: '{"tool_slug":"OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR","arguments":{"body":{"content":"<p>cut' };
+  const problem = carrierInnerJsonProblem(broken);
+  assert.ok(problem && /args_json is not valid JSON/.test(problem), problem ?? 'no problem reported');
+  assert.equal(carrierInnerJsonProblem({ args_json: '{"tool_slug":"X","arguments":{}}' }), null);
+  assert.equal(carrierInnerJsonProblem({ args_json: { tool_slug: 'X' } }), null, 'an object is not a parse problem');
+  const repairText = hostCarrierInnerJsonRepair('work_call', problem!);
+  assert.match(repairText, /args_json as ONE complete, valid JSON string/);
+  assert.doesNotMatch(repairText, /inner name/);
   const wrongProvider = hostProvenOperationRepair({
     requestedOperation: 'OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE',
     provenOperations: foreign,
@@ -155,6 +175,31 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),
     /No operation is bound to this turn yet/,
   );
+
+  // A reviewed-CLI identity is lowercase; the repair names it as-is with its
+  // args_json map, never an uppercased slug that does not exist.
+  const { CLI_CATALOG } = await import('../../integrations/cli-catalog/catalog.js');
+  const reviewedRead = CLI_CATALOG.find((entry) => entry.reviewedRead)?.reviewedRead;
+  assert.ok(reviewedRead);
+  const shellMatched = hostProvenOperationRepair({
+    requestedOperation: 'RUN_SHELL_COMMAND',
+    provenOperations: [],
+    missReason: `reviewed_cli_shell_matched:${reviewedRead!.operationId}`,
+  });
+  assert.match(shellMatched, new RegExp(`Use ${reviewedRead!.operationId} instead of run_shell_command`));
+  assert.match(shellMatched, new RegExp(`call work_call with name ${reviewedRead!.operationId} and args_json \\{`));
+  for (const argument of reviewedRead!.arguments) {
+    assert.match(shellMatched, new RegExp(`${JSON.stringify(argument.name)} ← ${argument.token ?? argument.name}`));
+  }
+  assert.match(shellMatched, /keep the requirement_id/);
+  assert.match(shellMatched, /no tool_search is needed/);
+  assert.doesNotMatch(shellMatched, new RegExp(reviewedRead!.operationId.toUpperCase()));
+  const lowercaseRequested = hostProvenOperationRepair({
+    requestedOperation: reviewedRead!.operationId,
+    provenOperations: [],
+  });
+  assert.match(lowercaseRequested, new RegExp(`${reviewedRead!.operationId} is not proven for this step`));
+  assert.doesNotMatch(lowercaseRequested, new RegExp(reviewedRead!.operationId.toUpperCase()));
 
   // ASK, DO NOT SUBSTITUTE. When the host knows the operation exists and the
   // only missing fact is which connected account it runs as, the refusal is an
@@ -9688,6 +9733,139 @@ test('retained review feedback rejects foreign sources and yields to actual deli
   assert.equal(eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] }).length, 0);
 });
 
+test('a delivered mid-run "remember …" steer reaches durable memory; a plain steer does not', async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-steer-memory-${++acceptedSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Draft the three follow-up emails.' } });
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:1` } };
+  // Not taken here: the host must deliver the notes itself on its model request.
+  const plain = steering.appendSteerNote(session.id, 'Keep them short.');
+  const remembered = steering.appendSteerNote(session.id, 'remember subject: Harbor follow-up');
+  const state = new HostInterruptState([{ role: 'user', content: source.data.text as string }] as never,
+    [], undefined, 'host_v1', undefined, undefined, 1);
+  const model = scriptedRecordingModel([[textMsg('Drafted.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, HostInterruptState.fromString(state.toString()) as never,
+    { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
+  ));
+  assert.equal(result.finalOutput, 'Drafted.');
+  await new Promise((resolve) => setImmediate(resolve));
+  const rows = eventlog.listEvents(session.id, { types: ['memory_signals_captured'] });
+  assert.equal(rows.length, 1, 'only the explicit instruction is captured');
+  assert.deepEqual(rows[0]?.data.reasons, ['explicit remember request']);
+  assert.equal(rows[0]?.data.sourceSteerSeq, remembered.seq);
+  assert.notEqual(rows[0]?.data.sourceSteerSeq, plain.seq);
+  assert.equal(rows[0]?.data.conversationOnly, true);
+  assert.equal(rows[0]?.data.sourceUserSeq, null);
+});
+
+test('a codex transport timeout on the production host journals one public stall_retry_attempted twin beside the private row', async () => {
+  const { projectHarnessEventsForPublic } = await import('./public-presentation.js');
+  const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
+  const fixture = acceptHostCanarySource('transport-retry-public-row', 'Exercise the transport-retry host boundary.');
+  let requests = 0;
+  const model = {
+    async getResponse(): Promise<never> { throw new Error('stream required'); },
+    async *getStreamedResponse() {
+      requests++;
+      if (requests === 1) {
+        throw new BoundaryError({ kind: 'codex.transport_timeout', retryable: true, userMessage: 'Connection dropped.',
+          operatorMessage: 'dead socket', context: { undiciCode: 'UND_ERR_BODY_TIMEOUT', phase: 'body' } });
+      }
+      yield { type: 'response_done', response: { usage: {}, output: [textMsg('The saved work is complete.')] } } as never;
+    },
+  };
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  try {
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(requests, 2);
+    assert.equal(outcome.finalOutput, 'The saved work is complete.');
+    const privateRows = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter((e) => e.data.kind === 'model_transport_retry');
+    assert.equal(privateRows.length, 1);
+    assert.equal(privateRows[0].data.failureKind, 'codex.transport_timeout');
+    assert.equal(privateRows[0].data.undiciCode, 'UND_ERR_BODY_TIMEOUT');
+    const publicRows = projectHarnessEventsForPublic(eventlog.listEvents(fixture.session.id))
+      .filter((e) => e.type === 'stall_retry_attempted');
+    assert.equal(publicRows.length, 1, 'one host retry, one public row');
+    assert.deepEqual(publicRows[0].data, { kind: 'model_transport_retry' }, 'the projection publishes only the kind');
+    const raw = eventlog.listEvents(fixture.session.id, { types: ['stall_retry_attempted'] });
+    assert.equal(raw.length, 1);
+    assert.equal(raw[0].data.layer, 'host');
+    assert.equal(raw[0].data.sourceUserSeq, fixture.source.seq);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
+  }
+});
+
+test('same-identity catalog entries minted under different search wordings collapse to one candidate', async () => {
+  const { collapseSameCapabilityIdentity } = await import('./host-turn-runner.js');
+  const entry = (capabilityId: string, issuedAt: string, overrides: Record<string, unknown> = {}) => ({
+    capabilityId,
+    toolName: 'reviewed_read_op',
+    schemaVersion: 'v-1',
+    schemaDigest: 'def-1',
+    effect: 'read',
+    account: 'reviewed_cli:host',
+    providerInputSchemaDigest: 'schema-1',
+    manifest: { accountId: 'reviewed_cli:host', invokePortId: 'port:one', provenance: { issuedAt } },
+    invoke: async () => ({}),
+    ...overrides,
+  }) as never;
+  const older = entry('cap:live:v1:aaa:op:def-1', '2026-01-01T00:00:00.000Z');
+  const newer = entry('cap:live:v1:bbb:op:def-1', '2026-01-02T00:00:00.000Z');
+  const disclosed = entry('cap:live:v1:ccc:op:def-1', '2026-01-01T12:00:00.000Z');
+  // Three wordings, one capability: the entry this source was shown wins.
+  const shown = collapseSameCapabilityIdentity([older, newer, disclosed], new Set(['cap:live:v1:ccc:op:def-1']));
+  assert.deepEqual(shown.map((e: { capabilityId: string }) => e.capabilityId), ['cap:live:v1:ccc:op:def-1']);
+  // Nothing shown to this source: the newest issuance wins.
+  const newest = collapseSameCapabilityIdentity([older, newer]);
+  assert.deepEqual(newest.map((e: { capabilityId: string }) => e.capabilityId), ['cap:live:v1:bbb:op:def-1']);
+  // A different account, definition or invoke port is a different capability and stays ambiguous.
+  const otherAccount = entry('cap:live:v1:ddd:op:def-1', '2026-01-03T00:00:00.000Z', { account: 'reviewed_cli:other' });
+  const otherPort = entry('cap:live:v1:eee:op:def-1', '2026-01-03T00:00:00.000Z',
+    { manifest: { accountId: 'reviewed_cli:host', invokePortId: 'port:two', provenance: { issuedAt: '2026-01-03T00:00:00.000Z' } } });
+  const otherDefinition = entry('cap:live:v1:fff:op:def-2', '2026-01-03T00:00:00.000Z', { schemaDigest: 'def-2' });
+  assert.equal(collapseSameCapabilityIdentity([newer, otherAccount]).length, 2);
+  assert.equal(collapseSameCapabilityIdentity([newer, otherPort]).length, 2);
+  assert.equal(collapseSameCapabilityIdentity([newer, otherDefinition]).length, 2);
+  assert.deepEqual(collapseSameCapabilityIdentity([]), []);
+});
+
+test('the stop cause is the newest tool result, and only when it failed', async () => {
+  const { concreteBlockerFromNewestToolResult } = await import('./host-turn-runner.js');
+  const providerError = { tool: 'session_search', result: 'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid ISO datetime.' };
+  const okResult = { tool: 'salesforce_sf_soql_query', result: '{"result":{"status":"exited","records":10}}' };
+  const hostRefusal = { tool: 'publish_plan', result: JSON.stringify({ ok: false, published: false, error: 'invalid_plan_input', message: 'Repair the listed fields in publish_plan; no plan was published.' }) };
+  assert.match(concreteBlockerFromNewestToolResult([providerError])!, /Invalid ISO datetime/);
+  assert.equal(concreteBlockerFromNewestToolResult([okResult, providerError]), null, 'an error that later results moved past is not the cause');
+  assert.match(concreteBlockerFromNewestToolResult([hostRefusal, okResult, providerError])!, /^publish_plan: Repair the listed fields/);
+  assert.equal(concreteBlockerFromNewestToolResult([]), null);
+});
+
+test('a published plan replies with a lead on card surfaces and the full text elsewhere', async () => {
+  const { publishedPlanReplyText, sessionRendersPlanCard } = await import('./host-turn-runner.js');
+  const fullText = '## Outbound: five accounts\n\n| Firm | Contact |\n|---|---|\n| A | a@x |';
+  assert.equal(sessionRendersPlanCard({ channel: 'mobile', metadata: { source: 'mobile' } }), true);
+  assert.equal(sessionRendersPlanCard({ channel: '', metadata: { source: 'desktop' } }), true);
+  assert.equal(sessionRendersPlanCard({ channel: 'discord', metadata: { source: 'discord' } }), false);
+  assert.equal(sessionRendersPlanCard(null), false);
+  const lead = publishedPlanReplyText({ fullText, needsInput: false, cardRendered: true });
+  assert.match(lead, /^Outbound: five accounts\n\nThe full plan is in the card below\. Review it and Execute when you are ready\.$/);
+  assert.doesNotMatch(lead, /\| Firm \|/);
+  const gaps = publishedPlanReplyText({ fullText, needsInput: true, missingPrerequisites: ['Step seo: path unverified.'], cardRendered: true });
+  assert.match(gaps, /It still needs: Step seo: path unverified\./);
+  assert.equal(publishedPlanReplyText({ fullText, needsInput: false, cardRendered: false }), fullText);
+});
+
 test('named workflow dispatch seals before review and final child evidence owns the verdict', async (t) => {
   const host = await import('./host-turn-runner.js');
   const { writeWorkflow } = await import('../../memory/workflow-store.js');
@@ -10193,6 +10371,12 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
     assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
     assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
     assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
+    // Plan validates what it will call: probes are preparation, an unexercised
+    // generic-request argument is a named gap, creates/sends/deletes stay out.
+    assert.match(options?.toolCallSummary ?? '', /Reads, discovery and carrier-bounded probes performed during planning are preparation/);
+    assert.match(options?.toolCallSummary ?? '', /neither exercised successfully this turn nor cited from documentation read this turn is a material gap: name the exact unverified argument/);
+    assert.match(options?.toolCallSummary ?? '', /Creates, sends and deletes must still not have run/);
+    assert.doesNotMatch(options?.toolCallSummary ?? '', /do not require execution findings during Plan|not a probe that performs the deferred work/);
     assert.equal(eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] }).length, 0, 'the reviewed bytes must still be an editable draft');
     if (variant === 'unavailable') throw new Error('review service unavailable');
     if (variant === 'correction' && count === 1) return { done: false, reason: 'The graph omits evidence coverage. Revise the comparison step.' };

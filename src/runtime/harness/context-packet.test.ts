@@ -174,6 +174,63 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
 });
 
+test('a new conversation carries the principal\'s unanswered questions from other recent conversations', async () => {
+  // Live 2026-09-15: three messages from one phone arrived as three new chats;
+  // each started blank and Clem asked a question the next blank room never
+  // saw. The packet now carries those open loops as bounded context.
+  const eventlog = await import('./eventlog.js');
+  const { HarnessSession } = await import('./session.js');
+  const parked = HarnessSession.create({ id: 'packet-open-loop-parked', kind: 'chat', channel: 'mobile', userId: 'device-9',
+    metadata: { source: 'mobile', channelId: 'packet-open-loop-parked', userId: 'device-9' } });
+  parked.recordUserInput('Add a description to the discussion with Adam tomorrow at 9', 1);
+  eventlog.appendEvent({ sessionId: parked.id, turn: 1, role: 'system', type: 'awaiting_user_input',
+    data: { question: 'Which calendar event should I update?', options: [], purpose: 'clarification' } });
+  const current = HarnessSession.create({ id: 'packet-open-loop-current', kind: 'chat', channel: 'mobile', userId: 'device-9',
+    metadata: { source: 'mobile', channelId: 'packet-open-loop-current', userId: 'device-9' } });
+  const packet = buildAgentContextPacket(
+    'The Clementine discussion with Adam tomorrow at 9.',
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    { sessionKind: 'chat', sessionId: current.id },
+  );
+  assert.equal(packet.openLoops.count, 1);
+  assert.deepEqual(packet.openLoops.sessionIds, [parked.id]);
+  assert.match(packet.text, /\[open with you/);
+  assert.match(packet.text, /You asked: "Which calendar event should I update\?"/);
+  assert.match(packet.text, /about: "Add a description to the discussion with Adam/);
+  // A workflow node never carries chat loops.
+  const node = buildAgentContextPacket('step', { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    { sessionKind: 'workflow', sessionId: current.id });
+  assert.equal(node.openLoops.count, 0);
+  assert.doesNotMatch(node.text, /open with you/);
+});
+
+test('a chat packet carries what the owner asked her to remember earlier in this conversation, verbatim', async () => {
+  const { HarnessSession } = await import('./session.js');
+  const session = HarnessSession.create({ id: 'packet-session-constraints', kind: 'chat', channel: 'desktop', userId: 'owner-9' });
+  session.recordUserInput('remember subject: Harbor follow-up', 1);
+  session.recordUserInput('ok draft the rest', 2);
+  const memory = { enabled: true, hitCount: 0, source: 'unified' as const, injected: false };
+
+  const packet = buildAgentContextPacket('ok draft the rest', memory, { sessionKind: 'chat', sessionId: session.id });
+  assert.equal(packet.sessionConstraints.count, 1);
+  assert.equal(packet.sessionConstraints.seqs.length, 1);
+  assert.ok(packet.sessionConstraints.bytes > 0);
+  assert.match(packet.text, /\[in force for this conversation/);
+  assert.match(packet.text, /"remember subject: Harbor follow-up"/);
+  assert.equal(packet.text.split('[in force for this conversation').length, 2, 'one copy only');
+
+  // A workflow node never carries chat constraints.
+  const node = buildAgentContextPacket('step', memory, { sessionKind: 'workflow', sessionId: session.id });
+  assert.equal(node.sessionConstraints.count, 0);
+  assert.doesNotMatch(node.text, /in force for this conversation/);
+
+  // Declining a proposal does not cancel a standing subject.
+  const declined = buildAgentContextPacket('No.', memory,
+    { sessionKind: 'chat', sessionId: session.id, authorityInput: 'No.', suppressSemanticEnrichment: true, suppressConfirmBeat: true });
+  assert.equal(declined.sessionConstraints.count, 1);
+  assert.match(declined.text, /"remember subject: Harbor follow-up"/);
+});
+
 test('private continuation text can rank context but cannot become preflight or tool authority', () => {
   const packet = buildAgentContextPacket(
     ['Send the client email through Outlook.', 'Should I send it?', 'No.'].join('\n'),

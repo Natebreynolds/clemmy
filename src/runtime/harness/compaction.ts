@@ -97,6 +97,32 @@ export function compactionBudgetForModel(modelId: string | undefined | null): nu
     return DEFAULT_INPUT_BUDGET_TOKENS;
   }
 }
+
+/**
+ * Layer 1's own budget. Layer 1 is lossless — it clips and collapses OLD tool
+ * results that stay recallable by call id — so the only question it answers
+ * is prefill cost, and prefill cost is absolute bytes on a wire that does not
+ * serve a cached prefix. That is the same split the mid-turn thresholds
+ * already make (inFlightCompactionThresholds): a wire that caches in practice
+ * keeps the real window, so its prefix is never rewritten for nothing; a wire
+ * that does not is held to the historical absolute budget, whatever its
+ * window says. Layer 2 (summaries) and Layer 3 (fork) are lossy and stay on
+ * the window (compactionBudgetForModel) — the 2026-08-05 pin.
+ *
+ * Live 2026-09-15: the Codex OAuth brain carried a 67-72k-token history on an
+ * 880k window, cached it on ~4 calls in 10, and between-turn compaction had
+ * never fired once on the session (0 condenser_applied). Under this budget
+ * Layer 1 fires at 60k on that wire; on Sonnet/Opus (seeded caching) and on a
+ * wire that has proven a real hit rate nothing moves.
+ */
+export function layer1CompactionBudgetForModel(modelId: string | undefined | null): number {
+  const window = compactionBudgetForModel(modelId);
+  try {
+    return effectivePromptCacheSupport(modelId) ? window : Math.min(window, DEFAULT_INPUT_BUDGET_TOKENS);
+  } catch {
+    return Math.min(window, DEFAULT_INPUT_BUDGET_TOKENS);
+  }
+}
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
 const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
 const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;
@@ -281,6 +307,9 @@ async function getSummarizerModel(): Promise<string> {
 
 export interface CompactionOptions {
   inputBudgetTokens?: number;
+  /** Budget the Layer 1 (lossless clip/collapse) trigger is measured against.
+   *  Defaults to inputBudgetTokens; see layer1CompactionBudgetForModel. */
+  layer1BudgetTokens?: number;
   layer1ItemThreshold?: number;
   layer1RetainTurns?: number;
   layer1RetainToolPairs?: number;
@@ -319,6 +348,9 @@ export interface CompactionResult {
   beforeTokens: number;
   afterTokens: number;
   budgetTokens: number;
+  /** The budget Layer 1 was measured against (== budgetTokens unless the
+   *  caller split them; see layer1CompactionBudgetForModel). */
+  layer1BudgetTokens: number;
 }
 
 function readDisableFlag(): CompactionOptions['disable'] {
@@ -1319,6 +1351,7 @@ export async function compactSessionIfNeeded(
 ): Promise<{ result: CompactionResult; nextItems: AgentInputItem[]; forkRequest?: ForkRequest }> {
   const disable = opts.disable ?? readDisableFlag();
   const budget = opts.inputBudgetTokens ?? DEFAULT_INPUT_BUDGET_TOKENS;
+  const layer1Budget = Math.min(budget, opts.layer1BudgetTokens ?? budget);
   const itemThreshold = opts.layer1ItemThreshold ?? DEFAULT_LAYER1_ITEM_THRESHOLD;
   const retainTurns = opts.layer1RetainTurns ?? DEFAULT_LAYER1_RETAIN_TURNS;
   const retainToolPairs = opts.layer1RetainToolPairs ?? Math.max(DEFAULT_LAYER1_RETAIN_TOOL_PAIRS, retainTurns * 3);
@@ -1337,6 +1370,7 @@ export async function compactSessionIfNeeded(
     beforeTokens,
     afterTokens: beforeTokens,
     budgetTokens: budget,
+    layer1BudgetTokens: layer1Budget,
   };
 
   if (disable === 'off') {
@@ -1355,8 +1389,8 @@ export async function compactSessionIfNeeded(
   // context pressure or an explicit stage checkpoint can trigger compaction.
   const layer1Trigger =
     opts.forceLayer2
-    || beforeTokens > budget * l1Frac
-    || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
+    || beforeTokens > layer1Budget * l1Frac
+    || (items.length > itemThreshold && beforeTokens > layer1Budget * l1ItemMinFrac);
   if (layer1Trigger) {
     const clipped = clipOldToolResults(nextItems, retainTurns, opts, session.id);
     const collapsed = collapseOldCompletedToolPairs(nextItems, retainToolPairs, session.id);
@@ -1456,6 +1490,7 @@ function appendCondenserEvent(sessionId: string, result: CompactionResult): void
         beforeTokens: result.beforeTokens,
         afterTokens: result.afterTokens,
         budgetTokens: result.budgetTokens,
+        layer1BudgetTokens: result.layer1BudgetTokens,
       },
     });
   } catch {

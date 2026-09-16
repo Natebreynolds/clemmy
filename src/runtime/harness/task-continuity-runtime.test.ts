@@ -327,6 +327,7 @@ test('clarification answer classification is conversational but question-shaped 
     );
   }
   assert.equal(runtime.classifyClarificationAnswer('first', choices), null);
+
   assert.equal(
     runtime.classifyClarificationAnswer('first', { ...choices, options: [] }),
     null,
@@ -785,6 +786,14 @@ test('exact live primary-only A/Q/B consumes, narrows, approves, and leaves para
     consumingSourceUserSeq: answer.seq,
   });
   assert.equal(consumed.status, 'consumed', 'the exact durable packet must not be dismissed as topic_changed');
+  // The completion judge measures the PARENT task plus the exchange, never the
+  // bare answer (live 2026-09-14: "Scorpion cal" was judged fulfilled while the
+  // requested attendee was silently dropped).
+  const hostTurnRunner = await import('./host-turn-runner.js');
+  const judged = hostTurnRunner.acceptedObjectiveForSource({ sessionId, sourceUserSeq: answer.seq }) ?? '';
+  assert.ok(judged.includes('Find the top 5 restaurants in Pismo Beach'), judged);
+  assert.ok(judged.includes(answerText), judged);
+  assert.notEqual(judged.trim(), answerText, 'the answer alone is not the objective');
   const replayed = await runtime.enrichAcceptedRequestWithTaskContinuity(
     continuationRequest,
     answer.seq,
@@ -1580,4 +1589,43 @@ test('an unreadable (not admitted) answer to an open clarification re-offers the
     runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: answer.seq }),
     null,
   );
+});
+
+
+test('continuationInheritsParentCapabilities is the one policy: declines inherit nothing, every other answer does', () => {
+  assert.equal(runtime.continuationInheritsParentCapabilities('affirmed'), true);
+  assert.equal(runtime.continuationInheritsParentCapabilities('selected'), true);
+  assert.equal(runtime.continuationInheritsParentCapabilities('provided'), true);
+  assert.equal(runtime.continuationInheritsParentCapabilities('declined'), false);
+  assert.equal(runtime.continuationInheritsParentCapabilities('declined_with_new_task'), false);
+});
+
+test('inherited capability evidence still empties for a plain decline through the shared predicate (connection pin)', async () => {
+  const sessionId = 'continuity-decline-inherits-nothing';
+  const source = accepted(sessionId, 'List my calendar events for today.');
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Should I list them?',
+    options: ['Yes', 'No'],
+    purpose: 'clarification',
+    withResolvedCapability: true,
+  });
+  const answer = accepted(sessionId, 'No.');
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: 'No.',
+  }, answer.seq);
+  assert.equal(enriched.taskContinuation?.disposition, 'declined');
+  assert.deepEqual(enriched.taskContinuation?.capabilities, [], 'a decline carries no parent capability evidence');
+
+  const { readFileSync } = await import('node:fs');
+  const text = readFileSync(new URL('./task-continuity-runtime.ts', import.meta.url), 'utf8');
+  const start = text.indexOf('function validInheritedEvidence(');
+  assert.ok(start > 0);
+  const body = text.slice(start, text.indexOf('\n}\n', start));
+  assert.match(body, /continuationInheritsParentCapabilities\(context\.disposition\)/,
+    'validInheritedEvidence decides through the exported predicate, not an inline decline check');
+  assert.doesNotMatch(body, /disposition === 'declined'/);
 });

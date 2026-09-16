@@ -566,15 +566,28 @@ function persistSilentBrains(): void {
   } catch { /* best-effort; in-memory registry still protects this process */ }
 }
 
-export function markBrainAuthDead(label: string, reason: string, correlation?: { sessionId?: string; workflowRunId?: string }): void {
+// A credential that failed to READ locally (expired or absent in its store, no
+// provider round-trip) can become valid again any second: the store's owner
+// refreshes it, or the user signs in. That pause is short. A provider that
+// REJECTED the credential needs the user, so that pause is the full cooldown.
+const LOCAL_CREDENTIAL_DEAD_COOLDOWN_MS = 60_000;
+
+function isLocalCredentialFailure(err: unknown): boolean {
+  const e = err as { kind?: unknown; statusCode?: unknown; status?: unknown } | null;
+  return typeof e?.kind === 'string' && (e.kind === 'expired' || e.kind === 'missing')
+    && typeof e.statusCode !== 'number' && typeof e.status !== 'number';
+}
+
+export function markBrainAuthDead(label: string, reason: string, correlation?: { sessionId?: string; workflowRunId?: string }, options: { cooldownMs?: number } = {}): void {
   loadDeadBrains();
   const now = Date.now();
   const existing = deadBrains.get(label);
-  deadBrains.set(label, { reason, since: existing?.since ?? now, until: now + authDeadCooldownMs() });
+  const cooldownMs = options.cooldownMs ?? authDeadCooldownMs();
+  deadBrains.set(label, { reason, since: existing?.since ?? now, until: now + cooldownMs });
   persistDeadBrains();
   if (existing) return; // already surfaced — just extend the cooldown
   logger.error(
-    { brain: label, reason, cooldownMs: authDeadCooldownMs() },
+    { brain: label, reason, cooldownMs },
     'brain auth is dead — skipping this brain until re-auth (reconnect it from Settings → Models)',
   );
   recordOperationalEvent({
@@ -781,13 +794,23 @@ function isAuthDeadReason(err: unknown): boolean {
   return kind === 'model.auth_expired' || isAuthRecoverableError(err);
 }
 
+/** One failure vocabulary at the chain boundary. Provider adapters throw their
+ *  own kinds (the Codex adapter keeps `codex.*` so its consumers and pins are
+ *  untouched); the chain decides fallover and benching on the provider-neutral
+ *  `model.*` class those kinds belong to. A stream that ended before content
+ *  after the adapter's own retry budget is the same class as an empty
+ *  completion: nothing came. */
 function normalizedModelFailureReason(err: unknown): string {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
-  return kind === 'runtime.unknown' && isAuthRecoverableError(err) ? 'model.auth_expired' : kind;
+  const normalized = kind === 'codex.transport_timeout' ? 'model.transport_timeout'
+    : kind === 'codex.sse_truncated' ? 'model.empty_completion'
+    : kind === 'codex.http_5xx' ? 'model.http_5xx'
+    : kind;
+  return normalized === 'runtime.unknown' && isAuthRecoverableError(err) ? 'model.auth_expired' : normalized;
 }
 
 export function isFalloverError(err: unknown): boolean {
-  const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+  const kind = normalizedModelFailureReason(err);
   if (
     kind === 'model.overloaded'
     || kind === 'model.http_5xx'
@@ -894,7 +917,8 @@ export class FallbackModel implements Model {
   private markIfAuthDead(chain: FallbackTarget[], i: number, err: unknown): void {
     if (!isAuthDeadReason(err)) return;
     const reason = normalizedModelFailureReason(err);
-    markBrainAuthDead(chain[i].label, reason, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
+    markBrainAuthDead(chain[i].label, reason, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId },
+      isLocalCredentialFailure(err) ? { cooldownMs: LOCAL_CREDENTIAL_DEAD_COOLDOWN_MS } : {});
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {

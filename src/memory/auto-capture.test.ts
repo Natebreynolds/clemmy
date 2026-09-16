@@ -2,10 +2,43 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   assessAutoMemoryAdmission,
+  explicitMemoryInstructionFor,
   extractAutoMemoryCandidates,
   extractProfilePatchFromMessage,
+  isEligibleAutoCaptureSourceProvenance,
   parseExplicitMemoryInstruction,
 } from './auto-capture.js';
+
+test('accepted-source provenance admits a mid-run steer note only under its own source-event identity', () => {
+  const steer = {
+    authority: 'accepted_user_input' as const, sessionId: 'sess-1', eventId: 'evt-1', seq: 7,
+    role: 'user', type: 'user_steer_note', data: { text: 'remember subject: Harbor follow-up' },
+  };
+  const expected = { sessionId: 'sess-1', sourceEventId: 'user-steer:7' };
+  assert.equal(isEligibleAutoCaptureSourceProvenance(steer, expected), true);
+  // The identity is exact: a steer note cannot pose as the accepted source, nor the reverse.
+  assert.equal(isEligibleAutoCaptureSourceProvenance(steer, { sessionId: 'sess-1', sourceEventId: 'user-source:7' }), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance({ ...steer, type: 'user_input_received' }, expected), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance(steer, { sessionId: 'sess-1', sourceEventId: 'user-steer:8' }), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance(steer, { sessionId: 'sess-2', sourceEventId: 'user-steer:7' }), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance(steer, {}), false);
+  // Every other check still applies.
+  assert.equal(isEligibleAutoCaptureSourceProvenance({ ...steer, role: 'system' }, expected), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance({ ...steer, data: { ...steer.data, synthetic: true } }, expected), false);
+  assert.equal(isEligibleAutoCaptureSourceProvenance({ ...steer, type: 'user_steer_note_delivered' }, expected), false);
+  // The accepted source keeps its own identity unchanged.
+  const source = { ...steer, type: 'user_input_received' };
+  assert.equal(isEligibleAutoCaptureSourceProvenance(source, { sessionId: 'sess-1', sourceEventId: 'user-source:7' }), true);
+});
+
+test('explicitMemoryInstructionFor is the parse minus a same-turn opt-out', () => {
+  assert.equal(explicitMemoryInstructionFor('remember subject: Harbor follow-up')?.kind, 'remember');
+  assert.equal(explicitMemoryInstructionFor('remember this list')?.kind, 'remember');
+  assert.equal(explicitMemoryInstructionFor('ok draft the rest'), null);
+  assert.equal(explicitMemoryInstructionFor(''), null);
+  assert.equal(explicitMemoryInstructionFor('Do not save this to memory. Remember subject: Harbor follow-up'), null,
+    'a turn-wide opt-out suppresses the instruction');
+});
 
 test('extractAutoMemoryCandidates captures Clementine product requirements', () => {
   const candidates = extractAutoMemoryCandidates(

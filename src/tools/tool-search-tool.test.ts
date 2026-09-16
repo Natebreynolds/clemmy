@@ -1223,11 +1223,15 @@ test('first discovery preserves a proven ref when Composio fuzzy search and stag
   const outerHostBudgetMs = timeoutForTool('tool_search');
   const firstDiscoveryWallCeilingMs = 30_000;
   assert.ok(
+    outerHostBudgetMs < 60_000,
+    'a search miss must not inherit the generic 60s host window',
+  );
+  assert.ok(
     CANDIDATE_SOURCE_SEARCH_DEADLINE_MS + PLANNING_DISCLOSURE_DEADLINE_MS < outerHostBudgetMs,
     'internal discovery deadlines must leave room inside the outer host budget',
   );
   assert.ok(firstDiscoveryWallCeilingMs < outerHostBudgetMs,
-    'the broker reserves at least half the host window for wrapper/model recovery overhead');
+    'the broker reserves settlement room above its 30s clock, not another 30s of hang');
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
   const server = new McpServer({ name: 'first-discovery-combined-stall-pin', version: '1.0.0' });
   const independentlyProvenRefs = Object.freeze({

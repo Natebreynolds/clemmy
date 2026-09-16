@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { stripAskMarker } from '../runtime/harness/open-loops.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -265,7 +266,11 @@ export function registerAutonomyActionTools(server: McpServer): void {
       contextExecutionId: z.string().optional(),
       contextSummary: z.string().max(600).optional().describe('One sentence on what you were doing, for the user\'s context.'),
     },
-    async ({ agentSlug, question, urgency, contextExecutionId, contextSummary }) => {
+    async ({ agentSlug, question: rawQuestion, urgency, contextExecutionId, contextSummary }) => {
+      // The loop-control marker is host protocol; a model that writes it into
+      // the question argument (live 2026-09-15: "ASK: Which description…")
+      // must not have it read back to the person.
+      const question = stripAskMarker(rawQuestion);
       const quality = validateCheckInQuestion(question, contextSummary);
       if (!quality.ok) {
         return textResult(`Question rejected: ${quality.reason}`);

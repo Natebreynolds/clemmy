@@ -39,9 +39,9 @@ interface WindowObservation {
   provenAcceptedInput?: number;
   /** Effective ceiling learned from a context-overflow rejection. */
   rejectedCeiling?: number;
-  /** Calls whose usage reported a prompt-cache READ for this model. A wire
-   *  either caches or it does not, so this is evidence of a contract, not a
-   *  rate to average. */
+  /** Calls whose usage reported a prompt-cache READ for this model. Read
+   *  against `cacheObservedCalls`: what the harness budgets on is how often
+   *  the wire actually serves a cached prefix, not whether it ever has. */
   cacheHitCalls?: number;
   /** Calls observed at all — the denominator, so a single fluke cannot flip a
    *  wire and a genuinely non-caching wire stays non-caching however long it
@@ -217,10 +217,18 @@ export function recordCacheObservation(
 }
 
 /**
- * Does this wire cache, according to the wire? The registry seed stands until
- * the model has actually demonstrated otherwise — a proof needs several calls,
- * so one fluke cannot flip a family, and absence of hits never flips a seeded
- * `true` to false (a cold conversation legitimately reports no reads).
+ * Does this wire cache, according to the wire? A seeded `true` is a contract
+ * the adapter itself honours (explicit breakpoints), so a cold conversation
+ * never un-learns it. A seeded `false` flips only on evidence, and the
+ * evidence is a RATE, not a first sighting: the wire must have served a cached
+ * prefix at least CACHE_PROOF_MIN_CALLS times AND at least as often as it
+ * missed. Measured 2026-09-15 on the Codex OAuth wire: 124 reads in 367 calls
+ * (37% over three days; 0% whenever the tool list changed, 11% when history
+ * was rewritten), while every consumer of this flag had been treating five
+ * lifetime hits as "this wire caches" and scaling its compaction thresholds to
+ * an 880k window — so a 67k-token history was re-prefilled on six calls of
+ * every ten and never compacted. Budgets that protect a cached prefix only
+ * pay off on a wire that actually serves one.
  */
 export function effectivePromptCacheSupport(modelId: string | undefined | null): boolean {
   const seeded = resolveModelCapability(cleanModelId(modelId) || undefined).supportsPromptCache;
@@ -230,7 +238,9 @@ export function effectivePromptCacheSupport(modelId: string | undefined | null):
     if (!id) return seeded;
     const obs = readObservations().entries[id];
     if (!obs) return seeded;
-    return (obs.cacheHitCalls ?? 0) >= CACHE_PROOF_MIN_CALLS;
+    const hits = obs.cacheHitCalls ?? 0;
+    const observed = Math.max(obs.cacheObservedCalls ?? 0, hits);
+    return hits >= CACHE_PROOF_MIN_CALLS && hits * 2 >= observed;
   } catch {
     return seeded;
   }

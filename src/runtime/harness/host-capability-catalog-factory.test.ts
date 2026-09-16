@@ -26,7 +26,10 @@ const {
 } = await import('./capability-manifest-store.js');
 const {
   createProductionCapabilityAdapter,
+  registeredCapabilityFromManifest,
 } = await import('./production-capability-adapter.js');
+const { rememberToolSchema, getCachedToolSchema } = await import('../../tools/composio-schema-cache.js');
+const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const { resetEventLog, createSession, appendEvent, openEventLog } = await import('./eventlog.js');
 import type { CapabilityManifestV1 } from './capability-manifest.js';
 import type { RegisteredHostCapability } from './host-capability-catalog-factory.js';
@@ -232,6 +235,45 @@ test('current-callable attestation refuses post-registration provider, port, and
       'a callable row cannot restamp manifest-only call-surface bytes after registration',
     );
   }
+});
+
+test('a local_registry entry with no provider input schema digest still yields a non-null canonical identity', () => {
+  // Strictness for the sealed digest lives in the reviewed-provider-identity
+  // helper, never here: a missing digest must not turn every local-registry
+  // catalog call into an invoke-identity miss.
+  const bare = asRegistered(sheetManifest());
+  assert.equal(bare.providerInputSchemaDigest, undefined);
+  assert.equal(bare.manifest!.externalDefinition, undefined);
+  const factory = createHostCapabilityCatalogFactory([bare]);
+  assert.equal(isCurrentCallableCatalogEntry(factory.get(bare.capabilityId)!), true);
+  const canonical = canonicalCatalogIdentityOf(bare);
+  assert.ok(canonical, 'a digest-less local_registry callable entry keeps its canonical identity');
+  assert.equal(canonical.capabilityId, bare.capabilityId);
+  assert.equal(Object.hasOwn(canonical, 'providerInputSchemaDigest'), false, 'no digest is invented for it');
+});
+
+test('a callable entry without an external definition carries its sealed provider input schema digest', () => {
+  // Producer form: the materializer seals digestSchema(inputSchema) at registration.
+  const sealed = { ...asRegistered(sheetManifest()), providerInputSchemaDigest: sha256('sealed:sheet_create') };
+  const factory = createHostCapabilityCatalogFactory([sealed]);
+  assert.equal(isCurrentCallableCatalogEntry(factory.get(sealed.capabilityId)!), true);
+  assert.equal(sealed.manifest!.externalDefinition, undefined);
+  assert.equal(canonicalCatalogIdentityOf(sealed)?.providerInputSchemaDigest, sha256('sealed:sheet_create'));
+  // Adapter form: a manifest with no external definition seals the digest of
+  // the exact schema its materializer installed in the durable contract store.
+  const manifest = attachSemanticContract({ ...sheetManifest(), manifestId: 'cap:sheet-create:adapter', operationId: 'sheet_create_adapter_fixture' });
+  const schema = { type: 'object', properties: { title: { type: 'string' } }, required: ['title'], additionalProperties: false };
+  rememberToolSchema(manifest.operationId, schema, Date.now());
+  const observation = { definitionFingerprint: manifest.definitionFingerprint, providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion, accountId: manifest.accountId, observedAt: Date.now() };
+  const registered = registeredCapabilityFromManifest({ manifest, observation, invoke: async () => ({}) });
+  assert.equal(registered.providerInputSchemaDigest, digestSchema(getCachedToolSchema(manifest.operationId)));
+  assert.equal(registered.providerInputSchemaDigest, digestSchema(schema), 'one canonicalisation: the cached and raw schema digest equal');
+  const adapterFactory = createHostCapabilityCatalogFactory([registered]);
+  assert.equal(canonicalCatalogIdentityOf(adapterFactory.get(registered.capabilityId)!)?.providerInputSchemaDigest, digestSchema(schema));
+  // No cached schema and no external definition: nothing is invented.
+  const uncached = attachSemanticContract({ ...sheetManifest(), manifestId: 'cap:sheet-create:uncached', operationId: 'sheet_create_never_cached' });
+  assert.equal(registeredCapabilityFromManifest({ manifest: uncached, observation, invoke: async () => ({}) }).providerInputSchemaDigest, undefined);
 });
 
 test('catalog snapshot persists canonical identities and refuses same-ID drift', () => {

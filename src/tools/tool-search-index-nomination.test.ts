@@ -617,10 +617,10 @@ test('confident Tool Memory takes one exact batch fast path and never starts fuz
 
   const candidates = await composioCandidates(query, undefined, Date.now() + 2_000);
   assert.ok(candidates.some((candidate) => candidate.name === operation));
-  assert.equal(providerToolCalls.length, 1,
-    'known memory does one exact revalidation batch and skips unknown discovery');
-  assert.ok(providerToolCalls.every((call) => Array.isArray(call.tools)),
+  assert.ok(!providerToolCalls.some((call) => Object.prototype.hasOwnProperty.call(call, 'search')),
     'no fuzzy search may start on the remembered fast path');
+  assert.equal(exactLookups.length, 0,
+    'a current schema lease is the remembered contract; live connection check is the revalidation');
 });
 
 test('generic Outlook Inbox recall ignores a stronger Slack history and exact-revalidates the canonical Outlook read', async () => {
@@ -661,8 +661,10 @@ test('generic Outlook Inbox recall ignores a stronger Slack history and exact-re
 
   const candidates = await composioCandidates(query, undefined, Date.now() + 2_000);
   assert.deepEqual(candidates.map((candidate) => candidate.name), [outlookOperation]);
-  assert.deepEqual(providerToolCalls, [{ tools: [outlookOperation], limit: 1 }],
-    'a named Outlook request must do one exact Outlook revalidation and never nominate Slack');
+  assert.ok(!providerToolCalls.some((call) => Object.prototype.hasOwnProperty.call(call, 'search')),
+    'a named Outlook request must never nominate Slack via fuzzy search');
+  assert.deepEqual(exactLookups, [],
+    'the current Outlook lease is served from memory; Slack is never fetched');
 });
 
 test('a lexically matching memory row without a successful receipt remains a fuzzy hint', async () => {
@@ -1105,4 +1107,98 @@ test('a remembered calendar read cannot hide the write phase of a mixed meeting 
     `the requested write phase must remain visible before plan freeze; got ${names.join(', ')}`);
   assert.ok(providerToolCalls.some((call) => Object.prototype.hasOwnProperty.call(call, 'search')),
     'mixed work must perform bounded live discovery instead of returning one remembered read');
+});
+
+const CREATE_EVENT = 'OUTLOOK_CALENDAR_CREATE_EVENT';
+const CREATE_SCHEMA = {
+  type: 'object',
+  required: ['subject', 'start_datetime'],
+  properties: {
+    subject: { type: 'string' },
+    start_datetime: { type: 'string' },
+    attendees: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+test('an exact slug with a current schema lease does not re-fetch the provider', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  installBroker({ exact: [CREATE_EVENT], exactDelayMs: 80 });
+  schemaCache.rememberToolSchema(CREATE_EVENT, CREATE_SCHEMA, Date.now(), 'fixture-outlook-create-v1', null);
+  assert.ok(schemaCache.liveComposioSchemaFingerprint(CREATE_EVENT), 'fixture must have a live lease');
+
+  const started = Date.now();
+  const candidates = await composioCandidates(CREATE_EVENT, undefined, Date.now() + 2_000);
+  const elapsed = Date.now() - started;
+  assert.equal(candidates[0]?.name, CREATE_EVENT);
+  assert.deepEqual(candidates[0]?.schema, CREATE_SCHEMA);
+  assert.equal(exactLookups.length, 0, 'a current lease must not pay getExactComposioToolsBySlugs');
+  assert.ok(elapsed < 200, `remembered exact slug must return without the provider round-trip (took ${elapsed}ms)`);
+});
+
+test('a drifted Tool Memory fingerprint is retired when the live lease disagrees', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  const intent = 'outlook.calendar.create.event';
+  toolChoices.rememberToolChoice({
+    intent,
+    description: 'Create an Outlook calendar event',
+    choice: {
+      kind: 'composio',
+      identifier: CREATE_EVENT,
+      schemaFingerprint: 'a'.repeat(64),
+      testEvidence: 'prior successful invite',
+    },
+  });
+  installBroker({ exact: [CREATE_EVENT] });
+  schemaCache.rememberToolSchema(CREATE_EVENT, CREATE_SCHEMA, Date.now(), 'fixture-outlook-create-v1', null);
+  const live = schemaCache.liveComposioSchemaFingerprint(CREATE_EVENT);
+  assert.ok(live && live !== 'a'.repeat(64));
+
+  await composioCandidates(CREATE_EVENT, undefined, Date.now() + 2_000);
+  assert.equal(toolChoices.peekToolChoice(intent)?.choice ?? null, null,
+    'a drifted memo must not keep recommending the stale contract');
+  assert.equal(exactLookups.length, 0, 'drift repair uses the live lease, not another provider fetch');
+});
+
+test('a matching Tool Memory row receives the live fingerprint without a provider fetch', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  const intent = 'outlook.calendar.create.event.stamp';
+  toolChoices.rememberToolChoice({
+    intent,
+    description: 'Create an Outlook calendar event',
+    choice: {
+      kind: 'composio',
+      identifier: CREATE_EVENT,
+      testEvidence: 'prior successful invite',
+    },
+  });
+  installBroker({ exact: [CREATE_EVENT] });
+  schemaCache.rememberToolSchema(CREATE_EVENT, CREATE_SCHEMA, Date.now(), 'fixture-outlook-create-v1', null);
+  const live = schemaCache.liveComposioSchemaFingerprint(CREATE_EVENT);
+  assert.ok(live);
+
+  await composioCandidates(CREATE_EVENT, undefined, Date.now() + 2_000);
+  assert.equal(toolChoices.peekToolChoice(intent)?.choice?.schemaFingerprint, live);
+  assert.equal(exactLookups.length, 0);
+});
+
+test('an expired schema lease still revalidates the exact slug live', async () => {
+  schemaCache.resetToolSchemaCache();
+  capabilityIndex._resetCapabilityIndexForTest();
+  const expired = 'OUTLOOK_CALENDAR_CREATE_EVENT_EXPIRED_LEASE';
+  installBroker({ exact: [expired] });
+  schemaCache.rememberToolSchema(
+    expired,
+    CREATE_SCHEMA,
+    Date.now() - 31 * 60_000,
+    'fixture-outlook-create-expired-v1',
+    null,
+  );
+  assert.equal(schemaCache.liveComposioSchemaFingerprint(expired), undefined);
+
+  const candidates = await composioCandidates(expired, undefined, Date.now() + 2_000);
+  assert.ok(candidates.some((row) => row.name === expired));
+  assert.ok(exactLookups.includes(expired), 'an expired lease must refresh from the provider');
 });

@@ -2,11 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel, CodexModelProvider } from './codex-model.js';
+import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel, CodexModelProvider, transparentCodexRetryBudget } from './codex-model.js';
 import { INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { BoundaryError } from '../boundary-error.js';
 import { buildTransportTimeoutError, detectCodexTransportFailure } from '../codex-dispatcher.js';
+import { HarnessSession } from './session.js';
+import { listEvents } from './eventlog.js';
 
 process.env.NODE_ENV = 'test';
 process.env.CLEMMY_CODEX_TRANSPARENT_RETRY_DELAY_MS = '0';
@@ -425,6 +427,104 @@ test('CodexResponsesModel does not retry transport timeout after content was yie
   assert.ok(caught instanceof BoundaryError);
   assert.equal(caught.kind, 'codex.transport_timeout');
   assert.equal(caught.context.undiciCode, 'UND_ERR_BODY_TIMEOUT');
+});
+
+test('transparent retry budget is per failure class: body timeout none, headers timeout one, terminated / no-content / rate limit the ceiling', () => {
+  assert.equal(transparentCodexRetryBudget(buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT', { phase: 'body' })), 0);
+  assert.equal(transparentCodexRetryBudget(buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' })), 1);
+  assert.equal(transparentCodexRetryBudget(buildTransportTimeoutError('FETCH_TERMINATED', { phase: 'body' }, new TypeError('terminated'))), 3);
+  assert.equal(transparentCodexRetryBudget(new BoundaryError({ kind: 'codex.sse_truncated', retryable: true, userMessage: '', operatorMessage: '' })), 3);
+  assert.equal(transparentCodexRetryBudget(new Error('invalid model configuration')), 0);
+});
+
+test('CodexResponsesModel does NOT replay a body timeout before content: the attempt spent the dead-socket window, the chain owns recovery', async () => {
+  const model = new ScriptedCodexModel(async function* () {
+    yield { type: 'response.created', response: { id: 'resp_dead_socket' } };
+    throw buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT', { phase: 'body' });
+  });
+
+  const events: StreamEvent[] = [];
+  let caught: unknown;
+  try {
+    for await (const event of model.getStreamedResponse(modelRequest())) events.push(event);
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.equal(model.attempts, 1, 'a body timeout is never replayed inside the adapter');
+  assert.deepEqual(events, [], 'the buffered response.created never reached the SDK');
+  assert.ok(caught instanceof BoundaryError);
+  assert.equal(caught.kind, 'codex.transport_timeout');
+  assert.equal(caught.context.undiciCode, 'UND_ERR_BODY_TIMEOUT');
+});
+
+test('CodexResponsesModel replays a headers timeout once, then lets the second one escape', async () => {
+  const model = new ScriptedCodexModel(async function* () {
+    throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' });
+  });
+
+  let caught: unknown;
+  try {
+    for await (const _event of model.getStreamedResponse(modelRequest())) { /* none */ }
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.equal(model.attempts, 2);
+  assert.ok(caught instanceof BoundaryError);
+  assert.equal(caught.kind, 'codex.transport_timeout');
+  assert.equal(caught.context.undiciCode, 'UND_ERR_HEADERS_TIMEOUT');
+});
+
+test('a transparent retry inside a harness run is journaled as one public stall_retry_attempted{model_transport_retry} row', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'codex transparent retry ledger' });
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' });
+    yield* successfulTurn('resp_journaled_retry');
+  });
+
+  const events = await harnessRunContextStorage.run(
+    { sessionId: session.id, sourceUserSeq: 7, turn: 2 } as never,
+    async () => {
+      const out: StreamEvent[] = [];
+      for await (const event of model.getStreamedResponse(modelRequest())) out.push(event);
+      return out;
+    },
+  );
+
+  assert.equal(model.attempts, 2);
+  assert.equal((events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>).response.id, 'resp_journaled_retry');
+  const rows = listEvents(session.id, { types: ['stall_retry_attempted'] });
+  assert.equal(rows.length, 1, 'exactly one retry, exactly one row');
+  const data = rows[0].data as Record<string, unknown>;
+  assert.equal(data.kind, 'model_transport_retry');
+  assert.equal(data.layer, 'adapter');
+  assert.equal(data.provider, 'codex');
+  assert.equal(data.model, 'gpt-5.5');
+  assert.equal(data.path, 'getStreamedResponse');
+  assert.equal(data.attempt, 1);
+  assert.equal(data.maxAttempts, 2, 'a headers timeout earns one replay: two attempts in all');
+  assert.equal(data.failureKind, 'codex.transport_timeout');
+  assert.equal(data.undiciCode, 'UND_ERR_HEADERS_TIMEOUT');
+  assert.equal(data.phase, 'headers');
+  assert.equal(data.sourceUserSeq, 7);
+  assert.equal(rows[0].turn, 2);
+  assert.equal(typeof data.backoffMs, 'number');
+});
+
+test('a transparent retry outside any harness run context journals nothing and still recovers', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'codex retry without run context' });
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' });
+    yield* successfulTurn('resp_unjournaled_retry');
+  });
+
+  const events: StreamEvent[] = [];
+  for await (const event of model.getStreamedResponse(modelRequest())) events.push(event);
+
+  assert.equal(model.attempts, 2);
+  assert.equal((events.at(-1) as Extract<StreamEvent, { type: 'response_done' }>).response.id, 'resp_unjournaled_retry');
+  assert.equal(listEvents(session.id, { types: ['stall_retry_attempted'] }).length, 0);
 });
 
 test('CodexResponsesModel retries first-call headers timeout in non-streaming path', async () => {

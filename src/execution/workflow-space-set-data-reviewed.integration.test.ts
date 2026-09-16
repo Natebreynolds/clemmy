@@ -1,6 +1,6 @@
 /** Run: node scripts/run-tests-isolated.mjs src/execution/workflow-space-set-data-reviewed.integration.test.ts */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -216,5 +216,89 @@ test('a human-initiated run makes the same reversible workspace commit a schedul
   assert.equal(grants[0]?.resolver, 'system:workflow-manual_run_authority');
   const replay = await runner.executeStep(step, ctx);
   assert.deepEqual(replay, first);
+});
+
+test('chat and dashboard Friday-style commits do not park when the run record omitted source or workflowSlug', async () => {
+  // Live 2026-09-15: "run friday-dashboard" from chat parked on
+  // space_set_data because chat dispatch wrote neither source nor
+  // workflowSlug, so auto-consent treated the run as unowned.
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+
+  const args = {
+    slug: 'friday-style-dashboard-chat',
+    source_id: 'dashboard',
+    data_json: JSON.stringify({ summary: { pipeline: '$125,000' }, rows: [{ id: 'opp-49' }] }),
+  };
+  spaces.spaceStore.save({
+    id: args.slug,
+    title: 'Friday-style dashboard (chat run)',
+    status: 'active',
+    viewEntry: 'view/index.html',
+    viewContent: '<!doctype html><title>Friday-style dashboard (chat run)</title>',
+    dataSources: [],
+    actions: [],
+  });
+  const observed = carrier.observeReviewedLocalTool('space_set_data');
+  assert.ok(observed);
+  const manifest = carrier.reviewedLocalCapabilityManifest(observed);
+  assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(
+    ports.productionPortIdentityFromManifest(manifest),
+    {
+      invoke: adapters.invokeForSealedManifest(manifest),
+      reconcile: adapters.reconcileForSealedManifest(manifest),
+    },
+  ).ok, true);
+
+  const step: WorkflowStepInput = {
+    id: 'update_dashboard',
+    prompt: '',
+    sideEffect: 'write',
+    call: { tool: 'space_set_data', args },
+  };
+  const workflow: WorkflowDefinition = {
+    name: 'reviewed-workspace-dataset-chat',
+    description: 'Commit one reviewed dashboard dataset from chat.',
+    enabled: true,
+    trigger: { schedule: '0 7 * * *', timezone: 'UTC', manual: true },
+    inputs: {},
+    steps: [step],
+  };
+  const persisted = workflowStore.writeWorkflow(workflow.name, workflow);
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    originSessionId: 'sess-desktop-owner-chat',
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`);
+  const rec = JSON.parse(readFileSync(runFile, 'utf8')) as Record<string, unknown>;
+  delete rec.source;
+  delete rec.workflowSlug;
+  writeFileSync(runFile, JSON.stringify(rec));
+
+  const ctx = {
+    workflow: persisted.data,
+    workflowSlug: persisted.name,
+    runId: queued.id,
+    inputs: {},
+    stepOutputs: {},
+    assistant: new Proxy({}, { get: () => { throw new Error('model fallback was consulted'); } }),
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof runner.executeStep>[1];
+
+  const first = await runner.executeStep(step, ctx) as { created: boolean };
+  assert.equal(first.created, true);
+  const grants = approvals.listPending({ sessionId: `workflow:${queued.id}:${step.id}`, status: 'any' });
+  assert.equal(grants.length, 1, 'auto-consent must mint a system grant, not a human card');
+  assert.equal(grants[0]?.resolver, 'system:workflow-manual_run_authority');
+  assert.notEqual(grants[0]?.status, 'pending');
 });
 

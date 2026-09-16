@@ -7,18 +7,17 @@ import { z } from 'zod';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { acceptedTaskModeIdentity } from '../runtime/harness/accepted-task-mode.js';
 import { parsePlanRevisionRef } from '../runtime/harness/task-mode.js';
-import { getPlanRevisionForSource, publishPlanRevision, type PlanStructuredOutline, type PlanArtifactV1 } from '../runtime/harness/plan-artifacts.js';
-import { canonicalCatalogIdentityOf, isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
+import { getPlanRevision, getPlanRevisionForSource, publishPlanRevision, type PlanStructuredOutline, type PlanArtifactV1 } from '../runtime/harness/plan-artifacts.js';
+import { currentReviewedProviderIdentity, reviewedProviderIdentityMismatch } from '../runtime/harness/reviewed-provider-identity.js';
 import { loadDurableAuthorizedLocalPlanningDefinition, resolveConfiguredLocalPlanningTool } from '../runtime/harness/local-planning-capability.js';
 import { currentPrimaryModelPlanningDescriptor, restoreSelectedPlanningCallable, snapshotPrimaryModelPlanningContext, snapshotPrimaryModelSelectedStagedPlanningDescriptors, type HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
-import { getCachedToolSchema } from './composio-schema-cache.js';
 import { digestSchema } from './tool-contract-store.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../shared/closed-canonical-json.js';
 import { validateProofProviderArguments } from '../runtime/harness/proof-provider-args.js';
-import { listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { validatePlanArgumentPreparation } from './plan-argument-preparation.js';
 import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
-import { PlanCollectionSchema, reviewedCollectionMembers, bindReviewedCollectionItem, planCollectionUniverseId, reviewedCollectionRoot } from '../runtime/harness/reviewed-plan-collection.js';
+import { PlanCollectionSchema, reviewedCollectionMembers, bindReviewedCollectionItem, planCollectionUniverseId, reviewedCollectionRoot, type PlanCollection } from '../runtime/harness/reviewed-plan-collection.js';
 import { nextEdge, renderNextEdge, type HostNextEdgeV1 } from '../runtime/harness/next-edge.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { assertDispatchLeaseCurrent } from '../runtime/harness/dispatch-lease.js';
@@ -41,16 +40,38 @@ export const PlanPreparationSchema = z.object({
 /** Provider-neutral, non-strict wire schema. The host validates the outline
  * itself; adapters need not force arbitrary provider data into JSON strings. */
 export const PlanPublicationOutlineSchema = PlanPreparationSchema.omit({ executionDraft: true }).extend({
-  steps: z.array(stepSchema.omit({ staticArguments: true }).extend({
+  steps: z.array(stepSchema.omit({ staticArguments: true, id: true }).extend({
+    id: z.string().min(1).max(160).optional().describe('Step identity, referenced by dependsOn and bindings. When omitted the host assigns step_<position>.'),
     staticArguments: z.record(z.string(), z.unknown()).optional().describe('The selected tool input object, directly. Keep JSON arrays and objects as data; the host serializes the transport.'),
     staticArgumentsJson: z.string().min(2).max(1_000_000).optional().describe('Legacy encoded input object. Prefer staticArguments. Supply only one representation.'),
   }).strict()).min(1),
 }).strict();
 
+/** Steps the outline left without an id, with the id the host assigns from
+ *  the step's position. A missing identity on an otherwise executable step is
+ *  a shape the host can complete from what it already holds; a refusal that
+ *  only names the missing field costs a full model round per step. Ids that
+ *  other steps reference are always authored, so a completed id never breaks
+ *  a reference. */
+export function completedPlanStepIds(outline: { steps: ReadonlyArray<{ id?: string }> }): Array<{ index: number; id: string }> {
+  const taken = new Set(outline.steps.map((step) => step.id).filter((id): id is string => typeof id === 'string' && id.length > 0));
+  const completed: Array<{ index: number; id: string }> = [];
+  outline.steps.forEach((step, index) => {
+    if (typeof step.id === 'string' && step.id.length > 0) return;
+    let candidate = `step_${index + 1}`;
+    for (let n = 2; taken.has(candidate); n += 1) candidate = `step_${index + 1}_${n}`;
+    taken.add(candidate);
+    completed.push({ index, id: candidate });
+  });
+  return completed;
+}
+
 export function decodePublishedPlanOutline(outline: z.infer<typeof PlanPublicationOutlineSchema>, executionDraft?: z.infer<typeof FreshActionPlanDraftSchema> | null): unknown {
+  const assigned = new Map(completedPlanStepIds(outline).map((entry) => [entry.index, entry.id]));
   return {
     ...outline, executionDraft: executionDraft ?? null,
-    steps: outline.steps.map(({ staticArgumentsJson, staticArguments: direct, ...step }) => {
+    steps: outline.steps.map(({ staticArgumentsJson, staticArguments: direct, ...rest }, index) => {
+      const step = { ...rest, id: rest.id ?? assigned.get(index)! };
       if (staticArgumentsJson !== undefined && direct !== undefined) throw new Error(`Step ${step.id}: supply staticArguments or staticArgumentsJson, not both.`);
       let staticArguments: unknown = direct ?? {};
       try { if (staticArgumentsJson !== undefined) staticArguments = JSON.parse(staticArgumentsJson); }
@@ -192,6 +213,56 @@ function publicationError(error: unknown): string {
     message: error instanceof Error ? error.message : 'Plan preparation failed; no plan was published.' });
 }
 
+/** A repeated tool step needs a member set the host can seal at review time:
+ *  the records the plan already holds (listed inline), or a complete read in
+ *  this plan. A step that only records an output cannot seal a member set, so
+ *  the repair names the two shapes that execute, without changing the plan's
+ *  intent: per-member content the bindings do not cover is authored at
+ *  execute time, judged against the approved goal and plan. */
+function collectionProducerRepair(stepId: string, producerId: string, collection: PlanCollection): string {
+  const bound = collection.bindings.map(binding => `${binding.itemPath || '/'} → ${binding.targetPath}`).join(', ');
+  return `Step ${stepId}: ${producerId} records an output; it cannot supply a reviewed member set. Repair one of two ways, keeping the bindings (${bound || 'none'}): `
+    + `(1) you already hold the members from planning — patch forEach to {items: [one object per member carrying every field those bindings read, including the authored per-member content such as subject and body], memberIdPath: the pointer to each object's stable id (for example /id), bindings} and drop producerStepId; `
+    + `(2) make a tool step in this plan the producerStepId (a complete read supplies its records; a repeated tool step supplies {memberId, result} records) and bind each argument from the record; `
+    + `or (3) unroll into one single-call step per member, each with dynamicBindings from ${producerId} (outputPath /drafts/0, /drafts/1, …), which stays a compute step whose result is recorded during Execute. `
+    + `A reviewed write carries its exact arguments: every required field is static, bound, or carried by the member record — never left to be written at execute time.`;
+}
+
+/** For each `type_mismatch` whose expected shape is `array<scalar>` at a
+ *  path a collection binding targets, and whose member value is exactly one
+ *  scalar of that kind, rewrite the member record's value to a one-element
+ *  list. Returns true when at least one value was completed. */
+function completeScalarListMembers(input: { item: unknown; collection: PlanCollection; failures: ReadonlyArray<{ path: string; code: string; expected?: string }> }): boolean {
+  if (!input.item || typeof input.item !== 'object' || Array.isArray(input.item)) return false;
+  let completed = false;
+  for (const failure of input.failures) {
+    if (failure.code !== 'type_mismatch') continue;
+    const inner = /^array<(string|number|boolean)>$/.exec(failure.expected ?? '')?.[1];
+    if (!inner) continue;
+    const binding = input.collection.bindings.find(candidate => candidate.targetPath === failure.path);
+    if (!binding) continue;
+    const parts = (binding.itemPath || '').split('/').slice(1).map(part => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+    if (!parts.length || parts.some(part => ['__proto__', 'prototype', 'constructor'].includes(part))) continue;
+    let parent: Record<string, unknown> = input.item as Record<string, unknown>;
+    for (const part of parts.slice(0, -1)) {
+      const next = parent[part];
+      if (!next || typeof next !== 'object' || Array.isArray(next)) { parent = null as never; break; }
+      parent = next as Record<string, unknown>;
+    }
+    if (!parent) continue;
+    const key = parts.at(-1)!;
+    const value = parent[key];
+    if (typeof value !== inner) continue;
+    parent[key] = [value];
+    completed = true;
+  }
+  return completed;
+}
+
+/** Reviewer send-backs a single Plan source may absorb before its next
+ *  structurally sound candidate publishes regardless. */
+const PLAN_REVIEW_SEND_BACK_BUDGET = 2;
+
 export async function preparePlanOutline(input: { planning?: HostFreshPlanningContextV1; sessionId: string; sourceUserSeq: number; raw: unknown; ready: boolean }): Promise<PlanStructuredOutline> {
   const outline = PlanPreparationSchema.parse(input.raw);
   // A typed data binding already declares its dependency. Do not make the
@@ -202,7 +273,11 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     ...(step.forEach?.producerStepId ? [step.forEach.producerStepId] : []),
   ])];
   const steps = new Map(outline.steps.map(step => [step.id, step]));
-  if (steps.size !== outline.steps.length) throw new Error('Plan step IDs must be unique.');
+  // Every structural problem is reported in ONE response. A plan with three
+  // repeated steps used to learn about them one rejection at a time, and each
+  // round trip was a full model call re-authoring the plan.
+  const structuralIssues: string[] = [];
+  if (steps.size !== outline.steps.length) structuralIssues.push('Plan step IDs must be unique.');
   const visited = new Set<string>();
   const visit = (id: string, chain = new Set<string>()): void => {
     if (visited.has(id)) return;
@@ -213,23 +288,27 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     visited.add(id);
   };
   for (const step of outline.steps) {
-    visit(step.id);
-    if (step.forEach) {
-      const collection = step.forEach;
-      if (!step.capabilityRef || Boolean(collection.items) === Boolean(collection.producerStepId)) throw new Error(`Step ${step.id}: forEach needs a tool and exactly one of items or producerStepId.`);
-      if (collection.items) reviewedCollectionMembers(collection, collection.items);
-      if (collection.producerStepId) {
-        const producer = steps.get(collection.producerStepId)!;
-        if (!producer.capabilityRef) throw new Error(`Step ${step.id}: a collection producer must be a tool step. For interpreted or transformed results, record a compute output and bind it to a later tool's batch input.`);
-        if (producer.forEach) {
-          if (!collection.memberIdPath) collection.memberIdPath = '/memberId';
-          if (collection.memberIdPath !== '/memberId') throw new Error(`Step ${step.id}: repeated producer ${producer.id} returns {memberId, result}; use /memberId for identity and /result/... for data. Preserve the discovered-result dependency.`);
+    try { visit(step.id); } catch (error) { structuralIssues.push(error instanceof Error ? error.message : String(error)); continue; }
+    try {
+      if (step.forEach) {
+        const collection = step.forEach;
+        if (!step.capabilityRef || Boolean(collection.items) === Boolean(collection.producerStepId)) throw new Error(`Step ${step.id}: forEach needs a tool and exactly one of items or producerStepId.`);
+        if (collection.items) reviewedCollectionMembers(collection, collection.items);
+        if (collection.producerStepId) {
+          const producer = steps.get(collection.producerStepId)!;
+          if (!producer.capabilityRef) throw new Error(collectionProducerRepair(step.id, producer.id, collection));
+          if (producer.forEach) {
+            if (!collection.memberIdPath) collection.memberIdPath = '/memberId';
+            if (collection.memberIdPath !== '/memberId') throw new Error(`Step ${step.id}: repeated producer ${producer.id} returns {memberId, result}; use /memberId for identity and /result/... for data. Preserve the discovered-result dependency.`);
+          }
         }
       }
-    }
-    for (const binding of step.dynamicBindings) {
-      const producer = steps.get(binding.producerStepId)!;
-      if (!producer.capabilityRef && producer.effect !== 'compute') throw new Error(`Step ${step.id}: producer ${producer.id} must be a tool step or a compute step whose result is recorded during Execute.`);
+      for (const binding of step.dynamicBindings) {
+        const producer = steps.get(binding.producerStepId)!;
+        if (!producer.capabilityRef && producer.effect !== 'compute') throw new Error(`Step ${step.id}: producer ${producer.id} must be a tool step or a compute step whose result is recorded during Execute.`);
+      }
+    } catch (error) {
+      structuralIssues.push(error instanceof Error ? error.message : String(error));
     }
   }
   for (const role of outline.subagents) {
@@ -237,35 +316,15 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     for (const id of role.stepIds) {
       const assigned = steps.get(id);
       if (assigned && assigned.subagentRole === null) assigned.subagentRole = role.role;
-    if (steps.get(id)?.subagentRole !== role.role) throw new Error(`Subagent ${role.role} assignment does not match step ${id}.`);
+      if (steps.get(id)?.subagentRole !== role.role) structuralIssues.push(`Subagent ${role.role} assignment does not match step ${id}.`);
     }
   }
-  for (const step of outline.steps) if (step.subagentRole && !outline.subagents.some(role => role.role === step.subagentRole && role.stepIds.includes(step.id))) throw new Error(`Step ${step.id} has an undefined subagent assignment.`);
+  for (const step of outline.steps) if (step.subagentRole && !outline.subagents.some(role => role.role === step.subagentRole && role.stepIds.includes(step.id))) structuralIssues.push(`Step ${step.id} has an undefined subagent assignment.`);
+  if (structuralIssues.length) throw new Error(structuralIssues.join('\n'));
+  // The host derives the execution draft from the reviewed steps below. A
+  // model-supplied draft is never compared against the outline: the outline
+  // is the contract, and a retained draft on an older submission is ignored.
   const toolSteps = outline.steps.filter(step => step.capabilityRef !== null);
-  if (outline.executionDraft) {
-    const draft = outline.executionDraft;
-    if (draft.topology.operations.length !== toolSteps.length) throw new Error('Execution draft must cover each reviewed tool step exactly once.');
-    for (const step of toolSteps) {
-      const op = draft.topology.operations.find(op => op.id === step.id);
-      const binding = draft.bindings.find(binding => binding.operationId === step.id);
-      const equalSet = (a: string[], b: string[]) => JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort());
-      // Name the exact disagreement. Live 2026-09-09: five identical refusals
-      // that only listed the four candidate fields cost a Plan turn ten
-      // minutes; the actual mismatch was cardinality, which the message never
-      // mentioned.
-      const disagreements: string[] = [];
-      if (!op) disagreements.push(`no execution_draft.topology operation with id ${JSON.stringify(step.id)}`);
-      if (!binding) disagreements.push(`no execution_draft binding with operationId ${JSON.stringify(step.id)}`);
-      if (binding && binding.capabilityRef !== step.capabilityRef) disagreements.push(`binding.capabilityRef ${JSON.stringify(binding.capabilityRef)} != step.capabilityRef ${JSON.stringify(step.capabilityRef)}`);
-      if (op && op.effect !== step.effect) disagreements.push(`operation.effect ${JSON.stringify(op.effect)} != step.effect ${JSON.stringify(step.effect)}`);
-      if (op && op.cardinality.kind !== 'once') disagreements.push(`legacy operation.cardinality must be {kind:"once"}; for a collection, omit the duplicate executionDraft and declare forEach on the reviewed step`);
-      if (op && !equalSet(op.dependsOn, step.dependsOn)) disagreements.push(`operation.dependsOn ${JSON.stringify(op.dependsOn)} != step.dependsOn ${JSON.stringify(step.dependsOn)}`);
-      if (op && !equalSet(op.dataFrom, step.dynamicBindings.map(binding => binding.producerStepId))) disagreements.push(`operation.dataFrom ${JSON.stringify(op.dataFrom)} != the producerStepIds of step.dynamicBindings ${JSON.stringify(step.dynamicBindings.map(binding => binding.producerStepId))}`);
-      if (disagreements.length > 0) {
-        throw new Error(`Step ${step.id}: execution draft disagrees with the reviewed outline — ${disagreements.join('; ')}.`);
-      }
-    }
-  }
   const refs = new Set(outline.steps.map(step => step.capabilityRef).filter((ref): ref is string => Boolean(ref)));
   const snapshot = input.planning && snapshotPrimaryModelPlanningContext(input.planning.authority);
   const descriptors = [...(snapshot?.capabilities ?? []), ...(input.planning ? snapshotPrimaryModelSelectedStagedPlanningDescriptors({ authority: input.planning.authority, identity: input, selectedRefs: refs }) : [])];
@@ -319,19 +378,24 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
         if (parsedArguments?.success === false || !validation.ok) throw new Error(`Step ${step.id}: static arguments do not match the exact local schema: ${JSON.stringify(parsedArguments?.success === false ? issueDetails(parsedArguments.error) : !validation.ok ? validation.failures : [])}. Repair those fields in this step; its selected local tool is already known.`);
       }
     } else {
-      const entry = peekHostCapabilityCatalogFactory()?.get(step.capabilityRef);
-      const canonical = entry && isCurrentCallableCatalogEntry(entry) ? canonicalCatalogIdentityOf(entry) : null;
-      const cached = canonical && getCachedToolSchema(canonical.operationId);
+      // ONE identity comparison, shared with Execute revalidation and call
+      // admission. The catalog seals the provider schema digest for every
+      // callable entry; publication records that identity and never fills it.
+      const current = currentReviewedProviderIdentity(step.capabilityRef);
+      const canonical = current.ok ? current.canonical : null;
       const mismatches = [
-        !entry ? 'callable catalog entry is missing' : !canonical ? 'catalog entry has no current callable attestation' : null,
-        canonical && !cached ? 'provider input schema is missing' : null,
+        !current.ok ? (current.reason === 'entry_missing' ? 'callable catalog entry is missing'
+          : current.reason === 'entry_not_callable' ? 'catalog entry has no current callable attestation'
+            : 'provider input schema is missing') : null,
         canonical && canonical.manifestDigest !== selectedDescriptor.manifestDigest ? 'manifest contract differs from the disclosed definition' : null,
         canonical && canonical.account !== selectedDescriptor.accountScope ? 'account differs from the disclosed account' : null,
       ].filter(Boolean);
       if (mismatches.length) throw new Error(`Step ${step.id}: ${mismatches.join('; ')}. This is a host capability identity mismatch, not an argument-formatting error.`);
-      if (!canonical || !cached) throw new Error(`Step ${step.id}: provider identity unavailable.`);
-      schema = JSON.parse(closedCanonicalJson(cached, { ...SEALED_CALL_CANONICAL_LIMITS, omitUndefinedObjectMembers: true }));
-      if (digestSchema(schema) !== canonical.providerInputSchemaDigest) throw new Error(`Step ${step.id}: provider schema changed after discovery.`);
+      if (!current.ok || !canonical) throw new Error(`Step ${step.id}: provider identity unavailable.`);
+      if (reviewedProviderIdentityMismatch(current, canonical as unknown as Record<string, unknown>) === 'schema_digest_mismatch') {
+        throw new Error(`Step ${step.id}: provider schema changed after discovery.`);
+      }
+      schema = JSON.parse(closedCanonicalJson(current.schema, { ...SEALED_CALL_CANONICAL_LIMITS, omitUndefinedObjectMembers: true }));
       identity = canonical;
       if (argumentBindings.length) validatePlanArgumentPreparation({ schema, staticArguments: step.staticArguments, dynamicBindings: argumentBindings });
       const validation = !argumentBindings.length && validateProofProviderArguments({ schema, payload: step.staticArguments });
@@ -341,8 +405,19 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     const dynamicallyBound = new Set(argumentBindings.map(binding => binding.targetPath.split('/')[1]?.replace(/~1/g, '/').replace(/~0/g, '~')));
     if (required.some(key => !Object.hasOwn(step.staticArguments, key) && !dynamicallyBound.has(key))) throw new Error(`Step ${step.id}: a required argument has neither a static value nor a producer binding.`);
     if (step.forEach?.items && !step.dynamicBindings.length) for (const item of step.forEach.items) {
-      const args = bindReviewedCollectionItem(step.staticArguments, step.forEach, item);
-      const validation = validateProofProviderArguments({ schema, payload: args });
+      let args = bindReviewedCollectionItem(step.staticArguments, step.forEach, item);
+      let validation = validateProofProviderArguments({ schema, payload: args });
+      if (!validation.ok) {
+        // A scalar bound where the schema wants a list of that scalar is a
+        // shape the host already knows how to complete: wrap it in the
+        // retained member record itself, so review, admission and execute
+        // all read the same bytes. Anything else still refuses.
+        const wrapped = completeScalarListMembers({ item, collection: step.forEach, failures: validation.failures });
+        if (wrapped) {
+          args = bindReviewedCollectionItem(step.staticArguments, step.forEach, item);
+          validation = validateProofProviderArguments({ schema, payload: args });
+        }
+      }
       if (!validation.ok) throw new Error(`Step ${step.id}: collection member arguments fail ${JSON.stringify(validation.failures)}.`);
     }
     preparedDescriptors.set(step.id, selectedDescriptor);
@@ -351,14 +426,17 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
       argumentValidation: argumentBindings.length ? 'validate_after_bound_results' : 'static_schema_checked',
       source: { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq } });
     } catch (error) {
-      preparationIssues.push(`Step ${step.id}: ${error instanceof Error ? error.message : 'preparation unavailable.'}`);
+      const message = error instanceof Error ? error.message : 'preparation unavailable.';
+      preparationIssues.push(message.startsWith(`Step ${step.id}:`) ? message : `Step ${step.id}: ${message}`);
     }
   }
-  if (input.ready && preparationIssues.length) throw new Error(preparationIssues.join('\n'));
+  // Producer effects are derived inside the loop above, so the collection
+  // check runs after it; it joins the same single preparation response.
   for (const step of outline.steps) if (step.forEach?.producerStepId) {
     const producer = steps.get(step.forEach.producerStepId)!;
-    if (!producer.forEach && producer.effect !== 'read') throw new Error(`Step ${step.id}: a new collection requires a complete read. Repeated producers keep their existing reviewed member IDs; they do not infer new members from a write.`);
+    if (!producer.forEach && producer.effect !== 'read') preparationIssues.push(`Step ${step.id}: a new collection requires a complete read. Repeated producers keep their existing reviewed member IDs; they do not infer new members from a write. ${collectionProducerRepair(step.id, producer.id, step.forEach)}`);
   }
+  if (input.ready && preparationIssues.length) throw new Error(preparationIssues.join('\n'));
   const executionDraft = (preparationIssues.length === 0 && toolSteps.some(step => step.forEach || ['local_write', 'external_write', 'admin'].includes(step.effect))
     ? deriveExecutionDraft(outline, preparedDescriptors) : null);
   return JSON.parse(closedCanonicalJson({ ...outline, executionDraft, preparedBindings, preparationIssues }, SEALED_CALL_CANONICAL_LIMITS)) as PlanStructuredOutline;
@@ -428,11 +506,25 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
         principalId: source.principalId });
       if (retained) return publicationReceipt(retained, true);
       let draft: { fullText: string; baseRefJson: string | null; raw: unknown };
-      if (args.draft_digest || args.step_patches) {
-        if (!args.draft_digest || !args.step_patches) throw new Error('Draft repair requires its exact draft_digest and step_patches.');
-        draft = applyPlanDraftPatches(loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest }), args);
+      // A complete outline is authoritative whenever it is supplied. A model
+      // that pairs a full plan with the retained digest is handing the host
+      // the bytes it wants published; refusing that as a malformed repair only
+      // cost a round trip (live 2026-09-15 22:52).
+      const fullSubmission = Boolean(args.full_text && args.structured_plan);
+      if (!fullSubmission && (args.draft_digest || args.step_patches)) {
+        if (!args.draft_digest) throw new Error('Draft repair requires the exact draft_digest returned with the retained draft.');
+        draft = applyPlanDraftPatches(loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest }),
+          { ...args, structured_plan: undefined, step_patches: args.step_patches ?? [] });
       } else {
         if (!args.full_text || (!args.structured_plan && args.readiness !== 'needs_input')) throw new Error('A ready plan requires full_text and structured_plan. For an unresolved user question, publish full_text with readiness needs_input; the executable outline can wait.');
+        const completedIds = args.structured_plan ? completedPlanStepIds(args.structured_plan) : [];
+        if (completedIds.length > 0) {
+          try {
+            appendEvent({ sessionId: context.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+              kind: 'plan_step_id_completed', sourceUserSeq: context.sourceUserSeq, steps: completedIds,
+            } });
+          } catch { /* advisory */ }
+        }
         draft = { fullText: args.full_text, baseRefJson: args.base_ref_json,
           raw: args.structured_plan ? decodePublishedPlanOutline(args.structured_plan) : null };
       }
@@ -459,7 +551,7 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
       assertActive();
       // Metadata preparation awaits. A concurrently repaired draft must still
       // be the exact one this patch selected before any synchronous commit.
-      if (args.draft_digest) loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest });
+      if (args.draft_digest && !fullSubmission) loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest });
       if (args.readiness === 'ready' && (structuredPlan.preparationIssues as string[]).length) {
         const digest = retainPlanPreparationDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
           fullText: draft.fullText, structuredPlan, baseRefJson: draft.baseRefJson });
@@ -468,20 +560,51 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
       // Review this candidate, not a pending advisory about an earlier draft.
       const candidate = { fullText: draft.fullText, structuredPlan, readiness: args.readiness,
         missingPrerequisites: [...new Set([...args.missing_prerequisites, ...(structuredPlan.preparationIssues as string[])])] };
-      const review = await reviewPlanForPublication(candidate);
+      // PLAN IS BEST EFFORT. The completion reviewer catches a plan that
+      // cannot execute; it must not hold a structurally sound plan hostage to
+      // wording. Two send-backs on one source are the budget: the third
+      // candidate publishes, and the reviewer's last note rides along as
+      // advisory (the Execute judge still measures the output).
+      const priorReviewRounds = listEvents(context.sessionId, { types: ['goal_alignment_judged'] })
+        .filter(event => event.data.sourceUserSeq === context.sourceUserSeq && event.data.fulfills === false).length;
+      const review = priorReviewRounds >= PLAN_REVIEW_SEND_BACK_BUDGET ? 'done' : await reviewPlanForPublication(candidate);
       assertActive();
+      if (priorReviewRounds >= PLAN_REVIEW_SEND_BACK_BUDGET) {
+        try {
+          appendEvent({ sessionId: context.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+            kind: 'plan_review_budget_spent', sourceUserSeq: context.sourceUserSeq, rounds: priorReviewRounds,
+          } });
+        } catch { /* advisory */ }
+      }
       if (review === 'continue') {
         const digest = retainPlanPreparationDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
           fullText: draft.fullText, structuredPlan, baseRefJson: draft.baseRefJson });
         return JSON.stringify({ ok: true, published: false, status: 'review_feedback', draft_digest: digest,
           message: 'The selected completion reviewer found a gap in this complete plan. The complete draft is retained. For existing steps, use draft_digest and step_patches [{step_id, changes}]; omit full_text to preserve it. If supplying full_text, include the entire revised plan, not a change note. To add, remove or reorder steps, submit full_text and the complete structured_plan without draft_digest and step_patches. Apply the review without changing the objective or replacing discovered dependencies with guesses. Nothing has executed.' });
       }
-      if (args.draft_digest) loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest });
+      if (args.draft_digest && !fullSubmission) loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest });
       const routed = listEvents(context.sessionId, { types: ['turn_model_routed'] }).filter(event => event.data.sourceUserSeq === context.sourceUserSeq).at(-1);
+      // A base revision this conversation cannot see (a plan recalled from an
+      // unrelated earlier conversation) is not a revision to append to: the
+      // model is describing new work in this conversation. Publish it as a new
+      // plan instead of refusing the whole publication (live 2026-09-15 23:11).
+      let baseRefJson = draft.baseRefJson;
+      if (baseRefJson) {
+        try {
+          getPlanRevision({ sessionId: context.sessionId, principalId: source.principalId, ref: parsePlanRevisionRef(JSON.parse(baseRefJson)) });
+        } catch {
+          try {
+            appendEvent({ sessionId: context.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+              kind: 'plan_base_ref_dropped', sourceUserSeq: context.sourceUserSeq, baseRefJson: baseRefJson.slice(0, 400),
+            } });
+          } catch { /* advisory */ }
+          baseRefJson = null;
+        }
+      }
       const artifact = publishPlanRevision({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, principalId: source.principalId,
         ...candidate,
         ...(typeof routed?.data.model === 'string' ? { authorModelId: routed.data.model } : {}),
-        ...(draft.baseRefJson ? { base: parsePlanRevisionRef(JSON.parse(draft.baseRefJson)) } : {}) });
+        ...(baseRefJson ? { base: parsePlanRevisionRef(JSON.parse(baseRefJson)) } : {}) });
       return publicationReceipt(artifact);
     },
   });

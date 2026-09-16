@@ -1251,10 +1251,23 @@ function accountEvidenceStillFits(row: TaskContinuityCapabilityEvidence): boolea
   ].some((value) => normalizedKey(value ?? '') === wanted));
 }
 
+/** The one policy for whether an answered continuation carries its parent
+ * source's capability authority forward. Affirmed, selected, and provided
+ * answers continue the parent's task; neither decline does — a plain decline
+ * keeps only conversational A/Q/B context, and a decline followed by new work
+ * starts that work from the fresh clause alone. Every reader that widens a
+ * source's capability view to its parent (inherited evidence here, replayed
+ * parent disclosures in planning-catalog priming) must consult this. */
+export function continuationInheritsParentCapabilities(
+  disposition: ContinuationAnswerDisposition,
+): boolean {
+  return disposition !== 'declined' && disposition !== 'declined_with_new_task';
+}
+
 function validInheritedEvidence(
   context: TaskContinuationContext,
 ): TaskContinuityCapabilityEvidence[] {
-  if (context.disposition === 'declined' || context.disposition === 'declined_with_new_task') return [];
+  if (!continuationInheritsParentCapabilities(context.disposition)) return [];
   const requestedEffect = requestedCapabilityEffectScope(context.parentInput);
   return context.capabilities.filter((row) => {
     if (!capabilityEffectIsCompatible(requestedEffect, row.effectClass)) return false;

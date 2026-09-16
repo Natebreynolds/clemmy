@@ -181,8 +181,7 @@ function currentCatalogOperationForCall(
       || manifest.definitionFingerprint !== attestation.schemaFingerprint
       || manifest.accountId !== attestation.accountId
       || manifest.invokePortId !== attestation.invokePortId
-      || manifest.effect !== attestation.effect
-      || manifest.externalDefinition?.providerInputSchemaDigest !== attestation.providerInputSchemaDigest) {
+      || manifest.effect !== attestation.effect) {
       return { ok: false, reason: 'accepted_manifest_unavailable' };
     }
     const entry = peekHostCapabilityCatalogFactory()?.get(attestation.capabilityId);

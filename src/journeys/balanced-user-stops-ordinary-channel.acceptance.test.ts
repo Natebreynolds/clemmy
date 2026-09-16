@@ -251,7 +251,7 @@ function fixtureCapability(
     }), {
       status: 'projected',
       resolution: 'not_exposed',
-      callSignals: { outboundDelivery: null },
+      callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
     });
   }
   return {

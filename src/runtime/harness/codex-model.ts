@@ -54,6 +54,7 @@ import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-clie
 import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthError } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
+import { appendEvent } from './eventlog.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
@@ -67,6 +68,8 @@ const logger = pino({ name: 'clementine.codex-model' });
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
 const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
+/** Ceiling on transparent retries for any failure class; the per-class budget
+ *  in `transparentCodexRetryBudget` never exceeds it. */
 const CODEX_TRANSPARENT_MAX_RETRIES = 3;
 const MIN_NATIVE_COMPACTION_THRESHOLD = 1000;
 const DEFAULT_NATIVE_COMPACTION_THRESHOLD = 8192;
@@ -376,14 +379,32 @@ export function isRetryableCodexRateLimit(err: unknown): boolean {
   return err instanceof CodexModelError && err.status === 429;
 }
 
+/**
+ * Transparent retries this failure class earns before the error escapes to the
+ * brain chain. The budget is per class because the classes cost differently:
+ *   - A body timeout has already spent the full dead-socket window on this
+ *     attempt; replaying it re-pays the prefill and overruns the chain's
+ *     first-content deadline, so the chain (fallover + bench) owns recovery.
+ *   - A headers timeout is short; one replay separates a dropped request from a
+ *     down edge.
+ *   - A terminated fetch, a stream that ended before content, and a rate limit
+ *     fail fast or need the backoff to clear, so they keep the full ceiling.
+ */
+export function transparentCodexRetryBudget(err: unknown): number {
+  if (isRetryableCodexRateLimit(err)) return CODEX_TRANSPARENT_MAX_RETRIES;
+  if (!isTransparentCodexRetryError(err)) return 0;
+  const undiciCode = (err as BoundaryError).context?.undiciCode;
+  if (undiciCode === 'UND_ERR_BODY_TIMEOUT') return 0;
+  if (undiciCode === 'UND_ERR_HEADERS_TIMEOUT') return 1;
+  return CODEX_TRANSPARENT_MAX_RETRIES;
+}
+
 function shouldRetryTransparentCodexFailure(
   err: unknown,
   yieldedRealContent: boolean,
   attempt: number,
 ): boolean {
-  return (isTransparentCodexRetryError(err) || isRetryableCodexRateLimit(err))
-    && !yieldedRealContent
-    && attempt < CODEX_TRANSPARENT_MAX_RETRIES;
+  return !yieldedRealContent && attempt < transparentCodexRetryBudget(err);
 }
 
 function transparentCodexRetryDelayMs(attempt: number, isRateLimit = false): number {
@@ -398,10 +419,64 @@ function transparentCodexRetryDelayMs(attempt: number, isRateLimit = false): num
   return base * Math.pow(2, attempt);
 }
 
+/**
+ * Journal one transparent retry into the owning session's ledger so the owner
+ * surface can say the backend did not respond instead of showing silence. The
+ * public `stall_retry_attempted` kind is reused with `kind:
+ * 'model_transport_retry'`; the projection publishes only `kind`. Best-effort:
+ * skipped outside a harness run context, and a ledger failure never blocks
+ * the retry itself.
+ */
+function journalTransparentCodexRetry(input: {
+  err: unknown;
+  attempt: number;
+  path: 'getResponse' | 'getStreamedResponse';
+  modelId: string;
+  diag: StreamDiagnostics | undefined;
+  backoffMs: number;
+}): void {
+  const ctx = harnessRunContextStorage.getStore();
+  if (!ctx?.sessionId) return;
+  try {
+    const { err, attempt, path, modelId, diag, backoffMs } = input;
+    const boundary = err instanceof BoundaryError ? err : null;
+    const context = (boundary?.context ?? {}) as Record<string, unknown>;
+    const rateLimitStatus = err instanceof CodexModelError ? err.status : undefined;
+    const sourceUserSeq = Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0
+      ? ctx.sourceUserSeq
+      : undefined;
+    appendEvent({
+      sessionId: ctx.sessionId,
+      turn: ctx.turn ?? 0,
+      role: 'system',
+      type: 'stall_retry_attempted',
+      data: {
+        kind: 'model_transport_retry',
+        layer: 'adapter',
+        provider: 'codex',
+        model: modelId,
+        path,
+        attempt: attempt + 1,
+        maxAttempts: transparentCodexRetryBudget(err) + 1,
+        failureKind: boundary?.kind ?? 'codex.rate_limited',
+        undiciCode: typeof context.undiciCode === 'string' ? context.undiciCode : null,
+        phase: typeof context.phase === 'string' ? context.phase : null,
+        responseId: typeof context.responseId === 'string' ? context.responseId : null,
+        httpStatus: diag?.httpStatus ?? rateLimitStatus ?? null,
+        elapsedMs: diag?.startTs != null ? Date.now() - diag.startTs : null,
+        backoffMs,
+        ...(sourceUserSeq !== undefined ? { sourceUserSeq } : {}),
+      },
+    });
+  } catch { /* telemetry never blocks the retry */ }
+}
+
 async function waitBeforeTransparentCodexRetry(
   err: unknown,
   attempt: number,
   path: 'getResponse' | 'getStreamedResponse',
+  modelId: string,
+  diag?: StreamDiagnostics,
 ): Promise<void> {
   const rateLimited = isRetryableCodexRateLimit(err);
   const backoffMs = transparentCodexRetryDelayMs(attempt, rateLimited);
@@ -411,7 +486,7 @@ async function waitBeforeTransparentCodexRetry(
       path,
       attempt: attempt + 1,
       nextAttempt: attempt + 2,
-      maxRetries: CODEX_TRANSPARENT_MAX_RETRIES,
+      maxRetries: transparentCodexRetryBudget(err),
       backoffMs,
       rateLimited,
       kind: boundary?.kind ?? (rateLimited ? 'codex.rate_limited' : null),
@@ -419,6 +494,7 @@ async function waitBeforeTransparentCodexRetry(
     },
     'Codex model call failed before real content; retrying transparently',
   );
+  journalTransparentCodexRetry({ err, attempt, path, modelId, diag, backoffMs });
   if (backoffMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, backoffMs));
   }
@@ -441,7 +517,7 @@ export class CodexResponsesModel implements Model {
       } catch (err) {
         const yieldedRealContent = events.some(isRealContentCodexEvent);
         if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
-          await waitBeforeTransparentCodexRetry(err, attempt, 'getResponse');
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getResponse', this.modelId);
           continue;
         }
         throw err;
@@ -452,35 +528,20 @@ export class CodexResponsesModel implements Model {
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     // Transparent retry on retryable Codex transport/SSE failures when
-    // NO content was yielded to the SDK yet. Common field cases:
-    // - UND_ERR_HEADERS_TIMEOUT before the backend sends headers.
-    // - UND_ERR_BODY_TIMEOUT before any real model content.
-    // - `codex.sse_truncated` after response.created but before content.
+    // NO content was yielded to the SDK yet:
+    // - a headers timeout before the backend answers,
+    // - a terminated fetch before any real model content,
+    // - a stream that ends after response.created but before content.
+    // A body timeout is NOT replayed here: the attempt already spent the
+    // dead-socket window, so the brain chain owns recovery (see
+    // `transparentCodexRetryBudget`).
     //
-    // A prior migration attempt moved the harness to Agents SDK 0.11.5
-    // but relied on SDK-level retry behavior; the first Codex call then
-    // surfaced `UND_ERR_HEADERS_TIMEOUT` and the workflow stalled before
-    // any tools fired. Keep this retry inside the Codex adapter, where
-    // we know exactly which events have escaped to the SDK.
-    //
-    // Existing SSE case from the field:
-    // the upstream Codex stream emits `response.created` and then drops
-    // before any output_text.delta / output_item.done — items=0,
-    // responseId set. With this retry, the user-visible failure is
-    // hidden as long as the second attempt succeeds. If content was
-    // already yielded, we cannot safely retry (would duplicate tokens),
-    // so we throw the BoundaryError as before.
-    // v0.5.21.1 — bumped 1 → 3 (4 total attempts) with exponential
-    // backoff. In the plan-timeout regression, under the chronic
-    // Codex SSE-flake window observed 2026-05-24/25 (7 truncations in
-    // 48h), MAX_RETRY=1 surfaced the F4 ask-user card on every flake
-    // and forced the user to click Retry manually — even though the
-    // very next attempt almost always succeeded. With 3 transparent
-    // retries + exponential backoff (750ms, 1.5s, 3s), the SDK rides
-    // through transient flakes silently. F4 only fires for SUSTAINED
-    // outages (rare). Tradeoff: a real outage waits ~12s before the
-    // user sees Retry, vs ~3s previously — acceptable because outages
-    // are 10× rarer than transient flakes per current telemetry.
+    // The retry lives inside the Codex adapter, not at the SDK level, because
+    // only this layer knows exactly which events have escaped to the SDK. If
+    // content was already yielded, a replay would duplicate tokens, so the
+    // BoundaryError is thrown instead. Each retry is journaled to the session
+    // ledger so the owner surface never sees silence; a sustained outage
+    // exhausts the budget and escapes to the chain with the same kind.
     let lastResponseId: string | undefined;
     let lastItemCount = 0;
     let lastDiag: StreamDiagnostics | undefined;
@@ -573,7 +634,7 @@ export class CodexResponsesModel implements Model {
         if (shouldRetryTransparentCodexFailure(err, yieldedRealContent, attempt)) {
           pendingStart = undefined;
           pendingMetadata = [];
-          await waitBeforeTransparentCodexRetry(err, attempt, 'getStreamedResponse');
+          await waitBeforeTransparentCodexRetry(err, attempt, 'getStreamedResponse', this.modelId, diag);
           continue;
         }
         throw err;
@@ -639,27 +700,22 @@ export class CodexResponsesModel implements Model {
       const noContentReason = completedEvent
         ? 'empty completion (response.completed carried no output)'
         : 'SSE ended without response.completed before real content';
-      if (!yieldedRealContent && attempt < CODEX_TRANSPARENT_MAX_RETRIES) {
-        // v0.5.21.1 — exponential backoff with jitter: 750ms, 1.5s, 3s.
-        // Single fixed delay re-hammered the backend on the same frame
-        // a struggling Cloudflare/Codex edge was rejecting; spacing
-        // attempts gives the upstream time to recover. Buffered events
-        // from the failed attempt are explicitly discarded so the new
-        // stream's response.created / metadata frames don't collide
-        // with stale ones.
+      const noContentError = new BoundaryError({
+        kind: 'codex.sse_truncated',
+        retryable: true,
+        userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
+        operatorMessage: `Codex produced no content: ${noContentReason}.`,
+        context: { responseId: lastResponseId ?? null, itemCount: lastItemCount, emptyCompletion: completedEvent != null },
+      });
+      if (shouldRetryTransparentCodexFailure(noContentError, yieldedRealContent, attempt)) {
+        // Exponential backoff: a fixed delay re-hammers the backend on the
+        // same frame a struggling edge is rejecting; spacing attempts gives
+        // the upstream time to recover. Buffered events from the failed
+        // attempt are explicitly discarded so the new stream's
+        // response.created / metadata frames don't collide with stale ones.
         pendingStart = undefined;
         pendingMetadata = [];
-        await waitBeforeTransparentCodexRetry(
-          new BoundaryError({
-            kind: 'codex.sse_truncated',
-            retryable: true,
-            userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
-            operatorMessage: `Codex produced no content: ${noContentReason}.`,
-            context: { responseId: lastResponseId ?? null, itemCount: lastItemCount, emptyCompletion: completedEvent != null },
-          }),
-          attempt,
-          'getStreamedResponse',
-        );
+        await waitBeforeTransparentCodexRetry(noContentError, attempt, 'getStreamedResponse', this.modelId, diag);
         continue;
       }
 
@@ -787,13 +843,10 @@ export class CodexResponsesModel implements Model {
       }
       let res: Response;
       try {
-        // v0.5.21 Phase 2 — pass `dispatcher: codexDispatcher` so undici
-        // enforces headersTimeout (15s) and bodyTimeout (30s) on this
-        // request. Default undici timeouts are 5min each, which hung
-        // chat indefinitely on a Cloudflare edge stall (2026-05-25
-        // transport-silence regression). Detect UND_ERR_HEADERS_TIMEOUT here
-        // (the body-timeout case is detected inside the streaming
-        // generator below).
+        // Pass `dispatcher: codexDispatcher` so undici enforces the Codex
+        // headers and body timeouts on this request instead of its multi-
+        // minute defaults. A headers timeout is detected here; the body-
+        // timeout case is detected inside the streaming generator below.
         res = await fetch(CODEX_URL, {
           method: 'POST',
           headers: buildCodexHeaders(token, accountId),
@@ -939,10 +992,10 @@ export class CodexResponsesModel implements Model {
     try {
       yield* parseCodexSse(bodyStream);
     } catch (err) {
-      // v0.5.21 Phase 2 — undici body-timeout fires here (no SSE bytes
-      // for 30s after headers arrived). Same routing as header-timeout
-      // above: throw a BoundaryError(kind='codex.transport_timeout')
-      // so loop.ts's F4 ask-user routing converts it to Retry/Switch/Stop.
+      // The undici body timeout fires here (no SSE bytes within the
+      // dead-socket window after headers arrived). Same routing as the
+      // headers timeout above: throw a BoundaryError(kind=
+      // 'codex.transport_timeout') so the harness recognizes the class.
       const undiciCode = detectCodexTransportFailure(err);
       if (undiciCode) {
         throw buildTransportTimeoutError(undiciCode, {

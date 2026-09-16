@@ -607,9 +607,10 @@ export function unboundReadComputeAuthority(input: {
  * already opened the accepted-task logical call and durably persisted the
  * exact catalog-manifest attestation (operation, account, schema, effect and
  * invoke port) before `work_call` reaches this callback. Re-read that binding
- * and the still-open logical authority here. Any graph, mutation, local
- * envelope, stale binding, or mismatched operation stays on the normal
- * expected-work path and fails closed.
+ * and the still-open logical authority here. A local envelope is admitted only
+ * for non-mutating local work (read or compute). Any graph, mutation, stale
+ * binding, or mismatched operation stays on the normal expected-work path and
+ * fails closed.
  */
 export function graphlessForegroundReadAuthority(input: {
   sessionId: string;
@@ -637,8 +638,12 @@ export function graphlessForegroundReadAuthority(input: {
       || attestation.sourceUserSeq !== input.sourceUserSeq
       || attestation.acceptedTaskId !== acceptedTaskId
       || attestation.logicalToolCallId !== input.logicalToolCallId
+      // A local envelope covers non-mutating local work, read or compute; the
+      // host mints it for both and this consumer must admit both. A catalog
+      // manifest is required for anything else.
       || (attestation.bindingKind !== 'catalog_manifest'
-        && !(attestation.bindingKind === 'local_envelope' && input.effect === 'read'))
+        && !(attestation.bindingKind === 'local_envelope'
+          && (input.effect === 'read' || input.effect === 'compute')))
       || attestation.effect !== input.effect
       || (attestation.bindingKind === 'local_envelope' ? attestation.toolName : attestation.operationId).toLowerCase()
         !== input.operationId.trim().toLowerCase()
@@ -1067,8 +1072,7 @@ export function sealedSourceStrategyWorkCarrierFromCatalog(input: {
     || canonical.account !== attested.accountId
     || canonical.invokePortId !== attested.invokePortId
     || canonical.effect !== attested.effect
-    || (canonical.providerInputSchemaDigest ?? undefined)
-      !== attested.providerInputSchemaDigest
+    || canonical.providerInputSchemaDigest !== attested.providerInputSchemaDigest
   ) return null;
   const capability = physicalSourceCapabilityIdentityFromCatalog({
     manifest,

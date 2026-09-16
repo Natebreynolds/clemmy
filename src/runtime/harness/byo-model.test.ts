@@ -380,9 +380,13 @@ test('wrap: a structured streaming turn carries reasoning + repaired JSON', asyn
 
 test('applyGlmThinking: GLM id + reasoning effort enables/disables thinking by tier', () => {
   const high: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(high, 'high');
-  assert.deepEqual(high.thinking, { type: 'enabled' });
+  assert.deepEqual(high.thinking, { type: 'disabled' }, 'no harness tier switches extended thinking on');
+  const explicit: AnyObj = { model: 'glm-5.2', thinking: { type: 'enabled' } }; applyGlmThinking(explicit, 'high');
+  assert.deepEqual(explicit.thinking, { type: 'enabled' }, 'a caller-set thinking switch is honored');
+  const medium: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(medium, 'medium');
+  assert.deepEqual(medium.thinking, { type: 'disabled' }, 'the ordinary tier never switches extended thinking on');
   const low: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(low, 'low');
-  assert.deepEqual(low.thinking, { type: 'enabled' });
+  assert.deepEqual(low.thinking, { type: 'disabled' });
   const minimal: AnyObj = { model: 'glm-4.6' }; applyGlmThinking(minimal, 'minimal');
   assert.deepEqual(minimal.thinking, { type: 'disabled' });
   const none: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(none, 'none');
@@ -408,7 +412,7 @@ test('applyGlmThinking: structured output (json_schema/json_object) forces think
   // free-form (no structured contract) keeps effort-driven thinking
   const freeform: AnyObj = { model: 'glm-5.2' };
   applyGlmThinking(freeform, 'high');
-  assert.deepEqual(freeform.thinking, { type: 'enabled' }, 'free-form + high → enabled (unchanged)');
+  assert.deepEqual(freeform.thinking, { type: 'disabled' }, 'free-form + high → still off: no harness tier switches extended thinking on');
 });
 
 test('relax: a GLM structured (json_schema) request ends up with thinking disabled', () => {
@@ -435,7 +439,7 @@ test('relax: GLM request translates stripped reasoning_effort into `thinking`', 
     messages: [{ role: 'user', content: 'hi' }],
   }) as Record<string, unknown>;
   assert.equal('reasoning_effort' in out, false, 'OpenAI-only field still stripped');
-  assert.deepEqual(out.thinking, { type: 'enabled' }, 'effort survives as GLM thinking');
+  assert.deepEqual(out.thinking, { type: 'disabled' }, 'effort is translated to an explicit thinking switch, and no harness tier turns it on');
 });
 
 test('relax: non-GLM request strips reasoning_effort and adds no `thinking`', () => {

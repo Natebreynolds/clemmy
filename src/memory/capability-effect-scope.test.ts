@@ -15,6 +15,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-effect-sc
 
 const {
   capabilityEffectIsCompatible,
+  cliCommandHead,
   rememberedCapabilityEffect,
   requestedCapabilityEffectScope,
 } = await import('./capability-effect-scope.js');
@@ -221,4 +222,44 @@ test('the workflow-step remembered-context block excludes the opposite effect', 
   const writeBlock = renderToolChoicesForContext(8, undefined, 'Send the Effectproof email now.');
   assert.match(writeBlock, /EFFECTPROOF_SEND_EMAIL/);
   assert.doesNotMatch(writeBlock, /EFFECTPROOF_LIST_EMAILS/);
+});
+
+// ── one command-head normaliser ───────────────────────────────────────────────
+//
+// Memory keys, effect scoping and reviewed-CLI matching all derive a command's
+// identity from its head. Three private copies drifted (one did not break on
+// command substitution); the exported one is the only definition.
+test('cliCommandHead is the one exported head normaliser and stops at flags, values, operators and substitutions', async () => {
+  assert.equal(cliCommandHead('sf data query --query "SELECT Id FROM Account" --json'), 'sf data query');
+  assert.equal(cliCommandHead('sf data query $(cat query.soql) --json'), 'sf data query');
+  assert.equal(cliCommandHead('gh pr list | head -5'), 'gh pr list');
+  assert.equal(cliCommandHead('node ./scripts/run.mjs status'), 'node');
+  assert.equal(cliCommandHead('  ls   -la '), 'ls');
+  assert.equal(cliCommandHead(''), '');
+  const { readFileSync } = await import('node:fs');
+  for (const file of ['./tool-choice-store.ts', '../runtime/harness/auto-remember.ts']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf-8');
+    assert.doesNotMatch(source, /function cliCommandHead\(/, `${file} must import the shared head, not define its own`);
+    assert.match(source, /import \{[^}]*\bcliCommandHead\b[^}]*\} from '[^']*capability-effect-scope\.js'/, `${file} imports the shared head`);
+  }
+});
+
+test('the shared head keeps tool-choice and auto-remember behaviour for a command with a substitution', async () => {
+  const { detectRememberableSuccess } = await import('../runtime/harness/auto-remember.js');
+  const remembered = detectRememberableSuccess(
+    'run_shell_command',
+    'exit_code: 0\n{"status":0,"result":{"records":[]}}',
+    { command: 'headproof data query $(cat query.soql) --json' },
+  );
+  assert.ok(remembered, 'a clean compute read is still remembered');
+  assert.equal(remembered!.kind, 'cli');
+  assert.equal(remembered!.identifier, 'headproof');
+  assert.match(remembered!.invocationTemplate ?? '', /^headproof data query/);
+
+  rememberToolChoice({
+    intent: 'headproof.records.query',
+    choice: { kind: 'cli', identifier: 'headproof', invocationTemplate: 'headproof data query $(cat query.soql) --json' },
+  });
+  const matches = matchToolChoicesForStep('Query the headproof data records.', { purpose: 'advertise' });
+  assert.ok(matches.some((m) => m.intent === 'headproof.records.query'), JSON.stringify(matches));
 });

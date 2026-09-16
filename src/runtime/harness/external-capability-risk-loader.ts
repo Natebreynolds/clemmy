@@ -51,6 +51,7 @@ import {
   refreshIndependentCapabilityObservation,
 } from './independent-capability-observation.js';
 import {
+  type ExternalCapabilityRequestMethodClass,
   EXTERNAL_CAPABILITY_RISK_INPUT_VERSION,
   projectExternalCapabilityRiskV1,
   type ExternalCapabilityEffect,
@@ -211,12 +212,16 @@ export type DeriveExternalCapabilityCallSignalsResultV1 =
   | {
       status: 'projected';
       resolution: ExternalCapabilityCallSignalResolution;
-      callSignals: { outboundDelivery: true | null };
+      callSignals: {
+        outboundDelivery: true | null;
+        recipientsPresent: boolean | null;
+        requestMethod: ExternalCapabilityRequestMethodClass | null;
+      };
     }
   | {
       status: 'unknown';
       reason: 'malformed_input' | 'ambiguous_schema' | 'unresolved_delivery_signal';
-      callSignals: { outboundDelivery: null };
+      callSignals: { outboundDelivery: null; recipientsPresent: null; requestMethod: null };
     };
 
 const SHA256 = /^[a-f0-9]{64}$/i;
@@ -256,7 +261,8 @@ const CURRENT_DEFINITION_KEYS = new Set([
   'behaviorHints',
 ]);
 const HINT_KEYS = new Set(['readOnly', 'destructive', 'idempotent', 'openWorld']);
-const CALL_SIGNAL_KEYS = new Set(['outboundDelivery']);
+const CALL_SIGNAL_KEYS = new Set(['outboundDelivery', 'recipientsPresent', 'requestMethod']);
+const REQUEST_METHOD_CLASSES = new Set<ExternalCapabilityRequestMethodClass>(['safe', 'post', 'update', 'delete']);
 const DESTINATION_KEYS = new Set(['digest', 'posture']);
 const MANIFEST_KEYS = new Set([
   'version',
@@ -308,10 +314,26 @@ const OUTBOUND_ARGUMENT_CONTEXT = new Set([
   'SUBSCRIBER', 'SUBSCRIBERS', 'FOLLOWER', 'FOLLOWERS', 'MESSAGE', 'MESSAGES',
   'EMAIL', 'EMAILS',
 ]);
+/** Recipient COLLECTIONS are counted, unlike delivery CONTROLS: an event or
+ * message created with no attendees/recipients invites nobody. Live
+ * 2026-09-14: every Outlook calendar create was carded as an irreversible
+ * send because `attendees_info` was invisible here and absent in the call. */
+const RECIPIENT_COLLECTION_TOKENS = new Set([
+  'ATTENDEE', 'ATTENDEES', 'RECIPIENT', 'RECIPIENTS', 'INVITEE', 'INVITEES', 'GUEST', 'GUESTS',
+]);
 const OUTBOUND_ENUM_VALUES = new Set([
   'SEND', 'SENT', 'PUBLISH', 'PUBLISHED', 'NOTIFY', 'NOTIFIED', 'INVITE',
   'INVITED', 'DELIVER', 'DELIVERED', 'DISPATCH', 'DISPATCHED', 'BROADCAST',
   'FORWARD', 'FORWARDED', 'SHARE', 'SHARED',
+]);
+/** Protocol vocabulary, not a provider list. A string property whose every
+ * enum/const value is one of these is a method surface; the selected value
+ * classifies the call as safe, post, update or delete. */
+const HTTP_METHOD_TOKENS: ReadonlyMap<string, ExternalCapabilityRequestMethodClass> = new Map([
+  ['GET', 'safe'], ['HEAD', 'safe'], ['OPTIONS', 'safe'],
+  ['POST', 'post'],
+  ['PUT', 'update'], ['PATCH', 'update'],
+  ['DELETE', 'delete'],
 ]);
 
 function sha256(bytes: string): string {
@@ -338,8 +360,17 @@ interface ArgumentSignalSurface {
 
 interface ArgumentSignalSchemaScan {
   surfaces: Map<string, ArgumentSignalSurface>;
+  /** Array-typed recipient collections the schema exposes (e.g. attendees_info). */
+  recipientSurfaces: string[][];
+  /** String properties whose closed value set is HTTP method tokens. */
+  methodSurfaces: string[][];
   malformed: boolean;
   ambiguous: boolean;
+}
+
+function recipientCollectionPath(path: readonly string[]): boolean {
+  if (path.length === 0 || path.includes('*')) return false;
+  return argumentTokens(path[path.length - 1]!).some((token) => RECIPIENT_COLLECTION_TOKENS.has(token));
 }
 
 function argumentTokens(value: string): string[] {
@@ -353,6 +384,22 @@ function argumentTokens(value: string): string[] {
 function outboundEnumValue(value: unknown): boolean {
   return typeof value === 'string'
     && argumentTokens(value).some((token) => OUTBOUND_ENUM_VALUES.has(token));
+}
+
+function httpMethodClass(value: unknown): ExternalCapabilityRequestMethodClass | null {
+  if (typeof value !== 'string') return null;
+  return HTTP_METHOD_TOKENS.get(value.trim().toUpperCase()) ?? null;
+}
+
+/** A closed string value set made only of HTTP method tokens. */
+function methodSurfaceSchema(schema: Record<string, unknown>): boolean {
+  if (schema.type !== undefined && !schemaAllowsType(schema, 'string')) return false;
+  const values = Array.isArray(schema.enum)
+    ? schema.enum
+    : schema.const !== undefined ? [schema.const] : null;
+  return values !== null
+    && values.length > 0
+    && values.every((value) => httpMethodClass(value) !== null);
 }
 
 function pathHasOutboundAction(path: readonly string[]): boolean {
@@ -485,6 +532,12 @@ function scanArgumentSignalSchema(input: {
       if (!isRecord(child)) {
         input.scan.malformed = true;
         continue;
+      }
+      if (schemaAllowsType(child, 'array') && recipientCollectionPath(path)) {
+        input.scan.recipientSurfaces.push(path);
+      }
+      if (!path.includes('*') && methodSurfaceSchema(child)) {
+        input.scan.methodSurfaces.push(path);
       }
       if (pathHasOutboundAction(path) && schemaAllowsType(child, 'boolean')) {
         addArgumentSignalSurface(input.scan, { path, kind: 'boolean' });
@@ -756,7 +809,7 @@ export function deriveExternalCapabilityCallSignalsV1(
     parsed = JSON.parse(closedCanonicalJson(raw, CALL_SIGNAL_CLOSED_LIMITS)) as unknown;
   } catch {
     return {
-      status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null },
+      status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
     };
   }
   if (
@@ -766,11 +819,13 @@ export function deriveExternalCapabilityCallSignalsV1(
     || !isRecord(parsed.inputSchema)
     || !isRecord(parsed.arguments)
   ) return {
-    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   };
 
   const scan: ArgumentSignalSchemaScan = {
     surfaces: new Map(),
+    recipientSurfaces: [],
+    methodSurfaces: [],
     malformed: false,
     ambiguous: false,
   };
@@ -783,7 +838,7 @@ export function deriveExternalCapabilityCallSignalsV1(
     depth: 0,
   });
   if (scan.malformed) return {
-    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   };
   if (
     scan.ambiguous
@@ -796,7 +851,7 @@ export function deriveExternalCapabilityCallSignalsV1(
       depth: 0,
     })
   ) return {
-    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   };
 
   const byPath = new Map<string, ArgumentSignalValue[]>();
@@ -811,21 +866,68 @@ export function deriveExternalCapabilityCallSignalsV1(
     const unique = new Set(values);
     pathResults.push(unique.size === 1 ? values[0]! : 'unknown');
   }
+  const recipientsPresent = recipientsPresentIn(scan.recipientSurfaces, parsed.arguments);
+  const requestMethod = requestMethodIn(scan.methodSurfaces, parsed.arguments);
   if (pathResults.includes('affirmative')) return {
     status: 'projected',
     resolution: 'affirmative',
-    callSignals: { outboundDelivery: true },
+    callSignals: { outboundDelivery: true, recipientsPresent, requestMethod },
   };
   if (pathResults.includes('unknown')) return {
     status: 'unknown',
     reason: 'unresolved_delivery_signal',
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   };
   return {
     status: 'projected',
     resolution: pathResults.length > 0 ? 'resolved_non_affirmative' : 'not_exposed',
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent, requestMethod },
   };
+}
+
+/** The one method class this call selects across every exposed method
+ * surface; null when none is exposed, a value is missing or unreadable, or
+ * two surfaces disagree. */
+function requestMethodIn(
+  surfaces: readonly string[][],
+  args: Record<string, unknown>,
+): ExternalCapabilityRequestMethodClass | null {
+  if (surfaces.length === 0) return null;
+  const classes = new Set<ExternalCapabilityRequestMethodClass>();
+  const seen = new Set<string>();
+  for (const path of surfaces) {
+    const key = path.join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const found = argumentValuesAtPath(args, path);
+    if (found.invalid) return null;
+    for (const value of found.values) {
+      if (value === null || value === undefined) continue;
+      const cls = httpMethodClass(value);
+      if (cls === null) return null;
+      classes.add(cls);
+    }
+  }
+  return classes.size === 1 ? [...classes][0]! : null;
+}
+
+/** true = at least one exposed recipient collection is non-empty; false = the
+ * schema exposes recipient collections and this call supplies none (absent,
+ * null, or empty); null = no recipient collection is exposed, or a value is
+ * not readable as a collection. */
+function recipientsPresentIn(surfaces: readonly string[][], args: Record<string, unknown>): boolean | null {
+  if (surfaces.length === 0) return null;
+  let present = false;
+  for (const path of surfaces) {
+    const found = argumentValuesAtPath(args, path);
+    if (found.invalid) return null;
+    for (const value of found.values) {
+      if (value === null || value === undefined) continue;
+      if (!Array.isArray(value)) return null;
+      if (value.length > 0) present = true;
+    }
+  }
+  return present;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -850,6 +952,11 @@ function boundedNonBlank(value: unknown): value is string {
 
 function nullableBoolean(value: unknown): value is boolean | null {
   return value === null || typeof value === 'boolean';
+}
+
+function nullableMethodClass(value: unknown): value is ExternalCapabilityRequestMethodClass | null {
+  return value === null
+    || (typeof value === 'string' && REQUEST_METHOD_CLASSES.has(value as ExternalCapabilityRequestMethodClass));
 }
 
 function validHints(value: unknown): value is ExternalCapabilityBehaviorHintsV1 {
@@ -906,6 +1013,8 @@ function closedInput(raw: unknown): LoadExternalCapabilityRiskAttestationInputV1
     || !isRecord(parsed.callSignals)
     || !hasExactKeys(parsed.callSignals, CALL_SIGNAL_KEYS)
     || !nullableBoolean(parsed.callSignals.outboundDelivery)
+    || !nullableBoolean(parsed.callSignals.recipientsPresent)
+    || !nullableMethodClass(parsed.callSignals.requestMethod)
   ) return null;
 
   return parsed as unknown as LoadExternalCapabilityRiskAttestationInputV1;

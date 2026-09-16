@@ -109,6 +109,24 @@ test('59796 REPLAY: goal words outrank fillable impostors — evidence selects t
   }
 });
 
+test('a selected entry carries the slug tokens the objective connected to as matchedTokens', () => {
+  installConnectedRegistryPort(() => LIVE_REGISTRY);
+  try {
+    const selection = selectGoalCatalog(LIVE_TEXT);
+    const create = selection.entries.find((entry) => entry.intent.startsWith('goal construct'));
+    assert.ok(create);
+    assert.equal(create.identifier, 'GOOGLESHEETS_SHEET_FROM_JSON');
+    // The objective said "Google sheet"; the compound toolkit token is what
+    // connected, recorded as the slug writes it so a toolkit-level consumer
+    // can compare it against the identifier's own prefix.
+    assert.ok(create.matchedTokens!.includes('googlesheets'), `expected the toolkit token, got ${JSON.stringify(create.matchedTokens)}`);
+    assert.ok(!create.matchedTokens!.includes('json'), 'generic structure words are never match evidence');
+    for (const entry of selection.entries) assert.ok(Array.isArray(entry.matchedTokens), `${entry.identifier} must carry match evidence`);
+  } finally {
+    installConnectedRegistryPort(null);
+  }
+});
+
 test('a create whose only array member is OPTIONAL is never a row create', () => {
   installConnectedRegistryPort(() => ({
     connectedToolkits: ['outlook', 'firecrawl'],

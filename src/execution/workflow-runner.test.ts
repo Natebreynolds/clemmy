@@ -8010,6 +8010,82 @@ test('rememberProvenWorkflowStepTool learns a provider call that crossed wrapped
     'a wrapper around a local tool is not a provider pin');
 });
 
+test('rememberProvenWorkflowStepTool keeps a settled nested insert shape after a later update pin', () => {
+  const toolChoices = learnedPinToolChoices;
+  const { workflowStepPinIntent, settledPinArgumentShape } = learnedPinBindings;
+  const insertArgs = JSON.stringify({
+    tool_slug: 'FIXTURE_SHEETS_INSERT',
+    arguments: JSON.stringify({
+      spreadsheet_id: 'sheet-q7x9',
+      insert_dimension: {
+        range: { sheet_id: 7, dimension: 'ROWS', start_index: 1, end_index: 2 },
+        inherit_from_before: false,
+      },
+    }),
+  });
+  const flatRefused = JSON.stringify({
+    tool_slug: 'FIXTURE_SHEETS_INSERT',
+    arguments: JSON.stringify({
+      spreadsheet_id: 'sheet-q7x9',
+      sheet_name: 'Log',
+      dimension: 'ROWS',
+      start_index: 1,
+      end_index: 2,
+      inherit_from_before: false,
+    }),
+  });
+  const updateArgs = JSON.stringify({
+    tool_slug: 'FIXTURE_SHEETS_UPDATE',
+    arguments: JSON.stringify({ spreadsheet_id: 'sheet-q7x9', values: [['digest line']] }),
+  });
+  const refusedMarker = JSON.stringify({
+    protocol: 'host_tool_disposition_v1',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'a'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    effect: 'none',
+    retry: 'replan',
+    requiresReconciliation: false,
+    message: 'arguments did not match its exact current schema. Failing paths: "/insert_dimension".',
+  });
+  const sessionId = 'workflow:learned-pin-insert-shape:main';
+  harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  const events: Array<[string, string, string]> = [
+    ['refused-flat', flatRefused, refusedMarker],
+    ['insert-ok', insertArgs, '{"successful":true,"data":{"updatedRows":1}}'],
+    ['update-ok', updateArgs, '{"successful":true,"data":{"updatedRows":1}}'],
+  ];
+  for (const [callId, args, result] of events) {
+    harnessEventlog.appendEvent({
+      sessionId, turn: 1, role: 'agent', type: 'tool_called',
+      data: { tool: 'composio_execute_tool', callId, arguments: args },
+    });
+    harnessEventlog.appendEvent({
+      sessionId, turn: 1, role: 'agent', type: 'tool_returned',
+      data: { tool: 'composio_execute_tool', callId, result },
+    });
+  }
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({
+    sessionId, workflowName: 'Learned Pin insert shape', stepId: 'main',
+  });
+  const record = toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin insert shape', 'main'));
+  assert.equal(record?.choice.identifier, 'FIXTURE_SHEETS_UPDATE');
+  const insertPin = record?.choice.alsoProven?.find((row) => row.identifier === 'FIXTURE_SHEETS_INSERT');
+  assert.ok(insertPin, 'a later update must not evict the settled insert');
+  assert.match(insertPin?.invocationTemplate ?? '', /insert_dimension/);
+  assert.match(insertPin?.invocationTemplate ?? '', /"range"/);
+  assert.doesNotMatch(insertPin?.invocationTemplate ?? '', /sheet_name/, 'the refused flat shape is not the pin');
+  const shape = settledPinArgumentShape(insertPin?.invocationTemplate);
+  assert.ok(shape.includes('/insert_dimension/range/sheet_id'));
+  assert.ok(shape.includes('/insert_dimension/range/dimension'));
+  const hint = workflowRunnerInternalsForTest.renderWorkflowToolPin('Learned Pin insert shape', 'main');
+  assert.match(hint, /LEARNED TOOL PIN/);
+  assert.match(hint, /FIXTURE_SHEETS_INSERT/);
+  assert.match(hint, /FIXTURE_SHEETS_UPDATE/);
+  assert.match(hint, /insert_dimension\/range\/sheet_id/);
+});
+
 
 test('a blocked JSON-text step finalizes as blocked and withholds its dependent write', () => {
   const blocked = { blocked: true, reason: 'The brief write was refused before dispatch.' };

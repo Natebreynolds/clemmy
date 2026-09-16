@@ -38,10 +38,16 @@ after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown') {
+/** `bounded` is the carrier-bounded shape: an unnamed operation whose current
+ * definition declares destructive:false, so its consequence stays unknown and
+ * its reversibility is ordinary_non_destructive. In Plan mode that shape is
+ * the one preparation probe; everything else is the typed Plan refusal. */
+async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown' | 'bounded',
+  options: { taskMode?: { version: 1; kind: 'plan' } } = {}) {
   const sessionId = `direct-consent-${randomUUID()}`;
   const operationId = { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE',
-    delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', unknown: 'EXAMPLE_RECORD' }[kind];
+    delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', unknown: 'EXAMPLE_RECORD',
+    bounded: 'EXAMPLE_REQUEST' }[kind];
   const effect = kind === 'admin' ? 'admin' as const : 'external_write' as const;
   const capabilityId = `cap:direct:${kind}`;
   const accountId = 'account:direct:owner';
@@ -52,7 +58,11 @@ async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown'
     operationVersion: '1', definitionFingerprint: fingerprint,
     externalDefinition: { version: 1, providerInputSchemaDigest: schemaDigest,
       semanticName: operationId,
-      behaviorHints: { readOnly: false, destructive: kind === 'delete', idempotent: null, openWorld: false } },
+      // 'unknown' is the carrier-silent shape: an absent destructive hint is
+      // no claim, so the exact-call card stays. A declared destructive:false
+      // on an unnamed operation is carrier-bounded work and proceeds.
+      behaviorHints: { readOnly: false, destructive: kind === 'delete' ? true : kind === 'unknown' ? null : false,
+        idempotent: null, openWorld: false } },
     effect, accountId,
     ...(kind === 'draft' ? { operationSemantics: { version: 1 as const, reversibility: 'reversible' as const } } : {}),
     destination: { family: 'external_resource', posture: kind === 'draft' ? 'create_new' : 'named_existing' },
@@ -80,7 +90,8 @@ async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown'
     operationVersion: '1', observedAt: Date.now(), origin: 'independent' }).ok, true);
   eventlog.createSession({ id: sessionId, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
-    data: { text: 'Perform this exact nominated operation on the connected account.' } });
+    data: { text: 'Perform this exact nominated operation on the connected account.',
+      ...(options.taskMode ? { taskMode: options.taskMode } : {}) } });
   const catalogRevisionDigest = sha(`catalog:${sessionId}`);
   const bindingRevisionDigest = sha(`binding:${sessionId}`);
   const root = authority.armHostCallAuthority({ sessionId, sourceUserSeq: source.seq,
@@ -216,5 +227,44 @@ for (const kind of ['send', 'delete', 'admin'] as const) {
     assert.equal(result.call.risk.consequence, kind);
     assert.equal(result.call.accountId, 'account:direct:owner');
     assert.ok(result.consentSubject);
+  });
+}
+
+// ─── A PLANNING TURN VALIDATES WHAT IT WILL CALL ────────────────────────────
+//
+// Plan holds no expected-work graph. A carrier-bounded call proceeds once as a
+// preparation probe and leaves the same private receipt the carrier bound
+// leaves in Act; a create in Plan gets the typed Plan refusal from the
+// reducer itself: never a card, never a coverage repair, nothing dispatched.
+const PLAN = { version: 1 as const, kind: 'plan' as const };
+
+test('a carrier-bounded call in Plan mode proceeds once as a preparation probe and journals its basis', async () => {
+  const { result, request } = await exactCall('bounded', { taskMode: PLAN });
+  assert.equal(result.status, 'decided', JSON.stringify(result));
+  if (result.status !== 'decided') return;
+  assert.deepEqual(result.decision, { kind: 'proceed', basis: 'plan_preparation_probe', authorityDigest: result.call.bindingDigest });
+  assert.deepEqual(result.call.risk, { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false });
+  assert.equal(result.consentSubject, undefined, 'a probe is never an approval subject');
+  const receipts = eventlog.listEvents(request.attestation.sessionId, { types: ['interactive_consent_decided'] });
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]!.data.basis, 'plan_preparation_probe');
+  assert.equal(receipts[0]!.data.operationId, 'EXAMPLE_REQUEST');
+  assert.equal(receipts[0]!.data.sourceUserSeq, request.attestation.sourceUserSeq);
+  assert.deepEqual(receipts[0]!.data.carrierHints, { destructive: false });
+  // The same shape outside Plan is ordinary carrier-bounded work, unchanged.
+  const act = await exactCall('bounded');
+  assert.equal(act.result.status === 'decided' && act.result.decision.kind === 'proceed' ? act.result.decision.basis : null, 'exact_carrier_bounded_work');
+});
+
+for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown'] as const) {
+  test(`a ${kind} in Plan mode returns the typed Plan refusal from consent and dispatches nothing`, async () => {
+    const { result, request } = await exactCall(kind, { taskMode: PLAN });
+    assert.equal(result.status, 'decided', JSON.stringify(result));
+    if (result.status !== 'decided') return;
+    assert.deepEqual(result.decision, { kind: 'refuse', reason: 'plan_mode_external_effect' });
+    assert.equal(result.consentSubject, undefined, 'no card in Plan, ever');
+    assert.equal(eventlog.listEvents(request.attestation.sessionId, { types: ['interactive_consent_decided'] }).length, 0);
+    assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+      .get(request.attestation.sessionId) as { n: number }).n, 0);
   });
 }

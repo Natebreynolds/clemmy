@@ -234,6 +234,13 @@ let keychainProbeOverride: KeychainProbe | null = null;
 let keychainProbeOverrideEnabled = true;
 let keychainNow = Date.now;
 let keychainProbeTimeoutMs = KEYCHAIN_PROBE_TIMEOUT_MS;
+// A CLI-owned credential is refreshed by the CLI, not by this process. When it
+// reads expired or absent, the replacement usually lands within seconds; wait
+// a bounded moment for it before declaring the sign-in gone.
+const CLI_REFRESH_WAIT_MS = 12_000;
+const CLI_REFRESH_POLL_MS = 2_000;
+let cliRefreshWaitMs = CLI_REFRESH_WAIT_MS;
+let cliRefreshPollMs = CLI_REFRESH_POLL_MS;
 
 function keychainProbeAllowed(): boolean {
   // An injected probe can exercise timing without ever touching the real
@@ -275,9 +282,17 @@ function refreshKeychainCacheAsync(): Promise<void> {
     if (generation !== keychainGeneration) return;
     // Negative results and unchanged expired positives are timestamped at
     // completion. Late results after timeout cannot overwrite this generation.
-    keychainCache = { raw: outcome.raw, at: keychainNow() };
+    //
+    // A probe that timed out or failed to run says nothing about the
+    // credential; only the store answering "absent" does. A slow keychain
+    // keeps the last credential it handed us and retries on the ordinary
+    // cadence instead of turning a valid sign-in into a missing one.
+    const transient = outcome.raw === null && (outcome.errorCode === 'ETIMEDOUT' || outcome.errorCode === 'PROBE_FAILED');
+    const retainedRaw = transient ? keychainCache?.raw ?? null : null;
+    keychainCache = { raw: outcome.raw ?? retainedRaw, at: keychainNow() };
     logger.info({
       outcome: outcome.raw ? 'credential_present' : outcome.errorCode === 'ETIMEDOUT' ? 'timed_out' : 'unavailable',
+      ...(retainedRaw ? { retainedCachedCredential: true } : {}),
       durationMs: Date.now() - started,
       ...(outcome.errorCode ? { errorCode: outcome.errorCode.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) } : {}),
     }, 'Claude Code keychain readiness probe completed');
@@ -286,6 +301,23 @@ function refreshKeychainCacheAsync(): Promise<void> {
   });
   keychainProbeInFlight = pending;
   return pending;
+}
+
+/** Re-read the CLI credential store on a short cadence until it holds a usable
+ *  token or the bounded wait ends. Returns the latest stored tokens either way. */
+async function awaitClaudeCodeCredentialRefresh(): Promise<ClaudeOAuthTokens | null> {
+  if (rawCredentialReader !== readRawCredentialJsonFromSystem || !keychainProbeAllowed()) return getStoredClaudeTokens();
+  const deadline = Date.now() + cliRefreshWaitMs;
+  let tokens = getStoredClaudeTokens();
+  while (Date.now() < deadline) {
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(cliRefreshPollMs, Math.max(0, deadline - Date.now()))));
+    keychainGeneration += 1; // retire any in-flight probe result: we want a fresh read
+    keychainProbeInFlight = null;
+    await refreshKeychainCacheAsync();
+    tokens = getStoredClaudeTokens();
+    try { assertSubscriptionToken(tokens); return tokens; } catch { /* keep waiting */ }
+  }
+  return tokens;
 }
 
 async function ensureClaudeCodeReadiness(): Promise<void> {
@@ -462,6 +494,15 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
         tokens = getStoredClaudeTokens();
       }
     }
+    if (!tokens || tokens.source === 'claude-code') {
+      try {
+        assertSubscriptionToken(tokens);
+      } catch (error) {
+        if (error instanceof ClaudeAuthError && (error.kind === 'missing' || error.kind === 'expired')) {
+          tokens = await awaitClaudeCodeCredentialRefresh();
+        }
+      }
+    }
   }
   if (
     tokens?.source === 'vault' &&
@@ -607,13 +648,15 @@ export function getClaudeAuthSnapshot(): ClaudeAuthSnapshot {
 
 export const __test__ = {
   setKeychainProbeForTests(probe: KeychainProbe | null, options: {
-    now?: () => number; timeoutMs?: number; enabled?: boolean;
+    now?: () => number; timeoutMs?: number; enabled?: boolean; cliRefreshWaitMs?: number; cliRefreshPollMs?: number;
   } = {}): void {
     keychainGeneration += 1;
     keychainProbeOverride = probe;
     keychainProbeOverrideEnabled = options.enabled ?? true;
     keychainNow = options.now ?? Date.now;
     keychainProbeTimeoutMs = options.timeoutMs ?? KEYCHAIN_PROBE_TIMEOUT_MS;
+    cliRefreshWaitMs = options.cliRefreshWaitMs ?? (probe ? 0 : CLI_REFRESH_WAIT_MS);
+    cliRefreshPollMs = options.cliRefreshPollMs ?? CLI_REFRESH_POLL_MS;
     keychainCache = null;
     keychainProbeInFlight = null;
   },

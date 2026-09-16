@@ -750,9 +750,15 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
   // acceptance, and the verdict still records verified:false /
   // enabled_unavailable. A review that RAN and did not stand still blocks.
   assert.equal(committed.presentation.status, 'done');
-  assert.match(committed.presentation.text, expected);
-  assert.match(committed.presentation.text, /remains unreviewed/);
+  // The reviewer's reason is operator diagnosis: it survives verbatim on the
+  // verdict row for the console, never in the chat sentence, which says only
+  // that the result stands unreviewed.
+  assert.doesNotMatch(committed.presentation.text, expected);
+  assert.match(committed.presentation.text, /stands unreviewed/);
+  assert.match(committed.presentation.text, /independently reviewed/);
   assert.doesNotMatch(committed.presentation.text, /accepting completion|accepted this result|without actually checking it/);
+  const recorded = listEvents(sessionId, { types: ['goal_alignment_judged'] }).at(-1);
+  assert.equal(recorded?.data.reason, reason);
   const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
   assert.equal(verdict.verified, false);
   assert.equal(verdict.disposition, 'enabled_unavailable');

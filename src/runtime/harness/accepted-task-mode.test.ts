@@ -85,3 +85,35 @@ test('the refusal names the call it actually classified', () => {
   assert.ok(refusal);
   assert.match(refusal, /focus_set/);
 });
+
+// ─── A PLANNING TURN VALIDATES WHAT IT WILL CALL ────────────────────────────
+//
+// This gate sees only an effect label. An external write the production host
+// has sealed carries a current definition whose risk consent can read, so the
+// gate hands it on: consent probes a carrier-bounded call once or refuses the
+// create/send/delete with the same sentence. An unattested external write has
+// no such fact and stays refused here; reads keep passing.
+test('an attested external write passes to consent, an unattested one stays refused, reads still pass', () => {
+  const identity = { sessionId: 's', sourceUserSeq: 1 };
+  for (const [toolName, args] of [
+    ['composio_execute_tool', { tool_slug: 'EXAMPLE_REQUEST', arguments: '{"path":"/v3/x"}' }],
+    ['work_call', { name: 'EXAMPLE_REQUEST', args_json: '{"path":"/v3/x"}' }],
+    ['call_tool', { name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: 'EXAMPLE_CREATE_DRAFT', arguments: '{}' }) }],
+  ] as const) {
+    assert.equal(planModeCallRefusal({ mode: plan, identity, toolName, args, attestedEffect: 'external_write', attested: true }), undefined, `${toolName} attested`);
+    assert.match(planModeCallRefusal({ mode: plan, identity, toolName, args, attestedEffect: 'external_write' }) ?? '', /PLAN_MODE_READ_ONLY/, `${toolName} unattested`);
+    assert.match(planModeCallRefusal({ mode: plan, identity, toolName, args, attestedEffect: 'external_write', attested: false }) ?? '', /PLAN_MODE_READ_ONLY/, `${toolName} attested:false`);
+  }
+  // Attestation widens nothing else: local writes and admin stay refused even when sealed.
+  assert.match(planModeCallRefusal({ mode: plan, identity, toolName: 'space_save', args: {}, attestedEffect: 'local_write', attested: true }) ?? '', /PLAN_MODE_READ_ONLY/);
+  assert.match(planModeCallRefusal({ mode: plan, identity, toolName: 'composio_execute_tool', args: { tool_slug: 'EXAMPLE_ROTATE_KEY', arguments: '{}' }, attestedEffect: 'admin', attested: true }) ?? '', /PLAN_MODE_READ_ONLY/);
+  assert.equal(planModeCallRefusal({ mode: plan, identity, toolName: 'composio_execute_tool', args: { tool_slug: 'EXAMPLE_GET', arguments: '{}' }, attestedEffect: 'read', attested: true }), undefined);
+});
+
+test('the shared refusal sentence names the operation and the publish_plan door', async () => {
+  const { planModeReadOnlyRefusalText } = await import('./accepted-task-mode.js');
+  const text = planModeReadOnlyRefusalText('EXAMPLE_CREATE_DRAFT');
+  assert.match(text, /^PLAN_MODE_READ_ONLY: EXAMPLE_CREATE_DRAFT cannot execute in Plan mode/);
+  assert.match(text, /publish_plan/);
+  assert.equal(planModeCallRefusal({ mode: plan, toolName: 'workflow_create', args: {} }), planModeReadOnlyRefusalText('workflow_create'));
+});

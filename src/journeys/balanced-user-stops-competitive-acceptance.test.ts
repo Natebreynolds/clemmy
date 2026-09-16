@@ -221,7 +221,7 @@ function evaluateGeneratedCreate(input: {
     binding: bindingFor(manifest),
     inputSchema: INPUT_SCHEMA,
     destination,
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
     safety: 'admissible',
   }, authorityFor(input.cohort));
   if (!loaded.ok) return { status: 'loader_refusal', reason: loaded.reason };
@@ -303,7 +303,17 @@ test('generated exact reversible creates stay card-free under catalog-order perm
 
 test('incomplete, irreversible, destructive, and ambiguous creates retain typed stops', () => {
   const { operationSemantics: _omittedSemantics, ...missingFields } = generatedManifest(101);
-  const missing = missingFields as CapabilityManifestV1;
+  // No sealed semantics and a carrier that declares nothing: the exact-call
+  // card stays. The same manifest whose carrier declares destructive:false is
+  // carrier-bounded work the harness answers itself (asserted below).
+  const missing = {
+    ...missingFields,
+    externalDefinition: {
+      ...missingFields.externalDefinition!,
+      behaviorHints: { ...missingFields.externalDefinition!.behaviorHints, destructive: null },
+    },
+  } as CapabilityManifestV1;
+  const carrierBounded = missingFields as CapabilityManifestV1;
   const irreversible = generatedManifest(102, {
     operationSemantics: { version: 1, reversibility: 'irreversible' },
   });
@@ -330,6 +340,12 @@ test('incomplete, irreversible, destructive, and ambiguous creates retain typed 
     assert.equal(evaluated.decision.kind, 'needs_user');
     if (evaluated.decision.kind !== 'needs_user') continue;
     assert.equal(evaluated.decision.need, 'approval');
+  }
+  const bounded = evaluateGeneratedCreate({ manifest: carrierBounded, cohort: [carrierBounded] });
+  assert.equal(bounded.status, 'consent_decision');
+  if (bounded.status === 'consent_decision') {
+    assert.equal(bounded.decision.kind, 'proceed');
+    if (bounded.decision.kind === 'proceed') assert.equal(bounded.decision.basis, 'exact_carrier_bounded_work');
   }
 
   const ambiguous = generatedManifest(105);
@@ -374,7 +390,7 @@ test('a stale callable row cannot lower consent from current manifest semantics'
         destination: manifest.destination,
       }),
     },
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
     safety: 'admissible',
   }, authority);
   assert.deepEqual(loaded, { ok: false, reason: 'catalog_binding_mismatch' });

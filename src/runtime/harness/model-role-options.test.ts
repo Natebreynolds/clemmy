@@ -451,11 +451,11 @@ test('brainOptions offers SPECIFIC Codex models (codex_oauth:<id>) so the brain 
     const opts = brainOptions();
     const codexValues = opts.filter((o) => o.id === 'codex_oauth').map((o) => o.value);
     assert.ok(codexValues.includes('codex_oauth:gpt-5.5'), 'gpt-5.5 is a selectable Codex brain');
-    assert.ok(codexValues.includes('codex_oauth:gpt-5.4'), 'gpt-5.4 is a selectable Codex brain');
+    assert.ok(codexValues.includes('codex_oauth:gpt-5.6-terra'), 'the current Codex default is a selectable brain');
     // The invariant: the highlighted value is always a real picker option. With the
-    // slot polluted by glm-5.2, the Codex brain resolves to the gpt-5.4 default.
+    // slot polluted by glm-5.2, the Codex brain resolves to DEFAULT_CODEX_MODEL.
     const value = effectiveBrainValue();
-    assert.ok(value.startsWith('codex_oauth:'), `codex brain value is model-specific, got ${value}`);
+    assert.equal(value, 'codex_oauth:gpt-5.6-terra', 'polluted primary falls to the current Codex default');
     assert.ok(opts.map((o) => o.value).includes(value), `effectiveBrainValue ${value} must be a real option`);
   });
 });

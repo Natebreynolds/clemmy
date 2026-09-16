@@ -20,6 +20,7 @@ import {
 } from './procedure-validity.js';
 import {
   capabilityEffectIsCompatible,
+  cliCommandHead,
   rememberedCapabilityEffect,
   requestedCapabilityEffectScope,
 } from './capability-effect-scope.js';
@@ -27,6 +28,10 @@ import {
   parseVerifiedReadCapabilityOrigin,
   type VerifiedReadCapabilityOrigin,
 } from './verified-read-origin.js';
+import {
+  renderReviewedCliWorkCallExample,
+  reviewedCliShellMatch,
+} from '../runtime/harness/reviewed-cli-shell-match.js';
 
 /**
  * Tool-choice memory store.
@@ -105,6 +110,19 @@ export interface ToolChoiceRecordChoice {
   rejectionCount?: number;
   lastSuccessAt?: string;
   lastFailureAt?: string;
+  /**
+   * Other proven operations for the same workflow step. One intent used to
+   * keep only the last success, so a later BATCH_UPDATE evicted a settled
+   * INSERT_DIMENSION shape and the next new-row run rediscovered it. These
+   * are advisory identities+shapes, never dispatch authority.
+   */
+  alsoProven?: ToolChoiceAlsoProven[];
+}
+
+export interface ToolChoiceAlsoProven {
+  identifier: string;
+  invocationTemplate?: string;
+  testedAt?: string;
 }
 
 export interface ToolChoiceRecordFallback {
@@ -418,7 +436,30 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     // back is what makes the fingerprint durable rather than write-only.
     schemaFingerprint: typeof r.schemaFingerprint === 'string' ? r.schemaFingerprint : undefined,
     verifiedReadOrigin: parseVerifiedReadCapabilityOrigin(r.verifiedReadOrigin) ?? undefined,
+    alsoProven: parseAlsoProven(r.alsoProven),
   };
+}
+
+const MAX_ALSO_PROVEN = 8;
+
+function parseAlsoProven(raw: unknown): ToolChoiceAlsoProven[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ToolChoiceAlsoProven[] = [];
+  const seen = new Set<string>();
+  for (const row of raw) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const identifier = String((row as { identifier?: unknown }).identifier ?? '').trim();
+    if (!identifier || seen.has(identifier.toLowerCase())) continue;
+    seen.add(identifier.toLowerCase());
+    const testedAt = (row as { testedAt?: unknown }).testedAt;
+    out.push({
+      identifier,
+      invocationTemplate: cleanInvocationTemplate((row as { invocationTemplate?: unknown }).invocationTemplate),
+      ...(typeof testedAt === 'string' ? { testedAt } : {}),
+    });
+    if (out.length >= MAX_ALSO_PROVEN) break;
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function numOrUndef(v: unknown): number | undefined {
@@ -689,8 +730,15 @@ function mergeProcedureChoice(
   if (!current) return { ...incoming };
   const incomingIsNewer = (incoming.testedAt ?? '') >= (current.testedAt ?? '');
   const preferred = incomingIsNewer ? incoming : current;
+  const primaryId = preferred.identifier.trim().toLowerCase();
+  const alsoProven = parseAlsoProven([
+    ...(incoming.alsoProven ?? []),
+    ...(preferred.alsoProven ?? []),
+    ...(current.alsoProven ?? []),
+  ].filter((row) => row.identifier.trim().toLowerCase() !== primaryId));
   return {
     ...preferred,
+    alsoProven,
     invocationTemplate: preferred.invocationTemplate ?? current.invocationTemplate ?? incoming.invocationTemplate,
     accountIdentity: preferred.accountIdentity ?? current.accountIdentity ?? incoming.accountIdentity,
     verifiedReadOrigin: preferred.verifiedReadOrigin
@@ -1313,6 +1361,8 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
       ?? (samePath ? prev.schemaFingerprint : undefined),
     verifiedReadOrigin: parseVerifiedReadCapabilityOrigin(input.choice.verifiedReadOrigin)
       ?? (samePath ? prev.verifiedReadOrigin : undefined),
+    alsoProven: parseAlsoProven(input.choice.alsoProven)
+      ?? (samePath ? prev.alsoProven : undefined),
     ...(samePath ? {
       successCount: prev.successCount,
       failureCount: prev.failureCount,
@@ -1738,28 +1788,6 @@ export function wordTokens(text: string): Set<string> {
     if (folded !== t) out.add(folded);
   }
   return out;
-}
-
-/** The IDENTITY portion of a CLI command — the program + subcommands BEFORE
- *  the first flag (`-x`/`--x`) or quoted/`=` argument. A tool's identity is
- *  `sf data query`, NOT its query string: ingesting argument VALUES let generic
- *  words leak into "core identity" (e.g. `LAST_N_DAYS:15` → "last"/"days"),
- *  which false-matched unrelated step prompts ("scrape posts from the last 14
- *  days" → the Salesforce SOQL choice). Non-CLI identifiers (composio/mcp) are
- *  bare identity slugs already, so they're used whole. */
-function cliCommandHead(command: string): string {
-  const parts = command.trim().split(/\s+/);
-  const keep: string[] = [];
-  for (const raw of parts) {
-    const token = raw.trim();
-    if (!token) continue;
-    if (/^(?:&&|\|\||\||;)$/.test(token)) break;
-    if (/^-/.test(token)) break;
-    if (/^["'`]/.test(token) || token.includes('=') || token.includes('{{') || token.includes('$(')) break;
-    if (/^(?:\/|\.\/|\.\.\/)/.test(token)) break;
-    keep.push(token);
-  }
-  return keep.join(' ');
 }
 
 function addExpandedToken(out: Set<string>, token: string): void {
@@ -2966,7 +2994,15 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   for (const r of active) {
     const c = r.choice!;
     const star = relevantIntents.has(r.intent) ? '★ ' : '';
-    const how = c.invocationTemplate ? ` → \`${c.invocationTemplate}\`` : '';
+    // A remembered cli command that is a callable reviewed read renders the
+    // operation to call, not the shell line: typing it through the shell meets
+    // a refusal that names no door, while the operation carries its own proof.
+    const reviewed = c.kind === 'cli'
+      ? reviewedCliShellMatch(boundCommandForChoice(c))
+      : { status: 'unmatched' as const };
+    const how = reviewed.status === 'matched'
+      ? ` → ${renderReviewedCliWorkCallExample(reviewed.operationId, reviewed.argumentMap)}`
+      : c.invocationTemplate ? ` → \`${c.invocationTemplate}\`` : '';
     // With outcomes on, show the track record so the model can gauge confidence.
     const neg = (c.failureCount ?? 0) + (c.rejectionCount ?? 0);
     const pos = (c.successCount ?? 0) + (c.approvalCount ?? 0);

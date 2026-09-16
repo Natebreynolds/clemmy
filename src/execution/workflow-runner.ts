@@ -38,11 +38,12 @@ import {
   auditAcceptedSourceSettlementTruth,
   type AcceptedSourceSettlementRecoveryIdentity,
 } from '../runtime/harness/accepted-source-settlement-audit.js';
-import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId, type ToolChoiceAlsoProven } from '../memory/tool-choice-store.js';
 import { explicitlyOptsOutOfAutomaticMemoryRecall } from '../memory/automatic-recall-opt-out.js';
 import {
   loadPriorSuccessfulStepOutputs,
   resolveCertifiedStepOutput,
+  settledPinArgumentShape,
   workflowStepPinIntent,
 } from '../memory/workflow-certified-binding.js';
 import {
@@ -2848,24 +2849,48 @@ type WorkflowV3SystemAuthorizationPolicy =
  * mobile run door, and a chat dispatch ("run my Friday dashboard"). */
 const HUMAN_INITIATED_RUN_SOURCES = new Set(['console', 'dashboard', 'mobile', 'chat', 'dispatch', 'discord']);
 
+function recordedWorkflowSlug(rec: QueuedRunRecord): string | undefined {
+  if (typeof rec.workflowSlug === 'string' && rec.workflowSlug.trim()) return rec.workflowSlug.trim();
+  const snapshot = rec.workflowDefinitionSnapshot;
+  if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+    const slug = (snapshot as { workflowSlug?: unknown }).workflowSlug;
+    if (typeof slug === 'string' && slug.trim()) return slug.trim();
+  }
+  if (typeof rec.workflow === 'string' && rec.workflow.trim()) return rec.workflow.trim();
+  return undefined;
+}
+
 /**
  * A person asked for THIS run. That is at least the authority an accepted
  * schedule occurrence carries, so the same non-send effects a scheduled run
  * makes without a second approval are made here too (a reversible workspace
  * dataset commit parked every manual Friday-dashboard run on "Approve exact
  * local_write call space_set_data", 2026-09-02). Sends keep their floor.
+ *
+ * Live 2026-09-15: chat dispatch omitted `source` and dashboard omitted
+ * `workflowSlug`, so this helper returned unavailable and auto-mode parked
+ * on space_set_data anyway. Resolve the slug from the fields the record
+ * actually has, and treat an originating chat session as a human ask.
  */
 function exactHumanRunAuthority(
   workflowSlug: string,
   runId: string,
 ): { ok: true; source: string } | { ok: false; reason: string } {
   const rec = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
-  if (!rec || rec.id !== runId || rec.workflowSlug !== workflowSlug) {
+  if (!rec || rec.id !== runId || recordedWorkflowSlug(rec) !== workflowSlug) {
     return { ok: false, reason: 'run_record_unavailable' };
   }
   const source = typeof rec.source === 'string' ? rec.source : '';
-  if (!HUMAN_INITIATED_RUN_SOURCES.has(source)) return { ok: false, reason: 'run_source_not_human' };
-  return { ok: true, source };
+  if (HUMAN_INITIATED_RUN_SOURCES.has(source)) return { ok: true, source };
+  if (typeof rec.originSessionId === 'string' && rec.originSessionId.trim()) {
+    return { ok: true, source: 'chat' };
+  }
+  const chatActivatedAt = (rec as QueuedRunRecord & { chatDispatchActivatedAt?: unknown })
+    .chatDispatchActivatedAt;
+  if (typeof chatActivatedAt === 'string' && chatActivatedAt.trim()) {
+    return { ok: true, source: 'chat' };
+  }
+  return { ok: false, reason: 'run_source_not_human' };
 }
 
 /**
@@ -6334,6 +6359,13 @@ function liftProvenCarrierCall(tool: unknown, rawArgs: unknown): { tool_slug?: s
   return undefined;
 }
 
+function pinTemplateFromArgs(args: unknown): string | undefined {
+  const template = typeof args === 'string'
+    ? args
+    : args && typeof args === 'object' ? JSON.stringify(args) : undefined;
+  return stripBakedConnectionId(template?.slice(0, 800));
+}
+
 function rememberProvenWorkflowStepTool(input: {
   sessionId: string;
   workflowName: string;
@@ -6353,32 +6385,70 @@ function rememberProvenWorkflowStepTool(input: {
         && !evidenceLooksFailedOrBlocked(resultText(e)));
     if (returned.length === 0) return;
     const calls = listHarnessEvents(input.sessionId, { types: ['tool_called'] });
-    // The LAST provider call that crossed clean — whether it crossed as the
-    // bare gateway or wrapped in one of the host's exec primitives (the shape
-    // the host completes from the proven disclosure). Ever-learning (2026-09-02):
-    // a wrapped carrier was invisible here, so the completed shape was never
-    // pinned and the next run re-derived, re-stuttered, and re-refused it.
-    let parsed: { tool_slug?: string; arguments?: unknown } | undefined;
-    for (let index = returned.length - 1; index >= 0 && !parsed?.tool_slug; index -= 1) {
-      const callId = returned[index]?.data?.callId;
-      const call = callId ? calls.find((e) => e.data?.callId === callId) : undefined;
+    // Every clean provider crossing on this step is a pin, not only the last
+    // one. Live Platform 49: digest BATCH_UPDATE evicted a settled INSERT
+    // shape, and the next new-row run rediscovered flattened insert_dimension
+    // arguments. Wrapped carriers still count (2026-09-02).
+    const bySlug = new Map<string, ToolChoiceAlsoProven>();
+    const order: string[] = [];
+    for (const event of returned) {
+      const callId = event.data?.callId;
+      const call = callId ? calls.find((row) => row.data?.callId === callId) : undefined;
+      let parsed: { tool_slug?: string; arguments?: unknown } | undefined;
       try { parsed = liftProvenCarrierCall(call?.data?.tool, call?.data?.arguments); } catch { parsed = undefined; }
+      const slug = parsed?.tool_slug?.trim();
+      if (!slug) continue;
+      const key = slug.toUpperCase();
+      const priorIndex = order.indexOf(key);
+      if (priorIndex >= 0) order.splice(priorIndex, 1);
+      order.push(key);
+      bySlug.set(key, {
+        identifier: slug,
+        invocationTemplate: pinTemplateFromArgs(parsed?.arguments),
+      });
     }
-    if (!parsed?.tool_slug) return;
-    const template = typeof parsed.arguments === 'string'
-      ? parsed.arguments
-      : parsed.arguments && typeof parsed.arguments === 'object' ? JSON.stringify(parsed.arguments) : undefined;
+    if (order.length === 0) return;
+    const intent = workflowStepPinIntent(input.workflowName, input.stepId);
+    const existing = peekToolChoice(intent)?.choice;
+    if (existing?.identifier) {
+      const extras: ToolChoiceAlsoProven[] = [
+        { identifier: existing.identifier, invocationTemplate: existing.invocationTemplate, testedAt: existing.testedAt },
+        ...(existing.alsoProven ?? []),
+      ];
+      for (const extra of extras) {
+        const key = extra.identifier.trim().toUpperCase();
+        if (!key || bySlug.has(key)) continue;
+        bySlug.set(key, extra);
+        order.unshift(key);
+      }
+    }
+    const primaryKey = order[order.length - 1]!;
+    const primary = bySlug.get(primaryKey)!;
+    const alsoProven = order
+      .filter((key) => key !== primaryKey)
+      .map((key) => bySlug.get(key)!)
+      .slice(-8);
     rememberToolChoice({
-      intent: workflowStepPinIntent(input.workflowName, input.stepId),
+      intent,
       description: `Proven tool for workflow "${input.workflowName}" step "${input.stepId}"`,
       choice: {
         kind: 'composio',
-        identifier: parsed.tool_slug,
-        invocationTemplate: stripBakedConnectionId(template?.slice(0, 800)),
+        identifier: primary.identifier,
+        invocationTemplate: primary.invocationTemplate,
+        ...(alsoProven.length > 0 ? { alsoProven } : {}),
         testEvidence: `step completed with a non-blocked structured result (run session ${input.sessionId.slice(0, 40)})`,
       },
     });
   } catch { /* pins are an optimization — never fail a step over them */ }
+}
+
+function renderOneWorkflowToolPin(pin: ToolChoiceAlsoProven & { testedAt?: string; successCount?: number }): string {
+  const shape = settledPinArgumentShape(pin.invocationTemplate);
+  const shapeText = shape.length > 0 ? ` nested shape ${shape.join(', ')}` : '';
+  const args = pin.invocationTemplate ? ` with args like: ${pin.invocationTemplate.slice(0, 600)}` : '';
+  const validated = pin.testedAt ? `, last validated ${pin.testedAt}` : '';
+  const wins = pin.successCount ? `, ${pin.successCount}x since` : '';
+  return `call composio_execute_tool slug "${pin.identifier}"${shapeText}${args}${validated}${wins}`;
 }
 
 function renderWorkflowToolPin(workflowName: string, stepId: string): string {
@@ -6391,8 +6461,12 @@ function renderWorkflowToolPin(workflowName: string, stepId: string): string {
     // A pin that has failed more than it has worked is retired from injection —
     // the store keeps the track record; we just stop recommending it.
     if ((choice.failureCount ?? 0) > (choice.successCount ?? 0)) return '';
-    const args = choice.invocationTemplate ? ` with args like: ${choice.invocationTemplate.slice(0, 600)}` : '';
-    return `\n\nLEARNED TOOL PIN (proven in a prior run of this step, last validated ${choice.testedAt}${choice.successCount ? `, ${choice.successCount}x since` : ''}): call composio_execute_tool slug "${choice.identifier}"${args}. Try this FIRST; if it fails, adapt or rediscover rather than repeating it blindly.`;
+    const pins: Array<ToolChoiceAlsoProven & { testedAt?: string; successCount?: number }> = [
+      choice,
+      ...(choice.alsoProven ?? []).filter((row) => row.identifier.trim().toUpperCase() !== choice.identifier.trim().toUpperCase()),
+    ];
+    const lines = pins.map((pin) => `- ${renderOneWorkflowToolPin(pin)}`);
+    return `\n\nLEARNED TOOL PIN (proven in a prior run of this step; advisory shape, not permission): ${pins.length === 1 ? renderOneWorkflowToolPin(choice) : `keep every proven operation, including nested write shapes:\n${lines.join('\n')}`}. Try this FIRST; if it fails, adapt or rediscover rather than repeating it blindly.`;
   } catch { return ''; }
 }
 

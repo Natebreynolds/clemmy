@@ -380,6 +380,78 @@ for (const stalled of [false, true]) test(`discovery recovery keeps the proven s
   assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
 });
 
+test('an exhausted Plan turn gets one publish-only step before it stops', async () => {
+  // Live 2026-09-15 (Sonnet 5, Plan mode): ten accounts pulled, the research
+  // call refused as Plan-mode read-only, a discovery timeout spent the last
+  // retry, and the turn ended "I stopped before publishing" with a plan the
+  // model itself called ready. publish_plan was admissible the whole time; the
+  // model never took it. Exhaustion on a Plan turn now buys exactly one step
+  // whose surface is publish_plan (+ the question control) with a publish-now
+  // steer. A second exhaustion stops as before.
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  const prompt = 'Plan the creation of one new local fixture file with the supplied content.';
+  const session = eventlog.createSession({ id: 'host-no-progress-plan-publish', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, taskMode: { version: 1, kind: 'plan' } },
+  });
+  const observed = await localPlanning.observeCurrentLocalPlanningDefinition({ name: 'write_file', carrier: 'work_call' });
+  assert.equal(observed.ok, true, JSON.stringify(observed));
+  const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+
+  let modelCalls = 0;
+  const surfaces: string[][] = [];
+  const inputs: string[] = [];
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }>; input?: unknown }) {
+      modelCalls += 1;
+      const surface = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      surfaces.push(surface);
+      inputs.push(JSON.stringify(request.input ?? ''));
+      if (surface.includes('tool_search')) {
+        return {
+          responseId: `plan-publish-response-${modelCalls}`,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: [functionCall(`discover-${modelCalls}`, 'tool_search', {
+            query: `write_file alternate ${modelCalls}`, role_key: null, limit: 1,
+          })],
+        };
+      }
+      // The publish-only step: this fixture answers in prose so the pin is
+      // about the step the host granted, not about a valid publication body.
+      return {
+        responseId: `plan-publish-response-${modelCalls}`,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Outline: one write_file step; verification: read the file back.' }] }],
+      };
+    },
+    getStreamedResponse: modelStream,
+  };
+  const agent = await buildOrchestratorAgent({
+    userInput: prompt, sessionId: session.id, sourceUserSeq: source.seq,
+    hostFreshPlanning: primed.planning, allowedToolNames: ['write_file', 'tool_search'], allowToolJit: true,
+    mcpToolScope: { authority: 'none', reason: 'plan publish regression has no external authority', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: model as never,
+  });
+  const parent = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1, counter: new brackets.ToolCallsCounter(20), behaviorScopeId: `${session.id}::turn:1` };
+  await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+    throwingRunner() as never, agent as never, [{ role: 'user', content: prompt }] as never,
+    { maxTurns: 12, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 } } as never,
+  ));
+
+  const granted = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'plan_final_publish_step');
+  assert.equal(granted.length, 1, 'exactly one publish-only step is granted');
+  const last = surfaces.at(-1) ?? [];
+  assert.ok(last.includes('publish_plan'), `the final surface carries publish_plan: ${JSON.stringify(last)}`);
+  assert.ok(last.every((name) => name === 'publish_plan' || name === 'ask_user_question'), `publish-only: ${JSON.stringify(last)}`);
+  assert.match(inputs.at(-1) ?? '', /PUBLISH NOW/);
+  assert.ok(surfaces.slice(0, -1).every((surface) => surface.includes('tool_search')), 'every earlier step still had discovery');
+});
+
 // A write already on the card is NOT a repair for a draft missing ITS write:
 // nothing can tell the matching write from an unrelated one, and offering the
 // card's writes as candidates is the "offered greenhouse/airtable" incident

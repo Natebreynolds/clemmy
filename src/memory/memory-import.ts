@@ -27,7 +27,7 @@ import os from 'node:os';
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
-import { BASE_DIR, MODELS } from '../config.js';
+import { BASE_DIR, DEFAULT_CODEX_FAST_MODEL, MODELS } from '../config.js';
 import { embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { deleteFact } from './facts.js';
 import type { ConsolidatedFactKind } from './db.js';
@@ -301,7 +301,7 @@ async function distillFile(text: string, filePath: string): Promise<DistilledImp
   try {
     const agent = new Agent({
       name: 'Memory Import Distiller',
-      model: MODELS.fast || MODELS.primary || 'gpt-5.4-mini',
+      model: MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL,
       instructions: DISTILL_INSTRUCTIONS,
     });
     const runner = new Runner({ workflowName: 'clementine-memory-import' });

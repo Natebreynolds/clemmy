@@ -2,10 +2,10 @@
 import { jsonSchemaAllowsNull } from '../schema-normalizer.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
-import { canonicalCatalogIdentityOf, isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
+import type { RegisteredHostCapability } from './host-capability-catalog-factory.js';
 import { revalidateLocalPlanningDefinition, issueAuthorizedLocalPlanningDisclosureCandidate, resolveConfiguredLocalPlanningTool, type AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
-import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import { attestationMatchesReviewedIdentity, currentReviewedProviderIdentity, reviewedProviderIdentityMismatch } from './reviewed-provider-identity.js';
 import { disclosePrimaryModelPlanningCapabilities, type HostFreshPlanningContextV1 } from '../semantic-boundary/admit-and-compile-accepted-source.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { resolveReviewedPlanStepResult, resolveReviewedPlanCollectionRecords } from './reviewed-plan-results.js';
@@ -16,7 +16,7 @@ import { unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './to
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { PlanArtifactV1 } from './plan-artifacts.js';
 import { isPlainOrClementineLocalTool, isTrustedComposioGateway } from './runtime-tool-identity.js';
-import { getTurnGraphEventForSource } from './eventlog.js';
+import { getTurnGraphEventForSource, appendEvent } from './eventlog.js';
 
 const object = (v: unknown): v is Record<string, any> => Boolean(v && typeof v === 'object' && !Array.isArray(v));
 const equal = (a: unknown, b: unknown) => closedCanonicalJson(a, SEALED_CALL_CANONICAL_LIMITS) === closedCanonicalJson(b, SEALED_CALL_CANONICAL_LIMITS);
@@ -27,10 +27,27 @@ function prepared(artifact: PlanArtifactV1) {
   return { steps: outline.steps.filter(object), bindings: outline.preparedBindings.filter(object) };
 }
 
-export async function revalidateReviewedPlanPreparation(planning: HostFreshPlanningContextV1): Promise<void> {
-  const execution = acceptedPlanExecution(planning.identity.sessionId, planning.identity.sourceUserSeq);
-  if (!execution) return;
-  const outline = prepared(execution.artifact);
+/** One reviewed tool step whose current capability passed the check. */
+export type ReviewedPlanPreparationCheckV1 =
+  | { stepId: string; capabilityRef: string; kind: 'local_registry'; candidate: AuthorizedLocalPlanningDisclosureCandidate }
+  | { stepId: string; capabilityRef: string; kind: 'provider'; entry: RegisteredHostCapability; schema: Record<string, unknown> };
+
+type AuthorizedLocalPlanningDisclosureCandidate = Parameters<typeof disclosePrimaryModelPlanningCapabilities>[0]['candidates'][number];
+
+/**
+ * The pure check half of Execute preparation: every reviewed tool step must
+ * still resolve to the exact current capability and schema it was published
+ * against. Nothing here attaches authority to a source or needs a claim, so a
+ * fresh Execute can run it BEFORE its one-per-revision claim is minted; a
+ * refusal then leaves the revision ready instead of burning it. The same
+ * check runs again after the claim, from `revalidateReviewedPlanPreparation`.
+ */
+export async function checkReviewedPlanPreparation(
+  artifact: PlanArtifactV1,
+  trace?: { sessionId?: string; sourceUserSeq?: number },
+): Promise<ReviewedPlanPreparationCheckV1[]> {
+  const outline = prepared(artifact);
+  const checked: ReviewedPlanPreparationCheckV1[] = [];
   for (const step of outline.steps) {
     if (!step.capabilityRef) continue;
     const binding = outline.bindings.find(row => row.stepId === step.id && row.capabilityRef === step.capabilityRef);
@@ -42,26 +59,45 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
       if (!current.ok || !configured?.parameters || digestSchema(JSON.parse(JSON.stringify(configured.parameters))) !== binding.identity.inputSchemaDigest) throw new Error(`Reviewed native tool ${prior.name} changed. Revise the plan before execution.`);
       const candidate = await issueAuthorizedLocalPlanningDisclosureCandidate({ name: prior.name, carrier: prior.carrier, configuredNames: new Set([configured.name]) });
       if (!candidate || 'refused' in candidate) throw new Error(`Reviewed native tool ${prior.name} is no longer available.`);
-      await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority, candidates: [candidate] });
+      checked.push({ stepId: step.id, capabilityRef: step.capabilityRef, kind: 'local_registry', candidate });
     } else {
-      const entry = peekHostCapabilityCatalogFactory()?.get(step.capabilityRef);
-      const canonical = entry && isCurrentCallableCatalogEntry(entry) ? canonicalCatalogIdentityOf(entry) : null;
-      const schema = canonical && getCachedToolSchema(canonical.operationId);
-      if (!canonical || !schema || !equal(canonical, binding.identity)
-        || digestSchema(JSON.parse(closedCanonicalJson(schema, { ...SEALED_CALL_CANONICAL_LIMITS, omitUndefinedObjectMembers: true }))) !== canonical.providerInputSchemaDigest) {
+      const current = currentReviewedProviderIdentity(step.capabilityRef);
+      const reason = current.ok ? reviewedProviderIdentityMismatch(current, binding.identity as Record<string, unknown>) : current.reason;
+      if (reason) {
+        try {
+          appendEvent({ sessionId: trace?.sessionId ?? artifact.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+            kind: 'plan_execution_revalidation_refused', sourceUserSeq: trace?.sourceUserSeq, stepId: step.id,
+            capabilityRef: step.capabilityRef, entryPresent: Boolean(current.entry), callable: current.ok, schemaCached: current.ok, reason,
+          } });
+        } catch { /* trace never blocks the refusal */ }
         throw new Error(`Reviewed provider capability ${step.capabilityRef} changed or is unavailable. Revise the plan before execution.`);
       }
-      // Revalidation must also attach the exact approved selection to THIS
-      // accepted source. A live catalog row alone is not its planning card,
-      // and unrelated remembered tools can occupy every display slot.
-      const providerKind = entry!.manifest?.providerKind;
-      if (!getTurnGraphEventForSource(planning.identity.sessionId, planning.identity.sourceUserSeq)
-        && (providerKind === 'composio' || providerKind === 'native_mcp')) {
-        const refs = await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority,
-          candidates: [{ name: step.capabilityRef, carrier: 'work_call', schema,
-            sourceKind: providerKind === 'composio' ? 'authorized_composio' : 'authorized_external_mcp' }] });
-        if (refs[step.capabilityRef] !== step.capabilityRef) throw new Error(`Reviewed provider capability ${step.capabilityRef} could not be attached to this execution source.`);
-      }
+      if (!current.ok) continue;
+      checked.push({ stepId: step.id, capabilityRef: step.capabilityRef, kind: 'provider', entry: current.entry, schema: current.schema });
+    }
+  }
+  return checked;
+}
+
+/** Check, then attach the exact approved selection to THIS accepted source. */
+export async function revalidateReviewedPlanPreparation(planning: HostFreshPlanningContextV1): Promise<void> {
+  const execution = acceptedPlanExecution(planning.identity.sessionId, planning.identity.sourceUserSeq);
+  if (!execution) return;
+  const checked = await checkReviewedPlanPreparation(execution.artifact, planning.identity);
+  for (const row of checked) {
+    if (row.kind === 'local_registry') {
+      await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority, candidates: [row.candidate] });
+      continue;
+    }
+    // A live catalog row alone is not this source's planning card, and
+    // unrelated remembered tools can occupy every display slot.
+    const providerKind = row.entry.manifest?.providerKind;
+    if (!getTurnGraphEventForSource(planning.identity.sessionId, planning.identity.sourceUserSeq)
+      && (providerKind === 'composio' || providerKind === 'native_mcp')) {
+      const refs = await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority,
+        candidates: [{ name: row.capabilityRef, carrier: 'work_call', schema: row.schema,
+          sourceKind: providerKind === 'composio' ? 'authorized_composio' : 'authorized_external_mcp' }] });
+      if (refs[row.capabilityRef] !== row.capabilityRef) throw new Error(`Reviewed provider capability ${row.capabilityRef} could not be attached to this execution source.`);
     }
   }
 }
@@ -187,7 +223,14 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
     if (loaded.status !== 'ok') throw new Error('Activate the exact reviewed plan with plan_task before its business calls.');
     const requestedBinding = outline.bindings.find(row => row.stepId === requestedId);
     if (requestedBinding && requestedBinding.identity?.kind !== 'local_registry' && !input.attestation) {
-      throw new Error(`Reviewed step ${requestedId}: current provider authority could not be bound (${input.authorityIssue || 'attestation_missing'}). This is a host capability binding failure, not a request to rewrite the approved arguments.`);
+      // Name the mismatch the model can act on. A reviewed step is bound to
+      // one operation; a call that names a different one for that step is the
+      // usual cause, and "binding failure" sent the model hunting elsewhere.
+      const boundOperation = typeof requestedBinding.identity?.operationId === 'string' ? requestedBinding.identity.operationId : '';
+      const substituted = boundOperation && toolName && boundOperation.toLowerCase() !== toolName.toLowerCase();
+      throw new Error(substituted
+        ? `Reviewed step ${requestedId} is bound to ${boundOperation}; this call names ${toolName}. Call ${boundOperation} for this step with corrected arguments, or ask for a plan revision. The reviewed binding is not rewritten by a different operation.`
+        : `Reviewed step ${requestedId}: current provider authority could not be bound (${input.authorityIssue || 'attestation_missing'}). This is a host capability binding failure, not a request to rewrite the approved arguments.`);
     }
     const candidates = outline.steps.filter(step => {
       if (typeof requestedId === 'string' && requestedId !== step.id) return false;
@@ -212,9 +255,8 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
       }
       const binding = outline.bindings.find(row => row.stepId === step.id)!;
       if (binding.identity.kind !== 'local_registry') {
-        const a = input.attestation;
-        if (!a || a.capabilityId !== binding.capabilityRef || a.manifestDigest !== binding.identity.manifestDigest
-          || a.accountId !== binding.identity.account || a.providerInputSchemaDigest !== binding.identity.providerInputSchemaDigest) return false;
+        if (input.attestation?.capabilityId !== binding.capabilityRef) return false;
+        if (!attestationMatchesReviewedIdentity(input.attestation, binding.identity)) return false;
       }
       return true;
     });

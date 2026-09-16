@@ -877,6 +877,76 @@ test('compactionBudgetForModel: budget tracks the ROUTED model window, never a f
   assert.equal(compactionBudgetForModel(undefined), resolveModelCapability(undefined).contextWindow);
 });
 
+test('layer1CompactionBudgetForModel: lossless Layer 1 is absolute on a wire without a cached prefix, the window on one with', async () => {
+  // Layer 1 clips and collapses OLD tool results that stay recallable by call
+  // id, so it only ever answers "what does the next prefill cost" — and that
+  // is absolute bytes unless the wire serves a cached prefix in practice. The
+  // mid-turn thresholds already make exactly this split (2026-09-01); between
+  // turns the window governed every layer, so on the Codex OAuth wire (880k
+  // window, ~37% cache reads) a 67k-token history never compacted at all.
+  const { layer1CompactionBudgetForModel, compactionBudgetForModel } = await import('./compaction.js');
+  // Seeded non-caching, large window: Layer 1 at the historical absolute.
+  assert.equal(layer1CompactionBudgetForModel('gpt-5.6-sol'), 200_000);
+  assert.equal(layer1CompactionBudgetForModel('kimi-k3'), 200_000);
+  // Layers 2/3 keep the real window — the 2026-08-05 pin above is untouched.
+  assert.equal(compactionBudgetForModel('gpt-5.6-sol'), 880_000);
+  // Seeded caching: the prefix is never rewritten for nothing.
+  assert.equal(layer1CompactionBudgetForModel('claude-sonnet-5'), 1_000_000);
+  assert.equal(layer1CompactionBudgetForModel('claude-opus-4-8'), 1_000_000);
+  // A window below the absolute is still the honest ceiling.
+  assert.equal(layer1CompactionBudgetForModel('glm-4.7'), 200_000);
+  assert.ok(layer1CompactionBudgetForModel('totally-unknown-model') <= 200_000);
+  assert.equal(layer1CompactionBudgetForModel('totally-unknown-model'), compactionBudgetForModel('totally-unknown-model'));
+});
+
+test('compactSessionIfNeeded — Layer 1 fires on its own budget while Layers 2/3 keep the window', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'layer1 budget test' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'scrape.site', `{"url":"https://site-${i}.test"}`));
+    items.push(toolResult(callId, `site ${i} result ${'z'.repeat(4000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'scrape.site', output: `site ${i} result ${'z'.repeat(4000)}` });
+  }
+  session.updateConversationSnapshot(items);
+  const before = estimateInputTokens(items);
+
+  // Window-only budget with headroom: nothing fires (the pre-existing behavior).
+  const untouched = await compactSessionIfNeeded(session, structuredClone(items), {
+    disable: 'layer1_only',
+    inputBudgetTokens: 880_000,
+    layer1ItemThreshold: 1_000,
+  });
+  assert.equal(untouched.result.modified, false, 'on the window alone the history is far below 30%');
+  assert.equal(untouched.result.layer1BudgetTokens, 880_000);
+
+  // Same history, same window, Layer 1 measured against an absolute budget it
+  // exceeds: old pairs collapse, and the window is still what Layers 2/3 see.
+  const compacted = await compactSessionIfNeeded(session, structuredClone(items), {
+    disable: 'layer1_only',
+    inputBudgetTokens: 880_000,
+    layer1BudgetTokens: Math.floor(before / 0.3) - 1,
+    layer1ItemThreshold: 1_000,
+    layer1RetainToolPairs: 4,
+  });
+  assert.equal(compacted.result.modified, true);
+  assert.equal(compacted.result.budgetTokens, 880_000, 'lossy layers keep the window');
+  assert.equal(compacted.result.layer1BudgetTokens, Math.floor(before / 0.3) - 1);
+  assert.ok(compacted.result.layer1.collapsedToolPairs > 0);
+  assert.ok(compacted.result.afterTokens < compacted.result.beforeTokens);
+
+  // A Layer 1 budget can never exceed the window it lives inside.
+  const clamped = await compactSessionIfNeeded(session, structuredClone(items), {
+    disable: 'layer1_only',
+    inputBudgetTokens: 50_000,
+    layer1BudgetTokens: 900_000,
+    layer1ItemThreshold: 1_000,
+  });
+  assert.equal(clamped.result.layer1BudgetTokens, 50_000);
+});
+
 test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its own window', async () => {
   // REGRESSION PIN (2026-08-05 deep-look): window-aware budgets let an
   // 880K/1M-budget session serialize MORE older history than the fast

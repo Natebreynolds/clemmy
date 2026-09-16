@@ -265,3 +265,40 @@ test('catalog join is exact on provider, operation, effect, account, and refuses
   assert.equal(indexed.currentManifestsForVerifiedWrite(ambiguous, catalogRecord).length, 2,
     'the caller sees ambiguity and therefore cannot choose by store order');
 });
+
+test('backfill memo: not_proven rows wait for the recheck cadence, proven rows never re-learn', () => {
+  const { NOT_PROVEN_RECHECK_MS } = learning.__test__;
+  const now = 10_000_000;
+  assert.equal(learning.backfillRowNeedsLearning(undefined, now), true);
+  assert.equal(learning.backfillRowNeedsLearning({ status: 'learned', at: 0 }, now), false);
+  assert.equal(learning.backfillRowNeedsLearning({ status: 'replayed', at: 0 }, now), false);
+  assert.equal(learning.backfillRowNeedsLearning({ status: 'not_proven', at: now - 1 }, now), false);
+  assert.equal(learning.backfillRowNeedsLearning({ status: 'not_proven', at: now - NOT_PROVEN_RECHECK_MS }, now), true);
+});
+
+test('backfill pays each not_proven row once per cadence and bounds the work of one turn', async () => {
+  // Measured 2026-09-09: the per-turn backfill re-learned every not_proven
+  // terminal row on every accepted turn (~4.1 s, growing with history).
+  learning.__test__.resetBackfillCache();
+  const { MAX_LEARNED_PER_BACKFILL, NOT_PROVEN_RECHECK_MS, backfillRows } = learning.__test__;
+  const rows = Array.from({ length: MAX_LEARNED_PER_BACKFILL + 4 }, (_, index) => ({
+    session_id: `backfill-${index}`,
+    source_user_seq: 1,
+  }));
+  const calls: string[] = [];
+  const learn = async (row: { sessionId: string; sourceUserSeq: number }) => {
+    calls.push(row.sessionId);
+    return { status: row.sessionId === 'backfill-0' ? 'learned' : 'not_proven' };
+  };
+  const t0 = 5_000_000;
+  const first = await backfillRows(rows, learn, t0);
+  assert.deepEqual(first, { scanned: rows.length, learned: MAX_LEARNED_PER_BACKFILL }, 'one turn is bounded');
+  const second = await backfillRows(rows, learn, t0 + 1_000);
+  assert.equal(second.learned, 4, 'the next turn picks up only the remainder');
+  const third = await backfillRows(rows, learn, t0 + 2_000);
+  assert.equal(third.learned, 0, 'a settled memo costs the following turns nothing');
+  const later = await backfillRows(rows, learn, t0 + NOT_PROVEN_RECHECK_MS + 2_000);
+  assert.equal(later.learned, MAX_LEARNED_PER_BACKFILL, 'not_proven rows are rechecked after the cadence, still bounded');
+  assert.equal(calls.filter((id) => id === 'backfill-0').length, 1, 'a learned row is never re-learned');
+  learning.__test__.resetBackfillCache();
+});

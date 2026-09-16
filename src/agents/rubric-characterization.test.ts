@@ -169,10 +169,15 @@ const GOLDEN = {
   // need no plan; call a disclosed read through work_call directly (byte-neutral).
   // 2026-09-02: PARALLELIZE READS — read a source whole in one call and recall
   // the retained set instead of walking a cursor one page per turn (net -39 B).
-  instructions: { len: 31886, sha16: '5cbcc32e2cdc807c' },
-  native: { len: 30993, sha16: '993e81186d1b02f8' },
-  claudeBrain: { len: 8949, sha16: '50404a7bf34c980a' },
-  lean: { len: 10954, sha16: '59b00aeb63a13b82' },
+  // 2026-09-15: CONVERSE FIRST now says which connected account/mailbox/calendar
+  // is never the clarifying question (attempt the call; the runtime resolves it
+  // and asks once only if it cannot) — live, the model asked "which calendar?"
+  // before any call while memory held the answer. The line was tightened by
+  // what it grew so the action-lean rubric stays under its 5,500-byte ceiling.
+  instructions: { len: 31879, sha16: 'b0e0fde7e3ea1766' },
+  native: { len: 30986, sha16: '9887e20c1f4577a0' },
+  claudeBrain: { len: 8942, sha16: '62c88f5454af1a39' },
+  lean: { len: 10947, sha16: 'c51e0e3169d675f0' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -197,6 +202,16 @@ test('characterization: ORCHESTRATOR_BEHAVIOR_NATIVE is byte-stable (reviewable-
 
 test('characterization: CLAUDE_BRAIN_RUBRIC (lean) is byte-stable (reviewable-diff guard)', () => {
   snapshotGuard('claudeBrain', CLAUDE_BRAIN_RUBRIC, GOLDEN.claudeBrain);
+});
+
+test('every lane tells the model that which account/mailbox/calendar is never the clarifying question', () => {
+  for (const [name, text] of [
+    ['action-lean', ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN],
+    ['lean', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+    ['full', ORCHESTRATOR_INSTRUCTIONS],
+  ] as const) {
+    assert.match(text, /Which connected account, mailbox, or calendar is never that question: attempt the call/, name);
+  }
 });
 
 test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewable-diff guard)', () => {

@@ -352,10 +352,16 @@ export const CODEX_USE_FULL_AUTO = getEnv('CODEX_USE_FULL_AUTO', 'true').toLower
 
 export type ModelTier = keyof Models;
 
+/** Cheap Codex id for FAST/judge/auxiliary lanes. */
+export const DEFAULT_CODEX_FAST_MODEL = 'gpt-5.6-luna';
+/** Codex brain default and BYO-slot rescue. gpt-5.4 is no longer served on ChatGPT Codex OAuth. */
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
+export const DEFAULT_CODEX_DEEP_MODEL = 'gpt-5.6-sol';
+
 export const DEFAULT_MODELS: Models = {
-  fast: 'gpt-5.4-mini',
-  primary: 'gpt-5.4',
-  deep: 'gpt-5.4',
+  fast: DEFAULT_CODEX_FAST_MODEL,
+  primary: DEFAULT_CODEX_MODEL,
+  deep: DEFAULT_CODEX_DEEP_MODEL,
 };
 
 export const MODEL_ENV_KEYS: Record<ModelTier, string> = {
@@ -379,12 +385,6 @@ export const MODEL_PRESETS = [
  * the primary tier while an operator still wants a specific, cheaper Codex
  * rescue. Unset deliberately preserves the legacy "follow primary" behavior. */
 export const CODEX_RESCUE_MODEL_ENV_KEY = 'OPENAI_MODEL_RESCUE';
-
-/** The Codex (gpt-5.x) brain's default model — used both by the Codex runtime
- *  and as the fallback when a Codex brain is selected but the OPENAI_MODEL_* slot
- *  was repurposed for a BYO model id (which would otherwise route the "Codex"
- *  brain back to the BYO endpoint). Single source of truth. */
-export const DEFAULT_CODEX_MODEL = 'gpt-5.4';
 
 export function normalizeModelId(value: unknown, fallback: string): string {
   const raw = typeof value === 'string' ? value.trim() : '';

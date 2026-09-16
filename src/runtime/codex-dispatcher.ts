@@ -1,39 +1,40 @@
 /**
  * Codex-scoped undici dispatcher.
  *
- * Codex requests share a dedicated undici `Agent` with tight headers
- * and body timeouts so a silently-stalled SSE stream fails fast
- * (within ~30s) instead of sitting on an open TCP connection until
- * the daemon is restarted. v0.5.21 Phase 2 root cause: undici defaults
- * are `headersTimeout: 300_000` and `bodyTimeout: 300_000` (5 min each),
- * and none of the Codex fetch sites set an explicit dispatcher. A
- * Cloudflare edge holding the connection open with no body bytes
- * therefore hung Discord chat indefinitely (verified 2026-05-25 on
- * transport-silence regression — 3+ minutes of silence after `turn_started`).
+ * Codex requests share a dedicated undici `Agent` with explicit headers and
+ * body timeouts. undici's defaults leave both at several minutes, so a
+ * connection an edge holds open without ever sending bytes would otherwise
+ * sit on an open TCP socket for the life of the daemon.
+ *
+ * What each timeout is for:
+ *   - The headers timeout is a liveness check on the request itself: a healthy
+ *     backend answers with headers in a few seconds, so a window several times
+ *     that is a down edge, not a slow one.
+ *   - The body timeout guards the gap between SSE frames, including the
+ *     provider-private reasoning frames that precede the first visible token
+ *     and are never surfaced to the SDK. It is a dead-socket guard, never the
+ *     owner-visible pace. A gap below a legitimate reasoning pause fires falsely,
+ *     and every false fire re-pays the whole prefill on the retry. The pace the
+ *     owner experiences is owned by the harness walls (the first-content
+ *     fallover deadline and the stream-stall watchdog), which are brain-agnostic
+ *     and sized to the prompt; this constant matches the between-event gap the
+ *     other streaming adapters tolerate.
  *
  * Why a SCOPED dispatcher and not `setGlobalDispatcher`:
- *   MCP servers, tool fetches (firecrawl, dataforseo), and embedding
- *   calls legitimately take longer than 30s. Setting a global timeout
- *   would cap them artificially. The dispatcher option is scoped to
- *   the 3 codex fetch sites only.
- *
- * Values calibrated against real telemetry from supervisor.log:
- *   - Healthy ttfbMs from `codex.codex-model` warn logs: ~2.6s worst
- *     case observed. 15s headers timeout gives 5× headroom.
- *   - Worst observed between-chunk gap on healthy streams: ~1-2s.
- *     30s body timeout gives 15× headroom — covers slow reasoning
- *     models (gpt-5.5 thinking gap before first content) without
- *     permitting indefinite stalls.
+ *   MCP servers, tool fetches, and embedding calls legitimately run longer than
+ *   a model's between-frame gap. A global timeout would cap them artificially,
+ *   so the dispatcher option is passed only at the Codex fetch sites.
  */
 
 import { Agent } from 'undici';
 import { BoundaryError } from './boundary-error.js';
 
-/** 15s — Codex must return response headers within this window after POST. */
+/** Codex must return response headers within this window after POST. */
 export const CODEX_HEADERS_TIMEOUT_MS = 15_000;
 
-/** 30s — at most this gap between SSE body bytes from Codex. */
-export const CODEX_BODY_TIMEOUT_MS = 30_000;
+/** At most this gap between SSE body bytes from Codex (a dead-socket guard;
+ *  see the header comment). */
+export const CODEX_BODY_TIMEOUT_MS = 120_000;
 
 /**
  * Shared undici Agent for Codex fetches. Same instance reused across

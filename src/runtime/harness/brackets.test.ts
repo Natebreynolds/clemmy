@@ -900,6 +900,18 @@ test('timeoutForTool: unrecognized tool uses the default', () => {
   assert.equal(timeoutForTool('write_file'), DEFAULT_TIMEOUTS_MS.default);
 });
 
+test('timeoutForTool: tool_search uses a discovery budget, not the 60s default', () => {
+  assert.equal(timeoutForTool('tool_search'), DEFAULT_TIMEOUTS_MS.discovery);
+  assert.ok(
+    timeoutForTool('tool_search') < DEFAULT_TIMEOUTS_MS.default,
+    'a search miss must not sit for the generic 60s host window',
+  );
+  assert.ok(
+    timeoutForTool('tool_search') > 30_000,
+    'the host window stays above the 30s broker clock so settlement can finish',
+  );
+});
+
 test('DEFAULT_MAX_TURNS exposes the roles the orchestrator hands off to', () => {
   for (const role of ['planner', 'verifier', 'researcher', 'writer', 'reviewer', 'executor', 'orchestrator', 'session']) {
     assert.ok(typeof DEFAULT_MAX_TURNS[role] === 'number', `missing role ${role}`);
@@ -1704,7 +1716,7 @@ test('isTimeoutSelfCorrectTool: external-API/MCP class only', () => {
   for (const t of ['composio_execute_tool', 'cx_apify_run_actor', 'external_api_foo', 'dataforseo__serp']) {
     assert.equal(isTimeoutSelfCorrectTool(t), true, `${t} should self-correct`);
   }
-  for (const t of ['run_worker', 'draft_plan', 'memory_search', 'write_file', 'run_shell_command', 'read_file']) {
+  for (const t of ['run_worker', 'draft_plan', 'memory_search', 'write_file', 'run_shell_command', 'read_file', 'tool_search']) {
     assert.equal(isTimeoutSelfCorrectTool(t), false, `${t} should NOT self-correct`);
   }
 });

@@ -1010,13 +1010,17 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const message = firstString(data.message).slice(0, 300);
       return { ...base, ...(message ? { message } : {}) };
     }
+    // A retry row carries only its kind: the surface distinguishes a model
+    // backend that did not respond from a reply that came back malformed,
+    // while the model's discarded draft and transport details stay private.
+    case 'stall_retry_attempted':
+      return selected(data, ['kind']);
     case 'turn_started':
     case 'turn_ended':
     case 'plan_drafted':
     case 'plan_approved':
     case 'plan_revised':
     case 'plan_rejected':
-    case 'stall_retry_attempted':
     case 'memory_signals_captured':
     case 'run_paused':
     case 'run_resumed':

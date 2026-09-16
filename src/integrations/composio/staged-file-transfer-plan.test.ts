@@ -325,3 +325,46 @@ test('patternProperties is refused through nested array/anyOf schema paths', () 
   );
   assert.ok(Date.now() - startedAt < 1_000, 'catastrophic provider regex is rejected without evaluation');
 });
+
+test('a property NAMED pattern is data, not a provider regular expression', () => {
+  // Live 2026-09-15: Outlook's recurrence.pattern object made every event update
+  // fail preflight as unsupported_pattern, with no recurrence in the call.
+  const schema = {
+    type: 'object',
+    properties: {
+      subject: { type: 'string' },
+      recurrence: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'object', properties: { type: { type: 'string' }, interval: { type: 'integer' } } },
+          range: { type: 'object', properties: { type: { type: 'string' } } },
+        },
+      },
+    },
+  };
+  assert.doesNotThrow(() => planStagedFileUploads(schema, { subject: 'Clementine discussion' }));
+  assert.doesNotThrow(() => planStagedFileUploads(schema, { subject: 'x', recurrence: { pattern: { type: 'daily', interval: 1 } } }));
+  // The keyword in keyword position is still refused where file authority is granted.
+  assert.throws(
+    () => planStagedFileUploads({ type: 'object', properties: { file: { type: 'string', file_uploadable: true }, code: { type: 'string', pattern: '^[a-z]+$' } } }, { file: '/x', code: 'abc' }),
+    (error: unknown) => error instanceof StagedFileTransferPlanError && error.code === 'unsupported_pattern'
+      && error.pointer === '/properties/code/pattern',
+  );
+});
+
+test('a schema that grants no file authority is never refused over an unrelated schema feature', () => {
+  // The strict preflight protects file authority. With no annotation anywhere
+  // there is nothing to protect, so an unsupported keyword elsewhere is inert.
+  const schema = {
+    type: 'object',
+    properties: { code: { type: 'string', pattern: '^[a-z]+$' }, nested: { type: 'object', patternProperties: { '^x': { type: 'string' } } } },
+  };
+  assert.deepEqual(planStagedFileUploads(schema, { code: 'abc' }), []);
+  // Runtime safety and schema validity stay strict without file authority.
+  assert.throws(() => planStagedFileUploads(schema, { code: 123 }), (error: unknown) => error instanceof StagedFileTransferPlanError && error.code === 'schema_mismatch');
+  // The same keyword next to a real file annotation is still refused.
+  assert.throws(
+    () => planStagedFileUploads({ type: 'object', properties: { file: { type: 'string', file_uploadable: true }, code: { type: 'string', pattern: '^[a-z]+$' } } }, { file: '/x', code: 'abc' }),
+    (error: unknown) => error instanceof StagedFileTransferPlanError && error.code === 'unsupported_pattern',
+  );
+});

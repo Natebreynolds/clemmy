@@ -45,6 +45,7 @@ import {
 } from './brackets.js';
 import type { RuntimeToolEffect, TrustedRuntimeEffectCarrier } from './tool-effect.js';
 import { getToolOutput, listEvents, openEventLog, writeToolOutput } from './eventlog.js';
+import type { InteractiveConsentProceedBasis } from './interactive-consent-policy.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import {
@@ -140,6 +141,11 @@ export interface InvokeHostToolCallInput<T> {
   isKillRequested?: () => boolean;
   killPollMs?: number;
   businessCall?: boolean;
+  /** The basis the host's consent reducer admitted this call under. A
+   * planning turn's preparation probe crosses like a read: no write
+   * reservation, no orphan projection, a non-mutating settlement. Every other
+   * basis leaves the effect-derived accounting untouched. */
+  consentBasis?: InteractiveConsentProceedBasis;
   /** Opaque provenance for an exact provider operation whose transport
    * envelope was peeled by the trusted host before this shared kernel. */
   trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
@@ -564,9 +570,24 @@ function mutatingEffect(effect: RuntimeToolEffect): boolean {
   return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
 }
 
+/** A planning turn's preparation probe is preparation, not a mutation: the
+ * consent basis, not the effect label, decides how the crossing is booked. */
+function preparationProbeInvocation(
+  input: Pick<InvokeHostToolCallInput<unknown>, 'consentBasis'>,
+): boolean {
+  return input.consentBasis === 'plan_preparation_probe';
+}
+
+function invocationMutating(
+  input: Pick<InvokeHostToolCallInput<unknown>, 'effect' | 'consentBasis'>,
+): boolean {
+  return !preparationProbeInvocation(input) && mutatingEffect(input.effect);
+}
+
 function projectsHostExternalWrite(input: InvokeHostToolCallInput<unknown>): boolean {
   return input.boundary === 'host_owned_external'
-    && (input.effect === 'external_write' || input.effect === 'admin');
+    && (input.effect === 'external_write' || input.effect === 'admin')
+    && !preparationProbeInvocation(input);
 }
 
 function hostExternalWriteDescriptor(
@@ -1212,7 +1233,7 @@ export async function invokeHostToolCall<T>(
       prior.settlement.toolName !== contract.toolName
       || prior.settlement.argumentDigest !== contract.argumentDigest
       || prior.settlement.recovery.businessCall !== frozenBusinessCall
-      || prior.settlement.recovery.mutating !== mutatingEffect(input.effect)
+      || prior.settlement.recovery.mutating !== invocationMutating(input)
     ) {
       throw new HostToolInvocationAuthorityError(
         'settled logical call conflicts with the current invocation contract',
@@ -1410,7 +1431,7 @@ export async function invokeHostToolCall<T>(
         args: input.identity.args,
         lane: 'byo',
         turn: input.identity.turn,
-        mutating: mutatingEffect(input.effect),
+        mutating: invocationMutating(input),
         reason,
       });
     };
@@ -1694,8 +1715,9 @@ export async function invokeHostToolCall<T>(
                   toolName: input.identity.toolName,
                   args: input.identity.args,
                   dispatchLease: childLease,
-                  mutating: mutatingEffect(input.effect),
+                  mutating: invocationMutating(input),
                   businessCall: frozenBusinessCall,
+                  ...(input.consentBasis ? { consentBasis: input.consentBasis } : {}),
                   result: preparation,
                 });
                 await revokeDispatchLeaseBeforeRecovery(childLease);
@@ -1765,7 +1787,7 @@ export async function invokeHostToolCall<T>(
         }
 
         const controller = new AbortController();
-        const isMutating = mutatingEffect(input.effect);
+        const isMutating = invocationMutating(input);
         type State = 'pending' | 'settling' | 'stopping' | 'done';
         let state: State = 'pending';
         let deadlineTimer: NodeJS.Timeout | undefined;
@@ -1839,6 +1861,7 @@ export async function invokeHostToolCall<T>(
               args: input.identity.args,
               mutating: isMutating,
               businessCall: frozenBusinessCall,
+              ...(input.consentBasis ? { consentBasis: input.consentBasis } : {}),
               ...(resultPresent ? { result } : {}),
               ...(observed?.thrownPresent
                 ? { thrown: observed.thrown }

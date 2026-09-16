@@ -31,10 +31,21 @@ export function retainPlanPreparationDraft(input: Identity & { fullText: string;
  * or stale repairs cannot silently overwrite a newer draft or a reviewed plan. */
 export function loadRetainedPlanDraft(input: Identity & { digest: string }) {
   if (acceptedTaskModeIdentity(input.sessionId, input.sourceUserSeq).mode?.kind !== 'plan') throw new Error('Only a Plan source can repair its draft.');
-  const row = db().prepare('SELECT draft_json FROM reviewed_plan_preparation_drafts_v1 WHERE session_id = ? AND source_user_seq = ?')
+  const own = db().prepare('SELECT draft_json FROM reviewed_plan_preparation_drafts_v1 WHERE session_id = ? AND source_user_seq = ?')
     .get(input.sessionId, input.sourceUserSeq) as { draft_json: string } | undefined;
-  if (!row || createHash('sha256').update(row.draft_json).digest('hex') !== input.digest) throw new Error('The draft reference is stale or belongs to another source. Use the current retained draft reference.');
-  return JSON.parse(row.draft_json) as { fullText: string; structuredPlan: PlanStructuredOutline; base: unknown };
+  const matches = (row: { draft_json: string } | undefined) => Boolean(row) && createHash('sha256').update(row!.draft_json).digest('hex') === input.digest;
+  if (matches(own)) return JSON.parse(own!.draft_json) as { fullText: string; structuredPlan: PlanStructuredOutline; base: unknown };
+  // The digest is content-addressed. An answer to a needs_input plan is a new
+  // accepted source in the same conversation; the draft it repairs was
+  // retained by the source that asked. Honor that exact draft (live
+  // 2026-09-15 23:18: the repair after the mailbox answer was refused as
+  // stale, and the model had to re-author the whole outline).
+  const earlier = db().prepare(`SELECT draft_json FROM reviewed_plan_preparation_drafts_v1
+    WHERE session_id = ? AND source_user_seq < ? ORDER BY source_user_seq DESC LIMIT 8`)
+    .all(input.sessionId, input.sourceUserSeq) as Array<{ draft_json: string }>;
+  const prior = earlier.find(row => matches(row));
+  if (!prior) throw new Error('The draft reference is stale or belongs to another source. Use the current retained draft reference.');
+  return JSON.parse(prior.draft_json) as { fullText: string; structuredPlan: PlanStructuredOutline; base: unknown };
 }
 export function publishRetainedPlanDraft(input: Identity): PlanArtifactV1 | null {
   const source = acceptedTaskModeIdentity(input.sessionId, input.sourceUserSeq);

@@ -26,6 +26,7 @@ import {
   type ComposioCliStatus,
 } from './cli.js';
 import { composioSlugIsReadOnly } from './slug-effect.js';
+import { successorSlugsFromProse } from './lifecycle-prose.js';
 import { aliasLabelFor } from '../../memory/account-alias-store.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 
@@ -2495,14 +2496,12 @@ function rankAgainstRequest(items: readonly unknown[], query: string): unknown[]
  */
 function providerRecommendedSuccessorSlugs(value: unknown): string[] {
   const description = str(obj(value).description) ?? '';
-  if (!/\bdeprecat(?:e|ed|ing|ion)\b/i.test(description)) return [];
-  const successors: string[] = [];
-  for (const match of description.matchAll(/\bprefer\b([^.!?\n]+)/gi)) {
-    for (const identifier of (match[1] ?? '').match(/\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b/g) ?? []) {
-      if (!successors.includes(identifier)) successors.push(identifier);
-    }
-  }
-  return successors.slice(0, 4);
+  if (
+    !/\bdeprecat(?:e|ed|ing|ion)\b/i.test(description)
+    && !/\buse\b.+\binstead\b/i.test(description)
+    && !/\bprefer\b/i.test(description)
+  ) return [];
+  return successorSlugsFromProse(description);
 }
 
 export function providerKeywordSearchRungs(

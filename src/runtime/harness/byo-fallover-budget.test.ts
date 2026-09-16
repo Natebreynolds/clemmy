@@ -63,7 +63,7 @@ test('a transport timeout is fallover-eligible, so the budget has somewhere to g
   // Both halves must hold: a deadline that fires, and an error class that moves.
   const { isFalloverError } = await import('./fallback-model.js');
   const { BoundaryError } = await import('../boundary-error.js');
-  for (const kind of ['model.transport_timeout', 'model.empty_completion', 'model.overloaded']) {
+  for (const kind of ['model.transport_timeout', 'model.empty_completion', 'model.overloaded', 'codex.transport_timeout', 'codex.sse_truncated']) {
     assert.equal(
       isFalloverError(new BoundaryError({ kind, retryable: true, userMessage: 'x', operatorMessage: 'x' } as never)),
       true,

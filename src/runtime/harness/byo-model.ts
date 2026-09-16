@@ -100,9 +100,12 @@ export function applyGlmThinking(body: Record<string, unknown>, effort: string |
     return;
   }
   if (!effort) return;
-  body.thinking = effort === 'none' || effort === 'minimal'
-    ? { type: 'disabled' }
-    : { type: 'enabled' };
+  // Extended thinking on this wire is a binary switch that multiplies the
+  // latency of every round several times over, and the harness's effort
+  // ladder has no tier that means "wait minutes per call". No harness tier
+  // switches it on; a caller that sets `thinking` on the body itself is
+  // honored above.
+  body.thinking = { type: 'disabled' };
 }
 
 // Marks request bodies whose strict json_schema we downgraded to json_object,

@@ -1,4 +1,5 @@
 import { buildPlanStepResultTool } from '../tools/plan-step-result.js';
+import { markTurnClock } from '../runtime/harness/turn-clock.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
 import { acceptedPlanExecution, acceptedPlanOwnerScopeInput } from '../runtime/harness/accepted-plan-execution.js';
 import { buildPublishPlanTool } from '../tools/publish-plan.js';
@@ -2231,6 +2232,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ? { count: multiItem.itemCount, kind: multiItem.itemKind, carried: !!multiItem.carriedFromPrior }
       : undefined,
   });
+  markTurnClock(options.sessionId, 'mcp_tool_scope');
   if (options.sessionId) {
     try {
       appendEvent({

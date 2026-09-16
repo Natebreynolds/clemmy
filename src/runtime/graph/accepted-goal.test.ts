@@ -474,3 +474,4 @@ test('admitted plural destinations are canonical; destination is the first-sink 
   assert.equal(goal.construct, 'collect_then_construct');
   assert.equal(goal.route, 'act');
 });
+

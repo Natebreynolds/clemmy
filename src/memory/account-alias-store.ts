@@ -183,5 +183,8 @@ export function aliasLabelFor(toolkit: string, email?: string, connectionId?: st
 
 /** Test seam. */
 export function resetAccountAliasesForTest(): void {
-  cache = null;
+  // A real reset: the file is the store, so dropping only the cache reloads
+  // whatever an earlier test remembered.
+  cache = [];
+  try { persist(); } catch { /* an unwritable test home still starts empty */ }
 }

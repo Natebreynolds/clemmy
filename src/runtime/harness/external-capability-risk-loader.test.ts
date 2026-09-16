@@ -182,7 +182,7 @@ function fixture(options: {
       digest: sha256({ accountId, semanticName, posture }),
       posture,
     },
-    callSignals: { outboundDelivery: options.outboundDelivery ?? null },
+    callSignals: { outboundDelivery: options.outboundDelivery ?? null, recipientsPresent: null, requestMethod: null },
     safety: 'admissible',
   };
 }
@@ -320,7 +320,7 @@ test('prepared catalog_manifest work consumes sealed reversible semantics indepe
       binding,
       inputSchema: input.currentDefinition.inputSchema,
       destination: input.destination,
-      callSignals: { outboundDelivery: false },
+      callSignals: { outboundDelivery: false, recipientsPresent: null, requestMethod: null },
       safety: 'admissible',
     }, authority);
     if (!result.ok) assert.fail(`${sealedCreate.operationId} catalog loader refused: ${result.reason}`);
@@ -521,14 +521,14 @@ test('closed schema-declared boolean, enum, and nested path evidence raises outb
     properties: { should_send: { type: 'boolean' } },
     additionalProperties: false,
   }, { should_send: true }), {
-    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true },
+    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(project({
     type: 'object',
     properties: { mode: { type: 'string', enum: ['draft', 'send'] } },
     additionalProperties: false,
   }, { mode: 'send' }), {
-    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true },
+    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(project({
     type: 'object',
@@ -542,7 +542,7 @@ test('closed schema-declared boolean, enum, and nested path evidence raises outb
     },
     additionalProperties: false,
   }, { send: { to: 'person@example.com' } }), {
-    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true },
+    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(project({
     $ref: '#/$defs/input',
@@ -556,7 +556,7 @@ test('closed schema-declared boolean, enum, and nested path evidence raises outb
       },
     },
   }, { title: 'Release', publish_now: true }), {
-    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true },
+    status: 'projected', resolution: 'affirmative', callSignals: { outboundDelivery: true, recipientsPresent: null, requestMethod: null },
   });
 });
 
@@ -574,7 +574,7 @@ test('negative or absent delivery controls never fabricate outbound false', () =
   assert.deepEqual(explicitNegative, {
     status: 'projected',
     resolution: 'resolved_non_affirmative',
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
   assert.equal(JSON.stringify(explicitNegative).includes('false'), false);
   assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
@@ -584,7 +584,7 @@ test('negative or absent delivery controls never fabricate outbound false', () =
   }), {
     status: 'unknown',
     reason: 'unresolved_delivery_signal',
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
     version: 1,
@@ -597,7 +597,7 @@ test('negative or absent delivery controls never fabricate outbound false', () =
   }), {
     status: 'projected',
     resolution: 'not_exposed',
-    callSignals: { outboundDelivery: null },
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
 });
 
@@ -609,28 +609,28 @@ test('malformed, accessor-backed, ambiguous, or undeclared delivery evidence rem
     inputSchema: { type: 'object', properties: { send: { type: 'boolean' } } },
     arguments: accessor,
   }), {
-    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
     version: 1,
     inputSchema: { type: 'object', properties: [], additionalProperties: false },
     arguments: {},
   }), {
-    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'malformed_input', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
     version: 1,
     inputSchema: { type: 'object', patternProperties: { '^send': { type: 'boolean' } } },
     arguments: { send_now: true },
   }), {
-    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
   assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
     version: 1,
     inputSchema: { type: 'object', properties: {}, additionalProperties: true },
     arguments: { send_now: true },
   }), {
-    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null },
+    status: 'unknown', reason: 'ambiguous_schema', callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: null },
   });
 });
 
@@ -814,3 +814,88 @@ for (const change of ['none', 'definition', 'account', 'catalog', 'outage'] as c
     }
   });
 }
+
+test('an exposed recipient collection reports whether this call supplies anyone', () => {
+  // Live 2026-09-14: OUTLOOK_CALENDAR_CREATE_EVENT without attendees_info was
+  // carded as an irreversible send.
+  const schema = {
+    type: 'object',
+    properties: {
+      subject: { type: 'string' },
+      attendees_info: {
+        type: 'array',
+        items: { type: 'object', properties: { email: { type: 'string' }, name: { type: 'string' } } },
+      },
+    },
+    additionalProperties: false,
+  };
+  const project = (args: unknown) => deriveExternalCapabilityCallSignalsV1({ version: 1, inputSchema: schema, arguments: args });
+  assert.deepEqual(project({ subject: 'Discuss Clementine' }), {
+    status: 'projected', resolution: 'not_exposed', callSignals: { outboundDelivery: null, recipientsPresent: false, requestMethod: null },
+  });
+  assert.deepEqual(project({ subject: 'x', attendees_info: [] }).callSignals, { outboundDelivery: null, recipientsPresent: false, requestMethod: null });
+  assert.deepEqual(project({ subject: 'x', attendees_info: [{ email: 'adam@example.com' }] }).callSignals, { outboundDelivery: null, recipientsPresent: true, requestMethod: null });
+  // No recipient collection exposed: the signal stays null, never fabricated.
+  assert.deepEqual(deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: { type: 'object', properties: { subject: { type: 'string' } }, additionalProperties: false },
+    arguments: { subject: 'x' },
+  }).callSignals, { outboundDelivery: null, recipientsPresent: null, requestMethod: null });
+});
+
+test('a closed HTTP-method surface classifies the bound call; anything else stays null', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      path: { type: 'string' },
+      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] },
+    },
+    required: ['path'],
+    additionalProperties: false,
+  };
+  const project = (args: unknown) => deriveExternalCapabilityCallSignalsV1({ version: 1, inputSchema: schema, arguments: args });
+  assert.deepEqual(project({ path: '/v1/things', method: 'GET' }), {
+    status: 'projected', resolution: 'not_exposed',
+    callSignals: { outboundDelivery: null, recipientsPresent: null, requestMethod: 'safe' },
+  });
+  assert.equal(project({ path: '/v1/things', method: 'POST' }).callSignals.requestMethod, 'post');
+  assert.equal(project({ path: '/v1/things', method: 'PUT' }).callSignals.requestMethod, 'update');
+  assert.equal(project({ path: '/v1/things', method: 'DELETE' }).callSignals.requestMethod, 'delete');
+  assert.equal(project({ path: '/v1/things', method: 'delete' }).callSignals.requestMethod, 'delete', 'case-insensitive');
+  // Missing value: no class, never a guess.
+  assert.equal(project({ path: '/v1/things' }).callSignals.requestMethod, null);
+  // A value outside the closed set is unreadable.
+  assert.equal(project({ path: '/v1/things', method: 'TRACE' }).callSignals.requestMethod, null);
+  // A const surface classifies too.
+  assert.equal(deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: { type: 'object', properties: { verb: { const: 'PATCH' } }, additionalProperties: false },
+    arguments: { verb: 'PATCH' },
+  }).callSignals.requestMethod, 'update');
+  // An enum with a non-HTTP token is not a method surface.
+  assert.equal(deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['GET', 'POST', 'BULK'] } }, additionalProperties: false },
+    arguments: { mode: 'GET' },
+  }).callSignals.requestMethod, null);
+  // Two surfaces that disagree resolve to nothing.
+  assert.equal(deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: { type: 'object', properties: {
+      method: { type: 'string', enum: ['GET', 'POST'] },
+      fallback: { type: 'object', properties: { method: { type: 'string', enum: ['GET', 'POST'] } } },
+    }, additionalProperties: false },
+    arguments: { method: 'GET', fallback: { method: 'POST' } },
+  }).callSignals.requestMethod, null);
+  // The method rides into the loader and a declared non-destructive carrier
+  // bounds an unnamed operation without a provider or tool allowlist.
+  const input = fixture({ semanticName: 'SYNC_RESOURCE', hints: { readOnly: false, destructive: false } });
+  input.callSignals = project({ path: '/v1/things', method: 'POST' }).callSignals;
+  assert.deepEqual(loaded(input).projection.risk, {
+    reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false,
+  });
+  input.callSignals = project({ path: '/v1/things', method: 'DELETE' }).callSignals;
+  assert.deepEqual(loaded(input).projection.risk, {
+    reversibility: 'unknown', consequence: 'delete', destructive: true,
+  });
+});

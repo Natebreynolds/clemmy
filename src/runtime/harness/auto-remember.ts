@@ -22,6 +22,7 @@
  */
 import { getActiveObjective, getActiveObjectiveForSession } from '../../memory/focus.js';
 import { peekToolChoice, rememberToolChoice } from '../../memory/tool-choice-store.js';
+import { cliCommandHead } from '../../memory/capability-effect-scope.js';
 import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
 import { listEvents } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
@@ -99,19 +100,6 @@ export type RememberableSuccess = {
   kind: 'mcp' | 'composio' | 'cli';
   invocationTemplate?: string;
 };
-
-function cliCommandHead(command: string): string {
-  const keep: string[] = [];
-  for (const raw of command.trim().split(/\s+/)) {
-    const token = raw.trim();
-    if (!token) continue;
-    if (/^(?:&&|\|\||\||;)$/.test(token)) break;
-    if (/^-/.test(token)) break;
-    if (/^["'`]/.test(token) || token.includes('=') || token.includes('{{')) break;
-    keep.push(token);
-  }
-  return keep.join(' ');
-}
 
 /** Shell builtins and interpreters that would poison procedural memory. */
 const CLI_MEMORY_SKIP_PROGRAMS = new Set([

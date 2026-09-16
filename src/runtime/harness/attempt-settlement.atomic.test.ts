@@ -285,3 +285,54 @@ test('contract conflict and storage failure surface as typed authority errors', 
     0,
   );
 });
+
+// A planning turn's preparation probe is accounted like a read crossing. The
+// same returned text that leaves a mutation unknown/stop_and_explain settles
+// the probe as a completed call with retained evidence, and the journaled
+// consent receipt (not the caller's claim) is what authorizes that accounting.
+test('a preparation probe with text evidence settles non-mutating and never stop_and_explain', () => {
+  const tool = 'alpha__api_request';
+  const args = { method: 'POST', path: '/v1/query', data: [{ query: 'fixture' }] };
+  const providerResult = 'Ok. 20000 rows returned for the fixture query.';
+
+  const journalProbe = (task: ReturnType<typeof accept>, logicalToolCallId: string) => {
+    eventlog.appendEvent({ sessionId: task.sessionId, turn: 0, role: 'system', type: 'interactive_consent_decided',
+      data: { protocolVersion: 1, sourceUserSeq: task.sourceUserSeq, acceptedTaskId: task.acceptedTaskId,
+        logicalToolCallId, operationId: tool, accountId: 'account:fixture', effect: 'external_write',
+        basis: 'plan_preparation_probe', risk: { reversibility: 'ordinary_non_destructive', consequence: 'unknown', destructive: false },
+        bindingDigest: 'binding', argumentDigest: 'args', carrierHints: { destructive: false }, requestMethod: 'post' } });
+  };
+
+  // The probe: receipt journaled, basis claimed, text returned.
+  const probeTask = accept('preparation probe');
+  const probeCallId = 'logical:preparation-probe';
+  admitReturnedProviderCall({ task: probeTask, logicalToolCallId: probeCallId, tool, args });
+  journalProbe(probeTask, probeCallId);
+  const probe = settlement.settleToolAttempt({ ...probeTask, lane: 'native_mcp', toolName: tool, callId: probeCallId,
+    args, businessCall: true, mutating: false, consentBasis: 'plan_preparation_probe', result: providerResult });
+  assert.equal(probe.outcome.kind, 'succeeded', JSON.stringify(probe.outcome));
+  assert.notEqual(probe.outcome.directive.action, 'stop_and_explain');
+  const probeRow = eventlog.listEvents(probeTask.sessionId, { types: ['tool_attempt_settled'] });
+  assert.equal(probeRow.length, 1);
+  assert.equal(probeRow[0]!.data.mutating, false);
+  assert.equal(probeRow[0]!.data.kind, 'succeeded');
+
+  // The same bytes as an ordinary mutation keep the inert stop.
+  const writeTask = accept('ordinary mutation');
+  const writeCallId = 'logical:ordinary-write';
+  admitReturnedProviderCall({ task: writeTask, logicalToolCallId: writeCallId, tool, args });
+  const write = settlement.settleToolAttempt({ ...writeTask, lane: 'native_mcp', toolName: tool, callId: writeCallId,
+    args, businessCall: true, mutating: true, result: providerResult });
+  assert.equal(write.outcome.kind, 'unknown');
+  assert.equal(write.outcome.directive.action, 'stop_and_explain');
+  assert.equal(eventlog.listEvents(writeTask.sessionId, { types: ['tool_attempt_settled'] })[0]!.data.mutating, true);
+
+  // A claimed basis without its journaled receipt changes nothing.
+  const claimTask = accept('unjournaled claim');
+  const claimCallId = 'logical:unjournaled-claim';
+  admitReturnedProviderCall({ task: claimTask, logicalToolCallId: claimCallId, tool, args });
+  const claim = settlement.settleToolAttempt({ ...claimTask, lane: 'native_mcp', toolName: tool, callId: claimCallId,
+    args, businessCall: true, mutating: true, consentBasis: 'plan_preparation_probe', result: providerResult });
+  assert.equal(claim.outcome.kind, 'unknown');
+  assert.equal(eventlog.listEvents(claimTask.sessionId, { types: ['tool_attempt_settled'] })[0]!.data.mutating, true);
+});

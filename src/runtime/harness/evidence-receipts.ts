@@ -1309,7 +1309,39 @@ function loadHostWriteReceiptRow(
   }
 }
 
-function createdPayloadOf(raw: unknown): {
+/** Provider fields that reach a created record from outside (a link a person
+ *  can open). Structural payload keys, never request vocabulary. */
+const CREATED_RECORD_HANDLE_KEYS = ['handle', 'webLink', 'webUrl', 'web_url', 'htmlLink', 'html_url', 'permalink', 'url', 'href', 'link', 'self'] as const;
+/** Provider-minted facts about the created record that the caller could not
+ *  have written itself: entity tags, change keys, message ids, revisions and
+ *  provider timestamps. Any one of them is an independent receipt. */
+const CREATED_RECORD_RECEIPT_KEYS = [
+  'receipt', '@odata.etag', 'etag', 'ETag', 'changeKey', 'change_key', 'internetMessageId', 'version', 'revision',
+  'revisionId', 'lastModifiedDateTime', 'updatedAt', 'updated_at', 'modifiedTime', 'createdDateTime', 'createdAt', 'created_at', 'createdTime',
+] as const;
+
+function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
+/**
+ * The created record's identity, as the PROVIDER reported it.
+ *
+ * The Clementine-shaped contract (`created: { id, handle, receipt }`) is read
+ * first. A real provider does not speak that dialect: live 2026-09-15 ten
+ * Outlook drafts were created, each answered with an `id`, a `webLink`, an
+ * `@odata.etag`, a `changeKey` and an `internetMessageId`, and the run was
+ * marked failed on "write settlement is missing an exact created id, handle,
+ * or receipt" while the reviewer had already confirmed the drafts. The
+ * record's own id, its outward link, and a provider-minted tag are exactly the
+ * three facts the contract asks for; they are read by structural key, never
+ * invented (a handle falls back to the id, a receipt never does).
+ */
+export function createdPayloadOf(raw: unknown): {
   id?: string;
   handle?: string;
   receipt?: string;
@@ -1321,10 +1353,13 @@ function createdPayloadOf(raw: unknown): {
   const nested = record.created && typeof record.created === 'object'
     ? record.created as Record<string, unknown>
     : record;
+  const id = typeof nested.id === 'string' && nested.id.trim() ? nested.id : undefined;
+  const handle = firstStringField(nested, CREATED_RECORD_HANDLE_KEYS) ?? id;
+  const receipt = firstStringField(nested, CREATED_RECORD_RECEIPT_KEYS);
   return {
-    ...(typeof nested.id === 'string' ? { id: nested.id } : {}),
-    ...(typeof nested.handle === 'string' ? { handle: nested.handle } : {}),
-    ...(typeof nested.receipt === 'string' ? { receipt: nested.receipt } : {}),
+    ...(id ? { id } : {}),
+    ...(handle ? { handle } : {}),
+    ...(receipt ? { receipt } : {}),
     ...(typeof nested.writtenDigest === 'string' ? { writtenDigest: nested.writtenDigest } : {}),
   };
 }
@@ -1587,6 +1622,21 @@ function redeemHostWriteReceiptFacts(input: {
   return { ok: true };
 }
 
+/** Where a provider echoes the content it stored, on the created record or a
+ *  readback of it. A nested `{ content, contentType }` body is its content. */
+const CREATED_RECORD_CONTENT_KEYS = ['content', 'body', 'text', 'description'] as const;
+export function echoedContentOf(record: Record<string, unknown>): unknown {
+  for (const key of CREATED_RECORD_CONTENT_KEYS) {
+    const value = record[key];
+    if (value === undefined || value === null) continue;
+    if (value && typeof value === 'object' && !Array.isArray(value) && 'content' in (value as Record<string, unknown>)) {
+      return (value as Record<string, unknown>).content;
+    }
+    return value;
+  }
+  return undefined;
+}
+
 function findReadbackDigest(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1609,8 +1659,12 @@ function findReadbackDigest(input: {
     const raw = exactProviderDataPayload(redeemed.value.rawPayload);
     if (!raw || typeof raw !== 'object') continue;
     const record = raw as { id?: string; handle?: string; content?: unknown };
-    if (record.id !== input.createdId || record.content === undefined) continue;
-    const digest = digestOf(record.content);
+    // The created record's own response is a readback when the provider
+    // echoes what it stored (a created mail draft returns its subject and
+    // body); a separate read that returns the same record also qualifies.
+    const content = echoedContentOf(record as Record<string, unknown>);
+    if (record.id !== input.createdId || content === undefined) continue;
+    const digest = digestOf(content);
     if (input.intendedDigest && digest !== input.intendedDigest) continue;
     return { digest, handle: typeof record.handle === 'string' ? record.handle : '' };
   }

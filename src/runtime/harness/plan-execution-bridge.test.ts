@@ -74,3 +74,66 @@ test('a terminal exact source joins its established execution without a retry at
   assert.equal((log.openEventLog().prepare('SELECT COUNT(*) AS n FROM run_attempts').get() as { n: number }).n, 1);
   assert.equal(log.getRunAttemptBySourceUserSeq(input.sessionId, first.source.seq)?.status, 'completed');
 });
+
+test('a preflight refusal before admission leaves no source, attempt or claim, and the same revision then Executes', async () => {
+  const { checkReviewedPlanPreparation } = await import('./reviewed-plan-runtime.js');
+  const catalogs = await import('./host-capability-catalog-factory.js');
+  const manifests = await import('./capability-manifest.js');
+  const schemas = await import('../../tools/composio-schema-cache.js');
+  const { providerInputSchemaDigestOf } = await import('./reviewed-provider-identity.js');
+  const { createHash } = await import('node:crypto');
+  const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const operationId = 'reviewed_cli_bridge_fixture';
+  const manifest = manifests.attachSemanticContract({
+    version: 1, manifestId: `cap:fixture:reviewed-cli:${operationId}`, providerKind: 'reviewed_cli', operationId,
+    providerIdentity: '/usr/bin/fixture-cli', providerVersion: 'fixture-v1', operationVersion: '1',
+    definitionFingerprint: sha256(`definition:${operationId}`), effect: 'read', accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' }, evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-09-01T00:00:00.000Z', trusted: true }, lifecycle: { state: 'current' },
+  });
+  const schema = { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false };
+  schemas.rememberToolSchema(operationId, schema, Date.now());
+  const cached = schemas.getCachedToolSchema(operationId)!;
+  const entry = {
+    capabilityId: manifest.manifestId, toolName: manifest.operationId, schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint, effect: manifest.effect, account: manifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest), providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint, providerInputSchemaDigest: providerInputSchemaDigestOf(cached),
+    manifest, invoke: async () => ({ records: [], has_more: false }),
+  };
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  factory.register(entry);
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  try {
+    const session = log.createSession({ id: 'bridge-preflight-owner', kind: 'chat', userId: 'owner' });
+    const planSource = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan the query.', taskMode: { version: 1, kind: 'plan' } } });
+    const structuredPlan = {
+      steps: [{ id: 'query', action: 'Run the reviewed query.', effect: 'read', capabilityRef: manifest.manifestId, staticArguments: { query: 'SELECT Id FROM Account' },
+        dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Rows returned.' }],
+      successCriteria: ['Rows returned.'], subagents: [], executionDraft: null,
+      preparedBindings: [{ stepId: 'query', capabilityRef: manifest.manifestId, identity: catalogs.canonicalCatalogIdentityOf(entry), inputSchema: cached,
+        argumentValidation: 'static_schema_checked', source: { sessionId: session.id, sourceUserSeq: planSource.seq } }],
+      preparationIssues: [],
+    } as never;
+    const artifact = plans.publishPlanRevision({ sessionId: session.id, sourceUserSeq: planSource.seq, principalId: 'owner', fullText: 'Run the reviewed query.', structuredPlan, readiness: 'ready' });
+    const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+    const scope = { sessionId: session.id, principalId: 'owner', ref };
+    // The capability is momentarily not current (evicted schema): the check
+    // refuses BEFORE admission, so nothing is minted for this revision.
+    factory.forget(entry.capabilityId);
+    await assert.rejects(checkReviewedPlanPreparation(artifact, { sessionId: session.id }), /changed or is unavailable/);
+    assert.equal(plans.getPlanExecutionClaim(scope), null, 'no claim was spent');
+    assert.equal((log.openEventLog().prepare('SELECT COUNT(*) AS n FROM run_attempts').get() as { n: number }).n, 0, 'no attempt');
+    assert.equal(log.listEvents(session.id, { types: ['user_input_received'] }).length, 1, 'no Execute source');
+    // The capability is current again: the SAME revision Executes.
+    factory.register(entry);
+    await checkReviewedPlanPreparation(artifact, { sessionId: session.id });
+    const admitted = admitPlanExecutionBridgeSource({ sessionId: session.id, mode: { version: 1, kind: 'execute', executeRef: ref }, displayText: 'Execute this plan.', modelDirectiveApplied: false, surface: 'home' });
+    assert.equal(admitted.kind, 'accepted'); if (admitted.kind !== 'accepted') throw new Error('not accepted');
+    assert.equal(admitted.claim.ref.revision, artifact.revision);
+    assert.equal(plans.getPlanExecutionClaim(scope)?.executionRunId, admitted.attempt.runId);
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
+});

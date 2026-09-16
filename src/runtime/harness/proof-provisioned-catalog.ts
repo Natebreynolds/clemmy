@@ -22,6 +22,7 @@
  *    recorded at runtime; argument shapes come from the slug's cached
  *    provider schema. A slug with no cached schema is skipped (fail closed).
  */
+import { structuralDestinationPosture } from './external-capability-risk.js';
 import { createHash } from 'node:crypto';
 import {
   validatedDocumentedComposioDefinitionContracts,
@@ -546,9 +547,20 @@ export async function registerProofProvisionedCapabilities(identity: {
       const currentInstalled = currentLineage[0];
       const outputSchemaDigest = outputSchema ? digestSchema(outputSchema) : undefined;
       const currentDefinition = currentInstalled?.manifest;
+      // The destination posture is part of the definition, not decoration:
+      // plan admission compares the model's plan against it. Read from the
+      // operation's own verb (or the verified mutation target), never the
+      // request wording. A stale posture on an installed manifest forks the
+      // identity so the next proof supersedes it.
+      const derivedDestinationPosture: 'create_new' | 'named_existing' | null = write
+        ? (mutationVerification?.target.source === 'provider_arguments'
+          ? 'named_existing'
+          : structuralDestinationPosture(slug) ?? 'create_new')
+        : null;
       const currentDefinitionMatches = Boolean(
         currentDefinition
         && currentDefinition.operationId === slug
+        && (!write || (currentDefinition.destination?.posture ?? null) === derivedDestinationPosture)
         && currentDefinition.effect === effect
         && currentDefinition.providerVersion === COMPOSIO_PROVIDER_SURFACE_VERSION
         && currentDefinition.operationVersion === operationVersion
@@ -625,9 +637,7 @@ export async function registerProofProvisionedCapabilities(identity: {
           ? {
               destination: {
                 family: mutationVerification?.resourceFamily ?? family,
-                posture: mutationVerification?.target.source === 'provider_arguments'
-                  ? 'named_existing' as const
-                  : 'create_new' as const,
+                posture: derivedDestinationPosture ?? 'create_new',
               },
             }
           : readbackVerification

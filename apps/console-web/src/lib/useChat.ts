@@ -925,7 +925,10 @@ export function progressLabel(ev: HarnessEvent): string | null {
     // Structured-decision repair loop (stall retry): without a label these
     // attempts are INVISIBLE — a 2026-07-03 codex turn burned ~51s across three
     // silent attempts and read as "the agent just isn't working".
-    case 'stall_retry_attempted': return 'That reply came back malformed — retrying…';
+    case 'stall_retry_attempted':
+      return d.kind === 'model_transport_retry'
+        ? 'The model backend didn’t respond — retrying…'
+        : 'That reply came back malformed — retrying…';
     case 'memory_signals_captured': return 'Learning from this…';
     // Mid-turn keep-alive fired while the brain reasons BETWEEN tool calls. With
     // no tool/plan event to relabel, the progress line otherwise freezes on the
@@ -1397,7 +1400,11 @@ export function useChat(options?: UseChatOptions) {
       // as if it were an answer — clear it and show the retry honestly
       // (live 2026-07-08: a flaked "I can't execute this" reply stayed visible
       // while the retry was already succeeding underneath).
-      patch(assistantId, { text: '', progress: 'First attempt came back malformed — retrying now…' });
+      // A transport retry (the model backend never answered) is named as such;
+      // the malformed-reply wording stays for the structured-decision repair.
+      patch(assistantId, { text: '', progress: d.kind === 'model_transport_retry'
+        ? 'The model backend didn’t respond — retrying…'
+        : 'First attempt came back malformed — retrying now…' });
     } else if (ev.type === 'run_failed') {
       const errStr = String(d.error ?? '').trim();
       const text = !errStr || looksRawError(errStr) ? GENERIC_TURN_ERROR : `Something went wrong: ${errStr}`;

@@ -582,13 +582,21 @@ export async function buildWorkflowStepAgent(
     });
     const firstClassNames = new Set(surface.firstClass);
     const deferredNames = new Set(surface.deferred);
+    // An unlocked workflow normally arrives with no explicit MCP scope.
+    // Undefined preserves discovery of connected tools; null is a deliberate
+    // restriction. Do not confuse that default with an empty local catalog.
+    // This scope feeds discovery only; the existing dispatcher and authored
+    // write binding still own execution.
+    const discoveryScope: McpToolScope | null = externalMcpScope === undefined
+      ? { authority: 'catalog', reason: 'unlocked workflow connected-tool discovery' }
+      : externalMcpScope;
     const discoveryIdentity = options.sessionId && Number.isSafeInteger(options.sourceUserSeq)
-      && (options.sourceUserSeq ?? 0) > 0 && externalMcpScope
-      && mcpToolScopeAuthority(externalMcpScope) !== 'none'
+      && (options.sourceUserSeq ?? 0) > 0 && discoveryScope
+      && mcpToolScopeAuthority(discoveryScope) !== 'none'
       ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
       : undefined;
-    const candidateSources = discoveryIdentity && externalMcpScope
-      ? buildAuthorizedToolSearchCandidateSources(externalMcpScope, undefined, 'call_tool')
+    const candidateSources = discoveryIdentity && discoveryScope
+      ? buildAuthorizedToolSearchCandidateSources(discoveryScope, undefined, 'call_tool')
       : undefined;
     const firstClassTools = lockedTools
       .filter((toolRef) => firstClassNames.has((toolRef as { name?: string }).name ?? ''))

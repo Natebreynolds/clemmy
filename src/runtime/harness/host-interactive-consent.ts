@@ -29,8 +29,13 @@ import {
   type InteractiveConsentReversibility,
 } from './interactive-consent-policy.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
+import { acceptedTaskMode } from './accepted-task-mode.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
-import { buildHostConsentEvidence } from './host-consent-evidence.js';
+import {
+  buildHostConsentEvidence,
+  journalInteractiveConsentDecision,
+  type HostConsentCarrierEvidence,
+} from './host-consent-evidence.js';
 import { appendEvent, getEvent, openEventLog } from './eventlog.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
@@ -752,6 +757,8 @@ interface PreparedConsentSemanticBasis {
   semanticBasis: CapabilityRiskAttestationV1['semanticBasis'];
   safety: CapabilityRiskAttestationV1['safety'];
   requirementCapabilityIdentity: string;
+  /** Carrier declaration + bound method class, for the decision receipt. */
+  carrier: HostConsentCarrierEvidence | null;
 }
 
 type PreparedConsentTarget = Pick<
@@ -967,6 +974,7 @@ async function semanticBasisForExactCall(input: {
       },
       safety: 'admissible',
       requirementCapabilityIdentity: local.capabilityRef,
+      carrier: null,
     } };
   }
   if (binding.bindingKind !== 'catalog_manifest') {
@@ -1053,7 +1061,18 @@ async function semanticBasisForExactCall(input: {
     semanticBasis: external.projection.semanticBasis,
     safety: external.projection.safety,
     requirementCapabilityIdentity: binding.capabilityId,
+    carrier: {
+      destructive: external.currentDefinition.behaviorHints.destructive,
+      requestMethod: callSignals.callSignals.requestMethod,
+    },
   } };
+}
+
+/** A planning source turns the reducer into probe-or-refuse: read from the
+ * durable accepted mode, never from model text. Workflow nodes carry no
+ * source turn and are therefore never planning. */
+function planPreparationProbe(identity: { sessionId: string; sourceUserSeq: number | null }): boolean {
+  return acceptedTaskMode(identity.sessionId, identity.sourceUserSeq ?? undefined)?.kind === 'plan';
 }
 
 /** Pause and resume reduce the same exact evidence and durable approval. */
@@ -1066,9 +1085,10 @@ function reduceHostConsentEvidence(input: {
   durableApproval?: DurableHostConsentApproval;
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
+  const preparationProbe = planPreparationProbe(input.identity);
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
-    crossing, reservationAlreadyClaimed,
+    crossing, reservationAlreadyClaimed, preparationProbe,
   });
   const consentSubject = exactConsentSubject({
     prepared: input.identity, call, coverage,
@@ -1083,7 +1103,7 @@ function reduceHostConsentEvidence(input: {
     ? { kind: 'repair', reason: 'scope_mismatch' }
     : userGrant ? evaluateInteractiveConsentV1({
         call, coverage, userGrant, readiness: { kind: 'ready' },
-        crossing, reservationAlreadyClaimed,
+        crossing, reservationAlreadyClaimed, preparationProbe,
       }) : ungrantedDecision;
   return { decision, consentSubject, userGrant };
 }
@@ -1196,6 +1216,10 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
     durableApproval: input.durableApproval,
   });
+  journalInteractiveConsentDecision({
+    sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
+    call, decision, carrier: semantic.carrier,
+  });
   if (decision.kind !== 'proceed') {
     return {
       status: 'decided',
@@ -1227,6 +1251,12 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     : null;
   if (decision.basis === 'exact_user_grant' && !exactGrantAdmission) {
     return { status: 'conflict', reason: 'exact host consent grant could not be sealed' };
+  }
+  // A prepared work_call is graph-bound work; a planning source holds no
+  // graph, so a probe basis here is a contradictory authority fact rather
+  // than an admission to mint.
+  if (decision.basis === 'plan_preparation_probe') {
+    return { status: 'conflict', reason: 'planning probe cannot admit graph-bound work' };
   }
   // Dynamic import keeps the grant mint private to this module while allowing
   // the nested edge to statically import only the one-shot consumer.
@@ -1351,6 +1381,10 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
       durableApproval: input.durableApproval,
     });
+    journalInteractiveConsentDecision({
+      sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
+      call, decision, carrier: semantic.carrier,
+    });
     if (binding.bindingKind === 'local_envelope' && decision.kind === 'proceed'
       && (decision.basis === 'exact_reversible_work' || decision.basis === 'exact_ordinary_work')) {
       const definition = await exactLocalDefinitionForPrepared({ prepared: target });
@@ -1466,6 +1500,10 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     readiness: { kind: 'ready' },
     crossing,
     reservationAlreadyClaimed: false,
+    preparationProbe: planPreparationProbe({
+      sessionId: attestation.sessionId,
+      sourceUserSeq: attestation.sourceUserSeq,
+    }),
   });
   return { status: 'decided', decision, call, coverage };
 }

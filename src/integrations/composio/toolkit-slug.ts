@@ -94,3 +94,14 @@ export function isRegisteredToolkitSlug(value: string): boolean {
 export function registeredToolkitOfSlug(toolSlug: string): string {
   return registeredToolkitNamespaceOfOperation(toolSlug) ?? genericToolkitOfSlug(toolSlug);
 }
+
+/** Doubled toolkit prefixes (a toolkit name repeated at the head of the slug) are fuzzy junk, not a fetch target. */
+export function composioSlugLooksWellFormed(name: string): boolean {
+  const slug = name.trim().toUpperCase();
+  const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
+  if (!toolkit || !isRegisteredToolkitSlug(toolkit)) return false;
+  const prefix = `${toolkit.toUpperCase()}_`;
+  if (!slug.startsWith(prefix)) return false;
+  const rest = slug.slice(prefix.length);
+  return rest.length > 0 && !rest.startsWith(prefix);
+}

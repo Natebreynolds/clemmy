@@ -91,12 +91,21 @@ export function composeRunProgressLine(input: {
     // The inventory is the same ledger read the compaction summary uses, so the
     // number here and the map she keeps mid-turn can never disagree.
     const held = heldInventory(input.sessionId, sourceUserSeq);
+    // The count stays complete, but the names in parentheses are the toolkits
+    // the ask itself named or a read already used. A discovery window returns
+    // neighbours of the requested toolkit as a matter of course; listing one
+    // here told a watching person she had gone off to a service the request
+    // never mentioned. When nothing is named, breadth is all there is to show.
+    const named = held.toolkits.filter((entry) => entry.named);
+    const advertised = (named.length > 0 ? named : held.toolkits)
+      .slice(0, 4)
+      .map((entry) => entry.toolkit.toLowerCase());
     const assembled = [
       held.readCount > 0
         ? `${held.readCount} read result${held.readCount === 1 ? '' : 's'} retained`
         : '',
       held.toolkitCount > 0
-        ? `${held.toolkitCount} toolkit${held.toolkitCount === 1 ? '' : 's'} identified (${held.toolkits.map((entry) => entry.toolkit.toLowerCase()).slice(0, 4).join(', ')})`
+        ? `${held.toolkitCount} toolkit${held.toolkitCount === 1 ? '' : 's'} identified (${advertised.join(', ')})`
         : '',
       held.total > 0 ? `${held.total} operation${held.total === 1 ? '' : 's'} identified` : '',
     ].filter(Boolean);

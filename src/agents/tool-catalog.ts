@@ -131,6 +131,11 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
   // tier:'core' change was inert.
   'session_search',
   'tool_search',
+  // The context packet tells the model to `call skill_read` whenever a likely
+  // skill fits. Schema-on-demand deferred it, so a direct call was refused
+  // pre-dispatch on the host Plan lane (live 2026-09-14: scorpion-outbound).
+  // The schema is a single name field — same class as ask_user_question.
+  'skill_read',
 ]);
 
 /**

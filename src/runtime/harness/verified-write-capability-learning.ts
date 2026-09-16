@@ -592,13 +592,53 @@ export async function learnVerifiedWriteCapabilitiesForAcceptedTask(input: {
   return { status: inserted === 0 ? 'replayed' : 'learned', records };
 }
 
-const backfilled = new Set<string>();
+export type BackfillMemoEntry = { status: 'learned' | 'replayed' | 'not_proven'; at: number };
+const backfillMemo = new Map<string, BackfillMemoEntry>();
+/** A not_proven row only changes when its catalog identity later resolves.
+ * Re-check on this cadence instead of every accepted turn. Measured
+ * 2026-09-09: re-learning every not_proven row cost ~4.1 s per turn and grew
+ * with history, because the memo only recorded learned/replayed rows. */
+const NOT_PROVEN_RECHECK_MS = 15 * 60_000;
+/** Bound the learning work one turn pays. Rows arrive newest-first, so the
+ * remainder is picked up by the following turns; nothing is dropped. */
+const MAX_LEARNED_PER_BACKFILL = 16;
+
+export function backfillRowNeedsLearning(entry: BackfillMemoEntry | undefined, now: number): boolean {
+  if (!entry) return true;
+  if (entry.status !== 'not_proven') return false;
+  return now - entry.at >= NOT_PROVEN_RECHECK_MS;
+}
+
+type BackfillRow = { session_id: string; source_user_seq: number };
+type BackfillLearner = (row: { sessionId: string; sourceUserSeq: number }) => Promise<{ status: string }>;
+
+async function backfillRows(
+  rows: ReadonlyArray<BackfillRow>,
+  learn: BackfillLearner,
+  now: number,
+): Promise<{ scanned: number; learned: number }> {
+  let learnedCalls = 0;
+  for (const row of rows) {
+    const key = `${row.session_id}#${row.source_user_seq}`;
+    if (!backfillRowNeedsLearning(backfillMemo.get(key), now)) continue;
+    if (learnedCalls >= MAX_LEARNED_PER_BACKFILL) break;
+    learnedCalls += 1;
+    const learned = await learn({ sessionId: row.session_id, sourceUserSeq: row.source_user_seq });
+    backfillMemo.set(key, {
+      status: learned.status === 'learned' || learned.status === 'replayed' ? learned.status : 'not_proven',
+      at: now,
+    });
+  }
+  return { scanned: rows.length, learned: learnedCalls };
+}
 
 /** Crash-gap repair: a terminal may commit immediately before the separate
  * capability-only row. The next planning turn backfills recent exact terminal
  * writes without replaying their calls. */
-export async function backfillRecentVerifiedWriteCapabilities(limit = 64): Promise<void> {
-  let rows: Array<{ session_id: string; source_user_seq: number }> = [];
+export async function backfillRecentVerifiedWriteCapabilities(
+  limit = 64,
+): Promise<{ scanned: number; learned: number }> {
+  let rows: BackfillRow[] = [];
   try {
     rows = openEventLog().prepare(`
       SELECT DISTINCT authority.session_id, authority.source_user_seq
@@ -611,19 +651,11 @@ export async function backfillRecentVerifiedWriteCapabilities(limit = 64): Promi
        WHERE authority.state = 'terminal'
        ORDER BY authority.updated_at DESC
        LIMIT ?
-    `).all(Math.max(1, Math.min(limit, 256))) as Array<{ session_id: string; source_user_seq: number }>;
+    `).all(Math.max(1, Math.min(limit, 256))) as BackfillRow[];
   } catch {
-    return;
+    return { scanned: 0, learned: 0 };
   }
-  for (const row of rows) {
-    const key = `${row.session_id}#${row.source_user_seq}`;
-    if (backfilled.has(key)) continue;
-    const learned = await learnVerifiedWriteCapabilitiesForAcceptedTask({
-      sessionId: row.session_id,
-      sourceUserSeq: row.source_user_seq,
-    });
-    if (learned.status === 'learned' || learned.status === 'replayed') backfilled.add(key);
-  }
+  return backfillRows(rows, learnVerifiedWriteCapabilitiesForAcceptedTask, Date.now());
 }
 
 /** Retrieve and canonically revalidate request-relevant learned write rows. */
@@ -643,5 +675,9 @@ export async function resolveCanonicalVerifiedWriteCapabilities(
 export const __test__ = {
   exactCatalogIdentityForBinding,
   graphNamesCapability,
-  resetBackfillCache() { backfilled.clear(); },
+  resetBackfillCache() { backfillMemo.clear(); },
+  backfillRows,
+  backfillMemo,
+  NOT_PROVEN_RECHECK_MS,
+  MAX_LEARNED_PER_BACKFILL,
 };
