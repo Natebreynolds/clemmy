@@ -231,3 +231,11 @@ Open, with evidence:
 - **Wall-clock gate.** `positive_host_wall_p95_le_50ms` measures p95 58–77 ms on the owner's loaded laptop (VS Code renderers ~150% CPU) at both 3.18.9 and 3.18.11; causal CPU p95 passes. It needs a quiet-machine or CI measurement.
 - **CI Test workflow red for infrastructure.** A unit-test watchdog on `constraint-guard.test.ts` (600 s), the Windows daemon boot, the iOS project read, and runner shutdowns.
 - **Completion review cannot fit large Space data.** The Space follow-up review was estimated at 1.24M tokens against a 712.8K window (703 calendar events). The review is complete-or-unavailable by design, so the result delivered as unreviewed. Whether a Space's data may be reviewed through its record digest instead of whole bytes is an owner decision.
+
+## 13. Addendum — release publish is incremental
+
+The v3.18.11 publish failed four times (HTTP 422, 400, 502, 400) on the 400–500 MB macOS assets. Evidence that it was GitHub's upload path, not this repo: the publish step took 0–2 minutes on the previous five releases with identical asset sizes; the same runner downloaded the same 1.8 GB artifact in 1.4 minutes; and 1 KB and 50 MB uploads to the same draft release from a workstation returned 201. Effective runner upload throughput fell from ~25 MB/s to ~0.4 MB/s.
+
+What was ours: `gh release upload --clobber` re-sent every asset on each retry, so one flaky file cost 1.8 GB per attempt and never converged. The publish step now uploads one asset at a time, skips an asset whose uploaded size already equals the local file, replaces an incomplete one, retries a failed upload five times with linear backoff, and flips the draft only after every asset is verified present at its exact local size. Pin: `release-workflow.test.mjs` "a flaky upload costs one asset, and an incomplete set is never published" (fails against the old step).
+
+The v3.18.11 draft was deleted and the work re-tagged as v3.18.12; its tag remains in history at ffe2b80c.

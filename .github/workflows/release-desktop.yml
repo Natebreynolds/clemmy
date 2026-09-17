@@ -548,5 +548,60 @@ jobs:
             gh release edit "$RELEASE_TAG" --notes-file "$curated_notes_file"
           fi
 
-          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          # ONE ASSET AT A TIME, AND ONLY WHAT IS MISSING.
+          # A single flaky upload used to fail the whole step, and the retry
+          # re-sent every asset — four attempts of 1.8 GB, none of which
+          # finished, for one bad file. An asset whose uploaded size already
+          # equals the local file is complete and is left alone; any other
+          # state is deleted and re-sent, so a retry costs one file. The
+          # release is published only after every asset is verified present at
+          # its exact local size.
+          upload_attempts=5
+          for asset in "${assets[@]}"; do
+            ASSET_NAME="$(basename "$asset")"
+            export ASSET_NAME
+            local_size="$(wc -c < "$asset" | tr -d '[:space:]')"
+            uploaded=false
+            for attempt in $(seq 1 "$upload_attempts"); do
+              remote_size="$(gh release view "$RELEASE_TAG" --json assets \
+                --jq '[.assets[] | select(.name == env.ASSET_NAME) | .size] | first // empty')"
+              if [[ "$remote_size" == "$local_size" ]]; then
+                uploaded=true
+                break
+              fi
+              if [[ -n "$remote_size" ]]; then
+                echo "Replacing incomplete $ASSET_NAME ($remote_size of $local_size bytes)."
+                gh release delete-asset "$RELEASE_TAG" "$ASSET_NAME" --yes || true
+              fi
+              if (( attempt == upload_attempts )); then
+                break
+              fi
+              if ! gh release upload "$RELEASE_TAG" "$asset"; then
+                backoff=$(( attempt * 30 ))
+                echo "Upload of $ASSET_NAME failed (attempt $attempt); retrying in ${backoff}s."
+                sleep "$backoff"
+              fi
+            done
+            if [[ "$uploaded" != true ]]; then
+              echo "::error::Could not upload $ASSET_NAME after $upload_attempts attempts."
+              exit 1
+            fi
+          done
+
+          missing=()
+          for asset in "${assets[@]}"; do
+            ASSET_NAME="$(basename "$asset")"
+            export ASSET_NAME
+            local_size="$(wc -c < "$asset" | tr -d '[:space:]')"
+            remote_size="$(gh release view "$RELEASE_TAG" --json assets \
+              --jq '[.assets[] | select(.name == env.ASSET_NAME) | .size] | first // empty')"
+            if [[ "$remote_size" != "$local_size" ]]; then
+              missing+=("$ASSET_NAME")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Release assets are incomplete, not publishing: ${missing[*]}"
+            exit 1
+          fi
+
           gh release edit "$RELEASE_TAG" --draft=false --latest="$mark_latest"

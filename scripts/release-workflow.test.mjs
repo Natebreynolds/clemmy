@@ -551,6 +551,22 @@ test('one tag-only publisher owns GitHub Release mutation', () => {
   assert.match(String(workflow.jobs?.['release-windows']?.if ?? ''), /github\.event_name == 'push'/);
 });
 
+test('a flaky upload costs one asset, and an incomplete set is never published', () => {
+  // 2026-09-17: one 400-500 MB asset failed mid-upload, the step re-sent every
+  // asset, and four attempts of 1.8 GB each never finished. Uploads are now
+  // per-asset, skip what is already complete, retry with backoff, and the
+  // draft is flipped only after every asset matches its exact local size.
+  const publish = runScripts(workflow.jobs?.['publish-release']);
+  assert.doesNotMatch(publish, /--clobber/, 'a retry must not re-send assets that are already complete');
+  assert.match(publish, /for asset in "\$\{assets\[@\]\}"/, 'assets upload one at a time');
+  assert.match(publish, /gh release delete-asset/, 'an incomplete asset is replaced, not duplicated');
+  assert.match(publish, /Could not upload \$ASSET_NAME after \$upload_attempts attempts/);
+  const verifyIndex = publish.indexOf('Release assets are incomplete, not publishing');
+  const publishIndex = publish.indexOf('--draft=false');
+  assert.ok(verifyIndex > 0 && verifyIndex < publishIndex,
+    'every asset is verified present at its local size before the release is published');
+});
+
 test('Windows artifacts use updater-safe names and are verified before upload', () => {
   assert.equal(desktopPackage.build?.nsis?.artifactName, '${productName}-Setup-${version}.${ext}');
   assert.match(
