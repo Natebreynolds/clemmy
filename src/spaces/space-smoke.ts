@@ -14,13 +14,19 @@
 import { spaceStore } from './store.js';
 import { refreshSpaceData } from './runner.js';
 import { readData } from './data-store.js';
+import { countWorkspaceRecords } from './workspace-data-digest.js';
 import { listConnectedToolkits, listComposioToolkitTools } from '../integrations/composio/client.js';
 
 /** Heuristic "did this source return anything usable?" — empty array, empty
  *  object, or null/undefined all count as empty; any non-empty array or scalar
- *  value (at top level or one level down, e.g. {contacts:[...]}) counts as data. */
+ *  value (at top level or one level down, e.g. {contacts:[...]}) counts as data.
+ *  When the value has a record list the view would read, its length decides:
+ *  a query envelope with zero records is empty even though it carries status
+ *  and paging scalars. */
 export function looksEmpty(value: unknown): boolean {
   if (value == null) return true;
+  const records = countWorkspaceRecords(value);
+  if (records !== null) return records === 0;
   if (Array.isArray(value)) return value.length === 0;
   if (typeof value === 'object') {
     const keys = Object.keys(value as Record<string, unknown>).filter((k) => k !== '_meta');

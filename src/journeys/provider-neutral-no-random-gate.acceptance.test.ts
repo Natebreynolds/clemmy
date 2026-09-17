@@ -1949,6 +1949,9 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label: 'unknown external mutation requests exact approval before I/O',
       expected: 'needs_user',
       resumeScenario: 'approve_restart',
+      // Unknown means the carrier says nothing about destructiveness. A carrier
+      // that declares a write non-destructive is bounded work and proceeds.
+      carrierDestructiveHint: null,
       operation: 'FIXTURE_SYNC_RESOURCE',
       destinationFamily: 'fixture',
       prompt: 'Synchronize one new fixture resource from this exact payload.',
@@ -2230,7 +2233,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           semanticName: candidate.operation,
           behaviorHints: {
             readOnly: false,
-            destructive: false,
+            destructive: 'carrierDestructiveHint' in candidate ? candidate.carrierDestructiveHint : false,
             idempotent: null,
             openWorld: false,
           },

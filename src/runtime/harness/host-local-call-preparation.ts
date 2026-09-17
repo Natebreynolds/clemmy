@@ -1,5 +1,6 @@
 import {
   inspectAuthorizedLocalPlanningDisclosureCandidates,
+  isRegistryDeclaredLocalPlanningCapability,
   issueAuthorizedLocalPlanningDisclosureCandidate,
   localPlanningArgumentsMatch,
   nominateDisclosedLocalPlanningDefinition,
@@ -43,19 +44,52 @@ export function bindHostLocalCallPreparation(agent: object, input: {
  * This never imports an earlier request's execution grant or acquires a
  * provider operation. Frozen graphs still own their selected capabilities. */
 export async function prepareHostLocalCall(agent: object, call: LocalCall): Promise<boolean> {
+  const current = await currentLocalWriteDefinitions(agent, call);
+  if (!current?.definitions.some(definition => definition.capabilityRef === call.capabilityRef)) return false;
+  await disclosePrimaryModelPlanningCapabilities({ authority: current.authority, candidates: [current.candidate] });
+  return nominateDisclosedLocalPlanningDefinition({ ...call, effect: 'local_write' }) !== null;
+}
+
+/** The requirement an exact native write runs under, or null.
+ *
+ * A requirement id copied from ANOTHER configured local operation (the one the
+ * model used a step earlier) is a label slip, not a different request: the
+ * named operation and its arguments are the call. When exactly one current
+ * write definition of the named operation matches those arguments, that
+ * definition is the requirement, published the same way as above. An id that
+ * names no configured local operation, or arguments that match no single
+ * variant, keep the ordinary refusal. */
+export async function resolveHostLocalCallRequirement(agent: object, call: LocalCall): Promise<string | null> {
+  if (await prepareHostLocalCall(agent, call)) return call.capabilityRef;
+  const namedOperation = /^cap:local:([^:]+):/.exec(call.capabilityRef)?.[1];
   const bound = preparations.get(agent);
-  if (!bound || !bound.configuredNames.has(call.operationId)) return false;
+  if (!bound || !namedOperation || namedOperation === call.operationId
+    || !bound.configuredNames.has(namedOperation)
+    || !isRegistryDeclaredLocalPlanningCapability(namedOperation)) return null;
+  const current = await currentLocalWriteDefinitions(agent, call);
+  if (current?.definitions.length !== 1) return null;
+  const requirement = { ...call, capabilityRef: current.definitions[0]!.capabilityRef, effect: 'local_write' };
+  if (!nominateDisclosedLocalPlanningDefinition(requirement)) {
+    await disclosePrimaryModelPlanningCapabilities({ authority: current.authority, candidates: [current.candidate] });
+  }
+  return nominateDisclosedLocalPlanningDefinition(requirement) ? requirement.capabilityRef : null;
+}
+
+/** The named operation's current write definitions that match these exact
+ * arguments, from the live registry and this agent's configured surface. */
+async function currentLocalWriteDefinitions(agent: object, call: LocalCall) {
+  const bound = preparations.get(agent);
+  if (!bound || !bound.configuredNames.has(call.operationId)) return null;
   const current = snapshotPrimaryModelPlanningContext(bound.planning.authority);
   if (!current || current.identity.sessionId !== call.sessionId
-    || current.identity.sourceUserSeq !== call.sourceUserSeq) return false;
+    || current.identity.sourceUserSeq !== call.sourceUserSeq) return null;
   const candidate = await issueAuthorizedLocalPlanningDisclosureCandidate({
     name: call.operationId, carrier: 'work_call', configuredNames: bound.configuredNames,
   });
-  if (!candidate || 'refused' in candidate) return false;
-  const definitions = inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
-  if (!definitions?.some(definition => definition.capabilityRef === call.capabilityRef
-    && definition.name === call.operationId && definition.descriptor.effect === 'local_write'
-    && localPlanningArgumentsMatch(definition, call.args))) return false;
-  await disclosePrimaryModelPlanningCapabilities({ authority: bound.planning.authority, candidates: [candidate] });
-  return nominateDisclosedLocalPlanningDefinition({ ...call, effect: 'local_write' }) !== null;
+  if (!candidate || 'refused' in candidate) return null;
+  const definitions = (inspectAuthorizedLocalPlanningDisclosureCandidates(candidate) ?? []).filter(definition => (
+    definition.name === call.operationId && definition.descriptor.effect === 'local_write'
+    && localPlanningArgumentsMatch(definition, call.args)
+  ));
+  return { authority: bound.planning.authority, candidate, definitions };
 }

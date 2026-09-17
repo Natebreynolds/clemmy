@@ -95,3 +95,19 @@ test('a frozen graph cannot acquire another native capability through call prepa
   assert.equal(await preparation.prepareHostLocalCall(f.agent, f.call), false);
   assert.equal(log.listEvents(f.call.sessionId, { types: ['capability_discovered'] }).length, 0);
 });
+
+test('a requirement id copied from another configured operation resolves to the named operation\'s own definition', async () => {
+  const f = await fixture();
+  preparation.bindHostLocalCallPreparation(f.agent, { planning: f.planning, configuredNames: new Set(['write_file', 'space_save']) });
+  const sibling = { ...f.call, capabilityRef: 'cap:local:space_save:reversible' };
+  assert.equal(await preparation.prepareHostLocalCall(f.agent, sibling), false, 'the exact-ref preparation is unchanged');
+  for (const call of [
+    { ...f.call, capabilityRef: 'cap:local:invented:create' },
+    { ...f.call, capabilityRef: 'cap:local:workflow_create:reversible' },
+    { ...sibling, args: { ...f.call.args, mode: 'append-everything' } },
+  ]) assert.equal(await preparation.resolveHostLocalCallRequirement(f.agent, call), null, JSON.stringify(call));
+  assert.equal(log.listEvents(f.call.sessionId, { types: ['capability_discovered'] }).length, 0,
+    'an unconfigured or invented label, or unmatched arguments, publish nothing');
+  assert.equal(await preparation.resolveHostLocalCallRequirement(f.agent, sibling), f.call.capabilityRef);
+  assert.ok(local.nominateDisclosedLocalPlanningDefinition({ ...f.call, effect: 'local_write' }));
+});

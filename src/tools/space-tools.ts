@@ -685,8 +685,21 @@ export function registerSpaceTools(server: McpServer): void {
           updatedAt: now,
         };
       const actionInputContract = await workspaceActionInputContract(prospective.actions);
+      // A declared source or action that the saved view does not read yet, and
+      // that this save does not wire either, is the pending wiring step rather
+      // than a broken view: the page renders exactly as before. It saves, and
+      // the gap test on the saved result names it as a fix. A new Workspace, or
+      // a view that stops reading what the saved view read, is still refused.
+      let savedView: string | null = null;
+      if (existing) {
+        try { savedView = readFileSync(resolveInSpace(slug, existing.viewEntry), 'utf-8'); } catch { /* no saved view: refuse as before */ }
+      }
+      const nextWiringStep = (gap: { unreferenced?: 'source' | 'action'; sourceId?: string; actionId?: string }): boolean => {
+        const id = gap.unreferenced === 'source' ? gap.sourceId : gap.unreferenced === 'action' ? gap.actionId : undefined;
+        return Boolean(id && savedView !== null && !savedView.includes(id));
+      };
       const implementationGaps = analyzeSpaceGaps(prospective, candidateView, [], actionInputContract)
-        .filter((gap) => gap.resolution === 'fix');
+        .filter((gap) => gap.resolution === 'fix' && !nextWiringStep(gap));
       if (implementationGaps.length > 0) {
         return invalidArgumentsTextResult(
           `Workspace "${slug}" was NOT saved — its view has implementation gaps.${renderSpaceGapQuestions(implementationGaps)}`,

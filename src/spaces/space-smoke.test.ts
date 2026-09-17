@@ -53,6 +53,11 @@ test('looksEmpty: empties vs data', () => {
   assert.equal(smoke.looksEmpty([1, 2]), false);
   assert.equal(smoke.looksEmpty({ contacts: [{ a: 1 }] }), false);
   assert.equal(smoke.looksEmpty({ count: 5 }), false);
+  // Command-line query output: status and paging scalars beside the records.
+  assert.equal(smoke.looksEmpty({ status: 0, result: { done: true, totalSize: 0, records: [] }, warnings: [] }), true);
+  assert.equal(smoke.looksEmpty({ status: 0, result: { done: true, totalSize: 1, records: [{ Id: 'a' }] }, warnings: [] }), false);
+  assert.equal(smoke.looksEmpty({ complete: true, result: { records: [] } }), true);
+  assert.equal(smoke.looksEmpty({ summary: { total: 5 }, warnings: [] }), false, 'an empty side list is not an empty source');
 });
 
 test('toolkitSlugForTool derives the toolkit', () => {

@@ -406,6 +406,62 @@ test('space_save records declared data sources + re-engage contract', async () =
   assert.deepEqual(rec?.reengage?.triggers, ['note', 'ask']);
 });
 
+test('a source added to an existing Workspace before its view reads it saves, and the saved result names the wiring step', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-added-source.html');
+  writeFileSync(draft, '<html><script>clem.data().then(data => render(data.cal))</script></html>', 'utf-8');
+  await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS'], () => tools.space_save({
+    slug: 'added-source',
+    title: 'Added Source',
+    view_path: draft,
+    data_sources: [{ id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', allow_empty: true }],
+  }));
+  assert.equal(store.spaceStore.get('added-source')?.dataSources.length, 1);
+
+  const added = text(await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS', 'SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'added-source',
+    title: 'Added Source',
+    data_sources: [
+      { id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', allow_empty: true },
+      { id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true },
+    ],
+  })));
+  assert.doesNotMatch(added, /was NOT saved/, added);
+  assert.deepEqual(store.spaceStore.get('added-source')?.dataSources.map((source) => source.id), ['cal', 'tasks']);
+  assert.match(added, /never references source "tasks"/, 'the saved result still names the next wiring step');
+
+  const widened = text(await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS', 'SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'added-source',
+    title: 'Added Source',
+    data_sources: [
+      { id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', allow_empty: true },
+      { id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', composio_args_json: '{"limit":50}', allow_empty: true },
+    ],
+  })));
+  assert.doesNotMatch(widened, /was NOT saved/, 'changing a source the saved view never read is still the pending wiring step');
+  assert.deepEqual(store.spaceStore.get('added-source')?.dataSources.find((source) => source.id === 'tasks')?.composioArgs, { limit: 50 });
+
+  const dropped = path.join(process.env.CLEMENTINE_HOME!, 'tmp-dropped-source.html');
+  writeFileSync(dropped, '<html><script>clem.data().then(data => render(data.tasks))</script></html>', 'utf-8');
+  const stopsReading = text(await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS', 'SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'added-source',
+    title: 'Added Source',
+    view_path: dropped,
+  })));
+  assert.match(stopsReading, /was NOT saved/, 'a view that stops reading a source it already declared is still refused');
+  assert.match(stopsReading, /never references source "cal"/);
+
+  const fresh = path.join(process.env.CLEMENTINE_HOME!, 'tmp-fresh-unwired.html');
+  writeFileSync(fresh, '<html><script>clem.data().then(data => render(data.other))</script></html>', 'utf-8');
+  const freshOut = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'fresh-unwired',
+    title: 'Fresh Unwired',
+    view_path: fresh,
+    data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true }],
+  })));
+  assert.match(freshOut, /was NOT saved/, 'a new Workspace whose view never reads its source is still refused');
+  assert.equal(store.spaceStore.get('fresh-unwired'), undefined);
+});
+
 test('space_save accepts a view rendering the host-planted dataset and refuses one rendering a pasted snapshot', async () => {
   // The planted window.__SPACE_DATA__ is the dataset the tool text tells the
   // author to render from; it is re-planted on every serve.

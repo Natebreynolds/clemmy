@@ -8976,15 +8976,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const identity = exactHostIdentity();
         const localCall = { ...identity, capabilityRef: args.requirement_id,
           operationId: effective.toolName, args: effective.args };
+        let requirementId = args.requirement_id;
         if (!nominateDisclosedLocalPlanningDefinition({ ...localCall, effect: 'local_write' })) {
-          const { prepareHostLocalCall } = await import('./host-local-call-preparation.js');
-          if (!await prepareHostLocalCall(agent, localCall)) continue;
+          const { resolveHostLocalCallRequirement } = await import('./host-local-call-preparation.js');
+          const resolved = await resolveHostLocalCallRequirement(agent, localCall);
+          if (!resolved) continue;
+          requirementId = resolved;
         }
         const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
         const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
         if (!prepared) continue;
         localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
-          JSON.stringify({ ...args, args_json: JSON.stringify(prepared.args) }));
+          JSON.stringify({ ...args, requirement_id: requirementId, args_json: JSON.stringify(prepared.args) }));
       }
     }
     const repeatsCommittedCallId = canonicalCalls.some((call) => history.some((item) => {

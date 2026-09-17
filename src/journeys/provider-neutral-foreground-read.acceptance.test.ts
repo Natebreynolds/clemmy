@@ -646,8 +646,10 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
   assert.equal(review?.data.replyDigest, sha256(success));
   assert.equal(review?.data.objectiveDigest, sha256(prompt));
   assert.equal(typeof review?.data.reason, 'string');
-  assert.ok(deliveredText?.includes(`Verification note: ${review!.data.reason}`));
-  assert.match(deliveredText ?? '', /This result remains unreviewed\./);
+  // The unavailability reason is operator diagnosis kept on the review row;
+  // the chat gets one plain sentence saying the result stands unreviewed.
+  assert.match(deliveredText ?? '', /I could not get this result independently reviewed, so it stands unreviewed\. The review model is not reachable with the current model setup; the console has the details\./);
+  assert.ok(!deliveredText?.includes(String(review!.data.reason)), 'operator diagnosis stays out of the chat');
   assert.doesNotMatch(deliveredText ?? '', /accepting completion/);
   assert.equal(reviewRef.verified, false);
   assert.equal(reviewRef.failedOpen, true);

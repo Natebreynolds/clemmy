@@ -21,6 +21,9 @@ export interface SpaceGap {
   resolution: 'fix' | 'clarify';
   sourceId?: string;
   actionId?: string;
+  /** Set when the gap is only that the view does not use a declared source or
+   *  action at all. */
+  unreferenced?: 'source' | 'action';
   question: string;
   why: string;
 }
@@ -239,6 +242,7 @@ export function analyzeSpaceGaps(
         severity: 'clarify',
         resolution: 'fix',
         sourceId: s.id,
+        unreferenced: 'source',
         question: `The view never references source "${s.id}" — confirm it reads the rows from data["${s.id}"] (the /refresh route nests each source's output under its id, so the array is at data["${s.id}"].<yourKey>).`,
         why: 'Reading the wrong key renders an empty table even though the data is there — the most common Workspace bug.',
       });
@@ -265,6 +269,7 @@ export function analyzeSpaceGaps(
           severity: 'clarify',
           resolution: 'fix',
           actionId: a.id,
+          unreferenced: 'action',
           question: `The view fires actions but never references "${a.id}" — confirm a control calls clem.action('${a.id}', {…}).`,
           why: 'A declared action the view never wires can never run.',
         });

@@ -363,3 +363,63 @@ test(`an exact file overwrite commits once without rediscovery or a redundant ap
   assert.equal(evidence.artifacts[0]?.digestMatches, true);
 });
 }
+
+for (const label of ['sibling', 'invented'] as const) {
+test(`a native write carrying ${label === 'sibling' ? "another configured operation's" : 'an invented'} requirement id ${label === 'sibling' ? 'runs under its own definition' : 'keeps the refusal'}`, async () => {
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: `native-requirement-${label}`, kind: 'chat', userId: 'native-fixture-owner' });
+  const file = path.join(TEST_HOME, `requirement-${label}.html`);
+  writeFileSync(file, 'Original draft\n');
+  const prompt = `Update ${file} to Revised draft.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, taskMode: { version: 1, kind: 'normal' } } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const args = { path: file, content: 'Revised draft', mode: 'overwrite', append: null };
+  const authoredRequirement = label === 'sibling' ? 'cap:local:space_save:reversible' : 'cap:local:not_a_tool:reversible';
+  const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
+    reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
+    settlementLane: 'byo', hostPlanningReady: () => true }) as never);
+  const carriedArgs = {
+    requirement_id: authoredRequirement, source_call_ids: null, source_record_ids: null,
+    universe_item_id: null, universe_selector: null, seal_amendment: null,
+    name: 'write_file', args_json: JSON.stringify(args),
+  };
+  const model = stubModel([[toolCall(`requirement-${label}`, 'work_call', carriedArgs)],
+    [textMessage('Done.')]]);
+  const agent = { model, tools: [workCall] };
+  localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning,
+    configuredNames: new Set(['write_file', 'space_save']) });
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
+    universeTools: [workCall], activeToolNames: ['work_call'], policyHash: `native-requirement-${label}`,
+    budget: { maxUncachedTokens: 20_000, maxModelCalls: 4, maxToolCalls: 4, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) throw new Error('native envelope unavailable');
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(4),
+    behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: prompt }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
+  const dispatches = (eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n;
+  if (label === 'sibling') {
+    assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
+    assert.equal(readFileSync(file, 'utf8'), 'Revised draft\n');
+    assert.equal(dispatches, 1);
+    assert.equal(model.calls(), 2);
+    assert.ok(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef: 'cap:local:write_file:overwrite',
+      operationId: 'write_file', effect: 'local_write', args }), 'the named operation\'s own definition was published');
+  } else {
+    assert.match(JSON.stringify(result.history), /work_contract_required|not yet published/);
+    assert.equal(readFileSync(file, 'utf8'), 'Original draft\n');
+    assert.equal(dispatches, 0);
+  }
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0);
+});
+}
