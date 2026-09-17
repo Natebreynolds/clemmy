@@ -33,6 +33,7 @@ Design documents describe the repository at the time they were written. They are
 
 ## Research and proposals
 
+- [Next-wave north-star improvements](NEXT-WAVE-NORTHSTAR-IMPROVEMENTS.md) — implementing-agent brief: what to take from Qwen 3.8 and Block Buzz without relaxing write law
 - [iOS app roadmap](roadmap-ios-app.md)
 - [Composio reliability slice](plans/composio-reliability-slice.md)
 

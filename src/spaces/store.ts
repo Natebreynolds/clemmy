@@ -24,6 +24,7 @@
  *
  * Pure persistence layer — no Express, no agent loop, no focus/workflow deps.
  */
+import { WORKSPACE_OPERATIONAL_MANIFEST_KEYS, workspaceManifestAuthoringFields } from './workspace-manifest-authoring.js';
 import { randomUUID } from 'node:crypto';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
@@ -1399,17 +1400,15 @@ export class SpaceStore {
   commitSaveResult(input: { expectedRecord: SpaceRecord; expectedView?: string; result: string }): string {
     const expected = input.expectedRecord;
     if (!isValidSpaceSlug(expected.id)) throw new Error('Invalid Workspace save identity');
-    const authoringFields = (value: Record<string, unknown>): string => {
-      const { updatedAt: _updatedAt, lastRefreshedAt: _lastRefreshedAt, lastOpenedAt: _lastOpenedAt, ...authoring } = value;
-      return canonicalWorkspaceJson(authoring);
-    };
+    const authoringFields = (value: Record<string, unknown>): string =>
+      canonicalWorkspaceJson(workspaceManifestAuthoringFields(value));
     // JSON encoding removes optional undefined properties exactly as persistence does.
     const expectedManifest = JSON.parse(JSON.stringify(persistableRecord(expected))) as Record<string, unknown>;
     return withWorkspaceSnapshotMutation(expected.id, () => withHostLocalWorkspaceCommitFromCurrentFiles({
       createdId: expected.id, viewEntry: expected.viewEntry, result: input.result,
       validate: ({ manifest, view, data }) => {
         const current = JSON.parse(manifest.toString('utf8')) as Record<string, unknown>;
-        for (const key of ['updatedAt', 'lastRefreshedAt', 'lastOpenedAt']) {
+        for (const key of WORKSPACE_OPERATIONAL_MANIFEST_KEYS) {
           if (current[key] !== undefined && (typeof current[key] !== 'string' || !Number.isFinite(Date.parse(current[key] as string)))) {
             throw new Error('Workspace operational timestamp is invalid before delivery proof');
           }

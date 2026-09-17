@@ -3372,6 +3372,105 @@ test('production host call_tool keeps exact v57 authority through strict nullabl
   }
 });
 
+test('production host carries a direct call to an off-surface reachable read through call_tool and keeps the authored name', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('production-off-surface-direct-read');
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['mcp_list_tools']),
+    firstClassNames: new Set(['call_tool']),
+    deniedNames: new Set(),
+    mcpToolScope: null,
+    controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async (name) => name === 'mcp_list_tools'
+      ? { ok: true }
+      : { ok: false, kind: 'requires_readmission', outside: [name] },
+  }));
+  const model = stubModel([
+    [toolCall('off-surface-direct-inventory', 'mcp_list_tools', {
+      server: 'not-configured-fixture',
+      query: 'calendar inventory',
+      limit: 1,
+    })],
+    [textMsg('direct inventory settled')],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindHostCanarySurface(fixture, agent, [carrier]);
+  try {
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.finalOutput, 'direct inventory settled', JSON.stringify(outcome.terminal));
+    const result = outcome.history.find((item) => (
+      (item as { type?: unknown; callId?: unknown }).type === 'function_call_result'
+      && (item as { callId?: unknown }).callId === 'off-surface-direct-inventory'
+    )) as { name?: string; output?: unknown } | undefined;
+    assert.ok(result, 'the authored call received one result');
+    assert.equal(result?.name, 'mcp_list_tools', 'the sealed result keeps the authored name');
+    assert.doesNotMatch(JSON.stringify(result?.output), /only admits configured harness-bounded tools|not_reachable/);
+    const db = eventlog.openEventLog();
+    assert.deepEqual(db.prepare(`
+      SELECT tool_name, state FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(fixture.session.id, fixture.source.seq, 'off-surface-direct-inventory'), {
+      tool_name: 'mcp_list_tools',
+      state: 'settled',
+    });
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(fixture.session.id, fixture.source.seq, 'off-surface-direct-inventory') as { n: number }).n, 1,
+    'one invocation settles once');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a write named directly off the surface meets exactly the host refusal its carrier call meets', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const observed: Record<string, { outcome: string; mutating: number; resultName?: string; bodyRan: boolean }> = {};
+    for (const shape of ['carrier', 'direct'] as const) {
+      const fixture = acceptHostCanarySource(`carried-local-write-parity-${shape}`);
+      const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+        reachableBuiltinNames: new Set(['note_create']),
+        firstClassNames: new Set(['call_tool']),
+        deniedNames: new Set(),
+        mcpToolScope: null,
+      }));
+      const args = { note_type: 'inbox', title: `Parity note ${shape}`, content: 'body' };
+      const model = stubModel([
+        [shape === 'carrier'
+          ? toolCall(`parity-${shape}`, 'call_tool', { name: 'note_create', args_json: JSON.stringify(args) })
+          : toolCall(`parity-${shape}`, 'note_create', args)],
+        [textMsg('done')],
+      ]);
+      const agent = { model, tools: [carrier] };
+      bindHostCanarySurface(fixture, agent, [carrier]);
+      const outcome = await runProductionHost(fixture, agent);
+      const result = outcome.history.find((item) => (
+        (item as { type?: unknown; callId?: unknown }).type === 'function_call_result'
+        && (item as { callId?: unknown }).callId === `parity-${shape}`
+      )) as { name?: string; output?: unknown } | undefined;
+      const settlement = eventlog.openEventLog().prepare(`
+        SELECT outcome_kind AS outcome, mutating FROM logical_call_settlements
+         WHERE session_id = ? AND source_user_seq = ?
+      `).get(fixture.session.id, fixture.source.seq) as { outcome: string; mutating: number };
+      observed[shape] = {
+        ...settlement,
+        ...(result?.name ? { resultName: result.name } : {}),
+        bodyRan: /Created /.test(JSON.stringify(result?.output ?? '')),
+      };
+    }
+    assert.equal(observed.direct!.outcome, observed.carrier!.outcome, JSON.stringify(observed));
+    assert.equal(observed.direct!.bodyRan, observed.carrier!.bodyRan, 'the direct name reaches no effect the carrier form is refused');
+    assert.equal(observed.direct!.resultName, 'note_create', 'the direct call keeps its authored name');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('production host reroutes a provider-carried local read control through the sealed acquisition surface', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -4209,6 +4308,50 @@ test('production text, image, and file outputs remain structured in the next mod
       result_class: 'media',
       disposition: 'ready',
     }], 'structured media bytes are sealed before their ready checkpoint');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a local image result reaches the next model as an image', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('local-image-result');
+    const projectedInputs: unknown[] = [];
+    let call = 0;
+    const imageBytes = Buffer.from('rendered-workspace-preview-bytes').toString('base64');
+    const model = {
+      async getResponse(request: { input?: unknown }) {
+        projectedInputs.push(structuredClone(request.input));
+        call += 1;
+        return {
+          usage: {},
+          output: call === 1 ? [toolCall('image-call', 'task_list', {})] : [textMsg('looked at it')],
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const imageTool = brackets.wrapToolForHarness({
+      type: 'function', name: 'task_list', description: 'Host image result',
+      parameters: { type: 'object', properties: {} },
+      needsApproval: async () => false,
+      invoke: async () => [
+        { type: 'text', text: 'Preview of "Board"' },
+        { type: 'image', data: imageBytes, mimeType: 'image/png' },
+      ],
+    });
+    const agent = { model, tools: [imageTool], getAllTools: async () => [imageTool] };
+    bindHostCanarySurface(fixture, agent, [imageTool]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.finalOutput, 'looked at it');
+    const projected = (projectedInputs[1] as Array<{ type?: string; output?: unknown }>)
+      .find((item) => item.type === 'function_call_result');
+    assert.deepEqual(projected?.output, [
+      { type: 'input_text', text: 'Preview of "Board"' },
+      { type: 'input_image', image: `data:image/png;base64,${imageBytes}` },
+    ]);
   } finally {
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
@@ -10352,7 +10495,7 @@ test('a concrete tool failure starts advisory review before the ordinary cadence
   assert.equal(seen.length, 1, 'a tool-free explanation cannot receive a useful tool correction');
 });
 
-for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wrong_plan_digest'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
+for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wrong_plan_digest', 'card_reply', 'card_reply_altered'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
   const host = await import('./host-turn-runner.js');
   const { buildPublishPlanTool } = await import('../../tools/publish-plan.js');
   const { planReviewDigest } = await import('./plan-publication-review.js');
@@ -10432,8 +10575,14 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
   const { commitTurnOutcome } = await import('./delivery-committer.js');
   const { turnOutcomeId } = await import('./turn-outcome.js');
   const identity = { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, turn: fixture.source.turn };
-  const terminal = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false, presentation: { kind: 'answer', text: String(result.finalOutput) } });
-  if (variant === 'positive' || variant === 'correction') {
+  // A card surface publishes the plan lead-in instead of the reviewed full text;
+  // that exact rendering of the reviewed plan is the reviewed reply.
+  const cardReply = host.publishedPlanReplyText({ fullText: artifact.fullText, needsInput: artifact.readiness === 'needs_input', missingPrerequisites: artifact.missingPrerequisites, cardRendered: true });
+  const committedText = variant === 'card_reply' ? cardReply
+    : variant === 'card_reply_altered' ? `${cardReply} I also sent the summary.`
+      : String(result.finalOutput);
+  const terminal = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false, presentation: { kind: 'answer', text: committedText } });
+  if (variant === 'positive' || variant === 'correction' || variant === 'card_reply') {
     assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, true, JSON.stringify(terminal));
     assert.equal((terminal.event.data.completionVerdictRef as any)?.planMatches, true);
   } else if (variant === 'wrong_plan_digest') {

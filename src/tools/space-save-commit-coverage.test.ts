@@ -145,13 +145,16 @@ test('absent-data descriptor rejects a symlink instead of reading or certifying 
   assert.equal(content.parts.length, 0);
 });
 
-test('legacy direct view edit keeps its exact view-only receipt', async () => {
+test('a direct view edit receipts everything it committed: the Workspace bundle, not the view alone', async () => {
   const slug = 'receipt-view-only';
-  await tools.space_save({ slug, title: 'View only', view_html: html });
+  const saved = checked(await tools.space_save({ slug, title: 'View only', view_html: html }));
   const result = await tools.space_edit_view({ slug, edits: [{ find: 'Board', replace: 'Edited' }] });
-  const facts = proof.parseHostLocalWriteCommitFacts(text(result)); assert.ok(facts, text(result));
-  assert.equal(facts.handle, `spaces/${slug}/view/index.html`);
-  assert.deepEqual(proof.readCommittedArtifactContent(facts).parts.map((part) => part.role), ['file']);
+  const edited = checked(result);
+  assert.equal(edited.facts.handle, saved.facts.handle, 'the edit supersedes the save by the same bundle handle');
+  assert.deepEqual(edited.content.parts.map((part) => part.role), ['manifest', 'view']);
+  assert.match(edited.view, /Edited/);
+  assert.equal(edited.manifest.version, saved.manifest.version + 1, 'the manifest the edit bumped is covered');
+  assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false, 'the earlier generation is history');
 });
 
 test('actual contained local-runner smoke issues a truthful paused snapshot receipt without a provider body', async () => {
@@ -261,7 +264,7 @@ test('actual successful smoke uses durable read authority and certifies post-ref
     data_sources: [{ id: 'contacts', composio_slug: operation }],
   });
   assert.equal(capability.portBodies(), 1, 'one registered fixture port invocation, no raw provider dispatch');
-  assert.match(text(result), /Data refreshed: contacts/);
+  assert.match(text(result), /Data refreshed: contacts \(1 row\)/, 'the receipt counts the records the view will read');
   const saved = checked(result);
   assert.equal(saved.manifest.status, 'active');
   assert.ok(saved.manifest.lastRefreshedAt);
@@ -270,4 +273,92 @@ test('actual successful smoke uses durable read authority and certifies post-ref
   assert.equal(digest(data.bytes), digest(readFileSync(store.resolveInSpace(slug, 'data.json'))));
   assert.equal(JSON.parse(readFileSync(path.join(home, saved.facts.handle), 'utf8')).version, 1);
   assert.ok(workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 10 }).some((row) => row.status === 'ok'));
+});
+
+test('a Space saved and then given new data in the same request verifies against that later data receipt only', async () => {
+  const slug = 'receipt-save-then-data';
+  const saved = checked(await tools.space_save({
+    slug, title: 'Board', view_html: html, initial_data_json: JSON.stringify({ rows: [1, 2] }),
+  }));
+  assert.deepEqual(saved.content.parts.map((part) => part.role), ['manifest', 'view', 'data']);
+  // A reviewed data write receipts data.json alone, exactly as the set-data
+  // carrier does.
+  const dataPath = store.resolveInSpace(slug, 'data.json');
+  writeFileSync(dataPath, JSON.stringify({ rows: [1, 2, 3] }));
+  const dataFacts = proof.parseHostLocalWriteCommitFacts(proof.withHostLocalWriteCommitFromFile({
+    createdId: slug, committedPath: dataPath, result: 'Saved 3 rows.',
+  }));
+  assert.ok(dataFacts);
+  assert.equal(dataFacts.handle, `spaces/${slug}/data.json`);
+
+  // Strict by default: the bundle alone cannot vouch for data that changed.
+  assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false);
+  const later = new Map([[dataFacts.handle, dataFacts.contentDigest]]);
+  const finalGeneration = proof.readCommittedArtifactContent(saved.facts, { laterReceipts: later });
+  assert.equal(finalGeneration.verified, true, finalGeneration.unresolvedReason);
+  assert.match(finalGeneration.parts.find((part) => part.role === 'data')!.bytes.toString('utf8'), /\[1,2,3\]/);
+
+  assert.equal(
+    proof.readCommittedArtifactContent(saved.facts, { laterReceipts: new Map([[dataFacts.handle, digest('other bytes')]]) }).verified,
+    false,
+    'a later receipt for different bytes does not cover the current data',
+  );
+  const viewPath = store.resolveInSpace(slug, 'view/index.html');
+  writeFileSync(viewPath, html + 'foreign');
+  assert.equal(
+    proof.readCommittedArtifactContent(saved.facts, { laterReceipts: later }).verified,
+    false,
+    'every component the later receipt does not name stays strict',
+  );
+  writeFileSync(viewPath, html);
+  writeFileSync(dataPath, JSON.stringify({ rows: ['foreign'] }));
+  assert.equal(
+    proof.readCommittedArtifactContent(saved.facts, { laterReceipts: later }).verified,
+    false,
+    'a foreign change after the later receipt is still drift',
+  );
+});
+
+test('host upkeep after a save (a refresh, a visit) does not read as drift; authored changes still do', async () => {
+  const slug = 'receipt-upkeep-refresh';
+  const operation = 'SALESFORCE_LIST_ACCOUNTS';
+  installReadCapability(operation);
+  const result = await tools.space_save({
+    slug, title: 'Upkeep',
+    view_html: '<html><script>clem.data().then(data => render(data.accounts))</script></html>',
+    data_sources: [{ id: 'accounts', composio_slug: operation }],
+  });
+  const saved = checked(result);
+  const manifestPath = store.resolveInSpace(slug, 'space.json');
+  const dataPath = store.resolveInSpace(slug, 'data.json');
+  const manifestAtSave = readFileSync(manifestPath);
+  const dataAtSave = readFileSync(dataPath);
+  assert.ok(JSON.parse(readFileSync(path.join(home, saved.facts.handle), 'utf8')).components[0].authoringDigest,
+    'the receipt records what was authored in the manifest');
+
+  // The host refreshes the source after the save: data is re-projected and
+  // the manifest's refresh timestamp advances.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const refreshed = await tools.space_refresh({ slug, source_id: null });
+  assert.doesNotMatch(text(refreshed), /FAILED|error/i, text(refreshed));
+  store.spaceStore.update(slug, { lastOpenedAt: new Date().toISOString() } as never);
+  assert.ok(!readFileSync(manifestPath).equals(manifestAtSave), 'upkeep changed the manifest bytes');
+  const afterUpkeep = proof.readCommittedArtifactContent(saved.facts);
+  assert.equal(afterUpkeep.verified, true, afterUpkeep.unresolvedReason);
+
+  // Foreign data that is not the host projection is drift.
+  writeFileSync(dataPath, JSON.stringify({ contacts: ['foreign'] }));
+  assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false, 'foreign data is not upkeep');
+  writeFileSync(dataPath, dataAtSave);
+  workspaceDb.healWorkspaceDataProjection(slug);
+
+  // An authored manifest change is drift even with only timestamps otherwise moving.
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, title: 'Renamed outside the request' }, null, 2));
+  assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false, 'an authoring field changed');
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+  const viewPath = store.resolveInSpace(slug, 'view/index.html');
+  writeFileSync(viewPath, '<html>foreign</html>');
+  assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false, 'the view stays exact');
 });

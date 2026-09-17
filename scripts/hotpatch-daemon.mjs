@@ -101,6 +101,53 @@ export function installDaemonPatch({ sourceDist, targetDist }, fileOps = fs) {
   }
 }
 
+/**
+ * Replace a packaged asset directory the daemon reads at boot (the shipped
+ * built-in skills) beside the daemon code, with the same verified staging copy
+ * and retained rollback as the code itself. The daemon provisions each shipped
+ * skill from this directory on every boot, so shipping new code without it
+ * leaves a skill the new code names absent from the installation.
+ */
+export function installBundledAssetDirectory({ sourceDir, targetDir }, fileOps = fs) {
+  const source = path.resolve(sourceDir);
+  const target = path.resolve(targetDir);
+  if (source === target || source.startsWith(`${target}${path.sep}`) || target.startsWith(`${source}${path.sep}`)) {
+    throw new Error('Source and installation must be separate directories.');
+  }
+  if (!fs.statSync(source).isDirectory()) throw new Error(`Packaged asset directory missing: ${source}`);
+  const digest = treeDigest(source);
+  const staging = fileOps.mkdtempSync(path.join(path.dirname(target), '.assets-stage-'));
+  const staged = path.join(staging, path.basename(target));
+  const hadTarget = fs.existsSync(target);
+  const backup = `${target}.backup-${path.basename(staging).slice('.assets-stage-'.length)}`;
+  let originalMoved = false;
+  try {
+    fileOps.cpSync(source, staged, { recursive: true });
+    if (treeDigest(staged) !== digest || treeDigest(source) !== digest) {
+      throw new Error('Asset source changed or staging copy is incomplete. Installed assets are untouched.');
+    }
+    if (hadTarget) {
+      fileOps.renameSync(target, backup);
+      originalMoved = true;
+    }
+    try {
+      fileOps.renameSync(staged, target);
+    } catch (error) {
+      if (originalMoved) fileOps.renameSync(backup, target);
+      originalMoved = false;
+      throw error;
+    }
+    return { digest, target, backup: hadTarget ? backup : null };
+  } catch (error) {
+    if (originalMoved && !fs.existsSync(target)) {
+      throw new Error(`Asset patch interrupted; prior assets are retained at ${backup}. Restore them to ${target} before launching.`, { cause: error });
+    }
+    throw error;
+  } finally {
+    fileOps.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const args = process.argv.slice(2);
@@ -129,7 +176,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       } catch (error) { if (error.status !== 1) throw error; }
       if (running) throw new Error('Quit Clementine before patching so the active run can finish cleanly.');
       const result = installDaemonPatch({ sourceDist, targetDist: path.join(installed.bundle, 'Contents/Resources/daemon/dist') });
-      console.log(`Daemon patched (${installed.bundle}, was ${installed.version}): ${result.stamp.sourceFingerprint}\nPrior daemon retained: ${result.backup}\nDesktop and web UI unchanged. Launch Clementine to test.`);
+      const skills = installBundledAssetDirectory({
+        sourceDir: path.join(repoRoot, 'builtin-skills'),
+        targetDir: path.join(installed.bundle, 'Contents/Resources/daemon/builtin-skills'),
+      });
+      console.log(`Daemon patched (${installed.bundle}, was ${installed.version}): ${result.stamp.sourceFingerprint}\nPrior daemon retained: ${result.backup}\nBuilt-in skills shipped (${skills.digest.slice(0, 12)})${skills.backup ? `; prior skills retained: ${skills.backup}` : ''}\nDesktop and web UI unchanged. Launch Clementine to test.`);
     }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

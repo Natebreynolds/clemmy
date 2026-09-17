@@ -112,3 +112,17 @@ test('a source rank cannot overcome stronger query relevance or promote a substr
   }]);
   assert.equal(body.results[0].name, 'space_save');
 });
+
+test('looking at a Workspace finds the preview, and authoring queries still find the authoring tools first', async () => {
+  for (const query of ['preview my workspace screenshot', 'render a screenshot of the space view']) {
+    const body = await search(query);
+    assert.equal(body.results[0].name, 'space_preview', `${query}: ${body.results.map((row: { name: string }) => row.name).join(', ')}`);
+  }
+  for (const [query, expected] of [
+    ['create a Space', 'space_save'],
+    ['get workspace view html content raw source', 'space_get_view'],
+  ]) {
+    const body = await search(query!);
+    assert.equal(body.results[0].name, expected, `${query}: ${body.results.map((row: { name: string }) => row.name).join(', ')}`);
+  }
+});

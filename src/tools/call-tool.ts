@@ -26,6 +26,9 @@
  *  - PROMOTION: a reached tool is recorded to the session hot-set, so it becomes
  *    first-class next turn (stops paying the catalog/dispatch indirection).
  */
+import { isToolMediaContent } from '../runtime/harness/tool-media-content.js';
+import { repairNativeArguments } from './native-argument-repair.js';
+import { renderReviewedCliArgumentMap, renderReviewedCliWorkCallExample, reviewedCliShellMatch } from '../runtime/harness/reviewed-cli-shell-match.js';
 import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -51,7 +54,7 @@ import {
   dispatchBatchItemTool,
   isMcpNamespacedTool,
 } from './inner-dispatch.js';
-import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool } from './tool-registry.js';
+import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
@@ -497,6 +500,23 @@ async function nullableRequiredKeys(): Promise<Map<string, ReadonlySet<string>>>
   return nullableRequiredKeysPromise;
 }
 
+/** A command line that spells a reviewed read is that operation. When the
+ *  command's own tool is unreachable, name the operation and its call shape so
+ *  the next call succeeds without another search. */
+function reviewedReadCorrection(args: unknown): string {
+  const command = args && typeof args === 'object' && !Array.isArray(args)
+    ? (args as { command?: unknown }).command
+    : undefined;
+  if (typeof command !== 'string' || !command.trim()) return '';
+  try {
+    const match = reviewedCliShellMatch(command);
+    if (match.status !== 'matched') return '';
+    return ` This command line is the reviewed read ${match.operationId}. Call ${renderReviewedCliWorkCallExample(match.operationId, match.argumentMap)} (arguments: ${renderReviewedCliArgumentMap(match.argumentMap)}); no search is needed.`;
+  } catch {
+    return '';
+  }
+}
+
 function jsonResult(value: unknown): string {
   if (value instanceof ExternalWritePreDispatchResult) return value.output;
   return typeof value === 'string' ? value : JSON.stringify(value ?? null);
@@ -541,8 +561,15 @@ export async function prepareNativeToolArguments(target: string, args: unknown):
   }
   // Local schemas own semantic defaults first; the core schema already is the
   // strict wire shape and needs its declared nullable omissions materialized.
-  const candidate = localSchema ? args : await completeLocalDispatchArguments(target, args);
-  const parsed = schema.safeParse(candidate);
+  let candidate = localSchema ? args : await completeLocalDispatchArguments(target, args);
+  let parsed = schema.safeParse(candidate);
+  if (!parsed.success) {
+    const repaired = repairNativeArguments(schema, candidate, { sideEffect: registeredToolSideEffect(target) });
+    if (repaired) {
+      candidate = repaired.args;
+      parsed = schema.safeParse(candidate);
+    }
+  }
   if (!parsed.success) {
     const paths = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
       ? issue.keys.map((key) => [...issue.path, key].join('.'))
@@ -1191,8 +1218,8 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
               ? `"${requestedTarget}" is a Clementine built-in, but it is NOT on this turn's surface:`
                 + ' this turn\'s tool policy does not reach it, so neither this carrier nor a direct call can invoke it here.'
                 + ' Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to disclose the exact operation for this step,'
-                + ` then invoke that operation.${boundSourceCorrection(requestedTarget)}`
-              : `"${requestedTarget}" is not a tool on this turn's surface. Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to find the exact operation, then invoke that operation. A connected external MCP tool is named <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
+                + ` then invoke that operation.${boundSourceCorrection(requestedTarget)}${reviewedReadCorrection(resolvedArgs)}`
+              : `"${requestedTarget}" is not a tool on this turn's surface. Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to find the exact operation, then invoke that operation. A connected external MCP tool is named <server>__<tool>.${boundSourceCorrection(requestedTarget)}${reviewedReadCorrection(resolvedArgs)}`,
           });
         }
         if (catalogPort && catalogManifest && catalogOperation) {
@@ -1477,6 +1504,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
 
       // 5. Promote the reached tool into the session hot-set.
       recordToolHit(sessionId, target);
+      // An inner result that carries an image stays content blocks, so the
+      // host delivers the image to the model instead of its base64 text.
+      if (isToolMediaContent(out)) return out as unknown as string;
       return jsonResult(out);
     },
   });
@@ -1526,6 +1556,7 @@ export function registerCallToolMcp(
       // answer. The consumer already reads `isError`; nothing ever set it, so a
       // pre-dispatch rejection and a real result were indistinguishable and an
       // identical payload could be sent straight back (live 2026-08-09).
+      if (isToolMediaContent(output)) return { content: output };
       const rendered = jsonResult(output);
       return textResult(rendered, { isError: isHarnessRefusalText(rendered) });
     },

@@ -1539,6 +1539,24 @@ function readWorkspaceProjection(rootDir: string): unknown {
   }
 }
 
+/**
+ * True when these data bytes are exactly what the host projects for the
+ * Workspace from its committed observations. A refresh writes this projection;
+ * an author writing different data does not produce it. Read-only.
+ */
+export function workspaceDataIsHostProjection(workspaceId: string, bytes: Buffer): boolean {
+  try {
+    if (bytes.byteLength > MAX_WORKSPACE_DATA_BYTES) return false;
+    const db = openWorkspaceDb();
+    workspaceRootFromDb(db, workspaceId);
+    const existing = JSON.parse(bytes.toString('utf8')) as unknown;
+    const projection = buildWorkspaceProjection(db, workspaceId, existing);
+    return Buffer.from(serializeWorkspaceProjection(projection.document).text, 'utf8').equals(bytes);
+  } catch {
+    return false;
+  }
+}
+
 export function serializeWorkspaceProjection(document: unknown): {
   text: string;
   bytes: number;

@@ -510,6 +510,13 @@ export class CodexResponsesModel implements Model {
         for await (const evt of this.streamCodex(request)) {
           events.push(evt);
         }
+        if (!events.some((event) => event.type === 'response.completed' || event.type === 'response.done')) {
+          const failed = codexFailedResponseError(events);
+          if (failed) {
+            if (failed.context?.requestTooLarge === true) await learnCodexWindowRejection(this.modelId);
+            throw failed;
+          }
+        }
         const response = assembleModelResponse(events);
         const completed = events.find((e) => e.type === 'response.completed' || e.type === 'response.done');
         recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId);
@@ -579,6 +586,7 @@ export class CodexResponsesModel implements Model {
       };
 
       let eventsConsumed = 0;
+      let failedEvent: AnyCodexEvent | undefined;
       try {
         for await (const evt of this.streamCodex(request, diag)) {
           eventsConsumed += 1;
@@ -615,6 +623,10 @@ export class CodexResponsesModel implements Model {
           }
           if (evt.type === 'response.completed' || evt.type === 'response.done') {
             completedEvent = evt;
+            continue;
+          }
+          if (evt.type === 'response.failed' || evt.type === 'error') {
+            failedEvent = evt;
             continue;
           }
           // Metadata pass-through — buffer instead of yielding. Codex
@@ -697,13 +709,20 @@ export class CodexResponsesModel implements Model {
       // "Always an output": never silently pass an empty answer downstream.
       lastResponseId = responseId;
       lastItemCount = seenOutputItems.length;
+      const failedResponse = !completedEvent && failedEvent ? codexFailedResponseError([failedEvent]) : null;
+      if (failedResponse && !failedResponse.retryable && !yieldedRealContent) {
+        if (failedResponse.context?.requestTooLarge === true) await learnCodexWindowRejection(this.modelId);
+        throw failedResponse;
+      }
       const noContentReason = completedEvent
         ? 'empty completion (response.completed carried no output)'
-        : 'SSE ended without response.completed before real content';
-      const noContentError = new BoundaryError({
+        : failedResponse
+          ? `the backend failed the response (${failedResponse.operatorMessage})`
+          : 'SSE ended without response.completed before real content';
+      const noContentError = failedResponse ?? new BoundaryError({
         kind: 'codex.sse_truncated',
         retryable: true,
-        userMessage: "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.",
+        userMessage: CODEX_NO_CONTENT_USER_MESSAGE,
         operatorMessage: `Codex produced no content: ${noContentReason}.`,
         context: { responseId: lastResponseId ?? null, itemCount: lastItemCount, emptyCompletion: completedEvent != null },
       });
@@ -1094,7 +1113,7 @@ export function splitCodexInstructions(raw: string | undefined | null): { instru
 // having to mock fetch + OAuth + SSE for every assertion.
 export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
-  const input = serializeInput(request.input);
+  const input = withLatestFunctionOutputImages(serializeInput(request.input));
   // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
   // ctx moves to a trailing input system message (after tools) so `instructions +
   // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
@@ -1285,10 +1304,11 @@ function serializeInputItem(item: AgentInputItem): unknown {
       : typeof anyItem.call_id === 'string'
         ? anyItem.call_id
         : undefined;
+    const media = codexFunctionOutputContent(anyItem.output);
     return {
       type: 'function_call_output',
       call_id: callId,
-      output: output?.type === 'text' ? output.text ?? '' : JSON.stringify(output ?? null),
+      output: media ?? (output?.type === 'text' ? output.text ?? '' : JSON.stringify(output ?? null)),
       status: anyItem.status,
     };
   }
@@ -1447,6 +1467,51 @@ interface AnyCodexEvent {
     error?: { code?: string; message?: string };
   };
   [key: string]: unknown;
+}
+
+const CODEX_REQUEST_TOO_LARGE_RE = /context_length_exceeded|context window|maximum context|too many tokens|request (?:is )?too large|input (?:is )?too (?:long|large)|exceeds the (?:maximum|limit)/i;
+const CODEX_NO_CONTENT_USER_MESSAGE = "Clementine's model backend dropped the connection before finishing this turn. Retry — if it persists, the Codex backend may be having an incident.";
+
+/**
+ * A stream the server ended with `response.failed` (or an `error` frame) is a
+ * refusal with a stated reason, not a dropped connection. The reason decides
+ * whether replaying the identical request can succeed: a request too large for
+ * the model fails the same way every time, so it is never replayed.
+ */
+export function codexFailedResponseError(events: readonly AnyCodexEvent[]): BoundaryError | null {
+  const failed = [...events].reverse().find((event) => event.type === 'response.failed' || event.type === 'error');
+  if (!failed) return null;
+  const topLevel = (failed as { error?: unknown }).error;
+  const reason = (failed.response?.error ?? (topLevel && typeof topLevel === 'object' ? topLevel : failed)) as { code?: unknown; message?: unknown };
+  const code = typeof reason.code === 'string' ? reason.code : '';
+  const message = typeof reason.message === 'string' ? reason.message.slice(0, 400) : '';
+  const responseId = failed.response?.id
+    ?? events.find((event) => event.type === 'response.created')?.response?.id
+    ?? null;
+  const stated = `${code || 'no code'}: ${message || 'no message'}`;
+  if (CODEX_REQUEST_TOO_LARGE_RE.test(`${code} ${message}`)) {
+    return new BoundaryError({
+      kind: 'codex.http_4xx',
+      retryable: false,
+      userMessage: 'This request was larger than the model accepts, so it was not retried.',
+      operatorMessage: `Codex failed the response as too large (${stated}, responseId=${responseId ?? 'none'})`,
+      context: { failedCode: code || null, failedMessage: message || null, responseId, requestTooLarge: true, lastEventType: failed.type ?? null },
+    });
+  }
+  return new BoundaryError({
+    kind: 'codex.sse_truncated',
+    retryable: true,
+    userMessage: CODEX_NO_CONTENT_USER_MESSAGE,
+    operatorMessage: `Codex failed the response (${stated}, responseId=${responseId ?? 'none'})`,
+    context: { failedCode: code || null, failedMessage: message || null, responseId, eventCount: events.length, itemCount: 0, lastEventType: failed.type ?? null },
+  });
+}
+
+async function learnCodexWindowRejection(modelId: string): Promise<void> {
+  try {
+    const { recordWindowRejection } = await import('./model-window-observations.js');
+    recordWindowRejection(modelId);
+  } catch { /* learning is additive */ }
 }
 
 async function* parseCodexSse(stream: ReadableStream<Uint8Array>): AsyncGenerator<AnyCodexEvent> {
@@ -1697,4 +1762,52 @@ async function safeReadErrorBody(res: Response): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/** A tool result that carries an image is sent as Responses content items, so
+ *  the model sees the image rather than its serialized bytes. Anything that is
+ *  not text plus at least one inline image keeps the text projection. */
+function codexFunctionOutputContent(output: unknown): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(output) || output.length === 0) return null;
+  const items: Array<Record<string, unknown>> = [];
+  let images = 0;
+  for (const part of output) {
+    if (!part || typeof part !== 'object') return null;
+    const row = part as Record<string, unknown>;
+    if (row.type === 'input_text' && typeof row.text === 'string') {
+      items.push({ type: 'input_text', text: row.text });
+      continue;
+    }
+    if (row.type === 'input_image' && typeof row.image === 'string' && row.image.startsWith('data:image/')) {
+      items.push({ type: 'input_image', image_url: row.image, ...(typeof row.detail === 'string' ? { detail: row.detail } : {}) });
+      images += 1;
+      continue;
+    }
+    return null;
+  }
+  return images > 0 ? items : null;
+}
+
+/** Tool-result images one request attaches: the latest renders, not every
+ *  earlier one. Older images become a text note naming how to see them again. */
+const CODEX_TOOL_IMAGES_PER_REQUEST = 4;
+
+function withLatestFunctionOutputImages<T>(input: T): T {
+  if (!Array.isArray(input)) return input;
+  const outputs = input.filter((item): item is { type: string; output: Array<Record<string, unknown>> } =>
+    Boolean(item) && typeof item === 'object'
+    && (item as { type?: unknown }).type === 'function_call_output'
+    && Array.isArray((item as { output?: unknown }).output));
+  let toDrop = outputs.reduce((count, item) => count + item.output.filter((part) => part?.type === 'input_image').length, 0)
+    - CODEX_TOOL_IMAGES_PER_REQUEST;
+  if (toDrop <= 0) return input;
+  for (const item of outputs) {
+    if (toDrop <= 0) break;
+    item.output = item.output.map((part) => {
+      if (toDrop <= 0 || part?.type !== 'input_image') return part;
+      toDrop -= 1;
+      return { type: 'input_text', text: '[An earlier image from this tool result is no longer attached. Call the tool again to see the current state.]' };
+    });
+  }
+  return input;
 }

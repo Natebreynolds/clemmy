@@ -86,10 +86,10 @@ function text(result: ToolResult): string {
 
 function seedSkills(): void {
   const provisioned = provisionBuiltinSkills();
-  assert.deepEqual(provisioned.map(({ name, status }) => ({ name, status })), [{
-    name: 'technical-content-marketing',
-    status: 'installed',
-  }]);
+  assert.deepEqual(provisioned.map(({ name, status }) => ({ name, status })), [
+    { name: 'technical-content-marketing', status: 'installed' },
+    { name: 'workspace-builder', status: 'installed' },
+  ]);
   const irrelevant = path.join(SKILLS_DIR, 'python-log-hygiene');
   mkdirSync(irrelevant, { recursive: true });
   writeFileSync(path.join(irrelevant, 'SKILL.md'), [

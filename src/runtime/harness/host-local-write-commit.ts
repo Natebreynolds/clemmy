@@ -10,6 +10,8 @@
  */
 import { createHash } from 'node:crypto';
 import { withWorkspaceSnapshotHandle } from '../../spaces/workspace-snapshot.js';
+import { workspaceManifestAuthoringDigest } from '../../spaces/workspace-manifest-authoring.js';
+import { workspaceDataIsHostProjection } from '../../spaces/workspace-db.js';
 import {
   closeSync,
   constants as fsConstants,
@@ -33,6 +35,9 @@ interface HostLocalWorkspaceCommitComponent {
   handle: string;
   contentDigest: string;
   bytes: number;
+  /** Manifest only: digest of its authoring fields (operational timestamps
+   *  removed), so host upkeep after the commit does not read as an edit. */
+  authoringDigest?: string;
 }
 
 type HostLocalWorkspaceCommitDocument = {
@@ -51,6 +56,8 @@ type HostLocalWorkspaceCommitDocument = {
 
 export interface HostLocalWorkspaceCompoundCommitFacts extends HostLocalWriteCommitFacts {
   components: readonly HostLocalWorkspaceCommitComponent[];
+  /** Component handle → digest of the current bytes this reopen accepted. */
+  acceptedDigests?: ReadonlyMap<string, string>;
 }
 
 export interface HostLocalWorkspaceStructuredCollectionProof {
@@ -269,12 +276,32 @@ function safeTargetHandle(root: string, filePath: string): string {
   return handle;
 }
 
-function reopenWorkspaceCompoundCommit(facts: HostLocalWriteCommitFacts): HostLocalWorkspaceCompoundCommitFacts | null {
-  try { return withWorkspaceSnapshotHandle(facts.handle, () => reopenWorkspaceCompoundCommitUnlocked(facts)); } catch { return null; }
+function reopenWorkspaceCompoundCommit(
+  facts: HostLocalWriteCommitFacts,
+  laterReceipts?: ReadonlyMap<string, string>,
+): HostLocalWorkspaceCompoundCommitFacts | null {
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => reopenWorkspaceCompoundCommitUnlocked(facts, laterReceipts)); } catch { return null; }
+}
+
+/** A component matches its bundle when its current bytes are the recorded
+ * bytes, or — only when the caller supplies them — the bytes of a LATER receipt
+ * for that exact component handle written by the same request. A later edit of
+ * one component is a newer generation of that component, not drift; the
+ * descriptor, roles, containment and every other component stay strict. */
+function workspaceComponentMatches(
+  bytes: Buffer,
+  component: { handle: string; contentDigest: string; bytes: number },
+  laterReceipts?: ReadonlyMap<string, string>,
+): boolean {
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (bytes.byteLength === component.bytes && digest === component.contentDigest) return true;
+  const later = laterReceipts?.get(component.handle);
+  return typeof later === 'string' && later === digest;
 }
 
 function reopenWorkspaceCompoundCommitUnlocked(
   facts: HostLocalWriteCommitFacts,
+  laterReceipts?: ReadonlyMap<string, string>,
 ): HostLocalWorkspaceCompoundCommitFacts | null {
   try {
     const root = realpathSync(path.resolve(BASE_DIR));
@@ -294,6 +321,13 @@ function reopenWorkspaceCompoundCommitUnlocked(
     const workspacePrefix = `spaces/${facts.createdId}/`;
     if (facts.handle !== `${workspacePrefix}${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`) return null;
     const expectedRoles = dataAbsent ? ['manifest', 'view'] as const : ['manifest', 'view', 'data'] as const;
+    // UPKEEP IS NOT AN EDIT. A refresh or a visit after the commit advances the
+    // manifest's operational timestamps and rewrites source-backed data. The
+    // authored Workspace still stands when the manifest's authoring fields are
+    // unchanged and the data is exactly the host's projection of its committed
+    // observations. Static snapshot data is authored content and stays exact.
+    let authoredManifest: Record<string, unknown> | null = null;
+    const acceptedDigests = new Map<string, string>();
     for (let index = 0; index < expectedRoles.length; index += 1) {
       const component = parsed.components[index];
       if (
@@ -303,6 +337,8 @@ function reopenWorkspaceCompoundCommitUnlocked(
         || !/^[a-f0-9]{64}$/.test(component.contentDigest)
         || !Number.isSafeInteger(component.bytes)
         || component.bytes < 0
+        || (component.authoringDigest !== undefined
+          && (component.role !== 'manifest' || !/^[a-f0-9]{64}$/.test(component.authoringDigest)))
       ) return null;
       if (component.role === 'manifest' && component.handle !== `${workspacePrefix}space.json`) return null;
       if (component.role === 'view' && !component.handle.startsWith(`${workspacePrefix}view/`)) return null;
@@ -311,9 +347,25 @@ function reopenWorkspaceCompoundCommitUnlocked(
       if (
         reopened.handle !== component.handle
         || reopened.path !== path.resolve(root, component.handle)
-        || reopened.bytes.byteLength !== component.bytes
-        || createHash('sha256').update(reopened.bytes).digest('hex') !== component.contentDigest
       ) return null;
+      if (component.role === 'manifest' && component.authoringDigest) {
+        const current = workspaceManifestAuthoringDigest(reopened.bytes);
+        if (current === component.authoringDigest) {
+          authoredManifest = JSON.parse(reopened.bytes.toString('utf8')) as Record<string, unknown>;
+        }
+      }
+      const stands = workspaceComponentMatches(reopened.bytes, component, laterReceipts)
+        || (component.role === 'manifest' && authoredManifest !== null)
+        || (
+          component.role === 'data'
+          && authoredManifest !== null
+          && authoredManifest.contentMode !== 'static_snapshot'
+          && Array.isArray(authoredManifest.dataSources)
+          && authoredManifest.dataSources.length > 0
+          && workspaceDataIsHostProjection(parsed.createdId, reopened.bytes)
+        );
+      if (!stands) return null;
+      acceptedDigests.set(component.handle, createHash('sha256').update(reopened.bytes).digest('hex'));
     }
     if (dataAbsent) {
       // Only this closed descriptor variant can omit data. Recheck absence
@@ -327,7 +379,7 @@ function reopenWorkspaceCompoundCommitUnlocked(
       }) !== receipt.bytes.toString('utf8')) return null;
     }
     if (JSON.stringify(parsed) !== receipt.bytes.toString('utf8')) return null;
-    return { ...facts, components: parsed.components };
+    return { ...facts, components: parsed.components, acceptedDigests };
   } catch {
     return null;
   }
@@ -863,11 +915,13 @@ export function serializeHostLocalWorkspaceCommitDocument(input: HostLocalWorksp
     source: { path: string; bytes: Buffer | string },
   ): HostLocalWorkspaceCommitComponent => {
     const bytes = Buffer.isBuffer(source.bytes) ? source.bytes : Buffer.from(source.bytes, 'utf8');
+    const authoringDigest = role === 'manifest' ? workspaceManifestAuthoringDigest(bytes) : null;
     return {
       role,
       handle: safeTargetHandle(root, source.path),
       contentDigest: createHash('sha256').update(bytes).digest('hex'),
       bytes: bytes.byteLength,
+      ...(authoringDigest ? { authoringDigest } : {}),
     };
   };
   const components = [component('manifest', input.manifest), component('view', input.view)];
@@ -966,19 +1020,29 @@ export interface CommittedArtifactContent {
   unresolvedReason?: string;
 }
 
-export function readCommittedArtifactContent(facts: HostLocalWriteCommitFacts): CommittedArtifactContent {
-  try { return withWorkspaceSnapshotHandle(facts.handle, () => readCommittedArtifactContentUnlocked(facts)); }
+export function readCommittedArtifactContent(
+  facts: HostLocalWriteCommitFacts,
+  options: {
+    /** Component handle → digest of the LATEST receipt for that handle written
+     *  AFTER this artifact by the same request. Completion review supplies it
+     *  so a Space saved and then edited in one request verifies as its final
+     *  generation instead of reading as drift. Omitted: strict. */
+    laterReceipts?: ReadonlyMap<string, string>;
+  } = {},
+): CommittedArtifactContent {
+  try { return withWorkspaceSnapshotHandle(facts.handle, () => readCommittedArtifactContentUnlocked(facts, options.laterReceipts)); }
   catch (error) { return { parts: [], totalBytes: 0, verified: false, unresolvedReason: `unreadable:${error instanceof Error ? error.name : 'error'}` }; }
 }
 
 function readCommittedArtifactContentUnlocked(
   facts: HostLocalWriteCommitFacts,
+  laterReceipts?: ReadonlyMap<string, string>,
 ): CommittedArtifactContent {
   const isBundle = facts.handle.endsWith(`/${HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`);
   try {
     const root = realpathSync(path.resolve(BASE_DIR));
     if (isBundle) {
-      const reopened = reopenWorkspaceCompoundCommit(facts);
+      const reopened = reopenWorkspaceCompoundCommit(facts, laterReceipts);
       if (!reopened) {
         // A component changed or the descriptor no longer verifies. This is a
         // real outcome to report, never an artifact that quietly vanishes.
@@ -987,7 +1051,9 @@ function readCommittedArtifactContentUnlocked(
       const parts: Array<{ handle: string; bytes: Buffer; role: string }> = [];
       for (const component of reopened.components) {
         const file = safeCommittedFile(root, path.resolve(root, component.handle));
-        if (createHash('sha256').update(file.bytes).digest('hex') !== component.contentDigest) {
+        const accepted = reopened.acceptedDigests?.get(component.handle);
+        const current = createHash('sha256').update(file.bytes).digest('hex');
+        if (accepted ? accepted !== current : !workspaceComponentMatches(file.bytes, component, laterReceipts)) {
           return { parts: [], totalBytes: 0, verified: false, unresolvedReason: 'workspace_component_digest_mismatch' };
         }
         parts.push({ handle: component.handle, bytes: file.bytes, role: component.role });

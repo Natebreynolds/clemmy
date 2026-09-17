@@ -196,3 +196,29 @@ test('a frozen argv whose head is a reviewed read compiles into that operation a
   assert.deepEqual(compileReviewedCliArgv([entry.command, 'org', 'display', '--json']), { status: 'unmatched' });
   assert.deepEqual(compileReviewedCliArgv([]), { status: 'unmatched' });
 });
+
+test('a shell call refused as unreachable names the reviewed read it spells', async () => {
+  const { buildCallTool } = await import('../../tools/call-tool.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  const entry = callableReviewedEntry(reviewedRead.operationId);
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory([entry]));
+  try {
+    const callTool = buildCallTool({ reachableBuiltinNames: new Set(['tool_search']) }) as unknown as {
+      invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+    };
+    const sessionId = 'sess-shell-reviewed-read';
+    const output = await withHarnessRunContext({ sessionId, counter: new ToolCallsCounter(10) }, () =>
+      withToolOutputContext({ sessionId, callId: 'call-shell-reviewed', toolName: 'call_tool' }, () =>
+        callTool.invoke({ context: { sessionId } }, JSON.stringify({
+          name: 'run_shell_command',
+          args_json: JSON.stringify({ command: reviewedCommand }),
+        }), { toolCall: { callId: 'call-shell-reviewed' } })));
+    const refusal = JSON.parse(String(output)) as { error?: string; detail?: string };
+    assert.equal(refusal.error, 'not_reachable');
+    assert.match(String(refusal.detail), new RegExp(`reviewed read ${reviewedRead.operationId}`));
+    assert.match(String(refusal.detail), new RegExp(`work_call name=${reviewedRead.operationId}`));
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
+});

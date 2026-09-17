@@ -19,6 +19,7 @@
  */
 import { aisdk } from '@openai/agents-extensions/ai-sdk';
 import { withTracelessStep } from './traceless-step-model.js';
+import { withProviderToolMedia } from './ai-sdk-tool-media.js';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { Agent } from 'undici';
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
@@ -955,7 +956,7 @@ export function getClaudeModel(modelId: string): Model {
 function buildRawClaudeModel(modelId: string): Model {
   const capability = resolveModelCapability(modelId);
   let model: Model = withClaudeInputSanitizer(
-    withClaudeRequestDefaults(withTracelessStep(aisdk(getProvider()(modelId))), capability),
+    withClaudeRequestDefaults(withTracelessStep(aisdk(withProviderToolMedia(getProvider()(modelId)))), capability),
   );
   // Parity layer: provider-agnostic resilience (retry/empty/401) + reasoning
   // translation (effort -> output_config.effort). Wrap BEFORE caching so the

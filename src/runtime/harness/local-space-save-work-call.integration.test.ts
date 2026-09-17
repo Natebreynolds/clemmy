@@ -791,6 +791,16 @@ test('accepted space_edit_view snapshots V1, commits and indexes V2 once, and te
   });
   assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
   const expectedViewDigest = fileDigest(viewFile);
+  // The edit commits the view and the manifest it versions, so its receipt is
+  // the Workspace bundle descriptor covering both.
+  const bundleFile = store.resolveInSpace('edit-proof', '.clementine-workspace-commit.json');
+  const expectedBundleDigest = fileDigest(bundleFile);
+  const bundle = JSON.parse(readFileSync(bundleFile, 'utf8')) as { components: Array<{ role: string; handle: string; contentDigest: string }> };
+  assert.deepEqual(
+    bundle.components.map((component) => [component.role, component.handle]),
+    [['manifest', 'spaces/edit-proof/space.json'], ['view', 'spaces/edit-proof/view/index.html']],
+  );
+  assert.equal(bundle.components[1]!.contentDigest, expectedViewDigest, 'the bundle covers the edited view bytes');
   const receipts = db.prepare(`
     SELECT kind, obligation, created_id, handle, provider_receipt,
            intended_digest, observed_digest
@@ -818,17 +828,17 @@ test('accepted space_edit_view snapshots V1, commits and indexes V2 once, and te
       kind: 'commit',
       obligation: 'commit_effect',
       createdId: 'edit-proof',
-      handle: 'spaces/edit-proof/view/index.html',
-      intendedDigest: expectedViewDigest,
-      observedDigest: expectedViewDigest,
+      handle: 'spaces/edit-proof/.clementine-workspace-commit.json',
+      intendedDigest: expectedBundleDigest,
+      observedDigest: expectedBundleDigest,
     },
     {
       kind: 'readback',
       obligation: 'verify_committed_readback',
       createdId: 'edit-proof',
-      handle: 'spaces/edit-proof/view/index.html',
-      intendedDigest: expectedViewDigest,
-      observedDigest: expectedViewDigest,
+      handle: 'spaces/edit-proof/.clementine-workspace-commit.json',
+      intendedDigest: expectedBundleDigest,
+      observedDigest: expectedBundleDigest,
     },
   ]);
   assert.ok(receipts.every((row) => (

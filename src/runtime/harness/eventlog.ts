@@ -7194,7 +7194,7 @@ interface DurableToolOutputOccurrence {
 
 function authorityEventString(
   event: EventRow,
-  field: 'callId' | 'tool' | 'effect' | 'effectiveTool' | 'accounting',
+  field: 'callId' | 'tool' | 'effect' | 'effectiveTool' | 'accounting' | 'dispatchLeaseId',
 ): string {
   const value = event.data[field];
   return typeof value === 'string' ? value.trim() : '';
@@ -8014,6 +8014,87 @@ function unusableAuthorityResolution(
   return { status: 'failed', reason: lifecycle.reason ?? fallbackReason };
 }
 
+/**
+ * ONE CARRIER DISPATCH STORES TWO OUTPUTS, NOT TWO INVOCATIONS.
+ *
+ * A carrier (call_tool, work_call) that runs an inner tool stores the inner
+ * tool's complete output AND its own presentation of it under the same call
+ * id. Counting both rows made every output read of a carried call fail as
+ * "reused by 2 invocations", with no call id the model could use instead.
+ *
+ * The pair is proven from host-authored facts only: exactly one parented
+ * top-level carrier occurrence whose effective tool is the other row's tool,
+ * exactly one transport-mirror call and return for that tool, both ordered
+ * inside the carrier's call and return, and the inner output written inside
+ * that window. A mirror return may be unparented when the carrier ran under a
+ * host dispatch lease (the transport mirror is not always written with a
+ * parent), but one parented to anything other than its mirror call is not this
+ * pair. The inner row carries the complete bytes, so it
+ * is the authority. Anything else stays ambiguous.
+ */
+function carrierMirrorInvocationOutput(
+  db: Database.Database,
+  sessionId: string,
+  callId: string,
+): AuthorityToolOutputResolution | null {
+  const rows = db.prepare(
+    `SELECT invocation_nonce, tool FROM tool_output_invocations
+      WHERE session_id = ? AND call_id = ?`,
+  ).all(sessionId, callId) as Array<{ invocation_nonce: string; tool: string | null }>;
+  if (rows.length !== 2) return null;
+  const lifecycle = durableToolOutputOccurrence(db, sessionId, callId);
+  const occurrence = lifecycle.occurrence;
+  if (!occurrence) return null;
+  const effectiveTool = authorityEventString(occurrence.call, 'effectiveTool');
+  if (
+    !effectiveTool
+    || effectiveTool === occurrence.tool
+    || authorityEventString(occurrence.call, 'accounting') !== 'top_level'
+  ) return null;
+  const carrierRows = rows.filter((row) => row.tool === occurrence.tool);
+  const innerRows = rows.filter((row) => row.tool === effectiveTool);
+  if (carrierRows.length !== 1 || innerRows.length !== 1) return null;
+  const mirrors = (db.prepare(`
+    SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
+      FROM events
+     WHERE session_id = ?
+       AND type IN ('tool_called', 'tool_returned')
+       AND json_extract(data_json, '$.callId') = ?
+  `).all(sessionId, callId) as RawEventRow[]).map((row) => rowToEvent(row))
+    .filter((event) => authorityEventString(event, 'accounting') === 'transport_mirror'
+      && authorityEventString(event, 'tool') === effectiveTool);
+  const mirrorCalls = mirrors.filter((event) => event.type === 'tool_called');
+  const mirrorReturns = mirrors.filter((event) => event.type === 'tool_returned');
+  if (mirrorCalls.length !== 1 || mirrorReturns.length !== 1) return null;
+  const mirrorCall = mirrorCalls[0]!;
+  const mirrorReturn = mirrorReturns[0]!;
+  if (mirrorReturn.parentEventId && mirrorReturn.parentEventId !== mirrorCall.id) return null;
+  // An unparented mirror return pairs only inside a host-owned dispatch: the
+  // carrier call and its return carry the host's dispatch lease. Without the
+  // host there is no canonical result, so the pair stays ambiguous.
+  if (!mirrorReturn.parentEventId && (
+    !authorityEventString(occurrence.call, 'dispatchLeaseId')
+    || authorityEventString(occurrence.call, 'dispatchLeaseId') !== authorityEventString(occurrence.returned, 'dispatchLeaseId')
+  )) return null;
+  if (!(
+    occurrence.call.seq < mirrorCall.seq
+    && mirrorCall.seq < mirrorReturn.seq
+    && mirrorReturn.seq < occurrence.returned.seq
+  )) return null;
+  const inner = readInvocationOutput(db, sessionId, callId, innerRows[0]!.invocation_nonce);
+  if (!inner) return null;
+  if (inner.createdAt < occurrence.call.createdAt || inner.createdAt > occurrence.returned.createdAt) return null;
+  const failureReason = authorityOutputFailureReason(inner, occurrence);
+  if (failureReason) return { status: 'failed', reason: failureReason };
+  return {
+    status: 'ok',
+    record: inner,
+    source: 'exact',
+    effect: occurrence.effect,
+    sourceUserSeq: occurrence.sourceUserSeq,
+  };
+}
+
 export function resolveToolOutputForAuthority(
   sessionId: string,
   callId: string,
@@ -8025,7 +8106,8 @@ export function resolveToolOutputForAuthority(
         WHERE session_id = ? AND call_id = ?`,
     ).get(sessionId, callId) as { count: number }).count;
     if (count > 1) {
-      return { status: 'ambiguous', invocationCount: count };
+      return carrierMirrorInvocationOutput(db, sessionId, callId)
+        ?? { status: 'ambiguous', invocationCount: count };
     }
     const lifecycle = durableToolOutputOccurrence(db, sessionId, callId);
     if (count === 1) {

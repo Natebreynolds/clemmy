@@ -2395,3 +2395,104 @@ test('wrapped first-class discovery uses the turn-configured instance and retain
     assert.equal(calls.length, 1, 'the selected instance never bypasses this turn exclusion');
   });
 });
+
+test('a carried local tool that returns an image delivers image content, never base64 text', async () => {
+  const { chmodSync, writeFileSync } = await import('node:fs');
+  const { getLocalRuntimeTools } = await import('./local-runtime-tools.js');
+  const { spaceStore } = await import('../spaces/store.js');
+  const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+  const browser = path.join(TMP_HOME, 'fake-carried-preview-browser.js');
+  writeFileSync(browser, `#!/usr/bin/env node
+const fs = require('node:fs');
+const shot = process.argv.find((v) => v.startsWith('--screenshot=')).slice('--screenshot='.length);
+fs.writeFileSync(shot, Buffer.from('${png.toString('hex')}', 'hex'));
+`, 'utf8');
+  chmodSync(browser, 0o755);
+  const prior = process.env.CLEMMY_PREVIEW_BROWSER;
+  process.env.CLEMMY_PREVIEW_BROWSER = browser;
+  spaceStore.save({ id: 'carried-preview', title: 'Carried preview', viewContent: '<!doctype html><html><body><main class="clem-app">Board</main></body></html>' });
+  const preview = getLocalRuntimeTools().find((candidate) => candidate.name === 'space_preview');
+  assert.ok(preview, 'space_preview is a local runtime tool');
+  _setInnerDispatchToolsForTests(new Map([['space_preview', preview as never]]));
+  try {
+    const callTool = buildCallTool({ reachableBuiltinNames: new Set(['space_preview']) }) as unknown as ToolLike;
+    const output = await invokeCallToolFixture(
+      callTool,
+      'sess-carried-image',
+      JSON.stringify({ name: 'space_preview', args_json: JSON.stringify({ slug: 'carried-preview' }) }),
+      'call-carried-image',
+    );
+    assert.ok(Array.isArray(output), `the carrier returns content blocks: ${String(output).slice(0, 160)}`);
+    const blocks = output as Array<{ type: string; data?: string; mimeType?: string; text?: string }>;
+    const image = blocks.find((block) => block.type === 'image');
+    assert.ok(image, 'the image block survives the local adapter and the carrier');
+    assert.equal(image.mimeType, 'image/png');
+    assert.ok(Buffer.from(image.data!, 'base64').equals(png));
+    const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
+    assert.match(text, /Preview of "Carried preview"/);
+    assert.ok(!text.includes(png.toString('base64')), 'no base64 image bytes in the text the model reads');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+    if (prior === undefined) delete process.env.CLEMMY_PREVIEW_BROWSER;
+    else process.env.CLEMMY_PREVIEW_BROWSER = prior;
+  }
+});
+
+test('a carried read sending a number as its canonical text dispatches the number', async () => {
+  let received: unknown = null;
+  _setInnerDispatchToolsForTests(new Map([[
+    'space_preview',
+    { name: 'space_preview', invoke: async (_context: unknown, input: unknown) => {
+      received = typeof input === 'string' ? JSON.parse(input) : input;
+      return 'Preview rendered.';
+    } },
+  ]]));
+  try {
+    const callTool = buildCallTool({ reachableBuiltinNames: new Set(['space_preview']) }) as unknown as ToolLike;
+    const output = await invokeCallToolFixture(
+      callTool,
+      'sess-canonical-scalar',
+      JSON.stringify({ name: 'space_preview', args_json: JSON.stringify({ slug: 'forty-k-plan', theme: 'light', width: '1440', height: '900', offset_y: '0' }) }),
+      'call-canonical-scalar',
+    );
+    assert.match(String(output), /Preview rendered/);
+    const args = received as Record<string, unknown> | null;
+    assert.equal(args?.width, 1440);
+    assert.equal(args?.height, 900);
+    assert.equal(args?.offset_y, 0);
+    const refused = await invokeCallToolFixture(
+      callTool,
+      'sess-canonical-scalar',
+      JSON.stringify({ name: 'space_preview', args_json: JSON.stringify({ slug: 'forty-k-plan', width: '1440px' }) }),
+      'call-noncanonical-scalar',
+    );
+    assert.match(String(refused), /arg_validation/, 'text that is not the exact value keeps the refusal');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+  }
+});
+
+test('a carried read naming its identifier the way another tool does is completed from its schema', async () => {
+  let received: unknown = null;
+  _setInnerDispatchToolsForTests(new Map([[
+    'space_get',
+    { name: 'space_get', invoke: async (_context: unknown, input: unknown) => {
+      received = typeof input === 'string' ? JSON.parse(input) : input;
+      return 'Workspace "my-day" read.';
+    } },
+  ]]));
+  try {
+    const callTool = buildCallTool({ reachableBuiltinNames: new Set(['space_get']) }) as unknown as ToolLike;
+    const output = await invokeCallToolFixture(
+      callTool,
+      'sess-renamed-identifier',
+      JSON.stringify({ name: 'space_get', args_json: JSON.stringify({ space_id: 'my-day' }) }),
+      'call-renamed-identifier',
+    );
+    assert.match(String(output), /Workspace "my-day" read/);
+    assert.equal((received as { slug?: string } | null)?.slug, 'my-day');
+    assert.ok(!(received && typeof received === 'object' && 'space_id' in received), 'the dispatched arguments carry only the schema name');
+  } finally {
+    _setInnerDispatchToolsForTests(null);
+  }
+});

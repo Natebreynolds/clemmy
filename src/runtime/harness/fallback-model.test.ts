@@ -1462,6 +1462,42 @@ test('first-byte window re-arms while the brain is provably reasoning off-stream
   assert.ok((out as Array<{ delta?: string }>).some((e) => e.delta === 'answer after thinking'));
 });
 
+test('reasoning that outlasts the first-content deadline survives a later metadata event', async () => {
+  // A brain thinks off-stream past the attempt's first-content deadline (the
+  // window re-arms), then its transport emits a lifecycle/metadata event before
+  // any text. That event opens a fresh wait; it must judge liveness exactly as
+  // the timer does, not fail instantly against the original absolute deadline.
+  const { withHarnessRunContext } = await import('./brackets.js');
+  let rescueCalls = 0;
+  const context: Record<string, unknown> = { sessionId: 'reasoning-past-deadline' };
+  const thinking = model({ getStreamedResponse: async function* () {
+    for (let tick = 0; tick < 6; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      context.privateModelActivityAt = Date.now();
+    }
+    yield { type: 'response_started' } as never;
+    for (let tick = 0; tick < 3; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      context.privateModelActivityAt = Date.now();
+    }
+    yield { type: 'output_text_delta', delta: 'answer after long thinking' } as never;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued' } as never;
+  } });
+
+  const out = await withHarnessRunContext(context as never, () => collect(
+    withModelFallback(
+      [target('thinking', thinking), target('rescue', rescue)],
+      { firstByteTimeoutMs: 40 },
+    ).getStreamedResponse(req()),
+  ));
+
+  assert.equal(rescueCalls, 0, 'a brain still reasoning past the deadline must not be benched by a metadata event');
+  assert.ok((out as Array<{ delta?: string }>).some((e) => e.delta === 'answer after long thinking'));
+});
+
 test('first-byte window still fires when nothing proves the brain is working', async () => {
   const { withHarnessRunContext } = await import('./brackets.js');
   let rescueCalls = 0;

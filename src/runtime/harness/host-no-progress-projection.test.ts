@@ -20,6 +20,7 @@ const {
 const { buildHostToolDispositionResult } = await import('./host-model-result-receipt.js');
 const {
   NO_PROGRESS_RECOVERY_TOOL_NAME_CAP,
+  createNoProgressConsequence,
   initializeNoProgressGovernor,
   observeNoProgress,
   NO_PROGRESS_RETRY_BUDGET,
@@ -2588,4 +2589,118 @@ test('a Plan turn is told to publish what it has, not to find another step', asy
   assert.doesNotMatch(plan, /publish_plan/, 'the owner does not call the tool');
   assert.doesNotMatch(plan, /next executable step/, 'Plan has no next executable step');
   assert.match(act, /next executable step/, 'an Act turn keeps its existing copy');
+});
+
+test('a successful call that returned new bytes is evidence; the same bytes again, a failure or a search are not', () => {
+  const identity = accepted('settled-read-evidence');
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE accepted_task_work_contracts (session_id TEXT, source_user_seq INTEGER, contract_id TEXT, graph_hash TEXT);
+    CREATE TABLE host_call_capability_bindings (
+      session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT,
+      capability_id TEXT, operation_id TEXT, schema_fingerprint TEXT,
+      account_id TEXT, attested_argument_digest TEXT
+    );
+    CREATE TABLE logical_call_settlements (
+      session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT,
+      outcome_kind TEXT, mutating INTEGER, result_handle_id TEXT,
+      progress_key_digest TEXT, progress_claimed INTEGER
+    );
+    CREATE TABLE durable_result_handles (handle_id TEXT PRIMARY KEY, tool_name TEXT, raw_payload_sha256 TEXT, success INTEGER);
+    CREATE TABLE evidence_receipts (session_id TEXT, source_user_seq INTEGER, manifest_id TEXT, node_id TEXT, obligation TEXT);
+    CREATE TABLE write_evidence_bindings (session_id TEXT, source_user_seq INTEGER, requirement_id TEXT, target_digest TEXT);
+    CREATE TABLE write_evidence_proofs (session_id TEXT, source_user_seq INTEGER, manifest_id TEXT, node_id TEXT, obligation TEXT);
+    CREATE TABLE discovery_governor_roles (session_id TEXT, source_user_seq INTEGER, role_key TEXT);
+    CREATE TABLE discovery_governor_tasks (session_id TEXT, source_user_seq INTEGER, claim_key_version INTEGER);
+  `);
+  const handle = db.prepare('INSERT INTO durable_result_handles VALUES (?, ?, ?, ?)');
+  const settle = db.prepare('INSERT INTO logical_call_settlements VALUES (?, ?, ?, ?, ?, ?, NULL, 0)');
+  const read = (callId: string, tool: string, digest: string, options: { outcome?: string; mutating?: number; success?: number } = {}) => {
+    handle.run(`rh_${callId}`, tool, digest, options.success ?? 1);
+    settle.run(identity.sessionId, identity.sourceUserSeq, callId, options.outcome ?? 'succeeded', options.mutating ?? 0, `rh_${callId}`);
+  };
+  const evidence = (): readonly string[] => {
+    const projected = projectHostNoProgressAuthority(identity, db);
+    assert.equal(projected.status, 'ok', JSON.stringify(projected));
+    return projected.status === 'ok' ? projected.authority.evidence : [];
+  };
+  try {
+    assert.deepEqual(evidence(), []);
+    read('read-artifact', 'space_get', 'a'.repeat(64));
+    assert.equal(evidence().length, 1, 'the first read of real content is evidence');
+    read('read-view', 'space_get_view', 'b'.repeat(64));
+    read('read-records', 'space_get', 'c'.repeat(64));
+    assert.equal(evidence().length, 3, 'each read returning new bytes is new evidence');
+    read('read-again', 'space_get', 'a'.repeat(64));
+    assert.equal(evidence().length, 3, 'the same bytes read again add nothing');
+    read('write', 'space_save', 'd'.repeat(64), { mutating: 1 });
+    assert.equal(evidence().length, 4, 'a committed write with new receipt bytes is evidence');
+    read('write-same', 'space_save', 'd'.repeat(64), { mutating: 1 });
+    assert.equal(evidence().length, 4, 'committing the same bytes again adds nothing');
+    read('failed-write', 'space_save', '8'.repeat(64), { outcome: 'invalid_arguments', mutating: 1 });
+    read('failed', 'space_get', 'e'.repeat(64), { outcome: 'failed' });
+    read('unsuccessful-handle', 'space_get', 'f'.repeat(64), { success: 0 });
+    assert.equal(evidence().length, 4, 'failures and unsuccessful results are not evidence');
+    read('search', 'tool_search', '9'.repeat(64));
+    appendEvent({
+      sessionId: identity.sessionId, turn: 1, role: 'system', type: 'discovery_governor_decision',
+      data: { sourceUserSeq: identity.sourceUserSeq, callId: 'search', decision: 'allow' },
+    });
+    assert.equal(evidence().length, 4, 'a search result is discovery, never evidence');
+  } finally {
+    db.close();
+  }
+});
+
+test('a committed write after a refused write clears the refusal\'s recovery surface', () => {
+  const identity = accepted('write-repair-clears-recovery');
+  const empty = { operation: [], account: [], target: [], evidence: [], effect: [] };
+  const held = { ...empty, operation: ['operation:space_save'], target: ['target:space'] };
+  let state = initializeNoProgressGovernor({ taskKey: identity.sessionId, authority: held });
+  const refused = observeNoProgress(state, {
+    taskKey: identity.sessionId,
+    attemptClass: 'zero_crossing_repair',
+    authority: held,
+    consequence: createNoProgressConsequence({
+      stage: 'schema_invalid:call:0123456789abcdef', recovery: 'repair_model',
+      effectState: 'not_started', recoveryToolNames: ['work_call'],
+    }),
+  });
+  state = refused.state;
+  assert.ok(state.lastConsequence, 'the refused write narrows recovery');
+  const committed = observeNoProgress(state, {
+    taskKey: identity.sessionId,
+    attemptClass: 'task_work',
+    authority: { ...held, evidence: ['evidence:settled_write_result:1'] },
+  });
+  assert.equal(committed.reason, 'authority_progress');
+  assert.equal(committed.state.lastConsequence, null, 'the repaired write ends recovery');
+  assert.equal(committed.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
+  const sameReceipt = observeNoProgress(refused.state, {
+    taskKey: identity.sessionId,
+    attemptClass: 'task_work',
+    authority: held,
+  });
+  assert.equal(sameReceipt.reason, 'unmetered_attempt', 'work that commits nothing new does not end recovery');
+  assert.ok(sameReceipt.state.lastConsequence);
+});
+
+test('three reads of different content no longer exhaust the governor before a write', () => {
+  const identity = accepted('authoring-read-phase');
+  const empty = { operation: [], account: [], target: [], evidence: [], effect: [] };
+  let state = initializeNoProgressGovernor({ taskKey: identity.sessionId, authority: empty });
+  const withEvidence = (count: number) => ({ ...empty, evidence: Array.from({ length: count }, (_, index) => `evidence:${index}`) });
+  for (let reads = 1; reads <= 6; reads += 1) {
+    const decision = observeNoProgress(state, { taskKey: identity.sessionId, attemptClass: 'dependency_lookup', authority: withEvidence(reads) });
+    assert.equal(decision.action, 'continue', `read ${reads} with new content must not terminalize`);
+    state = decision.state;
+  }
+  let repeated = state;
+  let stopped = false;
+  for (let repeat = 0; repeat <= NO_PROGRESS_RETRY_BUDGET; repeat += 1) {
+    const decision = observeNoProgress(repeated, { taskKey: identity.sessionId, attemptClass: 'dependency_lookup', authority: withEvidence(6) });
+    repeated = decision.state;
+    if (decision.action === 'terminalize') { stopped = true; break; }
+  }
+  assert.equal(stopped, true, 'reading nothing new still exhausts the budget');
 });

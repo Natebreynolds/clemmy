@@ -146,3 +146,106 @@ test('the LEGACY branch cannot claim a reuse either', () => {
   assert.ok(uses.length >= 3,
     'one shared decision, used by both resolution branches (plus its definition)');
 });
+
+/** A carrier running an inner tool, as the live Space read did: the carrier
+ *  and the inner tool each store an output under the one call id. */
+function carriedCallWithTwoOutputs(
+  sessionId: string,
+  callId: string,
+  inner: string,
+  presented: string,
+  options: { parentedMirrorReturn?: boolean; dispatchLeaseId?: string } = {},
+) {
+  const lease = options.dispatchLeaseId ? { dispatchLeaseId: options.dispatchLeaseId } : {};
+  const call = eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get', ...lease },
+  });
+  const mirrorCall = eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'transport_mirror', tool: 'space_get' },
+  });
+  eventlog.writeToolOutput({ sessionId, callId, tool: 'space_get', output: inner, invocationNonce: `${callId}-inner` });
+  eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_returned',
+    ...(options.parentedMirrorReturn === false ? {} : { parentEventId: mirrorCall.id }),
+    data: { callId, accounting: 'transport_mirror', tool: 'space_get', result: inner.slice(0, 40) },
+  });
+  eventlog.writeToolOutput({ sessionId, callId, tool: 'call_tool', output: presented, invocationNonce: `${callId}-carrier` });
+  eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'tool_returned', parentEventId: call.id,
+    data: { callId, accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get', result: presented.slice(0, 40), ...lease },
+  });
+}
+
+test('a carried call whose carrier and inner tool both stored output resolves to the complete inner bytes', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'carried-two-outputs' });
+  const inner = `Workspace "My Day" (my-day) — active. Dataset: ${'x'.repeat(4_000)} END-OF-INNER`;
+  const presented = `${inner.slice(0, 1_000)}\n[clipped for presentation]`;
+  carriedCallWithTwoOutputs(s.id, 'toolu_carried_pair', inner, presented);
+  const resolved = eventlog.resolveToolOutputForAuthority(s.id, 'toolu_carried_pair');
+  assert.equal(resolved.status, 'ok', JSON.stringify(resolved).slice(0, 300));
+  if (resolved.status !== 'ok') return;
+  assert.equal(resolved.record.tool, 'space_get');
+  assert.match(resolved.record.output, /END-OF-INNER$/, 'the complete inner output, not the clipped presentation');
+  assert.equal(resolved.effect, 'read');
+});
+
+test('a carried call resolves when its transport mirror return is unparented, as the host writes it', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'carried-unparented-mirror' });
+  const inner = `Workspace "My Day" (my-day) — active. Dataset: ${'y'.repeat(4_000)} END-OF-INNER`;
+  carriedCallWithTwoOutputs(s.id, 'toolu_unparented_mirror', inner, `${inner.slice(0, 900)}\n[clipped]`, {
+    parentedMirrorReturn: false, dispatchLeaseId: 'lease-host-owned',
+  });
+  const resolved = eventlog.resolveToolOutputForAuthority(s.id, 'toolu_unparented_mirror');
+  assert.equal(resolved.status, 'ok', JSON.stringify(resolved).slice(0, 300));
+  if (resolved.status !== 'ok') return;
+  assert.equal(resolved.record.tool, 'space_get');
+  assert.match(resolved.record.output, /END-OF-INNER$/);
+
+  carriedCallWithTwoOutputs(s.id, 'toolu_unparented_no_host', inner, `${inner.slice(0, 900)}\n[clipped]`, { parentedMirrorReturn: false });
+  assert.equal(eventlog.resolveToolOutputForAuthority(s.id, 'toolu_unparented_no_host').status, 'ambiguous',
+    'without a host dispatch lease there is no canonical result to pair');
+});
+
+test('a mirror pair outside the carrier call window is not the carried pair', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'mirror-outside-window' });
+  const callId = 'toolu_mirror_outside';
+  const mirrorCall = eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'transport_mirror', tool: 'space_get' },
+  });
+  eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_returned',
+    data: { callId, accounting: 'transport_mirror', tool: 'space_get', result: 'earlier' },
+  });
+  void mirrorCall;
+  const call = eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get' },
+  });
+  eventlog.writeToolOutput({ sessionId: s.id, callId, tool: 'space_get', output: 'inner', invocationNonce: 'inner' });
+  eventlog.writeToolOutput({ sessionId: s.id, callId, tool: 'call_tool', output: 'presented', invocationNonce: 'carrier' });
+  eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_returned', parentEventId: call.id,
+    data: { callId, accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get', result: 'presented' },
+  });
+  const resolved = eventlog.resolveToolOutputForAuthority(s.id, callId);
+  assert.equal(resolved.status, 'ambiguous');
+});
+
+test('two outputs under one id without a provable carrier pair stay ambiguous', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'unpaired-two-outputs' });
+  const call = eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId: 'toolu_unpaired', accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get' },
+  });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_unpaired', tool: 'space_get', output: 'first', invocationNonce: 'n1' });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_unpaired', tool: 'space_get', output: 'second', invocationNonce: 'n2' });
+  eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_returned', parentEventId: call.id,
+    data: { callId: 'toolu_unpaired', accounting: 'top_level', tool: 'call_tool', effect: 'read', effectiveTool: 'space_get', result: 'x' },
+  });
+  const resolved = eventlog.resolveToolOutputForAuthority(s.id, 'toolu_unpaired');
+  assert.equal(resolved.status, 'ambiguous', 'two outputs from the same tool are two invocations');
+});

@@ -227,6 +227,7 @@ test('space_save collision is a no-effect invalid-arguments result and a new slu
     view_html: '<html><body><h1>Local LLM calendar</h1></body></html>',
     view_path: null,
     data_sources: null,
+    remove_data_sources: null,
     actions: null,
     reengage_triggers: null,
     reengage_guidance: null,
@@ -476,4 +477,42 @@ test('memory_remember executes once from a valid prefix when optional annotation
   assert.match(String(output), /Remembered|Reinforced an existing fact|Already known/);
   assert.match(String(output), /Recovered valid kind\/content/);
   assert.doesNotMatch(String(output), /InvalidToolInputError/);
+});
+
+test('a direct read refused for an identifier under another name runs with the completed arguments', async () => {
+  const { z } = await import('zod');
+  let received: Record<string, unknown> | null = null;
+  const parameters = { slug: z.string().min(2), source_id: z.string().nullish() };
+  const errorFunction = buildLocalToolErrorFunction({
+    name: 'space_get',
+    description: 'test',
+    parameters,
+    handler: async (input: Record<string, unknown>) => { received = input; return 'Workspace "my-day" read.'; },
+  });
+  const strict = z.strictObject({ slug: z.string().min(2), source_id: z.string().nullable() });
+  const raw = JSON.stringify({ space_id: 'my-day' });
+  const parsed = strict.safeParse({ space_id: 'my-day' });
+  const result = await errorFunction(undefined, Object.assign(new ModelBehaviorError('Invalid JSON input for tool'), {
+    name: 'InvalidToolInputError',
+    originalError: parsed.success ? undefined : parsed.error,
+    toolInvocation: { input: raw },
+  }));
+  assert.deepEqual(received, { slug: 'my-day', source_id: null });
+  assert.match(String(result), /Workspace "my-day" read/);
+
+  let wrote = false;
+  const writeError = buildLocalToolErrorFunction({
+    name: 'space_save',
+    description: 'test',
+    parameters: { slug: z.string().min(2), title: z.string() },
+    handler: async () => { wrote = true; return 'saved'; },
+  });
+  const writeParsed = z.strictObject({ slug: z.string(), title: z.string() }).safeParse({ space_id: 'my-day', title: 'x' });
+  const refused = await writeError(undefined, Object.assign(new ModelBehaviorError('Invalid JSON input for tool'), {
+    name: 'InvalidToolInputError',
+    originalError: writeParsed.success ? undefined : writeParsed.error,
+    toolInvocation: { input: JSON.stringify({ space_id: 'my-day', title: 'x' }) },
+  }));
+  assert.equal(wrote, false, 'a write is never completed by renaming a field');
+  assert.ok(refused instanceof InvalidArgumentsPreDispatchResult);
 });

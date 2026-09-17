@@ -1,3 +1,5 @@
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+
 /**
  * THE NEXT EDGE — a refusal that cannot be recovered from is a dead end.
  *
@@ -131,4 +133,23 @@ export function defaultDispositionEdge(input: {
     });
   }
   return nextEdge({ tool: input.toolName, change: 'repair_arguments' });
+}
+
+const WRAPPER_EDGE_TOOLS = new Set(['call_tool', 'work_call', 'composio_execute_tool']);
+
+/** The tool an edge should name: the inner refused operation, never the
+ * envelope it arrived in. Live 2026-09-11 named `call_tool` three times. */
+export function edgeToolName(toolName: string, args?: unknown): string {
+  const authored = toolName.trim();
+  try {
+    const inner = unwrapRuntimeEffectiveToolIdentity(toolName, args).toolName;
+    const name = (typeof inner === 'string' && inner.trim() ? inner : authored).trim();
+    return name || 'tool_search';
+  } catch {
+    return authored || 'tool_search';
+  }
+}
+
+export function isWrapperEdgeTool(toolName: string): boolean {
+  return WRAPPER_EDGE_TOOLS.has(toolName.trim());
 }

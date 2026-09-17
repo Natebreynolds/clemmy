@@ -65,7 +65,7 @@ function staticClemBridge(slug: string, datasetJson: string, publishedAt: string
     + `data:async function(){return D;},`
     + `refresh:async function(){return {ok:true,snapshot:true,data:D};},`
     + `note:frozen('notes'),compose:frozen('compose'),action:frozen('actions')`
-    + `};var K=window.__clemKit;if(K){window.clem.fmt=K.fmt;window.clem.ui=K.ui;window.clem.sources=K.sources;window.clem.theme=K.theme;try{delete window.__clemKit;}catch(_){}}`
+    + `};var K=window.__clemKit;if(K){window.clem.fmt=K.fmt;window.clem.ui=K.ui;window.clem.sources=K.sources;window.clem.theme=K.theme;window.clem.pick=K.pick;window.clem.rows=K.rows;window.clem.mail=K.mail;try{delete window.__clemKit;}catch(_){}}`
     + `})();</script>`;
 }
 

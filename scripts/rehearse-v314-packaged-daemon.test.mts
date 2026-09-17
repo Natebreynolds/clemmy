@@ -236,6 +236,9 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
     [eventFile, 'recovery_projection'],
     ['state/check-in-templates/seed-friday-wrap.json', 'deterministic_boot_seed'],
     ['skills/technical-content-marketing/SKILL.md', 'deterministic_boot_seed'],
+    ['skills/technical-content-marketing/.builtin.json', 'deterministic_boot_seed'],
+    ['skills/workspace-builder/SKILL.md', 'deterministic_boot_seed'],
+    ['skills/workspace-builder/.builtin.json', 'deterministic_boot_seed'],
     ['state/space-schedule-state.json', 'scheduler_observation'],
     ['daemon.lock/owner-123e4567-e89b-12d3-a456-426614174000.json', 'ephemeral_process_owner'],
     ['daemon.pid.123.123e4567-e89b-12d3-a456-426614174000.tmp', 'ephemeral_process_owner'],
@@ -262,6 +265,7 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
     'state/operational-telemetry.json',
     'vault/00-System/workflows/other/SKILL.md',
     'skills/other/SKILL.md',
+    'skills/other/.builtin.json',
     'skills/technical-content-marketing/notes.md',
   ]) assert.equal(classifyPackagedFirstBootAddedFile(file, recovery), 'unexpected', file);
   // The closed seed list IS the package's builtin-skills directory: a shipped

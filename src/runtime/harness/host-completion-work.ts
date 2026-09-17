@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
+import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
@@ -49,7 +51,7 @@ export interface CompletionReadEvidence {
     rawByteCount?: number;
     shownByteCount?: number;
     contentComplete?: boolean;
-    presentation?: 'raw_json' | 'decoded_text';
+    presentation?: 'raw_json' | 'decoded_text' | 'media_described';
     contentDisposition?: 'prior_review_window' | 'duplicate_content' | 'discovery_navigation';
   }>;
 }
@@ -79,10 +81,59 @@ export function acceptedPlanPreparationReadEvidence(input: {
  * transport layer for the reviewer instead of spending context on escaped
  * quotes/newlines. Every character of the tool's text remains; the immutable
  * raw JSON and its digest remain the receipt owner. Objects stay raw JSON. */
-export function completionReadPresentation(rawPayloadJson: string): { text: string; format: 'raw_json' | 'decoded_text' } {
+/** Replace every inline image inside a result with a description of it.
+ * Returns null when the value holds no inline image. */
+function describeInlineImages(value: unknown, depth = 0): { value: unknown; images: number } | null {
+  if (depth > 12 || value === null || typeof value !== 'object') return null;
+  if (isToolMediaImageBlock(value)) {
+    const data = value.data;
+    return {
+      value: {
+        type: 'image',
+        mimeType: value.mimeType,
+        imageBytes: Math.floor((data.length * 3) / 4),
+        sha256: createHash('sha256').update(data, 'utf8').digest('hex'),
+        note: 'image bytes are not shown in text evidence',
+      },
+      images: 1,
+    };
+  }
+  let images = 0;
+  if (Array.isArray(value)) {
+    const next = value.map((entry) => {
+      const described = describeInlineImages(entry, depth + 1);
+      if (!described) return entry;
+      images += described.images;
+      return described.value;
+    });
+    return images > 0 ? { value: next, images } : null;
+  }
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const described = describeInlineImages(entry, depth + 1);
+    if (described) images += described.images;
+    next[key] = described ? described.value : entry;
+  }
+  return images > 0 ? { value: next, images } : null;
+}
+
+/** How one retained result is shown to a reviewer. An image is evidence that
+ * a picture was produced, not text to read: its base64 bytes are replaced by
+ * its media type, size and digest, so a screenshot never floods a review. */
+export function completionReadPresentation(rawPayloadJson: string): { text: string; format: 'raw_json' | 'decoded_text' | 'media_described' } {
   try {
     const value: unknown = JSON.parse(rawPayloadJson);
-    if (typeof value === 'string') return { text: value, format: 'decoded_text' };
+    const described = describeInlineImages(value);
+    if (described) return { text: JSON.stringify(described.value), format: 'media_described' };
+    if (typeof value === 'string') {
+      if (/^\s*[[{]/.test(value)) {
+        try {
+          const nested = describeInlineImages(JSON.parse(value) as unknown);
+          if (nested) return { text: JSON.stringify(nested.value), format: 'media_described' };
+        } catch { /* ordinary text */ }
+      }
+      return { text: value, format: 'decoded_text' };
+    }
   } catch { /* Redemption validates the source; retain unknown formats whole. */ }
   return { text: rawPayloadJson, format: 'raw_json' };
 }
@@ -163,8 +214,10 @@ export function sourceSettledReadEvidence(input: {
       const shown = completionReadPresentation(value.rawPayloadJson);
       const bytes = Buffer.from(shown.text, 'utf8');
       const priorWindow = incremental && row.settlementIndex <= input.afterSettlementIndex!;
-      const duplicateOf = incremental ? seenContent.get(value.rawPayloadSha256) : undefined;
-      seenContent.set(value.rawPayloadSha256, row.callId);
+      // Identical bytes are shown once in every review: a repeated read adds
+      // a reference to the call that already shows them, never a second copy.
+      const duplicateOf = seenContent.get(value.rawPayloadSha256);
+      if (!seenContent.has(value.rawPayloadSha256)) seenContent.set(value.rawPayloadSha256, row.callId);
       const navigation = incremental && row.toolName === 'tool_search'
         ? discoveryNavigation(value.rawPayload) : undefined;
       const contentDisposition = priorWindow ? 'prior_review_window' as const
@@ -174,7 +227,7 @@ export function sourceSettledReadEvidence(input: {
         results.push({ ...base, status: 'verified', resultHandleId: value.resultHandleId,
           physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
           rawByteCount: value.rawByteCount, shownByteCount: 0, contentComplete: false, contentDisposition });
-        blocks.push(`${label}: authenticated receipt; handle=${value.resultHandleId}; sha256=${value.rawPayloadSha256}; retained bytes=${value.rawByteCount}; content not expanded (${contentDisposition}${duplicateOf ? `, same bytes as ${duplicateOf}` : ''}).`
+        blocks.push(`${label}: authenticated receipt; handle=${value.resultHandleId}; sha256=${value.rawPayloadSha256}; retained bytes=${value.rawByteCount}; content not expanded (${contentDisposition}${duplicateOf ? `, same bytes as ${duplicateOf}` : ''})${!incremental && duplicateOf ? `; the complete content is shown above under logicalCall=${duplicateOf}` : ''}.`
           + (navigation?.length ? `\nDiscovered tool metadata (not proof that a nested operation or actor input is prepared): ${JSON.stringify(navigation)}` : ''));
         continue;
       }

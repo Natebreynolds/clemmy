@@ -69,6 +69,8 @@ function linkedWorkflowsForSpace(slug: string): Array<{ name: string; descriptio
 import { finalizeWorkspaceObservationCommit } from '../spaces/workspace-observation-finalize.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
+import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonical-consent.js';
+import { ensureToolSchema } from '../tools/composio-schema-cache.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
   spaceActionNeedsApproval, enqueueSpaceActionApproval, initSpaceActionApprovals,
@@ -353,9 +355,23 @@ try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;
 function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
 ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
 var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
-window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
+window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});}});
 })();</script>`;
 };
+
+/**
+ * The exact document a Workspace view is served as: the design layer and helper
+ * kit, the bridge, and the planted dataset ahead of the authored HTML, plus the
+ * wiring-health banner. The desktop frame and the author's preview render this
+ * same composition, so what the author checks is what the user sees.
+ */
+export function composeServedWorkspaceView(slug: string, html: string): string {
+  const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
+  return appendWiringHealthBanner(
+    injectWorkspaceBootstrap(html, clemViewDesignLayer() + CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
+    wiring,
+  );
+}
 
 function isLoopback(req: Request): boolean {
   const addr = req.socket?.remoteAddress ?? '';
@@ -430,11 +446,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // when its own plumbing can't deliver what the UI promises (e.g. a
       // refresh action with no data source attached) and names the one-line
       // ask that has Clem repair it. Advisory: dismissible, never blocks.
-      const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
-      res.send(appendWiringHealthBanner(
-        injectWorkspaceBootstrap(html, clemViewDesignLayer() + CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
-        wiring,
-      ));
+      res.send(composeServedWorkspaceView(slug, html));
       return;
     }
     res.send(readFileSync(target));
@@ -993,6 +1005,43 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       ? standingSpaceActionAuthority(rec, action, callerArgs)
       : null;
     if (spaceActionNeedsApproval(action) && !standing?.ok) {
+      // A click and the model's space_action_prepare share one decision: an
+      // ordinary provider write runs, an ambiguous account asks for a choice,
+      // and only high-consequence work stages the one exact approval. The
+      // current definition owns that answer, not the author's `confirm`
+      // display hint. When the exact binding cannot be evaluated the card stays
+      // the path, so a click never dead-ends.
+      const providerOperation = action.composioSlug?.trim();
+      if (providerOperation && !action.runner?.trim()) {
+        try { await ensureToolSchema(providerOperation.toUpperCase()); } catch { /* evaluated as unavailable */ }
+        const decided = await decideAndRunSpaceProviderAction({
+          record: rec,
+          action,
+          callerArgs,
+          runOccurrenceId: `space-click:${randomUUID()}`,
+        });
+        if (decided.kind === 'ran') {
+          const ran = decided.result;
+          appendAudit(slug, {
+            method: 'ACTION',
+            path: `/action/${actionId}`,
+            outcome: ran.ok ? 'ok' : 'error',
+            note: ran.ok ? undefined : ran.error,
+          });
+          appendNote(slug, {
+            text: ran.ok ? `Ran "${action.label ?? actionId}"` : `"${action.label ?? actionId}" failed: ${ran.error}`,
+            kind: 'action',
+            meta: { actionId, ok: ran.ok },
+          });
+          if (!ran.ok) { res.status(502).json({ ok: false, error: ran.error }); return; }
+          res.json({ ok: true, result: ran.data });
+          return;
+        }
+        if (decided.kind === 'needs_user') {
+          res.status(409).json({ ok: false, needs: decided.need, error: decided.message });
+          return;
+        }
+      }
       try {
         const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
         res.status(202).json({ pending: true, approvalId, subject });

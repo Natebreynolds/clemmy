@@ -31,6 +31,7 @@ const SPACE_TOOL_LABELS: Record<string, { label: string; kind: SpaceBuildStep['k
   space_refresh: { label: 'Pulled fresh data', kind: 'read' },
   space_get: { label: 'Checked the Space', kind: 'read' },
   space_get_view: { label: 'Read the view', kind: 'read' },
+  space_preview: { label: 'Looked at the view', kind: 'read' },
   space_history: { label: 'Read the data history', kind: 'read' },
   space_publish: { label: 'Published a share snapshot', kind: 'write' },
   tool_search: { label: 'Finding the right tool', kind: 'discover' },

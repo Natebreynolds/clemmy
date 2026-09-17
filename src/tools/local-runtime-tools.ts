@@ -70,6 +70,8 @@ import {
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
+import { toolMediaImageBlocks, type ToolMediaContent } from '../runtime/harness/tool-media-content.js';
+import { repairNativeArguments } from './native-argument-repair.js';
 import {
   HostLocalExecutionFailureResult,
   HostLocalNonWriteResult,
@@ -92,7 +94,7 @@ interface CapturedLocalTool {
 
 function resultToText(
   result: unknown,
-): string | ExternalWritePreDispatchResult | HostLocalExecutionFailureResult | HostLocalNonWriteResult {
+): string | ToolMediaContent | ExternalWritePreDispatchResult | HostLocalExecutionFailureResult | HostLocalNonWriteResult {
   // Preserve nominal pre-dispatch truth through the local Tool adapter. Turning
   // this into its model-facing string here would make the outer harness see a
   // normal returned local execution and could incorrectly settle it succeeded.
@@ -105,25 +107,38 @@ function resultToText(
   if (result && typeof result === 'object') {
     const content = (result as { content?: unknown }).content;
     if (Array.isArray(content)) {
+      // Images are delivered as images, never as base64 text. The text blocks
+      // keep flowing through every text boundary unchanged.
+      const images = toolMediaImageBlocks(content);
       const text = content
         .map((item) => {
           if (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string') {
             return (item as { text: string }).text;
           }
+          if (images.length > 0 && item && typeof item === 'object' && (item as { type?: unknown }).type === 'image') {
+            return '';
+          }
           return JSON.stringify(item);
         })
         .filter(Boolean)
         .join('\n');
-      if (text) {
-        const formatted = formatRecallableToolText(text);
+      if (text || images.length > 0) {
+        const formatted = text ? formatRecallableToolText(text) : '';
         // A typed NON-WRITE is not an execution failure: the tool ran fine and
         // reported, in a field, that it changed nothing. Flattening it into the
         // failure carrier lost that distinction and the status token with it.
         const nonWrite = localNonWriteStatus(result);
         if (nonWrite) return new HostLocalNonWriteResult(formatted, nonWrite);
-        return (result as { isError?: unknown }).isError === true
-          ? new HostLocalExecutionFailureResult(formatted)
-          : formatted;
+        if ((result as { isError?: unknown }).isError === true) {
+          return new HostLocalExecutionFailureResult(formatted);
+        }
+        if (images.length > 0) {
+          return [
+            ...(formatted ? [{ type: 'text' as const, text: formatted }] : []),
+            ...images,
+          ];
+        }
+        return formatted;
       }
     }
   }
@@ -372,6 +387,7 @@ function invalidLocalToolInputResult(
  *  from the tool's own schema — a genuine tool result of any local kind. */
 type LocalToolErrorFunctionResult =
   | string
+  | ToolMediaContent
   | InvalidArgumentsPreDispatchResult
   | ExternalWritePreDispatchResult
   | HostLocalExecutionFailureResult
@@ -419,6 +435,30 @@ export function recoverOmittedNullableFields(
   return parameters.safeParse(repaired).success ? repaired : null;
 }
 
+/** The same exact structural completions the carrier applies, for a direct
+ *  call refused by the SDK's parser: omitted nullables are filled first, then
+ *  a single item or a renamed identifier is completed from the schema. */
+function completeExactNativeArguments(
+  error: unknown,
+  parameters: z.ZodTypeAny,
+  sideEffect: ReturnType<typeof registeredToolSideEffect>,
+): Record<string, unknown> | null {
+  const raw = error && typeof error === 'object'
+    ? (error as { toolInvocation?: { input?: unknown } }).toolInvocation?.input
+    : undefined;
+  if (typeof raw !== 'string') return null;
+  let parsedInput: unknown;
+  try { parsedInput = JSON.parse(raw); } catch { return null; }
+  if (!parsedInput || typeof parsedInput !== 'object' || Array.isArray(parsedInput)) return null;
+  const filled: Record<string, unknown> = { ...(parsedInput as Record<string, unknown>) };
+  const shape = (parameters as unknown as { shape?: Record<string, z.ZodTypeAny> }).shape ?? {};
+  for (const [key, field] of Object.entries(shape)) {
+    // An omitted nullable field means null, exactly as the carrier treats it.
+    if (!(key in filled) && field.safeParse(null).success) filled[key] = null;
+  }
+  return repairNativeArguments(parameters, filled, { sideEffect })?.args ?? null;
+}
+
 export function buildLocalToolErrorFunction(
   localTool: CapturedLocalTool,
 ): (runContext: unknown, error: unknown) => Promise<LocalToolErrorFunctionResult> {
@@ -442,18 +482,19 @@ export function buildLocalToolErrorFunction(
         },
       );
     }
-    // READS ONLY. Filling a null and re-validating is a repair of the CALL, but
-    // proceeding turns a refusal into a real invocation — and a refusal that
-    // becomes a write is a far worse failure than the one being fixed. A read
-    // that was refused for an omitted optional field can simply run; anything
-    // that can leave a mark keeps the visible refusal and lets the model retry
-    // with the field named.
-    const repaired = registeredToolSideEffect(localTool.name) === 'read'
-      ? recoverOmittedNullableFields(
-          error,
-          z.object(normalizeShapeForResponses(localTool.parameters)),
-        )
-      : null;
+    // Proceeding turns a refusal into a real invocation, so only completions
+    // that cannot change what was asked for may proceed. A read refused for an
+    // omitted optional field or a renamed identifier can simply run. A write
+    // proceeds only when the call's own fields form exactly one valid item of
+    // the list it omitted: nothing dropped, nothing invented. Sends, admin
+    // changes, and every other invalid write keep the visible refusal.
+    const sideEffect = registeredToolSideEffect(localTool.name);
+    const normalizedShape = normalizeShapeForResponses(localTool.parameters);
+    const repaired = (sideEffect === 'read'
+      ? recoverOmittedNullableFields(error, z.object(normalizedShape))
+      : null)
+      // Unknown fields must be visible to be completed, so this check is strict.
+      ?? completeExactNativeArguments(error, z.strictObject(normalizedShape), sideEffect);
     if (repaired) {
       const recoveredDetails = error && typeof error === 'object'
         ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details

@@ -53,6 +53,10 @@ export function _setExactSpaceReadCatalogPreparerForTests(
   exactSpaceReadCatalogPreparer = preparer ?? prepareWorkflowStepExternalCatalog;
 }
 
+export type EnsureWorkspaceReadClassificationResult =
+  | { ok: true; operationId: string }
+  | { ok: false; operationId: string; error: string };
+
 /**
  * Reopen one declared Workspace READ from durable provider metadata before
  * minting its workflow-kernel authority. A cold daemon has no in-memory
@@ -65,26 +69,21 @@ export function _setExactSpaceReadCatalogPreparerForTests(
  * observation, and refreshes only that manifest. The read-only authority mint
  * below still independently requires one exact current READ binding, so this
  * seam cannot turn an action/write declaration into refresh authority.
+ *
+ * Judge a Workspace read against a CURRENT definition. Whether an operation is
+ * provably read-only is answered by the host catalog's live entry for it, and
+ * those entries are provisioned on demand and expire. A cold catalog is not
+ * evidence of a write: prepare the exact operation first (the same
+ * preparation a workflow step uses), then decide. Refresh and save share this
+ * one path so a source that refreshes is never refused at save.
  */
-export async function prepareAndAcquireSpaceReadAuthority(
-  input: {
-    slug: string;
-    sourceId: string;
-    toolSlug: string;
-    args: Record<string, unknown>;
-    /** Provenance only; it never widens what the activation may execute. */
-    cause: string;
-  },
+export async function ensureWorkspaceReadClassification(
+  toolSlug: string,
   dependencies: WorkflowStepExternalCatalogDependencies = {},
-): Promise<AcquireSpaceReadAuthorityResult> {
-  const operationId = input.toolSlug.trim().toUpperCase();
-  if (!operationId) return { ok: false, error: 'workspace read operation is blank' };
-  // Preserve the hot-path semantics: when the exact current catalog already
-  // proves this operation is a read, mint directly without another metadata
-  // round trip. Cold processes take the bounded revalidation path below.
-  if (workspaceComposioIsProvablyReadOnly(operationId)) {
-    return acquireSpaceReadAuthority({ ...input, toolSlug: operationId });
-  }
+): Promise<EnsureWorkspaceReadClassificationResult> {
+  const operationId = toolSlug.trim().toUpperCase();
+  if (!operationId) return { ok: false, operationId, error: 'workspace read operation is blank' };
+  if (workspaceComposioIsProvablyReadOnly(operationId)) return { ok: true, operationId };
   let prepared: Awaited<ReturnType<typeof prepareWorkflowStepExternalCatalog>>;
   try {
     prepared = await exactSpaceReadCatalogPreparer({
@@ -94,6 +93,7 @@ export async function prepareAndAcquireSpaceReadAuthority(
   } catch (error) {
     return {
       ok: false,
+      operationId,
       error: `workspace read catalog preparation failed: ${
         error instanceof Error ? error.message : String(error)
       }`,
@@ -102,6 +102,7 @@ export async function prepareAndAcquireSpaceReadAuthority(
   if (prepared.status !== 'ready') {
     return {
       ok: false,
+      operationId,
       error: prepared.status === 'none'
         ? `no durable current manifest is available for "${operationId}"`
         : [
@@ -118,16 +119,33 @@ export async function prepareAndAcquireSpaceReadAuthority(
   ) {
     return {
       ok: false,
+      operationId,
       error: `exact read catalog preparation did not resolve one manifest for "${operationId}"`,
     };
   }
   if (!workspaceComposioIsProvablyReadOnly(operationId)) {
     return {
       ok: false,
+      operationId,
       error: `prepared Workspace operation "${operationId}" is not provably read-only`,
     };
   }
-  return acquireSpaceReadAuthority({ ...input, toolSlug: operationId });
+  return { ok: true, operationId };
+}
+
+export async function prepareAndAcquireSpaceReadAuthority(
+  input: {
+    slug: string;
+    sourceId: string;
+    toolSlug: string;
+    args: Record<string, unknown>;
+    cause: string;
+  },
+  dependencies: WorkflowStepExternalCatalogDependencies = {},
+): Promise<AcquireSpaceReadAuthorityResult> {
+  const classified = await ensureWorkspaceReadClassification(input.toolSlug, dependencies);
+  if (!classified.ok) return { ok: false, error: classified.error };
+  return acquireSpaceReadAuthority({ ...input, toolSlug: classified.operationId });
 }
 
 type ReviewedCliReadAcquirer = (input: {

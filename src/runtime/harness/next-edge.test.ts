@@ -21,6 +21,7 @@ import test from 'node:test';
 
 const {
   nextEdge, renderNextEdge, isRecoverableWithoutEdge, defaultDispositionEdge,
+  edgeToolName,
 } = await import('./next-edge.js');
 
 test('an edge names a tool and a typed move — prose is never the only carrier', () => {
@@ -111,6 +112,41 @@ test('the disposition primitive attaches an edge to every recoverable refusal', 
   assert.equal(unknown.retry, 'do_not_retry');
   assert.equal(unknown.nextEdge, undefined, 'a call that may have started gets no retry edge');
   assert.doesNotMatch(String(unknown.message), /NEXT: /);
+});
+
+test('edgeToolName names the inner refused tool, never the wrapper', () => {
+  assert.equal(edgeToolName('call_tool', {
+    name: 'composio_status',
+    args_json: '{}',
+  }), 'composio_status');
+  assert.equal(edgeToolName('read_file', { path: 'a.md' }), 'read_file');
+  assert.equal(edgeToolName('call_tool', {}), 'call_tool');
+});
+
+test('a wrapped refusal tells the model to repair the inner tool, not call_tool', async () => {
+  const { buildHostToolDispositionResult, describeCanonicalHostModelResult } = await import(
+    './host-model-result-receipt.js'
+  );
+  const inner = edgeToolName('call_tool', { name: 'composio_status', args_json: '{}' });
+  const item = buildHostToolDispositionResult({
+    callId: 'c-wrap',
+    toolName: 'call_tool',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'a'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: true,
+    nextEdge: defaultDispositionEdge({ disposition: 'refused_pre_dispatch', toolName: inner }),
+  });
+  const described = describeCanonicalHostModelResult(item);
+  assert.ok(described, 'an inner-tool edge must still parse as a canonical host refusal');
+  const output = JSON.parse(String((item as { output?: { text?: string } }).output?.text ?? '{}')) as {
+    message?: string;
+    nextEdge?: { tool?: string };
+  };
+  assert.equal(output.nextEdge?.tool, 'composio_status');
+  assert.match(String(output.message), /composio_status/);
+  assert.doesNotMatch(String(output.message), /Use `call_tool`/);
 });
 
 test('publish_plan points at the partial-publish path instead of "repair the fields"', async () => {

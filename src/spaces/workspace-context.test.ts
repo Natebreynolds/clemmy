@@ -67,7 +67,9 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   assert.match(primer!, /space_history\('deal-risk'\)/);
   assert.match(primer!, /space_diff\('deal-risk', '<source id>'\)/);
   assert.match(primer!, /Never infer a delta.*insufficient history/i);
-  assert.match(primer!, /space_action_prepare stages exact approval.*executes only when exact standing approval/i);
+  assert.match(primer!, /space_action_prepare runs an ordinary declared action under the same canonical decision a click in the view uses/i);
+  assert.match(primer!, /stages one exact approval only for a send, delete, administrative or otherwise high-consequence effect/i);
+  assert.match(primer!, /built-in skill workspace-builder/);
   assert.doesNotMatch(primer!, /space_action_prepare queues approval, never execution/i);
   // Keep the always-injected guide small enough to let the model drive.
   assert.ok(primer!.length < 2_400, `workspace primer grew to ${primer!.length} chars`);
@@ -79,7 +81,7 @@ test('buildWorkspaceContextPrimer is null for a missing workspace', () => {
 
 test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
   assert.deepEqual([...WORKSPACE_DOCK_TOOLS], [
-    'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
+    'space_get', 'space_get_view', 'space_preview', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
     'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
     'space_history', 'space_diff', 'space_action_prepare', 'space_publish',
     'home_get', 'home_update',
@@ -105,6 +107,7 @@ test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () =>
   // the writes/executors (space_save/edit/try_runner/set_data).
   const ro = sdk.defaultClaudeAgentSdkAllowedLocalTools('read_only');
   assert.ok(ro.includes('space_get') && ro.includes('space_get_view') && ro.includes('space_list'));
+  assert.ok(ro.includes('space_preview') && full.includes('space_preview'), 'looking at a Workspace is a read on every profile');
   assert.ok(ro.includes('space_history') && ro.includes('space_diff'));
   assert.ok(!ro.includes('space_save') && !ro.includes('space_edit_view'));
   assert.ok(!ro.includes('space_try_runner') && !ro.includes('space_set_data'));

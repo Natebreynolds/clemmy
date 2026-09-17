@@ -595,7 +595,7 @@ const SELF_TOOL_DENY_EXACT = new Set<string>([
   // self-referential facts. NOTE: goal_create/goal_draft carry the user's stated
   // goal text and are intentionally NOT here (that content is reflectable).
   'goal_get', 'goal_list', 'goal_status',
-  'space_get', 'space_get_runner', 'space_get_view',
+  'space_get', 'space_get_runner', 'space_get_view', 'space_preview',
   'attempt_record',
   // Clem's OWN working-state scratchpad (focus/plan) + ephemeral status pollers.
   // focus_get returns the full plan/focus blob (>800 chars, so it clears the

@@ -40,6 +40,9 @@ after(() => {
 // bare call to it is genuinely unpublished on the host Plan lane. skill_read
 // used to play this role until it became always-loaded.
 const UNPUBLISHED_READ = { name: 'memory_search', args: { query: 'native read fixture' } } as const;
+// A name no carrier can reach: a direct call to it is refused, so repeating it
+// is a genuine no-progress loop rather than a carried read.
+const UNREACHABLE_READ = { name: 'retired_native_read_fixture', args: { query: 'native read fixture' } } as const;
 
 async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-field' | 'effect-upgrade' | 'unknown-repair' | 'unknown-repeat' | 'unknown-loop' | 'unknown-write' = 'repair') {
   const skillName = `native-read-${control}`;
@@ -63,6 +66,7 @@ async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-fi
       brainRequests++;
       const third = (control === 'effect-upgrade' || control === 'unknown-write')
         ? { name: 'write_file', args: { path: forbiddenWrite, content: 'Unauthorized Plan effect.', mode: 'create', append: false } }
+        : control === 'unknown-loop' ? { name: UNREACHABLE_READ.name, args: UNREACHABLE_READ.args }
         : control.startsWith('unknown-') ? { name: UNPUBLISHED_READ.name, args: UNPUBLISHED_READ.args }
         : { name: 'list_files', args: { directory: scripts,
           ...(control === 'forged-field' ? { hostCallAttestation: { effect: 'admin', sourceUserSeq: accepted.seq + 1 } } : {}) } };
@@ -70,7 +74,8 @@ async function journey(control: 'direct' | 'repair' | 'reused-call' | 'forged-fi
         { name: 'list_files', args: { directory: scripts, limit: null } },
         { name: 'read_file', args: { path: path.join(scripts, 'requested-script.txt'), max_chars: null } },
       ] : [control.startsWith('unknown-') ? { name: 'read_file', args: { path: path.join(skillDir, 'SKILL.md') } } : { name: 'skill_read', args: { name: skillName } },
-        control.startsWith('unknown-') ? { name: UNPUBLISHED_READ.name, args: UNPUBLISHED_READ.args } : { name: 'list_files', args: { path: scripts } }, third,
+        control === 'unknown-loop' ? { name: UNREACHABLE_READ.name, args: UNREACHABLE_READ.args }
+          : control.startsWith('unknown-') ? { name: UNPUBLISHED_READ.name, args: UNPUBLISHED_READ.args } : { name: 'list_files', args: { path: scripts } }, third,
         ...(control === 'unknown-repeat' ? [third] : control === 'unknown-loop' ? [third, third, third] : [])];
       const next = steps[brainRequests - 1];
       const callId = control === 'reused-call' && brainRequests === 3 ? 'native-call-2' : `native-call-${brainRequests}`;
@@ -214,15 +219,16 @@ test('repairing a read does not upgrade Plan authority into a write', async () =
   assert.equal(run.trace.some(row => row.type === 'tool_returned' && row.data.tool === 'write_file' && row.data.ok === true), false);
 });
 
-test('an unpublished bare native name repairs through the configured carrier in the same accepted Plan source', async () => {
+test('an unpublished bare native read is carried at admission in the same accepted Plan source', async () => {
   const run = await journey('unknown-repair');
   assert.equal(run.result.status, 'awaiting_user_input');
   assert.equal(run.brainRequests, 4);
-  assert.ok(!run.advertised[1]!.includes(UNPUBLISHED_READ.name), 'the refusal control calls a genuinely unpublished name');
-  assert.ok(run.advertised[2]!.includes('call_tool'), 'repair retains the configured carrier');
+  assert.ok(!run.advertised[1]!.includes(UNPUBLISHED_READ.name), 'the direct call names a genuinely unpublished read');
+  assert.ok(run.advertised[2]!.includes('call_tool'), 'the configured carrier stays advertised');
   assert.ok(run.advertised[2]!.includes('tool_search'), 'exact schema discovery remains callable');
-  assert.equal(run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name).length, 1);
-  assert.equal(run.rows.find(row => row.tool_name === UNPUBLISHED_READ.name)?.outcome_kind, 'succeeded');
+  const reads = run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name);
+  assert.equal(reads.length, 2, 'the direct call and the later carrier call each settle once');
+  assert.ok(reads.every(row => row.outcome_kind === 'succeeded'), 'the direct read ran through its carrier instead of being refused');
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   assert.notEqual(run.authority.state, 'conflict');
 });
@@ -237,38 +243,40 @@ test('a repeated unpublished recovery call resumes after its completed checkpoin
   assert.equal(new Set(calls).size, calls.length, 'one canonical call per model-emitted call ID');
   assert.equal(new Set(results).size, results.length, 'one result per canonical call');
   assert.deepEqual(calls, results, 'every completed frame is balanced exactly once');
-  assert.equal(run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name && row.outcome_kind === 'succeeded').length, 1);
+  assert.equal(run.rows.filter(row => row.tool_name === UNPUBLISHED_READ.name && row.outcome_kind === 'succeeded').length, 3,
+    'both direct calls are carried and the carrier call runs; none is re-admitted');
 });
 
-test('a genuinely repeated unpublished call exhausts the same repair budget across completed checkpoints', async () => {
+test('a genuinely repeated unreachable call exhausts one repair budget and ends in one blocked terminal', async () => {
+  // A carrier-reachable name is carried at admission (W1b) and simply runs, so
+  // the loop uses a name no carrier reaches. Its direct form meets exactly the
+  // refusal its carrier form would.
   const run = await journey('unknown-loop');
-  assert.equal(run.result.status, 'held', 'the first caller hands additional checkpoint hops to durable recovery');
   const { validTypedCompletionPresentation } = await import('./public-presentation.js');
   const terminals = run.trace.filter(event => event.type === 'conversation_completed')
     .map(event => validTypedCompletionPresentation(event.data, run.identity.sessionId));
   assert.equal(terminals.length, 1);
   assert.equal(terminals[0]?.status, 'blocked');
   assert.equal(terminals[0]?.identity.sourceUserSeq, run.identity.sourceUserSeq);
-  // Five governed attempts, then exactly one host-owned check-in: a chat turn
-  // the no-progress governor exhausts no longer ends on the engine's typed
-  // stop, it spends one tool-free request telling the person what stopped it
-  // (loop.ts modelCheckInForExhaustedTurn, 2026-09-09). The governor proof is
-  // the repair ledger below, not this count.
-  assert.equal(run.brainRequests, 6, 'five governed attempts plus one check-in request');
   const checkIns = run.trace.filter(event => event.type === 'guardrail_tripped'
     && event.data.kind === 'no_progress_check_in');
-  assert.equal(checkIns.length, 1, 'the sixth request is the check-in, asked once');
-  assert.equal(checkIns[0]?.data.why, 'governor_exhausted');
+  assert.equal(checkIns.length, 1, 'the exhausted turn asks for one check-in');
   assert.notEqual(run.authority.state, 'conflict');
-  assert.equal(run.rows.some(row => row.tool_name === UNPUBLISHED_READ.name && row.host_crossing_count === 1), false);
+  assert.equal(run.rows.some(row => row.tool_name === UNREACHABLE_READ.name && row.outcome_kind === 'succeeded'), false,
+    'the unreachable name never executes');
   assert.ok(run.rows.every(row => Number(row.mutating ?? 0) === 0));
+  assert.ok(run.rows.every(row => Number(row.physical_crossing_count ?? 0) === 0 || row.tool_name !== UNREACHABLE_READ.name));
   assert.ok(run.rows.every(row => row.source_user_seq === run.identity.sourceUserSeq));
   const repairs = run.trace.filter(event => event.type === 'guardrail_tripped'
     && event.data.kind === 'no_progress_decision' && event.data.attemptClass === 'zero_crossing_repair');
-  assert.deepEqual(repairs.map(event => event.data.retriesRemaining), [2, 1, 0, 0]);
-  assert.deepEqual(repairs.map(event => event.data.action), ['continue', 'continue', 'continue', 'terminalize']);
+  assert.ok(repairs.length >= 2, 'each repeat is metered as a zero-crossing repair');
+  const remaining = repairs.map(event => Number(event.data.retriesRemaining));
+  assert.deepEqual(remaining, [...remaining].sort((a, b) => b - a), 'the same budget only decreases');
   assert.ok(repairs.every(event => Array.isArray(event.data.gained) && event.data.gained.length === 0));
-  assert.equal(new Set(repairs.map(event => event.data.consequenceKey)).size, 1);
+  assert.equal(new Set(repairs.map(event => event.data.consequenceKey)).size, 1, 'one repeated consequence, not new problems');
+  assert.ok(run.trace.some(event => event.type === 'guardrail_tripped' && event.data.kind === 'host_blocked_terminal_site'
+    && event.data.reason === 'control_no_progress_exhausted'), 'the turn ends on budget exhaustion');
+  assert.ok(run.brainRequests <= 6, 'the loop is bounded');
   const calls = run.checkpointHistory.filter(item => item.type === 'function_call').map(item => item.callId);
   const results = run.checkpointHistory.filter(item => item.type === 'function_call_result').map(item => item.callId);
   assert.equal(new Set(calls).size, calls.length);

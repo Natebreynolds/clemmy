@@ -100,6 +100,10 @@ test('a mutated cached schema is a schema digest mismatch; a changed identity fi
   assert.equal(before.ok, true); if (!before.ok) return;
   assert.equal(identity.reviewedProviderIdentityMismatch(before, { ...reviewed, account: 'reviewed_cli:other' }), 'identity_mismatch');
   assert.equal(identity.reviewedProviderIdentityMismatch(before, { ...reviewed, providerInputSchemaDigest: sha256('other schema') }), 'identity_mismatch');
+  // A newer observation must be LATER: one in the same millisecond as the
+  // fixture's is an equal-time conflict, not a replacement.
+  const firstObservedAt = Date.now();
+  while (Date.now() <= firstObservedAt) { /* wait for the clock to advance */ }
   schemas.rememberToolSchema(f.manifest.operationId, { ...f.schema, properties: { ...f.schema.properties, limit: { type: 'number' } } }, Date.now());
   const after = identity.currentReviewedProviderIdentity(f.manifest.manifestId);
   assert.equal(after.ok, true); if (!after.ok) return;

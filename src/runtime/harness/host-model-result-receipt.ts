@@ -3,7 +3,12 @@ import type { AgentInputItem } from '@openai/agents';
 import { toSmartString } from '@openai/agents-core/utils';
 import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
 import { openEventLog } from './eventlog.js';
-import { defaultDispositionEdge, renderNextEdge, type HostNextEdgeV1 } from './next-edge.js';
+import {
+  defaultDispositionEdge,
+  renderNextEdge,
+  type HostNextEdgeV1,
+  type NextEdgeChange,
+} from './next-edge.js';
 
 export const HOST_TOOL_DISPOSITION_PROTOCOL = 'host_tool_disposition_v1' as const;
 export const USER_REJECTED_HOST_RESULT_TEXT =
@@ -145,6 +150,42 @@ export function canonicalModelResultJson(value: unknown, ancestors = new Set<obj
   } finally {
     ancestors.delete(value);
   }
+}
+
+const NEXT_EDGE_CHANGES = new Set<NextEdgeChange>([
+  'reissue_unstarted',
+  'repair_arguments',
+  'discover_capability',
+  'choose_account',
+  'publish_partial',
+  'ask_user',
+  'choose_other_capability',
+]);
+
+function parseHostNextEdge(value: unknown): HostNextEdgeV1 | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1 || typeof record.tool !== 'string' || typeof record.say !== 'string') {
+    return undefined;
+  }
+  if (typeof record.change !== 'string' || !NEXT_EDGE_CHANGES.has(record.change as NextEdgeChange)) {
+    return undefined;
+  }
+  const fields = Array.isArray(record.fields)
+    ? record.fields.slice(0, 12).flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const field = entry as Record<string, unknown>;
+      if (typeof field.path !== 'string' || typeof field.set !== 'string') return [];
+      return [{ path: field.path, set: field.set }];
+    })
+    : undefined;
+  return {
+    version: 1,
+    tool: record.tool.trim() || 'tool_search',
+    change: record.change as NextEdgeChange,
+    say: record.say,
+    ...(fields && fields.length > 0 ? { fields } : {}),
+  };
 }
 
 function textResultItem(callId: string, toolName: string, output: unknown): AgentInputItem {
@@ -312,6 +353,7 @@ export function describeCanonicalHostModelResult(
     || (marker.disposition === 'not_started'
       && (marker.retry !== 'replan' || marker.countsRefusal !== undefined))
   ) return null;
+  const nextEdge = parseHostNextEdge(marker.nextEdge);
   const rebuilt = buildHostToolDispositionResult({
     callId,
     toolName,
@@ -324,6 +366,7 @@ export function describeCanonicalHostModelResult(
     ...(marker.continuationReason === 'activation_budget' ? { continuationReason: 'activation_budget' as const } : {}),
     ...(typeof marker.diagnostic === 'string' ? { diagnostic: marker.diagnostic } : {}),
     ...(typeof marker.repairKey === 'string' ? { repairKey: marker.repairKey } : {}),
+    ...(nextEdge ? { nextEdge } : {}),
   });
   if (!exactItemMatches(item, rebuilt)) return null;
   const outputBytes = canonicalModelResultOutputBytes(item);

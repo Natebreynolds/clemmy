@@ -700,6 +700,72 @@ function durableAuthorityTokens(
   }
 }
 
+/**
+ * A SUCCESSFUL CALL THAT RETURNED NEW BYTES IS EVIDENCE.
+ *
+ * Authoring work reads before it writes: the artifact, its current source, and
+ * the real records the result must be built from. Those reads establish no new
+ * operation, account or target, so a frame of them projected zero gain and
+ * three such frames ended the turn before its write, with the model's own
+ * analysis complete and nothing saved.
+ *
+ * The identity is host-owned: the digest of the exact result bytes the host
+ * stored for a successful, non-mutating settlement of this source. Reading the
+ * same bytes again adds nothing, so a repeat loop is still metered. Discovery
+ * calls are excluded: a reworded search returns different rows without
+ * establishing anything, and discovery keeps its own role-bound stages.
+ *
+ * A committed write is the same kind of evidence under its own token. Writing
+ * again to an operation and target the task already holds establishes no new
+ * authority, so without its receipt a successful repair of a refused write
+ * left that refusal's narrowed recovery surface in force. The receipt bytes
+ * name what was committed; committing identical bytes again adds nothing.
+ */
+function settledReadResultTokens(
+  db: Database.Database,
+  identity: HostNoProgressIdentity,
+  events: readonly EventRow[],
+  tokens: Record<AuthorityProgressKind, Set<string>>,
+): void {
+  const tableExists = (name: string): boolean => Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name),
+  );
+  if (!tableExists('durable_result_handles') || !tableExists('logical_call_settlements')) return;
+  const settlementColumns = new Set(
+    (db.prepare('PRAGMA table_info(logical_call_settlements)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!['logical_tool_call_id', 'outcome_kind', 'mutating', 'result_handle_id'].every((column) => settlementColumns.has(column))) {
+    return;
+  }
+  const discoveryCallIds = new Set(events
+    .filter((event) => (event.type === 'discovery_governor_decision' || event.type === 'discovery_governor_outcome')
+      && event.data.sourceUserSeq === identity.sourceUserSeq
+      && typeof event.data.callId === 'string')
+    .map((event) => event.data.callId as string));
+  for (const row of rows<{
+    logical_tool_call_id: string;
+    tool_name: string;
+    raw_payload_sha256: string;
+    mutating: number;
+  }>(db, `
+    SELECT settlement.logical_tool_call_id, handle.tool_name, handle.raw_payload_sha256, settlement.mutating
+      FROM logical_call_settlements settlement
+      JOIN durable_result_handles handle ON handle.handle_id = settlement.result_handle_id
+     WHERE settlement.session_id = ? AND settlement.source_user_seq = ?
+       AND settlement.outcome_kind = 'succeeded'
+       AND handle.success = 1
+       AND handle.raw_payload_sha256 IS NOT NULL
+  `, [identity.sessionId, identity.sourceUserSeq])) {
+    if (discoveryCallIds.has(row.logical_tool_call_id)) continue;
+    tokens.evidence.add(token(
+      'evidence',
+      row.mutating === 1 ? 'settled_write_result' : 'settled_read_result',
+      [row.tool_name, row.raw_payload_sha256],
+    ));
+  }
+}
+
 export function projectHostNoProgressAuthority(
   input: HostNoProgressIdentity,
   database: Database.Database = openEventLog(),
@@ -718,6 +784,7 @@ export function projectHostNoProgressAuthority(
     }
     eventCapabilityTokens(events, exposedAt, tokens);
     durableAuthorityTokens(database, identity, tokens);
+    settledReadResultTokens(database, identity, events, tokens);
     durableRoleBoundDiscoveryStageTokens(database, identity, events, pages, tokens);
     return { status: 'ok', authority: sortedSnapshot(tokens) };
   } catch (error) {

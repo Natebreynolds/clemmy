@@ -453,3 +453,78 @@ test('a reviewed-CLI Workspace refresh acquires the reviewed read just in time a
     store.spaceStore.archive(slug);
   }
 });
+
+test('space_save prepares a cold declared read before judging it, so a source that refreshes is never refused at save', async () => {
+  const slug = 'save-cold-read';
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  observations.clearIndependentCapabilityObservations();
+  ports.clearProductionCapabilityPorts();
+  const bodies = new Map<string, number>();
+  const mail = coldComposioReadCapability('OUTLOOK_LIST_MESSAGES', bodies);
+  const manifestStore = manifestStores.createCapabilityManifestStore();
+  assert.equal(manifestStore.install(mail.manifest).ok, true);
+  manifestStores.installCapabilityManifestStore(manifestStore);
+  const factory = catalogs.peekHostCapabilityCatalogFactory()!;
+  const { workspaceComposioIsProvablyReadOnly } = await import('./space-execution-policy.js');
+  assert.equal(factory.get(mail.manifest.manifestId), undefined, 'the catalog starts cold');
+  assert.equal(workspaceComposioIsProvablyReadOnly('OUTLOOK_LIST_MESSAGES'), false, 'a cold catalog cannot classify the read');
+
+  const preparedOperations: string[] = [];
+  readAuthority._setExactSpaceReadCatalogPreparerForTests((input) => (
+    externalCatalog.prepareWorkflowStepExternalCatalog(input, {
+      manifestStore,
+      catalogFactory: factory,
+      revalidate: async (selections) => {
+        const operationId = selections[0]!.identifier;
+        preparedOperations.push(operationId);
+        return { ok: true, definitions: new Map([[operationId.toLowerCase(), mail.definition]]) };
+      },
+      refresh: () => { factory.register(mail.entry); },
+      ready: (manifestIds) => manifestIds.every((id) => Boolean(factory.get(id))),
+    })
+  ));
+  const handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> = {};
+  const { registerSpaceTools } = await import('../tools/space-tools.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  registerSpaceTools({ tool(name: string, _d: string, _p: unknown, h: never) { handlers[name] = h; } } as any);
+  try {
+    const result = await handlers.space_save!({
+      slug,
+      title: 'Cold read save',
+      view_html: '<!doctype html><html><body><main class="clem-app"><h1>Inbox</h1><ul id="list"></ul><script>clem.data().then(function(data){var rows=(data["emails"]||{}).value||[];document.getElementById("list").innerHTML=rows.length?rows.map(function(r){return "<li>"+clem.fmt.esc(r.subject)+"</li>";}).join(""):clem.ui.empty("No mail");});</script></main></body></html>',
+      data_sources: [{ id: 'emails', composio_slug: 'OUTLOOK_LIST_MESSAGES', composio_args_json: '{"top":5}' }],
+    });
+    const out = (result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+    assert.doesNotMatch(out, /not provably read-only/, out);
+    assert.doesNotMatch(out, /was NOT saved/, out);
+    assert.ok(preparedOperations.includes('OUTLOOK_LIST_MESSAGES'), 'the save prepared the exact declared read');
+    assert.equal(store.spaceStore.get(slug)?.dataSources[0]?.composioSlug, 'OUTLOOK_LIST_MESSAGES');
+  } finally {
+    readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
+    if (store.spaceStore.get(slug)) store.spaceStore.archive(slug);
+  }
+});
+
+test('space_save still refuses a declared source the preparation cannot confirm as a read, and says why', async () => {
+  const slug = 'save-unconfirmed-read';
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(async () => ({ status: 'none' }) as never);
+  const handlers: Record<string, (input: Record<string, unknown>) => Promise<unknown>> = {};
+  const { registerSpaceTools } = await import('../tools/space-tools.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  registerSpaceTools({ tool(name: string, _d: string, _p: unknown, h: never) { handlers[name] = h; } } as any);
+  try {
+    const result = await handlers.space_save!({
+      slug,
+      title: 'Unconfirmed read',
+      view_html: '<!doctype html><html><body><h1>x</h1></body></html>',
+      data_sources: [{ id: 'mystery', composio_slug: 'VENDOR_DO_SOMETHING_ODD' }],
+    });
+    const out = (result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+    assert.match(out, /was NOT saved/);
+    assert.match(out, /VENDOR_DO_SOMETHING_ODD could not be confirmed as a read: no durable current manifest is available/);
+    assert.ok(!store.spaceStore.get(slug), 'nothing was persisted');
+  } finally {
+    readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
+  }
+});

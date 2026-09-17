@@ -1455,7 +1455,16 @@ function preservedPreexistingFiles(
 /** Shipped first-party instruction skills that setup seeds into `skills/` on
  * first boot (src/setup/builtin-skills.ts). Closed on purpose: the pin proves
  * this list equals the package's `builtin-skills/` directory. */
-export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['technical-content-marketing'] as const);
+export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['technical-content-marketing', 'workspace-builder'] as const);
+
+/** The provisioner's record beside each seeded built-in: the digest of the exact
+ * SKILL.md bytes it published, so a later release can tell its own untouched
+ * copy from the user's edits. */
+export const BUILTIN_SKILL_SEED_RECORD = '.builtin.json';
+
+function builtinSkillSeedFiles(id: string): string[] {
+  return [`skills/${id}/SKILL.md`, `skills/${id}/${BUILTIN_SKILL_SEED_RECORD}`];
+}
 
 export type PackagedFirstBootAddedFileCategory =
   | 'recovery_projection'
@@ -1493,7 +1502,7 @@ export function classifyPackagedFirstBootAddedFile(
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/SKILL.md'
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md'
     || relativePath === `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`
-    || BUILTIN_SKILL_SEED_IDS.some((id) => relativePath === `skills/${id}/SKILL.md`)
+    || BUILTIN_SKILL_SEED_IDS.some((id) => builtinSkillSeedFiles(id).includes(relativePath))
     || (relativePath === 'state/starter-workspace-offer.json'
       && causalFiles.starterWorkspaceOffer === true)
   ) return 'deterministic_boot_seed';
@@ -1557,6 +1566,22 @@ export function validDeterministicBootSeed(home: string, relativePath: string): 
     const bytes = readFileSync(path.join(home, relativePath), 'utf8');
     return /(?:^|\n)name:\s*Objective Execution Loop(?:\n|$)/.test(bytes)
       && bytes.includes('requires_approval: true');
+  }
+  const builtinSkillRecord = BUILTIN_SKILL_SEED_IDS.find((id) => (
+    relativePath === `skills/${id}/${BUILTIN_SKILL_SEED_RECORD}`
+  ));
+  if (builtinSkillRecord) {
+    // The record names exactly the seeded SKILL.md bytes beside it.
+    const record = readJsonStateRecord(home, relativePath);
+    let skillBytes: Buffer;
+    try {
+      skillBytes = readFileSync(path.join(home, `skills/${builtinSkillRecord}/SKILL.md`));
+    } catch {
+      return false;
+    }
+    return record?.version === 1
+      && Object.keys(record).length === 2
+      && record.sha256 === createHash('sha256').update(skillBytes).digest('hex');
   }
   const builtinSkill = BUILTIN_SKILL_SEED_IDS.find((id) => relativePath === `skills/${id}/SKILL.md`);
   if (builtinSkill) {
@@ -2624,7 +2649,7 @@ export async function runPackagedV314DaemonRehearsal(
     'vault/00-System/workflows/objective-execution-loop/SKILL.md',
     'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md',
     canonicalMigrationSeed,
-    ...BUILTIN_SKILL_SEED_IDS.map((id) => `skills/${id}/SKILL.md`),
+    ...BUILTIN_SKILL_SEED_IDS.flatMap(builtinSkillSeedFiles),
   ].sort();
   add('first_packaged_boot_added_files_are_closed_causal_categories_with_exact_seed_semantics',
     firstBootAdded.unexpected.length === 0

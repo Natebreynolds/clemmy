@@ -156,6 +156,51 @@ test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provide
   assert.equal(input[5].output, 'direct output replay');
 });
 
+test('buildCodexRequestBody sends an image tool result as content items, not serialized bytes', () => {
+  const body = buildCodexRequestBody('gpt-5.5', modelRequest([
+    { role: 'user', content: 'check how the workspace looks' },
+    { type: 'function_call', id: 'fc_preview', callId: 'call_preview', name: 'call_tool', arguments: '{}', status: 'completed' },
+    {
+      type: 'function_call_result',
+      callId: 'call_preview',
+      output: [
+        { type: 'input_text', text: 'Preview of "Board"' },
+        { type: 'input_image', image: 'data:image/png;base64,aW1hZ2U=' },
+      ],
+      status: 'completed',
+    },
+    {
+      type: 'function_call_result',
+      callId: 'call_structured',
+      output: [{ type: 'input_text', text: 'no image here' }],
+      status: 'completed',
+    },
+  ] as unknown as ModelRequest['input']));
+  const input = body.input as Array<Record<string, unknown>>;
+  assert.deepEqual(input[2].output, [
+    { type: 'input_text', text: 'Preview of "Board"' },
+    { type: 'input_image', image_url: 'data:image/png;base64,aW1hZ2U=' },
+  ]);
+  assert.equal(typeof input[3].output, 'string', 'a result without an image keeps its text projection');
+});
+
+test('buildCodexRequestBody attaches only the latest tool-result images', () => {
+  const items: unknown[] = [{ role: 'user', content: 'iterate on the workspace' }];
+  for (let index = 0; index < 6; index += 1) {
+    items.push({ type: 'function_call', id: `fc_${index}`, callId: `call_${index}`, name: 'space_preview', arguments: '{}', status: 'completed' });
+    items.push({ type: 'function_call_result', callId: `call_${index}`, status: 'completed', output: [
+      { type: 'input_text', text: `render ${index}` },
+      { type: 'input_image', image: `data:image/png;base64,cmVuZGVy${index}` },
+    ] });
+  }
+  const body = buildCodexRequestBody('gpt-5.5', modelRequest(items as ModelRequest['input']));
+  const outputs = (body.input as Array<Record<string, unknown>>).filter((item) => item.type === 'function_call_output');
+  const imageUrls = outputs.flatMap((item) => (item.output as Array<Record<string, unknown>>)
+    .filter((part) => part.type === 'input_image').map((part) => part.image_url));
+  assert.deepEqual(imageUrls, [2, 3, 4, 5].map((index) => `data:image/png;base64,cmVuZGVy${index}`));
+  assert.match(JSON.stringify(outputs[0]!.output), /no longer attached/);
+});
+
 class ScriptedCodexModel extends CodexResponsesModel {
   attempts = 0;
 
@@ -714,4 +759,43 @@ test('Codex construction and serialization retain the documented fallback for un
     assert.equal(buildCodexRequestBody(model.modelId, request).model, 'gpt-5.4');
     assert.equal(buildCodexRequestBody(id, request).model, 'gpt-5.4');
   }
+});
+
+async function* failedResponse(code: string, message: string): AsyncGenerator<any> {
+  yield { type: 'response.created', response: { id: 'resp_failed' } };
+  yield { type: 'response.in_progress', response: { id: 'resp_failed' } };
+  yield { type: 'response.failed', response: { id: 'resp_failed', status: 'failed', error: { code, message } } };
+}
+
+test('a response the backend failed as too large is not replayed, and its stated reason survives', async () => {
+  for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+    const model = new ScriptedCodexModel(async function* () {
+      yield* failedResponse('context_length_exceeded', 'Your input exceeds the context window of this model.');
+    });
+    const run = async () => {
+      if (path === 'getResponse') return model.getResponse(modelRequest());
+      for await (const _event of model.getStreamedResponse(modelRequest())) { /* drain */ }
+      return undefined;
+    };
+    await assert.rejects(run, (error: unknown) => {
+      assert.equal((error as { kind?: string }).kind, 'codex.http_4xx', path);
+      assert.equal((error as { retryable?: boolean }).retryable, false);
+      assert.match(String((error as { operatorMessage?: string }).operatorMessage), /context_length_exceeded/);
+      return true;
+    });
+    assert.equal(model.attempts, 1, `${path}: an identical oversized request is sent once`);
+  }
+});
+
+test('a transient backend failure is still replayed and names what the backend said', async () => {
+  const model = new ScriptedCodexModel(async function* (attempt) {
+    if (attempt === 1) {
+      yield* failedResponse('server_error', 'The server had an error while processing your request.');
+      return;
+    }
+    yield* successfulTurn('resp_after_server_error');
+  });
+  const response = await model.getResponse(modelRequest());
+  assert.equal(model.attempts, 2);
+  assert.equal(response.responseId, 'resp_after_server_error');
 });

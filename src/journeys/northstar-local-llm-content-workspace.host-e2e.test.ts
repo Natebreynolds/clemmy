@@ -1010,10 +1010,10 @@ function configureResearchProvider(
 
 test('the shipped marketing skill and exact Firecrawl S→R→W definitions reach the production model surface', async () => {
   eventlog.resetEventLog();
-  assert.deepEqual(builtinSkills.provisionBuiltinSkills().map(({ name, status }) => ({ name, status })), [{
-    name: builtinSkills.TECHNICAL_CONTENT_MARKETING_SKILL,
-    status: 'installed',
-  }]);
+  assert.deepEqual(builtinSkills.provisionBuiltinSkills().map(({ name, status }) => ({ name, status })), [
+    { name: builtinSkills.TECHNICAL_CONTENT_MARKETING_SKILL, status: 'installed' },
+    { name: builtinSkills.WORKSPACE_BUILDER_SKILL, status: 'installed' },
+  ]);
   capabilityCatalogs.installHostCapabilityCatalogFactory(
     capabilityCatalogs.createHostCapabilityCatalogFactory(),
   );
@@ -1852,6 +1852,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
   const provisioned = builtinSkills.provisionBuiltinSkills();
   assert.deepEqual(provisioned.map(({ name }) => name), [
     builtinSkills.TECHNICAL_CONTENT_MARKETING_SKILL,
+    builtinSkills.WORKSPACE_BUILDER_SKILL,
   ]);
   assert.ok(provisioned.every(({ status }) => status === 'installed' || status === 'preserved'),
     'first-party skill provisioning is install-once and preserves the exact shipped bytes on repeat');

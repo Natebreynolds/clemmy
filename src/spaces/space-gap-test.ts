@@ -27,6 +27,97 @@ export interface SpaceGap {
 
 const MAX_GAPS = 5;
 
+export interface SpaceGapOptions {
+  /** Action id → input names the action's operation REQUIRES (no default),
+   *  read from its schema at save time. Absent for an action: not checked. */
+  actionInputRequirements?: Readonly<Record<string, readonly string[]>>;
+  /** Action id → every input name the action's operation declares, read from
+   *  its schema at save time. Absent for an action: its schema was not read. */
+  actionInputNames?: Readonly<Record<string, readonly string[]>>;
+}
+
+/** The balanced `{…}` object literal starting at `open` (an index of `{`),
+ *  or null when it does not close. Strings are skipped so a brace inside a
+ *  quoted value cannot end the literal early. */
+function balancedObjectLiteral(source: string, open: number): string | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let index = open; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (quote) {
+      if (char === '\\') { index += 1; continue; }
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') { quote = char; continue; }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(open, index + 1);
+    }
+  }
+  return null;
+}
+
+/** Top-level keys of an object literal, or null when they cannot be known
+ *  statically (a spread or a computed key). Nested objects are skipped. */
+function literalTopLevelKeys(literal: string): Set<string> | null {
+  const body = literal.slice(1, -1);
+  const keys = new Set<string>();
+  let depth = 0;
+  let quote: string | null = null;
+  let segment = '';
+  const flush = (): boolean => {
+    const part = segment.trim();
+    segment = '';
+    if (!part) return true;
+    if (part.startsWith('...') || part.startsWith('[')) return false;
+    const keyed = /^(?:([A-Za-z_$][\w$]*)|'([^']*)'|"([^"]*)")\s*:/.exec(part);
+    if (keyed) { keys.add(keyed[1] ?? keyed[2] ?? keyed[3] ?? ''); return true; }
+    const method = /^([A-Za-z_$][\w$]*)\s*\(/.exec(part);
+    if (method) { keys.add(method[1]!); return true; }
+    if (/^[A-Za-z_$][\w$]*$/.test(part)) { keys.add(part); return true; }
+    return false;
+  };
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index]!;
+    if (quote) {
+      segment += char;
+      if (char === '\\') { segment += body[index + 1] ?? ''; index += 1; continue; }
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') { quote = char; segment += char; continue; }
+    if (char === '{' || char === '[' || char === '(') depth += 1;
+    if (char === '}' || char === ']' || char === ')') depth -= 1;
+    if (char === ',' && depth === 0) {
+      if (!flush()) return null;
+      continue;
+    }
+    segment += char;
+  }
+  return flush() ? keys : null;
+}
+
+/** Keys passed at every literal `clem.action('<id>', {…})` call site, or null
+ *  when any call site cannot be read statically (a variable argument, a
+ *  spread, a computed key) or none exists. Null means "cannot prove". */
+function literalActionCallKeys(html: string, actionId: string): Array<Set<string>> | null {
+  const escaped = actionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const call = new RegExp(`\\bclem\\s*\\.\\s*action\\s*\\(\\s*(['"\`])${escaped}\\1\\s*,\\s*`, 'g');
+  const sites: Array<Set<string>> = [];
+  for (const match of html.matchAll(call)) {
+    const open = (match.index ?? 0) + match[0].length;
+    if (html[open] !== '{') return null;
+    const literal = balancedObjectLiteral(html, open);
+    if (!literal) return null;
+    const keys = literalTopLevelKeys(literal);
+    if (!keys) return null;
+    sites.push(keys);
+  }
+  return sites.length > 0 ? sites : null;
+}
+
 const RECIPIENT_KEY_RE = /\b(to|to_email|toemail|recipient|recipients|email|address|toaddress|to_address)\b/i;
 
 function templateHasRecipient(a: SpaceRecord['actions'][number]): boolean {
@@ -81,6 +172,7 @@ export function analyzeSpaceGaps(
   record: SpaceRecord,
   viewHtml: string,
   zeroRowSourceIds: string[] = [],
+  options: SpaceGapOptions = {},
 ): SpaceGap[] {
   const gaps: SpaceGap[] = [];
   const html = viewHtml ?? '';
@@ -104,10 +196,13 @@ export function analyzeSpaceGaps(
   //
   // clem.refresh() and the legacy absolute Workspace route are also backed by
   // the same parent-owned RPC boundary and remain valid for existing authored
-  // views. Embedded seeds and {{source}} placeholders are not live bindings.
-  // Keeping those distinctions prevents the GLM proof failure without making
-  // one coding style a persistence requirement.
+  // views. The host-planted `window.__SPACE_DATA__` is live too: the server
+  // plants the current dataset on every serve and the desktop remounts the
+  // frame whenever the dataset changes, which is exactly what the tool text
+  // tells the author to render from. A JSON literal pasted into the HTML and
+  // {{source}} placeholders are not live bindings.
   const usesScopedDataBridge = /\bclem\s*\.\s*(?:data|refresh)\s*\(/.test(html)
+    || /\b__SPACE_DATA__\b/.test(html)
     || /\bfetch\s*\(\s*['"`]\/api\/console\/spaces\/[^'"`?#]+\/(?:data|refresh)(?:['"`?#])/i.test(html);
   if (sources.length > 0 && !usesScopedDataBridge) {
     const hasLegacyBinding = /\{\{\s*[^{}\r\n]+\s*\}\}/.test(html);
@@ -177,11 +272,39 @@ export function analyzeSpaceGaps(
     }
   }
 
+  // 2d: an action whose operation REQUIRES an input that neither its args
+  // template sets nor the view's literal call passes fails on every click.
+  // Proven only statically: a call built from a variable, a spread or a
+  // computed key is not judged, so a working view is never refused on a guess.
+  for (const a of actions) {
+    const required = options.actionInputRequirements?.[a.id];
+    if (!html || !required || required.length === 0) continue;
+    const templateKeys = new Set(Object.keys(a.argsTemplate ?? {}));
+    const fromView = required.filter((name) => !templateKeys.has(name));
+    if (fromView.length === 0) continue;
+    const sites = literalActionCallKeys(html, a.id);
+    if (!sites) continue;
+    const missing = fromView.filter((name) => sites.some((keys) => !keys.has(name)));
+    if (missing.length === 0) continue;
+    gaps.push({
+      severity: 'clarify',
+      resolution: 'fix',
+      actionId: a.id,
+      question: `Action "${a.id}"${a.composioSlug ? ` (${a.composioSlug})` : ''} requires ${missing.map((name) => `\`${name}\``).join(', ')}, but its args template does not set ${missing.length === 1 ? 'it' : 'them'} and the view's clem.action('${a.id}', {…}) call does not pass ${missing.length === 1 ? 'it' : 'them'}. Add ${missing.length === 1 ? 'it' : 'them'} to args_template_json or pass ${missing.length === 1 ? 'it' : 'them'} from the view.`,
+      why: 'The operation refuses a call missing a required input, so the button would fail every time it is clicked.',
+    });
+  }
+
   // 3: a send-like action whose args template carries no recipient — confirm the
   // view supplies it, so it can't go to the wrong person (or nobody).
   for (const a of record.actions ?? []) {
     if (!workspaceActionExpectsRecipient(a)) continue;
     if (templateHasRecipient(a)) continue;
+    // The operation decides, not its name: an operation whose schema declares
+    // no recipient input (a reply draft addressed by the message it answers)
+    // cannot be sent to the wrong person by this template.
+    const declared = options.actionInputNames?.[a.id];
+    if (declared && !declared.some((name) => RECIPIENT_KEY_RE.test(name.replace(/_/g, ' ')))) continue;
     gaps.push({
       severity: 'clarify',
       resolution: 'clarify',

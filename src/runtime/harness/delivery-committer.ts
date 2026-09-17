@@ -13,7 +13,7 @@ import { finishRunAttempt } from './eventlog.js';
 import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
-import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
+import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, publishedPlanReplyText, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
 import { planReviewDigest } from './plan-publication-review.js';
 import { sourceRefusedAttempts } from './source-refused-attempts.js';
 import {
@@ -1208,13 +1208,34 @@ export function commitTurnOutcome(
       && publishedVerdict.objectiveDigest
         === createHash('sha256').update(acceptedObjective, 'utf8').digest('hex'))
     : false;
-  const replyMatches = publishedVerdict?.replyDigest
-    ? publishedVerdict.replyDigest === createHash('sha256').update(proposed.text, 'utf8').digest('hex')
-    : false;
   const planMatches = !publishedPlan || publishedVerdict?.planDigest === planReviewDigest({
     fullText: publishedPlan.fullText, structuredPlan: publishedPlan.structuredPlan,
     readiness: publishedPlan.readiness, missingPrerequisites: publishedPlan.missingPrerequisites,
   });
+  const replyDigestOf = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
+  // A PUBLISHED PLAN'S REPLY IS THE HOST'S RENDERING OF THE REVIEWED PLAN.
+  // The review judges the plan text itself. On a surface that shows the plan as
+  // a card, the reply is the plan's own title and a pointer to that card, which
+  // the host derives deterministically from the same reviewed text. That reply
+  // is vouched for exactly when the published plan is the reviewed one and the
+  // reply is precisely its rendering; any other wording still has to match.
+  const replyRendersReviewedPlan = Boolean(
+    publishedPlan
+    && publishedVerdict?.planDigest
+    && planMatches
+    && publishedVerdict.replyDigest
+    && (publishedVerdict.replyDigest === replyDigestOf(publishedPlan.fullText)
+      || publishedVerdict.replyDigest === replyDigestOf(publishedPlan.fullText.trim()))
+    && proposed.text === publishedPlanReplyText({
+      fullText: publishedPlan.fullText,
+      needsInput: publishedPlan.readiness === 'needs_input',
+      missingPrerequisites: publishedPlan.missingPrerequisites,
+      cardRendered: true,
+    }),
+  );
+  const replyMatches = publishedVerdict?.replyDigest
+    ? publishedVerdict.replyDigest === replyDigestOf(proposed.text) || replyRendersReviewedPlan
+    : false;
   // RE-VERIFY the artifacts NOW, against the files as they stand at publication.
   // Trusting the `digestMatches` flags recorded during judging misses every
   // change made between the verdict and the terminal — the artifact could have
@@ -1225,6 +1246,25 @@ export function commitTurnOutcome(
   // with no file contract, are excluded from the current-bytes recheck —
   // publication was requiring every historical receipt to match current bytes,
   // which no valid edit can satisfy.
+  // THE LATER-GENERATION MAP COMES FROM CANONICAL SETTLED WORK, not from the
+  // verdict: for each handle, the digest of the latest receipt this request
+  // wrote. A Space saved and then edited again in the same request rechecks its
+  // bundle against that final component generation instead of calling it drift.
+  const settledNow = settledSourceArtifacts({
+    sessionId: proposed.identity.sessionId,
+    sourceUserSeq: proposed.identity.sourceUserSeq,
+  });
+  const laterReceiptsAfter = (writeOrdinal: number): Map<string, string> => {
+    const latest = new Map<string, { ordinal: number; digest: string }>();
+    for (const entry of settledNow.artifacts) {
+      if (!entry.handle || !entry.contentDigest || entry.writeOrdinal <= writeOrdinal) continue;
+      const prior = latest.get(entry.handle);
+      if (!prior || entry.writeOrdinal > prior.ordinal) {
+        latest.set(entry.handle, { ordinal: entry.writeOrdinal, digest: entry.contentDigest });
+      }
+    }
+    return new Map([...latest].map(([handle, receipt]) => [handle, receipt.digest]));
+  };
   const artifactCoverage = (publishedVerdict?.artifacts ?? [])
     .filter((entry) => entry.superseded !== true && entry.evidenceContract !== 'none')
     .map((entry) => {
@@ -1233,6 +1273,14 @@ export function commitTurnOutcome(
       handle: entry.handle,
       contentDigest: entry.contentDigest,
       receipt: '',
+    }, {
+      // Located by exact revision in the host-computed ledger; an entry the
+      // ledger does not hold gets no later generations and rechecks strictly.
+      laterReceipts: laterReceiptsAfter(
+        settledNow.artifacts.find((settled) => (
+          settled.handle === entry.handle && settled.contentDigest === entry.contentDigest
+        ))?.writeOrdinal ?? Number.POSITIVE_INFINITY,
+      ),
     });
     return {
       createdId: entry.createdId,
@@ -1253,10 +1301,6 @@ export function commitTurnOutcome(
   // artifacts, published as done/verified. The settled ledger is the authority
   // on whether this request performed work; the verdict is only evidence about
   // that work.
-  const settledNow = settledSourceArtifacts({
-    sessionId: proposed.identity.sessionId,
-    sourceUserSeq: proposed.identity.sourceUserSeq,
-  });
   // Required only when this request produced FILE-contract work. A turn whose
   // only effects were deletions or non-file writes requires no artifact.
   const artifactsRequired = settledNow.artifacts.some((entry) => (

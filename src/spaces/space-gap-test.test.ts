@@ -110,6 +110,26 @@ test('send-like action with no recipient in template → a question', () => {
   assert.equal(gaps.find((g) => g.actionId === 'send_email')?.resolution, 'clarify');
 });
 
+test('a reply draft whose operation declares no recipient input asks no recipient question', () => {
+  const draft = { id: 'draft_reply', composioSlug: 'VENDOR_CREATE_REPLY_ALL_DRAFT', argsTemplate: { message_id: '{{message_id}}', comment: '{{comment}}' } };
+  const withSchema = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'mail', runner: 'r.mjs' }], actions: [draft] }),
+    GOOD_VIEW,
+    [],
+    { actionInputNames: { draft_reply: ['comment', 'mail_folder_id', 'message_id', 'user_id'] } },
+  );
+  assert.equal(withSchema.filter((g) => /recipient/i.test(g.question)).length, 0, 'the operation takes no recipient');
+  const sendSchema = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'mail', runner: 'r.mjs' }], actions: [{ id: 'send_email', composioSlug: 'VENDOR_SEND_EMAIL', argsTemplate: { user_id: 'me' } }] }),
+    GOOD_VIEW,
+    [],
+    { actionInputNames: { send_email: ['to_email', 'subject', 'body', 'user_id'] } },
+  );
+  assert.ok(sendSchema.some((g) => g.actionId === 'send_email' && /recipient/i.test(g.question)), 'an operation that takes a recipient still asks');
+  const unread = analyzeSpaceGaps(rec({ dataSources: [{ id: 'mail', runner: 'r.mjs' }], actions: [draft] }), GOOD_VIEW);
+  assert.ok(unread.some((g) => /recipient/i.test(g.question)), 'without the schema the conservative question stays');
+});
+
 test('send action WITH a recipient key in template → no recipient question', () => {
   const gaps = analyzeSpaceGaps(
     rec({
@@ -239,12 +259,79 @@ test('check 1 still fires on a view that demonstrably consumes nothing', () => {
   assert.ok(gaps.some((g) => g.question.includes('never reads them')), 'a truly data-blind view is still flagged');
 });
 
-test('reading an unassigned window seed does not pretend the view is data-connected', () => {
+test('the host-planted dataset is a live binding; a JSON literal pasted into the view is not', () => {
   const record = { dataSources: [{ id: 'tasks' }], actions: [] } as never;
-  const gaps = analyzeSpaceGaps(
+  // The server plants the current dataset as window.__SPACE_DATA__ on every
+  // serve and the desktop remounts the frame when the dataset changes, so a
+  // view rendering from it is data-connected, as the tool text instructs.
+  const planted = analyzeSpaceGaps(
     record,
     '<html><script>const data = window.__SPACE_DATA__ || {}; render(data.tasks)</script></html>',
     [],
   );
-  assert.ok(gaps.some((g) => g.resolution === 'fix' && g.question.includes('never reads them')));
+  assert.equal(planted.some((g) => g.question.includes('never reads them')), false);
+  // A snapshot of the data typed into the HTML never changes after authoring.
+  const pasted = analyzeSpaceGaps(
+    record,
+    '<html><script>const DATA = {"tasks":[{"title":"Call Ana"}]}; render(DATA.tasks)</script></html>',
+    [],
+  );
+  assert.ok(pasted.some((g) => g.resolution === 'fix' && g.question.includes('never reads them')));
+});
+
+test('2d: an action whose operation requires an input neither the template nor the literal view call supplies is a fix gap', () => {
+  const record = {
+    dataSources: [],
+    actions: [{ id: 'draft_reply', composioSlug: 'OUTLOOK_CREATE_DRAFT_REPLY', argsTemplate: { user_id: 'me' } }],
+  } as never;
+  const requirements = { actionInputRequirements: { draft_reply: ['user_id', 'message_id', 'mail_folder_id', 'comment'] } };
+  const call = (args: string) => `<html><button onclick="go()">Draft</button><script>async function go(){ await clem.action('draft_reply', ${args}); }</script></html>`;
+
+  const missing = analyzeSpaceGaps(record, call('{ message_id: row.id, comment: text }'), [], requirements);
+  const gap = missing.find((g) => g.actionId === 'draft_reply' && g.resolution === 'fix' && g.question.includes('requires'));
+  assert.ok(gap, JSON.stringify(missing));
+  assert.match(gap.question, /requires `mail_folder_id`/);
+  assert.doesNotMatch(gap.question, /message_id|comment|user_id/, 'only the input nobody supplies is named');
+
+  // Supplied by the view (keyed, quoted, shorthand) or by the template: clean.
+  for (const args of [
+    '{ message_id: row.id, mail_folder_id: row.folder, comment: text }',
+    '{ "message_id": row.id, \'mail_folder_id\': row.folder, comment }',
+    '{ message_id, mail_folder_id, comment: `Thanks {name}, will do` }',
+  ]) {
+    assert.equal(
+      analyzeSpaceGaps(record, call(args), [], requirements).some((g) => g.actionId === 'draft_reply' && g.question.includes('requires')),
+      false,
+      args,
+    );
+  }
+  const templated = {
+    dataSources: [],
+    actions: [{ id: 'draft_reply', composioSlug: 'OUTLOOK_CREATE_DRAFT_REPLY', argsTemplate: { user_id: 'me', mail_folder_id: 'inbox' } }],
+  } as never;
+  assert.equal(
+    analyzeSpaceGaps(templated, call('{ message_id: row.id, comment: text }'), [], requirements).some((g) => g.actionId === 'draft_reply' && g.question.includes('requires')),
+    false,
+  );
+
+  // Cannot be proven statically: never refused on a guess.
+  for (const args of [
+    'args',
+    '{ ...base, comment: text }',
+    '{ [field]: row.id, comment: text }',
+  ]) {
+    assert.equal(
+      analyzeSpaceGaps(record, call(args), [], requirements).some((g) => g.actionId === 'draft_reply' && g.question.includes('requires')),
+      false,
+      args,
+    );
+  }
+  // A nested object's keys do not count as top-level inputs.
+  const nested = analyzeSpaceGaps(record, call('{ message_id: row.id, comment: text, meta: { mail_folder_id: 1 } }'), [], requirements);
+  assert.ok(nested.some((g) => g.actionId === 'draft_reply' && g.question.includes('requires')));
+  // One of two call sites missing the input is still a broken button.
+  const twoSites = `<html><script>clem.action('draft_reply', { message_id: a, mail_folder_id: b, comment: c }); clem.action("draft_reply", { message_id: a, comment: c });</script></html>`;
+  assert.ok(analyzeSpaceGaps(record, twoSites, [], requirements).some((g) => g.actionId === 'draft_reply' && g.question.includes('requires')));
+  // No schema requirements known: not checked.
+  assert.equal(analyzeSpaceGaps(record, call('{ comment: text }'), []).some((g) => g.question.includes('requires')), false);
 });

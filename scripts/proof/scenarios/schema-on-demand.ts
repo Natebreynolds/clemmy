@@ -75,9 +75,13 @@ export const schemaOnDemand: ScenarioDef = {
       detail: `tool_search × ${calls.tool_search ?? 0}, call_tool × ${calls.call_tool ?? 0}`,
     });
     checks.push({
-      name: 'deferred tool used the gated dispatcher',
-      pass: (calls.call_tool ?? 0) >= 1 && (calls.workspace_roots ?? 0) >= 1,
-      detail: `call_tool × ${calls.call_tool ?? 0}, workspace_roots × ${calls.workspace_roots ?? 0}`,
+      name: 'omitted schema was invoked (direct or carried)',
+      // Lean surfaces dispatch through call_tool. After W1b a direct
+      // workspace_roots call is carried at admission and the sealed name
+      // stays authored, so the ledger shows workspace_roots × N and
+      // call_tool × 0. Either is success; shell fallback is not.
+      pass: (calls.workspace_roots ?? 0) >= 1,
+      detail: `workspace_roots × ${calls.workspace_roots ?? 0}, call_tool × ${calls.call_tool ?? 0}`,
     });
     checks.push({
       name: 'no shell fallback',

@@ -382,6 +382,65 @@ export function resolveCarriedHostControl(
 }
 
 /**
+ * Inverse of carrier unwrap: the model named a tool that is not on this step's
+ * advertised surface. Route the invoke through `call_tool` (local/control/read)
+ * or `work_call` (business/write) so the carrier's reachability checks run,
+ * while the caller keeps the authored name as the sealed identity.
+ *
+ * Returns null when the name is already on the surface, is itself a carrier,
+ * or no carrier is advertised — those stay ordinary misses.
+ */
+export type OffSurfaceDirectCarry = {
+  carrierName: 'call_tool' | 'work_call';
+  carrierArgs: { name: string; args_json: string };
+};
+
+export function resolveOffSurfaceDirectCarry(input: {
+  authoredName: string;
+  authoredArgs: Record<string, unknown> | null;
+  authoredArgumentsJson: string;
+  surfaceHas: (name: string) => boolean;
+}): OffSurfaceDirectCarry | null {
+  const authored = input.authoredName.trim();
+  if (!authored) return null;
+  if (input.surfaceHas(authored)) return null;
+  if (
+    isPlainOrClementineLocalTool(authored, 'call_tool')
+    || isPlainOrClementineLocalTool(authored, 'work_call')
+  ) return null;
+  const rawJson = input.authoredArgumentsJson.trim();
+  const argsJson = rawJson.startsWith('{')
+    ? rawJson
+    : JSON.stringify(input.authoredArgs ?? {});
+  const args = input.authoredArgs ?? {};
+  const declaration = TOOL_REGISTRY.find((candidate) => candidate.name === authored);
+  const role = actionTopologyRoleForRuntimeCall(authored, args);
+  const effect = classifyRuntimeToolEffect(authored, args).effect;
+  const registryLocal = Boolean(
+    declaration
+    && declaration.sideEffect !== 'send'
+    && declaration.sideEffect !== 'admin',
+  );
+  const business = !registryLocal && (
+    role === 'business'
+    || effect === 'external_write'
+    || effect === 'admin'
+  );
+  const wrap = (carrierName: 'call_tool' | 'work_call'): OffSurfaceDirectCarry => ({
+    carrierName,
+    carrierArgs: { name: authored, args_json: argsJson || '{}' },
+  });
+  if (business) {
+    if (input.surfaceHas('work_call')) return wrap('work_call');
+    if (input.surfaceHas('call_tool')) return wrap('call_tool');
+    return null;
+  }
+  if (input.surfaceHas('call_tool')) return wrap('call_tool');
+  if (input.surfaceHas('work_call')) return wrap('work_call');
+  return null;
+}
+
+/**
  * Peel schema/discovery carriers using the full invocation payload. Callers
  * must run this before event previews are clipped: the returned identity is a
  * small durable fact, while `args` may be arbitrarily large and remains only

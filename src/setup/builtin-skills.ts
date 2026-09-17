@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   linkSync,
@@ -6,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -17,17 +19,64 @@ import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 export const TECHNICAL_CONTENT_MARKETING_SKILL = 'technical-content-marketing' as const;
 export const TECHNICAL_CONTENT_MARKETING_RULE_MARKER =
   'SOURCE-DATED-CALENDAR-ONE-IDEA-PER-POST' as const;
+export const WORKSPACE_BUILDER_SKILL = 'workspace-builder' as const;
 
 const BUILTIN_SKILLS = Object.freeze([
   TECHNICAL_CONTENT_MARKETING_SKILL,
+  WORKSPACE_BUILDER_SKILL,
 ]);
+
+/**
+ * Beside each installed built-in: the digest of the exact bytes Clementine
+ * published. A SKILL.md whose bytes still equal that digest is Clementine's own
+ * untouched copy and follows the release; any other bytes are the user's and
+ * are never rewritten.
+ */
+export const BUILTIN_SKILL_RECORD = '.builtin.json';
+
+interface BuiltinSkillRecord {
+  version: 1;
+  sha256: string;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function readBuiltinRecord(targetDir: string): BuiltinSkillRecord | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(targetDir, BUILTIN_SKILL_RECORD), 'utf8')) as Partial<BuiltinSkillRecord>;
+    return parsed.version === 1 && typeof parsed.sha256 === 'string' && /^[a-f0-9]{64}$/.test(parsed.sha256)
+      ? { version: 1, sha256: parsed.sha256 }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBuiltinRecord(targetDir: string, sha256: string): void {
+  const record = path.join(targetDir, BUILTIN_SKILL_RECORD);
+  const staged = `${record}.${process.pid}.tmp`;
+  writeFileSync(staged, JSON.stringify({ version: 1, sha256 } satisfies BuiltinSkillRecord), 'utf8');
+  renameSync(staged, record);
+}
+
+function regularSkillFileBytes(target: string): Buffer | null {
+  try {
+    const stat = lstatSync(target);
+    return stat.isFile() && !stat.isSymbolicLink() ? readFileSync(target) : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Built-ins are instruction assets, not an unbounded packaging channel. */
 export const BUILTIN_SKILL_MAX_BYTES = 256 * 1024;
 
 export interface BuiltinSkillProvisionResult {
   name: string;
-  status: 'installed' | 'preserved';
+  /** `updated`: Clementine's own untouched copy was replaced by this release. */
+  status: 'installed' | 'preserved' | 'updated';
   target: string;
 }
 
@@ -146,9 +195,49 @@ export function provisionBuiltinSkills(options: {
       results.push({ name, status: 'preserved', target });
       return true;
     };
+    const installLockPath = path.join(skillsDir, `.${name}-builtin-install`);
+    // An existing copy follows the release only while it is byte-identical to
+    // what Clementine last published there. Decided under the per-name lock,
+    // and re-read immediately before the atomic replace, so a user edit that
+    // lands at any point wins.
+    if (regularSkillFileBytes(target)) {
+      let settled = false;
+      withFileLockSyncStrict(installLockPath, () => {
+        const current = regularSkillFileBytes(target);
+        if (!current) return;
+        const source = path.join(packageRoot, 'builtin-skills', name, 'SKILL.md');
+        let packaged: Buffer;
+        // A broken packaged asset never costs a working installed copy: the
+        // existing skill is preserved exactly as it was before updates existed.
+        try { packaged = validatedBuiltinSkillBytes(source, name); } catch { return; }
+        const packagedDigest = sha256Hex(packaged);
+        const currentDigest = sha256Hex(current);
+        const record = readBuiltinRecord(targetDir);
+        if (currentDigest === packagedDigest) {
+          if (record?.sha256 !== packagedDigest) writeBuiltinRecord(targetDir, packagedDigest);
+          assertPreservedSkillIsUsable(targetDir, target, name);
+          results.push({ name, status: 'preserved', target });
+          settled = true;
+          return;
+        }
+        if (record?.sha256 !== currentDigest) return; // user-owned bytes
+        const staged = path.join(targetDir, `.SKILL.md.${process.pid}.update`);
+        writeFileSync(staged, packaged, { flag: 'w' });
+        try {
+          const recheck = regularSkillFileBytes(target);
+          if (!recheck || sha256Hex(recheck) !== currentDigest) return;
+          renameSync(staged, target);
+        } finally {
+          if (existsSync(staged)) rmSync(staged, { force: true });
+        }
+        writeBuiltinRecord(targetDir, packagedDigest);
+        results.push({ name, status: 'updated', target });
+        settled = true;
+      });
+      if (settled) continue;
+    }
     if (preserveExistingIfUsable()) continue;
 
-    const installLockPath = path.join(skillsDir, `.${name}-builtin-install`);
     withFileLockSyncStrict(installLockPath, () => {
       // The first check is only a fast path. This check under the per-name
       // exclusive lock is the cooperative cross-process ownership boundary.
@@ -205,6 +294,7 @@ export function provisionBuiltinSkills(options: {
           }
           throw error;
         }
+        writeBuiltinRecord(targetDir, sha256Hex(bytes));
         results.push({ name, status: 'installed', target });
       } finally {
         // After a successful hard link this removes only the private name; the

@@ -61,6 +61,7 @@ import {
   runToolOutputGuardrails,
 } from '@openai/agents';
 import { toSmartString } from '@openai/agents-core/utils';
+import { isToolMediaContent, toolMediaText } from './tool-media-content.js';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
@@ -468,7 +469,17 @@ export function settledSourceArtifacts(input: {
   }));
 
   const blocks: string[] = [];
-  for (const entry of artifacts) {
+  // Later same-request receipts per handle, so a Space bundle whose component
+  // this request edited again afterwards verifies as its final generation.
+  const laterReceiptsAfter = (index: number): Map<string, string> => {
+    const later = new Map<string, string>();
+    for (const [handle, latest] of latestForHandle) {
+      const receipt = artifacts[latest];
+      if (latest > index && receipt?.contentDigest) later.set(handle, receipt.contentDigest);
+    }
+    return later;
+  };
+  for (const [index, entry] of artifacts.entries()) {
     if (entry.superseded) {
       blocks.push(`- artifact ${entry.createdId} (handle ${entry.handle}) — an EARLIER revision `
         + 'by this same request, later superseded. Not evidence of the final state.');
@@ -478,7 +489,9 @@ export function settledSourceArtifacts(input: {
       `- artifact ${entry.createdId} (handle ${entry.handle})`,
       `  written by THIS request as its write #${entry.writeOrdinal}; receipt digest ${entry.contentDigest.slice(0, 16)}`,
     ];
-    const content = entry.facts ? readCommittedArtifactContent(entry.facts) : null;
+    const content = entry.facts
+      ? readCommittedArtifactContent(entry.facts, { laterReceipts: laterReceiptsAfter(index) })
+      : null;
     if (entry.evidenceContract === 'undeclared') {
       // Authenticated work whose tool declares no result contract. Surfaced, not
       // silently discharged and not made to owe a file it never promised.
@@ -557,6 +570,7 @@ import {
   isDelegationPrimitiveRuntimeCall,
   isUnscopedShellRuntimeCall,
   resolveCarriedHostControl,
+  resolveOffSurfaceDirectCarry,
   resolveProviderCarrierLocalReadControl,
   runtimeToolAuthorityBinding,
   trustedRuntimeEffectCarrier,
@@ -705,6 +719,7 @@ import {
   type HostToolDisposition,
   type HostToolDispositionOutput,
 } from './host-model-result-receipt.js';
+import { defaultDispositionEdge, edgeToolName } from './next-edge.js';
 import {
   recordLogicalModelResultProjectionReceipt,
 } from './logical-model-result-projection-receipt.js';
@@ -2490,6 +2505,10 @@ function structuredInputItem(output: StructuredToolOutput): Record<string, unkno
 }
 
 function resultText(result: unknown): string {
+  // An image result reaches the model as an image. Everywhere only text can
+  // travel (the durable output, recall, review evidence) it is named, never
+  // re-serialized as base64.
+  if (isToolMediaContent(result)) return toolMediaText(result);
   return toSmartString(result);
 }
 
@@ -5621,18 +5640,46 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       executionContext.counter.increment();
     }
-    const tool = toolByName.get(call.name);
-    const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
-    const parsedArguments = parsedArgs(argumentsJson);
+    const authoredName = call.name;
+    let tool = toolByName.get(authoredName);
+    const authoredArgumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+    const authoredParsedArguments = parsedArgs(authoredArgumentsJson);
+    const offSurfaceCarry = (!tool || typeof tool.invoke !== 'function')
+      ? resolveOffSurfaceDirectCarry({
+          authoredName,
+          authoredArgs: authoredParsedArguments,
+          authoredArgumentsJson,
+          surfaceHas: (name) => toolByName.has(name),
+        })
+      : null;
+    if (offSurfaceCarry) {
+      const carrierTool = toolByName.get(offSurfaceCarry.carrierName);
+      if (carrierTool && typeof carrierTool.invoke === 'function') tool = carrierTool;
+    }
+    const argumentsJson = authoredArgumentsJson;
+    const invokeArgumentsJson = offSurfaceCarry
+      ? JSON.stringify(offSurfaceCarry.carrierArgs)
+      : authoredArgumentsJson;
+    const parsedArguments = authoredParsedArguments;
     let admittedEffect: RuntimeToolEffect = currentFrameEffects.get(call.callId)
       ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
-    const canaryRefusal = readOnlyCanaryRefusal(
-      call.name,
-      parsedArguments,
-      argumentsJson,
-      tool,
-      call.callId,
-    );
+    // A carried call answers to the same host refusals as the carrier call it
+    // rides; only the sealed identity below stays the authored name.
+    const canaryRefusal = offSurfaceCarry
+      ? readOnlyCanaryRefusal(
+          offSurfaceCarry.carrierName,
+          offSurfaceCarry.carrierArgs,
+          invokeArgumentsJson,
+          tool,
+          call.callId,
+        )
+      : readOnlyCanaryRefusal(
+          call.name,
+          parsedArguments,
+          argumentsJson,
+          tool,
+          call.callId,
+        );
     // Read synchronously: sibling reads share a bounded pool, and the exact
     // miss belongs to the refusal composed on the line above.
     const literalFaultOperation = canaryRefusal
@@ -5689,10 +5736,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // Guardrails and approval predicates are awaited outside the body. Mint
         // the proof again at the last synchronous edge so a wrapper/schema,
         // catalog, binding, source or root drift cannot ride an earlier check
-        // through the logical-admission or host-crossing transaction.
+        // through the logical-admission or host-crossing transaction. A
+        // carried call is proven as the carrier call that runs.
         exactAttestation = exactHostReadOnlyCallAttestation(
-          call.name,
-          parsedArguments,
+          offSurfaceCarry ? offSurfaceCarry.carrierName : call.name,
+          offSurfaceCarry ? offSurfaceCarry.carrierArgs : parsedArguments,
           tool,
           call.callId,
         );
@@ -5707,9 +5755,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
       } else if (hostProduction) {
         exactProduction = exactProductionHostCall(
-          call.name,
-          parsedArguments,
-          argumentsJson,
+          offSurfaceCarry ? offSurfaceCarry.carrierName : call.name,
+          offSurfaceCarry ? offSurfaceCarry.carrierArgs : parsedArguments,
+          offSurfaceCarry ? invokeArgumentsJson : argumentsJson,
           tool,
           call.callId,
           runContext,
@@ -5746,7 +5794,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           observation.invocationEntered = true;
           return withHostWatcherFanoutRearm(
             ambient?.sessionId,
-            () => tool.invoke!(runContext, argumentsJson, details),
+            () => tool.invoke!(runContext, invokeArgumentsJson, details),
           );
         }
         const exactAmbient = ambient!;
@@ -5850,12 +5898,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               sessionId: exactSource.sessionId,
               sourceUserSeq: exactSource.sourceUserSeq,
               modelCallId: call.callId,
-              toolName: preserveWorkCallCarrier
+              toolName: offSurfaceCarry
                 ? call.name
-                : exactProduction?.logicalToolName ?? call.name,
-              args: preserveWorkCallCarrier
-                ? parsedArguments
-                : exactProduction?.logicalArgs ?? parsedArguments,
+                : preserveWorkCallCarrier
+                  ? call.name
+                  : exactProduction?.logicalToolName ?? call.name,
+              args: offSurfaceCarry
+                ? parsedArguments ?? {}
+                : preserveWorkCallCarrier
+                  ? parsedArguments
+                  : exactProduction?.logicalArgs ?? parsedArguments,
               turn: exactAmbient.turn,
             },
             parentLease: exactSource.parentLease,
@@ -5930,7 +5982,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               exactSource.sessionId,
               () => withPlanCompletionReview(candidate => judgeHostCompletion(candidate.fullText, history, lastResponseId, candidate), () => exactProduction
                 ? exactProduction.invoke(callSignal)
-                : tool.invoke!(runContext, argumentsJson, { ...details, signal: callSignal })),
+                : tool.invoke!(runContext, invokeArgumentsJson, { ...details, signal: callSignal })),
             ),
           });
           if (preserveWorkCallCarrier) {
@@ -6322,6 +6374,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     repairKey?: string;
     continuationReason?: 'activation_budget';
   }): AgentInputItem => {
+    const innerTool = edgeToolName(
+      input.call.name,
+      parsedArgs(input.call.argumentsJson),
+    );
     return buildHostToolDispositionResult({
       callId: input.call.callId,
       toolName: input.call.name,
@@ -6334,6 +6390,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       diagnostic: input.diagnostic,
       repairKey: input.repairKey,
       continuationReason: input.continuationReason,
+      ...(input.continuationReason || input.retired || input.disposition === 'effect_unknown'
+        ? {}
+        : { nextEdge: defaultDispositionEdge({
+          disposition: input.disposition,
+          toolName: innerTool,
+        }) }),
     });
   };
 
@@ -8428,8 +8490,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             turnIsPlanMode(),
           );
         admissibleRecoveryToolNames = permittedNoProgressRecoveryToolNames;
-        const recoveryTools = tools.filter((tool) => permittedNoProgressRecoveryToolNames!.has(tool.name));
-        modelStepSchemas = serializedTools(recoveryTools);
+        // Advertise the accepted-turn tool array (cache-stable). Recovery
+        // permission is enforced at admission via permittedNoProgressRecoveryToolNames,
+        // not by shrinking the wire schemas. Live ~10/day: a correct selection
+        // rule over a list that already lost the carrier cannot save the turn,
+        // and shrinking here made the next step's `available` lose it too.
+        //
+        // Exceptions are terminal steps with one legal move, not looping
+        // recoveries: the one Plan-exhaustion publish step (so the model cannot
+        // keep discovering), and a required question the host already composed
+        // (so the model cannot spend the turn on anything but asking it).
+        if (planFinalPublishStep || consequence?.recovery === 'ask_user') {
+          modelStepSchemas = serializedTools(tools.filter((tool) => (
+            permittedNoProgressRecoveryToolNames!.has(tool.name)
+          )));
+        }
         if (!noProgressRecoveryDirectiveWritten) {
           // The model-facing steer, like the owner-facing copy above, must not
           // send a Plan turn hunting for another executable step. It owes an
@@ -8964,7 +9039,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       permittedNoProgressRecoveryToolNames
       && (
         nonCanonicalNoProgressAsk
-        || canonicalCalls.some((call) => !permittedNoProgressRecoveryToolNames!.has(call.name))
+        || canonicalCalls.some((call) => {
+          if (permittedNoProgressRecoveryToolNames!.has(call.name)) return false;
+          const authoredArgumentsJson = materializedArgumentsJson(
+            toolByName.get(call.name),
+            call.argumentsJson,
+          );
+          const carry = resolveOffSurfaceDirectCarry({
+            authoredName: call.name,
+            authoredArgs: parsedArgs(authoredArgumentsJson),
+            authoredArgumentsJson,
+            surfaceHas: (name) => toolByName.has(name),
+          });
+          return !(carry && permittedNoProgressRecoveryToolNames!.has(carry.carrierName));
+        })
       )
     ) {
       // The recovery request exposed no dependency/provider/business schema.
@@ -9019,6 +9107,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           journalHostGuide('recovery_surface_reprompt', {
             attempted: canonicalCalls.map((call) => call.name).slice(0, 6),
             permitted: permitted.slice(0, 12),
+            // What the recovery was chosen FROM: a permitted set can be narrow
+            // because the rule excluded a tool or because the step never had it.
+            available: tools.map((tool) => tool.name).slice(0, 40),
+            consequenceStage: noProgressState?.lastConsequence?.stage ?? null,
           });
           // The refused frame and its result are already checkpointed above.
           // Resume AFTER that balanced pair; re-admitting it would duplicate
@@ -9376,11 +9468,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       'repair_arguments' | 'stop_and_explain'
     >();
     let preApprovalRefused = false;
-    for (const [callIndex, call] of canonicalCalls.entries()) {
+    for (const [callIndex, authoredCall] of canonicalCalls.entries()) {
       // Exact admission can do substantial synchronous SQLite work. Let chat
       // and heartbeat I/O run between candidates as well as between bodies.
       // Every candidate still reopens its authority after this yield.
       if (callIndex > 0) await new Promise<void>(resolve => setImmediate(resolve));
+      // A DIRECT CALL CARRIED OFF THE SURFACE IS ADMITTED AS ITS CARRIER.
+      // Every gate below (mode refusals, exact authority, consent) sees the
+      // carrier call the host will actually run, so naming a tool directly can
+      // never reach an effect its carrier form would be refused. The queued
+      // entry keeps the authored call: that is the sealed identity a resume
+      // compares against.
+      const authoredSurfaceTool = toolByName.get(authoredCall.name);
+      const authoredAdmittedJson = materializedArgumentsJson(authoredSurfaceTool, authoredCall.argumentsJson);
+      const admissionCarry = (!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
+        ? resolveOffSurfaceDirectCarry({
+            authoredName: authoredCall.name,
+            authoredArgs: parsedArgs(authoredAdmittedJson),
+            authoredArgumentsJson: authoredAdmittedJson,
+            surfaceHas: (name) => toolByName.has(name),
+          })
+        : null;
+      const call: CanonicalHostCall = admissionCarry
+        ? {
+            callId: authoredCall.callId,
+            name: admissionCarry.carrierName,
+            argumentsJson: JSON.stringify(admissionCarry.carrierArgs),
+          }
+        : authoredCall;
       try {
       const tool = toolByName.get(call.name);
       const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
@@ -9654,12 +9769,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
       }
       const pending: PendingHostCall = {
-        callId: call.callId,
-        name: call.name,
-        rawItem: { name: call.name, arguments: argumentsJson, callId: call.callId },
+        callId: authoredCall.callId,
+        name: authoredCall.name,
+        rawItem: {
+          name: authoredCall.name,
+          arguments: admissionCarry ? authoredAdmittedJson : argumentsJson,
+          callId: authoredCall.callId,
+        },
         // The bytes this loop admitted (materialized + host-completed) and
         // minted the durable digest from; the resume compares against these.
-        admittedArgumentsJson: argumentsJson,
+        admittedArgumentsJson: admissionCarry ? authoredAdmittedJson : argumentsJson,
         ...(consentSubject ? { consentSubject } : {}),
         ...(consentCall ? { consentCall } : {}),
       };

@@ -113,6 +113,19 @@ test('an ask_user consequence still routes only to the question', () => {
   assert.deepEqual([...permitted], ['ask_user_question']);
 });
 
+test('recovery does not shrink the advertised tool array (W1a)', () => {
+  // Live ~10/day: hostNoProgressRecoveryToolNames is correct offline, but the
+  // step then replaced modelStepSchemas with serializedTools(recoveryTools).
+  // The next step's `available` log lost the carrier. Advertise the accepted-
+  // turn array; enforce the permitted set at admission.
+  assert.doesNotMatch(SRC, /const recoveryTools = tools\.filter/,
+    'ordinary recovery must not build a shrunk advertised set');
+  assert.match(SRC, /Advertise the accepted-turn tool array/,
+    'the cache-stable recovery surface is an explicit host rule');
+  assert.match(SRC, /if \(planFinalPublishStep \|\| consequence\?\.recovery === 'ask_user'\) \{/,
+    'only terminal one-move steps (the Plan-exhaustion publish, a required question) advertise their permitted set');
+});
+
 test('a surface miss resumes after its committed refusal instead of re-admitting that frame', () => {
   const start = SRC.indexOf('const permittedForDiagnostic =');
   const end = SRC.indexOf('const canonicalFrameDigest =', start);

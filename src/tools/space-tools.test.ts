@@ -406,20 +406,30 @@ test('space_save records declared data sources + re-engage contract', async () =
   assert.deepEqual(rec?.reengage?.triggers, ['note', 'ask']);
 });
 
-test('space_save refuses a data-backed view that only reads an imaginary window seed', async () => {
-  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.html');
-  writeFileSync(draft, '<html><script>const data=window.__SPACE_DATA__||{}; render(data.tasks)</script></html>', 'utf-8');
+test('space_save accepts a view rendering the host-planted dataset and refuses one rendering a pasted snapshot', async () => {
+  // The planted window.__SPACE_DATA__ is the dataset the tool text tells the
+  // author to render from; it is re-planted on every serve.
+  const planted = path.join(process.env.CLEMENTINE_HOME!, 'tmp-planted-seed.html');
+  writeFileSync(planted, '<html><script>const data=window.__SPACE_DATA__||{}; render(data.tasks)</script></html>', 'utf-8');
+  const plantedOut = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'planted-seed',
+    title: 'Planted Seed',
+    view_path: planted,
+    data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true }],
+  })));
+  assert.doesNotMatch(plantedOut, /never reads them through the scoped Workspace bridge/, plantedOut);
 
-  const out = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
-    slug: 'imaginary-seed',
-    title: 'Imaginary Seed',
-    view_path: draft,
+  const pasted = path.join(process.env.CLEMENTINE_HOME!, 'tmp-pasted-seed.html');
+  writeFileSync(pasted, '<html><script>const DATA={"tasks":[{"title":"Call Ana"}]}; render(DATA.tasks)</script></html>', 'utf-8');
+  const pastedOut = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
+    slug: 'pasted-seed',
+    title: 'Pasted Seed',
+    view_path: pasted,
     data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS' }],
   })));
-
-  assert.match(out, /was NOT saved/);
-  assert.match(out, /fix these implementation issues now/);
-  assert.equal(store.spaceStore.get('imaginary-seed'), undefined);
+  assert.match(pastedOut, /was NOT saved/);
+  assert.match(pastedOut, /never reads them through the scoped Workspace bridge/);
+  assert.equal(store.spaceStore.get('pasted-seed'), undefined);
 });
 
 test('space_save refuses legacy {{source}} binding before activating a dynamic Workspace', async () => {
@@ -1257,4 +1267,71 @@ test('re-saving an existing Workspace merges data sources by id; only an explici
     await tools.space_save({ slug: 'merge-board', title: 'Merge Board', data_sources: [] });
     assert.equal(store.spaceStore.get('merge-board')!.dataSources.length, 0);
   });
+});
+
+test('space_save refuses a button whose action can never succeed, using the operation schema and no provider call', async () => {
+  const { rememberToolSchema } = await import('./composio-schema-cache.js');
+  rememberToolSchema('VENDOR_CREATE_REPLY_DRAFT', {
+    type: 'object',
+    properties: {
+      user_id: { type: 'string', default: 'me' },
+      message_id: { type: 'string' },
+      folder_id: { type: 'string' },
+      comment: { type: 'string' },
+    },
+    required: ['user_id', 'message_id', 'folder_id', 'comment'],
+  }, Date.now() - 1_000);
+  const view = (args: string) => `<html><body><button id="b">Draft</button><script>document.getElementById('b').onclick = async () => { const r = await clem.action('draft', ${args}); document.body.dataset.state = r.pending ? 'pending' : 'done'; };</script></body></html>`;
+  const actions = [{ id: 'draft', label: 'Draft reply', composio_slug: 'VENDOR_CREATE_REPLY_DRAFT', args_template_json: '{}' }];
+
+  const broken = text(await tools.space_save({
+    slug: 'action-contract', title: 'Action contract', view_html: view('{ message_id: row.id, comment: text }'), actions,
+  }));
+  assert.match(broken, /was NOT saved/);
+  assert.match(broken, /Action "draft" \(VENDOR_CREATE_REPLY_DRAFT\) requires `folder_id`/);
+  assert.doesNotMatch(broken, /requires `user_id`/, 'an input with a schema default is not demanded');
+  assert.equal(store.spaceStore.get('action-contract'), undefined);
+
+  const fixed = text(await tools.space_save({
+    slug: 'action-contract', title: 'Action contract', view_html: view('{ message_id: row.id, folder_id: row.folder, comment: text }'), actions,
+  }));
+  assert.doesNotMatch(fixed, /was NOT saved/, fixed);
+  assert.equal(store.spaceStore.get('action-contract')?.actions[0]?.composioSlug, 'VENDOR_CREATE_REPLY_DRAFT');
+});
+
+test('space_preview returns an image of the served view rendered with its stored data', async () => {
+  const { chmodSync } = await import('node:fs');
+  const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+  const capture = path.join(process.env.CLEMENTINE_HOME!, 'preview-capture');
+  const browser = path.join(process.env.CLEMENTINE_HOME!, 'fake-preview-browser.js');
+  writeFileSync(browser, `#!/usr/bin/env node
+const fs = require('node:fs'); const path = require('node:path');
+const shot = process.argv.find((v) => v.startsWith('--screenshot=')).slice('--screenshot='.length);
+const url = process.argv[process.argv.length - 1].replace('file://', '');
+fs.mkdirSync(${JSON.stringify(capture)}, { recursive: true });
+fs.copyFileSync(path.join(path.dirname(url), 'view.html'), path.join(${JSON.stringify(capture)}, 'view.html'));
+fs.copyFileSync(url, path.join(${JSON.stringify(capture)}, 'index.html'));
+fs.writeFileSync(shot, Buffer.from('${png.toString('hex')}', 'hex'));
+`, 'utf8');
+  chmodSync(browser, 0o755);
+  const prior = process.env.CLEMMY_PREVIEW_BROWSER;
+  process.env.CLEMMY_PREVIEW_BROWSER = browser;
+  try {
+    await tools.space_save({ slug: 'previewable', title: 'Previewable', view_html: '<!doctype html><html><body><main class="clem-app"><h1>Board</h1></main></body></html>' });
+    const result = await tools.space_preview({ slug: 'previewable', theme: 'dark', width: 1280, height: 900 }) as { content: Array<{ type: string; data?: string; mimeType?: string; text?: string }> };
+    const image = result.content.find((block) => block.type === 'image');
+    assert.ok(image, JSON.stringify(result).slice(0, 300));
+    assert.equal(image.mimeType, 'image/png');
+    assert.ok(Buffer.from(image.data!, 'base64').equals(png));
+    assert.match(result.content.find((block) => block.type === 'text')?.text ?? '', /Preview of "Previewable" \(previewable\) v1, dark theme, 1280×900/);
+    const served = readFileSync(path.join(capture, 'view.html'), 'utf8');
+    assert.ok(served.indexOf('<style id="clem-view-design">') >= 0 && served.indexOf('<style id="clem-view-design">') < served.indexOf('<h1>Board</h1>'), 'the preview renders the exact served composition');
+    assert.match(readFileSync(path.join(capture, 'index.html'), 'utf8'), /sandbox="allow-scripts"/);
+
+    const missing = await tools.space_preview({ slug: 'no-such-space' });
+    assert.match(text(missing), /No workspace named/);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_PREVIEW_BROWSER;
+    else process.env.CLEMMY_PREVIEW_BROWSER = prior;
+  }
 });

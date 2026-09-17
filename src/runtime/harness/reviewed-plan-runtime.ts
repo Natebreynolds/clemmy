@@ -223,7 +223,7 @@ const REVIEWED_REPAIR_COMPANIONS: Readonly<Record<string, readonly string[]>> = 
   // park it paused, a data source can wait on a grant, the view can need an
   // edit. Reads, refreshes and view edits of the same Workspace are the step.
   space_save: [
-    'space_refresh', 'space_set_data', 'space_edit_view', 'space_get_view', 'space_get', 'space_list',
+    'space_refresh', 'space_set_data', 'space_edit_view', 'space_get_view', 'space_preview', 'space_get', 'space_list',
     'space_history', 'space_diff', 'space_get_runner', 'space_edit_runner', 'space_try_runner',
     'space_action_prepare', 'space_publish', 'pending_action_list', 'pending_action_get',
   ],

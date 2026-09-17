@@ -342,6 +342,7 @@ try {
     'dist/runtime/build-stamp.json',
     'dist/runtime/harness/implementation-artifacts/emitted/manifest.json',
     'builtin-skills/technical-content-marketing/SKILL.md',
+    'builtin-skills/workspace-builder/SKILL.md',
   ]) assert.equal(packedFiles.has(required), true, `npm tarball omitted ${required}`);
   const leakedSourceFixture = [...packedFiles].find((file) => (
     file === 'dist/execution/reviewed-local-workflow-v3-process.fixture.js'
@@ -443,6 +444,10 @@ try {
   const provisionedSkill = path.join(runtimeHome, 'skills', 'technical-content-marketing', 'SKILL.md');
   assert.equal(existsSync(packedSkill), true, 'installed package omitted the first-party marketing skill');
   assert.equal(readFileSync(provisionedSkill, 'utf8'), readFileSync(packedSkill, 'utf8'));
+  const packedWorkspaceSkill = path.join(installedRoot, 'builtin-skills', 'workspace-builder', 'SKILL.md');
+  const provisionedWorkspaceSkill = path.join(runtimeHome, 'skills', 'workspace-builder', 'SKILL.md');
+  assert.equal(existsSync(packedWorkspaceSkill), true, 'installed package omitted the first-party Workspace builder skill');
+  assert.equal(readFileSync(provisionedWorkspaceSkill, 'utf8'), readFileSync(packedWorkspaceSkill, 'utf8'));
   const provisionedSkillTimes = {
     mtimeMs: statSync(provisionedSkill).mtimeMs,
     ctimeMs: statSync(provisionedSkill).ctimeMs,

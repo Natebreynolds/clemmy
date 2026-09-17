@@ -95,7 +95,9 @@ test('first-party provisioning never overwrites a pre-existing same-name user sk
   writeFileSync(target, userBytes, 'utf8');
 
   const result = builtins.provisionBuiltinSkills({ baseDir: existingHome, packageRoot: PKG_DIR });
-  assert.deepEqual(result.map(({ name, status }) => ({ name, status })), [{
+  assert.deepEqual(result
+    .filter(({ name }) => name === builtins.TECHNICAL_CONTENT_MARKETING_SKILL)
+    .map(({ name, status }) => ({ name, status })), [{
     name: builtins.TECHNICAL_CONTENT_MARKETING_SKILL,
     status: 'preserved',
   }]);
@@ -152,7 +154,8 @@ test('a pre-publication failure publishes no partial skill and the next init sel
   assert.throws(() => builtins.provisionBuiltinSkills({
     baseDir: recoveryHome,
     packageRoot: PKG_DIR,
-    beforeInstallPublish: ({ stagingDir }) => {
+    beforeInstallPublish: ({ name, stagingDir }) => {
+      if (name !== builtins.TECHNICAL_CONTENT_MARKETING_SKILL) return;
       staged = stagingDir;
       assert.ok(existsSync(path.join(stagingDir, 'SKILL.md')));
       throw new Error('injected pre-publication crash');
@@ -162,7 +165,9 @@ test('a pre-publication failure publishes no partial skill and the next init sel
   assert.equal(existsSync(staged), false, 'the failed invocation left its private staging directory behind');
 
   const recovered = builtins.provisionBuiltinSkills({ baseDir: recoveryHome, packageRoot: PKG_DIR });
-  assert.deepEqual(recovered.map(({ name, status }) => ({ name, status })), [{
+  assert.deepEqual(recovered
+    .filter(({ name }) => name === builtins.TECHNICAL_CONTENT_MARKETING_SKILL)
+    .map(({ name, status }) => ({ name, status })), [{
     name: builtins.TECHNICAL_CONTENT_MARKETING_SKILL,
     status: 'installed',
   }]);
@@ -190,13 +195,16 @@ test('an empty same-name directory created at the publication seam is reused, ne
   const result = builtins.provisionBuiltinSkills({
     baseDir: raceHome,
     packageRoot: PKG_DIR,
-    beforeInstallPublish: () => {
+    beforeInstallPublish: ({ name }) => {
+      if (name !== builtins.TECHNICAL_CONTENT_MARKETING_SKILL) return;
       mkdirSync(targetDir);
       racedDirectoryInode = statSync(targetDir, { bigint: true }).ino;
     },
   });
 
-  assert.deepEqual(result.map(({ name, status }) => ({ name, status })), [{
+  assert.deepEqual(result
+    .filter(({ name }) => name === builtins.TECHNICAL_CONTENT_MARKETING_SKILL)
+    .map(({ name, status }) => ({ name, status })), [{
     name: builtins.TECHNICAL_CONTENT_MARKETING_SKILL,
     status: 'installed',
   }]);
@@ -349,4 +357,108 @@ test('an unusable preserved override makes the exact foreground daemon process f
   assert.match(output, /wrong-daemon-skill; expected technical-content-marketing/);
   assert.match(output, /Startup failed/);
   assert.doesNotMatch(output, /Daemon loop started|Webhook server listening|Direct-app mobile door open/);
+});
+
+function packageRootWith(label: string, overrides: Record<string, string> = {}): string {
+  const root = path.join(HOME, `package-${label}`);
+  for (const name of [builtins.TECHNICAL_CONTENT_MARKETING_SKILL, builtins.WORKSPACE_BUILDER_SKILL]) {
+    const dir = path.join(root, 'builtin-skills', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, 'SKILL.md'),
+      overrides[name] ?? readFileSync(path.join(PKG_DIR, 'builtin-skills', name, 'SKILL.md'), 'utf8'),
+    );
+  }
+  return root;
+}
+
+test('a framework skill follows the release while untouched, and a user edit is never overwritten', () => {
+  const home = path.join(HOME, 'release-updates');
+  const name = builtins.WORKSPACE_BUILDER_SKILL;
+  const target = path.join(home, 'skills', name, 'SKILL.md');
+  const record = path.join(home, 'skills', name, builtins.BUILTIN_SKILL_RECORD);
+  const shipped = readFileSync(path.join(PKG_DIR, 'builtin-skills', name, 'SKILL.md'), 'utf8');
+
+  const first = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('v1') });
+  assert.equal(first.find((entry) => entry.name === name)?.status, 'installed');
+  assert.equal(readFileSync(target, 'utf8'), shipped);
+  assert.ok(existsSync(record), 'the published digest is recorded beside the skill');
+
+  // Next release ships new bytes: the untouched copy follows it.
+  const v2 = shipped.replace('# Workspace builder', '# Workspace builder\n\nRELEASE-TWO-GUIDANCE');
+  const second = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('v2', { [name]: v2 }) });
+  assert.equal(second.find((entry) => entry.name === name)?.status, 'updated');
+  assert.equal(readFileSync(target, 'utf8'), v2);
+
+  // Same release again: nothing to do.
+  const steady = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('v2', { [name]: v2 }) });
+  assert.equal(steady.find((entry) => entry.name === name)?.status, 'preserved');
+
+  // The user edits it: the next release leaves their bytes alone.
+  const edited = v2.replace('RELEASE-TWO-GUIDANCE', 'MY-OWN-HOUSE-RULES');
+  writeFileSync(target, edited);
+  const v3 = shipped.replace('# Workspace builder', '# Workspace builder\n\nRELEASE-THREE-GUIDANCE');
+  const third = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('v3', { [name]: v3 }) });
+  assert.equal(third.find((entry) => entry.name === name)?.status, 'preserved');
+  assert.equal(readFileSync(target, 'utf8'), edited, 'a user edit is never overwritten');
+
+  // A broken packaged asset never costs the working installed copy.
+  const broken = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('broken', { [name]: 'not a skill' }) });
+  assert.equal(broken.find((entry) => entry.name === name)?.status, 'preserved');
+  assert.equal(readFileSync(target, 'utf8'), edited);
+  assert.deepEqual(
+    readdirSync(path.join(home, 'skills', name)).filter((entry) => entry.includes('.update') || entry.endsWith('.tmp')),
+    [],
+    'no staged update bytes are left behind',
+  );
+});
+
+test('an installed copy from before digests were recorded is adopted when it matches the release, preserved otherwise', () => {
+  const home = path.join(HOME, 'legacy-adoption');
+  const name = builtins.TECHNICAL_CONTENT_MARKETING_SKILL;
+  const dir = path.join(home, 'skills', name);
+  const shipped = readFileSync(path.join(PKG_DIR, 'builtin-skills', name, 'SKILL.md'), 'utf8');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'SKILL.md'), shipped);
+  const adopted = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('legacy') });
+  assert.equal(adopted.find((entry) => entry.name === name)?.status, 'preserved');
+  assert.ok(existsSync(path.join(dir, builtins.BUILTIN_SKILL_RECORD)), 'a matching legacy copy is adopted');
+  const next = shipped.replace('# Technical Content Marketing', '# Technical Content Marketing\n\nNEXT-RELEASE');
+  const updated = builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: packageRootWith('legacy-next', { [name]: next }) });
+  assert.equal(updated.find((entry) => entry.name === name)?.status, 'updated', 'an adopted copy then follows releases');
+
+  const otherHome = path.join(HOME, 'legacy-different');
+  const otherDir = path.join(otherHome, 'skills', name);
+  mkdirSync(otherDir, { recursive: true });
+  const older = shipped.replace('# Technical Content Marketing', '# Technical Content Marketing\n\nOLDER-OR-EDITED');
+  writeFileSync(path.join(otherDir, 'SKILL.md'), older);
+  const kept = builtins.provisionBuiltinSkills({ baseDir: otherHome, packageRoot: packageRootWith('legacy-other') });
+  assert.equal(kept.find((entry) => entry.name === name)?.status, 'preserved');
+  assert.equal(readFileSync(path.join(otherDir, 'SKILL.md'), 'utf8'), older, 'unrecorded bytes that differ are the user\'s');
+});
+
+test('Clem finds the workspace-builder skill for ordinary Space requests and not for unrelated work', async () => {
+  const home = path.join(HOME, 'skill-discovery');
+  builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: PKG_DIR });
+  const probe = spawnSync(process.execPath, ['--import', 'tsx', '-e', `
+    const { findRelevantSkills } = await import(${JSON.stringify(path.join(PKG_DIR, 'src', 'memory', 'skill-store.ts'))});
+    const asks = JSON.parse(process.argv[1]);
+    console.log(JSON.stringify(asks.map((ask) => findRelevantSkills(ask).map((m) => m.skill?.name ?? m.name))));
+  `, JSON.stringify([
+    'Completely revolutionize the design of my My Day space',
+    'add a draft reply button to the emails in my inbox workspace',
+    'build me a dashboard for my team pipeline that refreshes every morning',
+    'the slack section of my space is empty, fix it',
+    'what is the weather in denver tomorrow',
+  ])], {
+    cwd: PKG_DIR,
+    env: { ...process.env, CLEMENTINE_HOME: home, CLEMMY_TEST_ISOLATED_HOME: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  const found = JSON.parse(probe.stdout.trim().split('\n').pop()!) as string[][];
+  for (const [index, names] of found.slice(0, 4).entries()) {
+    assert.ok(names.includes(builtins.WORKSPACE_BUILDER_SKILL), `request ${index} did not surface the skill: ${JSON.stringify(names)}`);
+  }
+  assert.equal(found[4]!.includes(builtins.WORKSPACE_BUILDER_SKILL), false, 'unrelated work does not pull it in');
 });

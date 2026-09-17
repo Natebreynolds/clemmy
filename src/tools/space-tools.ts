@@ -27,6 +27,11 @@ import {
   type SpaceDataSource, type SpaceAction, type SpaceRecord,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
+import { workspaceComposioIsProvablyReadOnly } from '../spaces/space-execution-policy.js';
+import { ensureWorkspaceReadClassification } from '../spaces/space-read-authority.js';
+import { ensureToolSchema } from './composio-schema-cache.js';
+import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonical-consent.js';
+import { countWorkspaceRecords, renderWorkspaceDataDigest, renderWorkspaceSourceRecords } from '../spaces/workspace-data-digest.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData } from '../spaces/runner.js';
@@ -49,10 +54,6 @@ import {
   spaceActionNeedsApproval,
   standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
-import {
-  acquireAutoSpaceActionV3Authority,
-  evaluateSpaceActionV3AutoConsent,
-} from '../spaces/space-action-v3-authority.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import {
   HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
@@ -298,35 +299,6 @@ function toDataSource(
   return ds;
 }
 
-/** Best-effort row count for a refreshed source's data — an array's length, or
- *  the first array one level down (e.g. {contacts:[...]} → contacts.length).
- *  null when there's no obvious row collection (a scalar/object payload). */
-function countRows(val: unknown): number | null {
-  if (Array.isArray(val)) return val.length;
-  if (val && typeof val === 'object') {
-    for (const k of Object.keys(val as Record<string, unknown>)) {
-      if (k === '_meta') continue;
-      const v = (val as Record<string, unknown>)[k];
-      if (Array.isArray(v)) return v.length;
-    }
-  }
-  return null;
-}
-
-/** The row collection inside a runner's parsed output (mirrors countRows): the
- *  array itself, or the first array one level down — for a dry-run summary. */
-function rowCollection(val: unknown): unknown[] | null {
-  if (Array.isArray(val)) return val;
-  if (val && typeof val === 'object') {
-    for (const k of Object.keys(val as Record<string, unknown>)) {
-      if (k === '_meta') continue;
-      const v = (val as Record<string, unknown>)[k];
-      if (Array.isArray(v)) return v;
-    }
-  }
-  return null;
-}
-
 /** Max chars of view HTML space_get_view returns in one call. Sized just under
  *  read_file's 50000 ceiling so (a) the model has the SAME budget the shell
  *  read_file gives it — no reason to defect to shell to read a view — and (b) our
@@ -341,6 +313,45 @@ const VIEW_READ_RESULT_MAX_CHARS = 50_000;
  * former write_file staging hop. The HTML bytes now ride the exact space_save
  * argument digest, so no mutable path can change between consent and commit. */
 export const SPACE_INLINE_VIEW_MAX_BYTES = 24_000;
+/** A dataset up to this size is shown whole by space_get; larger live data is summarized per source. */
+const SPACE_GET_COMPLETE_DATASET_MAX_BYTES = 12_000;
+
+/** Distinct Composio reads one save will prepare before judging; a Workspace declares a handful. */
+const SPACE_SAVE_MAX_READ_PREPARATIONS = 12;
+
+/**
+ * Action id → the inputs its operation REQUIRES (declared required, no schema
+ * default), read from the operation's input schema without calling it. The gap
+ * test compares these against the args template and the view's literal
+ * clem.action call, so a button that could never succeed is caught at save
+ * instead of by clicking it against real data. An unreadable schema is simply
+ * not checked.
+ */
+async function workspaceActionInputContract(
+  actions: readonly SpaceAction[],
+): Promise<{ actionInputRequirements: Record<string, string[]>; actionInputNames: Record<string, string[]> }> {
+  const requirements: Record<string, string[]> = {};
+  const names: Record<string, string[]> = {};
+  for (const action of actions.slice(0, SPACE_SAVE_MAX_READ_PREPARATIONS)) {
+    const operationId = action.composioSlug?.trim().toUpperCase();
+    if (!operationId) continue;
+    let schema: Record<string, unknown> | null = null;
+    try { schema = await ensureToolSchema(operationId); } catch { schema = null; }
+    const required = Array.isArray(schema?.required)
+      ? (schema!.required as unknown[]).filter((name): name is string => typeof name === 'string' && name.length > 0)
+      : [];
+    const properties = schema?.properties && typeof schema.properties === 'object'
+      ? schema.properties as Record<string, unknown>
+      : {};
+    const withoutDefault = required.filter((name) => {
+      const property = properties[name];
+      return !(property && typeof property === 'object' && Object.prototype.hasOwnProperty.call(property, 'default'));
+    });
+    if (withoutDefault.length > 0) requirements[action.id] = withoutDefault;
+    if (schema) names[action.id] = Object.keys(properties);
+  }
+  return { actionInputRequirements: requirements, actionInputNames: names };
+}
 
 /**
  * Render a view's HTML for space_get_view: cat -n style line numbers so the model
@@ -447,13 +458,11 @@ export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_save',
     [
-      'Create or update a Workspace — a persistent HTML surface with stored data and phone content. Pass an existing slug to update it. For a static board record edit, read space_get, then pass replacement_data_json, its expected_revision and updated view_html here: data, phone content and view commit together.',
+      'Create or update a Workspace — a persistent HTML surface with stored data and phone content. The full playbook for building one here is the built-in skill workspace-builder; read it with skill_read before creating or redesigning a Workspace. Pass an existing slug to update it. For a static board record edit, read space_get, then pass replacement_data_json, its expected_revision and updated view_html here: data, phone content and view commit together.',
       `For an ordinary view, pass the complete self-contained HTML directly as view_html (maximum ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes; inline CSS/JS only — external CDNs are blocked by CSP). This keeps creation to one authoritative, versioned space_save commit.`,
       `view_path is legacy / oversized-file compatibility for an already-authored file inside ${BASE_DIR}; pass exactly one of view_html or view_path when replacing the view.`,
       'The view runs sandboxed: no network except the injected `clem` bridge (data/history/diff/refresh/note/compose/action). External links open through the desktop; nothing else leaves the frame.',
-      'DESIGN LAYER (auto-injected into every served view; use it instead of writing CSS): semantic tokens --clem-ink/-ink-muted/-ink-subtle, --clem-primary (fill) / --clem-primary-ink (text), --clem-success/-warning/-danger/-info (+ -tint), surfaces --clem-bg-canvas/-surface/-subtle/-hover/-raised, --clem-border, --clem-radius; a system font and base typography; light AND dark themes that follow the desktop automatically (never hardcode colors); and components: .clem-app (page), .clem-header (+ .clem-sub), .clem-kpis > .clem-kpi (-ok/-warn/-danger/-info), .clem-grid, .clem-card, .clem-section > .clem-section-head/.clem-section-body, .clem-list > .clem-item (-urgent/-warn; .clem-item-title/-meta/-body/-tags), .clem-table (.clem-right), .clem-tag (-ok/-warn/-danger/-info/-primary), .clem-btn (-primary/-ghost/-danger/-sm), .clem-empty, .clem-pending, .clem-error, .clem-src, .clem-skeleton, .clem-progress, utilities .clem-row/.clem-stack/.clem-muted/.clem-num/.clem-small/.clem-mono.',
-      'HELPER KIT on `clem` (pure, return strings, escape every field): clem.fmt.{money(n,cur?), number(n,dec?), percent, date(v,"long"?), time, relative(v), daysUntil(v), plural(n,one,many?), truncate(s,n), initials, esc}; clem.ui.{kpis([{label,value,hint?,tone?}]), section(title, bodyHtml, {count?, meta?, actions?}), list([{title, meta?, body?, html?, href?, tags?:[{text,tone}], urgent?, warn?, attrs?}], {empty?}), table(rows, [{key|render, label, align?, html?}], {empty?, rowAttrs?}), card(bodyHtml,{title?}), tag(text,tone?), empty(text,hint?), pending(text?), error(text), sourceStrip()}; clem.sources() → [{id, ok, error, refreshedAt, ageHours, stale}]; clem.theme() → {name,isDark}.',
-      'VIEW STANDARD (what a good Workspace shows, in this order): the view fills the whole frame — never a centered narrow column, no max-width on the page; use .clem-grid so sections sit side by side on a wide screen and stack on a narrow one. (1) a .clem-header with the title and clem.ui.sourceStrip(); (2) clem.ui.kpis with the 3-6 numbers the user would ask for first; (3) WHAT NEEDS THE USER TODAY — items that need a reply, decision or are overdue, most urgent first, each with a deadline/age and a one-line why; (4) context sections in a .clem-grid. Every list gets an empty state; every source renders its stale/error state from clem.sources() while keeping the last good data on screen; every write shows clem.ui.pending() until it actually ran; render row-level buttons for the actions you declare (Draft reply, Open, Mark done). Compute derived signals the data does not carry (no activity in 14 days, closing this week, amount at risk) — that is the value of the view. Interpolate external text only through clem.fmt.esc or the ui helpers.',
+      'DESIGN LAYER, HELPER KIT and VIEW STANDARD: every served view already carries a light/dark design layer (semantic --clem-* tokens and .clem-* components such as .clem-app, .clem-kpis, .clem-grid, .clem-section, .clem-list, .clem-table, .clem-btn) and a `clem` helper kit (clem.fmt, clem.ui, clem.rows, clem.pick, clem.sources, clem.mail). Their exact names and signatures, and what a good view shows, are in the workspace-builder skill. Fill the whole frame, never hardcode colors, and after saving call space_preview and fix what you see before reporting done.',
       'The dataset is planted in every served view as `window.__SPACE_DATA__` BEFORE your script runs, so render straight from it — no await, no polling, no empty first paint. A helper `clem` is auto-injected too, for data that changed since load: `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
       'Optionally declare NEW data_sources as PROVABLY READ-ONLY Composio operations so the workspace can refresh server-side without spending tokens. Only GET/LIST/SEARCH/FETCH/READ-class actions are accepted. Unknown or mutating slugs and new arbitrary runner scripts are refused.',
@@ -617,6 +626,19 @@ export function registerSpaceTools(server: McpServer): void {
       if (parseErrors.length > 0) {
         return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${parseErrors.join('\n- ')}`);
       }
+      // A cold host catalog is not evidence of a write. Each declared Composio
+      // read is judged against a current definition, prepared the same way a
+      // refresh prepares it, before the save-time safety check runs.
+      const readPreparationNotes: string[] = [];
+      const coldReads = [...new Set(dsList
+        .filter((src) => !src.runner?.trim() && !src.cliArgv?.length && src.composioSlug?.trim())
+        .map((src) => src.composioSlug!.trim().toUpperCase())
+        .filter((operationId) => !workspaceComposioIsProvablyReadOnly(operationId)))]
+        .slice(0, SPACE_SAVE_MAX_READ_PREPARATIONS);
+      for (const operationId of coldReads) {
+        const classified = await ensureWorkspaceReadClassification(operationId);
+        if (!classified.ok) readPreparationNotes.push(`${operationId} could not be confirmed as a read: ${classified.error}`);
+      }
       const prep = prepareSpaceForWrite({
         slug,
         dataSources: dsList,
@@ -626,7 +648,7 @@ export function registerSpaceTools(server: McpServer): void {
         existingDataSources: existing?.dataSources,
       });
       if (!prep.ok) {
-        return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
+        return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${[...prep.errors, ...readPreparationNotes].join('\n- ')}`);
       }
 
       // Code/runtime gaps are Clementine's responsibility, not questions for
@@ -662,7 +684,8 @@ export function registerSpaceTools(server: McpServer): void {
           createdAt: now,
           updatedAt: now,
         };
-      const implementationGaps = analyzeSpaceGaps(prospective, candidateView, [])
+      const actionInputContract = await workspaceActionInputContract(prospective.actions);
+      const implementationGaps = analyzeSpaceGaps(prospective, candidateView, [], actionInputContract)
         .filter((gap) => gap.resolution === 'fix');
       if (implementationGaps.length > 0) {
         return invalidArgumentsTextResult(
@@ -881,7 +904,7 @@ export function registerSpaceTools(server: McpServer): void {
         const dataNow = (() => { try { return readData(slug) as Record<string, unknown>; } catch { return {}; } })();
         const refreshed = record.dataSources
           .filter((s) => !failedIds.has(s.id) && !awaitingApprovalIds.has(s.id))
-          .map((s) => { const n = countRows(dataNow?.[s.id]); return `${s.id} (${n == null ? 'ok' : `${n} row${n === 1 ? '' : 's'}`})`; });
+          .map((s) => { const n = countWorkspaceRecords(dataNow?.[s.id]); return `${s.id} (${n == null ? 'ok' : `${n} row${n === 1 ? '' : 's'}`})`; });
         if (refreshed.length > 0) parts.push(`Data refreshed: ${refreshed.join(', ')}.`);
         if (smoke.failed.length > 0) {
           parts.push(`Creation smoke PARKED this Workspace as PAUSED — fix and re-save:\n- ${smoke.failed.map((f) => `source "${f.id}": ${f.error}`).join('\n- ')}`);
@@ -899,7 +922,7 @@ export function registerSpaceTools(server: McpServer): void {
       // wrong/empty surface (incl. zero-row sources from the smoke).
       let installedView = '';
       try { installedView = readFileSync(resolveInSpace(slug, record.viewEntry), 'utf-8'); } catch { /* no view */ }
-      const gaps = analyzeSpaceGaps(record, installedView, smoke?.empty ?? []);
+      const gaps = analyzeSpaceGaps(record, installedView, smoke?.empty ?? [], await workspaceActionInputContract(record.actions));
       // Record the gaps as a durable note so the desktop build panel can surface
       // them (not only in this tool result). Always recorded — an empty set on a
       // later clean save clears the panel (the UI reads the latest gap note).
@@ -1065,59 +1088,31 @@ export function registerSpaceTools(server: McpServer): void {
           actionId: action_id,
           callerArgs,
         }), 'utf8').digest('hex')}`;
-        const evaluated = evaluateSpaceActionV3AutoConsent({
-          slug,
+        const decided = await decideAndRunSpaceProviderAction({
+          record: rec,
           action,
           callerArgs,
           runOccurrenceId,
         });
-        if (evaluated.status === 'needs_user') {
-          return textResult(evaluated.need === 'choice'
-            ? `The account for "${action.label ?? action.id}" is ambiguous. Choose which connected account should own this action, then retry. ${evaluated.message}`
-            : `Connect the account required for "${action.label ?? action.id}", then retry. ${evaluated.message}`);
+        if (decided.kind === 'needs_user') {
+          if (decided.fromPreparation) {
+            return textResult(decided.need === 'choice'
+              ? `The account for "${action.label ?? action.id}" is ambiguous. Choose which connected account should own this action, then retry. ${decided.message}`
+              : `Connect the account required for "${action.label ?? action.id}", then retry. ${decided.message}`);
+          }
+          return textResult(`"${action.label ?? action.id}" ${decided.message}.`);
         }
-        if (evaluated.status === 'conflict') {
+        if (decided.kind === 'unavailable') {
           return textResult(
-            `Action "${action_id}" was not run because its current capability binding could not be verified: `
-            + redactSensitiveText(evaluated.reason),
+            `Action "${action_id}" was not run: ${redactSensitiveText(decided.reason)}`,
           );
         }
-        if (evaluated.decision.kind === 'proceed') {
-          if (!evaluated.authorization) {
-            return textResult(
-              `Action "${action_id}" was not run because its exact Auto authorization was unavailable.`,
-            );
-          }
-          const acquired = acquireAutoSpaceActionV3Authority({
-            slug,
-            preparation: evaluated.preparation,
-            authorization: evaluated.authorization,
-          });
-          if (!acquired.ok) {
-            return textResult(
-              `Action "${action_id}" was not run: ${redactSensitiveText(acquired.error)}`,
-            );
-          }
-          const { runSpaceAction } = await import('../spaces/runner.js');
-          const result = await runSpaceAction(rec.id, action, callerArgs, {
-            composioAuthority: acquired.authority,
-          });
-          return textResult(result.ok
+        if (decided.kind === 'ran') {
+          return textResult(decided.result.ok
             ? `Ran "${action.label ?? action.id}" in workspace "${rec.title}".`
-            : `"${action.label ?? action.id}" failed: ${redactSensitiveText(result.error)}`);
+            : `"${action.label ?? action.id}" failed: ${redactSensitiveText(decided.result.error)}`);
         }
-        if (evaluated.decision.kind === 'needs_user') {
-          if (evaluated.decision.need !== 'approval') {
-            return textResult(
-              `"${action.label ?? action.id}" needs ${evaluated.decision.need.replace('_', ' ')} before it can run.`,
-            );
-          }
-          // High-consequence work retains the existing one exact visible card.
-        } else {
-          return textResult(
-            `Action "${action_id}" was not run because its exact effect authority needs internal repair.`,
-          );
-        }
+        // High-consequence work retains the existing one exact visible card.
       }
       try {
         const prepared = enqueueSpaceActionApproval(rec, action, callerArgs);
@@ -1202,7 +1197,7 @@ export function registerSpaceTools(server: McpServer): void {
       // failure never fails the edit.
       let gapNote = '';
       try {
-        const gaps = analyzeSpaceGaps(after, html, []);
+        const gaps = analyzeSpaceGaps(after, html, [], await workspaceActionInputContract(after.actions));
         appendNote(slug, {
           text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
           kind: 'gap',
@@ -1219,9 +1214,13 @@ export function registerSpaceTools(server: McpServer): void {
         appendStateEvent: false,
         strict: true,
       });
-      return textResult(withHostLocalWriteCommitFromFile({
-        createdId: slug,
-        committedPath: viewFile,
+      // The edit commits the view AND the manifest (version, revision
+      // history), so its receipt is the Workspace bundle, exactly as a save's
+      // is. A view-only receipt under-reported the write, and an earlier save
+      // bundle in the same request then read as drift against the edit.
+      return textResult(spaceStore.commitSaveResult({
+        expectedRecord: after,
+        expectedView: html,
         result: `Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" HTML view (now v${after.version}). Stored data and phone content were not changed by this operation. The open Workspace auto-refreshes.${detail}${gapNote}`,
       }));
     },
@@ -1263,7 +1262,7 @@ export function registerSpaceTools(server: McpServer): void {
           return `- ${r.sourceId}: AWAITING APPROVAL (${r.pendingApprovalId}) — runner not executed; approve it, then call space_refresh once.`;
         }
         if (!r.ok) return `- ${r.sourceId}: FAILED — ${r.error}`;
-        const n = countRows(dataNow?.[r.sourceId]);
+        const n = countWorkspaceRecords(dataNow?.[r.sourceId]);
         return `- ${r.sourceId}: ok${n == null ? '' : ` (${n} row${n === 1 ? '' : 's'})`}`;
       });
       const anyOk = results.some((r) => r.ok);
@@ -1285,11 +1284,14 @@ export function registerSpaceTools(server: McpServer): void {
 
   server.tool(
     'space_get',
-    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), a snapshot of its current dataset, and recent user notes. Use this when re-engaged to see what the workspace shows and what the user did in it.',
+    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), its dataset, and recent user notes. For live sources the dataset is summarized per source: where the records are, how many, their fields, and trimmed samples. Pass source_id to page through one source\'s records (limit, offset). Use this when re-engaged to see what the workspace shows and what the user did in it, and before writing view code against a source.',
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      source_id: z.string().max(120).nullish().describe('Optional: return this one source\'s records (trimmed) instead of the per-source summary.'),
+      limit: z.number().int().min(1).max(60).nullish().describe('With source_id: records per page (default 20).'),
+      offset: z.number().int().min(0).nullish().describe('With source_id: first record index (default 0).'),
     },
-    async ({ slug }) => {
+    async ({ slug, source_id, limit, offset }) => {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       let rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
@@ -1303,6 +1305,22 @@ export function registerSpaceTools(server: McpServer): void {
       try {
         dataPreview = snapshot.data;
       } catch { dataPreview = '(unreadable)'; }
+      let parsedDataset: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(dataPreview) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) parsedDataset = parsed as Record<string, unknown>;
+      } catch { parsedDataset = null; }
+      if (source_id && source_id.trim()) {
+        return textResult(parsedDataset
+          ? renderWorkspaceSourceRecords(parsedDataset, source_id.trim(), limit ?? 20, offset ?? 0)
+          : `Workspace "${slug}" has no readable dataset.`);
+      }
+      // A static document is edited whole, and a small dataset reads fine
+      // whole; live provider payloads are summarized so their shape is visible.
+      const datasetLine = rec.contentMode === 'static_snapshot' || !parsedDataset
+        || Buffer.byteLength(dataPreview, 'utf8') <= SPACE_GET_COMPLETE_DATASET_MAX_BYTES
+        ? `Dataset (complete JSON): ${dataPreview}`
+        : `Dataset (${Buffer.byteLength(dataPreview, 'utf8')} bytes, summarized per source; space_get with source_id pages through one source's records):\n${renderWorkspaceDataDigest(parsedDataset, rec.dataSources.map((source) => source.id))}`;
       const parts = [
         `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.`,
         rec.contract
@@ -1336,7 +1354,7 @@ export function registerSpaceTools(server: McpServer): void {
         ...(rec.contentMode === 'static_snapshot' ? ['For a root data or phone-content edit, use space_save with replacement_data_json and this expected_revision; include view_html when the HTML also changes. space_edit_view alone changes only HTML; space_set_data changes a named source.'] : []),
         `Snapshot revision: ${snapshot.revision}`,
         `Content mode: ${rec.contentMode ?? 'source-based'}.`,
-        `Dataset (complete JSON): ${dataPreview}`,
+        datasetLine,
         notes.length > 0 ? `Recent notes:\n${notes.map((n) => `  - [${n.kind ?? 'note'}] ${n.text}`).join('\n')}` : 'No notes yet.',
         audit.length > 0 ? `Recent activity: ${audit.length} data-plane call(s).` : '',
       ].filter(Boolean);
@@ -1433,6 +1451,52 @@ export function registerSpaceTools(server: McpServer): void {
           reason: safeWorkspaceObservationError(err),
         }));
       }
+    },
+  );
+
+  server.tool(
+    'space_preview',
+    [
+      'SEE a Workspace: render a screenshot of the view exactly as the desktop shows it, with its current stored data, and return the image. Look at it after building or redesigning a view and after any visual change, and fix what you see (clutter, a boxed narrow column, raw codes or entities, empty or broken sections, weak hierarchy) before telling the user it is done.',
+      'Read-only: actions, notes, and compose never run from a preview. theme "light" (default) or "dark"; width and height set the browser window in CSS pixels (default 1440 × 1100, sized so text stays legible). A long page is checked in parts: offset_y starts the screenshot that many pixels down the page.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      theme: z.enum(['light', 'dark']).nullish().describe('Render in light (default) or dark theme.'),
+      width: z.number().int().min(360).max(4000).nullish().describe('Window width in CSS pixels (default 1440; 390 shows a phone-width layout; larger than 2000 is rendered at 2000).'),
+      height: z.number().int().min(480).max(4000).nullish().describe('Window height in CSS pixels (default 1100; larger than 2000 is rendered at 2000).'),
+      offset_y: z.number().int().min(0).max(20000).nullish().describe('Start the screenshot this many CSS pixels down the page, to check a lower part of a long view (default 0).'),
+    },
+    async ({ slug, theme, width, height, offset_y }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const snapshot = spaceStore.snapshot(slug);
+      let authored = '';
+      try { authored = readFileSync(resolveInSpace(slug, rec.viewEntry), 'utf-8'); } catch { authored = ''; }
+      if (!authored.trim()) return textResult(`Workspace "${slug}" has no view to preview yet.`);
+      let dataset: unknown = {};
+      try { dataset = snapshot ? JSON.parse(snapshot.data) as unknown : {}; } catch { dataset = {}; }
+      const { composeServedWorkspaceView } = await import('../dashboard/space-routes.js');
+      const { renderWorkspacePreview } = await import('../spaces/space-preview.js');
+      const rendered = await renderWorkspacePreview({
+        slug,
+        servedViewHtml: composeServedWorkspaceView(slug, authored),
+        dataset,
+        ...(theme ? { theme } : {}),
+        ...(width ? { width } : {}),
+        ...(height ? { height } : {}),
+        ...(offset_y ? { offsetY: offset_y } : {}),
+      });
+      if (!rendered.ok) {
+        return textResult(`Preview unavailable: ${rendered.reason}. Verify the view with space_get_view and space_get instead.`);
+      }
+      return {
+        content: [
+          { type: 'image' as const, data: rendered.png.toString('base64'), mimeType: 'image/png' },
+          { type: 'text' as const, text: `Preview of "${rec.title}" (${slug}) v${rec.version}, ${rendered.theme} theme, ${rendered.width}×${rendered.height}${offset_y ? `, starting ${offset_y}px down the page` : ''}, rendered with its current data. This is what the user sees in the desktop app.` },
+        ],
+      };
     },
   );
 

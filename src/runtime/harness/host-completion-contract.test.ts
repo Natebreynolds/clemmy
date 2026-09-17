@@ -328,7 +328,27 @@ test('incremental trajectory windows keep exact new content, discovery navigatio
   const completion = sourceSettledReadEvidence(identity);
   assert.ok(completion.summary.includes(brief));
   assert.ok(completion.summary.includes(docs));
-  assert.ok(completion.results.every(r => r.contentComplete), 'completion still receives all exact source evidence');
+  assert.equal(completion.summary.split('EXACT_DOCUMENTATION_TAIL').length - 1, 1, 'completion shows identical bytes once');
+  const shownDigests = new Set(completion.results.filter(r => r.contentComplete).map(r => r.contentDigest));
+  assert.ok(completion.results.every(r => r.contentComplete
+    || (r.contentDisposition === 'duplicate_content' && shownDigests.has(r.contentDigest))),
+  'completion still receives all exact source evidence: every result is shown or is the same bytes as a shown one');
+  assert.match(completion.summary, /complete content is shown above under logicalCall=/);
+});
+
+test('an image in a retained result is described for review, never inlined as base64', () => {
+  const identity = accepted();
+  const imageData = Buffer.from('rendered-preview-pixels'.repeat(2_000)).toString('base64');
+  retainedRead(identity, 'space_preview', [
+    { type: 'text', text: 'Preview of "Board" (board) v2, light theme.' },
+    { type: 'image', data: imageData, mimeType: 'image/png' },
+  ]);
+  retainedRead(identity, 'call_tool', JSON.stringify([{ type: 'image', data: imageData, mimeType: 'image/png' }]).replace(imageData, `${imageData}AA`));
+  const completion = sourceSettledReadEvidence(identity);
+  assert.ok(!completion.summary.includes(imageData.slice(0, 200)), 'no base64 image bytes reach the reviewer');
+  assert.match(completion.summary, /Preview of \\?"Board\\?"/);
+  assert.match(completion.summary, /image bytes are not shown in text evidence/);
+  assert.ok(completion.results.some(r => r.presentation === 'media_described'));
 });
 
 test('the active planning discovery map survives history collapse and database reopen without mixing sources', async () => {

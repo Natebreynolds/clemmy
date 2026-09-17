@@ -1357,7 +1357,14 @@ export class FallbackModel implements Model {
     // (live 2026-08-29: "Something went wrong on that turn"). The host
     // watchdog already bounds this interval with the full-stream deadline.
     if (activeBufferedProviderRequestInFlight()) return call;
-    const remainingMs = Math.max(0, (deadlineAt ?? Date.now() + ms) - Date.now());
+    // Every wait judges liveness the same way the running timer does. A wait
+    // opened by a metadata event after reasoning has already carried the
+    // attempt past its absolute deadline is live for one window beyond the
+    // latest proven activity; failing it against the stale deadline benched a
+    // brain in the middle of thinking.
+    const lastWorkedAt = harnessRunContextStorage.getStore()?.privateModelActivityAt ?? 0;
+    const effectiveDeadlineAt = Math.max(deadlineAt ?? Date.now() + ms, lastWorkedAt > 0 ? lastWorkedAt + ms : 0);
+    const remainingMs = Math.max(0, effectiveDeadlineAt - Date.now());
     if (remainingMs <= 0) {
       abort();
       throw new FirstByteTimeoutError(ms);

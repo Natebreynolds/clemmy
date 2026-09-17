@@ -543,3 +543,77 @@ test('high-consequence Workspace sends retain one exact visible approval and zer
     types: ['workflow_v3_auto_consent_decided'],
   }).length, 0, 'a needs-approval decision cannot mint an Auto receipt');
 });
+
+async function clickAction(slug: string, actionId: string, args: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+  const express = (await import('express')).default;
+  const { registerSpaceRoutes } = await import('../dashboard/space-routes.js');
+  const app = express();
+  app.use(express.json({ limit: '2mb' }));
+  registerSpaceRoutes(app, () => true);
+  const server = await new Promise<import('node:http').Server>((resolve) => {
+    const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
+  });
+  try {
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    const response = await fetch(`http://127.0.0.1:${port}/api/console/spaces/${slug}/action`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ actionId, args }),
+    });
+    return { status: response.status, body: await response.json() as Record<string, unknown> };
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test('a click on an ordinary Workspace create runs through the same canonical Auto decision, with no card', async () => {
+  const capability = installCapabilities(['account:workspace:click-create']);
+  const slug = 'click-create-case';
+  const actionId = 'create-case';
+  spaceStore.save({
+    id: slug,
+    title: 'Click create case',
+    actions: [{ id: actionId, label: 'Create case', composioSlug: OPERATION, confirm: true }],
+  });
+  const clicked = await clickAction(slug, actionId, { case_title: 'From the view', details: 'One click.' });
+  assert.equal(clicked.status, 200, JSON.stringify(clicked.body));
+  assert.equal(clicked.body.ok, true);
+  assert.equal(clicked.body.pending, undefined);
+  assert.equal(capability.bodies(), 1, 'the ordinary write crossed exactly once');
+  assert.equal(approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length, 0, 'no card for ordinary work');
+  const decisions = eventlog.listEvents(`workspace-action:${slug}`, { types: ['workflow_v3_auto_consent_decided'] });
+  assert.equal(decisions.length, 1, 'the click commits the same durable Auto decision receipt');
+  assert.equal((decisions[0]?.data.receipt as { decision?: { basis?: string } })?.decision?.basis, 'exact_ordinary_work');
+
+  // Each click is its own request: a second click is a second create.
+  const again = await clickAction(slug, actionId, { case_title: 'From the view', details: 'Second click.' });
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+  assert.equal(capability.bodies(), 2);
+});
+
+test('a click on a high-consequence Workspace send still stages exactly one approval and sends nothing', async () => {
+  const capability = installCapabilities(['account:workspace:click-send'], {
+    operation: SEND_OPERATION,
+    inputSchema: {
+      type: 'object',
+      properties: { to: { type: 'string' }, body: { type: 'string' } },
+      required: ['to', 'body'],
+      additionalProperties: false,
+    },
+    behaviorHints: { readOnly: false, destructive: false, idempotent: false, openWorld: false },
+  });
+  const slug = 'click-send-message';
+  const actionId = 'send-message';
+  spaceStore.save({
+    id: slug,
+    title: 'Click send message',
+    actions: [{ id: actionId, label: 'Send message', composioSlug: SEND_OPERATION }],
+  });
+  const clicked = await clickAction(slug, actionId, { to: 'owner-controlled@example.test', body: 'Click safety proof.' });
+  assert.equal(clicked.status, 202, JSON.stringify(clicked.body));
+  assert.equal(clicked.body.pending, true);
+  assert.equal(capability.bodies(), 0, 'a send cannot cross before the human decision');
+  assert.equal(approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length, 1);
+  assert.equal(eventlog.listEvents(`workspace-action:${slug}`, { types: ['workflow_v3_auto_consent_decided'] }).length, 0);
+});
