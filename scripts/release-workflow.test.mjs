@@ -558,9 +558,10 @@ test('a flaky upload costs one asset, and an incomplete set is never published',
   // draft is flipped only after every asset matches its exact local size.
   const publish = runScripts(workflow.jobs?.['publish-release']);
   assert.doesNotMatch(publish, /--clobber/, 'a retry must not re-send assets that are already complete');
-  assert.match(publish, /for asset in "\$\{assets\[@\]\}"/, 'assets upload one at a time');
+  assert.match(publish, /upload_asset "\$asset" &/, 'missing assets upload together, not one at a time');
+  assert.match(publish, /wait "\$\{upload_pids\[\$index\]\}"/, 'each upload is waited on and its failure is named');
   assert.match(publish, /gh release delete-asset/, 'an incomplete asset is replaced, not duplicated');
-  assert.match(publish, /Could not upload \$ASSET_NAME after \$upload_attempts attempts/);
+  assert.match(publish, /Could not upload \$name after \$upload_attempts attempts/);
   const verifyIndex = publish.indexOf('Release assets are incomplete, not publishing');
   const publishIndex = publish.indexOf('--draft=false');
   assert.ok(verifyIndex > 0 && verifyIndex < publishIndex,

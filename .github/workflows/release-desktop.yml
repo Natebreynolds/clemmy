@@ -548,45 +548,61 @@ jobs:
             gh release edit "$RELEASE_TAG" --notes-file "$curated_notes_file"
           fi
 
-          # ONE ASSET AT A TIME, AND ONLY WHAT IS MISSING.
-          # A single flaky upload used to fail the whole step, and the retry
-          # re-sent every asset — four attempts of 1.8 GB, none of which
-          # finished, for one bad file. An asset whose uploaded size already
-          # equals the local file is complete and is left alone; any other
-          # state is deleted and re-sent, so a retry costs one file. The
-          # release is published only after every asset is verified present at
-          # its exact local size.
+          # EVERY MISSING ASSET AT ONCE, EACH WITH ITS OWN RETRY.
+          # One flaky asset used to fail the step, and the retry re-sent all of
+          # them: four attempts of 1.8 GB, none of which finished, for one bad
+          # file (2026-09-17, GitHub answering 422/400/500/502 on 400-500 MB
+          # uploads). Each asset now uploads in its own process and retries
+          # itself, so a failure costs one file while they still upload
+          # together. An asset whose uploaded size already equals the local
+          # file is left alone, so a re-run sends only what is missing.
           upload_attempts=5
-          for asset in "${assets[@]}"; do
-            ASSET_NAME="$(basename "$asset")"
-            export ASSET_NAME
+          upload_asset() {
+            local asset="$1"
+            local name local_size remote_size attempt backoff
+            name="$(basename "$asset")"
             local_size="$(wc -c < "$asset" | tr -d '[:space:]')"
-            uploaded=false
             for attempt in $(seq 1 "$upload_attempts"); do
-              remote_size="$(gh release view "$RELEASE_TAG" --json assets \
+              remote_size="$(ASSET_NAME="$name" gh release view "$RELEASE_TAG" --json assets \
                 --jq '[.assets[] | select(.name == env.ASSET_NAME) | .size] | first // empty')"
               if [[ "$remote_size" == "$local_size" ]]; then
-                uploaded=true
-                break
+                echo "$name is uploaded ($local_size bytes)."
+                return 0
               fi
               if [[ -n "$remote_size" ]]; then
-                echo "Replacing incomplete $ASSET_NAME ($remote_size of $local_size bytes)."
-                gh release delete-asset "$RELEASE_TAG" "$ASSET_NAME" --yes || true
+                echo "Replacing incomplete $name ($remote_size of $local_size bytes)."
+                gh release delete-asset "$RELEASE_TAG" "$name" --yes || true
               fi
               if (( attempt == upload_attempts )); then
                 break
               fi
               if ! gh release upload "$RELEASE_TAG" "$asset"; then
                 backoff=$(( attempt * 30 ))
-                echo "Upload of $ASSET_NAME failed (attempt $attempt); retrying in ${backoff}s."
+                echo "Upload of $name failed (attempt $attempt); retrying in ${backoff}s."
                 sleep "$backoff"
               fi
             done
-            if [[ "$uploaded" != true ]]; then
-              echo "::error::Could not upload $ASSET_NAME after $upload_attempts attempts."
-              exit 1
+            echo "::error::Could not upload $name after $upload_attempts attempts."
+            return 1
+          }
+
+          upload_pids=()
+          upload_names=()
+          for asset in "${assets[@]}"; do
+            upload_asset "$asset" &
+            upload_pids+=("$!")
+            upload_names+=("$(basename "$asset")")
+          done
+          upload_failed=false
+          for index in "${!upload_pids[@]}"; do
+            if ! wait "${upload_pids[$index]}"; then
+              echo "::error::Asset upload failed: ${upload_names[$index]}"
+              upload_failed=true
             fi
           done
+          if [[ "$upload_failed" == true ]]; then
+            exit 1
+          fi
 
           missing=()
           for asset in "${assets[@]}"; do
