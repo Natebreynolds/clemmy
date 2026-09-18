@@ -304,3 +304,30 @@ test('connected CLI instructions refuse the unavailable lie and name the reviewe
   assert.equal(out.includes('salesforce_sf_soql_query'), true);
   assert.equal(out.includes('Call them via `run_shell_command`'), false);
 });
+
+test("a CLI's own diagnosis read is provisioned beside its query, and the query still wins that CLI's objective", async () => {
+  // A tool that cannot report its own accounts forces the model to tell the
+  // user "I cannot run commands to check this" — the failure this read exists
+  // to remove. Both reads carry the tool's name, so the objective is answered
+  // by the operation that covers more of it, not by refusing as ambiguous.
+  catalog.recordConnectedCli(salesforce);
+  await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+  const descriptors = config.listReviewedCliReadDescriptors();
+  const diagnosis = descriptors.find((row) => row.descriptorId === 'salesforce.org.list');
+  assert.ok(diagnosis, JSON.stringify(descriptors.map((row) => row.descriptorId)));
+  assert.equal(diagnosis?.operationId, 'salesforce_sf_org_list');
+  assert.deepEqual(diagnosis?.argvPrefix, ['org', 'list', '--json']);
+  assert.deepEqual(diagnosis?.arguments, []);
+  assert.equal(diagnosis?.effect, 'read');
+
+  const installed = await acquisition.createProductionLiveReadAcquisitionRegistry().acquire({
+    requirementId: 'requirement-salesforce-soql-with-diagnosis',
+    objective: liveSearch,
+    role: 'source',
+    effect: 'read',
+  });
+  assert.equal(installed.status, 'installed', JSON.stringify(installed));
+  if (installed.status === 'installed') {
+    assert.equal(installed.manifest.operationId, 'salesforce_sf_soql_query');
+  }
+});

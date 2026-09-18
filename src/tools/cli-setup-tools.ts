@@ -22,7 +22,7 @@ import { textResult } from './shared.js';
  * job id and watch it with job_status.
  */
 
-const ACTION = z.enum(['status', 'install', 'auth', 'job_status']);
+const ACTION = z.enum(['status', 'install', 'auth', 'job_status', 'repairs', 'repair']);
 
 export function registerCliSetupTools(server: McpServer): void {
   server.tool(
@@ -33,7 +33,9 @@ export function registerCliSetupTools(server: McpServer): void {
       '- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / brew install / uv tool install / pipx install / pip install --user / git clone https).',
       '- auth: sign a catalog CLI in again. Browser-based flows run as a background job; interactive logins open the user\'s Terminal with the login already running (tell them to finish the prompts there). Never run a login through run_shell_command yourself.',
       '- job_status: check a previously started install/auth job by id.',
-      'Ask the user before install/auth (one approval covers the whole fix); status and job_status are read-only.',
+      '- repairs: the bounded fixes a CLI declares for its own local configuration (for example: it is authenticated but no default account/org/project is selected, so every command fails).',
+      '- repair: run one of those declared fixes. Pass catalogId, repairId and values. The argv is fixed in the catalog; values are single plain arguments, never shell.',
+      'Ask the user before install/auth (one approval covers the whole fix); status, job_status and repairs are read-only. Run a repair when the user agrees to it — never report that you cannot fix a tool without first checking repairs.',
     ].join('\n'),
     {
       action: ACTION.describe('What to do: status | install | auth | job_status.'),
@@ -45,12 +47,22 @@ export function registerCliSetupTools(server: McpServer): void {
         .describe('install with a raw command: bare binary name to remember on the user\'s roster after success.'),
       jobId: z.string().max(120).optional()
         .describe('job_status only: the id returned by install/auth.'),
+      repairId: z.string().max(120).optional()
+        .describe('repair only: the declared repair id, exactly as the repairs action reports it.'),
+      values: z.record(z.string(), z.string().max(200)).optional()
+        .describe('repair only: one plain value per declared argument, for example {"org":"user@example.com"}.'),
     },
-    async ({ action, catalogId, command, saveAs, jobId }) => {
+    async ({ action, catalogId, command, saveAs, jobId, repairId, values }) => {
       try {
         if (action === 'status') return await statusAction();
         if (action === 'install') return await installAction(catalogId, command, saveAs);
         if (action === 'auth') return await authAction(catalogId);
+        if (action === 'repairs') return await repairsAction(catalogId);
+        if (action === 'repair') {
+          const plain: Record<string, string> = {};
+          for (const [key, value] of Object.entries(values ?? {})) plain[key] = String(value);
+          return await repairAction(catalogId, repairId, plain);
+        }
         return await jobStatusAction(jobId);
       } catch (err) {
         return textResult(`cli_setup ${action} failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -155,4 +167,70 @@ async function jobStatusAction(jobId: string | undefined): Promise<ReturnType<ty
   if (!job) return textResult(`No install/auth job found with id "${id}" (jobs do not survive a daemon restart — start a fresh one if needed).`);
   const tail = job.output ? `\n--- output tail ---\n${job.output.slice(-1500)}` : '';
   return textResult(`${job.title}: ${job.status}${job.status !== 'running' && 'exitCode' in job ? ` (exit ${String(job.exitCode)})` : ''}${tail}`);
+}
+
+/** The declared repairs a CLI carries, or every CLI's when none is named. */
+async function repairsAction(catalogId: string | undefined): Promise<ReturnType<typeof textResult>> {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const wanted = catalogId?.trim().toLowerCase();
+  const entries = CLI_CATALOG.filter((entry) => (entry.repairs?.length ?? 0) > 0
+    && (!wanted || entry.id === wanted));
+  if (entries.length === 0) {
+    return textResult(wanted
+      ? `"${wanted}" declares no repairs. Its own status read (if it has one) still tells you what is wrong.`
+      : 'No catalog CLI declares a repair yet.');
+  }
+  const lines = entries.flatMap((entry) => (entry.repairs ?? []).map((repair) => [
+    `- ${entry.id} · ${repair.id} — ${repair.title}`,
+    `  ${repair.description}`,
+    `  values: ${repair.arguments.map((argument) => `${argument.name}${argument.required ? '' : ' (optional)'} — ${argument.description}`).join('; ') || 'none'}`,
+    repair.diagnosis ? `  check first with: ${repair.diagnosis}` : '',
+  ].filter(Boolean).join('\n')));
+  return textResult([
+    'Declared CLI repairs (bounded argv fixed in the catalog):',
+    ...lines,
+    'Run one with cli_setup {action:"repair", catalogId, repairId, values}.',
+  ].join('\n'));
+}
+
+/** Run one declared repair. The catalog owns the argv; this only substitutes
+ *  named values and spawns the resolved executable directly — never a shell. */
+async function repairAction(
+  catalogId: string | undefined,
+  repairId: string | undefined,
+  values: Record<string, string>,
+): Promise<ReturnType<typeof textResult>> {
+  const { declaredCliRepair, resolveDeclaredCliRepairArgv } = await import('../integrations/cli-catalog/catalog.js');
+  const declared = declaredCliRepair(catalogId, repairId);
+  if (!declared) {
+    return textResult(`No declared repair "${repairId ?? ''}" for CLI "${catalogId ?? ''}". Call cli_setup {action:"repairs"} for the exact ids.`);
+  }
+  const argv = resolveDeclaredCliRepairArgv(declared.repair, values);
+  if (!argv.ok) return textResult(`${declared.repair.id} was not run — ${argv.error}`);
+  const { findSafeCliCommand } = await import('../runtime/cli-discovery.js');
+  const safe = findSafeCliCommand(declared.entry.command);
+  if (!safe || safe.skipped || !safe.path) {
+    return textResult(`${declared.entry.command} is not installed on this machine, so ${declared.repair.id} cannot run. Install it first with cli_setup {action:"install"}.`);
+  }
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const run = promisify(execFile);
+  try {
+    const { stdout, stderr } = await run(safe.path, argv.argv, {
+      timeout: declared.repair.limits.timeoutMs,
+      maxBuffer: declared.repair.limits.maxStdoutBytes + declared.repair.limits.maxStderrBytes,
+      windowsHide: true,
+    });
+    const output = [stdout, stderr].map((part) => part.trim()).filter(Boolean).join('\n').slice(0, declared.repair.limits.maxStdoutBytes);
+    return textResult([
+      `${declared.repair.title} — done: ${declared.entry.command} ${argv.argv.join(' ')}`,
+      output || '(the command printed nothing, which this CLI does on success)',
+      declared.repair.diagnosis ? `Confirm it with ${declared.repair.diagnosis}.` : '',
+    ].filter(Boolean).join('\n'));
+  } catch (error) {
+    const failure = error as { stdout?: string; stderr?: string; message?: string };
+    const detail = [failure.stdout, failure.stderr, failure.message]
+      .map((part) => (part ?? '').trim()).filter(Boolean).join('\n').slice(0, declared.repair.limits.maxStderrBytes);
+    return textResult(`${declared.repair.title} failed: ${declared.entry.command} ${argv.argv.join(' ')}\n${detail}`);
+  }
 }

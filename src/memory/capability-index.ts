@@ -420,13 +420,61 @@ export interface CapabilitySearchOptions {
  * when the index is cold, so callers fall back to live provider discovery
  * rather than mistaking an unbuilt index for an empty world.
  */
+/**
+ * THE USER'S OWN INSTALLED TOOLS ANSWER FIRST.
+ *
+ * Relevance across a global provider catalogue is a popularity contest a
+ * locally installed command-line tool always loses: a search naming the tool
+ * by name returned twenty provider operations and never the reviewed read the
+ * machine actually holds, so the model concluded it could not inspect or
+ * repair that tool at all (live 2026-09-18, a Salesforce CLI with no default
+ * org). A row whose own identity contains a term of the request is the exact
+ * answer to it; those come first, bounded, and ordinary relevance follows.
+ */
+function ownToolMatches(
+  query: string,
+  options: CapabilitySearchOptions,
+  limit: number,
+): CapabilityOperationHit[] {
+  const terms = String(query).toLowerCase().split(/[^a-z0-9]+/i).filter((term) => term.length > 2);
+  if (terms.length === 0) return [];
+  try {
+    const filters: string[] = ["ops.active = 1", "ops.carrier_kind = 'cli'"];
+    const params: unknown[] = [];
+    if (options.effectClass) { filters.push('ops.effect_class = ?'); params.push(options.effectClass); }
+    const rows = db().prepare(`
+      SELECT ops.* FROM capability_operations AS ops
+       WHERE ${filters.join(' AND ')}
+       ORDER BY ops.identifier
+       LIMIT 200
+    `).all(...params) as Array<Record<string, unknown>>;
+    return rows
+      .map((row) => rowToOperation(row))
+      .map((operation) => {
+        const identity = `${operation.identifier} ${operation.displayName ?? ''}`.toLowerCase();
+        const matched = new Set(terms.filter((term) => identity.includes(term)));
+        return { operation, matched: matched.size };
+      })
+      .filter((entry) => entry.matched >= 2)
+      .sort((left, right) => right.matched - left.matched
+        || left.operation.identifier.localeCompare(right.operation.identifier))
+      .slice(0, Math.min(limit, 3))
+      .map((entry) => ({ ...entry.operation, score: 1 }));
+  } catch {
+    return [];
+  }
+}
+
 export function searchCapabilityOperations(
   query: string,
   options: CapabilitySearchOptions = {},
 ): CapabilityOperationHit[] {
   const match = ftsQuery(query);
   const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
-  if (!match) return [];
+  const own = options.carrierKind && options.carrierKind !== 'cli'
+    ? []
+    : ownToolMatches(query, options, limit);
+  if (!match) return own;
   try {
     const filters: string[] = ['ops.active = 1'];
     const params: unknown[] = [match];
@@ -444,15 +492,17 @@ export function searchCapabilityOperations(
        ORDER BY rank
        LIMIT ?
     `).all(...params) as Array<Record<string, unknown>>;
-    return rows.map((row, index) => ({
+    const ranked = rows.map((row, index) => ({
       ...rowToOperation(row),
       // bm25 returns lower-is-better; expose a bounded higher-is-better score.
       score: Math.max(0, 1 - index / Math.max(1, rows.length)),
     }));
+    const seen = new Set(own.map((hit) => hit.identifier));
+    return [...own, ...ranked.filter((hit) => !seen.has(hit.identifier))].slice(0, limit);
   } catch {
     // A cold or damaged index must degrade to live discovery, never throw
     // into a turn.
-    return [];
+    return own;
   }
 }
 

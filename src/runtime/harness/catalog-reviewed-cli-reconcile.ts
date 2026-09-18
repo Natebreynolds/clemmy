@@ -13,6 +13,7 @@ import pino from 'pino';
 
 import {
   CLI_CATALOG,
+  catalogReviewedReadsOf,
   readConnectedClis,
   readForgottenCliIds,
   type CatalogReviewedReadV1,
@@ -20,7 +21,7 @@ import {
 } from '../../integrations/cli-catalog/catalog.js';
 import { findSafeCliCommand } from '../cli-discovery.js';
 import { getSavedClis } from '../saved-clis.js';
-import { recordCapabilityOperations } from '../../memory/capability-index.js';
+import { listCapabilityOperationsForCarrier, recordCapabilityOperations } from '../../memory/capability-index.js';
 import {
   currentReviewedCliDescriptor,
   REVIEWED_CLI_READ_ACCOUNT,
@@ -39,10 +40,10 @@ export interface ReconcileCatalogReviewedCliReadsResult {
   skipped: string[];
 }
 
-function catalogReviewedReads(): readonly (CliCatalogEntry & { reviewedRead: CatalogReviewedReadV1 })[] {
-  return CLI_CATALOG.filter((entry): entry is CliCatalogEntry & { reviewedRead: CatalogReviewedReadV1 } => (
-    entry.reviewedRead !== undefined
-  ));
+/** One row per declared reviewed read. A CLI may declare several — its query
+ *  and its own diagnosis — and each is provisioned on the same terms. */
+function catalogReviewedReads(): readonly { entry: CliCatalogEntry; contract: CatalogReviewedReadV1 }[] {
+  return CLI_CATALOG.flatMap((entry) => catalogReviewedReadsOf(entry).map((contract) => ({ entry, contract })));
 }
 
 /**
@@ -134,7 +135,7 @@ export async function reconcileCatalogReviewedCliReads(
   const removed: string[] = [];
   const skipped: string[] = [];
   const catalogByDescriptor = new Map(
-    catalogReviewedReads().map((entry) => [entry.reviewedRead.descriptorId, entry] as const),
+    catalogReviewedReads().map((row) => [row.contract.descriptorId, row.entry] as const),
   );
 
   for (const existing of listReviewedCliReadDescriptors()) {
@@ -146,8 +147,7 @@ export async function reconcileCatalogReviewedCliReads(
     }
   }
 
-  for (const entry of catalogReviewedReads()) {
-    const contract = entry.reviewedRead;
+  for (const { entry, contract } of catalogReviewedReads()) {
     if (!entryIsUserConfirmed(entry, connected, saved) || forgotten.has(entry.id)) {
       skipped.push(entry.id);
       continue;
@@ -171,6 +171,14 @@ export async function reconcileCatalogReviewedCliReads(
       && sameClosedContract(existing, contract, executableRealpath)
       && (!rehash || currentReviewedCliDescriptor(existing) !== null)
     ) {
+      // An unchanged contract still has to be FINDABLE. Anything else that
+      // reconciles the `cli` space can retire this row, and a reviewed read
+      // the model cannot discover is a capability the machine holds and never
+      // offers. Restore it only when it is missing or retired, so an ordinary
+      // rehash still changes nothing.
+      const findable = listCapabilityOperationsForCarrier('cli', REVIEWED_CLI_READ_CARRIER, 200)
+        .some((row) => row.identifier === existing.operationId);
+      if (!findable) indexReviewedRead(existing);
       skipped.push(entry.id);
       continue;
     }

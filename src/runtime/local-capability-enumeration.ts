@@ -22,6 +22,7 @@
 import {
   recordCapabilityOperations,
   deactivateCapabilityCarrier,
+  listCapabilityOperationsForCarrier,
   indexedCapabilityCarriers,
   markCapabilityInventory,
   capabilityInventoryState,
@@ -165,7 +166,19 @@ export function indexDiscoveredClis(clis: readonly CliObservation[]): number {
   // full scan so an uninstall is reflected without waiting for a restart.
   const live = new Set(rows.map((row) => row.carrier));
   for (const carrier of indexedCapabilityCarriers('cli')) {
-    if (!live.has(carrier)) deactivateCapabilityCarrier('cli', carrier);
+    if (live.has(carrier)) continue;
+    // RETIRE ONLY WHAT THIS SCAN OWNS.
+    //
+    // A $PATH scan knows about programs; it recorded each one as a carrier
+    // whose own identifier is the command. Host-provisioned operations share
+    // the `cli` kind but live under a carrier that is not a program — a
+    // reviewed descriptor registry — so reconciling the whole kind against
+    // $PATH switched them off every scan. The user's own reviewed Salesforce
+    // reads were inactive for exactly that reason, invisible to discovery, and
+    // the model concluded it could not inspect or repair the tool at all.
+    const ownedByScan = listCapabilityOperationsForCarrier('cli', carrier, 200)
+      .some((row) => row.identifier.trim().toLowerCase() === carrier);
+    if (ownedByScan) deactivateCapabilityCarrier('cli', carrier);
   }
   return recorded;
 }

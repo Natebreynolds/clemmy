@@ -3,6 +3,7 @@ import { getSession, listEvents } from './eventlog.js';
 import { parseTaskMode, taskModeDigest, type TaskMode } from './task-mode.js';
 import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { declaredCliRepair } from '../../integrations/cli-catalog/catalog.js';
 
 export function acceptedTaskMode(sessionId: string | undefined, sourceUserSeq: number | undefined): TaskMode | undefined {
   if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || Number(sourceUserSeq) <= 0) return undefined;
@@ -20,6 +21,15 @@ export function acceptedTaskModeIdentity(sessionId: string, sourceUserSeq: numbe
 export function planModeReadOnlyRefusalText(name: string): string {
   return `PLAN_MODE_READ_ONLY: ${name} cannot execute in Plan mode. Investigate its schema and required arguments, then include the proposed action in publish_plan. The user can Execute the reviewed revision; no business effect or approval was started.`;
 }
+/** A `cli_setup` call naming a repair the catalog declares. Data, not a tool
+ *  list: the catalog owns which repairs exist and what argv each one runs. */
+function declaredCliRepairCall(name: string, args: unknown): boolean {
+  if (name !== 'cli_setup' || !args || typeof args !== 'object' || Array.isArray(args)) return false;
+  const call = args as Record<string, unknown>;
+  if (call.action !== 'repair') return false;
+  return declaredCliRepair(call.catalogId, call.repairId) !== null;
+}
+
 export function planModeCallRefusal(input: {
   mode: TaskMode | undefined; toolName: string; args: unknown; attestedEffect?: RuntimeToolEffect;
   /** The production host sealed this exact call (catalog entry, account,
@@ -82,6 +92,16 @@ export function planModeCallRefusal(input: {
   // and every business/external effect is untouched below.
   if (effect === 'host_only' && !identity.composioCarrier
     && registeredToolSideEffect(name) === 'read') return undefined;
+  // A TOOL'S OWN CONFIGURATION IS PREPARATION, NOT AN EXTERNAL EFFECT.
+  //
+  // A declared repair carries a fixed argv reviewed in source and changes only
+  // the local settings of a tool this plan needs — which account, org or
+  // project it uses when a command does not name one. Refusing it stranded
+  // planning behind a tool that was authenticated but unusable: the model
+  // could see the problem, could not fix it, and said it was unable to run
+  // commands at all. The repair stays named, bounded, and reversible by
+  // running it again with another value.
+  if (declaredCliRepairCall(name, effectiveArgs)) return undefined;
   // A PLANNING TURN VALIDATES WHAT IT WILL CALL.
   //
   // This gate is synchronous and sees only an effect label. An external write

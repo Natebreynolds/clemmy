@@ -115,3 +115,47 @@ test('job_status on an unknown id says so instead of inventing state', async () 
   const out = await call({ action: 'job_status', jobId: 'nope-123' });
   assert.match(out, /No install\/auth job found/);
 });
+
+test('a declared repair lists its values, runs one bounded argv, and refuses anything but a plain value', async () => {
+  // The failure this closes: a CLI is authenticated but has no default target,
+  // every command fails, and the model tells the user it cannot run commands
+  // to fix it. The catalog declares the exact argv; nothing here is shell.
+  const listed = await call({ action: 'repairs', catalogId: 'salesforce' });
+  assert.match(listed, /salesforce\.default-org/);
+  assert.match(listed, /org — Username or alias/);
+  assert.match(listed, /salesforce_sf_org_list/, 'the repair names the read that shows whether it is needed');
+
+  const unknown = await call({ action: 'repair', catalogId: 'salesforce', repairId: 'invented', values: { org: 'x@y.z' } });
+  assert.match(unknown, /No declared repair/);
+
+  for (const org of ['a; rm -rf /', 'a b', '$(whoami)', '']) {
+    const refused = await call({ action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org', values: { org } });
+    assert.match(refused, /was not run/, JSON.stringify(org));
+  }
+
+  // The resolver above points every catalog command at this node binary, so the
+  // repair really spawns: argv reaches the process and nothing is interpreted.
+  const ran = await call({
+    action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org',
+    values: { org: 'someone@example.test' },
+  });
+  assert.match(ran, /Set the default Salesforce org|failed/);
+  assert.doesNotMatch(ran, /cannot run|unable to run/i);
+});
+
+test('a planning turn may run a declared repair, and may not run an undeclared one', async () => {
+  const { planModeCallRefusal } = await import('../runtime/harness/accepted-task-mode.js');
+  const mode = { version: 1 as const, kind: 'plan' as const };
+  assert.equal(planModeCallRefusal({
+    mode, toolName: 'cli_setup',
+    args: { action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org', values: { org: 'a@b.c' } },
+  }), undefined, 'a declared repair is preparation, not an external effect');
+  for (const args of [
+    { action: 'repair', catalogId: 'salesforce', repairId: 'invented' },
+    { action: 'install', catalogId: 'salesforce' },
+    { action: 'auth', catalogId: 'salesforce' },
+  ]) {
+    assert.match(String(planModeCallRefusal({ mode, toolName: 'cli_setup', args })), /Plan/,
+      `${JSON.stringify(args)} must stay refused in Plan`);
+  }
+});

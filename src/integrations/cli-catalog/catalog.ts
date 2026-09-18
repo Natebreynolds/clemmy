@@ -91,6 +91,16 @@ export interface CliCatalogEntry {
    * catalog row; PATH discovery never becomes authority.
    */
   reviewedRead?: CatalogReviewedReadV1;
+  /**
+   * Further reviewed reads for the same executable, reviewed on the same
+   * terms. A CLI's own diagnosis (which accounts it holds, which is the
+   * default) is a read like any other: without it the model cannot tell an
+   * unauthenticated tool from an authenticated one that was never made the
+   * default, and it has to ask the user to run commands for it.
+   */
+  reviewedReads?: readonly CatalogReviewedReadV1[];
+  /** Bounded local repairs this CLI can perform on its own configuration. */
+  repairs?: readonly CatalogCliRepairV1[];
 }
 
 /** Host-reviewed CLI read. Bytes must match ReviewedCliArgumentV1 exactly. */
@@ -116,10 +126,106 @@ export interface CatalogReviewedReadV1 {
 }
 
 /**
+ * A bounded, reviewed repair a CLI can perform on its own local configuration.
+ *
+ * The failure this exists for is generic: a tool is authenticated but has no
+ * default account, project, org or app selected, so every command fails and
+ * the model has to tell the user "I cannot run commands to fix this." A repair
+ * is declared here, in source, exactly like a reviewed read: a fixed argv with
+ * named substitutions, no shell, no free-form arguments. It changes only the
+ * tool's own local configuration, so it is preparation rather than an external
+ * effect, and a planning turn may run it.
+ */
+export interface CatalogCliRepairV1 {
+  /** Stable id, unique within the catalog. */
+  id: string;
+  /** One line the model and the user both read before it runs. */
+  title: string;
+  description: string;
+  /**
+   * Exact argv after the executable. A token of the form `{name}` is replaced
+   * by that named argument's value; every other token is literal.
+   */
+  argv: readonly string[];
+  arguments: readonly {
+    name: string;
+    description: string;
+    required: boolean;
+  }[];
+  /** Operation id of the reviewed read that shows whether the repair is needed. */
+  diagnosis?: string;
+  /**
+   * Case-insensitive substrings of a failure that this repair addresses. A
+   * failing call that matches names this repair as its next step.
+   */
+  failureSignals: readonly string[];
+  limits: { timeoutMs: number; maxStdoutBytes: number; maxStderrBytes: number };
+}
+
+/**
  * Curated entries. Order doesn't matter — search ranks by relevance.
  * Keep this list deliberately small and well-tested rather than chasing
  * coverage; better to ship 15 reliable links than 50 broken ones.
  */
+/** The declared repair this exact call names, or null. Pure catalog data: the
+ *  harness uses it to admit a bounded local repair without knowing any tool. */
+export function declaredCliRepair(catalogId: unknown, repairId: unknown): {
+  entry: CliCatalogEntry; repair: CatalogCliRepairV1;
+} | null {
+  const id = typeof catalogId === 'string' ? catalogId.trim().toLowerCase() : '';
+  const repairId_ = typeof repairId === 'string' ? repairId.trim() : '';
+  if (!id || !repairId_) return null;
+  const entry = CLI_CATALOG.find((candidate) => candidate.id === id);
+  const repair = entry?.repairs?.find((candidate) => candidate.id === repairId_);
+  return entry && repair ? { entry, repair } : null;
+}
+
+/** Repairs whose declared failure signals appear in this failure text. */
+export function declaredCliRepairsForFailure(catalogId: string, failure: string): readonly CatalogCliRepairV1[] {
+  const entry = CLI_CATALOG.find((candidate) => candidate.id === catalogId.trim().toLowerCase());
+  const haystack = failure.toLowerCase();
+  return Object.freeze((entry?.repairs ?? []).filter((repair) => (
+    repair.failureSignals.some((signal) => haystack.includes(signal.trim().toLowerCase()))
+  )));
+}
+
+/** The exact argv for a declared repair, or the reason it cannot be built.
+ *  Values are substituted into `{name}` tokens only, and every value must be a
+ *  single plain argument — no shell, no separators, no expansion. */
+export function resolveDeclaredCliRepairArgv(
+  repair: CatalogCliRepairV1,
+  values: Record<string, unknown>,
+): { ok: true; argv: string[] } | { ok: false; error: string } {
+  const resolved: Record<string, string> = {};
+  for (const argument of repair.arguments) {
+    const raw = values[argument.name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      if (argument.required) return { ok: false, error: `"${argument.name}" is required: ${argument.description}` };
+      continue;
+    }
+    const value = String(raw).trim();
+    if (!/^[A-Za-z0-9._@:+\/-]{1,200}$/.test(value)) {
+      return { ok: false, error: `"${argument.name}" must be one plain value (letters, digits and . _ @ : + / -).` };
+    }
+    resolved[argument.name] = value;
+  }
+  const argv: string[] = [];
+  for (const token of repair.argv) {
+    const substituted = token.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, name: string) => resolved[name] ?? '\u0000');
+    if (substituted.includes('\u0000')) return { ok: false, error: `the repair needs a value for "${token}"` };
+    argv.push(substituted);
+  }
+  return { ok: true, argv };
+}
+
+/** Every reviewed read a catalog entry declares, primary first. */
+export function catalogReviewedReadsOf(entry: CliCatalogEntry): readonly CatalogReviewedReadV1[] {
+  return Object.freeze([
+    ...(entry.reviewedRead ? [entry.reviewedRead] : []),
+    ...(entry.reviewedReads ?? []),
+  ]);
+}
+
 export const CLI_CATALOG: readonly CliCatalogEntry[] = [
   {
     id: 'salesforce',
@@ -145,7 +251,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
       descriptorId: 'salesforce.data.query',
       operationId: 'salesforce_sf_soql_query',
       displayName: 'Salesforce CLI SOQL query',
-      description: 'Read-only SOQL via the local Salesforce sf CLI (sf data query --json). Query Salesforce opportunities, accounts, contacts, leads, and deals.',
+      description: 'Read-only SOQL via the local Salesforce sf CLI (sf data query --json). Query Salesforce opportunities, accounts, contacts, leads, and deals. If it fails because no default org is set, read salesforce_sf_org_list and fix it with cli_setup {action:"repairs", catalogId:"salesforce"} — never report that you cannot run the command.',
       argvPrefix: ['data', 'query', '--json'],
       arguments: [
         { name: 'query', kind: 'option', token: '--query', valueType: 'string', required: true },
@@ -158,6 +264,41 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
         maxArgumentBytes: 32_768,
       },
     },
+    repairs: [
+      {
+        id: 'salesforce.default-org',
+        title: 'Set the default Salesforce org',
+        description: 'Point the Salesforce CLI at one of its authenticated orgs, so commands that do not name an org stop failing (sf config set target-org=<org> --global).',
+        argv: ['config', 'set', 'target-org={org}', '--global'],
+        arguments: [
+          { name: 'org', description: 'Username or alias of an authenticated org, exactly as the org list reports it.', required: true },
+        ],
+        diagnosis: 'salesforce_sf_org_list',
+        failureSignals: [
+          'NoDefaultEnvError',
+          'No default environment',
+          'No default org',
+          'no default org',
+        ],
+        limits: { timeoutMs: 30_000, maxStdoutBytes: 65_536, maxStderrBytes: 65_536 },
+      },
+    ],
+    reviewedReads: [
+      {
+        descriptorId: 'salesforce.org.list',
+        operationId: 'salesforce_sf_org_list',
+        displayName: 'Salesforce CLI org list',
+        description: 'List the Salesforce orgs this machine is authenticated to (sf org list --json): each org\'s username, alias, connection status, and which one is the default target-org. Read this before reporting a Salesforce CLI authentication problem.',
+        argvPrefix: ['org', 'list', '--json'],
+        arguments: [],
+        limits: {
+          timeoutMs: 30_000,
+          maxStdoutBytes: 262_144,
+          maxStderrBytes: 65_536,
+          maxArgumentBytes: 1_024,
+        },
+      },
+    ],
   },
   {
     id: 'higgsfield',

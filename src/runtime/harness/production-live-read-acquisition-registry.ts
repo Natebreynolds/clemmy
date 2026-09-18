@@ -8,6 +8,7 @@
  * fails closed and retires authority previously selected for the requirement.
  */
 import type { CapabilityCarrierKind, CapabilityOperationRow } from '../../memory/capability-index.js';
+import { listCapabilityOperationsForCarrier } from '../../memory/capability-index.js';
 import type { ManagedMcpServer } from '../../types.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { discoverMcpServers } from '../mcp-config.js';
@@ -937,6 +938,50 @@ export function createProductionLiveReadAcquisitionRegistry(
         );
       }
       return block(requirement, 'missing', 'no current attested read capability matched the objective');
+    }
+    // A TOOL'S SIBLING OPERATIONS ARE NOT AN AMBIGUITY.
+    //
+    // One executable exposes several reviewed operations — its query and its
+    // own diagnosis — and both carry the tool's name, so both match a request
+    // that names the tool. Keep the operation whose identity answers more of
+    // the request; call it ambiguous only when nothing separates them, which
+    // is what two accounts of the SAME operation look like (identical
+    // identifiers, identical score) and what still has to reach the user.
+    const objectiveTermSet = new Set(objectiveTerms(requirement.objective));
+    // Score on the same material the advisory match reads — identity, display
+    // name and description — so two operations that describe themselves the
+    // same way stay a tie, and only a genuinely closer answer wins.
+    const rowsByIdentifier = new Map<string, CapabilityOperationRow>();
+    for (const nomination of nominations) {
+      const key = nomination.identity.reference.identifier.trim().toLowerCase();
+      if (rowsByIdentifier.has(key)) continue;
+      for (const row of listCapabilityOperationsForCarrier(nomination.carrier.kind, nomination.carrier.name)) {
+        rowsByIdentifier.set(row.identifier.trim().toLowerCase(), row);
+      }
+    }
+    // Rank only when every candidate describes itself. A candidate with no
+    // indexed description has nothing to compare, and preferring a name that
+    // happens to echo the request would silently pick between two operations
+    // the harness cannot actually tell apart.
+    const rankable = nominations.every((nomination) => (
+      rowsByIdentifier.has(nomination.identity.reference.identifier.trim().toLowerCase())
+    ));
+    const identityScore = (nomination: ProductionLiveReadNominationV1): number => {
+      const row = rowsByIdentifier.get(nomination.identity.reference.identifier.trim().toLowerCase());
+      const material = [
+        nomination.identity.reference.identifier,
+        row?.displayName ?? '',
+        row?.description ?? '',
+      ].join(' ');
+      // DISTINCT terms of the request answered, so repeating the same words in
+      // a name and a description cannot outscore an operation that genuinely
+      // covers more of what was asked.
+      return new Set(objectiveTerms(material).filter((term) => objectiveTermSet.has(term))).size;
+    };
+    if (nominations.length > 1 && rankable) {
+      const best = Math.max(...nominations.map(identityScore));
+      const strongest = nominations.filter((nomination) => identityScore(nomination) === best);
+      if (strongest.length === 1) nominations = strongest;
     }
     if (nominations.length !== 1) {
       return block(

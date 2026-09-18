@@ -156,3 +156,41 @@ test('asking is recorded so it happens once, including when there is nothing', (
   indexCliSubcommands('plainly', []);
   assert.equal(capabilityInventoryState('plainly'), 'none');
 });
+
+test('a $PATH scan retires programs that left $PATH and never the host-provisioned operations beside them', async () => {
+  // The dead end this closes: reviewed CLI reads are recorded under a carrier
+  // that is a descriptor registry, not a program. Reconciling the whole `cli`
+  // space against $PATH switched them off on every scan, so the machine held
+  // a Salesforce read that discovery could never return and the model reported
+  // it could not inspect or repair that CLI at all.
+  const { recordCapabilityOperations } = await import('../memory/capability-index.js');
+  recordCapabilityOperations([{
+    identifier: 'vendor_cli_account_list',
+    carrierKind: 'cli',
+    carrier: 'reviewed-cli-config',
+    displayName: 'Vendor CLI account list',
+    description: 'List the accounts this machine is authenticated to.',
+    effectClass: 'read',
+    effectProvenance: 'curated',
+    accountIdentity: 'reviewed_cli:host',
+    parentIdentifier: 'vendor.account.list',
+  }]);
+  indexDiscoveredClis([
+    { command: 'vcs', path: '/usr/local/bin/vcs', isLikelyCli: true },
+    { command: 'departing', path: '/usr/local/bin/departing', isLikelyCli: true },
+  ]);
+  assert.equal(
+    listCapabilityOperationsForCarrier('cli', 'reviewed-cli-config').some((row) => row.identifier === 'vendor_cli_account_list'),
+    true,
+    'a host-provisioned operation survives a scan that never enumerates it',
+  );
+
+  // The program that left $PATH is still retired, which is what this scan owns.
+  indexDiscoveredClis([{ command: 'vcs', path: '/usr/local/bin/vcs', isLikelyCli: true }]);
+  assert.equal(listCapabilityOperationsForCarrier('cli', 'departing').length, 0, 'an uninstalled program is retired');
+  assert.equal(
+    listCapabilityOperationsForCarrier('cli', 'reviewed-cli-config').some((row) => row.identifier === 'vendor_cli_account_list'),
+    true,
+    'and the host-provisioned operation is still findable',
+  );
+});
