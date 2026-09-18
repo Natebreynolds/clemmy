@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { TOOL_REGISTRY } from './tool-registry.js';
 import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
+import { currentManifestOperationContract } from '../runtime/harness/current-manifest-operation-semantics.js';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -291,8 +292,9 @@ export function promoteWorkflowFromSession(input: {
     };
   }
   const def = draftToDefinition(name, draft);
-  // Same chat-aware binding as workflow_create: commit a toolkit the chat
-  // discussed (e.g. Apify) into the step that names it before persisting.
+  // Same citation-then-binding order as workflow_create: a step that already
+  // names its operation is bound by that citation, not by a toolkit guess.
+  recordAuthoredStepCitations(def.steps);
   const promoteBind = bindChatDiscussedToolkits(def.steps, sid);
   const built = commitAuthoredWorkflow(def, dirName);
   if (!built.ok) {
@@ -526,6 +528,67 @@ export function promptNamesExactOperation(prompt: string): boolean {
   return TOOL_REGISTRY.some((entry) => entry.name.includes('_') && lower.includes(entry.name.toLowerCase()));
 }
 
+// ── Authored-step citations ────────────────────────────────────────────────
+//
+// An authoring turn cites the exact operation IT calls. Until now it cited
+// nothing for the steps of the workflow it AUTHORS: those operations lived only
+// as prose inside a step prompt, so the toolkit binder below had to infer them
+// at run time. Live 2026-09-18, that inference bound a Salesforce read to the
+// Composio family the step's own prompt forbade, and validation then failed the
+// workflow the same turn had just built.
+//
+// A citation is a FIELD, never a sentence: the operations an authored step
+// names structurally, resolved against the current callable catalog by
+// identity. Recording is strictly additive — a cited operation joins the step's
+// tool scope, an uncited step keeps exactly the scope it already had.
+
+/** The operations an authored step NAMES structurally — its direct call and any
+ *  explicit tool scope. The prompt is deliberately not consulted. */
+function namedOperationsOfAuthoredStep(
+  step: Pick<WorkflowStepInput, 'allowedTools' | 'call'>,
+): string[] {
+  return [...(step.call?.tool ? [step.call.tool] : []), ...(step.allowedTools ?? [])]
+    .map((name) => String(name ?? '').trim())
+    .filter((name) => name.length > 0 && name !== '*');
+}
+
+/** Reopen each named operation from the CURRENT callable catalog. Identity
+ *  decides, never tokens; an absent or ambiguous operation resolves to nothing,
+ *  the same fail-closed reading publication already applies to a plan's own
+ *  steps. Returns the canonical operation ids this step has cited. */
+export function citedOperationsForAuthoredStep(
+  step: Pick<WorkflowStepInput, 'allowedTools' | 'call'>,
+): string[] {
+  const cited: string[] = [];
+  for (const named of namedOperationsOfAuthoredStep(step)) {
+    let operationId: string | null = null;
+    try { operationId = currentManifestOperationContract(named)?.operationId ?? null; } catch {
+      // A catalog that cannot be read names no operation here.
+    }
+    if (operationId && !cited.includes(operationId)) cited.push(operationId);
+  }
+  return cited;
+}
+
+/** Land every resolved citation in the authored step's own tool scope, so
+ *  nothing has to infer it later. UNION ONLY: this never removes a tool and
+ *  never gives scope to a step that cited nothing, so a workflow that runs
+ *  today runs identically after it. */
+export function recordAuthoredStepCitations(
+  steps: Array<Pick<WorkflowStepInput, 'id' | 'allowedTools' | 'call'>>,
+): { citedNotes: string[] } {
+  const citedNotes: string[] = [];
+  for (const step of steps) {
+    const cited = citedOperationsForAuthoredStep(step);
+    if (cited.length === 0) continue;
+    const scope = [...new Set<string>([...(step.allowedTools ?? []), ...cited])];
+    const added = cited.filter((id) => !(step.allowedTools ?? []).includes(id));
+    step.allowedTools = scope;
+    if (added.length > 0) citedNotes.push(`Step \`${step.id}\` cites ${added.join(', ')}.`);
+  }
+  return { citedNotes };
+}
+
 /** Pure step-binder: commit a DISCUSSED toolkit into any step whose prompt NAMES
  *  it AS A TOOL (not as a scrape target) — lock the tool surface to composio +
  *  append a use-this-toolkit directive. Mutates the steps. Exported for tests so
@@ -549,6 +612,12 @@ export function bindDiscussedToolkitsIntoSteps(
     // disabled. Naming an operation is a decision; a toolkit guess must not
     // overrule it, and a prohibition must never read as a request.
     if (promptNamesExactOperation(prompt)) continue;
+    // A STEP CARRYING A RESOLVED CITATION HAS ALREADY BEEN BOUND.
+    //
+    // The structural half of the rule above: the prompt check reads a sentence,
+    // this reads the step's own fields against the current catalog. A cited
+    // step needs no toolkit guess and must never be widened into one.
+    if (citedOperationsForAuthoredStep(step).length > 0) continue;
     const named = discussed.find((tk) => {
       const nm = escapeRe(tk.name);
       if (!new RegExp(`\\b${nm}\\b`, 'i').test(prompt)) return false;
@@ -1040,7 +1109,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
         }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. Composio output keeps its `{successful, data, ...}` envelope: bind provider fields with paths such as `steps.fetch.output.data.records`, and validate them with contract paths such as `data.records`. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
-        allowedTools: z.array(z.string()).optional(),
+        allowedTools: z.array(z.string()).optional().describe('CITE THE EXACT OPERATION this step will run, by its operation id — the same discover-and-cite rule a plan follows for its own steps, one level down. A step whose operation is named here is bound by that citation: nothing infers a tool family for it later, and execution does not rediscover it. Omit only for a step that does no external work; an omitted list keeps the workflow-level scope.'),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
@@ -1139,6 +1208,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
+      // Citations first: land every operation an authored step already names in
+      // that step's own tool scope, so the binder below never has to infer one
+      // and execution never has to rediscover it.
+      recordAuthoredStepCitations(def.steps);
       // Chat-aware binding: commit any toolkit the user discussed in THIS chat
       // into the step that names it (e.g. "Apify" → lock the scrape step to
       // composio + a use-Apify directive) BEFORE validation/persist, so the
