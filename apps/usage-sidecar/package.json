@@ -1,0 +1,12 @@
+{
+  "name": "@clementine/usage-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local task-level token proof: Clementine vs Claude Code, Cowork, and Codex",
+  "scripts": {
+    "start": "tsx server.ts",
+    "test": "tsx --test src/*.test.ts",
+    "build": "vite build --config web/vite.config.ts"
+  }
+}

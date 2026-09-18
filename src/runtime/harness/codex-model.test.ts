@@ -45,18 +45,40 @@ function modelRequest(input: ModelRequest['input'] = []): ModelRequest {
   } as unknown as ModelRequest;
 }
 
-test('buildCodexRequestBody sets a per-session prompt_cache_key inside a run context, omits it outside', () => {
-  // Outside any harness run context (unit/contract tests) → no key → the wire
-  // shape is byte-identical to before this feature.
+test('buildCodexRequestBody keys EVERY call, sharded by session and prompt shape', () => {
+  // CONTRACT CHANGED 2026-09-18, from measurement rather than preference.
+  //
+  // This previously omitted the key outside a run context, to keep the wire
+  // byte-identical to the pre-feature shape. Live measurement showed the cost:
+  // three of six observed frames in one chat turn carried no key, and a keyless
+  // call is never routed to a warm node, so it can never hit. The codex wires
+  // ran at 5.1% and 7.2% across 11.4M input tokens in a day against 59% and 44%
+  // on the anthropic wires.
   const outside = buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }]));
-  assert.equal(outside.prompt_cache_key, undefined);
+  assert.match(String(outside.prompt_cache_key), /^clem:nosession:[0-9a-f]{12}$/,
+    'a call with no run context still shards by shape rather than going unkeyed');
 
-  // Inside a run context → a stable per-session shard key routes the session's
-  // calls to the same cache node so the tool-schema prefix actually hits.
   const inside = harnessRunContextStorage.run({ sessionId: 'sess-abc' } as never, () =>
     buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
   );
-  assert.equal(inside.prompt_cache_key, 'clem:sess-abc');
+  assert.match(String(inside.prompt_cache_key), /^clem:sess-abc:[0-9a-f]{12}$/);
+});
+
+test('two prompt SHAPES in one session get different cache keys', () => {
+  // The second measured defect: one session interleaved a 16-tool agent, a
+  // 36-tool agent and toolless sub-calls under a single key. OpenAI caches the
+  // longest identical PREFIX, so shapes sharing a key evict one another — two
+  // consecutive byte-identical frames of the 16-tool agent still cached
+  // nothing. Different shapes must not fight over one node.
+  const run = (instructions: string) => harnessRunContextStorage.run({ sessionId: 'sess-shape' } as never, () =>
+    buildCodexRequestBody('gpt-5.5', { ...modelRequest([{ role: 'user', content: 'hi' }]), systemInstructions: instructions } as unknown as ModelRequest),
+  );
+  const a = run('AGENT ONE RUBRIC');
+  const b = run('A COMPLETELY DIFFERENT AGENT RUBRIC');
+  assert.notEqual(a.prompt_cache_key, b.prompt_cache_key, 'different shapes shard apart');
+
+  // And the same shape is stable call to call, or nothing could ever cache.
+  assert.equal(run('AGENT ONE RUBRIC').prompt_cache_key, a.prompt_cache_key, 'same shape, same key');
 });
 
 function requestWithInstructions(systemInstructions: string, input: ModelRequest['input'] = [{ role: 'user', content: 'hi' }]): ModelRequest {

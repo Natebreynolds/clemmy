@@ -65,6 +65,8 @@
     "rehearse:upgrade:v314": "tsx scripts/rehearse-v314-upgrade.mts",
     "eval:spans": "tsx scripts/eval-spans.ts",
     "eval:promote": "tsx scripts/eval-promote.ts",
+    "meter": "tsx apps/usage-sidecar/server.ts",
+    "test:meter": "tsx --test apps/usage-sidecar/src/*.test.ts",
     "measure:efficiency": "tsx scripts/measure-efficiency.ts",
     "measure:sessions": "tsx scripts/compare-sessions.ts",
     "measure:turns": "tsx scripts/compare-turns.ts",
