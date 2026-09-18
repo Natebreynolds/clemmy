@@ -22,6 +22,7 @@
  * surface as soft signals the user can override.
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { operationIdentity } from '../tools/operation-name-identity.js';
 import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 export { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
@@ -543,6 +544,7 @@ export function checkCallNode(
   if (!slug) return { errors, warnings }; // CALL-1 owns the missing-tool error
   const isLocal = knownToolNames?.has(slug) ?? false;
   const isComposio = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(slug);
+  const declaredIdentity = operationIdentity(slug);
   // Tool identifiers come in several families (Composio SCREAMING_SNAKE, cx_
   // aliases, local MCP names, lowercase CLI-discovered tools) — the hard
   // error targets only what can't be ANY identifier: prose, whitespace,
@@ -566,9 +568,20 @@ export function checkCallNode(
         `Step "${step.id ?? '?'}" call to ${slug} is missing required argument(s): ${argError.field} — verified against the tool's real schema. The run would fail at dispatch; add the missing arg(s) or template them from an upstream step.`,
       );
     }
-  } else if (isComposio && !isLocal) {
+  } else if (!isLocal && (isComposio || declaredIdentity)) {
+    // AN UNVERIFIABLE OPERATION IS UNVERIFIABLE WHATEVER CARRIES IT.
+    //
+    // This warned only for composio-SHAPED names, so a step calling a
+    // lower_snake operation — every reviewed CLI read — with a wrong id got no
+    // warning at all and failed on first fire instead. Identity widens the
+    // warning to any declared operation and keeps the advice carrier-correct:
+    // composio_search_tools is the right instruction for a provider slug and
+    // the wrong one for a local binary.
+    const how = declaredIdentity && declaredIdentity.providerKind !== 'composio'
+      ? 'confirm the exact operation id (tool_search shows the real id + required args)'
+      : 'confirm it exists (composio_search_tools shows the real slug + required args)';
     warnings.push(
-      `Step "${step.id ?? '?'}" call.tool "${slug}" can't be verified against the tool catalog right now — confirm it exists (composio_search_tools shows the real slug + required args) before relying on it; a wrong slug fails on first fire.`,
+      `Step "${step.id ?? '?'}" call.tool "${slug}" can't be verified against the tool catalog right now — ${how} before relying on it; a wrong slug fails on first fire.`,
     );
   }
   return { errors, warnings };
