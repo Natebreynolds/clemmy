@@ -6,6 +6,8 @@ import {
   type WorkflowStepShape,
 } from './workflow-validator.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
+import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
+import { currentManifestOperationContract } from '../runtime/harness/current-manifest-operation-semantics.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
 import { workflowAuthoringAdvisories } from './workflow-contract-proposals.js';
@@ -248,13 +250,45 @@ const READ_INTENT_RE =
 // A step's tool surface reaches OUTSIDE the model (so it can actually return real
 // data — or silently nothing). Used to decide whether a creation test is worth
 // running. A pure-LLM step (no external tools) has nothing real to validate.
+/** Does this name identify a real operation, according to the registries that
+ *  own operation identity? A reviewed CLI read is indexed under a descriptor
+ *  registry and a provider operation under the callable catalog; neither is a
+ *  spelling. Best-effort and sync: a registry that cannot be read here simply
+ *  identifies nothing, and the shape tests below still apply. */
+function namesKnownOperation(tool: string): boolean {
+  const name = tool.trim().toLowerCase();
+  if (!name) return false;
+  try {
+    for (const descriptor of listReviewedCliReadDescriptors()) {
+      if (descriptor.operationId && descriptor.operationId.trim().toLowerCase() === name) return true;
+    }
+  } catch { /* no reviewed-read registry here */ }
+  try {
+    return Boolean(currentManifestOperationContract(tool));
+  } catch {
+    return false;
+  }
+}
+
 function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: string; forEach?: string; call?: { tool?: string } }): boolean {
   if (step.call?.tool) return true;
   if (step.usesSkill) return true;
   if (step.forEach) return true;
   const tools = step.allowedTools ?? [];
   return tools.some((t) =>
-    t === '*'
+    // IDENTITY FIRST, SHAPE ONLY AS A FALLBACK.
+    //
+    // The UPPER_SNAKE test below was added when an author named a provider
+    // OPERATION where the gate was looking for a carrier. It fixed that carrier
+    // and left the next one: a reviewed CLI read is lower_snake
+    // (`salesforce_sf_soql_query`), so it matched nothing and read as "reaches
+    // nothing external" — no testable read, no creation test, enable directly.
+    // Live 2026-09-18: friday-sales-leadership-email, whose first step is that
+    // exact read and whose last step sends mail, auto-enabled having never
+    // proven its data step. Ask the registries that own operation identity
+    // instead of guessing from spelling, so the NEXT carrier is covered too.
+    namesKnownOperation(t)
+    || t === '*'
     // A provider OPERATION reaches outside as surely as its carrier does.
     // Operation names are UPPER_SNAKE and match none of the carrier prefixes
     // below, so a step that named one read as "reaches nothing external": not a
