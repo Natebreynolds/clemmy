@@ -13,7 +13,7 @@ Two counts, taken 2026-09-18 on `main` at `5f0fdae3`:
 
 | Measure | Count |
 |---|---|
-| Sites type-testing an operation with `/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/` | **21**, across 17 files |
+| Sites type-testing an operation with `/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/` | **21**, across 17 files (9 Category A, 11 Category B, 1 Category C) |
 | Non-test files containing hardcoded carrier/tool literals | **108** (41 occurrences in `host-turn-runner.ts`, 31 in `brackets.ts`, 29 in `tool-effect.ts`) |
 
 That regex is Composio's *spelling convention* used as a *type test*. A reviewed CLI
@@ -88,7 +88,7 @@ Nothing downstream re-derives any of those from the string.
 
 Not all 21 are the same. Two categories, and only one is the bug.
 
-### Category A — legitimately Composio-specific (8 sites): KEEP, but narrow
+### Category A — legitimately Composio-specific (9 sites): KEEP, but narrow
 
 These ask *"is this a Composio slug?"*, which is a fair question inside a
 Composio-only code path. The defect is only when their answer is consumed as
@@ -104,12 +104,13 @@ Composio-only code path. The defect is only when their answer is consumed as
 | `runtime/harness/capability-resolution.ts:491` | resolve a requested composio target |
 | `runtime/harness/execution-gate.ts:162,393` | composio read-rule lookup |
 | `tools/tool-search-provider-sources.ts:1570` | composio candidate validation |
+| `tools/operation-name-identity.ts:91` | a composio slug named in a query **before discovery has seen it** |
 
 **Action:** rename each to say `composio` in the identifier (several already do), and
 assert by test that no caller outside a Composio path consumes them. No behaviour
 change.
 
-### Category B — universal type tests (11 sites): DELETE, replace with identity
+### Category B — universal type tests (10 sites): DELETE, replace with identity
 
 These decide "is this an operation" for *all* carriers, and are the bug.
 
@@ -122,7 +123,6 @@ These decide "is this an operation" for *all* carriers, and are the bug.
 | `runtime/harness/discovery-boundary.ts:163` | exact-identifier vs natural-language search |
 | `execution/workflow-validator.ts:545,941` | structured-call validation |
 | `runtime/harness/accepted-source-catalog-scope.ts:33` | accepted catalog scope membership |
-| `tools/operation-name-identity.ts:29,91` | my own 2026-09-18 fallback |
 
 **Action:** each calls `operationIdentity(name)` and branches on the **declared**
 `providerKind` / `effect`. No regex.
@@ -143,11 +143,19 @@ Write `operation-identity.test.ts` asserting, for one operation of *each*
 test must be red for `reviewed_cli` before any Category B change and green after.
 Nothing else moves until this exists.
 
-**Step 1 — one owner.**
-Promote `src/tools/operation-name-identity.ts` into the single
-`operationIdentity()` module and **delete its shape fallback** (lines 29, 91). A name
-no registry knows is not an operation — that is the whole point. Expect fallout; the
-Step 0 test says whether it is real.
+**Step 1 — one owner. DONE (`0d70c7a7`).**
+`operationIdentity()` answers from declaration for all four provider kinds, with no
+shape fallback of its own. The Step 0 test was red for `reviewed_cli` before it
+existed.
+
+> **Correction, found by executing this step.** The plan originally said to delete the
+> shape fallback in `operationNamedInQuery` too (`operation-name-identity.ts:91`).
+> Trial-deleting it failed a pin: *"a composio slug no registry carries still resolves
+> by shape."* That fallback is **load-bearing** — detecting a composio operation the
+> catalog has not discovered YET is a real capability, and before discovery, spelling
+> is the only signal that exists. It is therefore **Category A**, not B: narrow to
+> composio, name it so, never let it answer "is this an operation" for other carriers.
+> `operationIdentity` remains fallback-free, which is what matters.
 
 **Step 2 — Category B, one site per commit, in dependency order.**
 `callable-surface` → `discovery-boundary` → `workflow-step-external-catalog` →
@@ -180,6 +188,10 @@ it by replacing carrier literals with the Step 4 table, not by find-and-replace.
 - **Every Category B commit needs a red-before proof.** Demonstrated by temporarily
   reverting the change and showing the test fails — the technique used on
   2026-09-18 for `f06a83e4` and `8a553414`.
+- **Never quote a guarded sentence in a comment.** `tool-search-callable-refusal.test.ts`
+  locates its guard with `src.indexOf('No returned candidate was materialized')`; a
+  comment repeating that string shadows the real one and the pin fails somewhere
+  unrelated. Cost one confusing red during Step 0.
 - **Run `npm test` in ≤80-file chunks**, plus `npm run journeys` separately; the
   isolated suite excludes `src/journeys/*`.
 
