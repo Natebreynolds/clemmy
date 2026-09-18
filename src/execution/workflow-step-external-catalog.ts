@@ -472,16 +472,94 @@ export async function prepareWorkflowStepExternalCatalog(input: {
         detail: revalidated.refusal.code,
       };
     }
-    for (const entry of selected) {
-      if (!publishRevalidatedObservation(
-        entry,
-        revalidated.definitions.get(entry.manifest.operationId.toLowerCase()),
-      )) {
+    // A PUBLISH-TIME MISMATCH IS DRIFT TOO.
+    //
+    // Revalidation and this publish compare the SAME live definition against
+    // the SAME stored manifest, but across different field sets: publish also
+    // checks `invokePortId` and `accountIdentity`, for which revalidation has
+    // no drift code. So when either of those moved, revalidation returned ok,
+    // publish disagreed, and the run took a terminal refusal with no successor
+    // path — parked forever waiting for a capability that was present the
+    // whole time.
+    //
+    // That is the 2026-09-02 failure recorded above, one comparison later:
+    // daily-standup-email blocked every morning from 2026-09-16 on
+    // its calendar-list operation while that toolkit was connected, the
+    // operation was live,
+    // and its pinned connection id was still valid. Route the mismatch into the
+    // same exact-provisioning successor path a revalidation drift takes, once.
+    const firstPass = revalidated;
+    const unpublished = selected.filter((entry) => !publishRevalidatedObservation(
+      entry,
+      firstPass.definitions.get(entry.manifest.operationId.toLowerCase()),
+    ));
+    if (unpublished.length > 0) {
+      const retryable = unpublished
+        .map((entry) => entry.manifest.operationId)
+        .filter((operationId) => !reboundOperationIds.includes(operationId));
+      // Already re-provisioned once, or there is no accepted source to
+      // provision against — the mismatch is real and terminal.
+      // One attempt, never a loop.
+      if (retryable.length === 0 || !input.acceptedSource) {
         return {
           status: 'refused',
           reason: 'selected_definition_observation_refused',
-          operationId: entry.manifest.operationId,
+          operationId: unpublished[0]!.manifest.operationId,
         };
+      }
+      const republished = await (
+        dependencies.provisionExactOperations ?? provisionExactWorkflowProviderOperations
+      )({
+        ...input.acceptedSource,
+        operationIds: retryable,
+        ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
+      });
+      if (!republished.ok) {
+        return {
+          status: 'refused',
+          reason: 'exact_operation_provisioning_refused',
+          operationId: republished.identifier,
+          detail: ['observation_mismatch_rebind', republished.code, republished.detail].filter(Boolean).join(':'),
+        };
+      }
+      if (dependencies.manifestStore === undefined) store = peekCapabilityManifestStore();
+      currentRows = currentComposioManifestRows(store);
+      byOperation = rowsByOperation();
+      for (const operationId of retryable) {
+        const rows = byOperation.get(operationId) ?? [];
+        if (rows.length !== 1) {
+          return {
+            status: 'refused',
+            reason: rows.length === 0
+              ? 'exact_operation_manifest_missing_after_provision'
+              : 'ambiguous_current_manifest',
+            operationId,
+          };
+        }
+        const index = selected.findIndex((entry) => entry.manifest.operationId === operationId);
+        if (index >= 0) selected[index] = rows[0]!;
+      }
+      const secondPass = await revalidate(selected.map(selectionFromManifest));
+      if (!secondPass.ok) {
+        return {
+          status: 'refused',
+          reason: 'selected_definition_revalidation_refused',
+          operationId: secondPass.refusal.identifier,
+          detail: secondPass.refusal.code,
+        };
+      }
+      revalidated = secondPass;
+      for (const entry of selected) {
+        if (!publishRevalidatedObservation(
+          entry,
+          secondPass.definitions.get(entry.manifest.operationId.toLowerCase()),
+        )) {
+          return {
+            status: 'refused',
+            reason: 'selected_definition_observation_refused',
+            operationId: entry.manifest.operationId,
+          };
+        }
       }
     }
   }
