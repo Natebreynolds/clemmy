@@ -252,13 +252,14 @@ function exactComposioOperationFromQuery(query: string): string | null {
     // A REVIEWED CLI READ IS NOT A PROVIDER SLUG.
     //
     // This uppercases every snake_case token and claims it when the result
-    // starts with a registered toolkit name. `salesforce_sf_soql_query` becomes
-    // `SALESFORCE_SF_SOQL_QUERY`, whose leading token IS a registered toolkit —
-    // so a read performed by the local sf binary was claimed by the composio
-    // source, which then refused the whole search with "no current salesforce
-    // connection can authorize SALESFORCE_SF_SOQL_QUERY" (live 2026-09-18)
-    // while the CLI itself was authenticated and healthy. Identity settles it
-    // before spelling gets a vote.
+    // starts with a registered toolkit name. A reviewed CLI read uppercases
+    // into something whose leading token IS a registered toolkit — so a read
+    // performed by a local binary was claimed by the composio source, which
+    // then refused the whole search for having no current provider connection
+    // (live 2026-09-18) while the CLI itself was authenticated and healthy.
+    // Identity settles it before spelling gets a vote. (The uppercased form is
+    // not written out: the no-hardcoded-provider-pins ratchet scans source
+    // text, so the example would become an instance of the problem.)
     if (isReviewedCliOperationName(raw)) continue;
     const operation = raw.toUpperCase();
     if (!operation) continue;

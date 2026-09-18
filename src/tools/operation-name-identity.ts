@@ -36,9 +36,11 @@ export function looksLikeProviderOperationName(name: string): boolean {
 
 /** Is this name a REVIEWED CLI read — an operation performed by a local binary,
  *  never by a provider connection? Uppercasing such a name can make it look
- *  like a composio slug (`salesforce_sf_soql_query` → `SALESFORCE_SF_SOQL_QUERY`,
- *  whose leading token is a registered toolkit), which is how a local CLI read
- *  came to be refused for having "no current salesforce connection". */
+ *  like a provider slug whose leading token is a registered toolkit, which is
+ *  how a local CLI read came to be refused for having no current provider
+ *  connection. (The uppercased form is deliberately not written out here: the
+ *  no-hardcoded-provider-pins ratchet scans source text, so an illustrative
+ *  example becomes an instance of the thing it illustrates.) */
 export function isReviewedCliOperationName(name: string): boolean {
   const candidate = name.trim();
   if (!candidate) return false;
