@@ -1,4 +1,5 @@
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { operationsNamedInQuery } from '../../tools/operation-name-identity.js';
 import { discoveryRequestDigest } from './discovery-request-identity.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { isHostStructuralPlanningControlLookup } from '../../tools/structural-control-lookup.js';
@@ -154,7 +155,15 @@ function exactToolIdentifierQuery(query: string): boolean {
   // bare identifier does. Charging that as a broad search spent the task's one
   // exploration on a lookup that explored nothing.
   const namespaced = value.match(/[A-Za-z][A-Za-z0-9.:-]*__[A-Za-z0-9._:-]+/g) ?? [];
-  return new Set(namespaced.map((name) => name.toLowerCase())).size === 1;
+  if (new Set(namespaced.map((name) => name.toLowerCase())).size === 1) return true;
+  // The same rule, for an operation that is not MCP-namespaced. The check above
+  // only recognises `__` identities, so a query naming a reviewed CLI read or a
+  // provider operation inside a sentence was charged as broad discovery — and
+  // the task's one exploration was spent on a lookup that explored nothing
+  // (live 2026-09-18: a workflow step's query named salesforce_sf_soql_query
+  // outright and was classified broad_discovery). Identity decides, so this
+  // covers every carrier rather than the one whose spelling was anticipated.
+  return operationsNamedInQuery(value).length === 1;
 }
 
 /** A Composio action identifier, rather than a natural-language search. */

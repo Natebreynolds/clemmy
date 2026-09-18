@@ -192,3 +192,17 @@ export function carrierForProviderKind(
 ): 'call_tool' | 'provider_carrier' {
   return providerKind === 'composio' ? 'provider_carrier' : 'call_tool';
 }
+
+/** Every DISTINCT operation a query names, by identity. A query naming exactly
+ *  one is an exact lookup however much prose surrounds it — charging that as a
+ *  broad search spends a task's one exploration on a lookup that explored
+ *  nothing. Returns operation ids, never spellings. */
+export function operationsNamedInQuery(query: string): string[] {
+  const tokens = String(query ?? '').match(/[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+/g) ?? [];
+  const found: string[] = [];
+  for (const token of tokens) {
+    const identity = operationIdentity(token);
+    if (identity && !found.includes(identity.operationId)) found.push(identity.operationId);
+  }
+  return found;
+}
