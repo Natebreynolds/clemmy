@@ -36,6 +36,9 @@ import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
 import { STEP_STRUCTURAL_BASELINE_TOOLS } from '../execution/workflow-step-structural-tools.js';
 import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
+import { CLI_CATALOG, catalogReviewedReadsOf } from '../integrations/cli-catalog/catalog.js';
+import { currentManifestOperationContract } from '../runtime/harness/current-manifest-operation-semantics.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import {
   appendAgentCapabilityBinding,
@@ -191,12 +194,41 @@ export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
 }
 
 /**
- * A provider OPERATION, not a tool. Operation names are spelled UPPER_SNAKE
- * everywhere in this codebase, and are reached THROUGH the composio gateway
- * rather than preloaded as their own tool object — which is exactly what the
- * blocklist comment above says. Matched by SHAPE: no service is pinned here.
+ * A provider OPERATION, not a tool: something reached THROUGH a carrier rather
+ * than preloaded as its own tool object.
+ *
+ * IDENTITY FIRST, SHAPE ONLY AS A FALLBACK. This asked whether the name was
+ * spelled UPPER_SNAKE, which is true of composio slugs and of nothing else. A
+ * reviewed CLI read is lower_snake (`salesforce_sf_soql_query`), so it read as
+ * an ordinary TOOL NAME, the lock kept no carrier for it, and the filter below
+ * matched no tool object at all.
+ *
+ * Live 2026-09-18: friday-sales-leadership-email's Salesforce step reached the
+ * model with `toolCount: 0` — it called `workflow_step_result` to report that
+ * the CLI was unavailable, having been advertised nothing to call, while the
+ * CLI itself was authenticated and healthy. Same defect as the 2026-09-11
+ * inbox triage recorded below, one carrier over.
  */
 function namesAProviderOperation(entry: string): boolean {
+  const name = entry.trim().toLowerCase();
+  if (!name) return false;
+  try {
+    for (const descriptor of listReviewedCliReadDescriptors()) {
+      if (descriptor.operationId && descriptor.operationId.trim().toLowerCase() === name) return true;
+    }
+  } catch { /* no provisioned reviewed-read registry here */ }
+  try {
+    // The shipped CLI catalog declares its reviewed reads in source, so this
+    // answer does not depend on a home having been reconciled yet.
+    for (const entry of CLI_CATALOG) {
+      for (const read of catalogReviewedReadsOf(entry)) {
+        if (read.operationId && read.operationId.trim().toLowerCase() === name) return true;
+      }
+    }
+  } catch { /* the shipped catalog names no operation here */ }
+  try {
+    if (currentManifestOperationContract(entry)) return true;
+  } catch { /* no callable catalog here */ }
   return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(entry);
 }
 
@@ -214,10 +246,22 @@ function namesAProviderOperation(entry: string): boolean {
  * about this in its own words ("it broke outlook-triage-hourly by removing
  * composio_status"); the per-step lock reintroduced the same anti-pattern one
  * level down. Naming what you want must never remove what performs it.
+ *
+ * The carrier set must cover EVERY carrier, not one. Composio operations ride
+ * the gateway pair below; a reviewed CLI read, an MCP operation and anything
+ * added later are reached by acquiring the named operation and calling it —
+ * the same `tool_search` → `call_tool` kernel an unlocked step gets through
+ * schema-on-demand. Without that kernel a lock naming a non-composio operation
+ * leaves the step holding a name and no way to reach it, which is the failure
+ * this whole comment block exists to prevent.
  */
 const PROVIDER_OPERATION_CARRIERS: readonly string[] = Object.freeze([
   'composio_execute_tool',
   'composio_status',
+  // The acquisition kernel: carrier-agnostic, and the only route by which an
+  // operation that is not preloaded as a tool object can be called at all.
+  'tool_search',
+  'call_tool',
 ]);
 
 /** Build a name predicate from an explicit allowedTools list: an entry ending
