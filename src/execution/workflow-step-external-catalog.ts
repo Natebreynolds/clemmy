@@ -185,24 +185,36 @@ function selectionFromManifest(entry: InstalledCapabilityManifest): SelectedComp
  * the immediately-following scoped refresh refuse every such workflow with
  * `typed_catalog_not_ready`.
  */
+/** Returns null when the observation published, or the NAME of the first field
+ *  that disagreed. The name reaches the refusal so a live block is diagnosable
+ *  from its own message instead of by inspection. */
 function publishRevalidatedObservation(
   entry: InstalledCapabilityManifest,
   definition: RevalidatedComposioDefinition | undefined,
-): boolean {
+): string | null {
   const manifest = entry.manifest;
   const external = manifest.externalDefinition;
-  if (
-    !definition
-    || !external
-    || definition.identifier !== manifest.operationId
-    || definition.accountIdentity !== manifest.accountId
-    || definition.schemaDigest !== external.providerInputSchemaDigest
-    || definition.providerOperationVersion !== manifest.operationVersion
-    || definition.invokePortId !== manifest.invokePortId
-    || definition.definitionFingerprint !== manifest.definitionFingerprint
-    || (definition.outputSchemaDigest ?? null)
-      !== (external.providerOutputSchemaDigest ?? null)
-  ) return false;
+  // NAME THE FIELD THAT MOVED.
+  //
+  // This returned a bare boolean, so a refusal could say only that the
+  // observation failed — never which of eight fields disagreed. The caller
+  // then reported "either the toolkit is not connected or the operation name
+  // is wrong", and diagnosing a live block meant guessing. A comparison that
+  // knows why must say why.
+  const mismatch = !definition ? 'definition_absent'
+    : !external ? 'manifest_has_no_external_definition'
+    : definition.identifier !== manifest.operationId ? 'identifier'
+    : definition.accountIdentity !== manifest.accountId ? 'account_identity'
+    : definition.schemaDigest !== external.providerInputSchemaDigest ? 'input_schema_digest'
+    : definition.providerOperationVersion !== manifest.operationVersion ? 'operation_version'
+    : definition.invokePortId !== manifest.invokePortId ? 'invoke_port_id'
+    : definition.definitionFingerprint !== manifest.definitionFingerprint ? 'definition_fingerprint'
+    : (definition.outputSchemaDigest ?? null) !== (external.providerOutputSchemaDigest ?? null)
+      ? 'output_schema_digest'
+      : null;
+  if (mismatch) return mismatch;
+  // Redundant after the chain above; narrows for the compiler.
+  if (!definition || !external) return 'definition_absent';
 
   const observedAt = Date.now();
   const observation = {
@@ -226,19 +238,20 @@ function publishRevalidatedObservation(
     }),
   };
   const registered = registerIndependentCapabilityObservation(observation);
-  if (registered.ok) return true;
-  if (registered.reason !== 'identity_exists') return false;
+  if (registered.ok) return null;
+  if (registered.reason !== 'identity_exists') return `observation_register:${registered.reason}`;
   const prior = peekIndependentCapabilityObservation(
     manifest.operationId,
     manifest.accountId,
   );
-  return Boolean(
+  const settled = Boolean(
     prior
     && compareAndSetIndependentCapabilityObservation({
       expected: prior,
       next: observation,
     }).ok,
   );
+  return settled ? null : 'observation_compare_and_set_lost';
 }
 
 /**
@@ -489,13 +502,18 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     // and its pinned connection id was still valid. Route the mismatch into the
     // same exact-provisioning successor path a revalidation drift takes, once.
     const firstPass = revalidated;
-    const unpublished = selected.filter((entry) => !publishRevalidatedObservation(
-      entry,
-      firstPass.definitions.get(entry.manifest.operationId.toLowerCase()),
-    ));
+    const unpublished = selected
+      .map((entry) => ({
+        entry,
+        mismatch: publishRevalidatedObservation(
+          entry,
+          firstPass.definitions.get(entry.manifest.operationId.toLowerCase()),
+        ),
+      }))
+      .filter((row): row is { entry: typeof row.entry; mismatch: string } => row.mismatch !== null);
     if (unpublished.length > 0) {
       const retryable = unpublished
-        .map((entry) => entry.manifest.operationId)
+        .map((row) => row.entry.manifest.operationId)
         .filter((operationId) => !reboundOperationIds.includes(operationId));
       // Already re-provisioned once, or there is no accepted source to
       // provision against — the mismatch is real and terminal.
@@ -504,7 +522,8 @@ export async function prepareWorkflowStepExternalCatalog(input: {
         return {
           status: 'refused',
           reason: 'selected_definition_observation_refused',
-          operationId: unpublished[0]!.manifest.operationId,
+          operationId: unpublished[0]!.entry.manifest.operationId,
+          detail: unpublished[0]!.mismatch,
         };
       }
       const republished = await (
@@ -550,14 +569,16 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       }
       revalidated = secondPass;
       for (const entry of selected) {
-        if (!publishRevalidatedObservation(
+        const mismatch = publishRevalidatedObservation(
           entry,
           secondPass.definitions.get(entry.manifest.operationId.toLowerCase()),
-        )) {
+        );
+        if (mismatch) {
           return {
             status: 'refused',
             reason: 'selected_definition_observation_refused',
             operationId: entry.manifest.operationId,
+            detail: `after_rebind:${mismatch}`,
           };
         }
       }

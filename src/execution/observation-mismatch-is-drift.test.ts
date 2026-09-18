@@ -53,7 +53,7 @@ const src = readFileSync(SRC, 'utf8');
 test.after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
 
 test('a failed publish routes into exact provisioning instead of refusing', () => {
-  const idx = src.indexOf('const unpublished = selected.filter');
+  const idx = src.indexOf('const unpublished = selected');
   assert.ok(idx > 0, 'the publish comparison collects its mismatches');
   const after = src.slice(idx, idx + 2600);
   assert.match(
@@ -66,7 +66,7 @@ test('a failed publish routes into exact provisioning instead of refusing', () =
 });
 
 test('it re-provisions at most once, never in a loop', () => {
-  const idx = src.indexOf('const unpublished = selected.filter');
+  const idx = src.indexOf('const unpublished = selected');
   const after = src.slice(idx, idx + 2600);
   assert.match(after, /!reboundOperationIds\.includes\(operationId\)/,
     'an operation already re-provisioned this call is not re-provisioned again');
@@ -91,4 +91,18 @@ test('an operation no registry carries still refuses without provisioning', asyn
     allowedTools: ['totally_unknown_local_thing'],
   });
   assert.equal(prepared.status, 'none', 'nothing named, nothing provisioned');
+});
+
+test('the refusal names the field that moved', () => {
+  // The comparison knew which of eight fields disagreed and threw it away, so a
+  // live block could only say "not connected or the name is wrong" — both of
+  // which were false for daily-standup-email. A comparison that knows why must
+  // say why, or the next diagnosis is guesswork again.
+  assert.match(src, /function publishRevalidatedObservation\([\s\S]{0,200}\): string \| null/,
+    'the comparison returns a reason, not a bare boolean');
+  for (const field of ['account_identity', 'invoke_port_id', 'operation_version', 'definition_fingerprint', 'input_schema_digest', 'output_schema_digest']) {
+    assert.match(src, new RegExp(`'${field}'`), `${field} is nameable in a refusal`);
+  }
+  assert.match(src, /detail: unpublished\[0\]!\.mismatch/, 'and the first mismatch reaches the refusal detail');
+  assert.match(src, /after_rebind:\$\{mismatch\}/, 'a post-rebind mismatch is labelled as such');
 });
