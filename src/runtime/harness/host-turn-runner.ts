@@ -1,4 +1,5 @@
 import { expectedWorkPlanLines } from './expected-work-admission.js';
+import { currentManifestOperationContract } from './current-manifest-operation-semantics.js';
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from './reviewed-plan-runtime.js';
@@ -6355,6 +6356,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && settlement.recovery.businessCall === false
         && settlement.physicalCrossingCount === 0
         && settlement.outcome.directive.action === 'retry_with_backoff'
+      ) return 'zero_crossing';
+      // A DECLARED READ HAS NOTHING TO RECONCILE, EVEN WHEN IT REACHED THE
+      // PROVIDER. The exemption above also demands zero crossings and a
+      // non-business call, so a bound provider read never qualified: every
+      // bound operation is a business call, and a read that actually ran has
+      // crossed out by definition. Live 2026-09-18: a workflow step's
+      // salesforce_sf_soql_query threw, settled `unknown`, and the step ended
+      // "its effect must be reconciled before continuing" — a failed read, on
+      // a workflow the user had just asked to repair itself. The manifest is
+      // the authority: an operation whose CURRENT contract declares effect
+      // `read` changed nothing by failing, so the model may repair its query
+      // and continue. A mutation, an unknown effect, or an operation with no
+      // current contract keeps reconciliation ownership.
+      if (
+        settlement.recovery.mutating === false
+        && currentManifestOperationContract(settlement.toolName)?.effect === 'read'
       ) return 'zero_crossing';
       return 'effect_may_have_started';
     } catch {

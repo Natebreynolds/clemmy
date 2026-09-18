@@ -212,3 +212,20 @@ test('retained readers are a registry declaration, not a list in the turn runner
     'it must read the registry declaration instead',
   );
 });
+
+test('a failed DECLARED READ is not reconciliation-owned, and a mutation still is', () => {
+  // Live 2026-09-18: a workflow step ran salesforce_sf_soql_query (manifest
+  // effect `read`), the CLI threw, the settlement classified `unknown`, and
+  // the step ended "its effect must be reconciled before continuing" — on a
+  // workflow the owner had just asked Clem to repair. A read that fails
+  // changed nothing; only its query needs repair.
+  const site = SRC.slice(SRC.indexOf('const failedCallCrossingDisposition'), SRC.indexOf('const dispositionResult'));
+  assert.match(site, /A DECLARED READ HAS NOTHING TO RECONCILE/);
+  assert.match(
+    site,
+    /settlement\.recovery\.mutating === false\s*&&\s*currentManifestOperationContract\(settlement\.toolName\)\?\.effect === 'read'\s*\)\s*return 'zero_crossing';/,
+    'the exemption is the manifest effect, not a name or a crossing count',
+  );
+  assert.match(site, /return 'effect_may_have_started';\s*\}\s*catch/,
+    'anything else keeps reconciliation ownership');
+});
