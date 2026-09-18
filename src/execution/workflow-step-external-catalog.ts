@@ -9,6 +9,7 @@ import {
   registeredToolkitOfSlug,
 } from '../integrations/composio/toolkit-slug.js';
 import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
+import pino from 'pino';
 import {
   peekCapabilityManifestStore,
   type CapabilityManifestStore,
@@ -151,6 +152,8 @@ function currentComposioManifestRows(
   });
 }
 
+const logger = pino({ name: 'clementine-next.workflow-step-external-catalog' });
+
 function selectionFromManifest(entry: InstalledCapabilityManifest): SelectedComposioDefinition {
   const manifest = entry.manifest;
   const external = manifest.externalDefinition!;
@@ -185,6 +188,42 @@ function selectionFromManifest(entry: InstalledCapabilityManifest): SelectedComp
  * the immediately-following scoped refresh refuse every such workflow with
  * `typed_catalog_not_ready`.
  */
+/**
+ * REVALIDATION AND PUBLISH MUST AGREE ABOUT A MOVED LABEL.
+ *
+ * A label-only operation-version move is one revalidation already PROVED
+ * benign: it recomputed the definition fingerprint under the old label, found
+ * it identical, and recorded the old values in `reboundFrom` while returning
+ * ok. Publish then compared the new label against the stored manifest and
+ * refused — sanctioning the move in one comparison and rejecting it in the
+ * next, a deadlock no amount of re-provisioning can break.
+ *
+ * Live 2026-09-18: daily-standup-email rebound both of its calendar and mail
+ * operations (driftOperationIds empty, so label-only), then refused
+ * with `operation_version` against a manifest still holding the pre-move
+ * label. It had blocked every morning since 2026-09-16 on exactly this.
+ *
+ * So the stored manifest matches when it holds EITHER the live label or the
+ * label revalidation recorded as the one that moved. Nothing else is widened:
+ * a move revalidation did not sanction has no `reboundFrom` and still refuses.
+ */
+function versionAccepted(
+  definition: RevalidatedComposioDefinition,
+  manifest: InstalledCapabilityManifest['manifest'],
+): boolean {
+  return definition.providerOperationVersion === manifest.operationVersion
+    || definition.reboundFrom?.providerOperationVersion === manifest.operationVersion;
+}
+
+/** The same agreement for the fingerprint that moved with the label. */
+function fingerprintAccepted(
+  definition: RevalidatedComposioDefinition,
+  manifest: InstalledCapabilityManifest['manifest'],
+): boolean {
+  return definition.definitionFingerprint === manifest.definitionFingerprint
+    || definition.reboundFrom?.definitionFingerprint === manifest.definitionFingerprint;
+}
+
 /** Returns null when the observation published, or the NAME of the first field
  *  that disagreed. The name reaches the refusal so a live block is diagnosable
  *  from its own message instead of by inspection. */
@@ -206,9 +245,9 @@ function publishRevalidatedObservation(
     : definition.identifier !== manifest.operationId ? 'identifier'
     : definition.accountIdentity !== manifest.accountId ? 'account_identity'
     : definition.schemaDigest !== external.providerInputSchemaDigest ? 'input_schema_digest'
-    : definition.providerOperationVersion !== manifest.operationVersion ? 'operation_version'
+    : !versionAccepted(definition, manifest) ? 'operation_version'
     : definition.invokePortId !== manifest.invokePortId ? 'invoke_port_id'
-    : definition.definitionFingerprint !== manifest.definitionFingerprint ? 'definition_fingerprint'
+    : !fingerprintAccepted(definition, manifest) ? 'definition_fingerprint'
     : (definition.outputSchemaDigest ?? null) !== (external.providerOutputSchemaDigest ?? null)
       ? 'output_schema_digest'
       : null;
@@ -424,6 +463,13 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       ...driftOperationIds,
     ])];
     if (reboundOperationIds.length > 0) {
+      // This path has now failed in production twice (2026-09-02, 2026-09-16)
+      // with no record of what it decided. Say it once per preparation.
+      logger.info({
+        reboundOperationIds,
+        driftOperationIds,
+        hasAcceptedSource: Boolean(input.acceptedSource),
+      }, 'external catalog rebinding a moved provider definition');
       if (!input.acceptedSource) {
         return {
           status: 'refused',
@@ -440,6 +486,11 @@ export async function prepareWorkflowStepExternalCatalog(input: {
         ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
       });
       if (!reprovisioned.ok) {
+        logger.warn({
+          operationId: reprovisioned.identifier,
+          code: reprovisioned.code,
+          detail: reprovisioned.detail,
+        }, 'external catalog rebind provisioning refused');
         return {
           status: 'refused',
           reason: 'exact_operation_provisioning_refused',
@@ -519,6 +570,13 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       // provision against — the mismatch is real and terminal.
       // One attempt, never a loop.
       if (retryable.length === 0 || !input.acceptedSource) {
+        logger.warn({
+          operationId: unpublished[0]!.entry.manifest.operationId,
+          mismatch: unpublished[0]!.mismatch,
+          alreadyRebound: reboundOperationIds,
+          hasAcceptedSource: Boolean(input.acceptedSource),
+          manifestOperationVersion: unpublished[0]!.entry.manifest.operationVersion,
+        }, 'external catalog observation mismatch has no remaining repair');
         return {
           status: 'refused',
           reason: 'selected_definition_observation_refused',
