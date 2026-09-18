@@ -4751,6 +4751,7 @@ export const workflowRunnerInternalsForTest = {
   selfHealAutoMaxAttempts,
   resolveWorkflowStepModel,
   workflowAutoApprovalTools,
+  materializeCitedStepOperations,
   workflowStepRunMaxTurns,
   shouldUseDeclarativeStepApproval,
   exactApprovedSendTools,
@@ -4853,6 +4854,57 @@ function exactWorkflowApprovalResume(input: {
   };
 }
 
+/** EXECUTION INHERITS ITS OPERATIONS; IT DOES NOT REDISCOVER THEM.
+ *
+ * A structured `call` node already resolves its operation by exact identifier
+ * before dispatch. A prompted step got only a PERMISSION list, so a read its
+ * plan had already cited still cost the step a run-time discovery that could
+ * settle on a different operation than the one that was reviewed.
+ *
+ * Every exact operation in the step's own scope is materialized here by
+ * identifier, through the same acquisition path the call node uses. Bounded
+ * and side-effect-free by construction: acquisition no-ops for anything but a
+ * read and for an operation already present, a wildcard names nothing, and an
+ * operation that cannot be acquired is left to the step exactly as before —
+ * this pass never blocks a step that would otherwise have run. */
+async function materializeCitedStepOperations(
+  step: WorkflowStepInput,
+  allowedTools: readonly string[],
+  ownerId: string,
+  acquire: typeof ensureLiveReadCapabilityForOperation = ensureLiveReadCapabilityForOperation,
+): Promise<void> {
+  if (step.call?.tool) return; // a call node acquires its own operation below
+  const expectedEffect = structuredCallSideEffectClass(step);
+  if (expectedEffect !== 'read') return;
+  const cited = [...new Set(
+    allowedTools.map((tool) => String(tool ?? '').trim()).filter((tool) => tool.length > 0 && tool !== '*'),
+  )].slice(0, 8);
+  for (const operationId of cited) {
+    try {
+      const acquisition = await acquire({
+        ownerId,
+        nodeId: step.id,
+        operationId,
+        expectedEffect,
+        deadlineAt: Date.now() + 30_000,
+      });
+      if (acquisition.status !== 'present') {
+        logger.info(
+          { workflow: ownerId, stepId: step.id, tool: operationId, acquisition },
+          'workflow prompted step cited operation acquisition',
+        );
+      }
+    } catch (error) {
+      // An operation that cannot be materialized leaves the step exactly as it
+      // ran before this pass existed. Inheriting is an improvement, never a gate.
+      logger.info(
+        { workflow: ownerId, stepId: step.id, tool: operationId, err: String(error) },
+        'workflow prompted step cited operation unavailable',
+      );
+    }
+  }
+}
+
 async function runStepViaHarness(
   step: WorkflowStepInput,
   sessionIdSuffix: string,
@@ -4889,6 +4941,7 @@ async function runStepViaHarness(
       `Codex auth not configured for workflow step "${step.id}": ${auth.reason ?? 'unknown'}`,
     );
   }
+  await materializeCitedStepOperations(step, allowedTools, workflowName);
   // `workflowName` is the human display name at existing call sites, while
   // durable run workspaces and definitions are keyed by slug. Resolve that
   // storage identity once so large-context refs, model pins, and run history
