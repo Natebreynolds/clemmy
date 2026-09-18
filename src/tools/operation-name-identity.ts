@@ -177,3 +177,18 @@ export function operationIdentity(name: string): OperationIdentityV1 | null {
 
   return null;
 }
+
+/**
+ * The carrier that performs an operation, from what its manifest DECLARES.
+ *
+ * One table, defined once, replacing the per-site guesses that read a carrier
+ * out of a name's spelling. `provider_carrier` is the composio gateway;
+ * everything else the host performs locally reaches execution through the
+ * call_tool dispatcher. A caller that has no local dispatcher mounted must
+ * mount one — it must not re-derive a different answer from the name.
+ */
+export function carrierForProviderKind(
+  providerKind: CapabilityProviderKind,
+): 'call_tool' | 'provider_carrier' {
+  return providerKind === 'composio' ? 'provider_carrier' : 'call_tool';
+}

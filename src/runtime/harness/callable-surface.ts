@@ -24,6 +24,7 @@
  */
 
 import { loadToolContract } from '../../tools/tool-contract-store.js';
+import { carrierForProviderKind, operationIdentity } from '../../tools/operation-name-identity.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { candidateEliminatedForTask } from './attempt-settlement.js';
 
@@ -146,7 +147,29 @@ export function resolveCallable(name: string, ctx?: CallableSurfaceContext): Cal
     return entry;
   }
 
-  // 3. Shape-recognized identities stay dispatchable through their carrier —
+  // 3. A DECLARED operation is reachable through the carrier it declares.
+  //
+  //    Step 2 of docs/SPELLING-IS-NOT-IDENTITY-PLAN-2026-09-18.md. Reachability
+  //    was decided by two name SHAPES, so an operation whose name matched
+  //    neither — every reviewed CLI read, all of them lower_snake — fell to
+  //    case 4 and was reported "not provably dispatchable this turn" while its
+  //    manifest sat in the catalog declaring both its carrier and its effect.
+  //    Ask identity first; shape below still covers a provider slug discovery
+  //    has not seen yet, which is the one case no registry can answer.
+  const declared = operationIdentity(trimmed);
+  if (declared) {
+    return {
+      name: declared.operationId,
+      reachable: true,
+      carrier: carrierForProviderKind(declared.providerKind),
+      schema: null,
+      schemaSource: 'none',
+      requiredFields: [],
+      eliminatedForTask,
+    };
+  }
+
+  // 4. Shape-recognized identities stay dispatchable through their carrier —
   //    validation is schema-first at dispatch — but with no schema in hand
   //    they are NEVER mandatable.
   if (PROVIDER_SLUG_RE.test(trimmed) || MCP_NAME_RE.test(trimmed)) {
@@ -161,7 +184,7 @@ export function resolveCallable(name: string, ctx?: CallableSurfaceContext): Cal
     };
   }
 
-  // 4. Unknown bare name: not provably dispatchable this turn.
+  // 5. Unknown bare name: not provably dispatchable this turn.
   return {
     name: trimmed,
     reachable: false,
