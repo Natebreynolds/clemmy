@@ -26,6 +26,7 @@ import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { operationNamedInQuery, sameOperationName } from './operation-name-identity.js';
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
 import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
@@ -1093,7 +1094,7 @@ export function registerToolSearchTool(
       // An operation the query names outright (a provider slug). When its
       // source fails, that failure is the headline, never a local tool that
       // happened to rank.
-      const requestedOperationInQuery = (query.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}\b/) ?? [])[0] ?? '';
+      const requestedOperationInQuery = operationNamedInQuery(query);
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -1325,6 +1326,23 @@ export function registerToolSearchTool(
         seen.add(key);
         return true;
       }).slice(0, TOOL_SEARCH_WINDOW_RESULTS);
+      // AN EXACT OPERATION ID IS AN ANSWER, NOT A RANKING SIGNAL.
+      //
+      // Live 2026-09-18: a workflow step whose scope cites
+      // `salesforce_sf_soql_query` searched for that exact id twelve times and
+      // was handed `space_save` at the top of twenty results, because the id
+      // was detected by UPPER_SNAKE shape and a reviewed CLI read is
+      // lower_snake. Relevance then decided a question identity had already
+      // answered. When the query names a real operation and that operation is
+      // in the window, it leads — the rest keep their order behind it.
+      if (requestedOperationInQuery) {
+        const namedIndex = rankedWindow
+          .findIndex((row) => sameOperationName(row.name, requestedOperationInQuery));
+        if (namedIndex > 0) {
+          const [named] = rankedWindow.splice(namedIndex, 1);
+          rankedWindow = [named!, ...rankedWindow];
+        }
+      }
       // Only sources with an exact selected-candidate contract may defer a
       // durable page. Existing opaque live-read authority keeps its old path.
       const canDeferPages = Boolean(!selectedExactly && opts.discloseForPlanning
@@ -1699,7 +1717,7 @@ export function registerToolSearchTool(
         // an otherwise-empty result — an exact/built-in hit already answered
         // the question and outranks a co-occurring unrelated outage.
         const namedOperationMissing = Boolean(requestedOperationInQuery)
-          && !rows.some((row) => row.name.trim().toUpperCase() === requestedOperationInQuery);
+          && !rows.some((row) => sameOperationName(row.name, requestedOperationInQuery));
         if (
           unavailable.length > 0
           && (sourceCandidates.length === 0 || namedOperationMissing)
