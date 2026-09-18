@@ -1,4 +1,5 @@
 import { expectedWorkPlanLines } from './expected-work-admission.js';
+import { usageEfficiencyForSource } from '../usage-log.js';
 import { currentManifestOperationContract } from './current-manifest-operation-semantics.js';
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
@@ -3936,6 +3937,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       continuation,
       reason: verdict.reason.slice(0, 200),
     }, 'host completion judge');
+    // A CHAT TURN'S COST MUST BE AS VISIBLE AS A WORKFLOW STEP'S.
+    //
+    // Workflow steps have logged frames, tokens and cache-hit share since the
+    // efficiency wave; chat turns logged neither. Live 2026-09-18: a single
+    // "what is on my calendar today" turn took 368 seconds and emitted two log
+    // lines total, so there was nothing to optimise against. Same helper, same
+    // fields, so chat and workflow cost can finally be compared.
+    try {
+      const efficiency = usageEfficiencyForSource(identity.sessionId);
+      if (efficiency.frames > 0) {
+        hostTurnLogger.info({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          ...efficiency,
+        }, 'host turn efficiency');
+      }
+    } catch { /* telemetry never blocks the reply */ }
     if (awaitingInput && !continuation) return 'awaiting_user_input';
     if (!continuation) return 'done';
     objectiveJudgeContinuations += 1;

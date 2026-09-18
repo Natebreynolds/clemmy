@@ -5888,6 +5888,17 @@ async function runConversationWithinRuntimeConfig(
       });
       if (reoffered) return reoffered;
     }
+    // A GUARD THAT CANNOT SAY WHY COSTS A TURN AND TEACHES NOTHING.
+    //
+    // This refuses the whole turn with "Please retry" while holding the exact
+    // reason priming failed. Live 2026-09-18: every tool-using chat turn was
+    // refused in under a second with no reason recorded anywhere, so the only
+    // available response was to retry into the same wall.
+    logger.warn({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      reason: hostPlanningCatalog.reason,
+    }, 'planning catalog priming refused the turn');
     // Same rule as the revalidation stop below: a pre-turn stop commits the
     // typed blocked terminal, or the person watches a spinner.
     const catalogStopText = acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute'
