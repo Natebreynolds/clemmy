@@ -45,6 +45,7 @@
   "scripts": {
     "clean:dist": "node scripts/clean-dist.mjs",
     "check:public-hygiene": "node scripts/check-public-hygiene.mjs",
+    "check:operation-identity": "node scripts/check-operation-identity.mjs",
     "prebuild": "npm run clean:dist",
     "build": "node --import tsx scripts/build-candidate.mjs",
     "build:mobile-web": "npm --prefix apps/mobile-web run build",

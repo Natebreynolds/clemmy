@@ -6,8 +6,7 @@ import {
   type WorkflowStepShape,
 } from './workflow-validator.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
-import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
-import { currentManifestOperationContract } from '../runtime/harness/current-manifest-operation-semantics.js';
+import { operationIdentity } from '../tools/operation-name-identity.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
 import { workflowAuthoringAdvisories } from './workflow-contract-proposals.js';
@@ -250,24 +249,12 @@ const READ_INTENT_RE =
 // A step's tool surface reaches OUTSIDE the model (so it can actually return real
 // data — or silently nothing). Used to decide whether a creation test is worth
 // running. A pure-LLM step (no external tools) has nothing real to validate.
-/** Does this name identify a real operation, according to the registries that
- *  own operation identity? A reviewed CLI read is indexed under a descriptor
- *  registry and a provider operation under the callable catalog; neither is a
- *  spelling. Best-effort and sync: a registry that cannot be read here simply
- *  identifies nothing, and the shape tests below still apply. */
+/** Does this name identify a real operation? One question, one owner —
+ *  `operationIdentity` asks the registries that own identity and answers from
+ *  what an operation declares. This module keeps no local copy of that logic
+ *  and no spelling of its own. */
 function namesKnownOperation(tool: string): boolean {
-  const name = tool.trim().toLowerCase();
-  if (!name) return false;
-  try {
-    for (const descriptor of listReviewedCliReadDescriptors()) {
-      if (descriptor.operationId && descriptor.operationId.trim().toLowerCase() === name) return true;
-    }
-  } catch { /* no reviewed-read registry here */ }
-  try {
-    return Boolean(currentManifestOperationContract(tool));
-  } catch {
-    return false;
-  }
+  return Boolean(operationIdentity(tool));
 }
 
 function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: string; forEach?: string; call?: { tool?: string } }): boolean {

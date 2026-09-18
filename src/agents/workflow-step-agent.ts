@@ -36,9 +36,7 @@ import { runWorkspaceDir } from '../execution/workflow-run-workspace.js';
 import { STEP_STRUCTURAL_BASELINE_TOOLS } from '../execution/workflow-step-structural-tools.js';
 import { queryWorkspaceArtifact } from '../tools/workspace-artifact-tools.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
-import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
-import { CLI_CATALOG, catalogReviewedReadsOf } from '../integrations/cli-catalog/catalog.js';
-import { currentManifestOperationContract } from '../runtime/harness/current-manifest-operation-semantics.js';
+import { looksLikeProviderOperationName, operationIdentity } from '../tools/operation-name-identity.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import {
   appendAgentCapabilityBinding,
@@ -210,26 +208,10 @@ export function stepAllowedToolsLock(allowed?: string[] | null): boolean {
  * inbox triage recorded below, one carrier over.
  */
 function namesAProviderOperation(entry: string): boolean {
-  const name = entry.trim().toLowerCase();
-  if (!name) return false;
-  try {
-    for (const descriptor of listReviewedCliReadDescriptors()) {
-      if (descriptor.operationId && descriptor.operationId.trim().toLowerCase() === name) return true;
-    }
-  } catch { /* no provisioned reviewed-read registry here */ }
-  try {
-    // The shipped CLI catalog declares its reviewed reads in source, so this
-    // answer does not depend on a home having been reconciled yet.
-    for (const entry of CLI_CATALOG) {
-      for (const read of catalogReviewedReadsOf(entry)) {
-        if (read.operationId && read.operationId.trim().toLowerCase() === name) return true;
-      }
-    }
-  } catch { /* the shipped catalog names no operation here */ }
-  try {
-    if (currentManifestOperationContract(entry)) return true;
-  } catch { /* no callable catalog here */ }
-  return /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(entry);
+  // One question, one owner. `operationIdentity` answers from what an operation
+  // declares; `looksLikeProviderOperationName` remains only for a composio slug
+  // no registry carries yet, which is the single case identity cannot cover.
+  return Boolean(operationIdentity(entry)) || looksLikeProviderOperationName(entry);
 }
 
 /**
