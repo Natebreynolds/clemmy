@@ -640,7 +640,7 @@ export async function buildWorkflowStepAgent(
       ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
       : undefined;
     const candidateSources = discoveryIdentity && discoveryScope
-      ? buildAuthorizedToolSearchCandidateSources(discoveryScope, undefined, 'call_tool')
+      ? buildAuthorizedToolSearchCandidateSources(discoveryScope, discoveryIdentity, 'call_tool')
       : undefined;
     const firstClassTools = lockedTools
       .filter((toolRef) => firstClassNames.has((toolRef as { name?: string }).name ?? ''))
@@ -672,6 +672,88 @@ export async function buildWorkflowStepAgent(
         + 'The inner tool keeps its normal safety/approval policy. Do not claim a listed capability is unavailable.',
       compactCatalog,
     ].filter(Boolean).join('\n');
+  }
+  // A LOCK THAT NAMES AN OPERATION MUST BE ABLE TO FIND IT.
+  //
+  // The schema-on-demand block above is the only place that ever built
+  // discovery candidate sources, and it runs only for an UNLOCKED step. So a
+  // locked step's tool_search saw the local registry and nothing else — and a
+  // reviewed CLI read or provider operation is a capability, not a registry
+  // tool, so it could never appear in the results at all.
+  //
+  // Live 2026-09-18: friday-sales-leadership-email's step cites
+  // salesforce_sf_soql_query. Once it had a carrier to search with it searched
+  // five times, was handed local_cli_list and other registry tools, and stopped
+  // at authority_acquisition:no_new_evidence — hunting a capability its own
+  // search could not reach. Naming what you want must never remove what FINDS
+  // it, any more than what performs it.
+  //
+  // Scope is unchanged: discovery breadth only. The lock still prunes the
+  // surface, the dispatcher still binds the exact manifest/account/schema, and
+  // a lock naming no operation gets no sources.
+  const lockNamesAnOperation = surfaceLocked
+    && !options.resultOnlyTools
+    && (options.lockTools ?? []).some((entry) => typeof entry === 'string' && namesAProviderOperation(entry));
+  if (!schemaOnDemand && lockNamesAnOperation) {
+    // A lock naming a non-MCP operation matches no MCP server, so the scope
+    // lock collapses to null — and that null then silenced EVERY discovery
+    // source, including the reviewed-CLI live-read source which has nothing to
+    // do with MCP. Discovery breadth is not execution authority: the lock still
+    // prunes the surface, plan scope still gates the call, and the dispatcher
+    // still binds the exact manifest/account/schema. So when the lock leaves no
+    // usable discovery scope, fall back to catalog breadth rather than to
+    // silence.
+    const discoveryScope: McpToolScope | null =
+      externalMcpScope && mcpToolScopeAuthority(externalMcpScope) !== 'none'
+        ? externalMcpScope
+        : { authority: 'catalog', reason: 'locked workflow step named-operation discovery' };
+    const discoveryIdentity = options.sessionId && Number.isSafeInteger(options.sourceUserSeq)
+      && (options.sourceUserSeq ?? 0) > 0 && discoveryScope
+      && mcpToolScopeAuthority(discoveryScope) !== 'none'
+      ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
+      : undefined;
+    const candidateSources = discoveryIdentity && discoveryScope
+      ? buildAuthorizedToolSearchCandidateSources(discoveryScope, discoveryIdentity, 'call_tool')
+      : undefined;
+    if (candidateSources) {
+      tools = tools.map((toolRef) => ((toolRef as { name?: string }).name === 'tool_search'
+        ? buildScopedLocalToolSearch(new Set<string>(), 'call_tool', undefined, candidateSources,
+            discoveryIdentity ? async (candidates, control) => ({
+              version: 1 as const,
+              ...await stageDisclosedPlanningProviderCandidates({
+                ...discoveryIdentity, candidates, signal: control?.signal,
+                get deadlineAt() { return control?.deadlineAt; },
+                awaitModelReview: control?.awaitModelReview,
+                accountSelection: control?.accountSelection,
+              }),
+            }) : undefined)
+        : toolRef));
+      // A DISCOVERED CAPABILITY NEEDS A DOOR, NOT JUST A NAME.
+      //
+      // Allowing the name `call_tool` through the lock does nothing if no
+      // call_tool TOOL OBJECT is mounted: lockToolsForStep filters an existing
+      // list, it cannot create one. The unlocked schema-on-demand path builds
+      // this dispatcher and so does the exact-external-lock path; a locked step
+      // that names an operation had neither, so the model was told the
+      // capability was discovered and then had nothing to call it with
+      // ("discovered but is not executable on this tool surface", live
+      // 2026-09-18). Mount the same local carrier. Execution authority is
+      // unchanged: the dispatcher still binds the exact manifest, account and
+      // schema, and the blocked-tool set still applies.
+      const dispatcherFirstClassNames = new Set(
+        tools.map((toolRef) => (toolRef as { name?: string }).name ?? '').filter(Boolean),
+      );
+      const lockedDispatcher = buildCallTool({
+        reachableBuiltinNames: new Set<string>(),
+        firstClassNames: dispatcherFirstClassNames,
+        deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
+        mcpToolScope: externalMcpScope,
+      }) as Tool<RuntimeContextValue>;
+      tools = [
+        ...tools.filter((toolRef) => (toolRef as { name?: string }).name !== 'call_tool'),
+        lockedDispatcher,
+      ];
+    }
   }
   // An explicit external-tool lock has no first-class provider schema now that
   // raw SDK MCP attachments are gone. Mount the same local carrier used by a

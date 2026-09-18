@@ -23,6 +23,7 @@ import {
   type ComposioBrokerCandidate,
 } from './composio-tools.js';
 import { searchCapabilityOperations } from '../memory/capability-index.js';
+import { isReviewedCliOperationName } from './operation-name-identity.js';
 import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import {
   aliasLabelFor,
@@ -247,7 +248,19 @@ function exactComposioOperationFromQuery(query: string): string | null {
   const operations = new Set<string>();
   const pattern = /(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?=$|[^A-Za-z0-9_])/g;
   for (const match of query.matchAll(pattern)) {
-    const operation = String(match[1] ?? '').trim().toUpperCase();
+    const raw = String(match[1] ?? '').trim();
+    // A REVIEWED CLI READ IS NOT A PROVIDER SLUG.
+    //
+    // This uppercases every snake_case token and claims it when the result
+    // starts with a registered toolkit name. `salesforce_sf_soql_query` becomes
+    // `SALESFORCE_SF_SOQL_QUERY`, whose leading token IS a registered toolkit —
+    // so a read performed by the local sf binary was claimed by the composio
+    // source, which then refused the whole search with "no current salesforce
+    // connection can authorize SALESFORCE_SF_SOQL_QUERY" (live 2026-09-18)
+    // while the CLI itself was authenticated and healthy. Identity settles it
+    // before spelling gets a vote.
+    if (isReviewedCliOperationName(raw)) continue;
+    const operation = raw.toUpperCase();
     if (!operation) continue;
     const toolkit = registeredToolkitOfSlug(operation).trim().toLowerCase();
     const normalizedToolkit = toolkit.toUpperCase();
@@ -2084,7 +2097,15 @@ export function buildAuthorizedToolSearchCandidateSources(
                 name: issued.name,
                 summary: `Current attested read capability ${issued.name}`,
                 schema: issued.schema,
-                carrier: 'work_call' as const,
+                // HONOR THE CALLER'S CARRIER. This row said `work_call`
+                // unconditionally while the parameter above went unused. A
+                // workflow step has no work_call tool — the orchestrator builds
+                // that one — so a reviewed CLI read discovered inside a step was
+                // returned with an executor the step does not have, and the
+                // model correctly reported it "discovered but not available as
+                // an executable tool" (live 2026-09-18). A step's local carrier
+                // is call_tool; chat keeps work_call by default.
+                carrier,
                 score: 1,
                 planningAuthority: issued.authority,
               }];

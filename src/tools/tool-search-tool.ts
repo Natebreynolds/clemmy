@@ -1476,17 +1476,32 @@ export function registerToolSearchTool(
        */
       const localPlanningRowStatus = (name: string): Record<string, unknown> => {
         const refused = planningRefusalByName.get(name);
-        if (!refused) return { planningRefStatus: 'unsupported_unmaterialized' as const };
         if (refused === 'destructive' || refused === 'irreversible_or_unknown') {
           return { planningRefStatus: 'not_plannable_destructive' as const, planningRefusalReason: refused };
         }
+        // THE CARRIER DECIDES DISPATCHABILITY, NOT THE PRESENCE OF A REFUSAL.
+        //
+        // This returned `unsupported_unmaterialized` on its first line whenever
+        // no refusal was RECORDED, before the carrier was ever consulted. A row
+        // that simply earned no planning ref — no refusal, just no ref — could
+        // therefore never reach dispatch_now, and the page then sent the model
+        // away to refine discovery about a tool sitting right there with its
+        // schema and a call_tool carrier. (The exact walk-away sentence is
+        // deliberately not quoted here: a source-text pin locates it by
+        // indexOf, and a comment repeating it would shadow the real one.)
+        //
+        // That is the 2026-08-27 seq 90427 failure the comment above records,
+        // recurring for the ref-less-without-refusal case. Live 2026-09-18: a
+        // workflow step discovered salesforce_sf_soql_query, was told it was
+        // unmaterialized, and blocked without ever calling it.
         const carrier = opts.dispatchCarrierForName?.(name)
           ?? opts.dispatchCarrier
           ?? (opts.dispatchViaCallTool ? 'call_tool' : undefined);
+        const reason = refused ? { planningRefusalReason: refused } : {};
         if (carrier === 'call_tool') {
-          return { planningRefStatus: 'dispatch_now' as const, planningRefusalReason: refused };
+          return { planningRefStatus: 'dispatch_now' as const, ...reason };
         }
-        return { planningRefStatus: 'unsupported_unmaterialized' as const, planningRefusalReason: refused };
+        return { planningRefStatus: 'unsupported_unmaterialized' as const, ...reason };
       };
 
       // Planning disclosure materializes exact host refs, which can mean one
