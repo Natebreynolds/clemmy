@@ -30,6 +30,7 @@ import {
 import {
   refreshTypedExecutionReadiness,
   typedExecutionCatalogReady,
+  typedExecutionCatalogRefusals,
 } from '../runtime/semantic-boundary/configure-typed-execution-runtime.js';
 import {
   provisionExactWorkflowProviderOperations,
@@ -647,7 +648,20 @@ export async function prepareWorkflowStepExternalCatalog(input: {
   if (manifestIds.length > 0) {
     (dependencies.refresh ?? refreshTypedExecutionReadiness)(manifestIds);
     if (!(dependencies.ready ?? typedExecutionCatalogReady)(manifestIds)) {
-      return { status: 'refused', reason: 'typed_catalog_not_ready' };
+      // The readiness evaluator records WHY each manifest was refused; this
+      // returned only that it was not ready, so a live block again could not be
+      // diagnosed from its own message. Carry the scoped reasons out.
+      let detail: string | undefined;
+      try {
+        const scoped = new Set(manifestIds);
+        const refusals = typedExecutionCatalogRefusals()
+          .filter((refusal) => refusal.manifestId === '*' || scoped.has(refusal.manifestId));
+        if (refusals.length > 0) {
+          detail = [...new Set(refusals.map((refusal) => refusal.reason))].sort().join(',');
+          logger.warn({ manifestIds, refusals }, 'typed execution catalog refused the selected manifests');
+        }
+      } catch { /* a refusal ledger that cannot be read names no reason */ }
+      return { status: 'refused', reason: 'typed_catalog_not_ready', ...(detail ? { detail } : {}) };
     }
   }
 
