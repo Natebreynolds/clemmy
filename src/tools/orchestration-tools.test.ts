@@ -1937,6 +1937,34 @@ test('bindDiscussedToolkitsIntoSteps: binds the scrape step to the discussed TOO
   assert.equal(steps[2].allowedTools.length, 1);
 });
 
+test('bindDiscussedToolkitsIntoSteps: a prohibition is not a request, and a named operation is already the decision', () => {
+  // Live 2026-09-18: a reviewed plan said "use only the authenticated local sf
+  // CLI / salesforce_sf_soql_query capability; never use Composio Salesforce".
+  // The toolkit name matched, the step was locked to the composio family, the
+  // workflow's own validation then failed it for holding that access, and the
+  // creation test left the workflow disabled. The owner's repair had to strip
+  // the tools this binder added.
+  const forbidden: any = [{
+    id: 'collect',
+    prompt: 'Use only the authenticated local Salesforce sf CLI / salesforce_sf_soql_query capability; never use Composio Salesforce.',
+    allowedTools: [],
+  }];
+  const forbiddenResult = bindDiscussedToolkitsIntoSteps(forbidden, [{ slug: 'salesforce', name: 'Salesforce' }]);
+  assert.deepEqual(forbiddenResult.boundNotes, []);
+  assert.deepEqual(forbidden[0].allowedTools, [], 'a step that named its exact operation keeps the tool surface it chose');
+  assert.doesNotMatch(forbidden[0].prompt, /via composio/);
+
+  // A prohibition alone is enough, even with no exact operation named.
+  const prohibition: any = [{ id: 'collect', prompt: 'Pull the pipeline through the connector API, but never use the Salesforce toolkit.', allowedTools: [] }];
+  assert.deepEqual(bindDiscussedToolkitsIntoSteps(prohibition, [{ slug: 'salesforce', name: 'Salesforce' }]).boundNotes, []);
+
+  // And an ordinary positive request still binds.
+  const positive: any = [{ id: 'pull', prompt: 'Use the Salesforce connector to pull open opportunities.', allowedTools: [] }];
+  const positiveResult = bindDiscussedToolkitsIntoSteps(positive, [{ slug: 'salesforce', name: 'Salesforce' }]);
+  assert.equal(positiveResult.boundNotes.length, 1);
+  assert.ok(positive[0].allowedTools.includes('composio_execute_tool'));
+});
+
 test('bindDiscussedToolkitsIntoSteps: a platform named only as a TARGET is never bound', () => {
   const steps: any = [{ id: 's', prompt: 'Summarize the latest Facebook posts for the team.', allowedTools: [] }];
   const r = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'facebook', name: 'Facebook' }]);

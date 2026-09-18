@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { TOOL_REGISTRY } from './tool-registry.js';
+import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -509,6 +511,21 @@ const TOOLKIT_TARGET_NOUN = /(?:page|pages|post|posts|profile|profiles|account|a
 const TOOLKIT_TOOL_INTENT = /\b(scraper|scrapers|actor|actors|connector|integration|api|crawl|crawler|toolkit)\b/i;
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** Does this prompt name an exact operation — a reviewed CLI read or a
+ *  registry tool — rather than a family of them? Data, not a tool list: the
+ *  descriptor registry and the tool registry answer it. */
+export function promptNamesExactOperation(prompt: string): boolean {
+  const lower = prompt.toLowerCase();
+  try {
+    for (const descriptor of listReviewedCliReadDescriptors()) {
+      if (descriptor.operationId && lower.includes(descriptor.operationId.toLowerCase())) return true;
+    }
+  } catch {
+    // A missing descriptor registry only means no reviewed read is named here.
+  }
+  return TOOL_REGISTRY.some((entry) => entry.name.includes('_') && lower.includes(entry.name.toLowerCase()));
+}
+
 /** Pure step-binder: commit a DISCUSSED toolkit into any step whose prompt NAMES
  *  it AS A TOOL (not as a scrape target) — lock the tool surface to composio +
  *  append a use-this-toolkit directive. Mutates the steps. Exported for tests so
@@ -522,11 +539,23 @@ export function bindDiscussedToolkitsIntoSteps(
   for (const step of steps) {
     const prompt = step.prompt ?? '';
     if (!prompt || prompt.includes(TOOLKIT_BIND_MARKER)) continue;
+    // A STEP THAT NAMES ITS EXACT OPERATION HAS ALREADY CHOSEN.
+    //
+    // Live 2026-09-18: a reviewed plan said "use only the authenticated local
+    // sf CLI / salesforce_sf_soql_query; never use Composio Salesforce". The
+    // toolkit name appeared twice — once as the exact thing to avoid — so this
+    // binder locked the step to the composio family, the workflow's own
+    // validation then failed it for holding that access, and the run was left
+    // disabled. Naming an operation is a decision; a toolkit guess must not
+    // overrule it, and a prohibition must never read as a request.
+    if (promptNamesExactOperation(prompt)) continue;
     const named = discussed.find((tk) => {
       const nm = escapeRe(tk.name);
       if (!new RegExp(`\\b${nm}\\b`, 'i').test(prompt)) return false;
       // Skip when the name reads as a TARGET ("<name> page/posts/…").
       if (new RegExp(`\\b${nm}\\b\\s+(?:\\w+\\s+){0,1}${TOOLKIT_TARGET_NOUN.source}`, 'i').test(prompt)) return false;
+      // Skip a prohibition: "never use <name>", "not via <name>", "without <name>".
+      if (new RegExp(`\\b(?:never|not|no|avoid|without|don'?t|do not|rather than|instead of)\\b[^.!?\\n]{0,60}\\b${nm}\\b`, 'i').test(prompt)) return false;
       // Require real tool intent: a tool-noun present, or "use/via/with/prefer <name>".
       return TOOLKIT_TOOL_INTENT.test(prompt)
         || new RegExp(`\\b(?:use|using|via|with|prefer)\\b[\\s\\w]{0,20}\\b${nm}\\b`, 'i').test(prompt);
