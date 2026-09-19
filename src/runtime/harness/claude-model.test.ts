@@ -80,6 +80,33 @@ test('raw Claude streamed usage records the response.id correlation used by resp
   assert.equal(recorded[0]?.outputTokens, 7);
 });
 
+test('raw Claude usage rows are inclusive: the adapter reports fresh input, cache writes and cache reads as one total', async () => {
+  const { canonicalCacheAccounting } = await import('../usage-log.js');
+  const recorded: Array<Record<string, unknown>> = [];
+  // Anthropic reported input_tokens 4,229 and cache_read_input_tokens 9,688;
+  // the adapter hands the harness the 13,917 total with the read broken out.
+  const response = {
+    id: 'msg_dialect_1',
+    usage: {
+      inputTokens: 13_917,
+      outputTokens: 3,
+      totalTokens: 13_920,
+      inputTokensDetails: [{ cacheReadInputTokens: 9_688 }],
+    },
+    output: [],
+  };
+  const wrapped = withRawClaudeUsageRecording(
+    { getResponse: async () => response, getStreamedResponse: async function* () { /* unused */ } } as never,
+    'claude-opus-5',
+    (entry) => recorded.push(entry as unknown as Record<string, unknown>),
+  );
+  await wrapped.getResponse({} as never);
+  assert.equal(recorded[0]?.cacheDialect, 'inclusive');
+  const canonical = canonicalCacheAccounting(recorded[0] as never);
+  assert.equal(canonical.cachedReadTokens, 9_688);
+  assert.equal(canonical.uncachedInputTokens, 4_229, 'uncached is the total minus what the cache served');
+});
+
 test('envelope: x-api-key is STRIPPED and OAuth Bearer is set (the billing guard)', () => {
   const { headers } = applyClaudeEnvelope({ headers: { 'x-api-key': 'sk-ant-api03-would-bill-api', 'content-type': 'application/json' } }, 'sk-ant-oat01-good');
   assert.equal(headers.has('x-api-key'), false, 'x-api-key must be removed → never API-bill');

@@ -857,8 +857,10 @@ class RawClaudeUsageRecordingModel implements Model {
         sourceUserSeq: context?.sourceUserSeq,
         attemptId: context?.runAttemptId,
         model: this.modelId,
-        // Raw Anthropic Messages wire: input_tokens EXCLUDES cache reads.
-        cacheDialect: 'exclusive',
+        // The adapter reports Anthropic usage as a total: fresh input, cache
+        // writes and cache reads together, with the reads broken out. The raw
+        // wire's input_tokens excludes reads; this usage does not.
+        cacheDialect: 'inclusive',
         ...fields,
         durationMs: Math.max(0, Date.now() - startedAt),
         promptComponents: context?.promptComponents,
