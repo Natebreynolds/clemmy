@@ -3827,18 +3827,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             : settled.evidenceAvailable
               ? 'This request produced no receipt-bound artifact.'
               : 'The artifact evidence store could not be read for this request. You have NO artifact evidence — do not accept completion on the assistant\'s wording alone.',
-          // Keep the complete evidence the receipt below claims was judged.
-          // Head/tail clipping hid middle records, including facts that could
-          // contradict the answer. The selected model's existing context
-          // admission owns capacity; presentation must not discard evidence.
+          // Each result is shown as the answerer received it: whole when it
+          // fit, otherwise the same bounded structure-aware view, and a
+          // repeated call by its latest read. A claim whose basis the answerer
+          // never saw is the gap to catch; bytes nobody read are not evidence
+          // for or against the reply.
           `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
           preparation?.summary,
           'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
             + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
             + 'artifacts the objective never requested. Unavailable optional or irrelevant reads do not create '
-            + 'new requirements. A selected/derived projection is not the full source result: '
-            + 'claims that data is missing, empty or unavailable must be checked against the complete '
-            + 'source content, including nested records. An omitted projection field does not establish absence. '
+            + 'new requirements. Each result above is shown whole or as the bounded view the answerer received, '
+            + 'as its own line says. A claim that rests on content outside what is shown, including a claim that '
+            + 'data is missing, empty, unavailable or complete, is unverified unless another read shown here covers '
+            + 'it, such as a filtered query, a true count or a recalled page. A selected/derived projection is not '
+            + 'the full source result, and an omitted projection field does not establish absence. '
             + 'Distinguish absent values from zero, empty and uninspected values.',
         ].filter(Boolean).join('\n'),
       });
