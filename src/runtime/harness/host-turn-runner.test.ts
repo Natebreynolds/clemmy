@@ -4236,6 +4236,53 @@ test('host tool resolution includes enabled MCP tools through agent.getAllTools'
   assert.equal(outcome.finalOutput, 'MCP complete');
 });
 
+test('a tool enabled mid-turn joins after the tools already on the wire', async () => {
+  // The provider caches the longest identical prefix. A tool that becomes
+  // enabled mid-turn must not be inserted ahead of the tools the model has
+  // already been shown, or every schema behind it is re-billed each frame.
+  const inert = (name: string) => ({
+    type: 'function', name, description: `${name} fixture`,
+    parameters: { type: 'object', properties: {} },
+    invoke: async () => `${name} ran`, needsApproval: async () => false,
+  });
+  const gated = inert('gated_carrier');
+  const first = inert('first_read');
+  const second = inert('second_read');
+  const surfaces: string[][] = [];
+  let call = 0;
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      surfaces.push((request.tools ?? []).map((entry) => entry.name ?? ''));
+      call += 1;
+      return {
+        usage: {},
+        output: call === 1
+          ? [toolCall('first-call', 'first_read', {})]
+          : call === 2
+            ? [toolCall('second-call', 'second_read', {})]
+            : [textMsg('surface complete')],
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const outcome = await hostRunRunner(
+    throwingRunner() as never,
+    {
+      model,
+      tools: [],
+      // The configured order lists the gated carrier first, as a registry may.
+      getAllTools: async () => (call === 0 ? [first, second] : [gated, first, second]),
+    } as never,
+    [] as never,
+    { maxTurns: 5 },
+  );
+  assert.equal(outcome.finalOutput, 'surface complete');
+  assert.deepEqual(surfaces[0], ['first_read', 'second_read']);
+  assert.deepEqual(surfaces[1], ['first_read', 'second_read', 'gated_carrier'],
+    'the first frame is still a prefix of the second');
+  assert.deepEqual(surfaces[2], surfaces[1], 'and the surface then holds still');
+});
+
 test('production text, image, and file outputs remain structured in the next model projection', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';

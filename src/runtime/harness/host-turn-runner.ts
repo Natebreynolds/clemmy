@@ -2648,6 +2648,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let toolByName = new Map<string, FunctionToolLike>();
   let configuredToolRefs = new Set<FunctionToolLike>();
   let schemas: unknown[] = [];
+  // Wire position is first-seen within this run: a tool the model has already
+  // been shown keeps its place, and a tool enabled mid-turn joins after them.
+  // The provider caches the longest identical prefix, so an insertion near the
+  // front would re-bill every schema behind it on every later frame. Authority
+  // digests sort by name and never read this order.
+  const toolWirePosition = new Map<string, number>();
+  const inFirstSeenOrder = (enabled: FunctionToolLike[]): FunctionToolLike[] => {
+    for (const tool of enabled) {
+      if (!toolWirePosition.has(tool.name)) toolWirePosition.set(tool.name, toolWirePosition.size);
+    }
+    return [...enabled].sort((left, right) =>
+      toolWirePosition.get(left.name)! - toolWirePosition.get(right.name)!);
+  };
   /** The host's conversational check-in is documented in three places as "one
    *  tool-free model request" — on RunTurnOptions.hostConversationalCheckIn,
    *  at the call site, and in the completion gate below, whose safety argument
@@ -2716,7 +2729,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               || (tool as { type?: unknown }).type === 'function'))
         : [],
     );
-    tools = await functionTools(agent, runContext, hostProduction);
+    tools = inFirstSeenOrder(await functionTools(agent, runContext, hostProduction));
     if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
       throw new UnsupportedHostCapabilityError('duplicate_function_name');
     }

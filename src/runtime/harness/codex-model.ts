@@ -1083,42 +1083,23 @@ interface CodexRequestBody {
 }
 
 /**
- * Per-SESSION prompt-cache key. OpenAI's Responses API caches the longest
- * identical prefix (instructions + tools + input head); `prompt_cache_key` is a
- * shard key that ROUTES a session's calls to the same cache node so that prefix
- * actually hits. Measured 2026-07-04: WITHOUT it, hit rate on ~50-94K-token
- * (mostly tool-schema) prompts was only ~28% — the tool block was re-billed and
- * re-processed nearly every call, the dominant turn-latency driver
- * (project_latency_rootcause_0704). Granularity is per-session on purpose: the
- * docs warn a too-broad key overflows a node's ~15 RPM/prefix budget and resets
- * the cache, while a too-narrow key spreads traffic and loses reuse. Returns
- * undefined outside a harness run context (unit/contract tests) → the field is
- * omitted → byte-identical wire shape.
+ * Prompt-cache routing key. The Responses API caches the longest identical
+ * prefix (instructions, then tools, then input), and `prompt_cache_key` routes
+ * calls to the node that holds it. The key therefore follows the part of the
+ * prefix that stays fixed for a prompt ROLE: its instruction block.
+ *
+ * - Every call is keyed; an unkeyed call is never routed to a warm node.
+ * - Different roles (a main agent, a sub-agent, a judge) carry different
+ *   instructions, so they never contend for one node's prefix.
+ * - Within a role the key survives a tool list that grows mid-turn. The host
+ *   appends a newly enabled tool after the tools already shown, so the earlier
+ *   prefix is still byte-identical — and still on the node the key names.
+ * - Across sessions the key is the same, so a new conversation starts on the
+ *   node that already holds this role's instructions and tool schemas.
  */
-function codexPromptCacheKey(shapeKey: string): string {
-  // EVERY CALL GETS A KEY, AND THE KEY FOLLOWS THE PROMPT SHAPE.
-  //
-  // Two measured defects, live 2026-09-18 on a single chat turn:
-  //
-  //  1. Calls made outside a harness run context got NO key at all
-  //     (`key=False` on three of six observed frames). A keyless call is never
-  //     routed to a warm node, so it can never hit — and the comment above
-  //     records that losing the key alone cost roughly two thirds of the hit
-  //     rate. A process-stable fallback is strictly better than nothing: it
-  //     still shards, it simply shards by shape instead of by session.
-  //
-  //  2. One session interleaved THREE prompt shapes — a 16-tool agent
-  //     (instructions 5,486B), a 36-tool agent (1,505B) and toolless sub-calls
-  //     — all under one key. OpenAI caches the longest identical PREFIX, so
-  //     shapes sharing a key evict one another and the stable prefix rarely
-  //     survives to a second consecutive call. Frames 4 and 5 of the 16-tool
-  //     agent were byte-identical and still cached nothing.
-  //
-  // Sharding by (session, shape) keeps each shape's prefix warm on its own
-  // node. The docs' warning is about a key too BROAD overflowing one node's
-  // budget; this narrows within a session, which is the direction that helps.
-  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
-  return `clem:${sessionId ?? 'nosession'}:${shapeKey}`;
+function codexPromptCacheKey(instructions: string): string {
+  const role = createHash('sha256').update(instructions, 'utf8').digest('hex').slice(0, 12);
+  return `clem:${role}`;
 }
 
 /** A stable digest of the parts of a request that must match for a prefix to
@@ -1173,10 +1154,10 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
     include: ['reasoning.encrypted_content'],
   };
 
-  // Route this session's calls to the same cache node so the (large, stable)
-  // tool-schema prefix actually hits. See codexPromptCacheKey().
+  // Route every call of this prompt role to the node holding its prefix, so
+  // the (large, stable) tool-schema block actually hits. See codexPromptCacheKey().
   const shapeKey = codexPromptShapeKey(body.instructions ?? '', tools ?? []);
-  const cacheKey = codexPromptCacheKey(shapeKey);
+  const cacheKey = codexPromptCacheKey(body.instructions ?? '');
   body.prompt_cache_key = cacheKey;
   // THE CACHE PREFIX HAS NEVER BEEN OBSERVABLE FROM OUTSIDE.
   //
@@ -1191,8 +1172,9 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
     // cacheable prefix is byte-identical call to call, quiet enough to live in
     // production. A prefix whose sha moves between frames can never cache, and
     // that is invisible from the usage numbers alone.
-    const seen = (loggedPrefixShapeFor.get(cacheKey) ?? 0) + 1;
-    loggedPrefixShapeFor.set(cacheKey, seen);
+    const shapeSeenKey = `${harnessRunContextStorage.getStore()?.sessionId ?? 'nosession'}:${shapeKey}`;
+    const seen = (loggedPrefixShapeFor.get(shapeSeenKey) ?? 0) + 1;
+    loggedPrefixShapeFor.set(shapeSeenKey, seen);
     if (loggedPrefixShapeFor.size > 256) loggedPrefixShapeFor.clear();
     if (seen <= 5) {
       logger.info({
@@ -1204,6 +1186,23 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
         frame: seen,
         instructionsSha: createHash('sha256').update(body.instructions ?? '', 'utf8').digest('hex').slice(0, 12),
         toolsSha: createHash('sha256').update(JSON.stringify(tools ?? []), 'utf8').digest('hex').slice(0, 12),
+        // Which tools ride the prefix and what each costs: a tool list that
+        // grows mid-turn moves the prefix, and only the names say why.
+        tools: (tools ?? []).map((tool) => {
+          const named = tool as { name?: unknown; type?: unknown };
+          return `${typeof named.name === 'string' ? named.name : String(named.type ?? '?')}:${Buffer.byteLength(JSON.stringify(tool), 'utf8')}`;
+        }),
+        // The input items in wire order, each as kind:bytes:digest. Two frames
+        // of one turn should share a leading run of identical items; where
+        // that run ends is where the cacheable prefix ends.
+        input: input.map((item) => {
+          const entry = item as { type?: unknown; role?: unknown };
+          const kind = typeof entry.type === 'string' && entry.type !== 'message'
+            ? entry.type
+            : `msg.${String(entry.role ?? '?')}`;
+          const bytes = JSON.stringify(item);
+          return `${kind}:${Buffer.byteLength(bytes, 'utf8')}:${createHash('sha256').update(bytes, 'utf8').digest('hex').slice(0, 6)}`;
+        }),
       }, 'codex request prefix shape');
     }
   } catch { /* telemetry never shapes the request */ }

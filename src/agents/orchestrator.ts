@@ -40,7 +40,7 @@ import { bindHostLocalCallPreparation } from '../runtime/harness/host-local-call
 import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
-import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
+import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, turnStateToolsLast, type SealableToolLike } from './capability-envelope.js';
 import { composioStandingPolicyCapabilityHints } from '../integrations/composio/standing-policy-adapter.js';
 import { isComposioEnabled, peekCurrentConnectedToolkits, listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
@@ -3881,12 +3881,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const name = (toolRef as { name?: string }).name ?? '';
     return !name || !structuralToolNames.has(name);
   });
-  const assembledTools = [
+  const assembledTools = turnStateToolsLast([
     ...structuralTools,
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
     ...(callTool ? [callTool] : []),
     ...nonStructuralDiscovery,
-  ];
+  ]);
   searchFirstClassCount = assembledTools.length;
   searchFirstClassTokens = Math.round(
     assembledTools.reduce((sum, t) => {

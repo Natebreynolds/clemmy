@@ -193,3 +193,13 @@ test('the binding is per-agent and null means unknown, not unlimited', () => {
   assert.equal(boundAgentCapabilityRevision(agentB), null,
     'an unbound agent returned a revision it never earned');
 });
+
+test('turn-state tools follow every fixed-byte tool, each group in its own order', async () => {
+  const { turnStateToolsLast } = await import('./capability-envelope.js');
+  const fixed = (name: string) => ({ name, description: `${name} fixed`, parameters: {} });
+  const turnState = (name: string) => ({ ...fixed(name), descriptionCarriesTurnState: true });
+  const ordered = turnStateToolsLast([
+    turnState('planner'), fixed('ask'), fixed('worker'), turnState('carrier'), fixed('search'),
+  ]);
+  assert.deepEqual(ordered.map((tool) => tool.name), ['ask', 'worker', 'search', 'planner', 'carrier']);
+});

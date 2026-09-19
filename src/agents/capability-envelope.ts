@@ -72,6 +72,17 @@ export function toolSchemaFingerprint(tool: SealableToolLike): string {
   }));
 }
 
+/** Wire order for a model surface: every tool whose bytes are fixed, then the
+ *  tools whose descriptions carry turn state. The provider caches the longest
+ *  identical prefix, so the fixed schemas lead and a description that grows
+ *  with same-source disclosures — or a carrier enabled only once one exists —
+ *  can move only the tail. Relative order is kept within each group. */
+export function turnStateToolsLast<T>(tools: readonly T[]): T[] {
+  const volatile = (tool: T): boolean =>
+    (tool as SealableToolLike | null | undefined)?.descriptionCarriesTurnState === true;
+  return [...tools.filter((tool) => !volatile(tool)), ...tools.filter(volatile)];
+}
+
 /** Widest effect class a tool may perform, from the runtime classifier that
  *  already fails closed: unknown and admin flatten UP to 'send', never down. */
 export function toolEffectClass(name: string): AdmittedCapability['effectClass'] {
