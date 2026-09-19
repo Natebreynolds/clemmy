@@ -128,12 +128,22 @@ const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
 const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;
 const DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS = 3;
 const DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS = 8;
+// On a wire that serves the previous frame's prompt from cache, a checkpoint
+// re-sends the history after its ledger once, and every frame between
+// checkpoints carries the uncollapsed results as cached reads. A lower trigger
+// checkpoints more often; a higher one carries more on every frame. At a cached
+// read of a tenth of the input price, this is where the two balance.
+const CHECKPOINTED_MIN_RESULT_TRIGGER_TOKENS = 48_000;
 
 export interface InFlightCompactionThresholds {
   resultTriggerTokens: number;
   retainedResultBudgetTokens: number;
   minRetainPairs: number;
   maxRetainPairs: number;
+  /** True on a wire the registry seeds as prompt-caching: each collapse is a
+   *  frozen checkpoint replayed verbatim on later frames, so the model-facing
+   *  history only extends (compactInFlightToolContextStable). */
+  checkpointed: boolean;
 }
 
 /** Window scale for mid-turn compaction: 1 unless the routed wire caches the
@@ -197,10 +207,16 @@ export function inFlightCompactionThresholds(
   // registry's conservative default, whose supportsPromptCache is false — so
   // "unknown" fails safe onto the absolute thresholds.
   const cacheScale = inFlightPromptCacheScale(routedModelId);
+  // Checkpointing follows the registry's seeded contract, not a learned rate:
+  // a wire that caches only some calls still prefills the others cold, and the
+  // absolute thresholds exist for exactly that first-byte cost.
+  let checkpointed = false;
+  try { checkpointed = resolveModelCapability(routedModelId ?? undefined).supportsPromptCache === true; } catch { /* absolute */ }
+  const scaledTrigger = Math.round(DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS * cacheScale);
   return {
     resultTriggerTokens: positive(
       'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS',
-      Math.round(DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS * cacheScale),
+      checkpointed ? Math.max(scaledTrigger, CHECKPOINTED_MIN_RESULT_TRIGGER_TOKENS) : scaledTrigger,
     ),
     retainedResultBudgetTokens: positive(
       'CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS',
@@ -208,6 +224,7 @@ export function inFlightCompactionThresholds(
     ),
     minRetainPairs: positive('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS),
     maxRetainPairs: positive('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS),
+    checkpointed,
   };
 }
 const COMPACTION_SYSTEM_SUMMARY_PREFIXES = [
@@ -826,7 +843,7 @@ export function collapseOldCompletedToolPairs(
   items: AgentInputItem[],
   retainPairs: number = DEFAULT_LAYER1_RETAIN_TOOL_PAIRS,
   sessionId?: string,
-): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[] } {
+): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[]; summary?: AgentInputItem } {
   if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const normalizedRetain = Math.max(0, Math.floor(retainPairs));
@@ -871,6 +888,7 @@ export function collapseOldCompletedToolPairs(
       : insertAtClosedCallBoundary(nextItems, desiredIndex, summary),
     collapsed: pairs.length,
     callIds: pairs.map((pair) => pair.callId),
+    summary,
   };
 }
 
@@ -895,6 +913,92 @@ export interface InFlightToolContextResult {
   beforeTokens: number;
   afterTokens: number;
   triggerTokens: number;
+  /** Checkpointed form only: this frame froze a new checkpoint. */
+  checkpointCreated?: boolean;
+  /** Checkpointed form only: frozen checkpoints now replayed on every frame. */
+  checkpoints?: number;
+}
+
+/** One frozen collapse: the pairs it removed and the exact ledger item that
+ *  replaced them, replayed verbatim on every later frame of the same run. */
+export interface InFlightCompactionCheckpoint {
+  callIds: ReadonlySet<string>;
+  summary: AgentInputItem;
+}
+
+/** Checkpoints taken so far in one model run, oldest first. */
+export interface InFlightCompactionState {
+  checkpoints: InFlightCompactionCheckpoint[];
+}
+
+export function createInFlightCompactionState(): InFlightCompactionState {
+  return { checkpoints: [] };
+}
+
+function completedResultTokenPairs(items: AgentInputItem[]): Array<{ callId: string; tokens: number }> {
+  const callIds = new Set<string>();
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    if (any.type === 'function_call' && typeof any.callId === 'string') callIds.add(any.callId);
+  }
+  const results: Array<{ callId: string; tokens: number }> = [];
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : '';
+    if (any.type !== 'function_call_result' || !callId || !callIds.has(callId)) continue;
+    results.push({ callId, tokens: estimateInputTokens([item]) });
+  }
+  return results;
+}
+
+/** How many of the newest completed pairs stay verbatim: at least the minimum,
+ *  then as many as the retained budget and the maximum allow. */
+function retainedPairCount(
+  results: ReadonlyArray<{ tokens: number }>,
+  budget: number,
+  minRetain: number,
+  maxRetain: number,
+): number {
+  let retainedPairs = 0;
+  let retainedTokens = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    const nextTokens = results[i]!.tokens;
+    if (retainedPairs < minRetain) {
+      retainedPairs += 1;
+      retainedTokens += nextTokens;
+      continue;
+    }
+    if (retainedPairs >= maxRetain || retainedTokens + nextTokens > budget) break;
+    retainedPairs += 1;
+    retainedTokens += nextTokens;
+  }
+  return retainedPairs;
+}
+
+/** Re-apply one frozen checkpoint: drop its pairs and put its exact ledger where
+ *  the first of them stood. The raw history only grows at its tail between
+ *  frames, so this lands on the same bytes every time. Null when none of its
+ *  pairs are in this history. */
+function replayInFlightCheckpoint(
+  items: AgentInputItem[],
+  checkpoint: InFlightCompactionCheckpoint,
+): AgentInputItem[] | null {
+  const nextItems: AgentInputItem[] = [];
+  let desiredIndex = -1;
+  for (const item of items) {
+    const any = item as Record<string, unknown>;
+    const callId = typeof any.callId === 'string' ? any.callId : null;
+    if (
+      callId != null
+      && checkpoint.callIds.has(callId)
+      && (any.type === 'function_call' || any.type === 'function_call_result')
+    ) {
+      if (desiredIndex < 0) desiredIndex = nextItems.length;
+      continue;
+    }
+    nextItems.push(item);
+  }
+  return desiredIndex < 0 ? null : insertAtClosedCallBoundary(nextItems, desiredIndex, checkpoint.summary);
 }
 
 /**
@@ -929,23 +1033,7 @@ export function compactInFlightToolContext(
   ));
   const beforeTokens = estimateInputTokens(items);
 
-  const completedResultTokens = (sourceItems: AgentInputItem[]) => {
-    const callIds = new Set<string>();
-    for (const item of sourceItems) {
-      const any = item as Record<string, unknown>;
-      if (any.type === 'function_call' && typeof any.callId === 'string') callIds.add(any.callId);
-    }
-    const results: Array<{ callId: string; tokens: number }> = [];
-    for (const item of sourceItems) {
-      const any = item as Record<string, unknown>;
-      const callId = typeof any.callId === 'string' ? any.callId : '';
-      if (any.type !== 'function_call_result' || !callId || !callIds.has(callId)) continue;
-      results.push({ callId, tokens: estimateInputTokens([item]) });
-    }
-    return results;
-  };
-
-  const originalCompletedResults = completedResultTokens(items);
+  const originalCompletedResults = completedResultTokenPairs(items);
   const resultTokensBefore = originalCompletedResults.reduce((sum, pair) => sum + pair.tokens, 0);
   const unchanged = (): InFlightToolContextResult => ({
     nextItems: items,
@@ -967,19 +1055,7 @@ export function compactInFlightToolContext(
   const completedResults = originalCompletedResults;
   if (resultTokensBefore <= triggerTokens || completedResults.length <= minRetain) return unchanged();
 
-  let retainedPairs = 0;
-  let retainedTokens = 0;
-  for (let i = completedResults.length - 1; i >= 0; i--) {
-    const nextTokens = completedResults[i].tokens;
-    if (retainedPairs < minRetain) {
-      retainedPairs += 1;
-      retainedTokens += nextTokens;
-      continue;
-    }
-    if (retainedPairs >= maxRetain || retainedTokens + nextTokens > retainedBudget) break;
-    retainedPairs += 1;
-    retainedTokens += nextTokens;
-  }
+  const retainedPairs = retainedPairCount(completedResults, retainedBudget, minRetain, maxRetain);
 
   const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId);
   if (collapsed.collapsed === 0) return unchanged();
@@ -994,6 +1070,90 @@ export function compactInFlightToolContext(
     afterTokens: estimateInputTokens(collapsed.nextItems),
     triggerTokens,
   };
+}
+
+/**
+ * Mid-turn compaction for a wire that serves the previous frame's prompt from
+ * cache.
+ *
+ * The sliding form above is a pure function of the raw history, recomputed
+ * every frame: once over its trigger, each new result ages another pair into
+ * one shared ledger that stands where the oldest collapsed pair stood, near
+ * the head. Every later frame rewrites the head, so a wire that could have
+ * served the previous frame from cache re-reads the whole transcript cold.
+ *
+ * Here a collapse is a checkpoint. Its ledger bytes and position are frozen
+ * and replayed verbatim on every later frame, so frames between checkpoints
+ * only extend. A new checkpoint is taken only when the results no checkpoint
+ * covers cross the trigger again; it covers only those pairs, its ledger lands
+ * after the earlier ones, and only the suffix from there is sent anew — once.
+ */
+export function compactInFlightToolContextStable(
+  items: AgentInputItem[],
+  state: InFlightCompactionState,
+  sessionId?: string,
+  opts: InFlightToolContextOptions = {},
+): InFlightToolContextResult {
+  const triggerTokens = Math.max(1, Math.floor(
+    opts.resultTriggerTokens ?? DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS,
+  ));
+  const retainedBudget = Math.max(1, Math.floor(
+    opts.retainedResultBudgetTokens ?? DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS,
+  ));
+  const minRetain = Math.max(0, Math.floor(
+    opts.minRetainPairs ?? DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS,
+  ));
+  const maxRetain = Math.max(minRetain, Math.floor(
+    opts.maxRetainPairs ?? DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS,
+  ));
+  const beforeTokens = estimateInputTokens(items);
+  const resultTokensBefore = completedResultTokenPairs(items).reduce((sum, pair) => sum + pair.tokens, 0);
+
+  let current = items;
+  const replayed: InFlightCompactionCheckpoint[] = [];
+  for (const checkpoint of state.checkpoints) {
+    const next = replayInFlightCheckpoint(current, checkpoint);
+    if (!next) continue;
+    current = next;
+    replayed.push(checkpoint);
+  }
+  state.checkpoints = replayed;
+
+  const outcome = (
+    nextItems: AgentInputItem[],
+    fields: { collapsed?: number; callIds?: string[]; retainedPairs: number; checkpointCreated: boolean },
+  ): InFlightToolContextResult => ({
+    nextItems,
+    applied: state.checkpoints.length > 0,
+    collapsed: fields.collapsed ?? 0,
+    callIds: fields.callIds ?? [],
+    retainedPairs: fields.retainedPairs,
+    resultTokensBefore,
+    beforeTokens,
+    afterTokens: state.checkpoints.length > 0 ? estimateInputTokens(nextItems) : beforeTokens,
+    triggerTokens,
+    checkpointCreated: fields.checkpointCreated,
+    checkpoints: state.checkpoints.length,
+  });
+
+  const uncovered = completedResultTokenPairs(current);
+  const uncoveredTokens = uncovered.reduce((sum, pair) => sum + pair.tokens, 0);
+  if (uncoveredTokens <= triggerTokens || uncovered.length <= minRetain) {
+    return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });
+  }
+
+  const retainedPairs = retainedPairCount(uncovered, retainedBudget, minRetain, maxRetain);
+  const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId);
+  if (collapsed.collapsed === 0 || !collapsed.summary) {
+    return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });
+  }
+  state.checkpoints.push({ callIds: new Set(collapsed.callIds), summary: collapsed.summary });
+  return outcome(collapsed.nextItems, {
+    collapsed: collapsed.collapsed,
+    callIds: collapsed.callIds,
+    retainedPairs,
+    checkpointCreated: true,
+  });
 }
 
 /**

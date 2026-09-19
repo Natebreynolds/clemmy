@@ -286,6 +286,7 @@ test('inFlightCompactionThresholds — absolute on a non-caching wire, env overr
     retainedResultBudgetTokens: 20_000,
     minRetainPairs: 3,
     maxRetainPairs: 8,
+    checkpointed: false,
   });
   const env: Record<string, string> = {
     CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS: '1000',
@@ -298,6 +299,7 @@ test('inFlightCompactionThresholds — absolute on a non-caching wire, env overr
     retainedResultBudgetTokens: 600,
     minRetainPairs: 1,
     maxRetainPairs: 2,
+    checkpointed: false,
   });
   // Garbage or non-positive overrides fall back to the defaults.
   assert.equal(inFlightCompactionThresholds((key) => (key === 'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS' ? '-5' : 'x')).resultTriggerTokens, 32_000);
@@ -324,6 +326,7 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
       retainedResultBudgetTokens: 20_000,
       minRetainPairs: 3,
       maxRetainPairs: 8,
+      checkpointed: false,
     }, `${id} must keep the absolute thresholds byte-identically`);
   }
 
@@ -476,6 +479,113 @@ test('collapseOldCompletedToolPairs — reserves a complete call-id index even w
   assert.equal(collapsed.collapsed, 83);
   assert.ok(collapsedIds.slice(0, -1).every((callId) => visible.includes(callId)));
   assert.match(visible, /complete collapsed call-id index JSON/);
+});
+
+test('inFlightCompactionThresholds — a seeded prompt-caching wire checkpoints and waits for real pressure', () => {
+  // A 200k-window caching model scaled to 1 and so collapsed at the same 32k
+  // as a wire with no cache at all, every frame, on a prompt the provider was
+  // serving from cache.
+  for (const id of ['claude-opus-5', 'claude-haiku-4-5']) {
+    const thresholds = inFlightCompactionThresholds(() => undefined, id);
+    assert.equal(thresholds.checkpointed, true, `${id} is seeded as caching`);
+    assert.ok(thresholds.resultTriggerTokens >= 48_000, `${id} trigger ${thresholds.resultTriggerTokens}`);
+    assert.equal(thresholds.retainedResultBudgetTokens, 20_000, 'the retained tail stays small, so each checkpoint removes far more than it re-sends');
+  }
+  const sonnet = inFlightCompactionThresholds(() => undefined, 'claude-sonnet-5');
+  assert.equal(sonnet.checkpointed, true);
+  assert.equal(sonnet.resultTriggerTokens, 128_000, 'a larger window keeps its larger scaled trigger');
+  assert.equal(
+    inFlightCompactionThresholds(
+      (key) => (key === 'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS' ? '9000' : undefined),
+      'claude-opus-5',
+    ).resultTriggerTokens,
+    9000,
+    'an operator override still wins',
+  );
+});
+
+function growingToolHistory(sessionId: string, label: string) {
+  const history: AgentInputItem[] = [userMessage('rebuild the dashboard view')];
+  return {
+    history,
+    add(i: number) {
+      const callId = `${label}_${i}`;
+      const output = `view ${i} ${'v'.repeat(3_000)}`;
+      history.push(toolCall(callId, 'space_get_view', `{"i":${i}}`));
+      history.push(toolResult(callId, output));
+      writeToolOutput({ sessionId, callId, tool: 'space_get_view', output });
+    },
+  };
+}
+
+function framesThatRewrite(frames: string[][]): number {
+  let rewrites = 0;
+  for (let f = 1; f < frames.length; f++) {
+    const previous = frames[f - 1]!;
+    const next = frames[f]!;
+    if (!previous.every((item, index) => next[index] === item)) rewrites += 1;
+  }
+  return rewrites;
+}
+
+test('compactInFlightToolContextStable — every frame extends the last except the one that takes a checkpoint', async () => {
+  const { compactInFlightToolContextStable, createInFlightCompactionState } = await import('./compaction.js');
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const opts = { resultTriggerTokens: 3_000, retainedResultBudgetTokens: 1_500, minRetainPairs: 1, maxRetainPairs: 3 };
+
+  const stable = growingToolHistory(sess.id, 'stable');
+  const state = createInFlightCompactionState();
+  const stableFrames: string[][] = [];
+  let checkpoints = 0;
+  for (let i = 0; i < 12; i++) {
+    stable.add(i);
+    const result = compactInFlightToolContextStable([...stable.history], state, sess.id, opts);
+    if (result.checkpointCreated) checkpoints += 1;
+    stableFrames.push(result.nextItems.map((item) => JSON.stringify(item)));
+  }
+  assert.ok(checkpoints >= 2, `pressure still collapses (${checkpoints} checkpoints)`);
+  assert.equal(framesThatRewrite(stableFrames), checkpoints,
+    'only a frame that takes a new checkpoint changes anything already sent');
+
+  // The same growth through the sliding form rewrites its ledger on nearly
+  // every frame once past the trigger.
+  const sliding = growingToolHistory(sess.id, 'sliding');
+  const slidingFrames: string[][] = [];
+  for (let i = 0; i < 12; i++) {
+    sliding.add(i);
+    slidingFrames.push(compactInFlightToolContext([...sliding.history], sess.id, opts).nextItems
+      .map((item) => JSON.stringify(item)));
+  }
+  assert.ok(framesThatRewrite(slidingFrames) > framesThatRewrite(stableFrames),
+    `sliding ${framesThatRewrite(slidingFrames)} vs checkpointed ${framesThatRewrite(stableFrames)}`);
+});
+
+test('compactInFlightToolContextStable — a new checkpoint lands after the earlier ledger and leaves it untouched', async () => {
+  const { compactInFlightToolContextStable, createInFlightCompactionState } = await import('./compaction.js');
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const opts = { resultTriggerTokens: 3_000, retainedResultBudgetTokens: 1_500, minRetainPairs: 1, maxRetainPairs: 3 };
+  const growth = growingToolHistory(sess.id, 'ledger');
+  const state = createInFlightCompactionState();
+  let firstLedger: { index: number; bytes: string } | null = null;
+  for (let i = 0; i < 12; i++) {
+    growth.add(i);
+    const result = compactInFlightToolContextStable([...growth.history], state, sess.id, opts);
+    const ledgers = result.nextItems
+      .map((item, index) => ({ index, bytes: JSON.stringify(item) }))
+      .filter((entry) => entry.bytes.includes('summary of older completed tool activity'));
+    if (!firstLedger && ledgers.length > 0) firstLedger = ledgers[0]!;
+    if (firstLedger) {
+      assert.deepEqual(ledgers[0], firstLedger, `frame ${i}: the first ledger never moves or changes`);
+    }
+  }
+  assert.ok(state.checkpoints.length >= 2);
+
+  // A history that does not contain a checkpoint's pairs drops it.
+  const unrelated = compactInFlightToolContextStable([userMessage('a different run')], state, sess.id, opts);
+  assert.equal(unrelated.applied, false);
+  assert.equal(state.checkpoints.length, 0);
 });
 
 test('compactInFlightToolContext — bounds same-turn results without mutating durable history', () => {

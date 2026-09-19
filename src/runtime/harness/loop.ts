@@ -72,6 +72,8 @@ import { recoverSettledPlanTaskActivation } from './plan-task-post-settlement.js
 import { markTurnClock, startTurnClock, takeTurnClock } from './turn-clock.js';
 import {
   compactInFlightToolContext,
+  compactInFlightToolContextStable,
+  createInFlightCompactionState,
   inFlightCompactionThresholds,
   compactSessionIfNeeded,
   compactionBudgetForModel,
@@ -11148,6 +11150,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // Honors
   // CLEMMY_TURN_MEMORY_PRIMER=off and CLEMMY_RETRY_CONTEXT_INJECT=off.
   let inFlightCompactionReported = false;
+  // Checkpoints this turn's frames replay verbatim on a caching wire.
+  const inFlightCompaction = createInFlightCompactionState();
   const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
@@ -11211,20 +11215,22 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         // 2026-09-03 on Sonnet 5 it fired three times and caused ~126k of the
         // run's ~139k uncached tokens. See inFlightCompactionThresholds.
         // Env overrides still win.
-        const compacted = compactInFlightToolContext(
-          modelData.input,
-          options.sessionId,
-          inFlightCompactionThresholds(
-            (key) => getRuntimeEnv(key, '') || undefined,
-            routedModelIdForBudget,
-          ),
+        const thresholds = inFlightCompactionThresholds(
+          (key) => getRuntimeEnv(key, '') || undefined,
+          routedModelIdForBudget,
         );
+        const compacted = thresholds.checkpointed
+          ? compactInFlightToolContextStable(modelData.input, inFlightCompaction, options.sessionId, thresholds)
+          : compactInFlightToolContext(modelData.input, options.sessionId, thresholds);
         if (compacted.applied) {
           modelData = {
             input: compacted.nextItems,
             instructions: modelData.instructions,
           };
-          if (!inFlightCompactionReported) {
+          // Every checkpoint is recorded: each one re-sends the history after
+          // it once, so their count is part of the turn's cost. The sliding
+          // form still reports its first collapse only.
+          if (compacted.checkpointCreated || (!thresholds.checkpointed && !inFlightCompactionReported)) {
             inFlightCompactionReported = true;
             safeAppend({
               sessionId: options.sessionId,
@@ -11245,6 +11251,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
                 budgetTokens: compacted.triggerTokens,
                 resultTokensBefore: compacted.resultTokensBefore,
                 retainedToolPairs: compacted.retainedPairs,
+                ...(thresholds.checkpointed ? { checkpoint: compacted.checkpoints } : {}),
               },
             });
           }
