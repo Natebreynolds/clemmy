@@ -558,6 +558,9 @@ test('disjoint CLI and native MCP discovery preserve exact provider-neutral read
   }, tokenRun.identity).source;
   const candidates = await tokenSource.search({ query: cliOperation, limit: 8 });
   assert.equal(candidates.length, 1, JSON.stringify(candidates));
+  // The reviewed descriptor's own description reaches the model, so a read can
+  // be matched to an instruction about how its data must be reached.
+  assert.equal(candidates[0]!.summary, `Read reviewed CLI facts ${nonce}`);
   const candidate = candidates[0]!;
   assert.equal(candidate.name, cliOperation);
   assert.ok(candidate.planningAuthority);

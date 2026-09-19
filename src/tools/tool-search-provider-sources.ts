@@ -168,6 +168,26 @@ function composioDiscoveryScore(base: number, toolkit: string, slug: string): nu
     : base;
 }
 
+/** The reviewed descriptor's own words for an issued read: what it runs and
+ * what it is for. A generic label gives the model nothing to match against a
+ * standing instruction about how that data must be reached, so it keeps
+ * searching for the route the instruction names instead. */
+function reviewedReadSummary(operationId: string): string | null {
+  try {
+    const descriptor = listReviewedCliReadDescriptors()
+      .find((entry) => entry.operationId === operationId);
+    if (!descriptor) return null;
+    const name = typeof descriptor.displayName === 'string' ? descriptor.displayName.trim() : '';
+    const description = typeof descriptor.description === 'string' ? descriptor.description.trim() : '';
+    if (!description) return name || null;
+    return !name || description.toLowerCase().includes(name.toLowerCase())
+      ? description
+      : `${name} — ${description}`;
+  } catch {
+    return null;
+  }
+}
+
 function createReviewedCliOnlyLiveReadRegistry(options: {
   adapterAllowed?: (
     adapter: Readonly<Pick<ProductionLiveReadCarrierAdapterV1, 'adapterId' | 'carrier'>>,
@@ -2096,7 +2116,8 @@ export function buildAuthorizedToolSearchCandidateSources(
               if (!issued || !discoveryStillActive(guard)) return [];
               return [{
                 name: issued.name,
-                summary: `Current attested read capability ${issued.name}`,
+                summary: reviewedReadSummary(issued.name)
+                  ?? `Current attested read capability ${issued.name}`,
                 schema: issued.schema,
                 // HONOR THE CALLER'S CARRIER. This row said `work_call`
                 // unconditionally while the parameter above went unused. A
