@@ -175,6 +175,41 @@ export function isEligibleAutoCaptureSourceProvenance(
   return true;
 }
 
+function normalizeOwnerText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+/** The owner's own words on an accepted source row: what they typed or saw
+ * sent, never a host expansion of it. A surface may keep a display copy beside
+ * the typed text; either is the owner's. */
+export function acceptedOwnerTexts(data: Record<string, unknown>): string[] {
+  const typed = [data.displayText, data.text]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  if (typed.length > 0) return typed;
+  return typeof data.message === 'string' && data.message.trim() ? [data.message] : [];
+}
+
+/** The owner text automatic memory should learn from, in display precedence. */
+export function acceptedOwnerText(data: Record<string, unknown>): string {
+  return acceptedOwnerTexts(data)[0] ?? '';
+}
+
+/** Automatic memory learns only the owner's words. A host may expand an
+ * accepted source for the model — a reviewed plan, a clarification capsule, a
+ * retry prompt — and that expansion carries the source's identity without being
+ * its author's statement. A message outside the accepted text is therefore not
+ * admissible; a narrower clause of it (the fresh clause after a decline) is. */
+export function captureMessageIsOwnerAuthored(
+  message: string,
+  provenance: AutoCaptureSourceProvenance,
+): boolean {
+  if (provenance.authority !== 'accepted_user_input') return true;
+  const candidate = normalizeOwnerText(message);
+  if (!candidate) return false;
+  return acceptedOwnerTexts(provenance.data)
+    .some((text) => normalizeOwnerText(text).includes(candidate));
+}
+
 function emptyAutoCaptureResult(): AutoCaptureResult {
   return { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
 }
@@ -914,6 +949,17 @@ export function captureInteractionSignals(input: {
     sessionId: input.sessionId,
     sourceEventId: input.sourceEventId,
   })) {
+    return emptyAutoCaptureResult();
+  }
+  if (!captureMessageIsOwnerAuthored(input.message, input.sourceProvenance)) {
+    logger.warn(
+      {
+        sessionId: input.sessionId,
+        sourceEventId: input.sourceEventId,
+        messageChars: input.message.length,
+      },
+      'auto-capture refused a message that is not the owner\'s accepted words',
+    );
     return emptyAutoCaptureResult();
   }
   // Harness-injected re-prompts (judge/stall/parse/grounding/YOLO/outcome) are

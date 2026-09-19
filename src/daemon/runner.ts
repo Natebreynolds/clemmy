@@ -138,6 +138,7 @@ import {
   finalizeMemoryIdentityOnBoot,
   processMemoryMaintenance,
 } from '../memory/maintenance.js';
+import { retireAutoCaptureFactsOutsideOwnerWords } from '../memory/owner-words-repair.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decision.js';
 import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
@@ -2295,6 +2296,17 @@ export async function startDaemon(
     }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot grounded resource finalization failed');
+  }
+  // Automatic memory admits only the owner's words. Rows captured from a host
+  // expansion before that boundary held are retired here; the pass proves each
+  // retirement against the accepted source and keeps anything it cannot prove.
+  try {
+    const ownerWords = retireAutoCaptureFactsOutsideOwnerWords();
+    if (ownerWords.retired.length > 0) {
+      logger.warn(ownerWords, "Retired auto-captured memories that were not the owner's words");
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Owner-words memory repair failed');
   }
   // Approval and worker creation are separate durable stores. Repair any
   // process death between them before the first background drain so accepted

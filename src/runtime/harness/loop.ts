@@ -196,6 +196,7 @@ import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv, withRuntimeConfigSnapshot } from '../../config.js';
 import { withAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
+  acceptedOwnerText,
   autoCaptureProvenanceFromAcceptedEvent,
   captureInteractionSignals,
 } from '../../memory/auto-capture.js';
@@ -10364,11 +10365,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   if (exactCaptureSource) {
     queueMicrotask(() => {
       try {
+        // Memory learns the owner's words from the accepted row itself. This
+        // loop's input can be a host expansion of that row (a reviewed plan
+        // selected for Execute, a clarification capsule), which the capture
+        // boundary refuses; only a fresh clause after a decline narrows it.
         const captureMessage = options.taskContinuation?.disposition === 'declined_with_new_task'
           ? options.taskContinuation.activeTaskInput
             ?? options.authoritativeUserInput
             ?? options.input
-          : options.authoritativeUserInput ?? options.input;
+          : acceptedOwnerText(exactCaptureSource.data)
+            || (options.authoritativeUserInput ?? options.input);
         const captured = captureInteractionSignals({
           // A dual-clause continuation keeps the full accepted sentence in the
           // transcript, while memory admission sees only the independent fresh

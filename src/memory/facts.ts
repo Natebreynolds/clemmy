@@ -1741,6 +1741,20 @@ const POLICY_RUNAWAY_CAP = 256;
 const CORE_PROFILE_BUDGET = 1400;
 const STANDING_PREFERENCE_BUDGET = 1000;
 
+// A standing rule is a sentence or two. Each renders within this bound so one
+// oversized row can neither ride every prompt at full length nor crowd the rest
+// of its group out. The full text stays in memory, and dispatch enforcement
+// reads the compiled contract, never this rendering.
+export const POLICY_LINE_MAX_CHARS = 600;
+
+/** A standing rule as the model sees it: verbatim when it fits the display
+ * bound, otherwise its opening with an explicit pointer to the full text. */
+export function presentPolicyText(fact: Pick<ConsolidatedFact, 'id' | 'content'>): string {
+  if (fact.content.length <= POLICY_LINE_MAX_CHARS) return fact.content;
+  const head = fact.content.replace(/\s+/g, ' ').trim().slice(0, POLICY_LINE_MAX_CHARS).trimEnd();
+  return `${head}… _(rule #${fact.id} shortened for display; memory_recall_all returns it in full)_`;
+}
+
 /** Candidate refs for the STABLE Persistent-Facts block (COMPOUNDING wave):
  * the same selection primitives the renderer uses (pinned policies + the
  * Stanford-ranked top-N), exposed as refs so the stable block can join the
@@ -1927,7 +1941,8 @@ export function renderFactsForInstructions(
     const share = (present: boolean, weight: number, cap: number): number => present && activeWeight > 0
       ? Math.min(cap, Math.floor(totalPolicyBudget * weight / activeWeight))
       : 0;
-    // Dispatch-enforced constraints render IN FULL, always. They are few
+    // Dispatch-enforced constraints ALL render, always — none is omitted, and
+    // each line is held to the per-rule display bound. They are few
     // (compiled policies, POLICY_RUNAWAY_CAP-bounded), and each carries the
     // POSITIVE route alongside the prohibition — eliding one as "still
     // enforced" leaves the model without the prescribed path: live
@@ -1939,13 +1954,21 @@ export function renderFactsForInstructions(
     const promptOnlyBudget = share(groups.prompt_instruction.length > 0, 25, totalPolicyBudget);
     const coreBudget = share(groups.core_profile.length > 0, 25, CORE_PROFILE_BUDGET);
     const preferenceBudget = share(groups.standing_preference.length > 0, 22, STANDING_PREFERENCE_BUDGET);
-    const renderGroup = (title: string, group: ConsolidatedFact[], budget: number, suffix: (omitted: number) => string): string => {
+    const renderGroup = (
+      title: string,
+      group: ConsolidatedFact[],
+      budget: number,
+      suffix: (omitted: number) => string,
+      present: (fact: ConsolidatedFact) => string = (fact) => fact.content,
+    ): string => {
       if (group.length === 0) return '';
       const lines: string[] = [];
       let used = 0;
       for (const fact of group) {
-        const line = `- ${fact.content}`;
-        if (used + line.length + 1 > budget) break;
+        const line = `- ${present(fact)}`;
+        // A row that cannot fit is omitted on its own; it never hides the
+        // smaller rows ranked after it.
+        if (used + line.length + 1 > budget) continue;
         lines.push(line);
         renderedPolicyFacts.push(fact);
         used += line.length + 1;
@@ -1954,9 +1977,12 @@ export function renderFactsForInstructions(
       return [`**${title}**`, ...lines, omitted > 0 ? suffix(omitted) : ''].filter(Boolean).join('\n');
     };
     pinnedSection = [
+      // The only unbudgeted group, so the per-rule display bound is what keeps
+      // it finite; the budgeted groups below omit a row that does not fit.
       renderGroup(
         'Dispatch-enforced constraints', groups.dispatch_constraint, dispatchBudget,
         (n) => `_… ${n} more constraint${n === 1 ? '' : 's'} omitted from this summary but still enforced._`,
+        presentPolicyText,
       ),
       renderGroup(
         'Prompt-only instructions (context, not deterministic enforcement)', groups.prompt_instruction, promptOnlyBudget,

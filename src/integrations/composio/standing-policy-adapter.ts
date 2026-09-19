@@ -1,4 +1,4 @@
-import type { ConsolidatedFact } from '../../memory/facts.js';
+import { presentPolicyText, type ConsolidatedFact } from '../../memory/facts.js';
 import type {
   StandingPolicyCapabilityHint,
   StandingPolicyIdentityDirective,
@@ -199,7 +199,7 @@ export function renderComposioToolkitConstraintBanner(toolkitSlug: string): stri
   return [
     '',
     `⚖️ SEALED STANDING POLICIES bound to the ${toolkitSlug} toolkit:`,
-    ...rules.map((constraint) => `- ${constraint.content}`),
+    ...rules.map((constraint) => `- ${presentPolicyText(constraint)}`),
   ].join('\n');
 }
 
