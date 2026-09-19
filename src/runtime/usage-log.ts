@@ -881,15 +881,41 @@ export interface UsageEfficiency {
   cacheHitShare: number;
   /** The largest single prompt the source composed. */
   maxInputTokens: number;
+  /** Frames on the source's most-used model — the brain — and on any other
+   * model: completion judges, reviewers, auxiliary calls. */
+  brainFrames: number;
+  sideFrames: number;
+  sideInputTokens: number;
+  /** Uncached prompt tokens a brain frame paid for bytes the previous brain
+   * frame had already sent. A frame that extends the previous prompt can have
+   * all of it served from cache; whatever fell short was billed again. */
+  rebilledPrefixTokens: number;
+  /** Uncached prompt tokens that were new since the previous brain frame. */
+  appendedTokens: number;
+  /** Share of the previous brain prompt the next frame read from cache, over
+   * every brain frame after the first: 1 means each frame extended the last. */
+  prefixReuse: number;
 }
 
 /** The efficiency numbers the owner asked to read after a run (2026-09-01):
- * frames per step, cache-stable share, tokens per step, largest prompt. Pure
- * over usage rows; cache accounting goes through the canonical dialect. */
+ * frames per step, cache-stable share, tokens per step, largest prompt — and
+ * whether each frame reused what the previous one sent, which is where a
+ * long turn's cost actually goes. Pure over usage rows in recorded order;
+ * cache accounting goes through the canonical dialect. */
 export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEfficiency {
   const out: UsageEfficiency = {
     frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
+    brainFrames: 0, sideFrames: 0, sideInputTokens: 0, rebilledPrefixTokens: 0, appendedTokens: 0, prefixReuse: 0,
   };
+  const modelCounts = new Map<string, number>();
+  for (const ev of events) modelCounts.set(ev.model, (modelCounts.get(ev.model) ?? 0) + 1);
+  let brainModel = '';
+  for (const [model, count] of modelCounts) {
+    if (count > (modelCounts.get(brainModel) ?? 0)) brainModel = model;
+  }
+  let previousBrainPrompt: number | null = null;
+  let reusable = 0;
+  let reused = 0;
   for (const ev of events) {
     const canonical = canonicalCacheAccounting(ev);
     out.frames += 1;
@@ -898,9 +924,26 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
     out.uncachedInputTokens += canonical.uncachedInputTokens;
     out.outputTokens += ev.outputTokens ?? 0;
     out.maxInputTokens = Math.max(out.maxInputTokens, ev.inputTokens ?? 0);
+    if (ev.model !== brainModel) {
+      out.sideFrames += 1;
+      out.sideInputTokens += canonical.cachedReadTokens + canonical.uncachedInputTokens;
+      continue;
+    }
+    out.brainFrames += 1;
+    const prompt = canonical.cachedReadTokens + canonical.uncachedInputTokens;
+    if (previousBrainPrompt !== null) {
+      const couldReuse = Math.min(prompt, previousBrainPrompt);
+      const rebilled = Math.max(0, couldReuse - canonical.cachedReadTokens);
+      reusable += couldReuse;
+      reused += Math.min(canonical.cachedReadTokens, couldReuse);
+      out.rebilledPrefixTokens += rebilled;
+      out.appendedTokens += Math.max(0, canonical.uncachedInputTokens - rebilled);
+    }
+    previousBrainPrompt = prompt;
   }
   const prompt = out.cachedInputTokens + out.uncachedInputTokens;
   out.cacheHitShare = prompt > 0 ? Math.round((out.cachedInputTokens / prompt) * 1000) / 1000 : 0;
+  out.prefixReuse = reusable > 0 ? Math.round((reused / reusable) * 1000) / 1000 : 0;
   return out;
 }
 

@@ -357,5 +357,26 @@ test('usageEfficiencyForEvents: frames, cache-hit share and the largest prompt, 
   assert.equal(efficiency.maxInputTokens, 30_000);
   assert.deepEqual(usageEfficiencyForEvents([]), {
     frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
+    brainFrames: 0, sideFrames: 0, sideInputTokens: 0, rebilledPrefixTokens: 0, appendedTokens: 0, prefixReuse: 0,
   });
+});
+
+test('usageEfficiencyForEvents: a brain frame that fails to reuse the previous prompt is re-billing; side calls count apart', async () => {
+  const { usageEfficiencyForEvents } = await import('./usage-log.js');
+  const row = (model: string, input: number, cached: number) => ({
+    at: '2026-09-18T00:00:00Z', source: 'sess:1', kind: 'chat', model, cacheDialect: 'inclusive',
+    inputTokens: input, cachedInputTokens: cached, outputTokens: 10, totalTokens: input + 10,
+  });
+  const efficiency = usageEfficiencyForEvents([
+    row('brain', 20_000, 0), // first frame: cold
+    row('brain', 25_000, 20_000), // extends it: 5k new, nothing re-billed
+    row('judge', 9_000, 0), // a side call on another model
+    row('brain', 30_000, 18_000), // prefix rewritten: 7k of the previous 25k billed again, 5k new
+  ] as never);
+  assert.equal(efficiency.brainFrames, 3);
+  assert.equal(efficiency.sideFrames, 1);
+  assert.equal(efficiency.sideInputTokens, 9_000);
+  assert.equal(efficiency.rebilledPrefixTokens, 7_000);
+  assert.equal(efficiency.appendedTokens, 10_000);
+  assert.equal(efficiency.prefixReuse, Math.round(((20_000 + 18_000) / (20_000 + 25_000)) * 1000) / 1000);
 });
