@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   createIsolatedRunnerProgressTracker,
+  DEFAULT_TEST_CONCURRENCY,
+  DEFAULT_TEST_CONCURRENCY_CEILING,
   DEFAULT_TEST_TARGETS,
   isolatedTestArgs,
   TEST_ISOLATION_PRELOAD,
@@ -39,11 +41,11 @@ function expandTestTargets(targets) {
 test('isolated test runner retains source-only defaults when only reporter options are forwarded', () => {
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter=dot']),
-    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter=dot', ...DEFAULT_TEST_TARGETS],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-concurrency', String(DEFAULT_TEST_CONCURRENCY), '--test-reporter=dot', ...DEFAULT_TEST_TARGETS],
   );
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter', 'dot']),
-    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-concurrency', String(DEFAULT_TEST_CONCURRENCY), '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
   );
   assert.equal(
     DEFAULT_TEST_TARGETS.some((target) => target.includes('/journeys/')),
@@ -88,8 +90,50 @@ test('broad and serialized journey targets partition every src/apps TypeScript t
 test('isolated test runner preserves an explicit targeted test without adding the full suite', () => {
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts']),
-    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
+    ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-concurrency', String(DEFAULT_TEST_CONCURRENCY), '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
   );
+});
+
+test('isolated test runner caps default concurrency below what a large machine would choose', () => {
+  // Node defaults to availableParallelism() - 1. That is wrong for this suite:
+  // the preload mints a private CLEMENTINE_HOME, with its own SQLite
+  // databases, per worker, so the width of the run is also its memory cost.
+  // CI has four cores and never exercises the wide end; an eighteen-core
+  // laptop fanned out to seventeen, and two checkouts at once reached 118 GB
+  // and stalled the machine. The cap is what keeps a local run near what CI
+  // actually proves.
+  assert.ok(DEFAULT_TEST_CONCURRENCY >= 1, 'at least one worker must always run');
+  assert.ok(
+    DEFAULT_TEST_CONCURRENCY <= DEFAULT_TEST_CONCURRENCY_CEILING,
+    `default concurrency ${DEFAULT_TEST_CONCURRENCY} must not exceed the ceiling`,
+  );
+  // A cap, never a floor: a small machine keeps Node's smaller answer rather
+  // than being pushed up to the ceiling.
+  assert.ok(
+    DEFAULT_TEST_CONCURRENCY <= Math.max(1, os.availableParallelism() - 1),
+    'the default may only narrow what Node would have chosen, never widen it',
+  );
+
+  assert.deepEqual(
+    isolatedTestArgs([]).filter((argument) => argument === '--test-concurrency').length,
+    1,
+    'the default is injected exactly once',
+  );
+});
+
+test('an explicitly forwarded concurrency wins over the default, in either spelling', () => {
+  // `npm run journeys` forwards --test-concurrency=1 and the canonical latency
+  // gate depends on it. Injecting a second value here would leave Node picking
+  // between two, so the default must stand down whenever the caller has spoken.
+  for (const forwarded of [['--test-concurrency=8'], ['--test-concurrency', '8']]) {
+    const args = isolatedTestArgs(forwarded);
+    assert.equal(
+      args.filter((argument) => argument === '--test-concurrency' || argument.startsWith('--test-concurrency=')).length,
+      1,
+      `exactly one --test-concurrency survives for ${JSON.stringify(forwarded)}`,
+    );
+    assert.ok(args.join(' ').includes(forwarded.join(' ')), 'the caller\'s own value is the one that survives');
+  }
 });
 
 test('watchdog advances on ordered top-level TAP completions in a serialized suite', () => {
