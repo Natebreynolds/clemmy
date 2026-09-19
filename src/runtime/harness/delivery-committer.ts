@@ -1381,7 +1381,7 @@ export function commitTurnOutcome(
       : publishedVerdict.failedOpen === true
         ? 'completion_review_failed_open'
         : !publishedVerdict.fulfills
-          ? 'completion_review_negative'
+          ? publishedVerdict.blocked === true ? 'completion_review_blocked' : 'completion_review_negative'
           : !settledNow.evidenceAvailable
             ? 'completion_review_evidence_unreadable'
             : coverageGap
@@ -1434,7 +1434,15 @@ export function commitTurnOutcome(
     // The reviewer's unavailability reason is operator diagnosis (model ids,
     // routing modes, settings to change). It is recorded on the verdict row
     // for the console; the person in the chat gets one plain sentence.
-    const note = NOTES[detail] ?? NOTES.completion_review_did_not_stand!;
+    // A BLOCKED review already names what did not happen and what stands in
+    // the way, written for the owner; that finding is the note.
+    const blockedFinding = detail === 'completion_review_blocked'
+      ? (publishedVerdict?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
+      : '';
+    const note = blockedFinding
+      ? `Verification note: ${blockedFinding}`
+      : NOTES[detail]
+        ?? (detail === 'completion_review_blocked' ? NOTES.completion_review_negative! : NOTES.completion_review_did_not_stand!);
     const authored = effectiveOutcome.presentation.text.trim();
     const withNote = {
       ...effectiveOutcome,

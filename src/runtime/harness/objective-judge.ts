@@ -11,6 +11,9 @@ import { estimateMessagesTokens, predictTurnCost } from './budget.js';
 import { renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { effectiveContextWindow } from './model-window-observations.js';
 import { resolveModelCapability } from './model-wire-registry.js';
+import {
+  JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceTools, type JudgeEvidenceSource,
+} from './judge-evidence-tools.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -38,6 +41,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
   '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
+  '- WOULD ANOTHER ATTEMPT HELP? When the objective is not met, decide whether the assistant could still meet it by trying again with the tools it has. If it could (it missed items, chose the wrong scope, made a claim it can correct, or stopped without trying), the verdict is INCOMPLETE. If it could not, because the evidence shows what stands in the way (a tool, provider or connection failing, a call refused before it ran, missing access, data that does not exist), the verdict is BLOCKED, even when the response misstates the cause. A BLOCKED reason is read by the owner: one plain sentence saying what did not happen and what stands in the way, without tool or internal names.',
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '- AWAITING THE USER: if the response asks the user a genuine direction or authorization question — which option to take, whether to proceed with an external action (sending, posting, deleting), or scope the objective left open — that question IS this turn\'s deliverable. The assistant must NOT take consequential external actions without the user\'s go-ahead, so demanding it "finish" instead of asking would be wrong. This includes an honest partial-progress report that pauses for the user\'s decision.',
@@ -45,7 +49,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   'Reply with EXACTLY ONE LINE and nothing else, one of:',
   '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
   '  "AWAITING: <one short sentence naming the decision the user was asked to make>";',
-  '  "INCOMPLETE: <one short sentence naming the missing evidence>".',
+  '  "INCOMPLETE: <one short sentence naming the missing evidence>";',
+  '  "BLOCKED: <one plain sentence for the owner: what did not happen and what stands in the way>".',
   '',
   'Examples:',
   '  DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned',
@@ -53,6 +58,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '  AWAITING: Assistant asked whether to send the 55 prepared emails now or review them first',
   '  INCOMPLETE: Assistant proposed steps but did not produce the deliverable the objective named',
   '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
+  '  BLOCKED: The invite was not changed because the update was refused before it reached the calendar.',
 ].join('\n');
 
 /**
@@ -109,6 +115,9 @@ export interface ObjectiveJudgeVerdict {
    * emails).
    */
   awaitingUser?: boolean;
+  /** Not done, and another attempt by the assistant cannot change that; the
+   * reason is written for the owner. The caller does not re-run the work. */
+  blocked?: boolean;
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -451,6 +460,8 @@ export interface SkillExecutionContext {
   fullSourceEvidence?: boolean;
   /** Only the accepted source may supply this; omitted retains legacy routing. */
   boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
+  /** Retained results the reviewer may open with read-only evidence tools. */
+  evidence?: JudgeEvidenceSource;
 }
 
 export type ObjectiveJudgeFn = (
@@ -465,16 +476,18 @@ export type ObjectiveJudgeFn = (
 // nothing left to reject a valid verdict on presentation. Returns null on no marker
 // so each caller applies its OWN fail semantics (strict throws → not-passed; the
 // interactive judge fails open → done:true), preserving both directions unchanged.
-export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean } | null {
+export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean } | null {
   if (isRecord(finalOutput)) return parseCompletionObject(finalOutput);
   const raw = String(finalOutput ?? '').trim();
-  const match = /^\s*(DONE|AWAITING|INCOMPLETE|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  const match = /^\s*(DONE|AWAITING|INCOMPLETE|BLOCKED|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
   if (match) {
     const marker = match[1].toUpperCase();
     const reason = (match[2] || '').trim().slice(0, 400);
     // AWAITING = the deliverable is a question to the user. Done for bounce
     // purposes (never scold-continue past it); the caller yields awaiting-user.
     if (marker === 'AWAITING') return { done: true, awaitingUser: true, reason };
+    // BLOCKED = not done, and trying again cannot change it: no re-run.
+    if (marker === 'BLOCKED') return { done: false, blocked: true, reason };
     return { done: marker === 'DONE', reason };
   }
   const json = extractJsonCandidate(raw);
@@ -513,7 +526,11 @@ function parseCompletionObject(obj: Record<string, unknown>): { done: boolean; r
   return { done, reason };
 }
 
-function buildJudgeAgent(routing?: BoundaryJudgeRouting, instructions: string = JUDGE_SYSTEM_PROMPT): Agent<RuntimeContextValue> {
+function buildJudgeAgent(
+  routing?: BoundaryJudgeRouting,
+  instructions: string = JUDGE_SYSTEM_PROMPT,
+  tools: Agent<RuntimeContextValue>['tools'] = [],
+): Agent<RuntimeContextValue> {
   return new Agent<RuntimeContextValue>({
     name: 'ObjectiveCompletionJudge',
     instructions,
@@ -525,7 +542,7 @@ function buildJudgeAgent(routing?: BoundaryJudgeRouting, instructions: string = 
     // settings object prevents a string fallback from acquiring an SDK-imposed
     // reasoning tier; the harness imposes no tier.
     modelSettings: {},
-    tools: [],
+    tools,
   });
 }
 
@@ -656,6 +673,7 @@ export async function runRoutedJudgeAttempt<T>(
   prompt: string,
   parse: (output: unknown) => T | null,
   requireCompletePrompt = false,
+  evidence?: JudgeEvidenceSource,
 ): Promise<T> {
   if (requireCompletePrompt) {
     const admission = completionJudgeContextAdmission(routing.modelId, instructions, prompt);
@@ -667,7 +685,13 @@ export async function runRoutedJudgeAttempt<T>(
     }
   }
   const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-  const result = await runner.run(buildJudgeAgent(routing, instructions), prompt, { maxTurns: 1 });
+  // With evidence tools the review is a short conversation: each lookup is a
+  // turn, the verdict is the last. The tools refuse past their budget, so the
+  // turn ceiling is only a backstop.
+  const agent = evidence
+    ? buildJudgeAgent(routing, instructions + judgeEvidenceGuidance(evidence), judgeEvidenceTools(evidence))
+    : buildJudgeAgent(routing, instructions);
+  const result = await runner.run(agent, prompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
   const value = parse(result.finalOutput);
   if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
   return value;
@@ -675,7 +699,7 @@ export async function runRoutedJudgeAttempt<T>(
 
 interface CompletionJudgeRun {
   /** Parsed verdict from the first attempt to answer, or null. */
-  verdict: { done: boolean; reason: string; awaitingUser?: boolean } | null;
+  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
    *  parse failure vs transport error. */
   failure: 'timeout' | 'invalid' | 'error' | null;
@@ -702,7 +726,10 @@ export async function runHedgedJudge<T>(
   parse: (finalOutput: unknown) => T | null,
   isPass: (value: T) => boolean,
   lane: JudgeMetricLane = 'completion',
-  opts: { timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection } = {},
+  opts: {
+    timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
+    evidence?: JudgeEvidenceSource;
+  } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
@@ -711,7 +738,7 @@ export async function runHedgedJudge<T>(
     routing = resolveBoundaryJudge(opts.boundaryJudgeSelection);
     const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
     const attempt = (r: BoundaryJudgeRouting) => () => runRoutedJudgeAttempt(
-      r, instructions, prompt, parse, opts.requireCompletePrompt === true,
+      r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -767,7 +794,8 @@ async function runCompletionJudge(
     judge.lane ?? 'completion',
     { ...(judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {}),
       ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
-      ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}) },
+      ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
+      ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}) },
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing,
     ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}) };
@@ -851,6 +879,7 @@ export async function judgeGoalCriteriaStrict(
   objective: string,
   criteria: string[],
   evidenceText: string,
+  evidence?: JudgeEvidenceSource,
 ): Promise<CriterionJudgeVerdict[]> {
   const list = criteria.map((c) => c.trim()).filter((c) => c.length > 0);
   if (list.length === 0 || !evidenceText.trim()) {
@@ -876,7 +905,7 @@ export async function judgeGoalCriteriaStrict(
     (o) => parseCriteriaVerdicts(o, list.length),
     (v) => v.every((x) => x.pass),
     'goal_fidelity',
-    { timeoutMs: goalJudgeTimeoutMs() },
+    { timeoutMs: goalJudgeTimeoutMs(), ...(evidence ? { evidence } : {}) },
   );
   if (!run.value) {
     throw new Error(
@@ -912,7 +941,9 @@ export async function judgeObjectiveCompleteStrict(
       run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
     );
   }
-  return { done: run.verdict.done, reason: run.verdict.reason, ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}) };
+  return { done: run.verdict.done, reason: run.verdict.reason,
+    ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}),
+    ...(run.verdict.blocked ? { blocked: true } : {}) };
 }
 
 /**
@@ -963,6 +994,7 @@ export async function judgeObjectiveComplete(
         }
       : {}),
     ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}),
+    ...(run.verdict.blocked ? { blocked: true } : {}),
   };
 }
 

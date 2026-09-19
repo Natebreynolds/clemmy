@@ -19,7 +19,8 @@ const host = await import('./host-turn-runner.js');
 const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
-const { acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceSettledReadEvidence } = await import('./host-completion-work.js');
+const { acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
+  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence } = await import('./host-completion-work.js');
 const { DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('./tool-output-format.js');
 const plans = await import('./plan-artifacts.js');
 const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
@@ -783,7 +784,8 @@ test('large file and all Space components reach the actual completion request wi
   assert.equal(host.settledSourceArtifacts({ ...identity, sourceUserSeq: identity.sourceUserSeq + 1 }).count, 0);
 });
 
-async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void }) {
+async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; firstReply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void;
+  firstVerdict?: { done: boolean; reason: string; blocked?: boolean } }) {
   const identity = accepted(options.text);
   if (options.policyData) {
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_policy_captured',
@@ -792,12 +794,13 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
   options.afterCapture?.();
   if (options.work !== false) attempted(identity);
   const signal = new AbortController();
-  const judged: Array<{ objective: string; reply: string; evidence?: string; selection?: import('./debate-model.js').CapturedBoundaryJudgeSelection }> = [];
+  const judged: Array<{ objective: string; reply: string; evidence?: string; selection?: import('./debate-model.js').CapturedBoundaryJudgeSelection;
+    lookup?: import('./judge-evidence-tools.js').JudgeEvidenceSource }> = [];
   host._setHostObjectiveJudgeForTests(async (objective, reply, context) => {
-    judged.push({ objective, reply, evidence: context?.toolCallSummary, selection: context?.boundaryJudgeSelection });
+    judged.push({ objective, reply, evidence: context?.toolCallSummary, selection: context?.boundaryJudgeSelection, lookup: context?.evidence });
     if (options.abortAtJudge) signal.abort();
     return judged.length === 1
-      ? { done: false, reason: 'Actor discovery does not contain the requested post findings.' }
+      ? options.firstVerdict ?? { done: false, reason: 'Actor discovery does not contain the requested post findings.' }
       : { done: true, reason: 'The bounded lookup returned no accessible posts, accurately reported.' };
   });
   let calls = 0;
@@ -807,7 +810,7 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
       if (calls === 1 && options.readResult !== undefined) {
         retainedRead(identity, 'read_file', options.readResult, false, true);
       }
-      const text = options.reply ?? (calls === 1 ? promise : options.secondReply ?? 'The lookup returned no accessible posts. No report data was changed.');
+      const text = options.reply ?? (calls === 1 ? options.firstReply ?? promise : options.secondReply ?? 'The lookup returned no accessible posts. No report data was changed.');
       return { responseId: `reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }] };
     },
     async *getStreamedResponse() {
@@ -847,7 +850,7 @@ test('host reviews the exact refresh objective and curly-apostrophe promise, the
   assert.equal(verdicts[0]?.data.continuation, true);
 });
 
-test('an honest continuation that added no evidence settles on the standing verdict without a second judge call', async () => {
+test('an unchanged honest continuation with no new evidence reuses the rejection', async () => {
   // Live 2026-09-15 ("edit this event and add a description"): the first
   // verdict said not done, the continuation made no further call and answered
   // "I still can't update it", and the pinned judge was asked again on
@@ -857,7 +860,7 @@ test('an honest continuation that added no evidence settles on the standing verd
   // standing verdict is carried onto it instead of bought twice.
   const request = 'Update the team calendar invite and add a short description about Clem.';
   const honest = 'I could not reach a working calendar update operation, so the invite is unchanged.';
-  const result = await runHost({ captured: true, incoming: true, text: request, secondReply: honest });
+  const result = await runHost({ captured: true, incoming: true, text: request, firstReply: honest, secondReply: honest });
   assert.equal(result.calls, 2, 'the continuation still gets its model step');
   assert.equal(result.judged.length, 1, 'no second judge call on identical evidence');
   const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
@@ -879,6 +882,22 @@ test('an honest continuation that added no evidence settles on the standing verd
   const claimingVerdicts = events.listEvents(claiming.identity.sessionId, { types: ['goal_alignment_judged'] });
   assert.equal(claimingVerdicts.length, 2);
   assert.equal(claimingVerdicts.every((row) => row.data.carriedVerdict !== true), true);
+});
+
+test('a corrected read answer gets a fresh verdict without another business call or completion verb', async () => {
+  const corrected = 'The inbox contains the 2:05 email and the 9:00 email.';
+  const result = await runHost({ captured: true, incoming: true,
+    text: 'List every email in my inbox today.',
+    firstReply: 'The inbox contains the 9:00 email.', secondReply: corrected,
+    readResult: { emails: [{ time: '2:05' }, { time: '9:00' }] },
+    firstVerdict: { done: false, reason: 'The 2:05 email is missing from the answer.' },
+  });
+  assert.equal(result.calls, 2);
+  assert.equal(result.judged.length, 2);
+  assert.equal(result.judged[1]?.reply, corrected);
+  const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts.at(-1)?.data.fulfills, true);
+  assert.equal(verdicts.at(-1)?.data.carriedVerdict, undefined);
 });
 
 test('the host sends decisive middle records to the judge, not just the evidence collector', async () => {
@@ -928,6 +947,128 @@ test('a stop arriving during a negative verdict never starts another brain turn'
   assert.equal(result.judged.length, 1);
   const verdict = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] })[0];
   assert.equal(verdict?.data.continuation, false);
+});
+
+test('a BLOCKED review ends the turn without another attempt and records the finding', async () => {
+  const finding = 'The invite was not changed because the update was refused before it reached the calendar.';
+  const result = await runHost({ captured: true, incoming: true,
+    text: 'Update the team calendar invite and add a short description about Clem.',
+    firstVerdict: { done: false, blocked: true, reason: finding } });
+  assert.equal(result.judged.length, 1);
+  assert.equal(result.calls, 1, 'another attempt cannot change a blocked outcome, so none is made');
+  const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0]?.data.blocked, true);
+  assert.equal(verdicts[0]?.data.continuation, false);
+  assert.equal(verdicts[0]?.data.reason, finding);
+  assert.equal(host.completionVerdictForAcceptedSource(result.identity)?.blocked, true);
+});
+
+test('an INCOMPLETE review still buys another attempt', async () => {
+  const result = await runHost({ captured: true, incoming: true,
+    firstVerdict: { done: false, reason: 'Two of the requested accounts are missing from the reply.' } });
+  assert.equal(result.calls, 2);
+  const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts[0]?.data.continuation, true);
+  assert.equal(verdicts[0]?.data.blocked, undefined);
+});
+
+test('the completion reviewer can open every retained result of the source past its bounded view', async () => {
+  const payload = { records: Array.from({ length: 400 }, (_, n) => ({ id: n, note: 'retained record '.repeat(12) })), tail: 'OPENABLE_TAIL' };
+  const result = await runHost({ captured: true, incoming: true, readResult: payload });
+  const lookup = result.judged[0]?.lookup;
+  assert.ok(lookup, 'the reviewer receives the source-scoped evidence lookup');
+  const refs = lookup.refs();
+  assert.ok(refs.length > 0);
+  const opened = refs.map((ref) => lookup.resolve(ref)).find((entry) => entry?.text.includes('OPENABLE_TAIL'));
+  assert.ok(opened, 'the whole retained result opens, not only the bounded view shown inline');
+  assert.equal((opened.value as { records: unknown[] }).records.length, 400);
+  assert.equal(lookup.resolve('read:some_other_source'), undefined);
+});
+
+test('writes that did not complete and calls refused before they ran are evidence for the reviewer', () => {
+  const identity = accepted('Update the invite description.');
+  retainedRead(identity, 'calendar_update_event', { error: 'rejected' }, true, false, true);
+  events.appendEvent({ ...identity, role: 'tool', type: 'tool_returned', data: {
+    sourceUserSeq: identity.sourceUserSeq, callId: 'read:calendar_update_event', tool: 'calendar_update_event',
+    ok: false, result: 'Event id is not valid for update.' } });
+  events.appendEvent({ ...identity, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'refused_pre_dispatch', sourceUserSeq: identity.sourceUserSeq, stage: 'host_disposition:refused_pre_dispatch',
+    recoveryToolNames: ['calendar_update_event'], refusalDetail: 'The reviewed call does not match the planned operation.',
+    calls: [{ name: 'work_call' }] } });
+  events.appendEvent({ ...identity, sourceUserSeq: identity.sourceUserSeq + 1, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'refused_pre_dispatch', sourceUserSeq: identity.sourceUserSeq + 1, stage: 'other', refusalDetail: 'UNRELATED_REFUSAL' } } as never);
+  events.closeEventLog();
+  const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
+  assert.match(summary, /write calendar_update_event \[logicalCall=read:calendar_update_event\] settled invalid_arguments/);
+  assert.match(summary, /returned: Event id is not valid for update\./);
+  assert.match(summary, /refused before it ran \(host_disposition:refused_pre_dispatch\) for calendar_update_event: The reviewed call does not match the planned operation\./);
+  assert.doesNotMatch(summary, /UNRELATED_REFUSAL/);
+  assert.equal(sourceIncompleteAttemptsEvidence(accepted('Nothing attempted.')), undefined);
+});
+
+test('a blocked review\'s finding is the note the owner reads; a plain negative keeps the generic note', () => {
+  for (const [blocked, expected] of [
+    [true, /Verification note: The invite was not changed because the update was refused before it reached the calendar\./],
+    [false, /Verification note: the completion review found this did not meet the request\./],
+  ] as const) {
+    const identity = accepted('Update the invite description.');
+    host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
+    events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: identity.sourceUserSeq, fulfills: false,
+      reason: 'The invite was not changed because the update was refused before it reached the calendar.',
+      ...(blocked ? { blocked: true } : {}), continuation: false } });
+    const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+      presentation: { kind: 'answer', text: 'I updated the invite.' } });
+    assert.match(committed.presentation.text, expected);
+    assert.notEqual(committed.presentation.status, 'done');
+  }
+});
+
+test('a reviewer looks up the evidence it needs through the real SDK loop, then rules', async () => {
+  const lookup = {
+    refKind: 'step ids of this run',
+    refs: () => ['triage'],
+    resolve: (ref: string) => ref === 'triage'
+      ? { text: '', value: { emails: [
+        { subject: 'Renewal', bucket: 'respond', draft: 'Attached.' },
+        { subject: 'Invoice', bucket: 'respond', draft: '' },
+      ] } }
+      : undefined,
+  };
+  const requests: string[] = [];
+  const strings = (value: unknown): string[] => typeof value === 'string' ? [value]
+    : Array.isArray(value) ? value.flatMap(strings)
+      : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+  const model = {
+    async getResponse(request: unknown) {
+      requests.push(strings(request).join('\n'));
+      const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15, requests: 1, inputTokensDetails: [], outputTokensDetails: [] };
+      if (requests.length === 1) {
+        return { responseId: 'judge-lookup', usage, output: [{ type: 'function_call', callId: 'lookup-1', name: 'query_evidence', status: 'completed',
+          arguments: JSON.stringify({ ref: 'triage', where_field: 'bucket', equals: 'respond', fields: ['subject', 'draft'] }) }] };
+      }
+      return { responseId: 'judge-verdict', usage, output: [{ type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text: 'INCOMPLETE: The Invoice email in the respond bucket has an empty draft.' }] }] };
+    },
+    async *getStreamedResponse() { throw new Error('The review uses the response path'); },
+  };
+  const verdict = await runRoutedJudgeAttempt({ model: model as never, modelId: 'claude-opus-5', judgeFamily: 'claude',
+    brainFamily: 'byo', transport: 'claude_subscription', selfJudge: false },
+    JUDGE_SYSTEM_PROMPT, 'Objective: Every respond email has a draft.\n\nEvidence: 2 emails (sample).', parseCompletionVerdict, false, lookup);
+  assert.equal(requests.length, 2, 'one lookup, then the verdict');
+  assert.match(requests[0]!, /EVIDENCE TOOLS/);
+  assert.match(requests[1]!, /2 of 2 records at emails match/, 'the lookup result is in front of the reviewer when it rules');
+  assert.equal(verdict?.done, false);
+  assert.match(verdict?.reason ?? '', /empty draft/);
+});
+
+test('a BLOCKED verdict parses as not done and not worth another attempt', () => {
+  assert.deepEqual(parseCompletionVerdict('BLOCKED: The sheet was not updated because the connection to it is failing.'),
+    { done: false, blocked: true, reason: 'The sheet was not updated because the connection to it is failing.' });
+  assert.equal(parseCompletionVerdict('INCOMPLETE: two rows missing')?.blocked, undefined);
+  assert.match(JUDGE_SYSTEM_PROMPT, /WOULD ANOTHER ATTEMPT HELP\?/);
+  assert.match(JUDGE_SYSTEM_PROMPT, /"BLOCKED: <one plain sentence for the owner/);
 });
 
 test('carrier use alone cannot replace a valid retained-data answer or adopted cancellation with a continue demand', () => {

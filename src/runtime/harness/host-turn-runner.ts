@@ -146,7 +146,10 @@ import {
   latestWatcherAssistantNote,
 } from './watcher-judge.js';
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
-import { acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceSettledReadEvidence } from './host-completion-work.js';
+import {
+  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
+  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence,
+} from './host-completion-work.js';
 import {
   isHostDurableContinuationPendingError,
   type HostDurableContinuationPendingError,
@@ -3748,15 +3751,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!gate && !planCandidate) return 'done';
     const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate) });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
-    // A continuation that made no further business call, settled nothing,
-    // and answers honestly cannot move the standing verdict: the reviewer
-    // would rule on the same source evidence and the same absence of a claim.
-    // Live 2026-09-15: after "I couldn't update it", the pinned judge was
-    // asked again on identical evidence and took 23–58 s to say the same
-    // thing (three identical negatives, ~66 s, on one honest report). The
-    // standing verdict settles the turn now; a new call, a settled write, a
-    // claim or a promise still buys a fresh verdict.
+    // Reuse a rejection only for the SAME reply and unchanged business work.
+    // A read answer can correct missing records using already-retained evidence
+    // without a new call or a "done" verb. Carrying its old verdict would mark
+    // the correction unfulfilled without ever showing it to the reviewer.
     if (!planCandidate && completionReviewFeedback && objectiveJudgeContinuations >= 1
+      && completionReviewFeedback.replyDigest === createHash('sha256').update(judgedReply, 'utf8').digest('hex')
       && judgedBusinessCallsAtLastVerdict === businessCalls.length
       && honestFailureReportSettles({
         verdictDone: false,
@@ -3808,6 +3808,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         fullSourceEvidence: true,
         ...(policy.status === 'captured' ? { boundaryJudgeSelection: policy.policy.judgeSelection } : {}),
+        // The reviewer opens retained results itself when its verdict depends
+        // on content it was not shown, instead of ruling the claim unverified.
+        evidence: sourceEvidenceLookup(identity),
         skills: gatherSessionSkills(identity.sessionId, { sourceUserSeq: identity.sourceUserSeq, includeUnavailable: true }),
         // Source-bound settled effects FIRST, then authenticated read results.
         // The judge rules on actual source evidence, not call-count proxies or
@@ -3827,6 +3830,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             : settled.evidenceAvailable
               ? 'This request produced no receipt-bound artifact.'
               : 'The artifact evidence store could not be read for this request. You have NO artifact evidence — do not accept completion on the assistant\'s wording alone.',
+          // What stopped the attempts that did not complete: a refused or
+          // failed write otherwise reads as work never attempted, and the
+          // reviewer cannot tell whether another attempt could help.
+          sourceIncompleteAttemptsEvidence(identity),
           // Each result is shown as the answerer received it: whole when it
           // fit, otherwise the same bounded structure-aware view, and a
           // repeated call by its latest read. A claim whose basis the answerer
@@ -3840,9 +3847,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             + 'new requirements. Each result above is shown whole or as the bounded view the answerer received, '
             + 'as its own line says. A claim that rests on content outside what is shown, including a claim that '
             + 'data is missing, empty, unavailable or complete, is unverified unless another read shown here covers '
-            + 'it, such as a filtered query, a true count or a recalled page. A selected/derived projection is not '
-            + 'the full source result, and an omitted projection field does not establish absence. '
-            + 'Distinguish absent values from zero, empty and uninspected values.',
+            + 'it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. '
+            + 'A selected/derived projection is not the full source result, and an omitted projection field does '
+            + 'not establish absence. Distinguish absent values from zero, empty and uninspected values. '
+            + 'When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.',
         ].filter(Boolean).join('\n'),
       });
     } catch (error) {
@@ -3859,7 +3867,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       reply: judgedReply,
       settledWrites: settled.count,
     });
-    const continuation = !honestStop && ((!verdict.done && !awaitingInput)
+    // A BLOCKED verdict says another attempt cannot change the outcome; the
+    // reviewer's finding goes to the owner instead of a re-run.
+    const blockedByReview = verdict.blocked === true && !verdict.failedOpen;
+    const continuation = !honestStop && !blockedByReview && ((!verdict.done && !awaitingInput)
       || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
       && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
     try {
@@ -3873,6 +3884,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           kind: 'completion',
           fulfills: verdict.done && !verdict.awaitingUser,
           reason: verdict.reason.slice(0, 600),
+          ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
@@ -3948,6 +3960,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       sessionId: identity.sessionId,
       sourceUserSeq: identity.sourceUserSeq,
       done: verdict.done,
+      ...(blockedByReview ? { blocked: true } : {}),
       failedOpen: verdict.failedOpen === true,
       selfJudge: verdict.selfJudge === true,
       continuation,
@@ -3970,6 +3983,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         hostTurnLogger.info({
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
+          snapshot: 'review',
           ...efficiency,
           sessionToDate: usageEfficiencyForSource(identity.sessionId).inputTokens,
         }, 'host turn efficiency');
@@ -10029,6 +10043,22 @@ export const hostRunRunner: RunRunnerFn = async (runner, agent, itemsOrState, op
     // Exact-generation and idempotent. Await before any caller recovery can
     // retry or fall over to another model/provider lane.
     await revokeDispatchLeaseBeforeRecovery(lease);
+    // Review snapshots can precede a repair, and carried verdicts bypass that
+    // logging branch altogether. Always include the last model call when this
+    // physical runner exits, whether it completed, paused, or threw. This is a
+    // cumulative accepted-source snapshot, not another increment to sum.
+    try {
+      if (parent && Number.isSafeInteger(parent.sourceUserSeq) && parent.sourceUserSeq! > 0) {
+        const efficiency = usageEfficiencyForTurn(parent.sessionId, parent.sourceUserSeq!);
+        if (efficiency.frames > 0) hostTurnLogger.info({
+          sessionId: parent.sessionId,
+          sourceUserSeq: parent.sourceUserSeq,
+          snapshot: 'runner_exit',
+          ...efficiency,
+          sessionToDate: usageEfficiencyForSource(parent.sessionId).inputTokens,
+        }, 'host turn efficiency');
+      }
+    } catch { /* telemetry never blocks the outcome or recovery */ }
   }
 };
 
@@ -10389,6 +10419,10 @@ export function completionVerdictForAcceptedSource(input: {
   eventId: string;
   seq: number;
   fulfills: boolean;
+  /** Not done, and the reviewer found another attempt cannot change that. */
+  blocked?: boolean;
+  /** The reviewer's finding, as recorded. */
+  reason?: string;
   judgeModelId?: string;
   judgeProvider?: 'claude' | 'codex' | 'byo';
   judgeProviderId?: string;
@@ -10428,6 +10462,8 @@ export function completionVerdictForAcceptedSource(input: {
         eventId: String(event.id),
         seq: event.seq,
         fulfills: data.fulfills === true,
+        ...(data.blocked === true && data.fulfills !== true ? { blocked: true } : {}),
+        ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
         ...(data.failedOpen === true ? { failedOpen: true } : {}),
         ...(data.failedOpen === true && typeof data.reason === 'string'
           ? { reviewUnavailableReason: data.reason } : {}),

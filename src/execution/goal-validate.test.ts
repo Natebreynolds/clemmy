@@ -364,3 +364,39 @@ test('goalMissIsJudgeOnlyAdvisory: a judge-only miss on a fully-run workflow is 
   assert.equal(goalMissIsJudgeOnlyAdvisory(null, clean), false);
 });
 
+
+test('goal judges can open every step output, not just the evidence projection that samples arrays', async () => {
+  const stepOutputs = {
+    triage: { emails: Array.from({ length: 30 }, (_, n) => ({ subject: `Mail ${n}`, bucket: n % 3 === 0 ? 'respond' : 'noise', draft: n === 27 ? '' : 'Draft text' })) },
+    notify: 'Sent the summary to Nate.',
+  };
+  const seen: Array<import('../runtime/harness/judge-evidence-tools.js').JudgeEvidenceSource | undefined> = [];
+  await validateGoal({
+    objective: 'Triage the inbox and draft every respond email.',
+    successCriteria: ['Every email in the respond bucket has a non-empty draft', 'The summary is sent to Nate'],
+    evidenceText: 'STEP RESULTS (bounded structural projections; arrays show count + sample): triage: emails array(30), sample 1',
+    stepOutputs,
+  }, {
+    judgeCriteria: async (_objective, criteria, _text, evidence) => {
+      seen.push(evidence);
+      return criteria.map(() => ({ pass: true, note: 'ok' }));
+    },
+    fileExists: () => false,
+  });
+  const lookup = seen[0];
+  assert.ok(lookup, 'the per-criterion judge receives the run\'s step outputs to open');
+  assert.deepEqual([...lookup.refs()], ['triage', 'notify']);
+  const triage = lookup.resolve('triage');
+  assert.equal((triage?.value as { emails: unknown[] }).emails.length, 30, 'every record, not the sample');
+  assert.equal(lookup.resolve('notify')?.text, 'Sent the summary to Nate.');
+  assert.equal(lookup.resolve('not_a_step'), undefined);
+
+  const contexts: Array<import('../runtime/harness/objective-judge.js').SkillExecutionContext | undefined> = [];
+  await validateGoal({ objective: 'Triage the inbox.', successCriteria: [], evidenceText: 'final output', stepOutputs },
+    { judge: async (_objective, _text, context) => { contexts.push(context); return { done: true, reason: 'ok' }; } });
+  assert.ok(contexts[0]?.evidence, 'the whole-goal judge receives the same step outputs');
+  const noSteps: unknown[] = [];
+  await validateGoal({ objective: 'Answer the question.', successCriteria: [], evidenceText: 'final output' },
+    { judge: async (_objective, _text, context) => { noSteps.push(context); return { done: true, reason: 'ok' }; } });
+  assert.equal(noSteps[0], undefined, 'a caller without step outputs gives the judge nothing to open');
+});

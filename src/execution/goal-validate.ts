@@ -32,7 +32,9 @@ import {
   judgeObjectiveCompleteStrict,
   type CriterionJudgeVerdict,
   type ObjectiveJudgeVerdict,
+  type SkillExecutionContext,
 } from '../runtime/harness/objective-judge.js';
+import type { JudgeEvidenceSource } from '../runtime/harness/judge-evidence-tools.js';
 
 export interface GoalCriterionVerdict {
   criterion: string;
@@ -155,12 +157,14 @@ export interface ValidateGoalDeps {
   /** Injectable judge; defaults to judgeObjectiveCompleteStrict (THROWS on
    *  infra failure → validateGoal resolves to pass:false + judgeFailedOpen).
    *  Pass a throwing fake in tests to exercise the fail-open path. */
-  judge?: (objective: string, evidenceText: string) => Promise<ObjectiveJudgeVerdict>;
+  judge?: (objective: string, evidenceText: string, context?: SkillExecutionContext) => Promise<ObjectiveJudgeVerdict>;
   /** Injectable PER-CRITERION judge (one call, one verdict per criterion);
    *  defaults to judgeGoalCriteriaStrict. When only `judge` is injected (test
    *  fakes), the legacy whole-checklist path runs instead — an injected fake
    *  must never be silently bypassed by a real model call. */
-  judgeCriteria?: (objective: string, criteria: string[], evidenceText: string) => Promise<CriterionJudgeVerdict[]>;
+  judgeCriteria?: (
+    objective: string, criteria: string[], evidenceText: string, evidence?: JudgeEvidenceSource,
+  ) => Promise<CriterionJudgeVerdict[]>;
   fileExists?: (p: string) => boolean;
 }
 
@@ -217,8 +221,24 @@ export function toGoalEvidence(result: GoalValidationResult, attempt: number, at
 // (right for the chat continuation gate, fatal here — a dead judge must never
 // auto-satisfy a goal). The strict variant throws; validateGoal's catch turns
 // that into pass:false + judgeFailedOpen.
-function defaultJudge(objective: string, evidenceText: string): Promise<ObjectiveJudgeVerdict> {
-  return judgeObjectiveCompleteStrict(objective, evidenceText);
+function defaultJudge(objective: string, evidenceText: string, context?: SkillExecutionContext): Promise<ObjectiveJudgeVerdict> {
+  return judgeObjectiveCompleteStrict(objective, evidenceText, context);
+}
+
+/** The run's complete step outputs, for a reviewer to open. Its evidence text
+ * shows each output as a bounded projection (arrays as count + sample), which
+ * cannot prove a criterion about every record; the reviewer reads the rest. */
+export function stepOutputEvidence(stepOutputs: Record<string, unknown> | undefined): JudgeEvidenceSource | undefined {
+  if (!stepOutputs || Object.keys(stepOutputs).length === 0) return undefined;
+  return {
+    refKind: 'step ids of this run',
+    refs: () => Object.keys(stepOutputs),
+    resolve(ref) {
+      if (!Object.prototype.hasOwnProperty.call(stepOutputs, ref)) return undefined;
+      const value = stepOutputs[ref];
+      return { text: typeof value === 'string' ? value : JSON.stringify(value, null, 1) ?? String(value), value };
+    },
+  };
 }
 
 /**
@@ -232,13 +252,15 @@ export async function validateGoal(
 ): Promise<GoalValidationResult> {
   const fileExists = deps.fileExists ?? existsSync;
   const judge = deps.judge ?? defaultJudge;
+  const evidence = stepOutputEvidence(input.stepOutputs);
+  const judgeContext: SkillExecutionContext | undefined = evidence ? { skills: [], toolCallSummary: '', evidence } : undefined;
   const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter((c) => c.length > 0);
 
   // No criteria declared → fall back to judging the objective itself, so a
   // criteria-less goal still gets the audit-checklist treatment.
   if (criteria.length === 0) {
     try {
-      const verdict = await judge(input.objective, input.evidenceText);
+      const verdict = await judge(input.objective, input.evidenceText, judgeContext);
       // AWAITING is done:true for the CHAT bounce lane, but for a parked GOAL
       // it means "paused for the user's decision" — the work has NOT happened.
       // Banking it as satisfied would clear the goal on the strength of a
@@ -314,7 +336,7 @@ export async function validateGoal(
     const judgeCriteria = deps.judgeCriteria ?? (deps.judge ? null : judgeGoalCriteriaStrict);
     try {
       if (judgeCriteria && fuzzy.length > 1) {
-        const verdicts = await judgeCriteria(input.objective, fuzzy, input.evidenceText);
+        const verdicts = await judgeCriteria(input.objective, fuzzy, input.evidenceText, evidence);
         fuzzy.forEach((criterion, i) => {
           const v = verdicts[i];
           perCriterion.push({ criterion, pass: v?.pass === true, method: 'judge', detail: v?.note });
@@ -326,7 +348,7 @@ export async function validateGoal(
           'The objective is complete ONLY when ALL of these success criteria are met:',
           ...fuzzy.map((c, i) => `${i + 1}. ${c}`),
         ].join('\n');
-        const verdict = await judge(checklistObjective, input.evidenceText);
+        const verdict = await judge(checklistObjective, input.evidenceText, judgeContext);
         // AWAITING = paused for the user, not satisfied (same guard as the
         // criteria-less lane above) — a goal never clears on a question.
         const pass = verdict.done && !verdict.awaitingUser;
