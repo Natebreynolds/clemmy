@@ -49,3 +49,25 @@ test('a full fitting annotated result reports complete content and preserves act
     assert.equal(exactToolOutputForInvocation({ ...context, compactResult: rendered }), raw);
   });
 });
+
+test('an oversized host annotation never displaces the provider result', async () => {
+  const session = events.createSession({ kind: 'chat' });
+  const context = { sessionId: session.id, callId: 'oversized-annotation', toolName: 'composio_execute_tool',
+    settlementNonce: '66666666-6666-4666-8666-666666666666' };
+  const subjects = ['Standup', 'Pipeline review', 'Leadership sync', 'Customer call', 'Team lunch', 'Weekly wrap-up'];
+  const raw = JSON.stringify({ data: { value: subjects.map((subject, index) => ({
+    subject, start: { dateTime: `2026-09-18T${String(9 + index).padStart(2, '0')}:00:00` }, isAllDay: false,
+  })) } });
+  const rule = `Standing rule: ${'host-composed text that is not a rule. '.repeat(1000)}`;
+  const account = '[account-route] Using the exact account frozen by the accepted host plan (ca_123456789012).';
+  await withToolOutputContext(context, () => {
+    const rendered = formatRecallableToolText(raw, { hostAnnotations: [account, rule] });
+    assert.ok(rendered.length <= 20000, `rendered ${rendered.length} chars`);
+    for (const subject of subjects) assert.ok(rendered.includes(subject), `${subject} reaches the model`);
+    assert.ok(rendered.includes(account), 'a small annotation survives whole');
+    assert.ok(rendered.includes('host annotation shortened'), 'the oversized note is shortened, not the result');
+    assert.equal(exactToolOutputForInvocation({ ...context, compactResult: rendered }), raw);
+  });
+  const unscoped = formatRecallableToolText(raw, { hostAnnotations: [rule] });
+  for (const subject of subjects) assert.ok(unscoped.includes(subject), `${subject} survives without a receipt too`);
+});

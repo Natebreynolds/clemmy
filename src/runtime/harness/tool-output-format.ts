@@ -14,6 +14,34 @@ import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output
 // window (compactionBudgetForModel) instead of a fixed 200K.
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 
+// Host commentary explains a provider result; it never displaces it. The
+// annotation block receives at most this share of the result budget, each note
+// shortened within it, and the provider result keeps the remainder.
+const HOST_ANNOTATION_BUDGET_SHARE = 0.25;
+const HOST_ANNOTATION_SHORTENED = '…[host annotation shortened]';
+
+export function boundHostAnnotations(notes: readonly string[], maxChars: number): string[] {
+  const budget = Math.max(0, Math.floor(maxChars * HOST_ANNOTATION_BUDGET_SHARE));
+  const bounded: string[] = [];
+  let used = 0;
+  let omitted = 0;
+  for (const note of notes) {
+    const remaining = budget - used;
+    if (note.length + 1 <= remaining) {
+      bounded.push(note);
+      used += note.length + 1;
+    } else if (remaining > HOST_ANNOTATION_SHORTENED.length * 3) {
+      const shortened = `${note.slice(0, remaining - HOST_ANNOTATION_SHORTENED.length - 1)}${HOST_ANNOTATION_SHORTENED}`;
+      bounded.push(shortened);
+      used += shortened.length + 1;
+    } else {
+      omitted += 1;
+    }
+  }
+  if (omitted > 0) bounded.push(`[${omitted} more host annotation${omitted === 1 ? '' : 's'} omitted]`);
+  return bounded;
+}
+
 export interface RecallableToolTextOptions {
   maxChars?: number;
   toolName?: string | null;
@@ -295,6 +323,7 @@ export function formatRecallableToolText(
     } catch { persistenceFailed = true; }
   }
   if (text.length <= maxChars && hostAnnotations.length === 0) return text;
+  hostAnnotations = boundHostAnnotations(hostAnnotations, maxChars);
 
   const annotationText = hostAnnotations.length > 0
     ? `[Host annotations — separate from provider result]\n${hostAnnotations.join("\n")}\n\n` : "";
