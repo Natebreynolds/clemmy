@@ -9,7 +9,7 @@
  *   - Never hang a request forever. A wedged worker is replaced, not waited on.
  *   - Never hold the process open (the worker is unref'd).
  */
-import { Worker } from 'node:worker_threads';
+import { isMainThread, Worker } from 'node:worker_threads';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import type { EmbeddingWorkerRequest, EmbeddingWorkerResponse } from './embedding.worker.js';
@@ -53,13 +53,37 @@ function workerDisabled(): boolean {
 }
 
 /**
+ * A worker thread must never start an embedding worker of its own.
+ *
+ * This module exists for exactly one reason: keep synchronous ONNX inference
+ * off the MAIN thread, whose event loop carries the HTTP listener and the
+ * supervisor heartbeat. Inside a worker there is no such loop to protect, so
+ * spawning another worker buys nothing -- and it does not merely waste a
+ * thread. embedding.worker.ts imports ./embeddings.js, whose module top level
+ * eagerly warms the local provider on a no-key install; that warmup calls
+ * startEmbeddingWorker(), which would spawn the next generation, which imports
+ * the module again. The recursion is unbounded and every generation keeps a
+ * loaded copy of the model (~220 MB plus an ONNX thread pool), so a process
+ * that merely touched embeddings climbed until the machine gave out: clemmy's
+ * own `bench:gates` and eval-suite CI jobs printed their PASS verdict and were
+ * then killed by the runner, ~70 generations in.
+ *
+ * Returning null here is the existing "no worker available" signal, and the
+ * caller already handles it by doing inference in process -- which is the
+ * correct behaviour off the main thread anyway.
+ */
+function workerWouldRecurse(): boolean {
+  return !isMainThread;
+}
+
+/**
  * Start (once) the embedding worker. Returns null when a worker cannot be used,
  * which is a signal to fall back — never an error.
  */
 export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | null> {
   if (handle !== undefined) return handle;
   if (startInFlight) return startInFlight;
-  if (workerDisabled()) { handle = null; return null; }
+  if (workerDisabled() || workerWouldRecurse()) { handle = null; return null; }
 
   startInFlight = (async () => {
     try {
@@ -130,6 +154,22 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
         handle = null;
         return null;
       }
+
+      // unref() AGAIN, and this time it sticks.
+      //
+      // The call at spawn is undone by our own listeners: attaching a
+      // 'message' handler starts the underlying MessagePort, and a started
+      // port is ref'd, so the process is held open by the very channel we
+      // unref'd before we had anything to listen with. The active handle list
+      // after a finished run read ["PipeWrap","MessagePort"] -- the port, not
+      // the Worker. Re-unref once the listeners this module needs are all
+      // attached, which is the only point at which the module's stated
+      // contract ("never hold the process open") is actually true.
+      //
+      // Consistent with the request timers above, which are unref'd for the
+      // same reason: nothing about an embedding is worth keeping a process
+      // alive for.
+      worker.unref();
 
       handle = {
         runtime,
