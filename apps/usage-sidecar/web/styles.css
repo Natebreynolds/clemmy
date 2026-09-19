@@ -118,7 +118,33 @@ textarea { min-height: 88px; resize: vertical; }
   grid-template-columns: 1fr 1fr;
   gap: 18px;
 }
-@media (max-width: 840px) { .columns { grid-template-columns: 1fr; } }
+.columns.four { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 1100px) { .columns.four { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 840px) { .columns, .columns.four { grid-template-columns: 1fr; } }
+.lane.emitting { border-color: color-mix(in srgb, var(--copper) 50%, var(--line)); }
+.lane .hero { font-size: clamp(28px, 4vw, 44px); }
+
+.tasks { margin-top: 28px; }
+.tasks h2, .tape h2 {
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.tasks ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.task {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+}
+.task.live { border-color: color-mix(in srgb, var(--copper) 40%, var(--line)); }
+.task-nums { text-align: right; }
+.task-nums b { display: block; font-size: 18px; }
 
 .lane {
   background: var(--bg-2);

@@ -915,6 +915,34 @@ export function usageEfficiencyForSource(sessionId: string, date: Date = new Dat
 }
 
 /**
+ * Efficiency for ONE accepted turn, not a whole session.
+ *
+ * `usageEfficiencyForSource` sums every row a session produced that day, which
+ * is right for a workflow step (one step, one session) and wrong for chat,
+ * where a session accumulates turn after turn. Measured 2026-09-18: a second
+ * identical chat turn reported the FIRST turn's cached tokens unchanged, so a
+ * per-turn cache improvement was indistinguishable from none — the instrument
+ * could not answer the question the optimisation was asking.
+ *
+ * Rows carry the accepted-source identity `<sessionId>:<seq>`, so one turn is
+ * exactly the rows matching this seq. Best-effort; never throws.
+ */
+export function usageEfficiencyForTurn(
+  sessionId: string,
+  sourceUserSeq: number,
+  date: Date = new Date(),
+): UsageEfficiency {
+  const exact = `${sessionId}:${sourceUserSeq}`;
+  return usageEfficiencyForEvents(
+    readUsageEventsForDate(date).filter((ev) => (
+      ev.source === exact
+      || ev.trace?.acceptedSource === exact
+      || ev.trace?.logicalTurnId === `turn:${sourceUserSeq}`
+    )),
+  );
+}
+
+/**
  * Total tokens recorded across an entire workflow run (all its steps) on a date,
  * using the derived `runId` join key. Leverages the S2 join so the run-level
  * STATE record can report "this whole goal attempt cost N tokens" without

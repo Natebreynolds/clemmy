@@ -70,8 +70,17 @@ function mime(file: string): string {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
   try {
-    if (req.method === 'GET' && url.pathname === '/api/trial') {
+    if (req.method === 'GET' && url.pathname === '/api/live') {
       send(res, 200, engine.snapshot());
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/clear') {
+      engine.clear();
+      send(res, 200, engine.snapshot());
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/trial') {
+      send(res, 200, engine.trialSnapshot());
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/trial') {

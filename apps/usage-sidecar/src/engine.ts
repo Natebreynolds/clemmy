@@ -12,6 +12,7 @@ import { parseClementineUsage } from './parse-clementine.js';
 import {
   acceptCall, armTrial, bindLane, createTrial, dedupeCalls, emptyLane, rollupLane, sealLane, verdictFor,
 } from './trial.js';
+import { buildLiveSnapshot, type LiveSnapshot } from './live.js';
 import type {
   CanonicalCall, Lane, NativeSource, Pairing, SessionCandidate, Trial, TrialSnapshot,
 } from './types.js';
@@ -72,27 +73,33 @@ function coworkMeta(auditPath: string): { title?: string; model?: string; create
 
 export class MeterEngine {
   trial: Trial | null = null;
+  watchingSince = new Date().toISOString();
   private calls: CanonicalCall[] = [];
   private tails = new Map<string, TailState>();
   private claudeMeta = new Map<string, ClaudeFileMeta>();
   private codexModel = new Map<string, string>();
   private watchers: FSWatcher[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
-  private listeners = new Set<(snap: TrialSnapshot) => void>();
+  private discoverPoll: ReturnType<typeof setInterval> | null = null;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private listeners = new Set<(snap: LiveSnapshot) => void>();
   private knownFiles = new Set<string>();
+  private lastEmitCount = -1;
 
-  onSnapshot(fn: (snap: TrialSnapshot) => void): () => void {
+  onSnapshot(fn: (snap: LiveSnapshot) => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
 
-  snapshot(): TrialSnapshot {
+  snapshot(): LiveSnapshot {
+    return buildLiveSnapshot(this.calls, this.watchingSince);
+  }
+
+  trialSnapshot(): TrialSnapshot {
     const blank = emptyLane();
     if (!this.trial) {
       return {
-        trial: {
-          id: '', name: '', pairing: 'codex', nativeSource: 'codex', createdAt: '',
-        },
+        trial: { id: '', name: '', pairing: 'codex', nativeSource: 'codex', createdAt: '' },
         native: blank,
         clementine: blank,
         verdict: {
@@ -106,26 +113,33 @@ export class MeterEngine {
     }
     const nativeCalls = dedupeCalls(this.calls.filter((c) => acceptCall(this.trial!, c) && c.lane === 'native'));
     const clemCalls = dedupeCalls(this.calls.filter((c) => acceptCall(this.trial!, c) && c.lane === 'clementine'));
-    const native = rollupLane(nativeCalls);
-    const clementine = rollupLane(clemCalls);
     return {
       trial: this.trial,
-      native,
-      clementine,
-      verdict: verdictFor(this.trial, native, clementine),
+      native: rollupLane(nativeCalls),
+      clementine: rollupLane(clemCalls),
+      verdict: verdictFor(this.trial, rollupLane(nativeCalls), rollupLane(clemCalls)),
       nativeCalls: nativeCalls.slice(-80),
       clementineCalls: clemCalls.slice(-80),
       candidates: this.candidates(),
     };
   }
 
-  reset(): void {
-    this.trial = null;
+  clear(): void {
     this.calls = [];
-    this.emit();
+    this.watchingSince = new Date().toISOString();
+    this.lastEmitCount = -1;
+    this.primeExisting();
+    this.emit(true);
   }
 
-  private emit(): void {
+  reset(): void {
+    this.trial = null;
+    this.clear();
+  }
+
+  private emit(force = false): void {
+    if (!force && this.calls.length === this.lastEmitCount) return;
+    this.lastEmitCount = this.calls.length;
     const snap = this.snapshot();
     for (const fn of this.listeners) fn(snap);
   }
@@ -182,12 +196,15 @@ export class MeterEngine {
     this.watchDir(coworkRootDir());
     this.watchDir(codexSessionsDir());
     this.watchDir(clementineUsageDir());
-    this.poll = setInterval(() => this.scanAll(), 1000);
+    this.discoverPoll = setInterval(() => this.discoverNew(), 2000);
+    this.heartbeat = setInterval(() => this.emit(true), 5000);
   }
 
   stop(): void {
-    if (this.poll) clearInterval(this.poll);
-    this.poll = null;
+    if (this.discoverPoll) clearInterval(this.discoverPoll);
+    this.discoverPoll = null;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = null;
     for (const w of this.watchers) {
       try { w.close(); } catch { /* ignore */ }
     }
@@ -197,13 +214,36 @@ export class MeterEngine {
   private watchDir(dir: string): void {
     if (!existsSync(dir)) return;
     try {
-      const w = watch(dir, { recursive: true }, () => {
-        this.scanAll(false);
+      const w = watch(dir, { recursive: true }, (_event, filename) => {
+        if (!filename) return;
+        this.ingestPath(path.join(dir, filename));
+        this.autoBind();
+        this.emit();
       });
       this.watchers.push(w);
     } catch {
       /* recursive watch not available — poll covers it */
     }
+  }
+
+  private ingestPath(file: string): void {
+    if (!file) return;
+    if (file.endsWith('.ndjson')) this.ingestClementine(file);
+    else if (file.endsWith(`${path.sep}audit.jsonl`) || file.endsWith('audit.jsonl')) {
+      this.ingestClaude(file, 'cowork', false);
+    } else if (file.includes(`${path.sep}.codex${path.sep}sessions${path.sep}`) && file.endsWith('.jsonl')) {
+      this.ingestCodex(file);
+    } else if (file.endsWith('.jsonl')) this.ingestClaude(file, 'claude-code', true);
+  }
+
+  private scanKnown(): void {
+    for (const file of this.knownFiles) this.ingestPath(file);
+    this.autoBind();
+    this.emit();
+  }
+
+  private discoverNew(): void {
+    this.scanAll();
   }
 
   private allWatchedFiles(): string[] {
@@ -225,7 +265,6 @@ export class MeterEngine {
   }
 
   private scanAll(): void {
-    if (!this.trial?.armedAt) return;
     for (const file of walkFiles(claudeProjectsDir(), (name) => name.endsWith('.jsonl'))) {
       this.ingestClaude(file, 'claude-code', true);
     }
@@ -293,6 +332,7 @@ export class MeterEngine {
   private pushCall(call: CanonicalCall): void {
     this.calls.push(call);
     if (this.calls.length > MAX_CALLS) this.calls.splice(0, this.calls.length - MAX_CALLS);
+    this.emit();
   }
 
   private candidates(): SessionCandidate[] {

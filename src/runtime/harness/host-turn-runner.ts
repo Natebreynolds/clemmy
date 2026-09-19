@@ -1,5 +1,5 @@
 import { expectedWorkPlanLines } from './expected-work-admission.js';
-import { usageEfficiencyForSource } from '../usage-log.js';
+import { usageEfficiencyForSource, usageEfficiencyForTurn } from '../usage-log.js';
 import { currentManifestOperationContract } from './current-manifest-operation-semantics.js';
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
@@ -3945,12 +3945,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // lines total, so there was nothing to optimise against. Same helper, same
     // fields, so chat and workflow cost can finally be compared.
     try {
-      const efficiency = usageEfficiencyForSource(identity.sessionId);
+      // THIS turn, not the session's running total. A chat session accumulates
+      // turn after turn, so the session-scoped helper reported a second
+      // identical turn as having added no cached tokens when it had — the
+      // number could not answer the question it was being asked.
+      const efficiency = usageEfficiencyForTurn(identity.sessionId, identity.sourceUserSeq);
       if (efficiency.frames > 0) {
         hostTurnLogger.info({
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           ...efficiency,
+          sessionToDate: usageEfficiencyForSource(identity.sessionId).inputTokens,
         }, 'host turn efficiency');
       }
     } catch { /* telemetry never blocks the reply */ }

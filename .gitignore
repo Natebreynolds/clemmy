@@ -45,6 +45,9 @@ apps/desktop/release-*/
 .idea/
 .history/
 
+# Usage sidecar trial proofs (local-only)
+apps/usage-sidecar/.trials/
+
 # Local scratch dirs
 .firecrawl/
 .codex/
