@@ -528,21 +528,30 @@ function MadeSection() {
         {groups.slice(0, 6).map((group) => {
           const open = group.artifacts?.find((a) => a.openable && /^https?:/i.test(a.target))?.target ?? group.url;
           const n = group.artifacts?.length || group.artifactCount;
-          return (
+          const body = (
+            <div class="min-w-0">
+              <div class="home-row-title truncate">{group.title}</div>
+              <div class="home-row-note">{n === 1 ? '1 item' : `${n} items`}</div>
+            </div>
+          );
+          // A group with no openable http artifact and no url has nowhere to
+          // go, and the tap only buzzed. A control that cannot act is not a
+          // control: render the same row without the affordance rather than a
+          // button whose entire effect is a haptic.
+          return open ? (
             <button
               key={group.id}
               type="button"
               class="home-row home-row-tap"
               onClick={() => {
                 haptic('light');
-                if (open) window.open(open, '_blank', 'noopener,noreferrer');
+                window.open(open, '_blank', 'noopener,noreferrer');
               }}
             >
-              <div class="min-w-0">
-                <div class="home-row-title truncate">{group.title}</div>
-                <div class="home-row-note">{n === 1 ? '1 item' : `${n} items`}</div>
-              </div>
+              {body}
             </button>
+          ) : (
+            <div key={group.id} class="home-row">{body}</div>
           );
         })}
       </div>

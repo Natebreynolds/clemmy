@@ -13,6 +13,18 @@ export interface NavDest {
   icon: LucideIcon;
   /** Plain-language one-liner shown as a tooltip / subtitle. */
   hint: string;
+  /**
+   * For power tools only: who the panel is for.
+   *
+   * `everyday` panels answer questions an owner actually asks — what am I
+   * spending, what can she reach, how far may a run go, when may she act
+   * alone. `developer` panels are instruments: logs, telemetry, run replay,
+   * nightly self-research, kill-switches. A personal assistant should not open
+   * on a lab bench, so the developer tier is hidden until developer mode is on
+   * (Settings → Developer mode) — hidden, never removed: the routes keep
+   * working, so an old deep link or a bookmark still resolves.
+   */
+  tier?: 'everyday' | 'developer';
 }
 
 /**
@@ -40,20 +52,27 @@ export const PRIMARY_NAV: NavDest[] = [
  * Developer link, shown when developer mode is on) and the command palette.
  */
 export const ADVANCED_NAV: NavDest[] = [
-  { path: '/advanced/usage', label: 'Usage', icon: BarChart3, hint: 'Token spend & activity' },
-  { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog' },
-  { path: '/advanced/diagnostics', label: 'Diagnostics', icon: Stethoscope, hint: 'Health, logs & storage' },
-  { path: '/advanced/observability', label: 'Observability', icon: Activity, hint: 'Live operational telemetry feed' },
-  { path: '/advanced/traces', label: 'Trace Lab', icon: GitBranch, hint: 'Harness run timeline & replay preview' },
-  { path: '/advanced/budgets', label: 'Run limits', icon: Gauge, hint: 'How far a run goes — steps, time & caps' },
-  { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own' },
-  { path: '/advanced/evolution', label: 'Evolution', icon: Sparkles, hint: 'Nightly self-research reports' },
+  { path: '/advanced/usage', label: 'Usage', icon: BarChart3, hint: 'Token spend & activity', tier: 'everyday' },
+  { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog', tier: 'everyday' },
+  { path: '/advanced/budgets', label: 'Run limits', icon: Gauge, hint: 'How far a run goes — steps, time & caps', tier: 'everyday' },
+  { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own', tier: 'everyday' },
+  { path: '/advanced/diagnostics', label: 'Diagnostics', icon: Stethoscope, hint: 'Health, logs & storage', tier: 'developer' },
+  { path: '/advanced/observability', label: 'Observability', icon: Activity, hint: 'Live operational telemetry feed', tier: 'developer' },
+  { path: '/advanced/traces', label: 'Trace Lab', icon: GitBranch, hint: 'Harness run timeline & replay preview', tier: 'developer' },
+  { path: '/advanced/evolution', label: 'Evolution', icon: Sparkles, hint: 'Nightly self-research reports', tier: 'developer' },
 ];
 
 /** Exists ONLY when developer mode is on (Settings → Developer mode). */
 export const DEVELOPER_NAV: NavDest = {
-  path: '/advanced/developer', label: 'Developer', icon: FlaskConical, hint: 'Feature flags & kill-switches',
+  path: '/advanced/developer', label: 'Developer', icon: FlaskConical, hint: 'Feature flags & kill-switches', tier: 'developer',
 };
+
+/** The power tools to OFFER, given whether developer mode is on. The hidden
+ *  ones stay routed; this decides only what the product advertises. */
+export function advancedNavFor(developerMode: boolean): NavDest[] {
+  const everyday = ADVANCED_NAV.filter((d) => d.tier !== 'developer');
+  return developerMode ? [...everyday, ...ADVANCED_NAV.filter((d) => d.tier === 'developer'), DEVELOPER_NAV] : everyday;
+}
 
 /** Pinned at the bottom of the sidebar. */
 export const FOOTER_NAV: NavDest[] = [

@@ -91,6 +91,23 @@ function upsertModelPhase(
  *  correlated called→returned by callId when available, falling back to name for
  *  older events; agents (run_worker) are keyed by item; run_batch renders as ONE
  *  live meter row driven by authoritative batch_progress counts. */
+
+/** Count a manifest's declared items by their LAST checkpointed status. Items
+ *  the harness has not spoken about yet are pending, which is neither done nor
+ *  failed — the meter shows work proved, never work assumed. */
+function manifestMeter(
+  itemStatus: Record<string, string>,
+  total: number,
+): { done: number; total: number; failed: number } {
+  let done = 0;
+  let failed = 0;
+  for (const status of Object.values(itemStatus)) {
+    if (status === 'succeeded') done += 1;
+    else if (status === 'failed' || status === 'invalidated') failed += 1;
+  }
+  return { done, total: Math.max(total, done + failed), failed };
+}
+
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () => number = Date.now): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
   const d = (ev.data ?? {}) as Record<string, unknown>;
@@ -189,6 +206,66 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       }
       return next;
     }
+    // ── The declared work contract ────────────────────────────────────────
+    //
+    // "Find 100 market-leader accounts" is the product's own success story, and
+    // the thread shows "Thinking…" for the whole of it — even though the
+    // harness enumerates every item up front (work_manifest_declared) and
+    // checkpoints each one as it settles (work_item_checkpoint). This folds
+    // both into a metered row, reusing the batch meter both shells draw.
+    //
+    // INERT TODAY, ON PURPOSE. Neither event is cased in `projectData`
+    // (src/runtime/harness/public-presentation.ts), which is a fail-closed
+    // allowlist, so neither reaches a client and this code cannot run in
+    // production. It is kept, tested and ready because the server change is
+    // small: add both cases with a bounded `selected(...)` projection. Both
+    // types are listed in AWAITING_PROJECTION, and event-coverage.test.ts fails
+    // the moment they are admitted, pointing at the rest of the wiring.
+    case 'work_manifest_declared': {
+      const manifestId = typeof d.manifestId === 'string' ? d.manifestId : '';
+      const items = Array.isArray(d.items) ? d.items : [];
+      if (!manifestId || items.length === 0) return prev;
+      const id = `wm-${manifestId}`;
+      const objective = typeof d.objective === 'string' && d.objective.trim() ? d.objective.trim() : '';
+      const label = objective || `Working through ${items.length} item${items.length === 1 ? '' : 's'}`;
+      const existing = prev.find((a) => a.id === id);
+      // `extend` adds to a live manifest; the already-settled items must keep
+      // their state or the meter would jump backwards.
+      const itemStatus = existing?.manifest?.itemStatus ?? {};
+      const row: ActivityItem = {
+        id,
+        kind: 'batch',
+        label,
+        status: 'running',
+        startedAt: existing?.startedAt ?? now(),
+        batch: manifestMeter(itemStatus, items.length),
+        manifest: { id: manifestId, itemStatus },
+      };
+      return existing ? prev.map((a) => (a.id === id ? { ...a, ...row } : a)) : [...prev, row];
+    }
+    case 'work_item_checkpoint': {
+      const manifestId = typeof d.manifestId === 'string' ? d.manifestId : '';
+      const itemId = typeof d.itemId === 'string' ? d.itemId : '';
+      const status = typeof d.status === 'string' ? d.status : '';
+      if (!manifestId || !itemId || !status) return prev;
+      const id = `wm-${manifestId}`;
+      const row = prev.find((a) => a.id === id);
+      // A checkpoint without its declaration has no denominator; inventing one
+      // would render a meter the harness never proved.
+      if (!row?.manifest) return prev;
+      const itemStatus = { ...row.manifest.itemStatus, [itemId]: status };
+      const total = row.batch?.total ?? Object.keys(itemStatus).length;
+      const phase = typeof d.phase === 'string' && d.phase.trim() ? d.phase.trim() : '';
+      const meter = manifestMeter(itemStatus, total);
+      const settled = meter.done + meter.failed >= total;
+      return prev.map((a) => (a.id === id ? {
+        ...a,
+        batch: meter,
+        manifest: { id: manifestId, itemStatus },
+        ...(phase ? { detail: phase.replace(/[_-]+/g, ' ') } : {}),
+        ...(settled ? { status: meter.failed > 0 ? 'failed' as const : 'done' as const } : {}),
+      } : a));
+    }
     case 'batch_started': {
       const batchId = typeof d.batchId === 'string' ? d.batchId : `${prev.length}`;
       const total = typeof d.items === 'number' ? d.items : 0;
@@ -250,6 +327,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         // The latest file's opening rides along, so the peek pane always
         // shows what was JUST produced.
         ...(excerpt ? { excerpt } : (existing?.excerpt ? { excerpt: existing.excerpt } : {})),
+        // The latest file's identity rides along so a surface can offer to open
+        // it. Basenames only — that is all the harness publishes.
+        deliverable: { name, dir },
       };
       return existing
         ? prev.map((a) => (a.id === 'deliverables' ? row : a))
@@ -366,12 +446,21 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       const failedOpen = d.failedOpen === true;
       const scorecard = typeof d.criteriaMet === 'number' && typeof d.criteriaTotal === 'number' ? ` ${d.criteriaMet}/${d.criteriaTotal}` : '';
       const reason = typeof d.reason === 'string' ? d.reason : '';
+      // "The reviewer said no" and "there was no reviewer" are different facts.
+      // Both used to render as a failed check, which made an unverified answer
+      // look rejected — and made a real rejection look routine. A failed-open
+      // verdict is the absence of verification: not a pass, not a refusal.
       return [...prev, {
         id: `v${prev.length}-${door}`,
         kind: 'check',
-        label: failedOpen ? `Verdict · ${door}: accepted (judge unavailable)` : `Verdict · ${door}${scorecard}: ${pass ? 'passed' : 'not passed'}`,
-        ...(reason ? { detail: reason } : {}),
-        status: pass && !failedOpen ? 'done' : 'failed',
+        label: failedOpen
+          ? `Verdict · ${door}: accepted without review`
+          : `Verdict · ${door}${scorecard}: ${pass ? 'passed' : 'not passed'}`,
+        ...(failedOpen
+          ? { detail: reason || 'The reviewer was unavailable, so this answer was not checked.' }
+          : (reason ? { detail: reason } : {})),
+        status: failedOpen ? 'done' as const : (pass ? 'done' as const : 'failed' as const),
+        ...(failedOpen ? { tone: 'warning' as const } : {}),
       }];
     }
     case 'heartbeat': {
@@ -430,7 +519,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     case 'conversation_completed':
       return prev.map((it) => (
         it.id.startsWith('dispatch-') && it.status === 'running'
-          ? { ...it, status: 'done', tone: 'success' }
+          // The turn ending proves the DISPATCH landed, not that the work
+          // succeeded — the row's own detail says the result arrives later.
+          // Success-green claimed an outcome nothing had reported yet.
+          ? { ...it, status: 'done' as const, tone: 'muted' as const }
           : it
       ));
     // ONE row per code-mode program: the user sees the outcome, not the machinery.

@@ -4,7 +4,6 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import { AppShell } from './components/AppShell';
 import { Chat } from './screens/Chat';
 import { Home } from './screens/Home';
-import { HomeMock } from './screens/HomeMock';
 import { useHomePreferences } from './lib/home-prefs';
 import { lastChatSession } from './lib/last-session';
 import { listSpaces } from './lib/spaces';
@@ -23,6 +22,10 @@ function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(
   return lazy(async () => ({ default: (await loader())[exportName] }));
 }
 
+// The approved design mock is 1,380 lines of fixture that almost nobody loads.
+// It was statically imported here AND in Home.tsx, so it rode the main chunk on
+// every cold start.
+const HomeMock = lazyNamed(() => import('./screens/HomeMock'), 'HomeMock');
 const Inbox = lazyNamed(() => import('./screens/Inbox'), 'Inbox');
 const BackgroundTasks = lazyNamed(() => import('./screens/BackgroundTasks'), 'BackgroundTasks');
 const Goals = lazyNamed(() => import('./screens/Goals'), 'Goals');
@@ -167,7 +170,7 @@ export function App() {
           <Route path="/notch" element={<NotchSurface />} />
           {/* Fixture-only Home command-center mock. Outside AppShell so it
               does not depend on the daemon, and does not replace /home. */}
-          <Route path="/dev/home-mock" element={<HomeMock />} />
+          <Route path="/dev/home-mock" element={deferred(<HomeMock />)} />
 
           <Route element={<AppShell />}>
             <Route index element={<LandingRedirect />} />

@@ -211,11 +211,38 @@ test('board feed uses durable terminal events and fails closed without one', () 
 // green tests proves it runs, never that it is connected. Both surfaces must
 // narrate, or the inline strip and the board drawer disagree about what
 // happened in the same run.
+//
+// 2026-09-19: this pin was itself an example of the thing it warns about. It
+// asserted that TurnActivity.tsx narrates — and TurnActivity.tsx was imported
+// by nothing. 156 lines, green test, mounted nowhere: the pin proved the FILE
+// narrated, never that the file was reachable. ActivityCard superseded it, so
+// the file is gone and the pin now proves what "WIRED" was always supposed to
+// mean: the narrating surface is imported by something a user can reach.
 {
-  const { readFileSync } = await import('node:fs');
-  for (const file of ['../components/chat/TurnActivity.tsx', '../components/chat/ActivityFeed.tsx']) {
-    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    assert.match(source, /narrateActivity\([^)]*live/, `${file} must narrate (and pass live so discovery can stand in)`);
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const srcRoot = fileURLToPath(new URL('..', import.meta.url));
+
+  function sourceFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) return sourceFiles(full);
+      return /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [full] : [];
+    });
+  }
+  const allSource = sourceFiles(srcRoot);
+
+  for (const file of ['../components/chat/ActivityCard.tsx', '../components/chat/ActivityFeed.tsx']) {
+    const absolute = fileURLToPath(new URL(file, import.meta.url));
+    const source = readFileSync(absolute, 'utf8');
+    assert.match(source, /narrateActivity\(|BatchRow|ActivityRow/,
+      `${file} must take part in narration`);
+    const name = absolute.split('/').pop()!.replace(/\.tsx?$/, '');
+    const importers = allSource.filter((candidate) => (
+      candidate !== absolute && new RegExp(`from '[^']*${name}'`).test(readFileSync(candidate, 'utf8'))
+    ));
+    assert.ok(importers.length > 0,
+      `${file} narrates but NOTHING imports it — that is a no-op, not a feature.`);
   }
   console.log('activity narration wiring pinned');
 }

@@ -153,7 +153,25 @@ export function Automate() {
     }
   };
   const toggle = async (name: string, enabled: boolean) => {
-    try { await setWorkflowEnabled(name, enabled); } finally { void qc.invalidateQueries({ queryKey: ['workflows'] }); }
+    // The server answers this call with words. A 409 names the inputs the
+    // creation test still needs; a 202 persists `enabled: false` on purpose
+    // while it queues that test. Swallowing both made the switch snap back to
+    // off, every time, with nothing on screen to say why — and the 409 threw
+    // into an unhandled rejection, discarding the list of what was missing.
+    setNotice(null);
+    try {
+      const result = await setWorkflowEnabled(name, enabled) as { enabled?: boolean; message?: string } | undefined;
+      if (enabled && result?.enabled === false) {
+        setNotice({ tone: 'info', text: result.message ?? `“${name}” needs its creation test before it can run.` });
+      }
+    } catch (e) {
+      // api.ts prefers `error` over `message`, so read the body: otherwise the
+      // owner gets "workflow verification missing inputs" instead of WHICH.
+      const body = (e as { body?: { message?: string } }).body;
+      setNotice({ tone: 'error', text: body?.message ?? (e as Error).message });
+    } finally {
+      void qc.invalidateQueries({ queryKey: ['workflows'] });
+    }
   };
   const install = async () => {
     if (!skillUrl.trim()) return;
@@ -355,6 +373,12 @@ export function Automate() {
 
           {skills.isLoading
             ? <CardGridSkeleton />
+            : skills.isError && !skills.data
+            ? <QueryUnavailable
+                title="Skills are unavailable"
+                description="Clementine couldn’t load your skills, so this is not an empty-skills state. Nothing has been uninstalled."
+                onRetry={() => { void skills.refetch(); }}
+              />
             : sk.length === 0
               ? <EmptyState title="No skills installed" description="Skills give Clementine new abilities. Add one above to get started." />
               : <div className="space-y-3">

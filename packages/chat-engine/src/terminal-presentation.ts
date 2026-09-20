@@ -1,4 +1,4 @@
-import type { ChatMessage, MessageStatus, TerminalFacts } from './types.js';
+import type { ChatMessage, MessageStatus, TerminalFacts, TurnEvidenceRef } from './types.js';
 import { humanHarnessText } from './types.js';
 
 export const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
@@ -69,7 +69,31 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   }
   if (typeof needs === 'string' && NEEDS_KINDS.has(needs)) facts.needs = needs as TerminalFacts['needs'];
   if (typeof outcome.resumable === 'boolean') facts.resumable = outcome.resumable;
+  const evidenceRefs = evidenceRefsFrom(outcome.evidenceRefs);
+  if (evidenceRefs.length > 0) facts.evidenceRefs = evidenceRefs;
   return facts;
+}
+
+const EVIDENCE_KINDS: ReadonlySet<string> = new Set([
+  'tool_result', 'external_receipt', 'artifact', 'source', 'memory',
+]);
+
+/** Revalidate the harness's evidence refs at the boundary rather than trusting
+ *  the shape. Same rule as the rest of this module: a field the event does not
+ *  carry stays absent, and a malformed ref is dropped rather than rendered. */
+function evidenceRefsFrom(value: unknown): TurnEvidenceRef[] {
+  if (!Array.isArray(value)) return [];
+  const refs: TurnEvidenceRef[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const ref = raw as Record<string, unknown>;
+    const kind = typeof ref.kind === 'string' ? ref.kind : '';
+    const id = typeof ref.id === 'string' ? ref.id.trim() : '';
+    if (!EVIDENCE_KINDS.has(kind) || !id) continue;
+    const uri = typeof ref.uri === 'string' && ref.uri.trim() ? ref.uri.trim() : undefined;
+    refs.push({ kind: kind as TurnEvidenceRef['kind'], id, ...(uri ? { uri } : {}) });
+  }
+  return refs;
 }
 
 export function meaningfulCompletionText(value: unknown): string {

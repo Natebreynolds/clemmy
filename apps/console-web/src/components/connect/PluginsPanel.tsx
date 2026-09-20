@@ -9,6 +9,7 @@ import { useRef, useState, type DragEvent } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Download, Link2, Package, Search, Upload } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
+import { Skeleton } from '@/components/ui/Skeleton';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
@@ -237,7 +238,14 @@ export function PluginsPanel() {
         </div>
       </Card>
 
-      {rows.length === 0 ? (
+      {plugins.isLoading ? (
+        <Card className="p-4"><Skeleton className="h-10 w-full" /></Card>
+      ) : plugins.isError && !plugins.data ? (
+        <Card className="p-4">
+          <p className="text-body text-muted">Installed plugins couldn’t be read just now — nothing has been uninstalled.</p>
+          <button type="button" onClick={() => { void plugins.refetch(); }} className="mt-1 cursor-pointer text-small font-semibold text-primary hover:underline">Try again</button>
+        </Card>
+      ) : rows.length === 0 ? (
         <Card className="p-4">
           <p className="text-body text-muted">No plugins installed yet.</p>
           <p className="mt-1 text-caption text-faint">

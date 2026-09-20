@@ -80,6 +80,10 @@ export function Memory() {
   const [counts, setCounts] = useState({ review: 0, duplicates: 0 });
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
   const searching = debouncedQ.length >= 2;
+  // A filter that is set must never be invisible: hiding the chips while one
+  // is still applied would silently narrow the next search to a scope the
+  // owner cannot see and did not remember choosing.
+  const showFacets = searching || kind !== 'all' || scope !== 'all';
   const search = useQuery({
     queryKey: ['mem-search', debouncedQ, kind],
     queryFn: () => searchMemory(debouncedQ, { limit: 30, ...(kind === 'all' ? {} : { stores: [kind] }) }),
@@ -93,12 +97,17 @@ export function Memory() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
-  const tabs: { key: Tab; label: string; icon: typeof Search }[] = [
-    { key: 'overview', label: 'Overview', icon: Brain },
+  // What Clementine is holding for YOU, on the tab that holds it. These counts
+  // already exist on this screen (ReviewPane reports them into `counts` for the
+  // health strip) — but they lived only inside the Overview, so a memory she
+  // wanted confirmed, or two identities she suspected were one person, waited
+  // behind a tab that gave no sign anything was there.
+  const tabs: { key: Tab; label: string; icon: typeof Search; badge?: number; badgeLabel?: string }[] = [
+    { key: 'overview', label: 'Overview', icon: Brain, badge: counts.review, badgeLabel: 'to review' },
     { key: 'facts', label: 'Facts', icon: BookOpen },
     { key: 'tools', label: 'Learned tools', icon: Wrench },
     { key: 'episodes', label: 'Timeline', icon: History },
-    { key: 'entities', label: 'People & things', icon: Users },
+    { key: 'entities', label: 'People & things', icon: Users, badge: counts.duplicates, badgeLabel: 'possible duplicates' },
     { key: 'sources', label: 'Sources', icon: FileText },
   ];
   const showDetail = Boolean(selected) || searching;
@@ -114,6 +123,11 @@ export function Memory() {
             {!q && <kbd className="rounded bg-subtle px-1.5 py-0.5 font-mono text-caption text-faint">⌘K</kbd>}
             {q && <button type="button" onClick={() => { setQ(''); setSelected(null); }} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
           </div>
+          {/* Filters belong to the search, not to the page. Two rows of chips sat
+              above the fold at all times narrowing nothing — the first thing
+              the eye met on the memory screen was a control panel for a query
+              nobody had typed. */}
+          {showFacets && (
           <div className="mb-2 flex flex-wrap items-center gap-1.5">
             {KIND_FACETS.map((f) => (
               <button key={f.key} type="button" aria-pressed={kind === f.key} onClick={() => setKind(f.key)}
@@ -121,12 +135,15 @@ export function Memory() {
             ))}
             {searching && <span className="ml-auto font-mono text-caption text-faint">{search.isLoading ? 'looking…' : `${hits.length} ${hits.length === 1 ? 'match' : 'matches'}${search.data?.diagnostics?.elapsedMs ? ` · ${(search.data.diagnostics.elapsedMs / 1000).toFixed(1)}s` : ''}`}</span>}
           </div>
+          )}
+          {showFacets && (
           <div className="mb-5 flex flex-wrap items-center gap-1.5">
             {SCOPE_FACETS.map((f) => (
               <button key={f.key} type="button" aria-pressed={scope === f.key} onClick={() => setScope(scope === f.key ? 'all' : f.key)}
                 className={cn('rounded-full border px-3 py-1 text-caption font-semibold transition-colors', scope === f.key ? 'border-fg bg-fg text-canvas' : 'border-border text-muted hover:border-border-strong hover:text-fg')}>{f.label}</button>
             ))}
           </div>
+          )}
 
           {searching ? (
             search.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
@@ -146,7 +163,7 @@ export function Memory() {
             )
           ) : (
             <div className="space-y-5">
-              <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} />
+              <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} unavailable={health.isError && !health.data} />
               <div className="grid gap-4 lg:grid-cols-2">
                 <ReviewPane onCounts={(n) => { if (n.review !== counts.review || n.duplicates !== counts.duplicates) setCounts(n); }} />
                 <LearnedPane onPick={(f) => { setSelected(factToHit(f)); setSelectedPinned(Boolean(f.pinned)); }} />
@@ -159,6 +176,14 @@ export function Memory() {
                       className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
                         active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
                       <Icon className="h-4 w-4" aria-hidden /> {t.label}
+                      {t.badge ? (
+                        <span
+                          className="inline-flex min-w-5 items-center justify-center rounded-full bg-warning-tint px-1.5 py-0.5 text-caption font-semibold text-warning"
+                          aria-label={`${t.badge} ${t.badgeLabel}`}
+                        >
+                          {t.badge > 99 ? '99+' : t.badge}
+                        </span>
+                      ) : null}
                     </button>
                   );
                 })}
@@ -194,11 +219,18 @@ function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
   const assurance = readiness.data ? memoryAssuranceView(readiness.data) : null;
   const firstIssue = readiness.data?.checks.find((c) => c.status === 'fail') ?? readiness.data?.checks.find((c) => c.status !== 'pass');
 
+  // On THIS screen an unanswered question must never read as an empty memory.
+  // The stat values already fall back to "—", but their sub-lines interpolated
+  // `?? 0`, so a health call that failed rendered "0 told · 0 learned" — a
+  // confident claim that Clementine has learned nothing, made on no evidence.
+  const statsUnknown = health.isError && !health.data;
+  const contextUnknown = ctx.isError && !ctx.data;
+  const sub = (text: string) => (statsUnknown ? 'count unavailable' : text);
   const longTerm: { label: string; value?: number; sub: string; tab: Tab; icon: typeof Database }[] = [
-    { label: 'Facts', value: h.activeFacts, sub: `${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned`, tab: 'facts', icon: BookOpen },
-    { label: 'People & things', value: h.entitiesTotal, sub: `${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs`, tab: 'entities', icon: Users },
-    { label: 'Timeline', value: h.memoryEpisodesTotal, sub: `${h.memoryEpisodesRecent ?? 0} recent episodes`, tab: 'episodes', icon: History },
-    { label: 'Knowledge files', value: files.data?.files?.length, sub: 'indexed & searchable', tab: 'sources', icon: Database },
+    { label: 'Facts', value: h.activeFacts, sub: sub(`${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned`), tab: 'facts', icon: BookOpen },
+    { label: 'People & things', value: h.entitiesTotal, sub: sub(`${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs`), tab: 'entities', icon: Users },
+    { label: 'Timeline', value: h.memoryEpisodesTotal, sub: sub(`${h.memoryEpisodesRecent ?? 0} recent episodes`), tab: 'episodes', icon: History },
+    { label: 'Knowledge files', value: files.data?.files?.length, sub: files.isError && !files.data ? 'count unavailable' : 'indexed & searchable', tab: 'sources', icon: Database },
   ];
 
   return (
@@ -211,7 +243,11 @@ function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
         <section>
           <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Clock className="h-5 w-5 text-primary" aria-hidden /> Short-term</h3>
           <p className="mb-3 text-small text-muted">Working memory & current session focus. Rewritten every turn and retained while the session remains resumable.</p>
-          {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : workingMem
+          {ctx.isLoading ? <Skeleton className="h-32 w-full" />
+            : contextUnknown
+            ? <Card className="p-4 text-body text-muted">Working memory couldn’t be read just now — nothing has been lost.{' '}
+                <button type="button" onClick={() => { void ctx.refetch(); }} className="cursor-pointer font-medium text-primary hover:underline">Try again</button></Card>
+            : workingMem
             ? <ContextFileCard file={workingMem} onNavigate={onNavigate} />
             : <Card className="p-4 text-body text-muted">No working memory yet — it fills in as you chat.</Card>}
         </section>
@@ -344,7 +380,7 @@ function MemoryReviewQueue({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-body-lg font-semibold text-fg">Memory review queue</h3>
+            <h3 className="text-body-lg font-semibold text-fg">Memory upkeep &amp; repairs</h3>
             {queuesLoading
               ? <StatusPill tone="neutral">Loading queues…</StatusPill>
               : totalReviewCount > 0
@@ -352,7 +388,12 @@ function MemoryReviewQueue({
                 : <StatusPill tone="success">Caught up</StatusPill>}
             {repairCount > 0 && <StatusPill tone="danger">{repairCount.toLocaleString()} repair item{repairCount === 1 ? '' : 's'}</StatusPill>}
           </div>
-          <p className="mt-0.5 text-small text-muted">Human judgment stays separate from safe, backup-first system repairs.</p>
+          {/* "Needs you" means exactly one thing in this product: a person is
+              blocking work, and it lives in the Inbox. What this panel owns is
+              the upkeep ReviewPane cannot do — identity convergence and
+              evidence reconciliation — plus the counts that feed it. Calling it
+              a second review queue put the same words on two different jobs. */}
+          <p className="mt-0.5 text-small text-muted">Decisions you make by hand live in the review queue above. These are safe, backup-first repairs Clementine can run for you.</p>
         </div>
         {unavailableEvidence > 0 && <div className="max-w-sm rounded-md bg-subtle px-3 py-2 text-caption text-muted">
           <span className="font-medium text-fg">Known historical limit:</span> {unavailableEvidence.toLocaleString()} pre-upgrade evidence links are honestly unavailable and are never presented as source-backed.
@@ -657,6 +698,26 @@ function HealthMetric({ label, value, detail, warning = false }: { label: string
 // ─────────── Search ───────────
 
 // ─────────── Facts ───────────
+/**
+ * What a memory store says when it could not be read.
+ *
+ * Every tab here used to go `isLoading ? skeleton : rows.length === 0 ?
+ * <EmptyState>` — so a failed call fell straight through to the empty state and
+ * the screen asserted a fact about Clementine's memory that nothing had
+ * established. On the Facts tab that read "Still getting to know you": Clem
+ * telling the owner she had learned nothing about him, when the truth was that
+ * she could not be asked. Unknown is not empty, and nowhere is that worse than
+ * on the memory screen.
+ */
+function CouldNotRead({ what, onRetry }: { what: string; onRetry: () => void }) {
+  return (
+    <Card className="p-4 text-body text-muted" role="status">
+      {what} couldn’t be read just now — nothing has been lost or forgotten.{' '}
+      <button type="button" onClick={onRetry} className="cursor-pointer font-medium text-primary hover:underline">Try again</button>
+    </Card>
+  );
+}
+
 function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
   const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
   const [showForgotten, setShowForgotten] = useState(false);
@@ -750,6 +811,7 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
         {addResult && <p className="basis-full text-caption text-muted"><CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" aria-hidden />{addResult}</p>}
       </div>
       {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
+        : facts.isError && !facts.data ? <CouldNotRead what="Your facts" onRetry={() => { void facts.refetch(); }} />
         : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
           : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} onImportance={(value) => { void updateFact(f.id, { importance: value }).finally(() => qc.invalidateQueries({ queryKey: ['facts'] })); }} />)}</div>}
       {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mt-4 border-warning/40 bg-warning/5 p-4">
@@ -1076,6 +1138,7 @@ function EpisodesTab() {
       </div>
 
       {episodes.isLoading ? <div className="space-y-2">{[0, 1, 2].map((index) => <Skeleton key={index} className="h-32 w-full" />)}</div>
+        : episodes.isError && !episodes.data ? <CouldNotRead what="The source timeline" onRetry={() => { void episodes.refetch(); }} />
         : rows.length === 0 ? <Card><EmptyState title="No source episodes match" description="Try a broader type, status, or search phrase. Clementine will never invent missing history." /></Card>
           : <>
             <div className="text-caption text-faint">Showing {rows.length.toLocaleString()} of {(episodes.data?.total ?? rows.length).toLocaleString()} matching episodes{(episodes.data?.allTotal ?? 0) !== (episodes.data?.total ?? 0) ? ` · ${(episodes.data?.allTotal ?? 0).toLocaleString()} total` : ''}.</div>
@@ -1233,6 +1296,7 @@ function EntitiesTab() {
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search all identities…" aria-label="Search all identities" className="ml-auto w-56" />
       </div>
       {entities.isLoading ? <div className="grid gap-2 sm:grid-cols-2">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-14 w-full" />)}</div>
+        : entities.isError && !entities.data ? <CouldNotRead what="People and things" onRetry={() => { void entities.refetch(); }} />
         : rows.length === 0 ? <Card><EmptyState title="Nothing here yet" description="People, companies, and projects Clementine learns about will appear here." /></Card>
           : <>
               <p className="mb-2 text-small text-muted">
@@ -1546,7 +1610,9 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
           </Card>
           <Card className="p-5">
             <div className="mb-3 flex items-center gap-2"><Target className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Standing goals</h3></div>
-            {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : goals.length === 0 ? <p className="text-body text-muted">No standing goals yet. Tell Clementine what you're working toward.</p>
+            {ctx.isLoading ? <Skeleton className="h-24 w-full" />
+              : ctx.isError && !ctx.data ? <p className="text-body text-muted">Core context couldn’t be read just now — nothing has been lost.</p>
+              : goals.length === 0 ? <p className="text-body text-muted">No standing goals yet. Tell Clementine what you're working toward.</p>
               : <ul className="space-y-2.5">{goals.map((g, i) => (
                   <li key={g.id || i} className="flex items-start gap-2.5"><span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden /><div><div className="text-body font-medium text-fg">{g.title || g.objective || 'Goal'}</div>{g.description && <div className="text-small text-muted">{g.description}</div>}</div></li>
                 ))}</ul>}
@@ -1556,6 +1622,11 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
                 <Input value={goalDesc} onChange={(e) => setGoalDesc(e.target.value)} placeholder="What does success look like?" aria-label="Goal description" className="flex-1" />
                 <Button size="sm" onClick={addContextGoal} disabled={!goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> Add</Button>
               </div>
+              {/* These are core-context notes (/api/console/context/goals), read
+                  on every turn — a different store from the tracked Goals screen
+                  (/api/console/goals). Both are called "goals", so say which is
+                  which rather than leaving the owner to discover it. */}
+              <p className="text-caption text-faint">Standing goals are context Clementine reads every turn. For goals you want tracked to completion, use <Link to="/goals" className="text-primary hover:underline">Goals</Link>.</p>
             </div>
           </Card>
         </div>

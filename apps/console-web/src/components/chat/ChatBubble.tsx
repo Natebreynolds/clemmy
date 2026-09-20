@@ -10,6 +10,7 @@ import { ActivityCard } from '@/components/chat/ActivityCard';
 import { RememberedStrip } from '@/components/chat/RememberedStrip';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
+import { TurnEvidenceLine } from '@/components/chat/TurnEvidenceLine';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
@@ -143,8 +144,14 @@ export function ChatBubble({
   onExecutePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
   onPreparePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
   onRevisePlan?: () => void;
-  onApprove: () => void | Promise<void>;
-  onReject: () => void | Promise<void>;
+  /**
+   * Absent on a read-only transcript. A surface that cannot carry a decision
+   * must not draw the controls for one: the replay thread passed
+   * `() => {}` for both, so a historical approval rendered live-looking
+   * Approve / Not now buttons that did nothing at all when clicked.
+   */
+  onApprove?: () => void | Promise<void>;
+  onReject?: () => void | Promise<void>;
   /** Detach THIS running turn to a durable background task (shown while thinking). */
   onBackground?: () => void;
   /** Deep link to this session's card/trace on the Tasks board. */
@@ -205,7 +212,7 @@ export function ChatBubble({
         // conversational approval path. EXECUTING / EXECUTED / FAILED skips
         // are handled above from durable truth and can never reach this call.
         setExec({ phase: 'idle' });
-        onApprove();
+        onApprove?.();
       }
     } catch {
       // A lost POST response cannot prove the provider did not act. Reconcile
@@ -221,7 +228,7 @@ export function ChatBubble({
     setDecisionBusy(decision);
     setDecisionError(null);
     try {
-      await Promise.resolve(decision === 'approve' ? onApprove() : onReject());
+      await Promise.resolve(decision === 'approve' ? onApprove?.() : onReject?.());
       setResolvedDecision(decision);
     } catch (error) {
       setDecisionError(error instanceof Error && error.message.trim()
@@ -277,6 +284,9 @@ export function ChatBubble({
   const thinking = message.status === 'thinking';
   const live = thinking || Boolean(message.workflowLive);
   const pendingAction = message.approval?.pendingAction;
+  // A decision needs somewhere to go. Without both handlers this thread is a
+  // replay, and the card is a record rather than a control.
+  const canDecide = Boolean(onApprove && onReject);
   const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
   // THE PLAN CARD IS THE REPLY.
   //
@@ -388,6 +398,11 @@ export function ChatBubble({
                   Always allow sends like this (same recipients — revocable in Settings)
                 </label>
               )}
+              {!canDecide ? (
+                <p className="mt-2.5 text-caption text-muted">
+                  This is a record of what was asked. Answer it where it is live — in Needs you.
+                </p>
+              ) : (
               <div className="mt-2.5 flex items-center gap-2">
                 <Button
                   size="sm"
@@ -423,6 +438,7 @@ export function ChatBubble({
                   )
                 )}
               </div>
+              )}
               {decisionError && <p role="alert" className="mt-1.5 text-caption text-danger">{decisionError}</p>}
               {pendingAction && exec.note && exec.phase !== 'idle' && (
                 <p
@@ -476,6 +492,11 @@ export function ChatBubble({
           }
           return null;
         })()}
+
+        {/* The harness's own ledger for this turn: what it wrote, saved, read
+            and remembered. Renders only when the typed terminal carried proof,
+            so an ordinary conversational reply stays a reply. */}
+        <TurnEvidenceLine terminal={message.terminal} />
       </div>
     </div>
   );

@@ -14,7 +14,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type {
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { reduceActivity } from './reduce-activity.js';
+import { reduceFeed } from './reduce-lifecycle.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
@@ -741,7 +741,7 @@ export class ChatEngine {
                       : `${runIds.length} workflows are running. I’ll report back here when they finish.`,
                   status: 'thinking',
                   delegatedWork: { sourceUserSeq, runIds, state: 'running' },
-                  activity: reduceActivity(message.activity ?? [], event, this.now),
+                  activity: reduceFeed(message.activity ?? [], event, this.now),
                 }
               : message
           ));
@@ -754,7 +754,7 @@ export class ChatEngine {
         }
         if (!this.busy && !this.activeAssistantId) return;
         this.updateActive((message) => {
-          const activity = reduceActivity(message.activity ?? [], event, this.now);
+          const activity = reduceFeed(message.activity ?? [], event, this.now);
           return activity === message.activity ? message : { ...message, activity };
         });
         break;
@@ -762,7 +762,7 @@ export class ChatEngine {
       default: {
         if (!this.busy && !this.activeAssistantId) return;
         this.updateActive((m) => {
-          const activity = reduceActivity(m.activity ?? [], event, this.now);
+          const activity = reduceFeed(m.activity ?? [], event, this.now);
           return activity === m.activity ? m : { ...m, activity };
         });
       }
@@ -1012,7 +1012,7 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
         break;
       }
       case 'async_work_dispatched': {
-        activity = reduceActivity(activity ?? [], event);
+        activity = reduceFeed(activity ?? [], event);
         const runIds = exactRunIds(d.runIds);
         const sourceUserSeq = sourceUserSeqOf(event);
         if (runIds.length > 0 && sourceUserSeq !== null) {
@@ -1039,7 +1039,7 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
         break;
       }
       default: {
-        activity = reduceActivity(activity ?? [], event);
+        activity = reduceFeed(activity ?? [], event);
       }
     }
   }

@@ -13,6 +13,7 @@ import { Link } from 'react-router-dom';
 import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Play, Send, Save, MessageSquare } from 'lucide-react';
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { reduceActivity, type ActivityItem } from '@/lib/useChat';
+import { reduceLifecycle } from '@clem/chat-engine';
 import { LiveFeed } from '@/components/chat/ActivityFeed';
 import { activityTerminalOutcomeFromHarnessEvents } from '@/lib/activity-presentation';
 import { apiGet } from '@/lib/api';
@@ -74,63 +75,15 @@ interface TraceRow {
   tone: 'live' | 'success' | 'danger' | 'warning' | 'muted';
 }
 
-// Lifecycle beats the shared fold (reduceActivity) does NOT carry — tools,
-// workers, batches, external writes, and code-mode programs all fold into the
-// unified feed already, so this map is ONLY the run-lifecycle rows the feed
-// interleaves around them (Started / Step / Needs approval / Completed / …). One
-// visual language: the drawer and chat describe a run through the same rows.
-const LIFECYCLE: Record<string, { label: string; tone: NonNullable<ActivityItem['tone']> }> = {
-  session_started: { label: 'Started', tone: 'muted' },
-  step_started: { label: 'Step', tone: 'live' },
-  approval_requested: { label: 'Needs approval', tone: 'warning' },
-  awaiting_user_input: { label: 'Waiting on you', tone: 'warning' },
-  guardrail_tripped: { label: 'Guardrail', tone: 'warning' },
-  brain_fallover: { label: 'Switched brain', tone: 'warning' },
-  sdk_compact_boundary: { label: 'Compacted context', tone: 'muted' },
-  sdk_auto_continue: { label: 'Auto-continued', tone: 'muted' },
-  work_manifest_declared: { label: 'Work map declared', tone: 'muted' },
-  work_contract_revised: { label: 'Work contract revised', tone: 'warning' },
-  background_contract_revised: { label: 'Course corrected', tone: 'warning' },
-  run_failed: { label: 'Failed', tone: 'danger' },
-  conversation_completed: { label: 'Completed', tone: 'success' },
-};
-
-/** The plain-human detail for a lifecycle row (a step title, else the event's
- *  own summary text; suppressed where a fuller surface already shows it). */
-function lifecycleDetail(ev: HarnessEvent): string {
-  const d = (ev.data ?? {}) as Record<string, unknown>;
-  if (ev.type === 'step_started') return typeof d.title === 'string' ? d.title : '';
-  if (ev.type === 'conversation_completed' || ev.type === 'run_failed') return '';
-  if (ev.type === 'guardrail_tripped') {
-    // Say WHAT tripped and whether it mattered — a bare "Guardrail" row reads
-    // as something going wrong when most trips are advisory warnings.
-    const reason = typeof d.reason === 'string' ? d.reason : (typeof d.rule === 'string' ? d.rule : '');
-    const action = d.action === 'warn' ? 'advisory' : (typeof d.action === 'string' ? d.action : '');
-    return [action, reason].filter(Boolean).join(' — ').slice(0, 140);
-  }
-  return humanHarnessText(d, '').slice(0, 140);
-}
-
-/** The drawer's unified feed fold: the SAME reduceActivity chat uses (tools,
- *  workers, batches, external writes, code-mode programs) PLUS the lifecycle
- *  beats above, interleaved in one chronological ActivityItem[] stream. An event
- *  reduceActivity already consumed never double-emits (we only add a lifecycle
- *  row when the shared fold left the list unchanged). */
+/** The drawer's unified feed fold: the SAME two folds chat uses — the shared
+ *  activity fold (tools, workers, batches, external writes, code-mode programs)
+ *  plus the shared lifecycle rows, interleaved in one chronological stream.
+ *  Both maps used to be local to this file, which is exactly why chat never got
+ *  them; they now live in @clem/chat-engine and this is one caller of two. */
 function reduceFeed(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   const next = reduceActivity(prev, ev);
   if (next !== prev) return next;
-  const m = LIFECYCLE[ev.type];
-  if (!m) return prev;
-  const detail = lifecycleDetail(ev);
-  return [...prev, {
-    id: `l-${ev.seq}`,
-    kind: 'event',
-    variant: 'lifecycle',
-    label: m.label,
-    tone: m.tone,
-    status: m.tone === 'danger' ? 'failed' : 'done',
-    ...(detail ? { detail } : {}),
-  }];
+  return reduceLifecycle(prev, { ...ev, createdAt: typeof ev.createdAt === 'number' ? ev.createdAt : undefined });
 }
 
 const WORKFLOW_MILESTONES: Record<string, { label: string; icon: typeof Radio; tone: TraceRow['tone'] }> = {

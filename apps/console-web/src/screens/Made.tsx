@@ -20,6 +20,7 @@ import {
 } from '@/lib/delivered';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { Button } from '@/components/ui/Button';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
@@ -130,6 +131,12 @@ export function MadeArchive() {
       </div>
       {delivered.isLoading ? (
         <div className="flex flex-col gap-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12" />)}</div>
+      ) : delivered.isError && !delivered.data ? (
+        <QueryUnavailable
+          title="Made is unavailable"
+          description="Clementine couldn’t load the archive, so this is not an empty one. Nothing you made has been lost."
+          onRetry={() => { void delivered.refetch(); }}
+        />
       ) : sections.length === 0 ? (
         <p className="text-body text-muted">Nothing made yet — drafts, files, and sheets land here when Clem finishes them.</p>
       ) : (

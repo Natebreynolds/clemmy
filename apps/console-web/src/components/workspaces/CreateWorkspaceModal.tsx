@@ -53,7 +53,11 @@ export function CreateWorkspaceModal({
   useEffect(() => {
     if (!open) return;
     setTitle('');
-    setDescription('');
+    // Seed, don't clobber. `useState(initialDescription ?? '')` above sets the
+    // starter-recipe prompt on mount, and this effect then ran and wiped it —
+    // so every "Start from something she can build now" chip opened New Space
+    // with an empty textarea, which is the one thing the chip exists to fill.
+    setDescription(initialDescription ?? '');
     setTitleWasManuallyEdited(false);
     setError(null);
     setCreating(false);

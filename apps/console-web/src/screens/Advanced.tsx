@@ -1,7 +1,10 @@
-import { useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useState, type ReactNode } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { Search } from 'lucide-react';
 import { Page } from '@/components/Page';
+import { cn } from '@/lib/cn';
+import { advancedNavFor, type NavDest } from '@/lib/nav';
+import { getSettings } from '@/lib/settings';
 import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -107,19 +110,83 @@ function Tools() {
   );
 }
 
+/**
+ * Advanced's sections, and the way between them.
+ *
+ * All of them shipped as routes with NO navigation of any kind: once you landed
+ * on one — and only two were linked from anywhere — the rest were reachable
+ * solely by editing the address bar. Working screens behind a dead end.
+ *
+ * The rail mirrors Settings' (screens/Settings.tsx NAV) because this is a
+ * settings-shaped place and the product rule is familiar over clever. What it
+ * OFFERS comes from lib/nav.ts — one list, already used by the sidebar and the
+ * command palette — so a panel cannot be advertised here and forgotten there.
+ * Developer-tier panels stay routed but unadvertised until developer mode is on.
+ */
+function AdvancedRail({ current, developerMode }: { current: string; developerMode: boolean }) {
+  const offered = advancedNavFor(developerMode);
+  const everyday = offered.filter((d) => d.tier !== 'developer');
+  const instruments = offered.filter((d) => d.tier === 'developer');
+  const row = (item: NavDest) => {
+    const Icon = item.icon;
+    const active = item.path.endsWith(`/${current}`);
+    return (
+      <Link
+        key={item.path}
+        to={item.path}
+        title={item.hint}
+        aria-current={active ? 'page' : undefined}
+        className={cn(
+          'flex items-center gap-2 rounded-md px-2.5 py-1.5 text-small font-medium transition-colors hover:bg-surface hover:text-fg',
+          active ? 'bg-surface text-fg' : 'text-muted',
+        )}
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        {item.label}
+      </Link>
+    );
+  };
+  return (
+    <nav aria-label="Advanced sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
+      <h1 className="mb-3 px-2 text-h2 text-fg">Advanced</h1>
+      {everyday.map(row)}
+      {instruments.length > 0 && (
+        <div className="mt-4 border-t border-border pt-3">
+          <p className="mb-1 px-2.5 text-caption font-semibold uppercase tracking-widest text-faint">Instruments</p>
+          {instruments.map(row)}
+        </div>
+      )}
+      <div className="mt-4 border-t border-border pt-3">
+        <Link to="/settings" className="block rounded-md px-2.5 py-1.5 text-small text-muted hover:text-fg">Settings</Link>
+      </div>
+    </nav>
+  );
+}
+
+
 export function Advanced() {
   const { pathname } = useLocation();
   const seg = pathname.split('/').filter(Boolean)[1] ?? 'usage';
-  switch (seg) {
-    case 'usage': return <Usage />;
-    case 'tools': return <Tools />;
-    case 'diagnostics': return <DiagnosticsView />;
-    case 'observability': return <ObservabilityView />;
-    case 'traces': return <TraceLabView />;
-    case 'budgets': return <BudgetsForm />;
-    case 'autonomy': return <AutonomyForm />;
-    case 'evolution': return <EvolutionView />;
-    case 'developer': return <DeveloperFlags />;
-    default: return <Usage />;
-  }
+  const settings = usePoll(['settings'], getSettings, 0);
+  const developerMode = settings.data?.developerMode === true;
+  const view = (): ReactNode => {
+    switch (seg) {
+      case 'usage': return <Usage />;
+      case 'tools': return <Tools />;
+      case 'diagnostics': return <DiagnosticsView />;
+      case 'observability': return <ObservabilityView />;
+      case 'traces': return <TraceLabView />;
+      case 'budgets': return <BudgetsForm />;
+      case 'autonomy': return <AutonomyForm />;
+      case 'evolution': return <EvolutionView />;
+      case 'developer': return <DeveloperFlags />;
+      default: return <Usage />;
+    }
+  };
+  return (
+    <div className="flex h-full min-h-0">
+      <AdvancedRail current={seg} developerMode={developerMode} />
+      <div className="min-h-0 flex-1 overflow-y-auto">{view()}</div>
+    </div>
+  );
 }

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { ADVANCED_NAV, DEVELOPER_NAV } from '@/lib/nav';
+import { advancedNavFor } from '@/lib/nav';
 import { Card } from '@/components/ui/Card';
 import { Switch } from '@/components/ui/Switch';
 import { usePoll } from '@/lib/poll';
@@ -36,13 +36,15 @@ export function DeveloperModeCard() {
         <div className="flex-1">
           <h3 className="text-h3 text-fg">Developer mode</h3>
           <p className="text-small text-muted">
-            Adds a <strong>Developer</strong> page here to flip CLEMMY_* feature flags at runtime. For power users — leave off if unsure.
+            Reveals the instruments — diagnostics, telemetry, run replay, nightly self-research — and a <strong>Developer</strong> page for CLEMMY_* flags. Off by default; the panels keep working if you have a link to one.
           </p>
         </div>
         <Switch checked={on} disabled={busy || settings.isLoading} label="Developer mode" onChange={toggle} />
       </div>
       <nav aria-label="Advanced panels" className="flex flex-wrap gap-2">
-        {[...ADVANCED_NAV, ...(on ? [DEVELOPER_NAV] : [])].map((d) => {
+        {/* One decision, one place: the instruments are advertised here on
+            exactly the terms the Advanced rail uses. */}
+        {advancedNavFor(on).map((d) => {
           const Icon = d.icon;
           return (
             <Link

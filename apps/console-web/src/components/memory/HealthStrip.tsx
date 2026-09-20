@@ -15,14 +15,29 @@ function Tile({ value, label, note, tone }: { value: string; label: string; note
   );
 }
 
-export function HealthStrip({ health, review, duplicates }: { health?: MemoryHealth; review: number; duplicates: number }) {
+/**
+ * `unavailable` is not the same as zero. Without it this strip answered a
+ * failed health call with "0 people & things · no identity conflicts" and
+ * "caught up" — three confident statements about a memory it had not been able
+ * to read. On this screen of all screens, say so instead.
+ */
+export function HealthStrip({ health, review, duplicates, unavailable }: { health?: MemoryHealth; review: number; duplicates: number; unavailable?: boolean }) {
+  if (unavailable) {
+    return (
+      <div className="grid gap-2.5 sm:grid-cols-3">
+        <Tile value="—" label="people & things" note="couldn’t be read" />
+        <Tile value="—" label="to review" note="couldn’t be read" />
+        <Tile value="—" label="last tidied" note="couldn’t be read" />
+      </div>
+    );
+  }
   const tidy = health?.lastHygiene ?? null;
   const tidyWhen = tidy ? relativeTime(tidy.at) : '';
   const tidyWhat = tidy ? `${tidy.kind.replace(/-/g, ' ')} · ${tidy.count} ${tidy.count === 1 ? 'memory' : 'memories'}` : 'no tidy recorded yet';
   return (
     <div className="grid gap-2.5 sm:grid-cols-3">
       <Tile value={String(health?.entities ?? 0)} label="people & things" note={health?.entityIdentity?.conflicts ? `${health.entityIdentity.conflicts} identity ${health.entityIdentity.conflicts === 1 ? 'conflict' : 'conflicts'}` : 'no identity conflicts'} tone={health?.entityIdentity?.conflicts ? 'warn' : undefined} />
-      <Tile value={String(review + duplicates)} label="need your review" note={duplicates > 0 ? `${duplicates} possible ${duplicates === 1 ? 'duplicate' : 'duplicates'}` : review > 0 ? 'facts to keep or fold' : 'caught up'} tone={review + duplicates > 0 ? 'warn' : 'up'} />
+      <Tile value={String(review + duplicates)} label="to review" note={duplicates > 0 ? `${duplicates} possible ${duplicates === 1 ? 'duplicate' : 'duplicates'}` : review > 0 ? 'facts to keep or fold' : 'caught up'} tone={review + duplicates > 0 ? 'warn' : 'up'} />
       <Tile value={tidy ? tidyWhen : '—'} label={tidy ? 'last tidied' : 'last tidied'} note={tidyWhat} />
     </div>
   );

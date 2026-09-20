@@ -17,6 +17,7 @@ import {
   createPendingMessageStore,
   type ComposerMode,
   type PlanRevisionRef,
+  evidenceSummary,
   liveActivityHeadline,
   narrateActivity,
   renderMarkdown,
@@ -570,6 +571,15 @@ function MessageRow({
           : null;
         return line ? <p class={`reply-state reply-state-${t.status}`} role="status">{line}</p> : null;
       })()}
+      {/* The harness's ledger for this turn — what it wrote, saved, read and
+          remembered. Desktop makes the file chips openable; a phone has nowhere
+          local to open to, so here it stays an honest count rather than a
+          button that does nothing. */}
+      {(() => {
+        if (thinking) return null;
+        const summary = evidenceSummary(message.terminal?.evidenceRefs);
+        return summary ? <p class="reply-evidence">{summary}</p> : null;
+      })()}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
           <button
@@ -624,16 +634,22 @@ function WorkLine({
   onDelegatedChanged: () => void;
 }) {
   const failed = activity.some((item) => item.status === 'failed');
+  // A turn with no failed ROW can still not have succeeded: stopped, waiting
+  // on a reply, waiting on approval, blocked. The typed terminal is what knows.
+  // Without this the card read "Worked 40s · 6 steps" for all of them, which is
+  // the same class of lie as Home's old "done while you were away".
+  const unfinished = !live && !failed
+    && Boolean(message.terminal) && message.terminal?.status !== 'done';
   const [open, setOpen] = useState(failed);
   const elapsed = useElapsed(activity, live);
   const delegatedControl = delegatedRunControlForExpandedWork(message, open);
 
   const summary = live
     ? liveActivityHeadline(activity)
-    : `${failed ? 'Ran into trouble · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
+    : `${failed ? 'Ran into trouble · ' : unfinished ? 'Didn’t finish · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
 
   return (
-    <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}`}>
+    <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}${unfinished ? ' work-unfinished' : ''}`}>
       <div class="work-head">
         <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
           {live ? <span class="work-spinner" aria-hidden="true" /> : <span class="work-caret" aria-hidden="true">{open ? '⌄' : '›'}</span>}

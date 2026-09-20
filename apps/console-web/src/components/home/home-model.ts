@@ -79,11 +79,73 @@ export function homeRows(blocks: readonly HomeBlockId[]): HomeBlockId[][] {
   return rows;
 }
 
+/**
+ * Panes with nothing to say.
+ *
+ * On a quiet morning Home used to stack four cards that each said a version of
+ * "nothing yet" — and the first of them, "Nothing needs you right now.",
+ * repeated the presence line verbatim one row above it. Five boxes to say the
+ * same thing: that nothing is happening.
+ *
+ * A pane earns its card by having something in it. The presence line already
+ * states the quiet case once, in words, at the top.
+ *
+ * UNKNOWN IS NOT EMPTY. `settled` is false while a source is loading or after
+ * it failed, and nothing is hidden then — a pane that vanishes because the
+ * daemon was asleep would assert "nothing needs you" on no evidence at all,
+ * which is the same lie as a green "done" row for undelivered work.
+ */
+export interface HomeQuietInput extends PresenceCounts {
+  /** True only when every source behind these counts actually answered. */
+  settled: boolean;
+  /** Every row the Running pane would draw — in flight, stalled, AND parked
+   *  waiting on the owner. `running` alone counts only what is moving, so
+   *  hiding the pane on it would hide a run that stopped for an answer. */
+  workRows: number;
+}
+
+export function silentImmediatePanes(input: HomeQuietInput): HomePaneId[] {
+  if (!input.settled) return [];
+  const silent: HomePaneId[] = [];
+  if (input.needsYou === 0) silent.push('needs_you');
+  if (input.workRows === 0) silent.push('running');
+  if (input.updates === 0 && input.attention === 0) silent.push('while_away');
+  return silent;
+}
+
 export interface PresenceCounts {
   needsYou: number;
   running: number;
   updates: number;
   attention: number;
+}
+
+/**
+ * How old a number is, when that is worth saying out loud.
+ *
+ * Desktop had no equivalent of the phone's rule — "disclose age, never hide it,
+ * and never render the confident version of an unknown"
+ * (apps/mobile-web/src/lib/needs-you.ts). The gap was narrow and real: when a
+ * poll FAILS but its previous data survives in cache, `isError && data` is
+ * true, the screen quietly keeps serving the old counts, and the presence line
+ * states them as flatly as if they had just been read.
+ *
+ * Same threshold and same words as the phone, so the two shells describe
+ * staleness identically. Below 90 seconds the number really is what it just
+ * was, and saying so would be noise.
+ */
+const DISCLOSE_AFTER_MS = 90_000;
+
+export function staleSuffix(input: { updatedAtMs: number; nowMs: number; live: boolean }): string {
+  if (input.live) return '';
+  if (!Number.isFinite(input.updatedAtMs) || input.updatedAtMs <= 0) return ' — last reading, age unknown';
+  const seconds = Math.max(0, Math.round((input.nowMs - input.updatedAtMs) / 1000));
+  if (seconds * 1000 < DISCLOSE_AFTER_MS) return '';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return ` — as of ${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return ` — as of ${hours}h ago`;
+  return ` — as of ${Math.round(hours / 24)}d ago`;
 }
 
 /** Delivered notifications are updates, not proof that work completed. */
@@ -114,8 +176,15 @@ export type NeedsYouDecision =
   | { kind: 'approval'; id: string; approvalKind?: 'runtime' | 'harness' }
   | { kind: 'plan'; id: string };
 
-/** Inline Approve / Not now exist ONLY where the Inbox already exposes an
- *  approve/reject call for that item kind. Everything else opens. */
+/**
+ * Inline Approve / Not now exist ONLY where the Inbox already exposes an
+ * approve/reject call for that item kind. Everything else opens.
+ *
+ * A QUESTION is settled a third way and returns null here on purpose: it has
+ * no approve/reject, it has an answer. NeedsYouPane handles that case itself
+ * through `answerInboxQuestion`, because the endpoint's own success value is
+ * `resuming` — the answer is what releases a parked run.
+ */
 export function needsYouDecision(item: HomeFeedItem): NeedsYouDecision | null {
   if (item.approvalId) return { kind: 'approval', id: item.approvalId, approvalKind: item.approvalKind };
   if (item.planProposalId) return { kind: 'plan', id: item.planProposalId };

@@ -68,6 +68,21 @@ export interface ActivityItem {
   effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
   /** A reservation becomes confirmed only through its own write terminal. */
   write?: WriteLedgerRow;
+  /** kind 'batch' rows fed by a declared work manifest. The harness enumerates
+   *  the items up front and checkpoints each one, so the meter above is a real
+   *  count of real work rather than a guess. Per-item status is kept because
+   *  checkpoints repeat (running → succeeded, and retries), and a naive
+   *  increment would count the same item several times. */
+  manifest?: {
+    id: string;
+    /** itemId → the last status the harness checkpointed for it. */
+    itemStatus: Record<string, string>;
+  };
+  /** kind 'event' deliverable rows: the most recent file this row folded in.
+   *  `deliverable_saved` carries basenames only, never a path, so a surface
+   *  that wants to OPEN the file has to resolve it — and must be able to tell
+   *  an exact match from an ambiguous one. */
+  deliverable?: { name: string; dir: string };
 }
 
 /**
@@ -84,6 +99,27 @@ export interface TerminalFacts {
   resumable?: boolean;
   /** Which model actually produced this turn (from turn_model_routed). */
   modelIdentity?: string;
+  /** Addressable proof of what this turn touched. The harness has published
+   *  this since the typed terminal shipped; no client read it until 2026-09-19,
+   *  so a turn that wrote to two systems and saved a file still ended as prose
+   *  plus a pill. See evidence-presentation.ts. */
+  evidenceRefs?: TurnEvidenceRef[];
+}
+
+/** Mirrors src/runtime/harness/turn-outcome.ts. Addressable proof only: bulky
+ *  tool output and internal reasoning stay in their owning ledgers, and the
+ *  presentation boundary carries references to them. */
+export type TurnEvidenceKind =
+  | 'tool_result'
+  | 'external_receipt'
+  | 'artifact'
+  | 'source'
+  | 'memory';
+
+export interface TurnEvidenceRef {
+  kind: TurnEvidenceKind;
+  id: string;
+  uri?: string;
 }
 
 export interface ChatMessage {

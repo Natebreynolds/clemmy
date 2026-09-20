@@ -1049,8 +1049,16 @@ export function cardTone(card: BoardCard): { tone: Tone; label: string } {
     if (s.includes('fail') || s.includes('abort') || s.includes('interrupt') || s.includes('block')) {
       return { tone: 'danger', label: humanStatusLabel(card.status) };
     }
-    if (s.includes('cancel')) return { tone: 'neutral', label: 'Stopped' };
-    return { tone: 'success', label: 'Done' };
+    if (s.includes('cancel') || s.includes('kill') || s.includes('stop')) return { tone: 'neutral', label: 'Stopped' };
+    // Green is a claim, so it is an allowlist. This was a denylist with a
+    // `success` fallback, which meant any spelling the list did not anticipate
+    // — `killed` among them — landed in the Done column wearing a green "Done".
+    // A status we do not recognise is reported in the shared human vocabulary,
+    // never as success we cannot back.
+    if (s.includes('done') || s.includes('complete') || s.includes('success') || s.includes('deliver')) {
+      return { tone: 'success', label: 'Done' };
+    }
+    return { tone: 'neutral', label: humanStatusLabel(card.status) };
   }
   if (card.column === 'needs_you') {
     return {

@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Field, Input, Textarea } from '@/components/ui/Field';
@@ -692,6 +693,12 @@ export function Goals() {
             <Skeleton className="h-56" />
             <Skeleton className="h-56" />
           </>
+        ) : goalsQ.isError ? (
+          <QueryUnavailable
+            title="Goals are unavailable"
+            description="Clementine couldn’t load your goals, so this is not an empty-goals state. Nothing has been deleted or closed."
+            onRetry={() => { void goalsQ.refetch(); }}
+          />
         ) : goals.length === 0 ? (
           <EmptyState title="No goals here" description="Create a goal or approve a plan from chat to make it visible here." />
         ) : (

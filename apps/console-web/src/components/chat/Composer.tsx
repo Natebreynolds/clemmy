@@ -1,9 +1,10 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { ModelPicker } from '@/components/chat/ModelPicker';
 import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type RefObject } from 'react';
-import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack } from 'lucide-react';
+import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
+import { useDictation } from '@/lib/use-dictation';
 import { cn } from '@/lib/cn';
 
 const MAX_BYTES = 30 * 1024 * 1024;
@@ -57,6 +58,10 @@ export function Composer({
   const mode = controlledMode ?? localMode;
   const planning = busy ? activeTaskMode?.kind === 'plan' : mode === 'plan';
   const changeMode = (next: ComposerMode) => { setLocalMode(next); onModeChange?.(next); };
+  const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
+    value,
+    (next) => { setValue(next); autoGrow(); },
+  );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -116,6 +121,9 @@ export function Composer({
 
   const submit = () => {
     if (!canSend) return;
+    // Sending ends the utterance: otherwise recognition keeps running and
+    // appends the next thing said into an already-cleared composer.
+    stopDictation();
     setDeliveryError('');
     void Promise.resolve(onSend({
       text: value.trim(),
@@ -221,6 +229,22 @@ export function Composer({
         >
           <Paperclip className="h-5 w-5" aria-hidden />
         </Button>
+
+        {/* Offered only where the browser actually provides speech recognition —
+            a microphone button that does nothing is a lie. The phone has had
+            this since it shipped; the desktop's only mic lived in the notch. */}
+        {dictation && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggleDictation}
+            aria-label={listening ? 'Stop dictation' : 'Dictate'}
+            aria-pressed={listening}
+            title={listening ? 'Stop dictation' : 'Dictate'}
+          >
+            <Mic className={cn('h-5 w-5', listening && 'animate-breathe text-primary')} aria-hidden />
+          </Button>
+        )}
 
         <textarea
           ref={textarea}

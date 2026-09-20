@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, CheckCircle2, AlertCircle, X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { decideApproval, decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
+import { answerInboxQuestion, decideApproval, decidePlanProposal, dismissInboxItem, listInboxQuestions, type InboxQuestionRow } from '@/lib/inbox';
+import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
   agoLabel,
@@ -17,10 +18,92 @@ import { plainText } from '@/components/home/home-model';
 
 const MAX_ROWS = 4;
 
+/**
+ * The answer box on a parked run.
+ *
+ * Options come from the question itself, so a run waiting on "Gmail or
+ * Outlook?" is one click, not a typing exercise. When the server says the row
+ * is not answerable it gives a reason — show that rather than a dead control,
+ * and keep the row's link so the owner can still go to where it can be
+ * answered.
+ */
+function AnswerRow({
+  question,
+  busy,
+  onAnswer,
+}: {
+  question?: InboxQuestionRow;
+  busy: boolean;
+  onAnswer: (text: string) => void;
+}) {
+  const [draft, setDraft] = useState('');
+  if (question && !question.answerable) {
+    return (
+      <p className="text-small text-muted">
+        {question.unavailableReason?.trim() || 'This one has to be answered where it was asked.'}
+      </p>
+    );
+  }
+  const options = question?.options ?? [];
+  if (options.length > 0) {
+    return (
+      <div className="flex flex-wrap items-center gap-2">
+        {options.slice(0, 4).map((option) => (
+          <Button
+            key={option}
+            size="sm"
+            variant="secondary"
+            className="h-8 px-3 text-small"
+            disabled={busy}
+            onClick={() => onAnswer(option)}
+          >
+            {option}
+          </Button>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <form
+      className="flex w-full items-center gap-2"
+      onSubmit={(event) => { event.preventDefault(); onAnswer(draft); setDraft(''); }}
+    >
+      <input
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        disabled={busy}
+        aria-label="Your answer"
+        placeholder="Answer so she can carry on…"
+        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
+      />
+      <Button type="submit" size="sm" className="h-8 px-3 text-small" disabled={busy || !draft.trim()}>
+        {busy ? 'Sending…' : 'Send'}
+      </Button>
+    </form>
+  );
+}
+
+
 interface RowState {
-  busy?: 'approve' | 'reject' | 'dismiss';
+  busy?: 'approve' | 'reject' | 'dismiss' | 'answer';
   notice?: { tone: 'success' | 'error'; text: string };
 }
+
+/**
+ * What the run is actually waiting for.
+ *
+ * A parked run reaches this pane either way, but only approvals could be
+ * settled here: `needsYouDecision` returns null for a question, so a run
+ * stopped on "which mailbox should I use?" showed up as a row you could read
+ * and not answer. The one thing that would let Clementine carry on was the one
+ * thing the pane would not take.
+ *
+ * `POST /api/console/inbox/questions/:id/answer` has always returned
+ * `resuming` when the answer releases a run — the word is in its contract. It
+ * also says when an answer must go somewhere else (`requires_origin`) and,
+ * per row, whether it is `answerable` at all and why not. All of it goes
+ * unused until something asks.
+ */
 
 /**
  * NEEDS YOU — the command center's list, rendered as decisions. Inline
@@ -46,6 +129,51 @@ export function NeedsYouPane({
   const settle = () => {
     for (const key of ['command-center', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
       void qc.invalidateQueries({ queryKey: [key] });
+    }
+  };
+
+  // Only fetched when a row actually needs it, so a Home with no open
+  // questions pays nothing for this.
+  const questionIds = items.filter((item) => item.questionId).map((item) => item.questionId!);
+  const questions = usePoll(['inbox-questions'], listInboxQuestions, 30_000, { enabled: questionIds.length > 0 });
+  const questionFor = (id?: string) => (id ? questions.data?.questions.find((q) => q.id === id) : undefined);
+
+  const answer = async (key: string, questionId: string, text: string) => {
+    const body = text.trim();
+    if (!body || rows[key]?.busy) return;
+    setRows((prev) => ({ ...prev, [key]: { busy: 'answer' } }));
+    try {
+      const result = await answerInboxQuestion(questionId, body);
+      setRows((prev) => ({
+        ...prev,
+        [key]: {
+          notice: {
+            tone: 'success',
+            // `resuming` is the server saying the answer released a parked run.
+            // Say that, rather than a generic acknowledgement.
+            text: result.status === 'resuming'
+              ? 'Answered — Clementine is picking the run back up.'
+              : 'Answered.',
+          },
+        },
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setRows((prev) => ({
+        ...prev,
+        [key]: {
+          notice: {
+            tone: 'error',
+            text: /authorized origin|requires_origin/i.test(message)
+              ? 'This one has to be answered in the conversation that asked it.'
+              : /already answered|superseded/i.test(message)
+                ? 'Already answered — Clementine has moved on.'
+                : message.trim() || 'Couldn’t send that answer.',
+          },
+        },
+      }));
+    } finally {
+      settle();
     }
   };
 
@@ -157,6 +285,13 @@ export function NeedsYouPane({
                     </p>
                   ) : (
                     <div className="flex flex-wrap items-center gap-2">
+                      {!decision && item.questionId && (
+                        <AnswerRow
+                          question={questionFor(item.questionId)}
+                          busy={state.busy === 'answer'}
+                          onAnswer={(text) => void answer(key, item.questionId!, text)}
+                        />
+                      )}
                       {decision && (
                         <>
                           <Button

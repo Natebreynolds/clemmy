@@ -118,6 +118,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
+              onPreparePlan={chat.preparePlan}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}
@@ -125,7 +126,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} />
       </div>
     </div>
   );
@@ -142,7 +143,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (
-            messages.map((m) => <ChatBubble key={m.id} message={m} sessionId={rawId(session.id)} onApprove={() => {}} onReject={() => {}} />)
+            messages.map((m) => <ChatBubble key={m.id} message={m} sessionId={rawId(session.id)} />)
           )}
         </div>
       </div>

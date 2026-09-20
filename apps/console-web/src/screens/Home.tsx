@@ -3,9 +3,8 @@
  * what got done. Chat is a separate door. A send from here hands off to the
  * conversation the moment the daemon acknowledges it.
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { HomeMock } from './HomeMock';
 import { Button } from '@/components/ui/Button';
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { HomeBuilder } from '@/components/home/HomeBuilder';
@@ -13,6 +12,9 @@ import { SpaceTile } from '@/components/home/SpaceTile';
 import { openCustomizeHome } from '@/components/home/CustomizePanel';
 import { useHomeLayout, type HomeTile } from '@/lib/home-layout';
 import { isHomeMockScreen } from '@/components/home/mock/screens';
+
+/** Loaded only when ?mock= or ?screen= asks for it — see app.tsx. */
+const HomeMock = lazy(async () => ({ default: (await import('./HomeMock')).HomeMock }));
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { getContext } from '@/lib/memory';
@@ -35,7 +37,7 @@ import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
-import { awayCounts, presenceLine, type HomeFeedItem } from '@/components/home/home-model';
+import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 
 const OPEN_THREAD_TIMEOUT_MS = 30_000;
 
@@ -44,7 +46,11 @@ export function Home() {
   const mockFlag = params.get('mock');
   const mockScreen = params.get('screen');
   if (mockFlag !== null || isHomeMockScreen(mockScreen)) {
-    return <HomeMock initialScreen={mockFlag || mockScreen || undefined} embedded />;
+    return (
+      <Suspense fallback={<div className="p-8"><Skeleton className="h-64 w-full" /></div>}>
+        <HomeMock initialScreen={mockFlag || mockScreen || undefined} embedded />
+      </Suspense>
+    );
   }
   return <LiveHome />;
 }
@@ -109,6 +115,12 @@ function LiveHome() {
 
   const ccLoading = cc.isLoading;
   const ccError = cc.isError && !cc.data;
+  // Every immediate pane on this screen is fed by the same daemon. When both
+  // shared sources fail at once that is not four broken panes, it is one
+  // unreachable Clementine — and desktop stacked up to six "Couldn't load…"
+  // rows with six Retry buttons to say it. Mobile has said it in one line for
+  // a while (ScreenNotice: "Can't reach your Mac right now.").
+  const daemonUnreachable = ccError && workingNow.isError && !workingNow.data;
   const retryCommandCenter = () => { void cc.refetch(); };
 
   const renderPane = (id: HomePaneId): ReactNode => {
@@ -184,19 +196,70 @@ function LiveHome() {
   const order = visiblePanes(prefs);
   const tileWidth = (tile: HomeTile) => tile.width === 'wide'
     ? 'col-span-12' : tile.width === 'small' ? 'col-span-12 md:col-span-6 xl:col-span-4' : 'col-span-12 md:col-span-6';
-  const immediatePanes = order.filter(id => ['needs_you', 'running', 'while_away'].includes(id));
-  const remainingPanes = order.filter(id => !immediatePanes.includes(id));
+  // A pane earns its card by having something in it; the presence line above
+  // already says the quiet case once. Nothing is hidden until every source has
+  // actually answered — see silentImmediatePanes.
+  const immediateSettled = !cc.isLoading && !cc.isError
+    && !workingNow.isLoading && !(workingNow.isError && !workingNow.data);
+  const silent = new Set(silentImmediatePanes({
+    needsYou: needsYou.length,
+    running: workingView.running,
+    updates: away.updates,
+    attention: away.attention,
+    settled: immediateSettled,
+    workRows: workingView.total,
+  }));
+  const IMMEDIATE: HomePaneId[] = ['needs_you', 'running', 'while_away'];
+  const immediatePanes = daemonUnreachable
+    ? []
+    : order.filter(id => IMMEDIATE.includes(id) && !silent.has(id));
   const tilesIn = (zone: HomeTile['zone']) => layout.data?.tiles.filter(tile => tile.zone === zone) ?? [];
+  // Projects deliberately does NOT follow the quiet rule. Its empty state is
+  // load-bearing: the "New project" link lives inside the pane and renders
+  // whether or not there are projects, so collapsing it on an empty list took
+  // away the only door on Home for starting your first one. A pane earns its
+  // card by having something in it — unless the empty state IS the something.
+  const remainingPanes = order.filter(id => !IMMEDIATE.includes(id));
+  const watching = tilesIn('watching');
+  // Nothing placed, nothing running, nothing to answer — and we actually KNOW
+  // that, rather than having failed to ask. This is the state the approved mock
+  // calls the blank canvas; live Home only ever had a dashed CTA tucked inside
+  // "Watching", which a new owner met at the bottom of four empty cards.
+  // ...and nothing the owner put below either. A Home with pinned quick actions
+  // or a kept Projects pane is furnished, however quiet the top of it is —
+  // swapping those for the onboarding canvas would take away what they chose.
+  const homeIsBare = immediateSettled && !daemonUnreachable && !layout.isLoading
+    && immediatePanes.length === 0 && tilesIn('now').length === 0 && watching.length === 0
+    && remainingPanes.length === 0;
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
-  const presence = ccLoading && workingNow.isLoading
+  // The presence line speaks for BOTH sources, so it may only speak once both
+  // have answered. It used to skeleton only while `ccLoading && workingNow
+  // .isLoading` — so with the command centre loaded and working-now still in
+  // flight it printed running=0 as fact, stating "Nothing needs you right now."
+  // over a run that was very much in progress. Unknown is not zero.
+  // Serving a cached count after a failed refresh is honest only if it says so.
+  // `immediateSettled` is false while a poll is erroring, so the skeleton covers
+  // the no-data case; this covers the other one — data survived, the read did
+  // not, and the numbers are older than they look.
+  const servingCached = (cc.isError && Boolean(cc.data)) || (workingNow.isError && Boolean(workingNow.data));
+  const oldestReading = Math.min(
+    cc.dataUpdatedAt || Number.POSITIVE_INFINITY,
+    workingNow.dataUpdatedAt || Number.POSITIVE_INFINITY,
+  );
+  const presence = ccError || (workingNow.isError && !workingNow.data)
+    ? 'Live work status is unavailable.'
+    : !immediateSettled && !servingCached
     ? null
-    : ccError || (workingNow.isError && !workingNow.data) ? 'Live work status is unavailable.'
     : presenceLine({
         needsYou: needsYou.length,
         running: workingView.running,
         updates: away.updates,
         attention: away.attention,
+      }) + staleSuffix({
+        updatedAtMs: Number.isFinite(oldestReading) ? oldestReading : 0,
+        nowMs: Date.now(),
+        live: !servingCached,
       });
 
   return (
@@ -226,10 +289,17 @@ function LiveHome() {
         {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
       </section>
 
+      {daemonUnreachable && (
+        <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-warning/30 bg-warning-tint px-4 py-3 text-small text-fg">
+          <span className="min-w-0 flex-1">Clementine isn’t responding, so what needs you and what’s running can’t be read right now.</span>
+          <Button size="sm" variant="secondary" onClick={() => { retryCommandCenter(); void workingNow.refetch(); }}>Try again</Button>
+        </div>
+      )}
       {layout.isError && <div role="alert" className="flex items-center gap-3 rounded-md border border-warning/30 p-3 text-small text-muted">
         <span>Couldn’t load your Home layout. {layout.data ? 'Your last saved tiles are shown.' : 'Your saved layout has not been changed.'}</span>
         <Button size="sm" variant="ghost" onClick={() => { void layout.refetch(); }}>Retry</Button>
       </div>}
+      {(immediatePanes.length > 0 || tilesIn('now').length > 0) && (
       <section className="flex flex-col gap-3" aria-label="Now">
         <p className="text-caption font-semibold uppercase tracking-widest text-faint">Now</p>
         <div className="grid grid-cols-12 items-start gap-5">
@@ -237,16 +307,40 @@ function LiveHome() {
           {layout.data && tilesIn('now').map(tile => <div key={tile.spaceId} className={tileWidth(tile)}><SpaceTile tile={tile} layout={layout.data!} /></div>)}
         </div>
       </section>
+      )}
+      {homeIsBare ? (
+        /* The blank canvas. One invitation, centred, instead of a dashed box at
+           the bottom of a stack of empty cards. */
+        <section className="flex flex-col items-center gap-4 px-4 py-12 text-center" aria-label="Build your Home">
+          <h2 className="text-h2 text-fg">Build your command center</h2>
+          <p className="reading max-w-[52ch] text-body text-muted">
+            Place what you want to see every time you sit down — your calendar, what needs an answer,
+            a report Clem keeps current. Nothing lives here until you put it here.
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Button onClick={() => setBuilding(true)} disabled={!layout.data}>Build home</Button>
+            <Button variant="secondary" onClick={() => composerRef.current?.focus()}>Ask Clem</Button>
+          </div>
+        </section>
+      ) : (
       <section className="flex flex-col gap-3" aria-label="Watching">
         <p className="text-caption font-semibold uppercase tracking-widest text-faint">Watching</p>
-        {layout.data && tilesIn('watching').length > 0 ? <div className="grid grid-cols-12 items-start gap-5">
-          {tilesIn('watching').map(tile => <div key={tile.spaceId} className={tileWidth(tile)}><SpaceTile tile={tile} layout={layout.data!} /></div>)}
+        {layout.data && watching.length > 0 ? <div className="grid grid-cols-12 items-start gap-5">
+          {watching.map(tile => <div key={tile.spaceId} className={tileWidth(tile)}><SpaceTile tile={tile} layout={layout.data!} /></div>)}
         </div> : layout.isLoading ? <Skeleton className="h-28 w-full" /> : layout.data && <div className="flex flex-wrap items-center justify-between gap-4 rounded-md border border-dashed border-border px-5 py-7">
           <div><h2 className="text-h3">Make this Home yours</h2><p className="mt-1 text-body text-muted">Bring a Space here, or ask Clem to build something you want to keep in view.</p></div>
           <Button variant="secondary" onClick={() => setBuilding(true)}>Build home</Button>
         </div>}
       </section>
-      {remainingPanes.length > 0 && <div className="flex flex-col gap-5">{remainingPanes.map(renderPane)}</div>}
+      )}
+      {/* "Now" and "Watching" are labelled; these were not, so the page ran out
+          of structure exactly where it got long. */}
+      {!homeIsBare && remainingPanes.length > 0 && (
+        <section className="flex flex-col gap-3" aria-label="Also on your Home">
+          <p className="text-caption font-semibold uppercase tracking-widest text-faint">Also</p>
+          <div className="flex flex-col gap-5">{remainingPanes.map(renderPane)}</div>
+        </section>
+      )}
       {building && layout.data && <HomeBuilder layout={layout.data} spaces={spaces.data ?? []} spacesUnavailable={spaces.isError && !spaces.data} spacesLoading={spaces.isLoading} onClose={() => setBuilding(false)}
         onBuild={text => sendAndOpen({ text, attachmentIds: [], attachmentNames: [] })} />}
     </div>

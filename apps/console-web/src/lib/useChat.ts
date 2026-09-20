@@ -1,5 +1,5 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
-import { reduceActivity as reduceSharedActivity } from '../../../../packages/chat-engine/src/reduce-activity';
+import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -22,7 +22,7 @@ import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail } from './toolLabels';
-import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone, type WriteLedgerRow } from '../../../../packages/chat-engine/src/write-ledger';
+import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone, type WriteLedgerRow } from '@clem/chat-engine';
 import { isWorkPlanRow, workPlanActivityItem, workPlanStepLabel } from './work-plan-presentation';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
@@ -73,6 +73,14 @@ export interface ActivityItem {
   effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
   /** Settlement belongs to this exact write, not the chat terminal. */
   write?: WriteLedgerRow;
+  /** kind 'batch' rows fed by a declared work manifest — the shared fold in
+   *  @clem/chat-engine owns this state; see its ActivityItem. */
+  manifest?: {
+    id: string;
+    itemStatus: Record<string, string>;
+  };
+  /** kind 'event' deliverable rows: the latest file folded in, by basename. */
+  deliverable?: { name: string; dir: string };
 }
 
 export interface ChatMessage {
@@ -445,11 +453,22 @@ function helperOf(ev: unknown): { sessionId: string; item: string } | null {
   return { sessionId: w.sessionId, item: w.item };
 }
 
+/** This surface's HarnessEvent still allows a string `createdAt` from older
+ *  transports; the shared engine's does not. Normalize once, at the boundary. */
+function sharedEvent(ev: HarnessEvent): SharedHarnessEvent {
+  return { ...ev, createdAt: typeof ev.createdAt === 'number' ? ev.createdAt : undefined };
+}
+
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
+  // Event types this surface delegates wholesale to the shared fold rather than
+  // keeping a second implementation of. The work-contract pair is here because
+  // the manifest meter is stateful (per-item status, retries counted once) and
+  // two of those would be guaranteed to drift.
   if (ev.type === 'turn_started' || ev.type === 'turn_model_routed'
+    || ev.type === 'work_manifest_declared' || ev.type === 'work_item_checkpoint'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
-    return reduceSharedActivity(prev, { ...ev, createdAt: typeof ev.createdAt === 'number' ? ev.createdAt : undefined });
+    return reduceSharedActivity(prev, sharedEvent(ev));
   }
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
@@ -773,7 +792,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'conversation_completed':
       return prev.map((item) => (
         item.id.startsWith('dispatch-') && item.status === 'running'
-          ? { ...item, status: 'done', tone: 'success' }
+          // The turn ending proves the DISPATCH landed, not that the work
+          // succeeded — the row's own detail says the result arrives later.
+          // Success-green claimed an outcome nothing had reported yet.
+          ? { ...item, status: 'done' as const, tone: 'muted' as const }
           : item
       ));
     case 'codemode_program_summary': {
@@ -790,7 +812,12 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       }];
     }
     default:
-      return prev;
+      // Everything the cases above did not claim still carries typed meaning.
+      // Until 2026-09-19 it died right here: a brain fall-over, a context
+      // compaction, a corrected memory, a write retried after an uncertain
+      // crossing all reached the client and became nothing. The shared
+      // lifecycle fold decides which of them the owner should see.
+      return reduceLifecycle(prev, sharedEvent(ev));
   }
 }
 

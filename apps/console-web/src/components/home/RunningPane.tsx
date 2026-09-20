@@ -63,9 +63,17 @@ export function RunningPane({
 }) {
   const inFlight = view.entries.filter((presented) => presented.membership === 'running');
   const stalled = view.entries.filter((presented) => presented.membership === 'stalled');
-  // The cap is on the pane, not on each group: running work first, then what
-  // stopped and never finished.
-  const rows = [...inFlight, ...stalled];
+  // Work BLOCKING the owner. This pane used to filter it out and the Needs-you
+  // pane never saw it either — that pane is fed by the command centre, and a
+  // workflow parked at awaiting_approval produces no Inbox card (the mobile
+  // shell says exactly this at screens/Home.tsx:190). So `view.needsYou` was
+  // computed on this screen and rendered by nothing: work stopped, waiting on
+  // a person, invisible on their Home. It leads the pane now, because it is
+  // the only group here that is a demand rather than a status.
+  const parked = view.entries.filter((presented) => presented.membership === 'needs_you');
+  // The cap is on the pane, not on each group: what needs you, then running
+  // work, then what stopped and never finished.
+  const rows = [...parked, ...inFlight, ...stalled];
   const visible = rows.slice(0, MAX_ROWS);
   const overflow = rows.length - visible.length;
   const leadLiveKey = inFlight[0]?.entry.runKey;
@@ -82,7 +90,10 @@ export function RunningPane({
           <QuietLine>Nothing is running right now.</QuietLine>
         ) : (
           <>
-            {inFlight.length === 0 && (
+            {parked.length > 0 && (
+              <QuietLine>{parked.length === 1 ? 'One run is waiting on you:' : `${parked.length} runs are waiting on you:`}</QuietLine>
+            )}
+            {parked.length === 0 && inFlight.length === 0 && (
               <QuietLine>Nothing is running right now. These stopped without finishing:</QuietLine>
             )}
             {visible.map((presented) => {

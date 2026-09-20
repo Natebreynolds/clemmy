@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { homeBlocks, homeRows, presenceLine, runningOpenTarget, steerTarget } from './home-model.js';
+import { homeBlocks, homeRows, presenceLine, runningOpenTarget, silentImmediatePanes, staleSuffix, steerTarget } from './home-model.js';
 import {
   DEFAULT_HOME_PANE_ORDER,
   DEFAULT_HOME_PREFERENCES,
@@ -202,4 +202,79 @@ test('the headline counts what is actually happening, in one sentence', () => {
 
 test('an idle console says so plainly rather than showing an empty headline', () => {
   assert.equal(presenceLine({ needsYou: 0, running: 0, updates: 0, attention: 0 }), 'Nothing needs you right now.');
+});
+
+// ─── Quiet Home ────────────────────────────────────────────────────────────
+
+test('a pane with nothing in it does not earn a card', () => {
+  assert.deepEqual(
+    silentImmediatePanes({ needsYou: 0, running: 0, updates: 0, attention: 0, settled: true, workRows: 0 }),
+    ['needs_you', 'running', 'while_away'],
+  );
+});
+
+test('a pane with something in it keeps its card', () => {
+  assert.deepEqual(
+    silentImmediatePanes({ needsYou: 2, running: 1, updates: 3, attention: 0, settled: true, workRows: 1 }),
+    [],
+  );
+  // "While you were away" speaks for updates OR things to review.
+  assert.deepEqual(
+    silentImmediatePanes({ needsYou: 0, running: 0, updates: 0, attention: 1, settled: true, workRows: 0 }),
+    ['needs_you', 'running'],
+  );
+});
+
+test('unknown is never rendered as empty', () => {
+  // A pane that vanished because the daemon was asleep would assert "nothing
+  // needs you" on no evidence — the same lie as a green row for undelivered
+  // work. Until every source answers, every pane the user kept stays.
+  assert.deepEqual(
+    silentImmediatePanes({ needsYou: 0, running: 0, updates: 0, attention: 0, settled: false, workRows: 0 }),
+    [],
+  );
+});
+
+test('the quiet line and the quiet panes agree', () => {
+  // The presence line says the quiet case once; the panes then say nothing.
+  const counts = { needsYou: 0, running: 0, updates: 0, attention: 0 };
+  assert.equal(presenceLine(counts), 'Nothing needs you right now.');
+  assert.equal(silentImmediatePanes({ ...counts, settled: true, workRows: 0 }).length, 3);
+});
+
+test('a run parked waiting on you keeps the Running pane on screen', () => {
+  // view.running counts only what is MOVING. A workflow stopped at
+  // awaiting_approval is not moving and is not in the Inbox either, so hiding
+  // the pane on `running === 0` would make work that is blocking the owner
+  // disappear from Home entirely.
+  assert.deepEqual(
+    silentImmediatePanes({ needsYou: 0, running: 0, updates: 0, attention: 0, settled: true, workRows: 1 }),
+    ['needs_you', 'while_away'],
+  );
+});
+
+// ─── Age disclosure (desktop adopting the phone's rule) ────────────────────
+
+test('a live reading says nothing about its age', () => {
+  assert.equal(staleSuffix({ updatedAtMs: 1_000, nowMs: 10_000_000, live: true }), '');
+});
+
+test('a fresh cached reading is not worth a caveat', () => {
+  // Under 90s the number really is what it just was; saying so is noise.
+  const now = 1_789_000_000_000;
+  assert.equal(staleSuffix({ updatedAtMs: now - 60_000, nowMs: now, live: false }), '');
+});
+
+test('a stale cached reading says how old it is, in the phone’s words', () => {
+  // A realistic epoch clock: the offsets below must not run past it.
+  const now = 1_789_000_000_000;
+  assert.equal(staleSuffix({ updatedAtMs: now - 4 * 60_000, nowMs: now, live: false }), ' — as of 4m ago');
+  assert.equal(staleSuffix({ updatedAtMs: now - 3 * 3_600_000, nowMs: now, live: false }), ' — as of 3h ago');
+  assert.equal(staleSuffix({ updatedAtMs: now - 2 * 86_400_000, nowMs: now, live: false }), ' — as of 2d ago');
+});
+
+test('unknown provenance is disclosed, never rendered as fresh', () => {
+  // A cached count with no timestamp is still not a live one.
+  assert.equal(staleSuffix({ updatedAtMs: 0, nowMs: 10_000_000, live: false }), ' — last reading, age unknown');
+  assert.equal(staleSuffix({ updatedAtMs: NaN, nowMs: 10_000_000, live: false }), ' — last reading, age unknown');
 });

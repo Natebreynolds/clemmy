@@ -4,6 +4,8 @@ export * from './tool-labels.js';
 export * from './work-plan-presentation.js';
 export * from './activity-presentation.js';
 export * from './reduce-activity.js';
+export * from './reduce-lifecycle.js';
+export * from './evidence-presentation.js';
 export * from './terminal-presentation.js';
 export * from './stream.js';
 export * from './engine.js';

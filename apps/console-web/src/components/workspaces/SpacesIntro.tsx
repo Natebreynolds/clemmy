@@ -25,8 +25,15 @@ export interface SpacesIntroProps {
 export function SpacesIntro({ onBuild, force }: SpacesIntroProps) {
   const [dismissed, setDismissed] = useState(() => readDismissed());
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
+  // Three states, not two. Folding a rejection into the same empty array as a
+  // genuine no-recipes result made a failed read say "Connect an app under
+  // Connect and starter Spaces will appear here" — advice for a problem the
+  // owner does not have, when apps may well be connected already.
+  const [recipes, setRecipes] = useState<'loading' | 'ready' | 'error'>('loading');
   useEffect(() => {
-    listStarterRecipes().then(setStarters).catch(() => setStarters([]));
+    listStarterRecipes()
+      .then((rows) => { setStarters(rows); setRecipes('ready'); })
+      .catch(() => { setStarters([]); setRecipes('error'); });
   }, []);
   if (dismissed && !force) return null;
   const ready = starters.filter((s) => s.connected).slice(0, 4);
@@ -55,7 +62,11 @@ export function SpacesIntro({ onBuild, force }: SpacesIntroProps) {
         </div>
         <div className="space-y-2">
           <p className="text-caption uppercase tracking-wide text-faint">Start from something she can build now</p>
-          {ready.length === 0 ? (
+          {recipes === 'loading' ? (
+            <p className="text-small text-faint">Looking for starters…</p>
+          ) : recipes === 'error' ? (
+            <p className="text-small text-muted">Starter Spaces couldn’t be loaded just now — this isn’t a sign that nothing is connected.</p>
+          ) : ready.length === 0 ? (
             <p className="text-small text-muted">Connect an app under Connect and starter Spaces will appear here.</p>
           ) : (
             <ul className="grid gap-2">

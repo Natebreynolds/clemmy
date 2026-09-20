@@ -268,9 +268,15 @@ export function WorkspaceFrame({
       if (!rememberGesture(parsed.gesture.id) || gestureInFlight) return;
       gestureInFlight = true;
       void runWorkspaceGesture(parsed.gesture)
-        .catch(() => {
-          // The iframe has no privileged response channel. Browser/Electron
-          // failures remain local and cannot turn this capability into RPC.
+        .catch((error: unknown) => {
+          // The iframe still gets no response channel — this reports to the
+          // HOST, exactly as the RPC path above does, so the invariant holds.
+          // Reporting nowhere at all meant an "Open in…" or "Download CSV" that
+          // failed looked identical to one that worked, and the owner concluded
+          // the Space Clementine built was broken.
+          onErrorRef.current?.(error instanceof Error && error.message.trim()
+            ? error.message
+            : 'That action didn’t complete.');
         })
         .finally(() => { gestureInFlight = false; });
     };

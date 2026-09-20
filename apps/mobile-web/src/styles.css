@@ -1358,6 +1358,9 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .work-elapsed { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .work-caret { flex: 0 0 auto; width: 10px; text-align: center; }
 .work-failed .work-line { color: var(--accent-fail); }
+/* Not a failure, but not a success either — a turn that stopped, is waiting on
+   you, or was blocked. It must not read like a finished one. */
+.work-unfinished .work-line { color: var(--accent-deep); }
 .work-spinner {
   flex: 0 0 auto;
   width: 9px;
@@ -4007,6 +4010,9 @@ textarea.cz-input { resize: vertical; }
    default; warning tint only when the harness itself says stopped/uncertain. */
 .reply-state { margin: 6px 0 0; font-size: 13px; color: var(--fg-2); }
 .reply-state-blocked, .reply-state-uncertain { color: var(--accent-deep); }
+/* The turn's evidence counts. Quieter than the status line above it: this is
+   what the harness proved, not what it needs from you. */
+.reply-evidence { margin: 4px 0 0; font-size: 12px; color: var(--fg-3, var(--fg-2)); }
 
 /* ── press feedback on touch screens ─────────────────────────────────
    A finger has no hover. On a touch screen the :active rules above fire on

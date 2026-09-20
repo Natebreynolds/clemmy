@@ -10,6 +10,7 @@ import { Link } from 'react-router-dom';
 import { Users, MessageSquare, ArrowRight, Send, Inbox, Repeat, Clock, Plus, BookOpen, Workflow, Route, Share2, CheckCircle2, XCircle, Sparkles, ClipboardList } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Card } from '@/components/ui/Card';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -741,6 +742,12 @@ export function Agents() {
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2].map((i) => <Skeleton key={i} className="h-36 rounded-2xl" />)}
         </div>
+      ) : agentsQ.isError && !agentsQ.data ? (
+        <QueryUnavailable
+          title="Your agents are unavailable"
+          description="Clementine couldn’t load your team, so this is not an empty roster. No agent has been removed."
+          onRetry={() => { void agentsQ.refetch(); }}
+        />
       ) : agents.length === 0 ? (
         <EmptyState
           title="No agents yet"

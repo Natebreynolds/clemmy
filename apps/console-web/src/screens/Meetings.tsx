@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, type LucideIcon } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
 import { Input, Select } from '@/components/ui/Field';
@@ -579,6 +580,8 @@ export function Meetings() {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
         <div className="space-y-2">
           {meetings.isLoading ? [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)
+            : meetings.isError && !meetings.data
+              ? <QueryUnavailable title="Meetings are unavailable" description="Clementine couldn’t load your meetings, so this is not an empty-meetings state. Nothing has been deleted." onRetry={() => { void meetings.refetch(); }} />
             : rows.length === 0 ? <EmptyState title="No meetings yet" description="Recorded meetings will show up here with summaries and action items." />
               : rows.map((m) => <MeetingRow key={m.id} m={m} selected={selected === m.id} onSelect={() => setSelected(m.id)} />)}
         </div>

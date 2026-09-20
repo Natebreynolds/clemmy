@@ -10,6 +10,7 @@
  */
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
+import { openFile, resolveDeliverablePath } from '@/lib/files';
 import { ArrowUpRight, Check, X, AlertCircle, Send, Zap, Users } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
@@ -39,6 +40,48 @@ function StepIcon({ a, live }: { a: ActivityItem; live: boolean }) {
   return <span className={shell}><Check className="h-3 w-3 text-success" strokeWidth={2.25} aria-hidden /></span>;
 }
 
+
+/**
+ * "open" on a file Clem just saved.
+ *
+ * The harness publishes basenames, not a path, so the exact file is resolved
+ * on demand (see lib/files.ts). The button only appears once exactly one file
+ * matches: an ambiguous name would otherwise open the wrong document in front
+ * of the owner, which is worse than no button at all. A refusal from the route
+ * — outside the vault, since deleted, not macOS — is said out loud.
+ */
+function OpenDeliverable({ file }: { file: { name: string; dir: string } }) {
+  const [state, setState] = useState<'idle' | 'working' | 'unavailable'>('idle');
+  const [problem, setProblem] = useState('');
+  if (state === 'unavailable') return null;
+  const reveal = () => {
+    setState('working');
+    setProblem('');
+    void resolveDeliverablePath(file.name, file.dir)
+      .then(async (resolved) => {
+        if (!resolved) { setState('unavailable'); return; }
+        const result = await openFile(resolved);
+        setState('idle');
+        if (!result.ok) setProblem(result.reason);
+      })
+      .catch(() => setState('unavailable'));
+  };
+  return (
+    <>
+      <button
+        type="button"
+        onClick={reveal}
+        disabled={state === 'working'}
+        title={`Open ${file.name}`}
+        className="font-sans transition-colors hover:text-primary disabled:opacity-50"
+      >
+        {state === 'working' ? 'opening…' : 'open'}
+      </button>
+      {problem && <span className="font-sans text-warning" role="status">{problem}</span>}
+    </>
+  );
+}
+
 function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live: boolean; nested?: boolean }) {
   const running = live && a.status === 'running';
   const [peek, setPeek] = useState<boolean | null>(null);
@@ -58,6 +101,7 @@ function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live:
         )}
       </span>
       <span className="flex items-center gap-2 pt-0.5 font-mono text-caption tabular-nums text-faint">
+        {a.deliverable && <OpenDeliverable file={a.deliverable} />}
         {a.excerpt && (
           <button type="button" onClick={() => setPeek(!showExcerpt)} aria-expanded={showExcerpt} className="font-sans transition-colors hover:text-muted">{showExcerpt ? 'hide' : 'peek'}</button>
         )}
@@ -131,7 +175,16 @@ export function ActivityCard({
   const expanded = live || (open ?? defaultOpen ?? false);
   const { top, children } = groupActivityByParent(view);
   const clock = live ? clockLabel(head.startedAt, now) : (head.totalMs !== undefined ? clockLabel(0, head.totalMs) : '');
+  // Three outcomes, three dots. `terminalOutcome` is 'interrupted' for a turn
+  // that stopped, is awaiting a reply, or is waiting on approval
+  // (activity-presentation.ts activityTerminalOutcomeForMessageStatus) — none
+  // of which is success. Painting everything-but-failed green was the same
+  // class of lie as Home's "done while you were away" rows: the card asserted
+  // an outcome the engine had not proved.
   const failed = !live && terminalOutcome === 'failed';
+  const unfinished = !live && terminalOutcome === 'interrupted';
+  const dotTone = failed ? 'bg-danger' : unfinished ? 'bg-warning' : 'bg-success';
+  const dotLabel = failed ? 'Failed' : unfinished ? 'Did not finish' : 'Completed';
 
   if (!expanded) {
     return (
@@ -140,7 +193,7 @@ export function ActivityCard({
         onClick={() => setOpen(true)}
         className={cn('flex w-full items-center gap-2 text-left text-caption text-faint transition-colors hover:text-muted', className)}
       >
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', failed ? 'bg-danger' : 'bg-success')} aria-hidden />
+        <span className={cn('h-2 w-2 shrink-0 rounded-full', dotTone)} role="img" aria-label={dotLabel} />
         <span className="min-w-0 truncate">{head.title}</span>
         {clock && <span className="shrink-0 font-mono tabular-nums">{clock}</span>}
         <span className="shrink-0" aria-hidden>· show</span>
@@ -153,7 +206,7 @@ export function ActivityCard({
       <header className="flex items-center gap-2.5 px-4 pt-3 pb-2">
         {live
           ? <span className="h-2 w-2 shrink-0 animate-breathe rounded-full bg-primary shadow-[0_0_0_3px_var(--primary-tint)]" aria-hidden />
-          : <span className={cn('h-2 w-2 shrink-0 rounded-full', failed ? 'bg-danger' : 'bg-success')} aria-hidden />}
+          : <span className={cn('h-2 w-2 shrink-0 rounded-full', dotTone)} role="img" aria-label={dotLabel} />}
         <span className="min-w-0 flex-1 truncate text-body font-semibold text-fg">{title ?? head.title}</span>
         {head.helpers > 0 && (
           <span className="flex shrink-0 items-center gap-1 text-caption text-faint" title={`${head.helpers} helper${head.helpers > 1 ? 's' : ''}`}>

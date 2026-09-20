@@ -123,7 +123,13 @@ export function Inbox() {
   const queryUnavailable = tab === 'needs'
     ? approvals.isError || workspaceChoosers.isError || notifications.isError || trustProposals.isError || planProposals.isError || questions.isError
     : notifications.isError;
-  const hasRows = !queryUnavailable && (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
+  // Gate the reading pane on the SAME denominator the list renders from.
+  // `needsCount` excludes stale approvals; `anyDecisionRows` does not — so with
+  // only aged approvals pending, every card still drew and stayed clickable
+  // while the pane that shows tool, session, requested-at and the full args
+  // never mounted. The click went nowhere, on the one screen whose whole job
+  // is to let a decision land.
+  const hasRows = !queryUnavailable && (tab === 'needs' ? anyDecisionRows : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
   const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
@@ -434,7 +440,7 @@ export function Inbox() {
     <Page
       title="Needs you"
       subtitle="Decisions waiting on you, and updates from finished work"
-      actions={tab === 'needs' && needsCount > 0
+      actions={tab === 'needs' && anyDecisionRows > 0
         ? (confirmClearAsks
           ? <span className="inline-flex items-center gap-2 text-small text-muted">Decline all {needsCount}? <Button variant="danger" size="sm" onClick={onClearAsks}>Yes, clear all</Button><Button variant="ghost" size="sm" onClick={() => setConfirmClearAsks(false)}>Keep</Button></span>
           : <span className="inline-flex items-center gap-2">{approvalRows.length > 0 ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button> : null}<Button variant="secondary" size="sm" onClick={() => setConfirmClearAsks(true)}><X className="h-4 w-4" aria-hidden /> Clear all ({needsCount})</Button></span>)
