@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type {
   WorkflowDefinition,
   WorkflowResourceBinding,
@@ -18,7 +19,7 @@ import {
 } from '../integrations/cli-catalog/catalog.js';
 import { getSavedClis } from '../runtime/saved-clis.js';
 
-export type WorkflowResourceCandidateKind = 'composio' | 'cli' | 'url' | 'project' | 'workspace';
+export type WorkflowResourceCandidateKind = 'composio' | 'cli' | 'url' | 'project' | 'workspace' | 'local_path';
 export type WorkflowResourceCandidateStatus = 'ready' | 'available' | 'missing' | 'unknown';
 export type WorkflowResourceProposalStatus =
   | 'bound'
@@ -294,6 +295,7 @@ function resourceCandidates(
 ): WorkflowResourceCandidate[] {
   const candidates: WorkflowResourceCandidate[] = [];
   const selected = selectedSurfaceCandidate(resource, def, inventory);
+  if (selected?.kind === 'local_path') return [selected];
   if (selected) candidates.push({ ...selected, score: 1 });
   for (const slug of candidateToolkitSlugs(resource, inventory)) {
     if (resource.toolkit && normalizeKey(slug) === normalizeKey(resource.toolkit)) continue;
@@ -345,6 +347,11 @@ function selectedSurfaceCandidate(
   def: WorkflowDefinition,
   inventory: WorkflowResourceBindingInventory,
 ): WorkflowResourceCandidate | undefined {
+  const localFolder = localFolderResourcePath(resource);
+  if (localFolder) return {
+    id: `local_path:${localFolder}`, kind: 'local_path', label: resource.label || localFolder,
+    status: 'ready', score: 1, reason: 'Explicit absolute local folder; filesystem access is checked by the executing tool.',
+  };
   if (resource.toolkit) return composioCandidate(resource.toolkit, inventory, 1, 'Selected toolkit on the workflow resource.');
   if (resource.cli) {
     const record = candidateCliRecords(resource, inventory).find((candidate) => candidate.command === resource.cli || candidate.id === resource.cli)
@@ -503,7 +510,17 @@ function candidateStatusRank(status: WorkflowResourceCandidateStatus): number {
  * The single, pure, inventory-free predicate — shared with certification so
  * "what makes a resource bound" is defined once. See [[workflow-certification]].
  */
+/** An absolute folder selector without a remote owner names the native
+ * filesystem. This is binding metadata, not evidence of existence or permission. */
+export function localFolderResourcePath(resource: WorkflowResourceBinding): string | null {
+  const selector = resource.resourceId?.trim();
+  return resource.kind === 'folder' && !resource.toolkit && !resource.tool && !resource.cli
+    && !resource.mcpServer && !resource.url && selector && !selector.includes('\0')
+    && path.isAbsolute(selector) ? selector : null;
+}
+
 export function resourceHasSurface(resource: WorkflowResourceBinding, def: WorkflowDefinition): boolean {
+  if (localFolderResourcePath(resource)) return true;
   if (resource.toolkit || resource.tool || resource.cli || resource.mcpServer) return true;
   if (resource.kind === 'api' || resource.kind === 'webhook') return Boolean(resource.url);
   if (resource.kind === 'project') return Boolean(resource.resourceId || resource.name || resource.url || def.project);

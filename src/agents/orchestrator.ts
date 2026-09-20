@@ -6,7 +6,7 @@ import { buildPublishPlanTool } from '../tools/publish-plan.js';
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
-import { getRuntimeEnv, MODELS } from '../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import type { RuntimeContextValue, TaskContinuationContext } from '../types.js';
@@ -72,6 +72,7 @@ import {
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS } from './tool-catalog.js';
+import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import {
   composeSessionFromStore,
   pinCompositionHotTools,
@@ -107,6 +108,7 @@ import {
   isRegistryDeclaredLocalPlanningCapability,
   isRegistryDeclaredNativePlanningRead,
   isWorkCallConfiguredLocalPlanningCapability,
+  issueAuthorizedLocalPlanningDisclosureCandidate,
 } from '../runtime/harness/local-planning-capability.js';
 import {
   accountSelectionBlockersFromSearchResult,
@@ -125,7 +127,7 @@ import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { describeMissingWorkerItems, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
+import { describeMissingWorkerItems, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerItemContexts, workerContextForItem, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from './worker-concurrency.js';
 import {
@@ -173,7 +175,7 @@ import { WorkerBatchGenerationCancelledError } from './worker-batch-execution.js
 import { describeInvalidToolInput, isSdkToolInputValidationError } from '../tools/shared.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
-import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
+import { falloverWorkerModelIds } from '../runtime/harness/model-role-options.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import {
@@ -353,12 +355,9 @@ export function externalMcpAttachmentScope(
   };
 }
 
-// A turn that explicitly selects Clementine memory ("use only local memory",
-// "remember this", or a recent-conversation recall) needs a much narrower
-// built-in capability surface. Keep every read/recovery hatch that can answer
-// from local memory, but do not pay to serialize unrelated workflow, admin,
-// file-write, or focus-mutation schemas. The implicit forms remain phrase-tight:
-// ordinary memory-ish questions retain the full schema-on-demand catalog.
+// Restrict capabilities only when the user explicitly requests local memory
+// only. Remembering or recalling something can be one part of a larger task;
+// those phrases must not hide native files, Spaces, workflows, or discovery.
 const LOCAL_MEMORY_ONLY_BUILTINS = new Set([
   'focus_get',
   'memory_list_facts',
@@ -384,7 +383,7 @@ export function localMemoryBuiltinScope(input: string | null | undefined): Set<s
   const explicitLocalOnly = LOCAL_MEMORY_ONLY_TURN_RE.test(text);
   const explicitStore = EXPLICIT_MEMORY_STORE_TURN_RE.test(text);
   const recentConversationRecall = RECENT_CONVERSATION_RECALL_TURN_RE.test(text);
-  if (!explicitLocalOnly && !explicitStore && !recentConversationRecall) return null;
+  if (!explicitLocalOnly) return null;
   const allowed = new Set(LOCAL_MEMORY_ONLY_BUILTINS);
   if (NO_MEMORY_WRITE_TURN_RE.test(text) || (recentConversationRecall && !explicitStore)) {
     allowed.delete('memory_remember');
@@ -405,7 +404,7 @@ function workerIntentRoutingEnabled(): boolean {
  *  the next connected brain. Default ON (kill-switch CLEMMY_BRAIN_FALLOVER=off) —
  *  parity with the router, chat, and workflow lanes (2026-07-20: this lane was left
  *  default-off when the others were flipped, so a configured fallback brain never
- *  engaged for fan-out workers). falloverBrainModelIds returns [] when no other brain
+ *  engaged for fan-out workers). falloverWorkerModelIds returns [] when no other brain
  *  is connected, so a single-brain user is an automatic no-op. */
 function workerBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -455,7 +454,7 @@ function executedWorkerRoute(
   sessionId: string,
   item: string,
   scope: { packetKey: string; parentLogicalCallId: string | null },
-): { executedModel?: string; executedProvider?: string; model?: string; provider?: string } {
+): { executedModel?: string; executedProvider?: string; model?: string; provider?: string; executionReceipt?: { model: string; provider: string } } {
   // Scoped to THIS logical call's packet: an earlier run of the same item in
   // this session (a prior turn, a prior batch) must never label a result —
   // least of all a pre-run refusal — with a route that did not execute now.
@@ -463,12 +462,15 @@ function executedWorkerRoute(
   try {
     const events = listEvents(sessionId, { types: ['worker_model_executed'] });
     for (let i = events.length - 1; i >= 0; i -= 1) {
-      const data = events[i]!.data as { executed?: unknown; item?: unknown; model?: unknown; provider?: unknown; packetKey?: unknown; parentLogicalCallId?: unknown };
+      const data = events[i]!.data as { executed?: unknown; item?: unknown; model?: unknown; provider?: unknown; packetKey?: unknown; parentLogicalCallId?: unknown; evidenceKind?: unknown };
       if (data.executed !== true || data.item !== item) continue;
       if (data.packetKey !== scope.packetKey || data.parentLogicalCallId !== scope.parentLogicalCallId) continue;
-      const out: { executedModel?: string; executedProvider?: string; model?: string; provider?: string } = {};
+      const out: { executedModel?: string; executedProvider?: string; model?: string; provider?: string; executionReceipt?: { model: string; provider: string } } = {};
       if (typeof data.model === 'string') { out.executedModel = data.model; out.model = data.model; }
       if (typeof data.provider === 'string') { out.executedProvider = data.provider; out.provider = data.provider; }
+      if (data.evidenceKind === 'completed_model_response' && out.executedModel && out.executedProvider) {
+        out.executionReceipt = { model: out.executedModel, provider: out.executedProvider };
+      }
       return out;
     }
   } catch { /* best-effort attribution */ }
@@ -2050,11 +2052,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.taskContinuation?.parentInput ?? '',
         ...historicalPriorUserInputs,
       ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
-  // workflow_run is a structured control with its own exact accepted-source
-  // admission and queue boundary. Its availability cannot depend on a fuzzy
-  // English request match or require an unrelated planning graph.
+  // Ordinary chat dispatch keeps its exact accepted-source control path.
+  // Explicit Plan/Execute must instead expose the existing citable local
+  // capability: otherwise hot-set promotion hides it from search while Plan's
+  // effect boundary correctly prevents its direct invocation.
   const routesPlanBoundLocalCapabilityForTurn = (name: string): boolean => (
-    routesPlanBoundLocalCapability(name) && name !== 'workflow_run'
+    routesPlanBoundLocalCapability(name)
+    && (name !== 'workflow_run' || planMode || taskMode?.kind === 'execute')
   );
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
@@ -2442,6 +2446,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const missing = describeMissingWorkerItems(call);
         return refuseWorkerPacketBeforeDispatch(missing.reason, missing.shapes);
       }
+      let itemContexts: Map<string, string>;
+      try {
+        itemContexts = workerItemContexts(callItems, call.itemContexts);
+      } catch (error) {
+        return refuseWorkerPacketBeforeDispatch(
+          error instanceof Error ? error.message : String(error), ['itemContexts:partition'],
+        );
+      }
       // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
       const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
         extractSessionId(runContext) ?? undefined,
@@ -2505,7 +2517,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? `Manifest guidance: the complete "${manifestBinding.phase}" phase is already proven for ${manifestBinding.manifestId} contract ${manifestBinding.contractVersion}. Do not call run_worker again for this phase; synthesize the user-facing result now from the returned work-products and durable evidence.`
           : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
         : null;
-      const { items: _batch, ...packetRaw } = call;
+      const { items: _batch, itemContexts: _itemContexts, ...packetRaw } = call;
       const packetBase = bindWorkerPacketExpectedWork({
         packet: packetRaw,
         sessionId: manifestSessionId,
@@ -2522,7 +2534,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // N× wall time. Per-item worker slots keep provider throttling honest;
         // per-item callId suffixes keep tool_outputs/reduce-tier rows distinct.
         const specs = callItems.map((item, index) => {
-          const workerInput = { ...packetBase, item } as WorkerToolInput;
+          const workerInput = { ...packetBase, item,
+            context: workerContextForItem(packetBase.context, itemContexts, item) } as WorkerToolInput;
           return { item, index, input: workerInput, packetKey: workerPacketKey(workerInput) };
         });
         const outputContext = getToolOutputContext();
@@ -2660,7 +2673,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (uniform && (workerFailureLooksRateLimited(uniform) || failedItems.some((f) => workerFailureLooksRateLimited(f.text)))) {
           const benched = resolveRoleModel('worker', call.intent || undefined).modelId;
           markWorkerModelCoolingDown(benched);
-          const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, MODELS.primary]);
+          const next = pickWorkerModelWithFallover([benched, resolveRoleModel('worker').modelId, DEFAULT_CODEX_FAST_MODEL]);
           if (next.falloverFrom) {
             return `Batch failed: ALL ${rendered.length} workers hit a rate limit on worker model "${benched}". It is benched for a cooldown and fan-out has AUTO-SWITCHED to "${next.model}" — call run_worker again NOW with the same items; they will dispatch on the healthy model.`;
           }
@@ -2690,7 +2703,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ].join('\n\n');
       }
       const singleResult = await runOneOrchestratorWorker(
-        { ...packetBase, item: callItems[0] } as WorkerToolInput,
+        { ...packetBase, item: callItems[0],
+          context: workerContextForItem(packetBase.context, itemContexts, callItems[0]!) } as WorkerToolInput,
         runContext,
         details,
         manifestBinding,
@@ -2777,7 +2791,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const workerPick = pickWorkerModelWithFallover([
         workerModel,
         resolveRoleModel('worker').modelId,
-        MODELS.primary,
+        DEFAULT_CODEX_FAST_MODEL,
       ]);
       if (workerPick.falloverFrom) {
         workerModel = workerPick.model;
@@ -2877,7 +2891,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // fan-outs and ERROR results are byte-identical to today.
       const reduceReturn = async (output: unknown, reuseParkedOutput = false): Promise<string> => {
         const text = typeof output === 'string' ? output : String(output ?? '');
-        return buildWorkerReturn({
+        const reduced = await buildWorkerReturn({
           sessionId,
           parentRunId: getToolOutputContext()?.workflowRunId || sessionId || '',
           item: input.item,
@@ -2885,6 +2899,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           callId: toolCallId ?? `call_w_${workerRouteStartedAt}_${packetKey.slice(0, 12)}`,
           ...(reuseParkedOutput ? { reuseParkedOutput: true } : {}),
         });
+        const receipt = sessionId ? executedWorkerRoute(sessionId, input.item, { packetKey, parentLogicalCallId }).executionReceipt : undefined;
+        // Append outside the reducer so compact digests retain host attribution.
+        // Keep ERROR/PARTIAL prefixes intact and distinguish cached reuse.
+        return receipt ? `${reduced}\n[Host execution receipt${reuseParkedOutput ? ' for reused result' : ''}: completed model response ${JSON.stringify(receipt)}.]` : reduced;
       };
       const appendWorkerResultFromOutput = (
         output: unknown,
@@ -3081,7 +3099,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // Explicit Plan workers need the same accepted-source mode, capability
       // attestation and reasoning settings as their parent. The legacy SDK
       // worker borrows the parent source and cannot preserve those contracts.
-      const useClaudeSdkWorker = !planMode && claudeAgentSdkWorkerEnabled(workerModel);
+      // Host-owned parent calls need host-owned child authority and receipts,
+      // regardless of provider. The legacy SDK lane shares the parent's source
+      // and cannot redeem the host's exact per-call tool attestation.
+      const useClaudeSdkWorker = !hostFreshPlanning && !planMode && claudeAgentSdkWorkerEnabled(workerModel);
       if (sessionId) {
         if (useClaudeSdkWorker) {
           try {
@@ -3152,7 +3173,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // which handles any further hop). committed=true → rethrow (a re-run could
           // double-act). Kill-switch CLEMMY_BRAIN_FALLOVER.
           const next = (workerBrainFalloverEnabled() && isCommitSafeWorkerFallover(err))
-            ? falloverBrainModelIds('claude')[0]
+            ? falloverWorkerModelIds('claude')[0]
             : undefined;
           if (!next) {
             appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
@@ -3517,7 +3538,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             // On an action turn these exact mutations must cross work_call's
             // requirement binder. Their ordinary graph-neutral control
             // exposure is unchanged on non-action turns.
-            && !localPlanningCapabilityNames.has(name)
+            && (!localPlanningCapabilityNames.has(name)
+              || (Boolean(hostFreshPlanning) && !planMode && taskMode?.kind !== 'execute'
+                && !frozenContract && NATIVE_PRODUCT_AUTHORING_TOOLS.has(name)))
           )))
         : firstClassNames;
       const deferredActionControlNames = new Set([...actionControlNames]
@@ -3690,7 +3713,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const catalogText = buildCompactToolCatalog({ allowedNames: catalogNames });
       const nativeAuthoringNames = hostFreshPlanning
         ? new Set([...localPlanningCapabilityNames].filter(name => workCallBuiltinNames.has(name)
-          && !isRegistryDeclaredRead(name)))
+          && !isRegistryDeclaredRead(name)
+          && !visibleFirstClassNames.has(name)))
         : new Set<string>();
       const nativeAuthoringCatalog = nativeAuthoringNames.size > 0
         ? '[native-authoring-catalog] Available native authoring tools. If an exact tool fits, use its known work_call contract or look up that exact name with tool_search for its schema and callable example. An exact native lookup stays local; describing it as a broad app search can return unrelated connectors.\n'
@@ -3710,7 +3734,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? frozenContract
             ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
             : hostFreshPlanning
-              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. Each identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision. Independent exact reversible writes can proceed one call at a time; chat does not compile a hidden plan for them. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for dependency or set topology, unresolved dependencies, an explicit tracked plan, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
+              ? '[tool-catalog] Full tool access. In Normal mode, call the exposed native space_save, workflow_create, and workflow_update tools directly using their schemas; the host prepares their current definitions and validates the exact call. No discovery or model-authored requirement ID is needed for those direct native calls. Explicit Plan and reviewed Execute keep their reviewed-step path. The planning card contains only exact live refs. For other operations, if a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. Each identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision. Independent exact reversible writes can proceed one call at a time; chat does not compile a hidden plan for them. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for dependency or set topology, unresolved dependencies, an explicit tracked plan, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
               : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
@@ -3809,7 +3833,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // catalog or frozen-plan revision silently revise the stable prefix.
   const volatileInstructions = [
     !planMode && batchShapeMandate,
-    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. For a compute step, synthesize its actual findings after dependencies finish. Before recording content that a write will consume, compare that content with the accepted objective, source evidence and reviewed success criteria; preserve unresolved facts as unknown, distinguish preparation from current reads, and correct unsupported claims now. Then record its actual JSON value with plan_step_result using step_id and data (text for a whole-text binding, or the object fields used by later bindings) before the consuming write. The host fills declared dynamicBindings and per-member bindings from their retained results; omit those bound fields from work_call args_json instead of retyping the content. Static arguments still match the approved plan. Reuse evidence already gathered in Plan; read it again when freshness affects the result or the reviewed verification requires it. If a finding is missing, contradictory or a read fails, investigate with additional read-only calls within the same objective and synthesize the result before the write. Such contextual reads use their discovered capabilityRef through work_call (or call_tool for local reads), not a reviewed step ID. They do not replace required reviewed steps or authorize new effects. Successful supplemental observations are retained with the synthesis automatically. If a current capability changed, stop and explain the need to revise. If a saved local file contains a mistake, record its corrected synthesis with plan_step_result and invoke the same reviewed write step at its original destination. The host binds a new revision, keeps prior receipts and refuses to overwrite an intervening edit. Do not retry external creates or sends. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Reuse successful results when no correction is needed.' : null,
+    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? reviewedReadOnlyExecution ? '[explicit-execute-mode] The user selected one exact saved read-only plan. Its reviewed text and prepared arguments are in the current input. Perform its reads using exposed read tools or call_tool with the exact prepared arguments; discover an operation only when its schema is missing. This plan has no execution draft: plan_task and plan_step_result are not on this surface. Do not use reviewed step IDs as work_call requirement_id. Follow the reviewed dependencies, synthesize compute findings directly from the returned evidence, and report the result. Do not re-plan, change scope, or introduce mutations. Reuse preparation evidence unless freshness or the reviewed verification requires a current read. Investigate missing or contradictory evidence with additional reads within the same objective; preserve unresolved facts as unknown. Completion still requires the reviewed success criteria and actual evidence.' : '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. For a compute step, synthesize its actual findings after dependencies finish. Before recording content that a write will consume, compare that content with the accepted objective, source evidence and reviewed success criteria; preserve unresolved facts as unknown, distinguish preparation from current reads, and correct unsupported claims now. Then record its actual JSON value with plan_step_result using step_id and data (text for a whole-text binding, or the object fields used by later bindings) before the consuming write. The host fills declared dynamicBindings and per-member bindings from their retained results; omit those bound fields from work_call args_json instead of retyping the content. Static arguments still match the approved plan. Reuse evidence already gathered in Plan; read it again when freshness affects the result or the reviewed verification requires it. If a finding is missing, contradictory or a read fails, investigate with additional read-only calls within the same objective and synthesize the result before the write. Such contextual reads use their discovered capabilityRef through work_call (or call_tool for local reads), not a reviewed step ID. They do not replace required reviewed steps or authorize new effects. Successful supplemental observations are retained with the synthesis automatically. If a current capability changed, stop and explain the need to revise. If a saved local file contains a mistake, record its corrected synthesis with plan_step_result and invoke the same reviewed write step at its original destination. The host binds a new revision, keeps prior receipts and refuses to overwrite an intervening edit. Do not retry external creates or sends. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Reuse successful results when no correction is needed.' : null,
     planMode ? '[explicit-plan-mode] The user selected Plan. Understand the current goal, adopted user changes and what successful execution must deliver. Think through the approach before publishing: connect the important questions or decisions to the evidence needed and explain how findings will support the result. For comparisons, use consistent criteria across subjects; separate observed facts, source claims and inference. Describe follow-up investigation for missing or conflicting evidence within the synthesis method. Required graph steps must succeed: do not turn a contingent lookup or its fallback into mandatory success dependencies. Execute can make additional contextual read-only calls while synthesizing, retaining their observations without freezing an unknown number of lookups. Keep indispensable input reads as graph steps; if those cannot be obtained, explain the unresolved prerequisite. A missing fact remains unknown rather than guessed. Investigate enough to choose a useful method without doing the proposed business work. Inspect supplied inputs and use relevant recalled preferences, previous successful procedures and skills; read a matching skill before relying on its method, and search memory when the request depends on prior work not already present. In the plan, briefly name material remembered preferences, procedures or facts that shape the approach and explain why they matter to this goal. Distinguish established preferences from changeable facts: confirm the latter through available current evidence, or label them as assumptions with a verification step. Retrieval and plan approval do not themselves verify a fact. Do not add a memory-search checklist or ask separately to approve each remembered item; ask only about unresolved choices that materially change the work. Treat recalled tools as candidates to validate, not permission or proof of current availability. Investigate the exact capabilities, schemas, accounts and arguments needed for this task. If a tool wraps another operation or accepts an open input object, inspect the selected operation’s own input contract before treating its arguments as prepared. Check that pagination, batch settings and per-item settings cover the intended collection. When repairing a step or changing from per-item work to a batch, reconsider coverage and downstream dependencies, not just whether the arguments now parse. More connected tools means more options, not a checklist. Gather enough evidence to choose and validate the method; use URL or metadata discovery when page bodies are not yet needed. Save exhaustive collection for Execute unless it is necessary to prepare the plan. Preparation reads and read-only shell commands remain available. Reuse retained evidence and known operations, and discover missing ones when needed. A pending internal review is not a missing user decision; continue independent preparation when a future execution requirement is unresolved. Once an exact operation is available, use its supplied schema or inspect the selected nested operation’s documentation; do not repeat broad catalog searches or a full documentation index to recover a contract you already have. A supplied exact input or destination path does not require repeated directory exploration after its scope is established. Reopen only the missing or changed definition. Publish full_text and one structured_plan with ordinary staticArguments objects; omit redundant execution_draft and unused optional fields. The host compiles the execution structure. Explain the findings, chosen method and relevant skill or memory constraints in the full plan so Execute inherits them. Carry their evidence and confirmation status into execution and the final deliverable. Before reporting completion, compare material claims against the sources; saving and reading back a file proves persistence, not the accuracy of its contents. Keep interpretation and uncertainty labeled rather than adding unsupported specificity. Describe choices in terms of the user’s outcome; keep harness repair details out of the user-facing plan unless they materially affect the approach. Keep known input values exact. Link future values to settled tool outputs or to a reviewed compute step. A compute step with capabilityRef:null declares the synthesis method and dependencies; Execute records its actual output with plan_step_result. Reference its output fields in dynamicBindings (for example /markdown into /markdown_text), never freeze placeholder report text. Use one tool step per distinct operation. For repeated work over a known collection or a reviewed read, use forEach with stable member IDs and item-to-argument bindings instead of copying the operation for every record. A repeated step can feed another repeated step: its result records contain memberId and result; preserve /memberId. result is the retained inner tool value, not a carrier envelope. If the tool returns text, bind /result directly; do not invent /result/output or /result/content fields. For an object, bind only known fields under /result. If outputs need interpretation or reshaping, prepare a compute step that consumes them and produces the exact input object or batch array for the next tool. Distinguish reading API documentation from calling that API. Separate independent work from actual dependencies, assign helpers only where useful, and describe verification and meaningful user check-ins. Surface only choices or missing facts that materially change the result. Prepare a ready plan when the necessary facts are available. If a missing user choice prevents useful planning, ask that specific question now; do not inventory tools or memories just to postpone it. Publish the partial findings and question as full_text with readiness needs_input; structured_plan can be omitted for that partial. An answer continues planning, not business execution. If a prerequisite cannot be resolved, publish needs_input naming the gap or ask the specific question. Do not claim an unread input was inspected. The user may discuss and revise the saved plan; use its exact base reference for a revision. Execute selects the reviewed revision. There is no mandatory separate shape-approval round before investigating and preparing the plan. You may delegate investigation to run_worker; workers inherit Plan mode. Business mutations, workflow dispatch, sends, unknown-effect commands, approvals and plan_task stay closed. Never guess account IDs or present model-authored identities as verified. This turn produces a reviewable plan, not execution of its business effects.' : null,
     !planMode && carrierWork
       ? frozenContract
@@ -3940,6 +3964,30 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     excludeToolNames: options.excludeToolNames,
     reason: 'orchestrator local harness tools',
   });
+  // A native reader already on the Plan surface should carry its exact
+  // planning identity too. Publish through the same current-source registry
+  // validation as discovery, after policy filtering; this adds no callable
+  // tools and does not change the reader's direct invocation or execution gates.
+  const nativePlanRefs: Record<string, string> = {};
+  if (planMode && hostFreshPlanning) {
+    const configuredNames = new Set(toolPolicy.tools.map(t => t.name));
+    const candidates = (await Promise.all(toolPolicy.tools
+      .filter(t => isRegistryDeclaredNativePlanningRead(t.name))
+      .map(t => issueAuthorizedLocalPlanningDisclosureCandidate({
+        name: t.name, carrier: 'call_tool', configuredNames,
+      })))).flatMap(candidate => candidate && !('refused' in candidate) ? [candidate] : []);
+    for (let i = 0; i < candidates.length; i += 20) {
+      Object.assign(nativePlanRefs, await disclosePrimaryModelPlanningCapabilities({
+        authority: hostFreshPlanning.authority, candidates: candidates.slice(i, i + 20),
+      }));
+    }
+  }
+  const modelTools = toolPolicy.tools.map(t => {
+    const ref = nativePlanRefs[t.name];
+    return ref && t.type === 'function'
+      ? { ...t, description: `${t.description}\nFor a saved plan, capabilityRef=${ref}. This current native reference is already available; no discovery call is needed.` }
+      : t;
+  });
   if (options.sessionId) {
     try {
       appendEvent({
@@ -4009,7 +4057,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
     // before the flag flips default-on.
-    tools: toolPolicy.tools
+    tools: modelTools
       .map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     // A real pause is terminal. A YOLO approval-shaped ask is intentionally
     // non-halting, so this must inspect the tool result instead of using a static
@@ -4065,7 +4113,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     for (const toolRef of [
       ...actionScopedDiscoveryTools,
       ...assembledTools,
-      ...toolPolicy.tools,
+      ...modelTools,
     ] as unknown as SealableToolLike[]) {
       const name = typeof toolRef.name === 'string' ? toolRef.name : '';
       if (name) universeByName.set(name, toolRef); // later (active) instances win
@@ -4073,7 +4121,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const sealed = sealAgentCapabilityUniverse({
       sessionId: options.sessionId ?? 'unbound',
       universeTools: [...universeByName.values()],
-      activeToolNames: toolPolicy.tools
+      activeToolNames: modelTools
         .map((toolRef) => (toolRef as { name?: string }).name ?? '')
         .filter(Boolean),
       policyHash: createHash('sha256')

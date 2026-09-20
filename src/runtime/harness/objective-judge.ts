@@ -1,4 +1,5 @@
 import { classifyModelError } from './resilient-model.js';
+import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
 import { MODELS } from '../../config.js';
@@ -12,7 +13,7 @@ import { renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { effectiveContextWindow } from './model-window-observations.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import {
-  JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceTools, type JudgeEvidenceSource,
+  JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
 
 /**
@@ -31,6 +32,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
   '',
   'Rules:',
+  READ_SCOPE_EVIDENCE_RUBRIC,
   '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE — the concrete result itself, its quoted output, or a pointer to the produced artifact — not a promise or summary of what was done.',
   '- Evidence takes WHATEVER FORM the objective implies. Demand a link, file, or record only when the objective itself calls for one; for a question, analysis, or plan the answer in the response IS the deliverable. NEVER mark the objective incomplete for lacking a URL or file it never asked for.',
   '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
@@ -39,6 +41,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Check factual claims and limitations against the supplied source evidence. A field omitted from a selected projection is not evidence that the provider omitted it. A result shown as a bounded view is what the assistant itself received of it. Inspect the evidence shown, including nested records, before accepting claims that data is absent, empty, unavailable or complete; such a claim resting on content outside the evidence shown is unverified unless other evidence shown covers it. Distinguish missing values from zero and from values the assistant did not inspect.',
   '- A saved artifact and matching readback prove persistence, not the correctness of its claims. Compare material conclusions, added specificity and claimed certainty against the actual source values and the adopted constraints or preferences. Plausible details unsupported by those sources are a gap. Interpretations of ambiguous data must remain labeled as interpretations, not promoted to confirmed facts or diagnoses.',
   '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
+  '- Separate delivered content from private review evidence. Apply response-only constraints (format, brevity, omitted identifiers or metadata) to the candidate response, and to any actual deliverable the objective covers, not to tool results or diagnostic evidence supplied only for this review. Private evidence does not prove disclosure. Still use it to verify claims and enforce restrictions on what may be read, written, sent, or stored. When rejecting a response for disclosure, identify the offending text in that response or actual deliverable.',
   '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
   '- WOULD ANOTHER ATTEMPT HELP? When the objective is not met, decide whether the assistant could still meet it by trying again with the tools it has. If it could (it missed items, chose the wrong scope, made a claim it can correct, or stopped without trying), the verdict is INCOMPLETE. If it could not, because the evidence shows what stands in the way (a tool, provider or connection failing, a call refused before it ran, missing access, data that does not exist), the verdict is BLOCKED, even when the response misstates the cause. A BLOCKED reason is read by the owner: one plain sentence saying what did not happen and what stands in the way, without tool or internal names.',
@@ -50,6 +53,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
   '  "AWAITING: <one short sentence naming the decision the user was asked to make>";',
   '  "INCOMPLETE: <one short sentence naming the missing evidence>";',
+  '  "REVISE_REPLY: <exact formatting or extraneous-wording correction>" ONLY when all requested work and factual claims are verified and the sole remaining defect is final-answer format or extra wording. Missing evidence, factual corrections, artifact edits, actions, or genuine user decisions must never use REVISE_REPLY;',
   '  "BLOCKED: <one plain sentence for the owner: what did not happen and what stands in the way>".',
   '',
   'Examples:',
@@ -77,6 +81,7 @@ export const JUDGE_SYSTEM_PROMPT = [
 export interface ObjectiveJudgeVerdict {
   done: boolean;
   reason: string;
+  repairScope?: 'reply_format';
   /**
    * Verification PROVENANCE (Move 4 — defeat silent success). Callers surface
    * these so a "done" the user trusts is distinguishable from an ASSUMED done:
@@ -476,10 +481,10 @@ export type ObjectiveJudgeFn = (
 // nothing left to reject a valid verdict on presentation. Returns null on no marker
 // so each caller applies its OWN fail semantics (strict throws → not-passed; the
 // interactive judge fails open → done:true), preserving both directions unchanged.
-export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean } | null {
+export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' } | null {
   if (isRecord(finalOutput)) return parseCompletionObject(finalOutput);
   const raw = String(finalOutput ?? '').trim();
-  const match = /^\s*(DONE|AWAITING|INCOMPLETE|BLOCKED|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  const match = /^\s*(DONE|AWAITING|INCOMPLETE|BLOCKED|REVISE_REPLY|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
   if (match) {
     const marker = match[1].toUpperCase();
     const reason = (match[2] || '').trim().slice(0, 400);
@@ -487,6 +492,7 @@ export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; r
     // purposes (never scold-continue past it); the caller yields awaiting-user.
     if (marker === 'AWAITING') return { done: true, awaitingUser: true, reason };
     // BLOCKED = not done, and trying again cannot change it: no re-run.
+    if (marker === 'REVISE_REPLY') return { done: false, repairScope: 'reply_format', reason };
     if (marker === 'BLOCKED') return { done: false, blocked: true, reason };
     return { done: marker === 'DONE', reason };
   }
@@ -600,6 +606,7 @@ export function buildObjectiveJudgePrompt(
       ? "Assistant's most recent response (LONG — windowed to its head and tail with the middle elided for length; judge ONLY what is visible and do NOT mark the objective incomplete merely because an expected deliverable might fall in the omitted middle):"
       : "Assistant's most recent response:",
     shown.text,
+    '=== END OF CANDIDATE RESPONSE ===',
   ];
   // Tool-call evidence — surface it whenever we have it, EVEN with no skill
   // loaded. The judge audits an ACTION objective ("build/deploy X"); without the
@@ -611,6 +618,7 @@ export function buildObjectiveJudgePrompt(
   if (toolSummary && toolSummary !== '(no tool calls made)') {
     parts.push(
       '',
+      '=== PRIVATE REVIEW EVIDENCE — not appended to the user-facing response ===',
       skillContext?.fullSourceEvidence
         ? `Authenticated evidence for this accepted source (raw results and retained projections are identified separately): ${toolSummary}`
         : `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
@@ -675,8 +683,12 @@ export async function runRoutedJudgeAttempt<T>(
   requireCompletePrompt = false,
   evidence?: JudgeEvidenceSource,
 ): Promise<T> {
+  // Keep per-review handles out of tool schemas and stable instructions.
+  // Supply them once with the evidence whose handles they identify.
+  const reviewInstructions = evidence ? instructions + judgeEvidenceGuidance(evidence) : instructions;
+  const reviewPrompt = evidence ? `${prompt}\n\nReview evidence references: ${judgeEvidenceReferences(evidence)}` : prompt;
   if (requireCompletePrompt) {
-    const admission = completionJudgeContextAdmission(routing.modelId, instructions, prompt);
+    const admission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, reviewPrompt);
     if (!admission.fits) {
       throw new JudgeContextUnavailableError(`Complete evidence review unavailable: ${routing.modelId} `
         + `has a ${admission.contextWindow}-token context window; the complete request is estimated at `
@@ -689,9 +701,9 @@ export async function runRoutedJudgeAttempt<T>(
   // turn, the verdict is the last. The tools refuse past their budget, so the
   // turn ceiling is only a backstop.
   const agent = evidence
-    ? buildJudgeAgent(routing, instructions + judgeEvidenceGuidance(evidence), judgeEvidenceTools(evidence))
+    ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
     : buildJudgeAgent(routing, instructions);
-  const result = await runner.run(agent, prompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
+  const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
   const value = parse(result.finalOutput);
   if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
   return value;
@@ -699,7 +711,7 @@ export async function runRoutedJudgeAttempt<T>(
 
 interface CompletionJudgeRun {
   /** Parsed verdict from the first attempt to answer, or null. */
-  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean } | null;
+  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
    *  parse failure vs transport error. */
   failure: 'timeout' | 'invalid' | 'error' | null;
@@ -974,6 +986,7 @@ export async function judgeObjectiveComplete(
   return {
     done: run.verdict.done,
     reason: run.verdict.reason,
+    ...(run.verdict.repairScope ? { repairScope: run.verdict.repairScope } : {}),
     selfJudge: run.routing?.selfJudge === true,
     ...(run.routing?.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),
     // Requested-vs-actual identity travels WITH the verdict. A downstream reader

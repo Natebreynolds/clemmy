@@ -20,7 +20,8 @@ import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
 import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
 import { prepareWorkflowChatDispatch } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
-import { queueWorkflowRun } from './workflow-run-queue.js';
+import { queueWorkflowRun, pendingWorkflowVerification } from './workflow-run-queue.js';
+import { disabledWorkflowRunMessage } from './workflow-verification-state.js';
 import { workflowNamesEqual } from './workflow-resolve.js';
 import { linkFocusActionForSession } from '../memory/focus.js';
 
@@ -69,19 +70,13 @@ export function admitNamedWorkflowRunFromAcceptedSource(
     };
   }
   const canonicalName = workflow.data.name;
-  if (!workflow.data.enabled) {
+  const verificationRunId = !workflow.data.enabled ? pendingWorkflowVerification(canonicalName, workflow.data) : undefined;
+  if (!workflow.data.enabled && !verificationRunId) {
     return {
       ok: false,
       status: 'disabled',
       workflowName: canonicalName,
-      // Disabled means "do not run this saved definition", never "do not do
-      // this work". Live 2026-09-03 run 29: the model matched a saved workflow,
-      // was told it is disabled, and stopped there — zero business calls on a
-      // request it was fully equipped to carry out directly.
-      message: `Workflow "${canonicalName}" is disabled, so it will not be run. `
-        + `That does not block the request: carry it out directly with the tools `
-        + `you already have (tool_search for the exact operations, then plan and `
-        + `act as usual). Do not re-attempt this workflow.`,
+      message: disabledWorkflowRunMessage(canonicalName, pendingWorkflowVerification(canonicalName, workflow.data)),
     };
   }
 
@@ -151,6 +146,7 @@ export function admitNamedWorkflowRunFromAcceptedSource(
     ? { ...exactOrigin, replyTarget }
     : undefined;
   const queued = queueWorkflowRun(canonicalName, normalizedInputs, {
+    ...(verificationRunId ? { verificationRunId } : {}),
     ...(originObserver
       ? {
           originObserver,
@@ -189,7 +185,9 @@ export function admitNamedWorkflowRunFromAcceptedSource(
           ? 'duplicate'
           : 'queued',
     workflowName: canonicalName,
-    message: queued.message,
+    message: verificationRunId
+      ? `Requested execution ${queued.id ?? "(not admitted)"} depends on verification ${verificationRunId}. It will execute only after that exact verification passes and this saved definition is enabled. Do not queue another run or do the work independently. ${queued.message}`
+      : queued.message,
     ...(queued.id ? { runId: queued.id } : {}),
   };
 }

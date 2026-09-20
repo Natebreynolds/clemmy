@@ -676,7 +676,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
     // safe-mode arguments, and manifest identity before invoking the handler.
     // No local tool name is interpreted here, and this artifact never imports
     // host storage: the host binds its carrier beside the attested transport.
-    if (sealed.providerKind === 'local_registry' && sealed.effect === 'local_write') {
+    if (sealed.providerKind === 'local_registry' && (sealed.effect === 'local_write' || sealed.effect === 'read')) {
       const compiled = authority?.canonicalArgs ?? (
         payload && typeof payload === 'object' && !Array.isArray(payload)
           ? payload as Record<string, unknown>

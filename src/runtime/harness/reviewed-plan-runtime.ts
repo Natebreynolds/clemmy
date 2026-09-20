@@ -1,8 +1,8 @@
 /** Exact reviewed preparation at activation and each business call. No grants. */
-import { jsonSchemaAllowsNull } from '../schema-normalizer.js';
+import { reviewedArgumentsWithLocalNulls } from './reviewed-local-null-arguments.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
-import type { RegisteredHostCapability } from './host-capability-catalog-factory.js';
+import type { RegisteredHostCapability, CanonicalCatalogIdentityV1 } from './host-capability-catalog-factory.js';
 import { revalidateLocalPlanningDefinition, issueAuthorizedLocalPlanningDisclosureCandidate, resolveConfiguredLocalPlanningTool, type AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
 import { attestationMatchesReviewedIdentity, currentReviewedProviderIdentity, reviewedProviderIdentityMismatch } from './reviewed-provider-identity.js';
@@ -17,9 +17,15 @@ import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { PlanArtifactV1 } from './plan-artifacts.js';
 import { isPlainOrClementineLocalTool, isTrustedComposioGateway } from './runtime-tool-identity.js';
 import { getTurnGraphEventForSource, appendEvent } from './eventlog.js';
+import { parseNamespacedTool } from '../mcp-namespace-shim.js';
 
 const object = (v: unknown): v is Record<string, any> => Boolean(v && typeof v === 'object' && !Array.isArray(v));
 const equal = (a: unknown, b: unknown) => closedCanonicalJson(a, SEALED_CALL_CANONICAL_LIMITS) === closedCanonicalJson(b, SEALED_CALL_CANONICAL_LIMITS);
+async function prepareReviewedMcpServer(serverSlug: string): Promise<void> {
+  const { prewarmMcpServers } = await import('../mcp-servers.js');
+  const ready = await prewarmMcpServers({ allowedServerSlugs: [serverSlug], attempts: 1 });
+  if (!ready.allConnected || ready.target === 'none') throw new Error(`Reviewed MCP server ${serverSlug} is not connected yet. Retry when it is available.`);
+}
 function prepared(artifact: PlanArtifactV1) {
   const outline = artifact.structuredPlan;
   if (!outline || !Array.isArray(outline.steps) || !Array.isArray(outline.preparedBindings)
@@ -61,7 +67,46 @@ export async function checkReviewedPlanPreparation(
       if (!candidate || 'refused' in candidate) throw new Error(`Reviewed native tool ${prior.name} is no longer available.`);
       checked.push({ stepId: step.id, capabilityRef: step.capabilityRef, kind: 'local_registry', candidate });
     } else {
-      const current = currentReviewedProviderIdentity(step.capabilityRef);
+      let current = currentReviewedProviderIdentity(step.capabilityRef);
+      if (!current.ok && binding.identity.providerKind === 'composio'
+        && typeof binding.identity.operationId === 'string') {
+        // Reobserve metadata for the existing reviewed manifest after restart.
+        // This supplies no new grant and the full identity comparison below
+        // still rejects changed definitions, accounts, or implementations.
+        const { registerProofProvisionedCapabilities } = await import('./proof-provisioned-catalog.js');
+        const { getPlanRevision } = await import('./plan-artifacts.js');
+        let proofSource = artifact;
+        const seenRevisions = new Set<string>();
+        while (!seenRevisions.has(proofSource.digest)) {
+          seenRevisions.add(proofSource.digest);
+          await registerProofProvisionedCapabilities({ sessionId: proofSource.sessionId, sourceUserSeq: proofSource.sourceUserSeq }, {
+            allowedIdentifiers: [binding.identity.operationId],
+            expectedSchemaDigests: [{ identifier: binding.identity.operationId, schemaDigest: binding.identity.providerInputSchemaDigest }],
+            recoveryExpectedIdentities: [binding.identity as CanonicalCatalogIdentityV1],
+          });
+          current = currentReviewedProviderIdentity(step.capabilityRef);
+          if (current.ok || !proofSource.base) break;
+          // Reused revisions retain the original discovery proof in their
+          // owned base lineage; they do not fabricate a fresh account choice.
+          proofSource = getPlanRevision({ sessionId: artifact.sessionId,
+            principalId: artifact.principalId, ref: proofSource.base });
+        }
+      }
+      if (!current.ok && binding.identity.providerKind === 'native_mcp'
+        && typeof binding.identity.operationId === 'string' && object(binding.inputSchema)) {
+        const operation = parseNamespacedTool(binding.identity.operationId);
+        if (operation) {
+          await prepareReviewedMcpServer(operation.serverSlug);
+          // Restart drops process-local MCP entries. Reobserve the configured
+          // server's exact definition before comparing it to the reviewed
+          // identity; the saved schema alone never grants a callable tool.
+          const { createProductionMcpReadCarrier } = await import('./production-mcp-read-carrier.js');
+          await createProductionMcpReadCarrier({ serverName: operation.serverSlug }).materializeExact({
+            operationId: binding.identity.operationId, inputSchema: binding.inputSchema,
+          });
+          current = currentReviewedProviderIdentity(step.capabilityRef);
+        }
+      }
       const reason = current.ok ? reviewedProviderIdentityMismatch(current, binding.identity as Record<string, unknown>) : current.reason;
       if (reason) {
         try {
@@ -84,6 +129,13 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
   const execution = acceptedPlanExecution(planning.identity.sessionId, planning.identity.sourceUserSeq);
   if (!execution) return;
   const checked = await checkReviewedPlanPreparation(execution.artifact, planning.identity);
+  await attachReviewedPlanPreparation(planning, checked);
+}
+
+export async function attachReviewedPlanPreparation(
+  planning: HostFreshPlanningContextV1,
+  checked: readonly ReviewedPlanPreparationCheckV1[],
+): Promise<void> {
   for (const row of checked) {
     if (row.kind === 'local_registry') {
       await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority, candidates: [row.candidate] });
@@ -94,12 +146,45 @@ export async function revalidateReviewedPlanPreparation(planning: HostFreshPlann
     const providerKind = row.entry.manifest?.providerKind;
     if (!getTurnGraphEventForSource(planning.identity.sessionId, planning.identity.sourceUserSeq)
       && (providerKind === 'composio' || providerKind === 'native_mcp')) {
+      const disclosureName = row.capabilityRef;
       const refs = await disclosePrimaryModelPlanningCapabilities({ authority: planning.authority,
-        candidates: [{ name: row.capabilityRef, carrier: 'work_call', schema: row.schema,
+        candidates: [{ name: disclosureName, carrier: 'work_call', schema: row.schema,
           sourceKind: providerKind === 'composio' ? 'authorized_composio' : 'authorized_external_mcp' }] });
-      if (refs[row.capabilityRef] !== row.capabilityRef) throw new Error(`Reviewed provider capability ${row.capabilityRef} could not be attached to this execution source.`);
+      if (refs[disclosureName] !== row.capabilityRef) throw new Error(`Reviewed provider capability ${row.capabilityRef} could not be attached to this execution source.`);
     }
   }
+}
+
+/** Prepare a NEW reviewed revision from retained steps. A retired MCP lease
+ * may be replaced only by the same observed operation contract. Execute never
+ * uses this path: the new revision still goes through publication review. */
+export async function refreshRetainedPlanPreparation(artifact: PlanArtifactV1) {
+  const next = structuredClone(artifact);
+  const outline = prepared(next);
+  for (const binding of outline.bindings) {
+    if (binding.identity?.providerKind !== 'native_mcp') continue;
+    const operation = parseNamespacedTool(binding.identity.operationId);
+    if (!operation) throw new Error('Retained MCP operation is malformed.');
+    await prepareReviewedMcpServer(operation.serverSlug);
+    const { createProductionMcpReadCarrier } = await import('./production-mcp-read-carrier.js');
+    const restored = await createProductionMcpReadCarrier({ serverName: operation.serverSlug }).materializeExact({
+      operationId: binding.identity.operationId, inputSchema: binding.inputSchema,
+    });
+    if (restored.status !== 'installed') throw new Error(`Retained MCP preparation failed: ${restored.detail}`);
+    const current = currentReviewedProviderIdentity(restored.manifest.manifestId);
+    if (!current.ok) throw new Error('Refreshed MCP operation is unavailable.');
+    const contract = (identity: object) => Object.fromEntries(Object.entries(identity)
+      .filter(([key]) => !['capabilityId', 'manifestId', 'manifestDigest'].includes(key)));
+    if (!equal(contract(current.canonical), contract(binding.identity))) {
+      throw new Error('Retained MCP operation contract changed; revise the plan explicitly.');
+    }
+    const step = outline.steps.find(row => row.id === binding.stepId);
+    if (step) step.capabilityRef = restored.manifest.manifestId;
+    binding.capabilityRef = restored.manifest.manifestId;
+    binding.identity = current.canonical;
+  }
+  const checked = await checkReviewedPlanPreparation(next);
+  return { artifact: next, checked };
 }
 
 export { resolveReviewedStepArguments } from './reviewed-plan-bindings.js';
@@ -190,15 +275,7 @@ export function reviewedPlanMemberReadArgumentsMatch(input: { sessionId: string;
     if (!member) return false;
     const expected = bindReviewedCollectionItem(resolveReviewedStepArguments(step,
       id => resolveReviewedPlanStepResult(input, id)), step.forEach, member.record);
-    // The local args_json adapter materializes omitted nullable optionals.
-    // Compare that same representation; never discard a non-null value or
-    // apply local omission rules to provider data.
-    if (binding.identity.kind === 'local_registry' && object(input.args)) {
-      for (const [key, value] of Object.entries(input.args)) if (value === null
-        && !Object.hasOwn(expected, key) && Object.hasOwn(binding.inputSchema.properties ?? {}, key)
-        && jsonSchemaAllowsNull(binding.inputSchema.properties[key])) expected[key] = null;
-    }
-    return equal(input.args, expected);
+    return equal(input.args, reviewedArgumentsWithLocalNulls(expected, input.args, binding));
   } catch { return false; }
 }
 
@@ -277,8 +354,9 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
         : binding.identity.operationId === input.attestation?.operationId;
     });
     const matching = candidates.filter(step => {
-      const expected = resolvedCallArguments(input, step);
       const actual = unwrapped.args ?? input.effectiveArgs ?? input.args;
+      const binding = outline.bindings.find(row => row.stepId === step.id)!;
+      const expected = reviewedArgumentsWithLocalNulls(resolvedCallArguments(input, step), actual, binding);
       if (!equal(actual, expected)) {
         if (candidates.length === 1 && object(actual)) {
           const paths = [...new Set([...Object.keys(actual), ...Object.keys(expected)])]
@@ -290,7 +368,6 @@ export function reviewedPlanCallRefusal(input: { sessionId: string; sourceUserSe
         }
         return false;
       }
-      const binding = outline.bindings.find(row => row.stepId === step.id)!;
       if (binding.identity.kind !== 'local_registry') {
         if (input.attestation?.capabilityId !== binding.capabilityRef) return false;
         if (!attestationMatchesReviewedIdentity(input.attestation, binding.identity)) return false;

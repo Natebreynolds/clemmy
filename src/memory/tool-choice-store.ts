@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
+import { selectToolChoicesForContext } from './tool-choice-context-selection.js';
+import { toolChoiceMatchesResolvedContract } from './tool-choice-resolved-context.js';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
@@ -1765,6 +1767,18 @@ const SHORT_TOOL_ALIASES: Record<string, string[]> = {
   gh: ['github'],
 };
 
+// Advertising is retrieval, not execution binding. Grammatical words and
+// generic conversation/user nouns must not make old task prose relevant.
+const ADVERTISE_WEAK_TOKENS = new Set([
+  ...STEP_MATCH_WEAK_IDENTITY_TOKENS,
+  'you', 'your', 'yours', 'we', 'our', 'ours', 'they', 'them', 'their', 'my',
+  'mine', 'its', 'what', 'which', 'why', 'how', 'who', 'whom', 'please',
+  'not', 'only', 'any', 'some', 'just', 'again', 'already', 'still',
+  'did', 'does', 'done', 'was', 'were', 'have', 'has', 'had', 'been',
+  'return', 'show', 'tell', 'answer', 'number', 'text', 'user', 'users',
+  'conversation', 'conversations',
+]);
+
 /** Word-tokenize free text (a step prompt) into a lowercase set, dropping
  *  punctuation and very short tokens. (recall's `tokenize` only splits slugs
  *  on `._-/`, so it can't tokenize a sentence — this is the prose counterpart.) */
@@ -2046,6 +2060,7 @@ export function matchToolChoicesForStep(
 ): StepToolChoiceMatch[] {
   const limit = opts.limit ?? 3;
   const advertiseOnly = opts.purpose === 'advertise';
+  const weakIdentityTokens = advertiseOnly ? ADVERTISE_WEAK_TOKENS : STEP_MATCH_WEAK_IDENTITY_TOKENS;
   const prompt = wordTokens(promptText);
   if (prompt.size === 0) return [];
   const requestedEffect = requestedCapabilityEffectScope(promptText);
@@ -2101,7 +2116,7 @@ export function matchToolChoicesForStep(
     const core = coreChoiceTokens(rec);
     if (core.size === 0) continue;
     const matchedIdentity = [...identity].filter((t) => prompt.has(t));
-    const hasStrongIdentity = matchedIdentity.some((t) => !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+    const hasStrongIdentity = matchedIdentity.some((t) => !weakIdentityTokens.has(t));
     const matchedMcpNamespace = rec.choice.kind === 'mcp'
       ? [...mcpNamespaceTokens(rec.choice.identifier)].filter((t) => prompt.has(t))
       : [];
@@ -2114,8 +2129,12 @@ export function matchToolChoicesForStep(
     // AND "query") and a concrete tool-identity anchor — so broad old objective
     // prose ("email audit", "summary") cannot bind unrelated tools.
     if (!alreadyBound) {
-      const matchedAliasContext = [...intentChoiceTokens(rec), ...contextChoiceTokens(rec)]
-        .filter((t) => prompt.has(t) && t.length >= 3 && !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+      // The same word in both fields is one relevance signal, not two.
+      const matchedAliasContext = [...new Set(
+        [...intentChoiceTokens(rec), ...contextChoiceTokens(rec)]
+          .filter((t) => prompt.has(t) && t.length >= 3 && !weakIdentityTokens.has(t))
+          .map(singularFold),
+      )];
       // Advertise-only: a learned ask ("net MRR we sold this week") must
       // retrieve the proven CLI even when the user did not name the service.
       // Two distinctive alias/context tokens, one of them length >= 4, is the
@@ -2906,7 +2925,7 @@ export function reapDeadToolChoiceMemos(now = Date.now()): string[] {
   return retired;
 }
 
-export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX, objective?: string): string {
+export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_BLOCK_MAX, objective?: string, resolvedContract?: string): string {
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
   try {
@@ -2915,6 +2934,10 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
     return '';
   }
   let activeRecords = records.filter((r) => r.choice);
+  if (resolvedContract !== undefined) {
+    activeRecords = activeRecords.filter((record) => record.choice
+      && toolChoiceMatchesResolvedContract(record.choice.identifier, resolvedContract));
+  }
   if (activeRecords.length === 0) return '';
   const trimmedObjective = objective?.trim();
   if (trimmedObjective) {
@@ -2954,8 +2977,8 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   // re-discovering. Relevance uses the same matcher workflows use (≥2 core
   // identity tokens), so a lone service mention can't promote an unrelated
   // choice. The no-objective path is unchanged.
-  let ordered = byRecency;
   const relevantIntents = new Set<string>();
+  let scopedSearchCompleted = false;
   if (trimmedObjective) {
     try {
       const matches = matchToolChoicesForStep(trimmedObjective, {
@@ -2964,17 +2987,13 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
         purpose: 'advertise',
       });
       for (const m of matches) relevantIntents.add(m.intent);
-      if (relevantIntents.size > 0) {
-        const relevant = byRecency.filter((r) => relevantIntents.has(r.intent));
-        const rest = byRecency.filter((r) => !relevantIntents.has(r.intent));
-        ordered = [...relevant, ...rest];
-      }
+      scopedSearchCompleted = true;
     } catch {
       /* relevance ranking is best-effort; fall back to recency */
     }
   }
 
-  const active = ordered.slice(0, limit);
+  const active = selectToolChoicesForContext(byRecency, relevantIntents, scopedSearchCompleted).slice(0, limit);
   // FIT-VALIDATED reuse (2026-07-09): the store mixes tools from MANY past tasks
   // (an email task can surface an SEO tool that once ranked high on a different
   // job). A remembered tool is a HINT to verify, never a blind directive — so the

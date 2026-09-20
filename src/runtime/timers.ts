@@ -35,6 +35,8 @@ export interface TimerEntry {
   createdAt: number;
   /** Durable routing snapshot captured when the reminder is authored. */
   metadata?: {
+    /** Explicit local-only reminders remain in the app inbox, with no outbound delivery. */
+    inboxOnly?: boolean;
     originSessionId?: string;
     discordUserId?: string;
     discordChannelId?: string;

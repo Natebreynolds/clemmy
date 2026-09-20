@@ -1,6 +1,11 @@
+import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
+import { archivedTaskMessageReferences, type ArchivedTaskMessageReference } from './archived-task-context.js';
+import { projectArchivedContext } from './archived-context-projection.js';
 import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
+import { acceptedPlanExecution } from './accepted-plan-execution.js';
+import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
@@ -73,6 +78,7 @@ import { markTurnClock, startTurnClock, takeTurnClock } from './turn-clock.js';
 import {
   compactInFlightToolContext,
   compactInFlightToolContextStable,
+  projectInFlightCompactionCheckpoints,
   createInFlightCompactionState,
   inFlightCompactionThresholds,
   compactSessionIfNeeded,
@@ -11150,8 +11156,35 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // Honors
   // CLEMMY_TURN_MEMORY_PRIMER=off and CLEMMY_RETRY_CONTEXT_INJECT=off.
   let inFlightCompactionReported = false;
+  // Execute already carries its exact reviewed plan. Park older preparation
+  // once before its first model request, rather than carrying every discovery
+  // schema through execution. Durable recall checks govern every collapsed pair.
+  // Keep the persisted history and all current-source/recovery frames untouched.
+  let executeHistoryProjection: ((input: AgentInputItem[]) => AgentInputItem[]) | undefined;
+  let executeHistorySavings: ReturnType<typeof compactInFlightToolContext> | undefined;
+  let executeHistoryReported = false;
+  if (inFlightCompactionEnabled() && !adoptedCheckpointContinuation
+    && options.hostOwnedContinuation !== true && sourceUserSeq) {
+    try {
+      const alreadyStarted = openEventLog().prepare(
+        'SELECT 1 FROM model_request_provenance WHERE session_id = ? AND source_user_seq = ? LIMIT 1',
+      ).get(options.sessionId, sourceUserSeq);
+      if (!alreadyStarted && acceptedPlanExecution(options.sessionId, sourceUserSeq)) {
+        const compacted = compactInFlightToolContext(compactedItems, options.sessionId, {
+          resultTriggerTokens: 16_000, retainedResultBudgetTokens: 8_000,
+          minRetainPairs: 3, maxRetainPairs: 8,
+        });
+        if (compacted.applied) {
+          executeHistoryProjection = retainedHistoryPrefixProjection(compactedItems, compacted.nextItems);
+          executeHistorySavings = compacted;
+        }
+      }
+    } catch { /* Missing exact plan/recall state preserves ordinary history. */ }
+  }
   // Checkpoints this turn's frames replay verbatim on a caching wire.
   const inFlightCompaction = createInFlightCompactionState();
+  let archiveReferences: Map<string, ArchivedTaskMessageReference> | undefined;
+  const archivedMessages = new Map<string, ArchivedTaskMessageReference>();
   const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
@@ -11159,6 +11192,134 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     let modelData = args.modelData;
     let promptComponents: Record<string, number> = {};
     const publishPromptComponents = <T extends { input: AgentInputItem[]; instructions?: string }>(value: T): T => {
+      try {
+        const projectedExecuteInput = executeHistoryProjection?.(value.input);
+        if (projectedExecuteInput && projectedExecuteInput !== value.input) {
+          value = { ...value, input: projectedExecuteInput };
+          if (typeof promptComponents.history === 'number' && executeHistorySavings) {
+            promptComponents.history = Math.max(0, promptComponents.history
+              - (executeHistorySavings.beforeTokens - executeHistorySavings.afterTokens));
+          }
+          if (!executeHistoryReported && executeHistorySavings) {
+            executeHistoryReported = true;
+            safeAppend({ sessionId: options.sessionId, turn, role: 'system', type: 'condenser_applied',
+              data: { sourceUserSeq, kind: 'reviewed_execute_preparation',
+                collapsedToolPairs: executeHistorySavings.collapsed,
+                beforeTokens: executeHistorySavings.beforeTokens,
+                afterTokens: executeHistorySavings.afterTokens,
+                callIds: executeHistorySavings.callIds } });
+          }
+        }
+        // All current request, memory and retry context is now present. Compact
+        // once at this boundary, then measure precisely the model-facing frame.
+        // The Runner may make dozens of model calls inside this ONE turn. Its
+        // persisted history must remain lossless, but later model calls should
+        // not re-send every raw result from the beginning of the turn. Once the
+        // completed-result payload crosses the threshold, replace only the
+        // model-facing old pairs with a recall ledger and retain a recent working
+        // set. Every full output was durably parked by the tool-end hook first.
+        if (inFlightCompactionEnabled()) {
+          const protectedTexts = [options.input, options.semanticTaskInput ?? '', options.taskContinuation?.activeTaskInput ?? ''];
+          const applyArchiveProjection = (references: ReadonlyMap<string, ArchivedTaskMessageReference>, targetHistoryTokens: number) => {
+            const projected = projectArchivedContext({ items: value.input, references, protectedTexts, targetHistoryTokens });
+            if (projected.archived.length > 0) {
+              value = { ...value, input: projected.nextItems };
+              if (typeof promptComponents.history === 'number') {
+                promptComponents.history = Math.max(0, promptComponents.history - (projected.beforeTokens - projected.afterTokens));
+              }
+            }
+            return projected;
+          };
+          // Replay exactly the archive references already chosen this turn
+          // before measuring pressure, just as with frozen tool checkpoints.
+          if (archivedMessages.size) applyArchiveProjection(archivedMessages, 0);
+          // Absolute on a wire with no prompt cache — the 2026-09-01 fix for
+          // GLM/grok 27-read steps that composed 58k prompts and timed out on
+          // first byte. Window-scaled on a wire that DOES cache, where collapsing
+          // the prefix turns a cache hit into a full cold prefill: live
+          // 2026-09-03 on Sonnet 5 it fired three times and caused ~126k of the
+          // run's ~139k uncached tokens. See inFlightCompactionThresholds.
+          // Configured thresholds govern normal frames; capacity pressure keeps
+          // one recent pair while the existing recall checks protect older results.
+          const normalThresholds = inFlightCompactionThresholds(
+            (key) => getRuntimeEnv(key, '') || undefined,
+            routedModelIdForBudget,
+          );
+          const workingInput = normalThresholds.checkpointed
+            ? projectInFlightCompactionCheckpoints(value.input, inFlightCompaction)
+            : value.input;
+          const outgoingInputTokens = estimateInputTokens(workingInput)
+            + estimateTokens(value.instructions)
+            + (toolPromptComponents.toolSchemas ?? 0)
+            + (toolPromptComponents.deferredToolIndex ?? 0);
+          const { thresholds, capacityPressure } = capacityAwareCompactionThresholds(
+            normalThresholds, turnInputBudgetTokens, outgoingInputTokens,
+          );
+          const compacted = thresholds.checkpointed
+            ? compactInFlightToolContextStable(value.input, inFlightCompaction, options.sessionId, thresholds)
+            : compactInFlightToolContext(value.input, options.sessionId, thresholds);
+          if (compacted.applied) {
+            value = {
+              ...value,
+              input: compacted.nextItems,
+              instructions: value.instructions,
+            };
+            if (typeof promptComponents.history === 'number') {
+              promptComponents.history = Math.max(0,
+                promptComponents.history - (compacted.beforeTokens - compacted.afterTokens));
+            }
+            // Every checkpoint is recorded: each one re-sends the history after
+            // it once, so their count is part of the turn's cost. The sliding
+            // form still reports its first collapse only.
+            if (compacted.checkpointCreated || (!thresholds.checkpointed && !inFlightCompactionReported)) {
+              inFlightCompactionReported = true;
+              safeAppend({
+                sessionId: options.sessionId,
+                turn,
+                role: 'system',
+                type: 'condenser_applied',
+                data: {
+                  inFlight: true,
+                  ...(capacityPressure ? { capacityPressure: true, outgoingInputTokens,
+                    contextWindowTokens: turnInputBudgetTokens } : {}),
+                  layer1: {
+                    applied: true,
+                    clipped: 0,
+                    collapsedToolPairs: compacted.collapsed,
+                  },
+                  layer2: { applied: false },
+                  layer3: { applied: false },
+                  beforeTokens: compacted.beforeTokens,
+                  afterTokens: compacted.afterTokens,
+                  budgetTokens: compacted.triggerTokens,
+                  resultTokensBefore: compacted.resultTokensBefore,
+                  retainedToolPairs: compacted.retainedPairs,
+                  ...(thresholds.checkpointed ? { checkpoint: compacted.checkpoints } : {}),
+                },
+              });
+            }
+          }
+          const overhead = estimateTokens(value.instructions)
+            + (toolPromptComponents.toolSchemas ?? 0) + (toolPromptComponents.deferredToolIndex ?? 0);
+          const targetHistoryTokens = Math.max(0, Math.floor(turnInputBudgetTokens * 0.9) - overhead);
+          if (sourceUserSeq && estimateInputTokens(value.input) > targetHistoryTokens) {
+            archiveReferences ??= archivedTaskMessageReferences(options.sessionId, sourceUserSeq);
+            const projected = applyArchiveProjection(archiveReferences, targetHistoryTokens);
+            if (projected.archived.length > 0) {
+              projected.archivedTexts.forEach((text, index) => archivedMessages.set(text, projected.archived[index]!));
+              safeAppend({ sessionId: options.sessionId, turn, role: 'system', type: 'condenser_applied', data: {
+                inFlight: true, capacityPressure: true, sourceUserSeq,
+                archivedUserMessages: projected.archived,
+                beforeTokens: projected.beforeTokens, afterTokens: projected.afterTokens,
+                contextWindowTokens: turnInputBudgetTokens,
+                layer1: { applied: false, clipped: 0, collapsedToolPairs: 0 },
+                layer2: { applied: false }, layer3: { applied: false },
+              } });
+            }
+          }
+        }
+      } catch { /* Preserve the uncompacted frame if best-effort compaction fails. */ }
+
       const harnessContext = harnessRunContextStorage.getStore();
       if (harnessContext) {
         harnessContext.promptComponents = Object.keys(promptComponents).length > 0
@@ -11201,62 +11362,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       return value;
     };
     try {
-      // The Runner may make dozens of model calls inside this ONE turn. Its
-      // persisted history must remain lossless, but later model calls should
-      // not re-send every raw result from the beginning of the turn. Once the
-      // completed-result payload crosses the threshold, replace only the
-      // model-facing old pairs with a recall ledger and retain a recent working
-      // set. Every full output was durably parked by the tool-end hook first.
-      if (inFlightCompactionEnabled()) {
-        // Absolute on a wire with no prompt cache — the 2026-09-01 fix for
-        // GLM/grok 27-read steps that composed 58k prompts and timed out on
-        // first byte. Window-scaled on a wire that DOES cache, where collapsing
-        // the prefix turns a cache hit into a full cold prefill: live
-        // 2026-09-03 on Sonnet 5 it fired three times and caused ~126k of the
-        // run's ~139k uncached tokens. See inFlightCompactionThresholds.
-        // Env overrides still win.
-        const thresholds = inFlightCompactionThresholds(
-          (key) => getRuntimeEnv(key, '') || undefined,
-          routedModelIdForBudget,
-        );
-        const compacted = thresholds.checkpointed
-          ? compactInFlightToolContextStable(modelData.input, inFlightCompaction, options.sessionId, thresholds)
-          : compactInFlightToolContext(modelData.input, options.sessionId, thresholds);
-        if (compacted.applied) {
-          modelData = {
-            input: compacted.nextItems,
-            instructions: modelData.instructions,
-          };
-          // Every checkpoint is recorded: each one re-sends the history after
-          // it once, so their count is part of the turn's cost. The sliding
-          // form still reports its first collapse only.
-          if (compacted.checkpointCreated || (!thresholds.checkpointed && !inFlightCompactionReported)) {
-            inFlightCompactionReported = true;
-            safeAppend({
-              sessionId: options.sessionId,
-              turn,
-              role: 'system',
-              type: 'condenser_applied',
-              data: {
-                inFlight: true,
-                layer1: {
-                  applied: true,
-                  clipped: 0,
-                  collapsedToolPairs: compacted.collapsed,
-                },
-                layer2: { applied: false },
-                layer3: { applied: false },
-                beforeTokens: compacted.beforeTokens,
-                afterTokens: compacted.afterTokens,
-                budgetTokens: compacted.triggerTokens,
-                resultTokensBefore: compacted.resultTokensBefore,
-                retainedToolPairs: compacted.retainedPairs,
-                ...(thresholds.checkpointed ? { checkpoint: compacted.checkpoints } : {}),
-              },
-            });
-          }
-        }
-      }
 
       promptComponents = {
         instructions: estimateTokens(modelData.instructions),

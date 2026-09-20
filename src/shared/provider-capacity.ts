@@ -52,3 +52,10 @@ export function providerCapacityErrorText(value: unknown): string {
 export function isProviderCapacityExhausted(value: unknown): boolean {
   return PROVIDER_CAPACITY_EXHAUSTED_RE.test(providerCapacityErrorText(value));
 }
+
+/** Preserve the provider's explicitly named allowance in diagnostics. A
+ * generic 429 or quota message does not identify this billing scope. */
+export function isProviderExtraUsageUnavailable(value: unknown): boolean {
+  return /out of extra usage|extra usage (?:is )?(?:exhausted|unavailable|disabled)/i
+    .test(providerCapacityErrorText(value));
+}

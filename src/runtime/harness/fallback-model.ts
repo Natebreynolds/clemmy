@@ -11,10 +11,9 @@
  * Anthropic is at capacity it frequently HANGS rather than returning a clean 529
  * (model.transport_timeout) — gating on overload-only meant the chain never
  * advanced on that, the dominant real-world failure, so a hung Claude took the
- * turn down instead of falling over. A 429 is your ACCOUNT-wide quota — switching
- * Claude models won't help — so we do NOT fall back on it (the resilient wrapper
- * backs off + surfaces). Codex is a different provider, so it survives an
- * Anthropic-wide incident.
+ * turn down instead of falling over. A 429 may reflect a burst, token rate,
+ * model allowance or account allowance; status alone does not establish its
+ * scope. The provider error and retry policy determine routing and backoff.
  *
  * Retry-safety: for a streamed turn we may only switch before actionable model
  * output (assistant text, a tool call, or another durable continuation item)
@@ -32,6 +31,8 @@ import { BoundaryError } from '../boundary-error.js';
 import { appendEvent } from './eventlog.js';
 import { classifyModelError } from './resilient-model.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
+import { providerCapacityErrorText, isProviderExtraUsageUnavailable } from '../../shared/provider-capacity.js';
+import { redactSensitiveText } from '../security.js';
 import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
@@ -631,7 +632,7 @@ export function isBrainAuthDead(label: string): boolean {
  *  role). Unlike auth-dead (sticky, needs the user) this is a short
  *  self-healing pause that honors the provider's retry hint when present,
  *  so calls route straight to the fallover brain during the window. */
-const rateLimitedBrains = new Map<string, { until: number }>();
+const rateLimitedBrains = new Map<string, { until: number; extraUsageUnavailable: boolean }>();
 const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 60_000;
 const RATE_LIMIT_MAX_COOLDOWN_MS = 10 * 60_000;
 
@@ -660,8 +661,16 @@ export function markBrainRateLimited(label: string, err: unknown): void {
   const until = Date.now() + pauseMs;
   const existing = rateLimitedBrains.get(label);
   if (!existing || until > existing.until) {
-    rateLimitedBrains.set(label, { until });
-    logger.warn({ brain: label, pauseMs }, 'brain rate-limited — routing around it until the window resets');
+    rateLimitedBrains.set(label, { until, extraUsageUnavailable: isProviderExtraUsageUnavailable(err) });
+    logger.warn({
+      brain: label,
+      pauseMs,
+      errorClass: cls.kind,
+      status: 'status' in cls ? cls.status : undefined,
+      retryAfterMs: cls.retryAfterMs,
+      sameProviderRetryable: cls.sameProviderRetryable,
+      errorDetail: redactSensitiveText(providerCapacityErrorText(err)).slice(0, 1000),
+    }, 'brain temporarily unavailable — routing around it until the local cooldown expires');
   }
 }
 
@@ -864,7 +873,8 @@ export class FallbackModel implements Model {
       // auth genuinely fails again, the catch below surfaces one honest
       // reconnect edge instead of a silent brain steal.
       if (isBrainAuthDead(target.label) && !isUserPinnedBrain(target.label)) return 'preselected-auth-dead';
-      if (isBrainRateLimited(target.label)) return 'preselected-rate-limited';
+      if (isBrainRateLimited(target.label)) return rateLimitedBrains.get(target.label)?.extraUsageUnavailable
+        ? 'preselected-extra-usage-unavailable' : 'preselected-rate-limited';
       // The same rule for a silent cooldown: the brain the USER pinned is
       // tried, not skipped — if it stays silent the ordinary first-byte
       // fallover still switches. Live 2026-09-01: a turn the user explicitly
@@ -1174,6 +1184,7 @@ export class FallbackModel implements Model {
   }
 
   private falloverReason(err: unknown): string {
+    if (isProviderExtraUsageUnavailable(err)) return 'model.extra_usage_unavailable';
     if (isHarnessDeadlineAbortReason(err)) return 'host-stall-watchdog';
     if (err instanceof FirstByteTimeoutError) return 'first-content-timeout';
     if (err instanceof ResponseWallExceededError) return 'response-wall-exceeded';

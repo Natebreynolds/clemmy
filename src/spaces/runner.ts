@@ -39,6 +39,7 @@ import {
 } from './space-read-authority.js';
 import { compileReviewedCliArgv } from '../runtime/harness/reviewed-cli-shell-match.js';
 import { readHostCliEnvelope } from '../runtime/harness/json-repair.js';
+import { parseSpaceSourceTransforms, transformSpaceSourceData } from './source-transforms.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr {
@@ -273,6 +274,26 @@ export function reviewedCliSourceResult(run: RunSourceResult): RunSourceResult {
 
 /** Run a single declared data source (no persistence). */
 export async function runSpaceDataSource(
+  slug: string,
+  source: SpaceDataSource,
+  opts: SpaceDataSourceRunOptions = {},
+): Promise<RunSourceResult> {
+  if (source.transforms !== undefined) {
+    try { parseSpaceSourceTransforms(source.transforms); }
+    catch (error) { return { ok: false, error: `Invalid source transforms: ${(error as Error).message}`, provenNoDispatch: true }; }
+  }
+  const result = await runSpaceDataSourceRead(slug, source, opts);
+  if (!result.ok || source.transforms === undefined) return result;
+  try {
+    return { ok: true, data: transformSpaceSourceData(source.transforms, result.data, new Date().toISOString()) };
+  } catch (error) {
+    // The read happened; do not claim zero dispatch. Failed shaping must never
+    // publish partially transformed rows or replace the last good dataset.
+    return { ok: false, error: `Data source "${source.id}" transformation failed: ${(error as Error).message}` };
+  }
+}
+
+async function runSpaceDataSourceRead(
   slug: string,
   source: SpaceDataSource,
   opts: SpaceDataSourceRunOptions = {},
@@ -545,6 +566,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
           slug,
           sourceId: source.id,
           toolSlug: source.composioSlug.trim(),
+          accountId: source.composioAccountId,
           args: source.composioArgs ?? {},
           cause,
         });
@@ -552,11 +574,16 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
         else mintRefusal = minted.error;
       }
     }
-    const run = await runSpaceDataSource(slug, source, {
-      composioAuthority,
-      requestFreshTrustApproval: cause === 'manual',
-    });
-    if (!run.ok && mintRefusal) {
+    // A preparation failure is not evidence that a read is a write. Return
+    // its actual cause without running a second gate that obscures it.
+    const refusedProviderRead = Boolean(mintRefusal && source.composioSlug && !source.runner && !source.cliArgv?.length);
+    const run: RunSourceResult = refusedProviderRead
+      ? { ok: false, error: `Data source "${source.id}" could not refresh. ${mintRefusal}`, provenNoDispatch: true }
+      : await runSpaceDataSource(slug, source, {
+        composioAuthority,
+        requestFreshTrustApproval: cause === 'manual',
+      });
+    if (!run.ok && mintRefusal && !refusedProviderRead) {
       run.error = `${run.error} Durable read authority could not be minted: ${mintRefusal}`;
     }
     const observedAt = new Date().toISOString();
@@ -581,6 +608,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
         ...(source.runner ? { runner: source.runner } : {}),
         ...(source.schedule ? { schedule: source.schedule } : {}),
       };
+    if (source.transforms) provenance.transformsHash = createHash('sha256').update(JSON.stringify(source.transforms)).digest('hex');
     if (run.ok) {
       results.push({ ok: true, sourceId: source.id });
       observations.push({

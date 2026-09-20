@@ -6,6 +6,7 @@ import {
   getLatestPlanRevision, getPlanRevision, PlanArtifactError,
 } from './plan-artifacts.js';
 import type { PlanRevisionRef } from './task-mode.js';
+import { checkReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 
 type Scope = { sessionId: string; principalId: string; ref: PlanRevisionRef; requestId: string; inputHash: string };
 type Claim = { receipt: HarnessChatRequestReceipt; inserted: boolean };
@@ -71,6 +72,12 @@ export function inspectPlanExecutionIngress(input: Scope): HarnessChatRequestRec
   return inspect(input);
 }
 
+/** Run before reserving a fresh desktop/mobile request. A transient capability
+ * failure must not consume the source or this revision's execution claim. */
+export async function preflightPlanExecutionIngress(input: Scope): Promise<void> {
+  await checkReviewedPlanPreparation(getPlanRevision(input), { sessionId: input.sessionId });
+}
+
 /** A reviewed revision owns one durable chat run, even when two Execute taps
  * have different request IDs. The ordinary session selector still creates the
  * first receipt; subsequent keys alias it without creating a source/attempt.
@@ -104,4 +111,3 @@ export function claimPlanExecutionIngress(input: Scope, create: () => Claim): Cl
     return { ...first, joined: false };
   }).immediate();
 }
-

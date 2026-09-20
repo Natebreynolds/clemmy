@@ -165,6 +165,22 @@ export function findScriptSyntaxError(html: string): string | undefined {
   return undefined;
 }
 
+/** A deliberately small, statically recognizable whole-dataset renderer.
+ * The callback body must consist only of assigning its entire data parameter
+ * as JSON to a DOM node. A console log, selected subkey, or unused stringify
+ * is not evidence that all declared sources are displayed. */
+function rendersWholeScopedDataset(html: string): boolean {
+  const scripts = html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi);
+  const renderer = /^\s*clem\s*\.\s*data\s*\(\s*\)\s*\.\s*then\s*\(\s*(?:function\s*\(\s*([A-Za-z_$][\w$]*)\s*\)|\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>)\s*\{\s*document\s*\.\s*getElementById\s*\(\s*(['"])([^'"\r\n]+)\3\s*\)\s*\.\s*textContent\s*=\s*JSON\s*\.\s*stringify\s*\(\s*([A-Za-z_$][\w$]*)\s*(?:,\s*null\s*,\s*\d+\s*)?\)\s*;?\s*\}\s*\)\s*;?\s*$/;
+  for (const script of scripts) {
+    const match = renderer.exec(script[1]!);
+    if (!match || (match[1] ?? match[2]) !== match[5]) continue;
+    const escapedId = match[4]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`<[^>]+\\bid\\s*=\\s*(["'])${escapedId}\\1`, 'i').test(html)) return true;
+  }
+  return false;
+}
+
 /**
  * Run the gap test over a saved Workspace + its installed view HTML. Returns
  * clarifying questions (possibly empty). Deterministic, side-effect free.
@@ -236,8 +252,9 @@ export function analyzeSpaceGaps(
   // 2: the view never references a declared source by id (so it can't be reading
   // its rows). NB: the data is nested at data["<id>"] — a view that reads the
   // wrong key renders 0 rows (the exact bug from the first real build).
+  const rendersAllSources = rendersWholeScopedDataset(html);
   for (const s of sources) {
-    if (html && !html.includes(s.id)) {
+    if (html && !rendersAllSources && !html.includes(s.id)) {
       gaps.push({
         severity: 'clarify',
         resolution: 'fix',

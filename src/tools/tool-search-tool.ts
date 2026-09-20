@@ -28,7 +28,7 @@ import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { operationNamedInQuery, sameOperationName } from './operation-name-identity.js';
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
-import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
+import { capabilityEffectIsCompatible, rememberedCapabilityEffect, requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
@@ -460,6 +460,23 @@ function deferredToolSearchPageSchema() { return z.object({
   page: z.number().int().min(2).max(TOOL_SEARCH_WINDOW_RESULTS),
   pageCount: z.number().int().min(2).max(TOOL_SEARCH_WINDOW_RESULTS),
   totalResults: z.number().int().min(1).max(TOOL_SEARCH_WINDOW_RESULTS),
+  unavailable: z.array(z.object({
+    source: z.enum(['authorized_external_mcp', 'authorized_composio',
+      AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, AUTHORIZED_LOCAL_REGISTRY_PROVENANCE]),
+    code: z.enum(['not_configured', 'not_authenticated', 'no_connections', 'search_failed', 'timed_out']),
+    reason: z.string(),
+    dependencySubject: z.union([
+      z.object({ version: z.literal(1), kind: z.literal('exact_capability_connection'),
+        source: z.enum(['authorized_external_mcp', 'authorized_composio',
+          AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, AUTHORIZED_LOCAL_REGISTRY_PROVENANCE]),
+        query: z.string(), roleKey: z.string().optional(), toolkit: z.string(),
+        capability: z.string(), capabilityRef: z.string() }),
+      z.object({ version: z.literal(1), kind: z.literal('provider_reconnect_and_rerun'),
+        source: z.enum(['authorized_external_mcp', 'authorized_composio',
+          AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, AUTHORIZED_LOCAL_REGISTRY_PROVENANCE]),
+        query: z.string(), roleKey: z.string().optional() }),
+    ]).optional(),
+  })).optional(),
   rows: z.array(z.object({
     name: z.string().min(1), summary: z.string(),
     sourceKind: z.enum(['authorized_external_mcp', 'authorized_composio',
@@ -1082,7 +1099,7 @@ export function registerToolSearchTool(
         code: CandidateSourceUnavailableCode;
         reason: string;
         dependencySubject?: ToolSearchUnavailableConnectionSubjectV1;
-      }> = [];
+      }> = [...(deferredPage?.unavailable ?? [])];
       // Per-source ledger for the durable discovery_source_outcome row.
       const sourceOutcomes: Array<{
         kind: ToolSearchCandidateSourceKind;
@@ -1273,6 +1290,7 @@ export function registerToolSearchTool(
         ? exactSourceMatches[0]
         : undefined;
       const selectedExactly = exactSourceHit ?? exactNamedHit;
+      const requestedEffect = requestedCapabilityEffectScope(query);
       // Merge all scoped metadata onto one query-relevance scale. A source's
       // ordinal score is useful only as a tie-break, never as proof that its
       // first result is more relevant than another catalog's matching tool.
@@ -1302,25 +1320,42 @@ export function registerToolSearchTool(
               acquiredLiveRead: false,
               lifecycleSuccessor: false,
             })),
-          ]).sort((left, right) => (
+          ]).map((row) => ({
+            ...row,
+            // Advisory ordering only: retain opposite/unknown operations and
+            // preserve exact-name selection. A provider's lifecycle successor
+            // is not automatically relevant to a request for another effect.
+            effectCompatible: !('sourceKind' in row && row.sourceKind === 'authorized_composio')
+              || capabilityEffectIsCompatible(requestedEffect,
+                rememberedCapabilityEffect({ kind: 'composio', identifier: row.name })),
+          })).sort((left, right) => (
             Number(right.acquiredLiveRead) - Number(left.acquiredLiveRead)
-            // One relevance scale orders rows that compete on relevance. A row
-            // the provider hydrated as a deprecated result's named replacement
-            // is not competing on relevance: the deprecated row is exactly the
-            // one holding the query's prose, so scoring alone buries the
-            // operation the request is actually about.
-            || Number(right.lifecycleSuccessor) - Number(left.lifecycleSuccessor)
+            // A replacement from an unrelated provider must not outrank the
+            // provider explicitly named by the query. Lifecycle priority
+            // applies only within that selected namespace.
+            || Number(right.namespaceMatch) - Number(left.namespaceMatch)
+            || Number(right.effectCompatible) - Number(left.effectCompatible)
+            // A current replacement stays ahead within an explicitly selected
+            // provider. Without that selection, lifecycle metadata proves only
+            // which operation is current, not relevance to the request. Broad
+            // provider search can return unrelated deprecated rows; promoting
+            // all their replacements buried a requested local file operation.
+            || Number(right.lifecycleSuccessor && right.namespaceMatch)
+              - Number(left.lifecycleSuccessor && left.namespaceMatch)
             // An explicitly expressed compound operation name precedes
             // descriptive coverage; acquisition/lifecycle priorities stay intact.
             || Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
-            || Number(right.namespaceMatch) - Number(left.namespaceMatch)
             || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
             || right.score - left.score
             || right.sourceRank - left.sourceRank
             || left.name.localeCompare(right.name)
           ));
       const seen = new Set<string>();
-      let rankedWindow = combined.filter((candidate) => {
+      // Keep every explicitly requested operation ahead of fuzzy alternatives,
+      // before the display window can discard a second exact match.
+      const exactRows = combined.filter((row) => queryExplicitlyNamesTool(query, row.name));
+      const otherRows = combined.filter((row) => !queryExplicitlyNamesTool(query, row.name));
+      let rankedWindow = [...exactRows, ...otherRows].filter((candidate) => {
         const key = candidate.name.toLowerCase();
         if (seen.has(key)) return false;
         seen.add(key);
@@ -1710,9 +1745,9 @@ export function registerToolSearchTool(
       // because `schemaHandles` lives in the deeper render scope; render()
       // recomputes this hint on every pass, so by the final render it describes
       // the payload that actually ships.
-      const handleReadingGuidance = (hasSchemaHandles: boolean): string => (hasSchemaHandles
-        ? ' One or more complete schemas are behind schema_handles: read the ordered local chunks using that handle cursor before calling. It is a local read and does not repeat provider discovery; do not expect those tools under `schemas`.'
-        : '');
+      const handleReadingGuidance = (requiresSchemaRead: boolean): string => (requiresSchemaRead
+        ? ' Only tools listed in schema_read_required need their complete schema reopened: read the ordered local chunks using their schema_handles cursor before calling. Other schemas are complete inline and can be used directly.'
+        : ' Schemas shown inline are complete; use them directly. schema_handles are optional rereads after context loss, not extra discovery steps.');
       const invocationHint = (hasSchemaHandles: boolean): string => {
         if (exactCarrier) return dispatchHint(exactCarrier) + handleReadingGuidance(hasSchemaHandles);
         if (opts.dispatchCarrierForName) {
@@ -1724,7 +1759,7 @@ export function registerToolSearchTool(
         if (fixedCarrier) return dispatchHint(fixedCarrier) + handleReadingGuidance(hasSchemaHandles);
         return opts.allowedNames
           ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.' + handleReadingGuidance(hasSchemaHandles)
-          : 'Call the tool you need by name. If a complete schema is behind schema_handles, read its ordered local chunks; this does not repeat provider discovery.';
+          : 'Call the tool you need by name.' + handleReadingGuidance(hasSchemaHandles);
       };
       const hintForRows = (rows: readonly (typeof rankedWindow)[number][], hasSchemaHandles: boolean): string => {
         // A provider that did not answer must never read like a capability
@@ -1895,9 +1930,6 @@ export function registerToolSearchTool(
                 ? { carrier: opts.dispatchCarrier }
                 : {}),
           ...(invocation ? { invocation } : {}),
-          ...(planningRefs[r.name] ? {
-            planArgumentsHint: `For publish_plan, staticArgumentsJson contains only the direct ${r.name} input fields matching schemas.${r.name}. The invocation/example wrapper is used only for execution, not inside staticArgumentsJson.`,
-          } : {}),
           ...(invocation
             && planningBlockers[r.name]?.code !== 'capability_publication_required'
             ? { example: renderCarrierInvocationExample(
@@ -1944,6 +1976,7 @@ export function registerToolSearchTool(
         }
 
         const schemaHandles: Record<string, ToolSearchSchemaHandle> = {};
+        const schemaReadRequired = new Set<string>();
         const schemaHandleErrors: Record<string, { error: string; max_bytes: number }> = {};
         const ensureSchemaHandle = (name: string): void => {
           if (schemaHandles[name] || schemaHandleErrors[name] || schemas[name] === undefined) return;
@@ -2001,15 +2034,19 @@ export function registerToolSearchTool(
           page_count: pageCount,
           total_results: deferredPage?.totalResults ?? rankedWindow.length,
           results: rows.map(publicResult),
+          ...(rows.some((row) => planningRefs[row.name]) ? {
+            planning_arguments_hint: 'For publish_plan, staticArgumentsJson contains only the selected tool\'s direct input fields matching its schema (inline or reopened). The invocation/example wrapper is for execution, never inside staticArgumentsJson.',
+          } : {}),
           schemas,
           ...(Object.keys(schemaHandles).length > 0 ? { schema_handles: schemaHandles } : {}),
+          ...(schemaReadRequired.size > 0 ? { schema_read_required: [...schemaReadRequired] } : {}),
           ...(Object.keys(schemaHandleErrors).length > 0 ? { schema_handle_errors: schemaHandleErrors } : {}),
           ...(Object.keys(guidance).length > 0 ? { guidance } : {}),
           // A source that could not answer this query — a provider/connection
           // fact, distinct from and never implied by an empty `results`.
           ...(unavailable.length > 0 ? { unavailable } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
-          hint: hintForRows(rows, Object.keys(schemaHandles).length > 0),
+          hint: hintForRows(rows, schemaReadRequired.size > 0),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,
@@ -2032,6 +2069,7 @@ export function registerToolSearchTool(
           const moved = shownSchemaNames.pop()!;
           ensureSchemaHandle(moved);
           delete schemas[moved];
+          schemaReadRequired.add(moved);
           text = render();
         }
         if (
@@ -2043,6 +2081,7 @@ export function registerToolSearchTool(
           // preview, and retain the complete original behind its exact handle.
           ensureSchemaHandle(primarySchemaName);
           schemas[primarySchemaName] = compactSelectedSchema(schemas[primarySchemaName]);
+          schemaReadRequired.add(primarySchemaName);
           text = render();
         }
         // Guidance is useful but is not an argument contract. If an unusually
@@ -2062,6 +2101,7 @@ export function registerToolSearchTool(
         ) {
           ensureSchemaHandle(primarySchemaName);
           delete schemas[primarySchemaName];
+          schemaReadRequired.add(primarySchemaName);
           text = render();
         }
         return text;
@@ -2075,6 +2115,7 @@ export function registerToolSearchTool(
           kind: 'deferred_tool_search_page_v1', query, roleKey: role_key ?? null,
           accountSelection: account_selection ?? null, limit: requestedLimit,
           page: page + 1, pageCount, totalResults: deferredPage?.totalResults ?? rankedWindow.length,
+          ...(unavailable.length > 0 ? { unavailable } : {}),
           rows: remaining.map((row) => ({
             name: row.name, summary: 'summary' in row ? row.summary : row.oneLiner,
             ...('sourceKind' in row && row.sourceKind ? { sourceKind: row.sourceKind } : {}),

@@ -148,7 +148,7 @@ test('legacy assistant fallback uses unified evidence recall for local in-person
   assert.match(runtime.request!.prompt, /Relevant memory context:/);
   assert.match(runtime.request!.prompt, /\[EPISODE\].*In-person revenue review/);
   assert.match(runtime.request!.prompt, /meeting:\/\/local\/live-2026-07-15/);
-  assert.match(runtime.request!.prompt, /answerability: supported/);
+  assert.match(runtime.request!.prompt, /ranked candidates; coverage: non-exhaustive; applicability: check cited scope/);
   assert.doesNotMatch(runtime.request!.prompt, /Relevant vault context:/);
 });
 

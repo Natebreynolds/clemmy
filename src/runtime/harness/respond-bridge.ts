@@ -106,6 +106,7 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
+import { acceptedResponseRoute } from './accepted-response-route.js';
 import { resolveWriteEvidence, synthesizeTurnReport, synthesizeWorkReport } from './work-report.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
@@ -512,6 +513,17 @@ function routeForHarness(surface: HarnessSurface, request: AssistantRequest, mod
     transport: 'host_harness',
     mode: getModelRoutingMode(),
   };
+}
+
+function routeForAcceptedHarness(
+  surface: HarnessSurface, request: AssistantRequest, modelOverride: string | undefined,
+  source: Pick<EventRow, 'sessionId' | 'seq'>,
+): AssistantRouteDiagnostics {
+  const planned = routeForHarness(surface, request, modelOverride);
+  try {
+    return acceptedResponseRoute(planned, { sessionId: source.sessionId, sourceUserSeq: source.seq },
+      listEvents(source.sessionId, { types: ['turn_model_routed'], sinceSeq: source.seq }));
+  } catch { return planned; }
 }
 
 function routeForClaudeSdkBrain(surface: HarnessSurface, request: AssistantRequest, response: AssistantResponse): AssistantRouteDiagnostics {
@@ -1640,7 +1652,7 @@ export async function respondViaHarness(
       clearRunInFlightAfterTerminal(sessionId, requestAttempt.attemptId, sourceUserEvent.seq);
       return withRouteDiagnostics(
         responseForCommittedTerminal(terminal, { failure: 'material_source_authority_invalid' }),
-        routeForHarness(surface, request, opts.modelOverride),
+        routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent),
       );
     }
   }
@@ -1892,7 +1904,7 @@ export async function respondViaHarness(
         stoppedReason: stoppedReasonForPresentation(presentation, result.blockedReason),
         turnsUsed: result.lastTurn,
         ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
-      }, routeForHarness(surface, request, opts.modelOverride));
+      }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
     }
 
     // The authoritative public presentation returned above. From this point
@@ -1913,7 +1925,7 @@ export async function respondViaHarness(
           stoppedReason: 'in-progress',
           turnsUsed: result.lastTurn,
           raw: { transport: 'host_harness', typedExecution: result.hold },
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       }
       case 'dispatched': {
         const dispatch = exactAsyncDispatchForSource(sourceUserEvent);
@@ -1940,7 +1952,7 @@ export async function respondViaHarness(
               dispatchKey: dispatch.dispatchKey,
             },
           },
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       }
       case 'completed': {
         // Parse-exhaustion DEAD turn (retries burned, apology text, near-zero
@@ -1999,7 +2011,7 @@ export async function respondViaHarness(
                 });
             return withRouteDiagnostics(
               responseForCommittedTerminal(terminal, { recoverySkipped: recoveryCheck.reason }),
-              routeForHarness(surface, request, opts.modelOverride),
+              routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent),
             );
           } else try {
             const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
@@ -2042,7 +2054,7 @@ export async function respondViaHarness(
               recoveryCandidate: result.completedReason,
             }),
             turnsUsed: result.lastTurn,
-          }, routeForHarness(surface, request, opts.modelOverride));
+          }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
         }
         return withRouteDiagnostics({
           // ALWAYS REPORT BACK: if the model produced no reply text but the turn
@@ -2052,7 +2064,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'success',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       }
       case 'awaiting_user_input':
         // The run asked the user a clarifying question (ask_user_question). It is
@@ -2075,7 +2087,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       case 'awaiting_approval': {
         const pending = listPending({ sessionId, status: 'pending' });
         const first = pending[0];
@@ -2086,7 +2098,7 @@ export async function respondViaHarness(
             sessionId,
             stoppedReason: 'awaiting-input',
             turnsUsed: result.lastTurn,
-          }, routeForHarness(surface, request, opts.modelOverride));
+          }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
         }
         return withRouteDiagnostics({
           text: replyText
@@ -2097,7 +2109,7 @@ export async function respondViaHarness(
           pendingApprovalId: dependency?.kind === 'approval' ? dependency.approvalId : undefined,
           stoppedReason: 'pending-approval',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       }
       case 'limit_exceeded': {
         // HOST TURN LOOP (2026-08-19): step ceilings continue IN-TURN via the
@@ -2115,7 +2127,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: result.limitKind === 'token_budget' ? 'token-budget' : 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       }
       case 'killed':
         // Preserve the legacy cancellation contract: callers (background
@@ -2126,7 +2138,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'cancelled',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       case 'blocked':
         return withRouteDiagnostics({
           text: result.error
@@ -2140,7 +2152,7 @@ export async function respondViaHarness(
             ? 'unverified'
             : 'blocked',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request, opts.modelOverride));
+        }, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
       case 'failed':
       default:
         throw new Error(result.error || `harness run ${result.status}`);
@@ -2168,7 +2180,7 @@ export async function respondViaHarness(
         state: restartOwned,
         transport: 'host_harness',
       });
-      return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
+      return withRouteDiagnostics(response, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
     }
     requestAttemptStatus = 'failed';
     bridgeLogger.error({ surface, sessionId: sourceUserEvent.sessionId, sourceUserSeq: sourceUserEvent.seq, err }, 'Harness turn failed before its terminal could be delivered');
@@ -2193,7 +2205,7 @@ export async function respondViaHarness(
       if (response.stoppedReason !== 'error') {
         requestAttemptStatus = 'completed';
       }
-      return withRouteDiagnostics(response, routeForHarness(surface, request, opts.modelOverride));
+      return withRouteDiagnostics(response, routeForAcceptedHarness(surface, request, opts.modelOverride, sourceUserEvent));
     } catch (commitErr) {
       bridgeLogger.error({
         surface,

@@ -139,6 +139,31 @@ test('resolveMcpToolScope: positive external-app intent does not compile as a re
   assert.ok((scope.maxTools ?? 0) > 0);
 });
 
+test('preserving integration configuration does not revoke read/discovery access', () => {
+  for (const constraint of [
+    'No changes to personal workflows or integrations.',
+    'Do not make any changes to integrations.',
+    'Do not modify DataForSEO configuration.',
+    'Without reconfiguring external MCP servers, inspect the available tools.',
+    'This does not forbid discovering or reading MCP tools.',
+    'Do not block access to external integrations.',
+  ]) {
+    const input = `Use local DataForSEO MCP for read-only planning. ${constraint}`;
+    // Context assembly can resolve before the configured catalog is supplied.
+    for (const catalog of [undefined, ['dataforseo']]) {
+      const compiled = compileMcpAccessConstraint(input, catalog);
+      assert.notEqual(compiled.mode, 'deny_all', input);
+      assert.deepEqual(compiled.deny, [], input);
+      assert.notEqual(mcpToolScopeAuthority(resolveMcpToolScope({
+        userInput: input, configuredServerNames: catalog,
+      })), 'none', input);
+    }
+  }
+  assert.equal(compileMcpAccessConstraint('Do not modify or use integrations.', []).mode, 'deny_all');
+  assert.equal(compileMcpAccessConstraint('No changes to integrations. Do not use external tools.', []).mode, 'deny_all');
+  assert.deepEqual(compileMcpAccessConstraint('Do not modify or query DataForSEO.', ['dataforseo']).deny, ['dataforseo']);
+});
+
 test('resolveMcpToolScope: an email column in a Sheet is structured data, not Outlook intent', () => {
   const scope = resolveMcpToolScope({
     userInput: 'Create a Google Sheet with columns company and email. Beacon has email missing; validate every row before writing.',

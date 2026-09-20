@@ -1,7 +1,9 @@
+import { exactGroundedIdentifierMatch } from './grounded-identifier-match.js';
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { backupMemoryDb, openMemoryDb } from './db.js';
 import { compileWordMatcher } from './word-match.js';
+import { groundedEntityMentionIds, type NamedEntityMentions } from './grounded-entity-mentions.js';
 import {
   autoReconcileStrongEntityIdentifiers,
   observeEntityFromEpisodeInDatabase,
@@ -866,6 +868,8 @@ export function readEntityRelationshipHealth(asOf = new Date().toISOString()): E
 interface EntityMatcher {
   id: number;
   rank: number;
+  names: string[];
+  canonicalName: string;
   nameRes: RegExp[];
   identifiers: Array<{ scheme: string; value: string; re: RegExp | null }>;
   anchors: string[];
@@ -1018,7 +1022,7 @@ function entityMatcherIndex(limit = 100_000): EntityMatcherIndex {
       ...nameValues.map(matcherAnchor),
       ...identifiers.filter((identifier) => identifier.scheme !== 'phone').map((identifier) => matcherAnchor(identifier.value)),
     ].filter((anchor): anchor is string => anchor !== null)));
-    if (nameRes.length > 0 || identifiers.length > 0) out.push({ id: r.id, rank: out.length, nameRes, identifiers, anchors });
+    if (nameRes.length > 0 || identifiers.length > 0) out.push({ id: r.id, rank: out.length, names: nameValues, canonicalName: r.canonical_name_lc, nameRes, identifiers, anchors });
   }
   const index = buildEntityMatcherIndex(out);
   entityMatcherCache = { db, key: fingerprint.key, limit: boundedLimit, index };
@@ -1040,6 +1044,16 @@ export function resolveEntityIdsForText(text: string, limit = 8): number[] {
     if (matched.length >= limit) break;
   }
   return matched;
+}
+
+/** Direct fact links require an unambiguous name in both claim and evidence.
+ * Keep broad alias/identifier matching in recall; it is not stored identity proof.
+ */
+export function resolveGroundedEntityIdsForText(text: string, evidence: string, limit = 8, canonicalOnly = false): number[] {
+  const index = entityMatcherIndex();
+  const claimIds = groundedEntityMentionIds(maskIdentifierSpans(text), candidateEntityMatchers(index, text), canonicalOnly);
+  const evidenceIds = new Set(groundedEntityMentionIds(maskIdentifierSpans(evidence), candidateEntityMatchers(index, evidence), canonicalOnly));
+  return claimIds.filter(id => evidenceIds.has(id)).slice(0, limit);
 }
 
 // ── deterministic backfill sync ─────────────────────────────────────────
@@ -1148,6 +1162,7 @@ function entityNamesForBackfill(db: Database.Database, entityId: number): string
 }
 
 interface EntityGroundingIndex {
+  mentions: NamedEntityMentions[];
   nameOwners: Map<string, Set<number>>;
   identifierOwners: Map<string, Set<number>>;
 }
@@ -1157,6 +1172,7 @@ function normalizedGroundingName(value: string): string {
 }
 
 function buildEntityGroundingIndex(db: Database.Database): EntityGroundingIndex {
+  const mentionsById = new Map<number, { id: number; canonicalName: string; names: string[] }>();
   const nameOwners = new Map<string, Set<number>>();
   const identifierOwners = new Map<string, Set<number>>();
   const add = (map: Map<string, Set<number>>, key: string, entityId: number): void => {
@@ -1166,11 +1182,17 @@ function buildEntityGroundingIndex(db: Database.Database): EntityGroundingIndex 
     map.set(key, owners);
   };
   for (const row of db.prepare(`
-    SELECT e.id, e.canonical_name
+    SELECT e.id, e.canonical_name, e.aliases_json
     FROM entities e
     WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
-  `).all() as Array<{ id: number; canonical_name: string }>) {
-    add(nameOwners, normalizedGroundingName(row.canonical_name), row.id);
+  `).all() as Array<{ id: number; canonical_name: string; aliases_json: string }>) {
+    const names = [row.canonical_name];
+    try {
+      const aliases: unknown = JSON.parse(row.aliases_json);
+      if (Array.isArray(aliases)) names.push(...aliases.filter((x): x is string => typeof x === 'string'));
+    } catch { /* malformed legacy aliases */ }
+    mentionsById.set(row.id, { id: row.id, canonicalName: row.canonical_name, names });
+    for (const name of names) add(nameOwners, normalizedGroundingName(name), row.id);
   }
   for (const row of db.prepare(`
     SELECT ea.entity_id, ea.alias
@@ -1178,6 +1200,7 @@ function buildEntityGroundingIndex(db: Database.Database): EntityGroundingIndex 
     WHERE NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = ea.entity_id)
   `).all() as Array<{ entity_id: number; alias: string }>) {
     add(nameOwners, normalizedGroundingName(row.alias), row.entity_id);
+    mentionsById.get(row.entity_id)?.names.push(row.alias);
   }
   for (const row of db.prepare(`
     SELECT ei.entity_id, ei.scheme, ei.value_norm
@@ -1187,7 +1210,7 @@ function buildEntityGroundingIndex(db: Database.Database): EntityGroundingIndex 
   `).all() as Array<{ entity_id: number; scheme: string; value_norm: string }>) {
     add(identifierOwners, `${row.scheme}:${row.value_norm}`, row.entity_id);
   }
-  return { nameOwners, identifierOwners };
+  return { nameOwners, identifierOwners, mentions: [...mentionsById.values()] };
 }
 
 function exactGroundingNameMatch(text: string, name: string): boolean {
@@ -1195,7 +1218,7 @@ function exactGroundingNameMatch(text: string, name: string): boolean {
 }
 
 function exactIdentifierMatch(text: string, value: string): boolean {
-  return text.toLowerCase().includes(value.toLowerCase());
+  return exactGroundedIdentifierMatch(text, value);
 }
 
 export interface ExtractedFactEntityEvidenceReconciliationStats {
@@ -1309,9 +1332,11 @@ export function reconcileExtractedFactEntityEvidenceInDatabase(
         value_norm: string;
       }>;
       const supporting = evidence.filter((item) => {
-        const nameSupported = strongNames.some((name) =>
-          exactGroundingNameMatch(row.content, name)
-          && exactGroundingNameMatch(item.excerpt, name));
+        const nameSupported = groundedEntityMentionIds(maskIdentifierSpans(row.content), index.mentions, true).includes(row.entity_id)
+          && groundedEntityMentionIds(maskIdentifierSpans(item.excerpt), index.mentions, true).includes(row.entity_id)
+          && strongNames.some((name) =>
+            exactGroundingNameMatch(row.content, name)
+            && exactGroundingNameMatch(item.excerpt, name));
         const identifierSupported = identifiers.some((identifier) =>
           (index.identifierOwners.get(`${identifier.scheme}:${identifier.value_norm}`)?.size ?? 0) === 1
           && exactIdentifierMatch(row.content, identifier.value_norm)
@@ -1541,6 +1566,10 @@ export function backfillGroundedFactEntityLinksInDatabase(
     }>;
     stats.evidenceScanned += evidence.length;
     const candidates = readCandidates.all(fact.id) as Array<{ entity_id: number; entity_type: string }>;
+    const claimNames = new Set(groundedEntityMentionIds(maskIdentifierSpans(fact.content), index.mentions, true));
+    const evidenceNames = new Map(evidence.map(item => [item,
+      new Set(groundedEntityMentionIds(maskIdentifierSpans(item.excerpt), index.mentions, true)),
+    ]));
     for (const candidate of candidates) {
       stats.candidates += 1;
       const names = entityNamesForBackfill(db, candidate.entity_id);
@@ -1554,8 +1583,10 @@ export function backfillGroundedFactEntityLinksInDatabase(
       const identifiers = readIdentifiers.all(candidate.entity_id) as Array<{ scheme: string; value_norm: string }>;
       let supporting: { episode_id: string; excerpt: string; source_uri: string | null } | undefined;
       for (const item of evidence) {
-        const nameSupported = strongNames.some((name) =>
-          exactGroundingNameMatch(fact.content, name) && exactGroundingNameMatch(item.excerpt, name));
+        const nameSupported = claimNames.has(candidate.entity_id)
+          && evidenceNames.get(item)!.has(candidate.entity_id)
+          && strongNames.some((name) =>
+            exactGroundingNameMatch(fact.content, name) && exactGroundingNameMatch(item.excerpt, name));
         const identifierSupported = identifiers.some((identifier) =>
           (index.identifierOwners.get(`${identifier.scheme}:${identifier.value_norm}`)?.size ?? 0) === 1
           && exactIdentifierMatch(fact.content, identifier.value_norm)

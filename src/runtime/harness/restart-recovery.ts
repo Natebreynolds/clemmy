@@ -51,6 +51,8 @@ import {
   exactCheckpointFrameCallIds,
   exactCheckpointReentryExhausted,
   exactCheckpointReentryKey,
+  exactCheckpointReentryCount,
+  noteUnchangedCheckpointResume,
 } from './exact-checkpoint-reentry.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { prepareAcceptedModelBatchRestart } from './accepted-model-batch-checkpoint.js';
@@ -1708,12 +1710,31 @@ export function recoverInterruptedChatRuns(
       // 2026-09-01/09-02: 1,006 and 454 re-entries under a budget of 5).
       record.autoResumed = true;
       const sessionId = row.id;
+      const dispatchedCheckpoint = exactCheckpointRecovery ? checkpointRecovery : null;
+      const reentryKey = dispatchedCheckpoint ? exactCheckpointReentryKey(sessionId, dispatchedCheckpoint) : null;
+      const reentriesBefore = reentryKey ? exactCheckpointReentryCount(reentryKey) : 0;
       void dispatchResume({
         sessionId,
         sourceUserSeq: recoveryIdentity.sourceUserSeq,
         acceptedInput,
         surface: restartSurfaceForSession(row),
         ...(row.channel ? { channel: row.channel } : {}),
+      }).then(() => {
+        // A replay may return successfully before entering the host admission
+        // path that normally counts failures. If it leaves the exact private
+        // checkpoint and interrupted marker unchanged, it made no recovery
+        // progress. Account for that no-op without double-counting an admission
+        // failure; retain the checkpoint and use the existing bounded policy.
+        if (!dispatchedCheckpoint || !reentryKey
+          || exactCheckpointReentryCount(reentryKey) !== reentriesBefore) return;
+        try {
+          const current = HarnessSession.load(sessionId);
+          if (current) noteUnchangedCheckpointResume({
+            key: reentryKey, countBefore: reentriesBefore,
+            markerBefore: since, markerAfter: current.runInFlightSince(),
+            stateBefore: dispatchedCheckpoint.serializedState, stateAfter: current.loadRecoveryState(),
+          });
+        } catch { /* unreadable state proves no no-op; preserve recovery */ }
       }).catch(async (error: unknown) => {
         try {
           // Raw dispatch diagnostics remain private; the user-facing terminal

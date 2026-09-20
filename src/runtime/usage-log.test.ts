@@ -96,6 +96,8 @@ test('reconcilePromptComponents exposes provider/tool overhead without inventing
 });
 
 test('parseWorkflowSource derives runId/stepId/itemKey from a workflow session id', () => {
+  // Run-level reviewers have no step and must still join the run's total.
+  assert.deepEqual(parseWorkflowSource('workflow:run-123'), { runId: 'run-123' });
   // plain step session: workflow:<runId>:<stepId>
   assert.deepEqual(parseWorkflowSource('workflow:run-123:research'), {
     runId: 'run-123',

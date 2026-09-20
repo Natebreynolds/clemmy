@@ -25,7 +25,7 @@ import type { AgentInputItem } from '@openai/agents';
 
 // Dynamic imports: BASE_DIR is read at module load (see config.ts:11),
 // so anything that touches it must be imported AFTER the env is set.
-const { closeEventLog, resetEventLog, listEvents, openEventLog } = await import('./eventlog.js');
+const { closeEventLog, resetEventLog, listEvents, openEventLog, getSession, updateSession } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 
 test.after(() => {
@@ -88,6 +88,23 @@ test('recordTurnResult persists history and lastResponseId across reopen', () =>
   const ended = listEvents(sess.id, { types: ['turn_ended'] });
   assert.equal(ended.length, 1);
   assert.equal(ended[0].data.lastResponseId, 'resp_abc');
+});
+
+test('compaction snapshot preserves metadata committed after the session was loaded', () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', metadata: { retained: 'original' } });
+  session.recordTurnResult({ history: [{ role: 'user', content: 'Keep this requirement.' }], lastResponseId: 'resp_before', turn: 1 });
+  const stale = HarnessSession.load(session.id)!;
+  const latest = getSession(session.id)!;
+  updateSession(session.id, { metadata: { ...latest.metadata, retained: 'updated', concurrentOwner: 'keep me' } });
+  const eventCount = listEvents(session.id).length;
+  stale.updateConversationSnapshot([{ role: 'user', content: 'Keep this requirement.' }, { role: 'system', content: '[summary of earlier conversation] preserved decision' }]);
+  const loaded = HarnessSession.load(session.id)!;
+  assert.equal(loaded.sessionRow.metadata.retained, 'updated');
+  assert.equal(loaded.sessionRow.metadata.concurrentOwner, 'keep me');
+  assert.equal(loaded.previousResponseId(), 'resp_before');
+  assert.equal(loaded.toInputItems().length, 2);
+  assert.equal(listEvents(session.id).length, eventCount, 'snapshot writes must not emit a phantom turn');
 });
 
 test('recordCompletedTurnResult atomically persists the snapshot, ordered events, and turn watermark', () => {

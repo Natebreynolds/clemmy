@@ -2,6 +2,7 @@ import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
 import { createHash } from 'node:crypto';
+import { selectRecursivePatternSources, type RecursivePattern } from './recursive-pattern-sources.js';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EpisodicPointerRow } from './db.js';
 import {
@@ -20,9 +21,9 @@ import {
 } from './facts.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
-import { attachGroundedFactResources, recordGroundedEntityRelationship, setFactEntityLinks } from './relations.js';
+import { attachGroundedFactResources, recordGroundedEntityRelationship, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
-import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
+import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
@@ -31,7 +32,6 @@ import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
 import { upsertEntity } from './entity-identity.js';
-import { compileWordMatcher } from './word-match.js';
 import { derivedFactRejectionReason } from './memory-quality.js';
 import {
   recordReflectionCandidate,
@@ -40,6 +40,8 @@ import {
 } from './reflection-candidates.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { digestToolOutput } from '../runtime/harness/tool-output-digest.js';
+import { canSkipMemoryConflictReview, includeUnembeddedConflictCandidates } from './conflict-candidate-coverage.js';
+import { isExplicitCorrectionText } from './explicit-correction.js';
 
 export { upsertEntity } from './entity-identity.js';
 
@@ -507,7 +509,7 @@ function sanitizeExtractionOutput(
   return extraction;
 }
 
-function sanitizeRecursivePatternOutput(value: unknown): { patterns: { text: string; importance: number }[] } | null {
+function sanitizeRecursivePatternOutput(value: unknown): { patterns: RecursivePattern[] } | null {
   const parsed = parseExtractorJson(value);
   if (!isRecord(parsed) && !Array.isArray(parsed)) return null;
   const source = Array.isArray(parsed) ? parsed : parsed.patterns;
@@ -518,9 +520,11 @@ function sanitizeRecursivePatternOutput(value: unknown): { patterns: { text: str
       return {
         text,
         importance: numberInRange(pattern.importance ?? pattern.score ?? pattern.poignancy, 1, 10, 5),
+        ...(Array.isArray(pattern.source_fact_ids ?? pattern.sourceFactIds)
+          ? { sourceFactIds: (pattern.source_fact_ids ?? pattern.sourceFactIds) as number[] } : {}),
       };
     })
-    .filter((pattern): pattern is { text: string; importance: number } => pattern !== null)
+    .filter((pattern): pattern is RecursivePattern => pattern !== null)
     .slice(0, 3);
   return { patterns };
 }
@@ -756,7 +760,7 @@ export function _testOnly_sanitizeExtractionOutput(
 
 export function _testOnly_sanitizeRecursivePatternOutput(
   value: unknown,
-): { patterns: { text: string; importance: number }[] } | null {
+): { patterns: RecursivePattern[] } | null {
   return sanitizeRecursivePatternOutput(value);
 }
 
@@ -1286,7 +1290,7 @@ export interface ConsolidateOutcome {
   deleted: number;
   noop: number;
   importanceAdded: number;
-  /** Related facts remain active after a resolver failure. Foreground callers
+  /** Related facts remain active after a failed or partial resolution. Foreground callers
    * must distinguish saving the candidate from completing a correction. */
   unresolvedConflict?: { factIds: number[]; reason: string };
 }
@@ -1306,9 +1310,6 @@ export interface ConsolidateOptions {
 // user's wording makes the revision explicit. `kind` is a classification hint,
 // not a causal boundary: the live failure classified "remember my project
 // code" as project and "Correction — that code is stale" as user.
-const EXPLICIT_CORRECTION_RE =
-  /\bcorrection\b|\b(?:wrong|incorrect|stale|outdated)\b.{0,120}\b(?:actually|instead|correct|use|valid)\b|\b(?:actually|instead|no longer)\b.{0,120}\b(?:wrong|incorrect|stale|outdated|valid|current|correct)\b/i;
-
 const CORRECTION_RELATION_STOPWORDS = new Set([
   'the', 'and', 'but', 'not', 'for', 'from', 'this', 'that', 'with', 'your',
   'you', 'our', 'my', 'was', 'were', 'are', 'is', 'actually', 'correction',
@@ -1441,7 +1442,7 @@ function isStrongExplicitCorrectionRelation(a: string, b: string): boolean {
 function isExplicitUserCorrectionCandidate(candidate: ConsolidateCandidate): boolean {
   return candidate.authority === 'user'
     && (candidate.trustLevel ?? 1) >= 0.99
-    && EXPLICIT_CORRECTION_RE.test(candidate.text);
+    && isExplicitCorrectionText(candidate.text);
 }
 
 function factTimeMs(fact: ConsolidatedFact): number | null {
@@ -1462,7 +1463,7 @@ function isStoredExplicitUserCorrection(fact: ConsolidatedFact): boolean {
   return fact.active
     && directConversationEvidence
     && (fact.trustLevel ?? fact.confidence ?? 0) >= 0.99
-    && EXPLICIT_CORRECTION_RE.test(fact.content);
+    && isExplicitCorrectionText(fact.content);
 }
 
 /** Fresh, synchronous lexical lookup complements the embedding pool here.
@@ -1642,6 +1643,24 @@ async function consolidateFactInner(
     try { setFactPinned(id, true); } catch { /* best-effort */ }
   };
 
+  const reportRemainingCorrection = async (): Promise<void> => {
+    if (!out.factId || !isExplicitUserCorrectionCandidate(candidate)) return;
+    // The resolver's single target does not certify the other related rows.
+    // Preserve complementary facts, but expose any still-active candidates to
+    // the foreground caller instead of reporting a fully applied correction.
+    const factIds = relatedFactsForExplicitCorrection(candidate)
+      .filter(fact => fact.id !== out.factId).map(fact => fact.id);
+    if (factIds.length === 0) return;
+    out.unresolvedConflict = {
+      factIds,
+      reason: 'The correction was saved, but other related facts remain active and need comparison with the user instruction.',
+    };
+    try {
+      const { recordUnresolvedConflict } = await import('./conflict-retry.js');
+      recordUnresolvedConflict({ candidateFactId: out.factId, similarFactIds: factIds });
+    } catch { /* Foreground callers still receive the unresolved candidates. */ }
+  };
+
   const rememberInput: RememberInput = {
     kind: candidate.kind,
     content: candidate.text,
@@ -1704,7 +1723,17 @@ async function consolidateFactInner(
     return true;
   };
 
-  const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
+  // Capture coverage before the asynchronous query. A vector written while
+  // that query is awaiting its embedding was not in its search snapshot.
+  const embeddedFactIds = new Set(loadActiveFactEmbeddings(candidate.kind).keys());
+  const semantic = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
+  // An embedding index can be populated but still lag the immediately preceding
+  // write. Give the resolver fresh same-kind lexical candidates too; similarity
+  // is never a license to retire them without a semantic decision.
+  const lexical = searchFactsByText(candidate.text, 20);
+  const scored = includeUnembeddedConflictCandidates(
+    semantic, lexical, embeddedFactIds, candidate.kind,
+  );
   let explicitCorrectionRelated = relatedFactsForExplicitCorrection(candidate);
   const scoredIds = new Set(scored.map((item) => item.fact.id));
   // Explicit correction is the sole bounded exception to same-kind conflict
@@ -1728,6 +1757,7 @@ async function consolidateFactInner(
     out.factId = reinforced.id;
     out.noop = 1; // legacy compatibility: no new canonical row was created
     out.importanceAdded += candidate.importance ?? 0;
+    await reportRemainingCorrection();
     return out;
   }
 
@@ -1809,11 +1839,7 @@ async function consolidateFactInner(
   // plausible conflict to resolve, so ADD directly and skip the LLM
   // resolver call. Only applies on the semantic path (sim != null); the
   // lexical fallback reports sim=null and always runs the resolver.
-  if (
-    typeof opts.noveltyFastPathSim === 'number' &&
-    topSim !== null &&
-    topSim < opts.noveltyFastPathSim
-  ) {
+  if (canSkipMemoryConflictReview(scored, opts.noveltyFastPathSim)) {
     const { fact: added } = await rememberCandidate();
     out.action = 'add';
     out.factId = added.id;
@@ -1914,6 +1940,7 @@ async function consolidateFactInner(
       }
     }
     out.noop = 1;
+    await reportRemainingCorrection();
     return out;
   }
 
@@ -1955,6 +1982,7 @@ async function consolidateFactInner(
       out.supersededFactId = decision.target_id;
       out.deleted = 1; // legacy decision tally
       out.importanceAdded += candidate.importance ?? 0;
+      await reportRemainingCorrection();
       return out;
     }
   }
@@ -1987,6 +2015,7 @@ async function consolidateFactInner(
       out.updated = 1;
       maybePin(updated.id);
       out.importanceAdded += candidate.importance ?? 0;
+      await reportRemainingCorrection();
       return out; // UPDATE replaces ADD; no additional row
     }
     // Target row gone — fall through to ADD.
@@ -2571,15 +2600,12 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       try {
         const excerpt = selectSupportingExcerpt(evidenceSourceText, committed.fact.text, 1_500);
         if (!excerpt) continue;
-        const entityIds = new Set<number>();
-        for (const entity of extraction.entities ?? []) {
-          const names = [entity.name, ...(entity.aliases ?? [])].map((name) => name.trim()).filter(Boolean);
-          const mentionedInFact = names.some((name) => compileWordMatcher(name)?.test(committed.fact.text.toLowerCase()));
-          const mentionedInEvidence = names.some((name) => compileWordMatcher(name)?.test(excerpt.toLowerCase()));
-          if (!mentionedInFact || !mentionedInEvidence) continue;
-          const entityId = entityIdByName.get(entity.name.trim().toLowerCase());
-          if (entityId) entityIds.add(entityId);
-        }
+        const extractedIds = new Set(entityIdByName.values());
+        // Resolve against the whole identity registry, not only this extraction:
+        // a short alias can belong to an older, different project.
+        const entityIds = new Set(resolveGroundedEntityIdsForText(
+          committed.fact.text, excerpt, Number.MAX_SAFE_INTEGER, true,
+        ).filter(id => extractedIds.has(id)));
         if (entityIds.size > 0) setFactEntityLinks(committed.factId, Array.from(entityIds), {
           linkType: 'extracted',
           confidence: source?.trust ?? 0.7,
@@ -2890,10 +2916,12 @@ const RECURSIVE_PROMPT = [
   'You will be shown a batch of recent atomic facts the assistant has learned about a single kind (user / project / feedback / reference). Identify 0-3 higher-order PATTERNS that emerge across these facts — themes, trends, shifts, recurring concerns — that would NOT be visible from any single fact alone.',
   '',
   'Return strict JSON:',
-  '{ "patterns": [{ "text": "<one-sentence pattern>", "importance": <1-10 per Park et al §4.1> }] }',
+  '{ "patterns": [{ "text": "<one-sentence pattern>", "importance": <1-10 per Park et al §4.1>, "source_fact_ids": [<supporting fact id>, <supporting fact id>] }] }',
   '',
   'Rules:',
   '- A pattern must reference EVIDENCE that spans ≥ 2 of the input facts. Single-fact restatements are NOT patterns.',
+  '- Cite only the distinct input fact IDs that actually support EACH pattern. Never attach the whole batch by default; unrelated facts are not evidence.',
+  '- Preserve named project/resource scope, exceptions, and time bounds. Test-project constraints do not become general user preferences. Describe observed patterns as inferences, not new standing rules or permissions. Omit a pattern if its sources do not support that scope.',
   '- "text" is present-tense, third-person, atomic — same shape as the atomic facts.',
   '- Score importance per Park et al: 1 mundane / 4 routine-recurring / 7 notable-actionable / 10 life-changing. Patterns typically score 5-8.',
   '- If no patterns are warranted (facts are unrelated or already-summarized), return { "patterns": [] }. Empty is the correct answer most of the time.',
@@ -2917,10 +2945,10 @@ interface RecursiveReflectionResult {
   groupsFailed: number;
 }
 
-async function runRecursivePatternExtractor(
+export async function runRecursivePatternExtractor(
   kind: ConsolidatedFactKind,
   facts: ConsolidatedFactRow[],
-): Promise<{ patterns: { text: string; importance: number }[] } | null> {
+): Promise<{ patterns: RecursivePattern[] } | null> {
   const model = getReflectorModel();
   if (!model) return null;
   try {
@@ -3026,15 +3054,23 @@ export async function runRecursiveReflection(
     producedAnything = true;
     result.groupsProcessed += 1;
 
-    const sourceIds = rows.map((r) => r.id);
-    const maxSourceDepth = rows.reduce((m, r) => Math.max(m, r.derivation_depth ?? 0), 0);
-    const targetDepth = Math.min(RECURSIVE_REFLECTION_MAX_DEPTH, maxSourceDepth + 1);
     // Track whether this group actually produced a higher-order fact, so we only
     // demote the source atoms once (after the pattern loop) and only when the
     // signal genuinely got rolled up.
-    let groupRolledUp = false;
+    const rolledUpSourceIds = new Set<number>();
+    let invalidSources = false;
 
     for (const [patternIndex, pattern] of extraction.patterns.entries()) {
+      const sources = selectRecursivePatternSources(pattern.sourceFactIds, rows);
+      if (!sources) {
+        invalidSources = true;
+        result.patternsNoop += 1;
+        logger.warn({ kind, patternIndex }, 'recursive-reflection: missing or invalid per-pattern source citations');
+        continue;
+      }
+      const sourceIds = sources.map(row => row.id);
+      const targetDepth = Math.min(RECURSIVE_REFLECTION_MAX_DEPTH,
+        1 + Math.max(...sources.map(row => row.derivation_depth ?? 0)));
       const sessionId = 'cron:recursive-reflection';
       const callId = `recursive:${startedAt}:${kind}:${patternIndex}:${reflectionCandidateHash(pattern.text).slice(0, 12)}`;
       try {
@@ -3049,7 +3085,7 @@ export async function runRecursiveReflection(
           // This is an exact bounded projection of canonical source claims,
           // not the generated pattern. It survives source-fact decay and lets
           // the synthesis explain precisely what it was inferred from.
-          content: rows.map((row) => `[fact:${row.id}] ${row.content}`).join('\n'),
+          content: sources.map((row) => `[fact:${row.id}] ${row.content}`).join('\n'),
           metadata: { sourceFactIds: sourceIds, derivationDepth: targetDepth },
         });
         const rejectionReason = derivedFactRejectionReason(pattern.text);
@@ -3097,10 +3133,10 @@ export async function runRecursiveReflection(
         });
         if (outcome.action === 'add') {
           result.patternsWritten += 1;
-          groupRolledUp = true;
+          sourceIds.forEach(id => rolledUpSourceIds.add(id));
         } else if (outcome.action === 'supersede') {
           result.patternsUpdated += 1;
-          groupRolledUp = true;
+          sourceIds.forEach(id => rolledUpSourceIds.add(id));
         } else {
           result.patternsNoop += 1;
         }
@@ -3126,8 +3162,10 @@ export async function runRecursiveReflection(
     // Demotion only clamps importance DOWN; nothing is deleted here (the atom must
     // still go idle to decay, and access reinforcement protects one that stays
     // useful). Rides the decay default — no separate flag.
-    if (groupRolledUp) {
+    if (invalidSources) result.groupsFailed += 1;
+    if (rolledUpSourceIds.size > 0) {
       for (const r of rows) {
+        if (!rolledUpSourceIds.has(r.id)) continue;
         const depth = r.derivation_depth ?? 0;
         const trust = r.trust_level ?? 0;
         if (depth !== 0) continue;        // only roll up atomic facts

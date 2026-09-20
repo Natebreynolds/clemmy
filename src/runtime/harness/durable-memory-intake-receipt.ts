@@ -470,6 +470,79 @@ function deriveExactEvidence(input: {
   }
 }
 
+/** Informational model context only. Does not issue a completion receipt or
+ * settle the accepted task; all source/episode/candidate checks still apply. */
+function verifiedMemoryIntakeRows(input: { sessionId: string; sourceUserSeq: number }): {
+  episodeId: string; rows: Array<MemoryCandidateEvidenceRow & { resulting_fact_id?: number | null; reason?: string | null }>;
+} | null {
+  try {
+    if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
+    const row = openEventLog().prepare('SELECT id, session_id, seq, role, type, data_json FROM events WHERE session_id = ? AND seq = ?')
+      .get(input.sessionId, input.sourceUserSeq) as { id: string; session_id: string; seq: number; role: string; type: string; data_json: string } | undefined;
+    if (!row) return null;
+    const data: unknown = JSON.parse(row.data_json);
+    if (!record(data)) return null;
+    const sourceEventId = `user-source:${input.sourceUserSeq}`;
+    const provenance = autoCaptureProvenanceFromAcceptedEvent({ id: row.id, sessionId: row.session_id, seq: row.seq, role: row.role, type: row.type, data });
+    if (!isEligibleAutoCaptureSourceProvenance(provenance, { sessionId: input.sessionId, sourceEventId })) return null;
+    const message = normalizeMessage(acceptedSourceText(data));
+    const candidates = extractAutoMemoryCandidates(message, 3);
+    if (!candidates.length) return null;
+    const callId = `auto-capture:${sourceEventId}`;
+    const sourceUri = `conversation://${encodeURIComponent(input.sessionId)}/${encodeURIComponent(callId)}`;
+    const db = openMemoryDb();
+    const episodes = db.prepare('SELECT * FROM memory_episodes WHERE session_id = ? AND call_id = ?').all(input.sessionId, callId) as MemoryEpisodeEvidenceRow[];
+    if (episodes.length !== 1) return null;
+    const episode = episodes[0]!;
+    if (episode.kind !== 'user_turn' || episode.source_app !== 'Conversation' || episode.subtype !== 'auto_capture'
+      || episode.status !== 'available' || episode.source_uri !== sourceUri || episode.evidence_excerpt !== message
+      || episode.content_hash !== digest(message)
+      || !isDeepStrictEqual(JSON.parse(episode.metadata_json), { candidateCount: candidates.length, sourceEventId })) return null;
+    const rows = db.prepare('SELECT * FROM memory_reflection_candidates WHERE session_id = ? AND call_id = ?').all(input.sessionId, callId) as MemoryCandidateEvidenceRow[];
+    if (rows.length !== candidates.length) return null;
+    const byHash = new Map(candidates.map(candidate => [reflectionCandidateHash(candidate.content), candidate]));
+    for (const candidateRow of rows) {
+      const candidate = byHash.get(candidateRow.candidate_hash);
+      if (!candidate || candidateRow.episode_id !== episode.id || candidateRow.source_type !== 'auto_capture'
+        || candidateRow.authority !== 'user' || candidateRow.trust_level !== 1 || candidateRow.source_uri !== sourceUri
+        || !['pending', 'promoted'].includes(candidateRow.status) || candidateRow.text !== candidate.content.trim()
+        || candidateRow.candidate_hash !== reflectionCandidateHash(candidateRow.text)
+        || candidateRow.kind !== candidate.kind || candidateRow.intake_reason !== candidate.reason
+        || candidateRow.importance !== 5 || candidateRow.pin !== (candidate.pin ? 1 : 0)) return null;
+    }
+    return { episodeId: episode.id, rows };
+  } catch { return null; }
+}
+
+export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUserSeq: number }): string | null {
+  if (!verifiedMemoryIntakeRows(input)) return null;
+  return '[Verified memory intake] The automatic layer has already durably captured the memory claims in this accepted request. Do not duplicate those claims through memory_remember or discovery/readback solely to save them again. Consolidation may still be pending; intake alone does not prove every canonical fact has been updated. Acknowledge the captured request accurately and continue any separate requested work. This notice does not complete the task.';
+}
+
+/** Current canonical results of this exact source's automatic consolidation.
+ * Intake alone, inactive facts and absent source links are explicitly unverified. */
+export function verifiedMemoryConsolidationEvidence(input: { sessionId: string; sourceUserSeq: number }) {
+  const intake = verifiedMemoryIntakeRows(input);
+  if (!intake) return null;
+  try {
+    const db = openMemoryDb();
+    return intake.rows.map(row => {
+      const fact = Number.isSafeInteger(row.resulting_fact_id) && Number(row.resulting_fact_id) > 0
+        ? db.prepare('SELECT id, content, active, updated_at FROM consolidated_facts WHERE id = ?').get(row.resulting_fact_id) as { id: number; content: string; active: number; updated_at: string } | undefined
+        : undefined;
+      const linked = fact ? Boolean(db.prepare('SELECT 1 FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND source_uri = ? LIMIT 1').get(fact.id, intake.episodeId, row.source_uri)) : false;
+      const complete = Boolean(fact && fact.content.length <= 12000);
+      return {
+        candidateId: row.id, candidate: row.text, status: row.status, disposition: row.reason ?? null,
+        verified: row.status === 'promoted' && fact?.active === 1 && linked && complete,
+        sourceLinked: linked,
+        fact: fact ? { id: fact.id, active: fact.active === 1, content: fact.content.slice(0, 12000),
+          contentComplete: complete, contentDigest: digest(fact.content), updatedAt: fact.updated_at } : null,
+      };
+    });
+  } catch { return null; }
+}
+
 function exactReceiptRow(
   row: HostReceiptRow,
   evidence: DerivedEvidence,

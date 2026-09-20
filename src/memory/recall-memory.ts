@@ -1,4 +1,6 @@
 import { activeFactEmbeddingCoverage } from './embeddings.js';
+import { deliverableRecallScore } from './deliverable-recall-score.js';
+import { explicitlyNamesRecallEntity, prioritizeNamedEntityFacts } from './named-entity-recall-priority.js';
 import { openMemoryDb, type MemoryEpisodeStatus } from './db.js';
 import { renderDeliverableHit, searchDeliverables } from './deliverable-index.js';
 import {
@@ -18,6 +20,7 @@ import {
   loadFactEntityEdges,
   loadFactResourceEdges,
   resolveEntityIdsForText,
+  resolveGroundedEntityIdsForText,
 } from './relations.js';
 import { getResourcePointersByIds, listAllResourcePointers, type ResourcePointer } from './source-map.js';
 import { matchToolChoicesForStep } from './tool-choice-store.js';
@@ -730,8 +733,21 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const factLinkedEntityIdSet = new Set<number>();
   const neighborEntityIdSet = new Set<number>();
   const entityIds = new Set<number>();
+  const groundedDirectEntityIds = new Set<number>();
+  const canonicalDirectEntityIds = new Set<number>();
   if (wanted.has('entity') || depth > 0) {
-    const directEntityIds = resolveEntityIdsForText(objective, perStore);
+    // Resolve unambiguous mentions before truncating broad alias candidates.
+    // Otherwise several aliases of the first project can evict a second fully
+    // named project before its facts ever reach the relevance ranker.
+    for (const id of resolveGroundedEntityIdsForText(objective, objective, perStore)) groundedDirectEntityIds.add(id);
+    if (ambient) for (const id of resolveGroundedEntityIdsForText(objective, objective, perStore, true)) {
+      canonicalDirectEntityIds.add(id);
+    }
+    const directEntityIds = [...new Set([
+      ...canonicalDirectEntityIds,
+      ...groundedDirectEntityIds,
+      ...resolveEntityIdsForText(objective, perStore),
+    ])].slice(0, perStore);
     for (const id of directEntityIds) {
       directEntityIdSet.add(id);
       entityIds.add(id);
@@ -798,13 +814,18 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     }
   }
 
-  if (entityIds.size > 0 && wanted.has('entity')) {
+  const explicitlyNamedEntityIds = new Set<number>();
+  if (entityIds.size > 0 && (wanted.has('entity') || wanted.has('fact') || wanted.has('policy'))) {
     const ids = Array.from(entityIds).slice(0, perStore * 3);
     const ph = ids.map(() => '?').join(',');
     const rows = openMemoryDb().prepare(`
       SELECT id, entity_type, canonical_name, mention_count FROM entities WHERE id IN (${ph})
     `).all(...ids) as Array<{ id: number; entity_type: string; canonical_name: string; mention_count: number }>;
     for (const row of rows) {
+      if (directEntityIdSet.has(row.id) && explicitlyNamesRecallEntity(objective, row.canonical_name)) {
+        explicitlyNamedEntityIds.add(row.id);
+      }
+      if (!wanted.has('entity')) continue;
       const supportingEdges = factEntityEdges.filter((edge) => edge.entityId === row.id);
       const evidence = supportingEdges
         .filter((edge) => edge.evidenceEpisodeId && edge.evidenceExcerpt?.trim())
@@ -818,7 +839,14 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         ref: { type: 'entity', id: row.id },
         title: row.canonical_name,
         text: `${row.entity_type} · mentioned ${row.mention_count}×`,
-        score: direct ? 0.72 : factLinked ? 0.58 : 0.48,
+        // A unique alias can still be a common task word. Automatic context
+        // ranks full canonical mentions above alias-only candidates; targeted
+        // lookup keeps its broad alias behavior.
+        score: direct
+          ? ambient
+            ? canonicalDirectEntityIds.has(row.id) ? 0.72 : groundedDirectEntityIds.has(row.id) ? 0.62 : 0.52
+            : (groundedDirectEntityIds.size > 0 && !groundedDirectEntityIds.has(row.id) ? 0.52 : 0.72)
+          : factLinked ? 0.58 : 0.48,
         confidence: supportingEdges.length > 0
           ? Math.max(...supportingEdges.map((edge) => edge.confidence))
           : 0.75,
@@ -830,7 +858,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
         ].filter(Boolean),
       });
     }
-    usedStores.add('entity');
+    if (wanted.has('entity')) usedStores.add('entity');
   }
 
   for (const resource of getResourcePointersByIds(Array.from(resourceIds))) resourceById.set(resource.id, resource);
@@ -844,11 +872,13 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     usedStores.add('deliverable');
     for (const d of searchDeliverables(objective, perStore)) {
       const gone = d.kind === 'file' && d.stillExists === false;
+      const score = deliverableRecallScore(d.score, gone, ambient);
+      if (score === null) continue;
       const hit: MemoryEvidenceHit = {
         ref: { type: 'deliverable', id: `${d.kind}:${d.target}` },
         title: `Deliverable: ${d.title}`,
         text: renderDeliverableHit(d),
-        score: gone ? Math.min(d.score, 0.4) : Math.min(0.95, 0.55 + d.score * 0.4),
+        score,
         confidence: gone ? 0.4 : 0.9,
         evidence: [],
         whyRecalled: [`deliverable index (${d.kind}${gone ? ', file missing' : ''})`],
@@ -1078,7 +1108,12 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   }
 
   const utilityRerank = applyUtilityRerank(Array.from(merged.values()), nowMs, objective);
-  const completeSetRerank = preferDurableCompleteSetHits(utilityRerank.hits, objective);
+  const scopedFacts = prioritizeNamedEntityFacts(utilityRerank.hits, explicitlyNamedEntityIds, factEntityEdges);
+  // Ambient input is a whole task, including format and output instructions.
+  // Words such as "complete" or "all" do not establish a request for a stored
+  // roster. Preserve relevance ranking here; targeted recall still prefers
+  // complete source-backed sets when the user asks for them.
+  const completeSetRerank = ambient ? scopedFacts : preferDurableCompleteSetHits(scopedFacts, objective);
   const logicalCandidates = collapseMeetingRepresentations(completeSetRerank, logicalMeetingKeys)
     .map((hit) => temporalMeetingTopicQuery && hit.whyRecalled.includes('exact temporal match')
       && !meetingContentSupportsTopicAnswer(hit.text)

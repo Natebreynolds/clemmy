@@ -1,3 +1,7 @@
+import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
+import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
+import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
+import { workflowRunReadEvidence, summarizeWorkflowReadExecutions } from './workflow-read-evidence.js';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -126,6 +130,7 @@ import {
   listWorkflowRunIds,
 } from './workflow-events.js';
 import { sumUsageTokensForSource, sumUsageTokensForRun, usageEfficiencyForSource } from '../runtime/usage-log.js';
+import { withWorkflowUsageAttribution } from '../runtime/workflow-usage-context.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { HostInterruptState } from '../runtime/harness/host-turn-runner.js';
 import { approvalAuthorityMatchesToolCall } from '../runtime/harness/approval-authority.js';
@@ -277,7 +282,7 @@ import {
   type WorkflowCapabilityAccountChoiceSetV1,
   type WorkflowCapabilityAccountSelectionV1,
 } from './workflow-live-call-compiler.js';
-import { ensureReviewedLocalWorkflowCapability } from '../runtime/harness/reviewed-local-workflow-capability.js';
+import { ensureReviewedLocalWorkflowCapability, normalizeReviewedLocalWorkflowArguments } from '../runtime/harness/reviewed-local-workflow-capability.js';
 import {
   activatePreparedWorkflowNodeCall,
   executeActivatedWorkflowNodeCall,
@@ -863,6 +868,11 @@ export interface QueuedRunRecord {
   sourceExecutionId?: string;
   /** Exact accepted human event sequence that owns the project admission. */
   sourceUserSeq?: number;
+  /** Original authoring call that queued this creation test. */
+  verificationRunId?: string;
+  creationTestSource?: { sessionId: string; sourceUserSeq: number; logicalToolCallId: string };
+  /** Explicit draft creation keeps verification separate from activation. */
+  activateAfterCreationTest?: boolean;
   /** Exact immutable compiled admission contract persisted by its V3 source
    * receipt. Ordinary catalog runs never carry this capability. */
   compiledContractHash?: string;
@@ -3295,13 +3305,13 @@ async function executeWorkflowCallNode(
         );
       }
     }
-    const renderedArgs = renderCallArgs(
+    const renderedArgs = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(
       call.args,
       ctx.inputs,
       ctx.stepOutputs,
       partition?.item,
       resolveWorkflowStepProjectContext(step, ctx.workflow),
-    );
+    ));
     const reviewedLocal = ensureReviewedLocalWorkflowCapability({
       operationId: call.tool,
       args: renderedArgs,
@@ -4146,12 +4156,9 @@ export function workflowAdvisoryRequiresAttention(
       // failure or trigger chronic-failure accounting by itself.
       return false;
     case 'goal_validation_unmet':
-      // Every step ran and the deliverable went out; only the judge's opinion
-      // of the evidence disagrees (goalMissIsJudgeOnlyAdvisory). Delivered
-      // work reads as delivered, with the per-criterion note attached — never
-      // as a blocked, resumable run (live 2026-09-09, Slack update posted then
-      // typed blocked).
-      return false;
+      // Preserve delivered artifacts, but an unmet authored criterion is not
+      // clean success. Attention alone does not authorize replaying mutations.
+      return true;
     case 'synthesis_degraded':
       // Every step already completed and verified — only the final prose
       // rollup fell back to the deterministic step-output format. Substance
@@ -12714,7 +12721,8 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
       if (!ownership) return;
       if (item.run.catchupFire === true) inFlightCatchupRunIds.add(item.run.id);
       try {
-        await processOneRunFile(item.file, item.filePath, item.run, workflows, assistant);
+        await withWorkflowUsageAttribution(item.run.id, () =>
+          processOneRunFile(item.file, item.filePath, item.run, workflows, assistant));
       } finally {
         inFlightCatchupRunIds.delete(item.run.id);
         releaseWorkflowDrainOwnership(ownership);
@@ -13975,7 +13983,29 @@ async function processOneRunFile(
       if (cancelledRecord && !cancelledRecord.notifiedAt) notifyCancelledRunOnce(filePath, cancelledRecord);
       return;
     }
-    const definitionResolution = resolveWorkflowDefinitionForRun(run, workflows);
+    let definitionResolution = resolveWorkflowDefinitionForRun(run, workflows);
+    if (run.verificationRunId && definitionResolution.ok) {
+      const snapshot = definitionResolution.snapshot;
+      const current = snapshot && isCatalogWorkflowRunDefinitionSnapshot(snapshot)
+        ? readWorkflow(snapshot.workflowSlug) : undefined;
+      const verification = /^[a-zA-Z0-9_-]+$/.test(run.verificationRunId)
+        ? readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${run.verificationRunId}.json`)) : null;
+      const dependency = workflowVerificationDependencyState({
+        verification, runId: run.verificationRunId, workflowName: run.workflow,
+        definitionHash: snapshot?.definitionHash ?? '',
+        currentDefinitionMatches: Boolean(snapshot && current
+          && isCatalogWorkflowRunDefinitionSnapshot(snapshot)
+          && workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot, current.data)
+          && workflowCodeRevisionMatchesSnapshot(snapshot, current.data)),
+        enabled: current?.data.enabled === true,
+      });
+      if (dependency === 'pending') return;
+      if (dependency === 'blocked') definitionResolution = {
+        ...definitionResolution, ok: false,
+        error: 'Requested workflow execution stopped before any step: its exact verification did not pass, or its saved definition changed or remains disabled.',
+      };
+      else if (current) definitionResolution = { ...definitionResolution, currentWorkflow: current };
+    }
     const workflow = definitionResolution.workflow;
     const currentWorkflow = definitionResolution.currentWorkflow;
     if (
@@ -14115,7 +14145,8 @@ async function processOneRunFile(
         }
       }
       let activationDefinition: WorkflowDefinition | undefined;
-      if (result.pass && activationCompatible) {
+      const activateAfterCreationTest = run.activateAfterCreationTest !== false;
+      if (result.pass && activationCompatible && activateAfterCreationTest) {
         const latest = readWorkflow(workflow.name)?.data ?? workflow.data;
         const enabledCandidate = { ...latest, enabled: true };
         if (enabledCandidate.steps.some((step) => (
@@ -14156,6 +14187,7 @@ async function processOneRunFile(
             ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
             ...(typeof run.source === 'string' && run.source ? { source: run.source } : {}),
             autoRetestDepth: (run.autoRetestDepth ?? 0) + 1,
+            activateAfterCreationTest,
           });
           if (requeued.status === 'queued' && requeued.id) autoRetestRunId = requeued.id;
         } catch { /* self-heal is additive — fall back to the manual message */ }
@@ -14169,10 +14201,12 @@ async function processOneRunFile(
         return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
       });
       const body = creationReady
-        ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
+        ? activateAfterCreationTest
+          ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
+          : `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. It remains DISABLED as requested.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run).`
         : result.pass
           ? autoRetestRunId
-            ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); it'll auto-enable here on pass.\n\n${lines.join('\n')}`
+            ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); ${activateAfterCreationTest ? "it'll auto-enable here on pass" : 'it will remain disabled'}.\n\n${lines.join('\n')}`
             : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
         : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
       const report = {
@@ -14190,7 +14224,7 @@ async function processOneRunFile(
       // Only the process that published this creation-test terminal may enable
       // the draft or clear its failure history. A cancellation/other terminal
       // winner leaves workflow state untouched.
-      if (creationReady) {
+      if (creationReady && activateAfterCreationTest) {
         try {
           const latest = readWorkflow(workflow.name);
           if (
@@ -14201,10 +14235,24 @@ async function processOneRunFile(
               && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
             )
           ) {
+            const before = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
             writeWorkflowAndSyncTriggers(
               workflow.name,
               activationDefinition ?? { ...(latest?.data ?? workflow.data), enabled: true },
             );
+            const after = activationCommitFacts(activationWorkflowCommit(workflow.name, ''));
+            const activated = readWorkflow(workflow.name);
+            if (run.creationTestSource && before && after && catalogSnapshot && activated
+              && latest?.data.enabled === false && activated.data.enabled === true
+              && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, activated.data)
+              && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, activated.data)) {
+              appendHarnessEvent({
+                sessionId: run.creationTestSource.sessionId, turn: 0, role: 'system',
+                type: 'workflow_activation_committed',
+                data: { ...run.creationTestSource, runId: run.id,
+                  priorDigest: before.contentDigest, facts: after },
+              });
+            }
           }
         } catch { /* best-effort */ }
         try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
@@ -14820,6 +14868,7 @@ async function processOneRunFile(
             workflow: workflow.data,
             inputs,
             finalOutput,
+            deliveredBody: baseSuccessBody,
             goal: legacyRunGoal ?? undefined,
             fallbackBody: baseSuccessBody,
             isPartialRun: Boolean(run.targetStepId),
@@ -14932,14 +14981,17 @@ async function processOneRunFile(
       let goalFeedbackNext = '';
       let goalRequeueId: string | undefined;
       if (runGoal) {
+        const readEvidence = workflowRunReadEvidence(run.id);
+        const readExecutions = summarizeWorkflowReadExecutions(readEvidence);
         goalVerdict = await validateGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
-          evidenceText: buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }),
+          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), readExecutions].filter(Boolean).join("\n\n"),
           // Structured outputs unlock the required-keys deterministic class —
           // key-presence criteria are checked in code, never by the judge
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).
           stepOutputs: publicRawStepOutputs,
+          readEvidence,
         });
         const goalValidatedAt = new Date().toISOString();
         goalValidation = {
@@ -15505,12 +15557,9 @@ async function processOneRunFile(
       // fix offer when self-heal produced one. Otherwise today's body.
       // Success body: human-readable (synthesis prose or humanized step
       // results), never a raw JSON dump of the step bookkeeping.
-      // Pinned-goal verdict rides the body in both lanes: a satisfied goal is
-      // a one-line confirmation; an escalated miss shows the per-criterion
-      // evidence + what to do (the deliverable itself is never hidden).
-      const goalSummary = goalDecision?.action === 'satisfied' && runGoal
-        ? `\n\n🎯 Pinned goal validated — ${runGoal.successCriteria.length > 0 ? `all ${runGoal.successCriteria.length} criteria met` : 'objective met'}.`
-        : goalMissed && goalMissAdvisoryOnly
+      // Successful verification remains in the run record. Surface unmet criteria
+      // alongside the deliverable so concise results never hide incomplete work.
+      const goalSummary = goalMissed && goalMissAdvisoryOnly
           ? `\n\n🎯 Pinned goal review — the work above was delivered; the judge could not evidence every criterion:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nReview if the gap matters, or adjust the goal.`
           : goalMissed
           ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
@@ -15519,10 +15568,8 @@ async function processOneRunFile(
       // (files/URLs/counts)" at completion. The structured `run_summary` event is
       // a durable per-run record (persisted in events.jsonl for the run detail +
       // a future run-view consumer to render; it also carries the inform-only
-      // empty-deliverable-read notes from 2.1). A concise "📦 Produced:" line is
-      // appended to the human body ONLY when concrete artifacts exist — and a run
-      // that produced artifacts is by definition NOT a routine no-op, so this can
-      // never break the quiet-day no-op silencing.
+      // empty-deliverable-read notes from 2.1). Keep result counts in that record;
+      // append file and URL locations so users can still access produced artifacts.
       const runArtifacts = summarizeRunArtifacts(publicExecutionSteps, publicRawStepOutputs);
       const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
         ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
@@ -15538,7 +15585,6 @@ async function processOneRunFile(
             : `completed ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}`;
         })();
       const producedItems = [
-        runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
         ...runArtifacts.files,
         ...runArtifacts.urls,
       ].filter(Boolean);

@@ -78,6 +78,8 @@ export type WorkflowTransformExpressionV1 =
   | { op: 'array'; items: WorkflowTransformExpressionV1[] }
   | { op: 'count'; value: WorkflowTransformExpressionV1 }
   | { op: 'map'; value: WorkflowTransformExpressionV1; each: WorkflowTransformExpressionV1 }
+  | { op: 'sort'; value: WorkflowTransformExpressionV1; by: Array<{ column: string; direction: 'asc' | 'desc' }> }
+  | { op: 'unique'; value: WorkflowTransformExpressionV1; keys: string[] }
   | {
       op: 'select';
       value: WorkflowTransformExpressionV1;

@@ -203,6 +203,23 @@ function nearestBefore(positions: number[], index: number, text?: string): numbe
   return best;
 }
 
+/** Preserving connector configuration is not a refusal to discover/read it.
+ * Keep this separate from access refusals; dispatch still checks effects. */
+function accessNegativeBefore(positions: number[], index: number, text: string): number {
+  const negative = nearestBefore(positions, index, text);
+  if (negative < 0) return negative;
+  const span = text.slice(negative, index);
+  // A retained execution report is evidence, not an access instruction.
+  // "Never dispatched ... Provider attempts" must not ban that provider now.
+  if (/^(?:never|not)\s+(?:(?:previously|already)\s+)?(?:dispatched|executed|called|used|queried|connected|received|returned)\b/i.test(span)) return -1;
+  // "does not forbid reading MCP tools" negates a prohibition, not access.
+  if (/^(?:not|do\s+not|don't|dont|never)\s+(?:forbid|prohibit|prevent|restrict|block)\b/i.test(span)) return -1;
+  const preservesConfiguration = /\b(?:changes?\s+to|changing|reconfigur(?:e|ing)|modifying|modify|migrat(?:e|ing)|repair(?:ing)?)\b/i.test(span);
+  // A later access verb is a separate prohibition: "do not change or use X".
+  const alsoRefusesAccess = /\b(?:use|using|call|calling|access|accessing|query|querying|invoke|invoking|connect|connecting)\b/i.test(span);
+  return preservesConfiguration && !alsoRefusesAccess ? -1 : negative;
+}
+
 function slugOf(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 }
@@ -265,7 +282,7 @@ export function compileMcpAccessConstraint(
       if (claimed.some((span) => start < span.end && end > span.start)) continue;
       claimed.push({ start, end });
 
-      const negative = nearestBefore(negatives, start, text);
+      const negative = accessNegativeBefore(negatives, start, text);
       const exception = nearestBefore(exceptions, start, text);
       // An exception that sits inside a refusal grants; one that sits inside a
       // permission refuses ("use anything except Beta").
@@ -290,7 +307,7 @@ export function compileMcpAccessConstraint(
   // A blanket refusal of "connectors" with nothing carved out denies everything.
   const genericMentions = markerPositions(text, GENERIC_CONNECTOR_RE);
   const blanketRefusal = genericMentions.some((position) => {
-    const negative = nearestBefore(negatives, position, text);
+    const negative = accessNegativeBefore(negatives, position, text);
     const exception = nearestBefore(exceptions, position, text);
     return negative >= 0 && negative > exception;
   });

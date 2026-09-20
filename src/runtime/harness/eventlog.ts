@@ -345,6 +345,7 @@ export const EVENT_TYPES = [
   'worker_capped',
   // A fan-out worker STARTING — lets the chat/board render the specialist as
   // running the moment it spawns (not only when worker_result lands).
+  'workflow_activation_committed',
   'worker_started',
   // Deterministic batch runner (run_batch): plan execution started / a single
   // item failed (with consecutive-failure count) / the whole batch finished
@@ -380,6 +381,7 @@ export const EVENT_TYPES = [
   // rate-limit fallover can move it off the planned model); worker_result
   // attributes from this, never from the plan (live 2026-09-05).
   'worker_model_executed',
+  'worker_model_response_completed',
   // A fan-out worker COMPLETED — durable record of {item, ok, model, toolUses,
   // tokens} (Move 5). The honest N-of-M coverage map was in-memory only, so a
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
@@ -638,6 +640,7 @@ export const EVENT_TYPES = [
   // Effective completion-review policy, stamped once at accept time so a later
   // settings change cannot relabel an already-running task.
   'completion_policy_captured',
+  'completion_review_skipped',
   // The scope one accepted source froze for its mutations. Read back by the
   // consent boundary so a later call cannot widen the job by proposing more.
   'accepted_mutation_scope',

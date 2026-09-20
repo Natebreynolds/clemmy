@@ -154,8 +154,10 @@ export function registerAdminTools(server: McpServer): void {
       fire_at: z.string().optional()
         .describe('Exact ISO 8601 timestamp with an explicit UTC offset, within 24 hours. Example: 2026-07-30T22:00:00-07:00. Provide this OR minutes.'),
       message: z.string().min(1),
+      delivery: z.enum(['configured', 'local']).optional()
+        .describe('Use local when the user requests in-app/local-only delivery: inbox only, never external channels or push. Omitted/configured uses the user’s notification destinations.'),
     },
-    async ({ minutes, fire_at, message }) => {
+    async ({ minutes, fire_at, message, delivery }) => {
       const now = Date.now();
       const resolved = resolveTimerFireAt({ minutes, fireAt: fire_at }, now);
       if (!resolved.ok) {
@@ -166,7 +168,7 @@ export function registerAdminTools(server: McpServer): void {
         message,
         fireAt: resolved.fireAt,
         createdAt: now,
-        metadata: reminderOriginMetadata(),
+        metadata: { ...reminderOriginMetadata(), ...(delivery === 'local' ? { inboxOnly: true } : {}) },
       };
       appendTimer(timer);
       // Materialize the future commitment immediately. The timer file remains
@@ -177,7 +179,9 @@ export function registerAdminTools(server: McpServer): void {
 
       return textResult(
         `Reminder scheduled (${timer.id}) for ${resolved.confirmationTarget}: "${message}" — `
-        + 'it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).',
+        + (delivery === 'local'
+          ? 'it will appear only in the app inbox, with no external delivery (after reopening if the app is closed).'
+          : 'it will fire as a notification (late-but-never-lost if the app is closed or the Mac sleeps).'),
       );
     },
   );

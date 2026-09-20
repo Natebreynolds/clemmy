@@ -1715,6 +1715,19 @@ function beginPhysicalDispatchCore(
           ordinal: persistOrdinal,
         });
       }
+      // Retain compatibility requests as encrypted evidence, never authority.
+      let requestEvidenceCipher: string | undefined;
+      if (!typed && !staged && !preparation) {
+        try {
+          requestEvidenceCipher = sealCanonicalArguments({
+            version: 1, sessionId: input.identity.sessionId,
+            sourceUserSeq: input.identity.sourceUserSeq, acceptedTaskId: authority.acceptedTaskId,
+            logicalToolCallId: input.identity.logicalToolCallId,
+            physicalDispatchId: input.identity.physicalDispatchId,
+            toolName: tool, argumentDigest: digest, args: input.args ?? {},
+          });
+        } catch { /* Missing evidence must not block a call or fabricate scope. */ }
+      }
       mirror = insertInternalEventInTransaction(db, {
         sessionId: input.identity.sessionId,
         turn: input.turn ?? authority.identity.turn,
@@ -1730,6 +1743,7 @@ function beginPhysicalDispatchCore(
           ...(input.identity.retryOf ? { retryOf: input.identity.retryOf } : {}),
           tool,
           argumentDigest: digest,
+          ...(requestEvidenceCipher ? { requestEvidenceCipher } : {}),
         },
       });
       db.prepare(`
@@ -1981,6 +1995,30 @@ export function beginTypedPhysicalDispatch(input: {
     typedAuthorityJson: serialized,
     argumentCipher,
   });
+}
+
+/** Reopen exact admitted request evidence, never execution authority. */
+export function loadPhysicalRequestEvidence(input: {
+  sessionId: string; sourceUserSeq: number; logicalToolCallId: string; physicalDispatchId: string;
+}): { args: unknown } | undefined {
+  try {
+    const row = openEventLog().prepare(`SELECT p.accepted_task_id, p.tool_name, p.argument_digest, e.data_json
+      FROM physical_dispatches p JOIN events e ON e.id = p.start_event_id AND e.session_id = p.session_id
+      WHERE p.session_id = ? AND p.source_user_seq = ? AND p.logical_tool_call_id = ?
+        AND p.physical_dispatch_id = ? AND p.state = 'returned' AND e.type = 'provider_dispatch_started'`)
+      .get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId, input.physicalDispatchId) as {
+        accepted_task_id: string; tool_name: string; argument_digest: string; data_json: string;
+      } | undefined;
+    if (!row) return undefined;
+    const event = JSON.parse(row.data_json);
+    if (typeof event.requestEvidenceCipher !== 'string') return undefined;
+    const opened = openCanonicalArguments(event.requestEvidenceCipher);
+    if (!opened || opened.version !== 1 || opened.sessionId !== input.sessionId
+      || opened.sourceUserSeq !== input.sourceUserSeq || opened.logicalToolCallId !== input.logicalToolCallId
+      || opened.physicalDispatchId !== input.physicalDispatchId || opened.acceptedTaskId !== row.accepted_task_id
+      || opened.toolName !== row.tool_name || opened.argumentDigest !== row.argument_digest) return undefined;
+    return { args: opened.args };
+  } catch { return undefined; }
 }
 
 export function loadPersistedCallAuthority(input: {

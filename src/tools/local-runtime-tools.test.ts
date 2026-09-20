@@ -516,3 +516,20 @@ test('a direct read refused for an identifier under another name runs with the c
   assert.equal(wrote, false, 'a write is never completed by renaming a field');
   assert.ok(refused instanceof InvalidArgumentsPreDispatchResult);
 });
+
+test('omitted nullable recovery fills nested records without guessing required fields', async () => {
+  const { z } = await import('zod');
+  const { recoverOmittedNullableFields } = await import('./local-runtime-tools.js');
+  const parameters = z.object({ steps: z.array(z.object({ id: z.string(), inputs: z.record(z.string(),
+    z.object({ from: z.string(), required: z.boolean().nullable(), default: z.string().nullable() })) })) });
+  const input = { steps: [{ id: 'read', inputs: { run_key: { from: 'input.run_key' } } }] };
+  const raw = JSON.stringify(input);
+  const error = { name: 'InvalidToolInputError', toolInvocation: { input: raw } };
+  assert.deepEqual(recoverOmittedNullableFields(error, parameters), { steps: [{ id: 'read',
+    inputs: { run_key: { from: 'input.run_key', required: null, default: null } } }] });
+  assert.equal(JSON.stringify(input), raw);
+  for (const value of [{ steps: [{ id: 42, inputs: { run_key: { from: 'input.run_key' } } }] },
+    { steps: [{ id: 'read', inputs: { run_key: {} } }] }]) {
+    assert.equal(recoverOmittedNullableFields({ ...error, toolInvocation: { input: JSON.stringify(value) } }, parameters), null);
+  }
+});

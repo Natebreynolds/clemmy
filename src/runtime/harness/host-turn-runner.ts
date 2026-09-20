@@ -1,3 +1,7 @@
+import { responseFormatRepairPacket } from './response-format-repair.js';
+import { verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
+import { hostModelOutputPreview } from './host-model-output-preview.js';
+import { workflowActivationSuccessor } from './workflow-activation-successor.js';
 import { expectedWorkPlanLines } from './expected-work-admission.js';
 import { usageEfficiencyForSource, usageEfficiencyForTurn } from '../usage-log.js';
 import { currentManifestOperationContract } from './current-manifest-operation-semantics.js';
@@ -79,6 +83,7 @@ import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
+import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 import {
   durableLogicalCallContract,
   durableLogicalCallRecoveryMaterial,
@@ -146,6 +151,7 @@ import {
   latestWatcherAssistantNote,
 } from './watcher-judge.js';
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
+import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence,
@@ -411,7 +417,7 @@ export function settledSourceArtifacts(input: {
       // generation's receipt, which then lost its handle and could never be
       // superseded, so a correct final state looked like unresolved work.
       const datasetContract = TOOL_REGISTRY.find((candidate) => candidate.name === settlement.toolName)?.localPlanning?.outputKind === 'workspace_observation';
-      const facts = parseHostLocalWriteCommitFacts(evidence.rawPayload)
+      let facts = parseHostLocalWriteCommitFacts(evidence.rawPayload)
         ?? (datasetContract ? parseHostLocalWriteCommitFacts(workspaceDatasetHostFileCommit(evidence.rawPayload)) : null);
       if (!facts) {
         // The contract is decided by the REGISTRY, before the payload is
@@ -441,6 +447,9 @@ export function settledSourceArtifacts(input: {
         });
         continue;
       }
+      facts = workflowActivationSuccessor(facts, {
+        ...input, logicalToolCallId: settlement.logicalToolCallId,
+      }, listEvents(input.sessionId, { types: ['workflow_activation_committed'] }));
       collected.push({
         createdId: facts.createdId,
         handle: facts.handle,
@@ -1032,6 +1041,17 @@ const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
  * recovery advice names them, so forbidding them makes the host contradict its
  * own instruction.
  */
+
+/** A repaired inner operation may still travel through its published carrier. */
+export function hostRecoveryCallMatchesOperation(
+  consequence: NoProgressGovernorState['lastConsequence'],
+  name: string,
+  args: unknown,
+): boolean {
+  if (consequence?.recovery !== 'repair_model' || consequence.effectState !== 'not_started') return false;
+  const operation = unwrapRuntimeEffectiveToolIdentity(name, args).toolName;
+  return Boolean(operation && consequence.recoveryToolNames.includes(operation));
+}
 
 export function hostNoProgressRecoveryToolNames(
   consequence: NoProgressGovernorState['lastConsequence'],
@@ -2772,6 +2792,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // Retain original model bytes in the accepted batch. Every execution check
   // below consumes the same locally schema-completed carrier bytes instead.
   const localArgumentPreparations = new Map<string, string>();
+  const directLocalCallRequirements = new Map<string, string>();
   const materializedArgumentsJson = (tool: FunctionToolLike | undefined, raw: string): string => (
     localArgumentPreparations.get(`${tool?.name ?? ''}\0${raw}`) ?? materializedToolArgumentsJson(tool, raw)
   );
@@ -3318,7 +3339,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const hostWatcherEnabled = watcherJudgeEnabled() && !conversationalCheckInSurface();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
   const hostWatcherHistoryStart = history.length;
-  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string }) | null } = { pending: null };
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
   let hostWatcherLastCheckedAt = 0;
@@ -3404,11 +3425,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const latestAssistantNote = latestWatcherAssistantNote(history, hostWatcherHistoryStart);
         const policy = readCapturedCompletionPolicy(watcherIdentity);
         let unavailableReason: string | undefined;
+        const workerProgress = summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity);
         const verdict = await watcherJudge({
           objective: watcherObjective,
           toolCallSummary: [
             summarizeToolCallsForJudge(watcherIdentity.sessionId, watcherIdentity),
-            summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity),
+            workerProgress,
           ].filter(Boolean).join('; '),
           latestAssistantNote,
           sourceEvidence,
@@ -3416,10 +3438,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(policy.status === 'captured' ? { boundaryJudgeSelection: policy.policy.judgeSelection } : {}),
           toolCallCount: watcherToolCalls,
         });
-        const stale = judgedObjective() !== watcherObjective;
+        const staleReason = judgedObjective() !== watcherObjective ? 'objective_changed'
+          : summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity) !== workerProgress
+            ? 'worker_progress_changed' : undefined;
+        const stale = staleReason !== undefined;
         recordWatcherReview('completed', { reviewId, objectiveDigest,
           verdict: verdict ? (verdict.onTrack ? 'on_track' : 'drift') : 'unavailable',
-          stale, miss: verdict?.miss, steer: verdict?.steer, review: verdict?.review,
+          stale, ...(staleReason ? { staleReason } : {}),
+          miss: verdict?.miss, steer: verdict?.steer, review: verdict?.review,
           ...(verdict?.coverage ? { coverage: verdict.coverage } : {}),
           ...(!verdict ? { unavailableReason: unavailableReason ?? 'watcher_no_verdict' } : {}),
           readEvidenceCursor: readEvidence.throughSettlementIndex,
@@ -3433,7 +3459,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           evidenceBytes: Buffer.byteLength(sourceEvidence), latestAssistantNote,
         });
         if (verdict && !verdict.onTrack && !stale) {
-          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId };
+          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId, workerProgress };
         }
       } catch (error) {
         recordWatcherReview('completed', { reviewId, objectiveDigest, verdict: 'unavailable',
@@ -3441,29 +3467,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       } finally { hostWatcherCheckInFlight = false; }
     })();
   };
-  /** A worker fan-out is one parent tool call that can hold this loop for
-   * minutes, so no continuation boundary (and no cadence check) happens while
-   * the children run. Scoped to the invocation: when the parent's eventlog
-   * records the batch's first worker_started, the cadence is re-armed and the
-   * SAME gate/check runs — same budgets, same steer channel, no authority.
-   * A call that starts no workers, or a run with the watcher off, is untouched. */
+  /** A quick worker batch already reaches the ordinary continuation and final
+   * review. Only re-arm the extra in-flight review if it lasts 30 seconds;
+   * launching it at the first worker start reviews an incomplete dispatch and
+   * spends a model call even when all children finish moments later. */
   const withHostWatcherFanoutRearm = async <T>(
     sessionId: string | undefined,
     run: () => Promise<T>,
   ): Promise<T> => {
     if (!hostProduction || !hostWatcherEnabled || !sessionId) return run();
     const parentScope = harnessRunContextStorage.getStore();
+    let reviewTimer: ReturnType<typeof setTimeout> | undefined;
     const stop = observeWorkerFanoutStart(sessionId, () => {
-      const watcherToolCalls = hostWatcherToolCalls();
-      if (!shouldStartWatcherCheck(rearmedWatcherCadence(hostWatcherGate(watcherToolCalls)))) return;
-      const start = (): void => startHostWatcherCheck(watcherToolCalls);
-      if (parentScope) harnessRunContextStorage.run(parentScope, start);
-      else start();
+      if (reviewTimer) return;
+      reviewTimer = setTimeout(() => {
+        const start = (): void => {
+          const watcherToolCalls = hostWatcherToolCalls();
+          if (!shouldStartWatcherCheck(rearmedWatcherCadence(hostWatcherGate(watcherToolCalls)))) return;
+          startHostWatcherCheck(watcherToolCalls);
+        };
+        if (parentScope) harnessRunContextStorage.run(parentScope, start);
+        else start();
+      }, 30_000);
+      reviewTimer.unref();
     }, exactHostIdentity().sourceUserSeq);
     try {
       return await run();
     } finally {
       stop();
+      if (reviewTimer) clearTimeout(reviewTimer);
     }
   };
   let lastContinueMarkerNote: string | undefined;
@@ -3475,6 +3507,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
    *  continuation, so a continuation that added no evidence is recognisable
    *  before a second identical verdict is bought. */
   let judgedBusinessCallsAtLastVerdict: number | undefined;
+  let pendingResponseFormatRepair: { objective: string; instructions: string; text: string } | undefined;
   let completionReviewFeedback = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? parseHostCompletionReviewFeedback(itemsOrState.completionReviewFeedback)
@@ -3729,7 +3762,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // wording or whether one business call happened to succeed. Keep the
     // legacy zero-tool fallback, but never let it waive attempted work.
     const judgedText = decision?.reply ?? replyText;
-    const gate = shouldRunObjectiveJudge({
+    const gateInput = {
       optIn: true,
       actionIntent: classifyMessageIntent(objective).intent === 'action',
       meaningfulToolEvidence: businessCalls.length > 0,
@@ -3747,8 +3780,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       promiseShaped: isPromiseShapedReply(judgedText),
       claimedCompletedWork: replyClaimsCompletedWork(judgedText),
       openApprovalCard,
-    });
-    if (!gate && !planCandidate) return 'done';
+    };
+    const gate = shouldRunObjectiveJudge(gateInput);
+    if (!gate && !planCandidate) {
+      const skipped = conversationalReviewSkipRecord({ sourceUserSeq: identity.sourceUserSeq,
+        objective, reply: judgedText, gate: gateInput });
+      if (skipped) {
+        try {
+          appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system',
+            type: 'completion_review_skipped', data: skipped });
+        } catch { /* Missing metadata cannot change completion eligibility. */ }
+      }
+      return 'done';
+    }
     const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate) });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
     // Reuse a rejection only for the SAME reply and unchanged business work.
@@ -3800,6 +3844,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }, 'host completion judge');
       return 'done';
     }
+    let memoryConsolidation = verifiedMemoryConsolidationEvidence(identity);
+    // Automatic consolidation already owns these source-bound claims. Give its
+    // existing job a bounded chance to settle before a reviewer sends the model
+    // back to duplicate the same memory write. No new consolidation is started.
+    const memoryWaitStartedAt = Date.now();
+    while (explicitMemoryInstructionFor(objective) !== null
+      && memoryConsolidation?.some(result => result.status === 'pending')
+      && !signal?.aborted && Date.now() - memoryWaitStartedAt < 15_000) {
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+      memoryConsolidation = verifiedMemoryConsolidationEvidence(identity);
+    }
+    if (signal?.aborted) return 'done';
+    if (Date.now() - memoryWaitStartedAt >= 500) {
+      try {
+        appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+          data: { kind: 'memory_consolidation_review_wait', sourceUserSeq: identity.sourceUserSeq,
+            elapsedMs: Date.now() - memoryWaitStartedAt,
+            stillPending: memoryConsolidation?.some(result => result.status === 'pending') ?? false } });
+      } catch { /* observability does not decide completion */ }
+    }
     let verdict: ObjectiveJudgeVerdict;
     const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
@@ -3820,6 +3884,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // ran BEFORE the write is not evidence of the write.
         toolCallSummary: [
           acceptedModelMemoryEvidence(identity),
+          memoryConsolidation ? `Automatic memory consolidation for THIS accepted request (read from persisted source-bound candidates and current canonical facts):\n${JSON.stringify(memoryConsolidation)}\nOnly verified=true records prove a current active memory linked to this source. Compare their actual content to the requested correction; a promoted or ignored candidate alone is not proof the requested rule was adopted. Pending or unverified records do not establish completion. This evidence covers memory only; separately verify all other requested work.` : undefined,
           planCandidate ? `THIS IS A PLAN TURN. Judge the investigated plan, not future execution. Reads, discovery and carrier-bounded probes performed during planning are preparation, never a gap: a plan may hold members, facts and authored content gathered this turn as inline data, may bind the arguments a probe proved, and it need not re-read at execution what it already holds. Creates, sends and deletes must still not have run. Whether inputs were gathered during planning or are deferred to execution as read steps is the planner's choice; neither is a gap. This candidate is reviewed BEFORE it is published, by design: earlier publish_plan refusals, retained drafts and review feedback in the history are the road to this candidate, never gaps in it. Review the prose AND its prepared graph below. structuredPlan.steps is the complete reviewed graph, including synthesis and its dynamicBindings. executionDraft is a host-derived tool-only projection: compute steps intentionally do not appear there, and their transitive tool prerequisites become ordering edges. Their absence from executionDraft is not a missing step or data binding. Judge synthesis and the consuming write against structuredPlan.steps and dynamicBindings. preparedBindings includes the selected local tool descriptions; use that actual behavior instead of inventing prerequisite steps. Do dependencies actually supply the discovered results to their consumers, are unknown values prepared at execution time instead of guessed, and do verification criteria cover the accepted objective? Do the proposed evidence sources and comparison criteria support the decisions requested, with a useful response to missing or conflicting facts? Separate source claims from verified facts. Check the selected operation’s own contract when it is carried inside a generic tool: batch, pagination and per-item settings must still cover the intended scope after repairs. Compare coverage and dependencies against the whole objective, not merely valid argument shapes. Do not require every optional tool or demand unrelated work. A step carried by a generic request tool whose path and arguments were neither exercised successfully this turn nor cited from documentation read this turn is a material gap: name the exact unverified argument. Evidence that only a create, send or delete can produce belongs to execution: specify its execution method rather than asking Plan to perform it. Empty or irrelevant memory is not a missing prerequisite; require memory-derived assumptions to be disclosed only when they influence this plan. A compute step can investigate contextual read-only sources, extract/transform evidence and bind its recorded output to a later tool. Graph dependencies require successful results: an optional lookup plus its fallback must not both be indispensable producers, since the intended recovery could never complete. Conditional investigation can live in the compute method while truly required input reads remain graph steps. Report all material gaps supported by this evidence together, so a repair can address the whole finding. Optional improvements are not completion failures. Successful tool_search result dumps are omitted here; the prepared graph includes the exact selected operation contracts, while actual input reads and unsuccessful attempts remain below.\nComplete candidate plan:\n${JSON.stringify(planCandidate)}` : undefined,
           completionReviewFeedback ? hostCompletionReviewFeedbackContext(completionReviewFeedback) : undefined,
           settled.count > 0
@@ -3883,6 +3948,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           lane: 'host_v1',
           kind: 'completion',
           fulfills: verdict.done && !verdict.awaitingUser,
+          ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
           reason: verdict.reason.slice(0, 600),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
@@ -3921,6 +3987,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           settledEffectCount: settled.count,
           settledEvidenceAvailable: settled.evidenceAvailable && readEvidence.evidenceAvailable,
           judgedReadResults: readEvidence.results,
+          ...(memoryConsolidation ? { judgedMemoryResults: memoryConsolidation } : {}),
           ...(preparation ? { judgedPreparationReadResults: {
             source: preparation.source, plan: preparation.plan,
             evidenceAvailable: preparation.evidence.evidenceAvailable, results: preparation.evidence.results,
@@ -4004,6 +4071,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
       reason: verdict.reason,
     };
+    const formatPacket = responseFormatRepairPacket({ ...verdict,
+      plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason });
+    pendingResponseFormatRepair = formatPacket ? { objective, ...formatPacket } : undefined;
     return 'continue';
   };
 
@@ -4240,6 +4310,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     modelInput: AgentInputItem[],
     instructions: string | undefined,
     modelSchemas: readonly unknown[] = schemas,
+    formatWorkerModelId?: string,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
     const ambient = harnessRunContextStorage.getStore();
     const killTarget = ambient?.runAttemptId
@@ -4378,7 +4449,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const hostProjection = canonicalPromptCacheRequest({
       ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
       input: modelInput,
-      modelSettings,
+      modelSettings: formatWorkerModelId ? {} : modelSettings,
       tools: modelSchemas as never,
       toolsExplicitlyProvided: true,
       outputType: 'text',
@@ -4392,10 +4463,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         codexOneStep({
           input: modelInput,
           tools: modelSchemas as never,
-          ...(modelId !== undefined ? { modelId } : {}),
-          ...(resolveModel ? { resolveModel } : {}),
+          ...(formatWorkerModelId ? { modelId: formatWorkerModelId } : modelId !== undefined ? { modelId } : {}),
+          ...(!formatWorkerModelId && resolveModel ? { resolveModel } : {}),
           ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
-          modelSettings,
+          modelSettings: formatWorkerModelId ? {} : modelSettings,
           signal: controller.signal,
           stream: true,
           ...(hostProduction
@@ -5207,19 +5278,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ? decision.effect
       : null;
     if (!localEffect) return miss(`local_effect_mismatch:${decision.effect}:${effectClass}`);
+    const localRequirement = directLocalCallRequirements.get(logicalToolCallId) ?? args.requirement_id;
     const localNomination = localEffect === 'local_write'
       && !actionExpectedWorkRequired(identity)
-      && typeof args.requirement_id === 'string'
-      && args.requirement_id.startsWith('cap:local:')
+      && typeof localRequirement === 'string'
+      && localRequirement.startsWith('cap:local:')
       ? nominateDisclosedLocalPlanningDefinition({
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
-          capabilityRef: args.requirement_id,
+          capabilityRef: localRequirement,
           operationId: effectiveName,
           effect: localEffect,
           args: effective.args,
         })
       : null;
+    if (NATIVE_PRODUCT_AUTHORING_TOOLS.has(name) && !localNomination) {
+      return miss('native_authoring_definition_unavailable');
+    }
     const binding = {
       bindingKind: 'local_envelope' as const,
       capabilityId: localNomination?.capabilityRef ?? capability[0]!.name,
@@ -6200,8 +6275,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
       } catch { /* steering is advisory; never let it end a turn */ }
     }
+    const modelOutput = structuredToolOutputs(output) ? output : await hostModelOutputPreview(text, {
+      sessionId: exactHostIdentity().sessionId,
+      sourceUserSeq: exactHostIdentity().sourceUserSeq,
+      callId: call.callId,
+      toolName: call.name,
+      arguments: parsedArguments,
+    });
     return {
-      historyItem: functionResultItem(call.callId, call.name, output, hostSteer),
+      historyItem: functionResultItem(call.callId, call.name, modelOutput, hostSteer),
       ...(tool ? { tool } : {}),
       output,
       argumentsJson: call.argumentsJson,
@@ -8278,10 +8360,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let watcherObjectiveForStep: string | undefined;
     let watcherDriftForStep: (WatcherVerdict & { objective: string }) | undefined;
     if (hostProduction && hostWatcherEnabled) {
-      const drift = hostWatcherSteer.pending?.objective === judgedObjective()
-        ? hostWatcherSteer.pending : null;
+      const pending = hostWatcherSteer.pending;
+      const staleReason = pending && pending.objective !== judgedObjective() ? 'objective_changed'
+        : pending && pending.workerProgress !== summarizeWorkerProgressForWatcher(exactHostIdentity().sessionId, exactHostIdentity())
+          ? 'worker_progress_changed' : undefined;
+      const drift = staleReason ? null : pending;
       if (!drift && hostWatcherSteer.pending) {
-        recordWatcherReview('discarded', { reviewId: hostWatcherSteer.pending.reviewId, reason: 'objective_changed' });
+        recordWatcherReview('discarded', { reviewId: hostWatcherSteer.pending.reviewId, reason: staleReason });
         hostWatcherSteer.pending = null;
       }
       if (drift && !drift.onTrack && hostWatcherInjectionsUsed < MAX_WATCHER_INJECTIONS) {
@@ -8607,6 +8692,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // normalises, annotates or truncates its input in place would then be
     // editing history that has already been accepted — silently, and only on
     // the configuration that looks simplest.
+    let formatWorkerModelId: string | undefined;
     let modelInput: AgentInputItem[] = [];
     let instructions: string | undefined;
     if (!consumingRecoveredFrame) {
@@ -8645,6 +8731,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let adoptedSteering = '';
       if (hostProduction) {
         const steerIdentity = exactHostIdentity();
+        const memoryIntake = verifiedMemoryIntakeContext(steerIdentity);
+        if (memoryIntake) modelInput.push({ role: 'system', content: memoryIntake } as AgentInputItem);
         const deliveredNotes = takeUndeliveredSteerNotes(steerIdentity.sessionId, steerIdentity.sourceUserSeq);
         captureExplicitSteerInstructions(steerIdentity.sessionId, deliveredNotes);
         adoptedSteering = formatSteerBlock(adoptedSteerNotesForSource(steerIdentity));
@@ -8678,6 +8766,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         modelInput.push({ role: 'user', content: modelInputDirective });
       }
       if (adoptedSteering) modelInput.push({ role: 'user', content: adoptedSteering });
+      const formatRepair = pendingResponseFormatRepair;
+      pendingResponseFormatRepair = undefined;
+      // New owner/recovery guidance wins. An interrupted optimization falls
+      // back to the normal retained feedback path; it never loses the finding.
+      if (formatRepair && formatRepair.objective === judgedObjective()
+        && !adoptedSteering && !modelInputDirective && !watcherDirectiveForStep) {
+        formatWorkerModelId = resolveRoleModel('worker').modelId;
+        modelInput = [{ role: 'user', content: formatRepair.text }];
+        instructions = formatRepair.instructions;
+        journalHostGuide('response_format_repair', { modelId: formatWorkerModelId,
+          promptChars: formatRepair.text.length, tools: 0 });
+      }
     }
     let step: Awaited<ReturnType<typeof codexOneStep>>;
     let ranModelStep = false;
@@ -8695,7 +8795,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
       recoveredToolFrame = undefined;
     } else try {
-      step = await runOneModelStep(modelInput, instructions, modelStepSchemas);
+      step = await runOneModelStep(modelInput, instructions, formatWorkerModelId ? [] : modelStepSchemas, formatWorkerModelId);
+      if (formatWorkerModelId && step.toolCalls.length > 0) {
+        throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
+      }
       ranModelStep = true;
       if (watcherReviewForStep && watcherDriftForStep) {
         recordWatcherReview('delivered', { reviewId: watcherReviewForStep });
@@ -9038,6 +9141,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const canonicalCalls = admission.frame.calls;
     if (hostProduction) {
       for (const call of canonicalCalls) {
+        if (NATIVE_PRODUCT_AUTHORING_TOOLS.has(call.name) && toolByName.has(call.name)) {
+          const identity = exactHostIdentity();
+          const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+          if (args && !actionExpectedWorkRequired(identity)) {
+            const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
+            const requirement = await prepareDirectHostLocalCall(agent, {
+              ...identity, operationId: call.name, args,
+            });
+            if (requirement) directLocalCallRequirements.set(call.callId, requirement);
+          }
+          continue;
+        }
         if (!isPlainOrClementineLocalTool(call.name, 'work_call')) continue;
         const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
         if (!args || typeof args.requirement_id !== 'string' || !args.requirement_id.startsWith('cap:local:')) continue;
@@ -9118,6 +9233,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             toolByName.get(call.name),
             call.argumentsJson,
           );
+          if (hostRecoveryCallMatchesOperation(
+            noProgressState?.lastConsequence ?? null,
+            call.name,
+            parsedArgs(authoredArgumentsJson),
+          )) return false;
           const carry = resolveOffSurfaceDirectCarry({
             authoredName: call.name,
             authoredArgs: parsedArgs(authoredArgumentsJson),

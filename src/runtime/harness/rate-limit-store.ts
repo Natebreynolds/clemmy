@@ -23,6 +23,8 @@ import { atomicJsonMutate } from '../atomic-json.js';
 
 export interface CodexWindow { usedPercent: number; resetAt?: number; windowMinutes?: number }
 export interface CodexRateLimit {
+  /** Older captures ambiguously converted 1 percent to 100; never reuse them. */
+  percentUnit?: 'percent';
   primary?: CodexWindow;
   secondary?: CodexWindow;
   capturedAt: number;
@@ -63,7 +65,7 @@ function loadOnce(): void {
   if (isTest()) return; // tests run in-memory; never touch the operator's live file
   try {
     if (existsSync(STORE_PATH)) {
-      snapshot = JSON.parse(readFileSync(STORE_PATH, 'utf-8')) as RateLimitSnapshot;
+      snapshot = discardAmbiguousCodexPercentages(JSON.parse(readFileSync(STORE_PATH, 'utf-8')) as RateLimitSnapshot);
     }
   } catch {
     /* corrupt / unreadable → start empty */
@@ -98,12 +100,19 @@ function numFrom(h: HeaderLike, ...names: string[]): number | undefined {
   return undefined;
 }
 
-/** Normalize a utilization value to 0–100. Providers report either a fraction
- *  (0–1) or a percentage (0–100); a value ≤ 1 is treated as a fraction. */
+/** Codex *-used-percent headers are percentages, including values <= 1. */
 function toPercent(v: number | undefined): number | undefined {
   if (v == null) return undefined;
-  const p = v <= 1 ? v * 100 : v;
-  return Math.max(0, Math.min(100, Math.round(p)));
+  return Math.max(0, Math.min(100, v));
+}
+
+/** Legacy normalized values cannot distinguish actual exhaustion from 1%.
+ * Drop those windows until a fresh provider response; preserve explicit 429
+ * backoff and unrelated providers. Never guess a replacement percentage. */
+export function discardAmbiguousCodexPercentages(value: RateLimitSnapshot): RateLimitSnapshot {
+  if (!value.codex || value.codex.percentUnit === 'percent') return value;
+  const { primary: _primary, secondary: _secondary, ...rest } = value.codex;
+  return { ...value, codex: rest };
 }
 
 /** Resolve a reset value to absolute epoch-ms. Accepts an RFC3339/ISO string, an
@@ -154,6 +163,7 @@ export function recordCodexRateLimit(headers: HeaderLike): void {
       (window) => window && window.windowMinutes !== 0 && window.usedPercent < 100,
     );
     snapshot.codex = {
+      percentUnit: 'percent',
       primary,
       secondary,
       capturedAt: now,

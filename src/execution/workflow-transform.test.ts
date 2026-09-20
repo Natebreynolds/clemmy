@@ -241,3 +241,52 @@ test('the authoring carrier parses exact JSON and the implementation imports no 
   const source = readFileSync(new URL('./workflow-transform.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /node:child_process|\beval\s*\(|new Function|node:vm|run_shell|spawn\s*\(/);
 });
+
+test('sort then unique preserves preferred contact, newest send, and stable ties without mutating evidence', () => {
+  const rows = [
+    { account: 'A', primary: false, date: '2026-09-18', id: 'new-secondary' },
+    { account: 'B', primary: false, date: '2026-09-12', id: 'old' },
+    { account: 'A', primary: true, date: '2026-09-10', id: 'primary' },
+    { account: 'B', primary: false, date: '2026-09-15', id: 'new' },
+    { account: 'A', primary: true, date: '2026-09-10', id: 'tied-primary' },
+  ];
+  const original = structuredClone(rows);
+  const output = executeWorkflowTransform({
+    transform: { version: 1, expression: {
+      op: 'unique', keys: ['account'], value: {
+        op: 'sort', by: [{ column: 'primary', direction: 'desc' }, { column: 'date', direction: 'desc' }],
+        value: { op: 'get', from: 'steps.read.output' },
+      },
+    } }, inputs: {}, stepOutputs: { read: rows },
+  });
+  assert.deepEqual(output, [rows[2], rows[3]]);
+  assert.deepEqual(rows, original);
+});
+
+test('unique uses typed composite keys and keeps first occurrence', () => {
+  const rows = [{ a: '1', b: null }, { a: 1, b: null }, { a: 'a|b', b: 'c' }, { a: 'a', b: 'b|c' }, { a: '1', b: null }];
+  const output = executeWorkflowTransform({ transform: { version: 1, expression: {
+    op: 'unique', keys: ['a', 'b'], value: { op: 'literal', value: rows },
+  } }, inputs: {}, stepOutputs: {} });
+  assert.deepEqual(output, rows.slice(0, 4));
+});
+
+test('row selection rejects absent/non-scalar IDs and mixed sort types; explicit null sorts last', () => {
+  const run = (op: string, rows: unknown[], direction = 'asc') => executeWorkflowTransform({
+    transform: { version: 1, expression: { op, ...(op === 'sort' ? { by: [{ column: 'id', direction }] } : { keys: ['id'] }), value: { op: 'literal', value: rows } } },
+    inputs: {}, stepOutputs: {},
+  });
+  for (const op of ['sort', 'unique']) {
+    assert.throws(() => run(op, [{ wrong: 1 }]), /must exist/);
+    assert.throws(() => run(op, [{ id: {} }]), /finite scalar/);
+  }
+  assert.throws(() => run('sort', [{ id: 1 }, { id: '1' }]), /mixed scalar types/);
+  assert.deepEqual(run('sort', [{ id: null }, { id: 2 }, { id: 1 }]), [{ id: 1 }, { id: 2 }, { id: null }]);
+  assert.deepEqual(run('sort', [{ id: null }, { id: 2 }, { id: 1 }], 'desc'), [{ id: 2 }, { id: 1 }, { id: null }]);
+  for (const expression of [
+    { op: 'unique', keys: [] },
+    { op: 'unique', keys: ['__proto__'] },
+    { op: 'sort', by: [{ column: 'id', direction: 'sideways' }] },
+    { op: 'sort', by: [{ column: 'id', direction: 'asc', code: 'anything' }] },
+  ]) assert.equal(validateWorkflowTransform({ version: 1, expression: { ...expression, value: { op: 'literal', value: [] } } }).ok, false);
+});

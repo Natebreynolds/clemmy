@@ -23,6 +23,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { openMemoryDb } from './db.js';
+import { explicitlyNamesDeliverable } from './deliverable-recall-score.js';
 
 export interface DeliverableRecord {
   id: number;
@@ -332,7 +333,9 @@ export function searchDeliverables(query: string, limit = 6): DeliverableHit[] {
       if (overlap === 0) continue;
       const ageMs = Math.max(0, nowMs - Date.parse(row.createdAt));
       const recency = Math.max(0, 1 - ageMs / (30 * 24 * 60 * 60 * 1000)); // 30-day fade
-      const score = Math.min(1, overlap / Math.max(2, qTokens.size)) * 0.75 + recency * 0.25;
+      const exactTarget = explicitlyNamesDeliverable(query, row.target)
+        || (row.kind === 'file' && explicitlyNamesDeliverable(query, path.basename(row.target)));
+      const score = exactTarget ? 1 : Math.min(1, overlap / Math.max(2, qTokens.size)) * 0.75 + recency * 0.25;
       const hit: DeliverableHit = { ...row, score };
       if (row.kind === 'file') hit.stillExists = existsSync(row.target);
       hits.push(hit);

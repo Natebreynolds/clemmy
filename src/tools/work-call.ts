@@ -7,6 +7,7 @@
  * deterministic-retrieve turns do not register this schema.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { isToolMediaContent } from '../runtime/harness/tool-media-content.js';
 import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
@@ -2032,6 +2033,9 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         runContext,
         details as { toolCall?: { callId?: string; id?: string } } | undefined,
       );
+      // Preserve successful media across the reviewed carrier just as call_tool
+      // does. Refusals retain their existing text envelope and steering.
+      if (!frame.refusalKind && isToolMediaContent(output)) return output as unknown as string;
       const rendered = output instanceof ExternalWritePreDispatchResult
         ? output.output
         : typeof output === 'string'

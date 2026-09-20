@@ -242,6 +242,8 @@ export interface AttemptSignals {
    * only by the settlement seam, and only when no crossing left the machine.
    */
   hostExecuted?: boolean;
+  /** Nominal local read completion: returned bytes are content, not an error envelope. */
+  hostReadCompleted?: boolean;
   /**
    * The local result carried an EXPLICIT typed negative — `ok: false` — rather
    * than merely lacking a success flag. The two are not the same fact, and

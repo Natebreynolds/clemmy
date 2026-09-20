@@ -59,7 +59,7 @@ import { appendEvent } from './eventlog.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
-import { recordModelUsage } from '../usage-log.js';
+import { acceptedSourceIdentity, recordModelUsage } from '../usage-log.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import pino from 'pino';
@@ -1168,17 +1168,30 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   // recorded whether the key was present or whether the prefix bytes held, so
   // the gap could only be guessed at. Record the three numbers that decide it.
   try {
-    // The first few calls of a session: enough frames to see whether the
+    // The first few calls of an accepted turn: enough frames to see whether the
     // cacheable prefix is byte-identical call to call, quiet enough to live in
     // production. A prefix whose sha moves between frames can never cache, and
     // that is invisible from the usage numbers alone.
-    const shapeSeenKey = `${harnessRunContextStorage.getStore()?.sessionId ?? 'nosession'}:${shapeKey}`;
+    const shapeContext = harnessRunContextStorage.getStore();
+    const hasExactSource = Boolean(shapeContext?.sessionId)
+      && Number.isSafeInteger(shapeContext?.sourceUserSeq)
+      && (shapeContext?.sourceUserSeq ?? 0) > 0;
+    const acceptedSource = hasExactSource
+      ? acceptedSourceIdentity(shapeContext!.sessionId, shapeContext!.sourceUserSeq)
+      : undefined;
+    // A long chat must not exhaust all diagnostics in its first turn. Use the
+    // same exact source key as the usage ledger; never infer it from timing.
+    const shapeSeenKey = `${acceptedSource ?? shapeContext?.sessionId ?? 'nosession'}:${modelId}:${shapeKey}`;
     const seen = (loggedPrefixShapeFor.get(shapeSeenKey) ?? 0) + 1;
     loggedPrefixShapeFor.set(shapeSeenKey, seen);
     if (loggedPrefixShapeFor.size > 256) loggedPrefixShapeFor.clear();
     if (seen <= 5) {
       logger.info({
         model: modelId,
+        sessionId: shapeContext?.sessionId,
+        acceptedSource,
+        sourceUserSeq: hasExactSource ? shapeContext?.sourceUserSeq : undefined,
+        runAttemptId: shapeContext?.runAttemptId,
         cacheKeyPresent: Boolean(cacheKey),
         instructionsBytes: Buffer.byteLength(body.instructions ?? '', 'utf8'),
         toolsBytes: Buffer.byteLength(JSON.stringify(tools ?? []), 'utf8'),

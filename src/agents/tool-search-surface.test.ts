@@ -247,24 +247,33 @@ test('explicit local-memory-only turns load a bounded read surface and honor no-
   assert.doesNotMatch(catalog, /workflow_run|focus_clear|memory_remember/);
 });
 
-test('explicit remember and recent-conversation recall use the bounded memory surface', () => {
-  const store = localMemoryBuiltinScope(
+test('implicit memory requests retain general capabilities for accompanying work', () => {
+  for (const input of [
     'Remember this: the codeword for the Falcon project is tangerine-osprey-42.',
-  );
-  assert.ok(store?.has('memory_remember'), 'an explicit durable store keeps the write tool');
-  assert.equal(store?.has('workflow_run'), false);
+    'Remember this reporting preference: use minutes. Then read /tmp/report.txt.',
+    'Remember this preference and create a workflow for my daily summary.',
+    'What was the phrase I told you a moment ago? Then update my Space.',
+    'Can you improve the memory settings screen?',
+  ]) assert.equal(localMemoryBuiltinScope(input), null, input);
+  const restricted = localMemoryBuiltinScope('Use only local memory; do not write memory. What did I tell you?');
+  assert.ok(restricted?.has('memory_recall_all'));
+  assert.equal(restricted?.has('memory_remember'), false);
+  assert.equal(restricted?.has('workflow_run'), false);
+});
 
-  const recall = localMemoryBuiltinScope(
-    'What was the secret phrase for that bird-themed project I told you about a moment ago?',
-  );
-  assert.ok(recall?.has('memory_recall_all'));
-  assert.equal(recall?.has('memory_remember'), false, 'a recent-conversation lookup is read-only');
-
-  assert.equal(
-    localMemoryBuiltinScope('Can you improve the memory settings screen?'),
-    null,
-    'ordinary memory-ish product work keeps the general tool surface',
-  );
+test('ON: explicit Plan routes workflow_run through capability discovery', async () => {
+  const session = createSession({ kind: 'chat' });
+  const text = 'Plan one manual workflow_run of my saved workflow.';
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text, taskMode: { version: 1, kind: 'plan' } } });
+  const agent = await withFlag('on', () => buildOrchestratorAgent({
+    sessionId: session.id, sourceUserSeq: source.seq, userInput: text, allowToolJit: true,
+    hostFreshPlanning: { authority: { scope: 'primary_model_planning_catalog_v1' },
+      identity: { sessionId: session.id, sourceUserSeq: source.seq }, capabilities: [],
+      digest: '0'.repeat(64) } as never,
+  }));
+  assert.equal(namesOf(agent).has('workflow_run'), false);
+  assert.ok(namesOf(agent).has('tool_search'));
 });
 
 test('ON: uniquely named workflow execution keeps workflow_run first-class on a planning turn', async () => {

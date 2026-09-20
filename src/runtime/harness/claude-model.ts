@@ -45,6 +45,7 @@ import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadl
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
 import { recordModelUsage } from '../usage-log.js';
+import { recordWindowAcceptance } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
@@ -567,7 +568,7 @@ export function makeClaudeFetch(): typeof fetch {
     } as RequestInit & { dispatcher?: unknown });
     // ALWAYS persist an error trace (request body + response) to disk on ANY
     // non-2xx — 4xx (malformed: system placement / effort / cache_control), 429
-    // (YOUR usage quota: rate_limit_error), 529 (ANTHROPIC capacity:
+    // (rate_limit_error; scope depends on provider detail), 529 (ANTHROPIC capacity:
     // overloaded_error — "not your usage limit"), and 5xx. The Codex path traces;
     // the Claude path didn't. This makes "was it us or Anthropic?" answerable
     // from disk (the body names the error type). Best-effort; reads a clone so
@@ -607,22 +608,21 @@ export function makeClaudeFetch(): typeof fetch {
   }) as typeof fetch;
 }
 
-/** Classify an Anthropic non-2xx so "was it us or Anthropic?" is one glance:
- *  429 rate_limit_error = YOUR quota; 529 overloaded_error = ANTHROPIC capacity
- *  (not your usage limit); 4xx = malformed request (our bug); 5xx = backend. */
+/** Classify the observed response without inferring account exhaustion or
+ * assigning blame from a status alone. The retained response supplies detail. */
 function classifyClaudeHttpCause(status: number, body: string): string {
-  if (status === 429) return 'rate_limited (YOUR usage/rate quota)';
+  if (status === 429) return 'rate_limited (scope unconfirmed; inspect provider detail)';
   if (status === 529) return 'overloaded (ANTHROPIC capacity — not your usage limit)';
   if (/overloaded_error/.test(body)) return 'overloaded (ANTHROPIC capacity)';
-  if (/rate_limit_error/.test(body)) return 'rate_limited (YOUR usage/rate quota)';
+  if (/rate_limit_error/.test(body)) return 'rate_limited (scope unconfirmed; inspect provider detail)';
   if (status >= 500) return 'backend 5xx (ANTHROPIC server)';
-  if (status >= 400) return 'invalid_request (malformed by us)';
+  if (status >= 400) return 'request_rejected (inspect provider detail)';
   return 'unknown';
 }
 
 /** Persist a Claude error (request body + response) to BASE_DIR/state/
  *  claude-error-trace on ANY non-2xx, with the cause classified, so a rejection
- *  (malformed), a 429 (your quota) or a 529 (Anthropic overload) is diagnosable
+ *  (malformed), a 429 (rate limit) or a 529 (Anthropic overload) is diagnosable
  *  from disk. Mirrors the Codex trace pattern. Best-effort — never throws. */
 async function persistClaudeErrorTrace(res: Response, requestBody: BodyInit | null | undefined, status: number): Promise<void> {
   try {
@@ -845,12 +845,19 @@ class RawClaudeUsageRecordingModel implements Model {
     private readonly inner: Model,
     private readonly modelId: string,
     private readonly usageRecorder: typeof recordModelUsage,
+    private readonly windowRecorder: typeof recordWindowAcceptance,
   ) {}
 
   private record(response: ModelResponse, startedAt: number): void {
     try {
       const fields = rawClaudeUsageFields(response);
       if (fields.inputTokens === 0 && fields.outputTokens === 0) return;
+      // This wrapper sees a completed single provider response, unlike a
+      // headless run's potentially aggregated usage. Learn the proven prompt
+      // size including cache reads/writes, not just Anthropic's fresh input.
+      if (fields.inputTokens > 0 && fields.cachedInputTokens <= fields.inputTokens) {
+        try { this.windowRecorder(this.modelId, fields.inputTokens); } catch { /* best effort */ }
+      }
       const context = harnessRunContextStorage.getStore();
       this.usageRecorder({
         sessionId: context?.sessionId ?? 'unknown',
@@ -900,8 +907,9 @@ export function withRawClaudeUsageRecording(
   inner: Model,
   modelId: string,
   usageRecorder: typeof recordModelUsage = recordModelUsage,
+  windowRecorder: typeof recordWindowAcceptance = recordWindowAcceptance,
 ): Model {
-  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder);
+  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder, windowRecorder);
 }
 
 /** Per-request transport router (owner question, 2026-07-24: "why can't

@@ -973,7 +973,7 @@ function callTargetWitness(input: {
  * can contradict the gate is its own truth defect, so both now derive from here
  * and the card can only ever be equal to the gate or more conservative.
  */
-function dischargedRequirementSettlements(
+export function dischargedRequirementSettlements(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
   requirementId: string,
@@ -1054,6 +1054,25 @@ function dischargedRequirementSettlements(
         ownerLogicalToolCallId: row.logical_tool_call_id,
       });
       if (frozenVerification.status === 'verified') return true;
+      // A generic external operation may have no mutation/readback contract
+      // at all (for example a paid research POST or starting an async job).
+      // Its exact successful host settlement and retained response complete
+      // that invocation. Do not invent a verifier that no tool can satisfy.
+      // Explicit mutation/content verification contracts still govern below;
+      // this does not certify the task's final artifact or allow a replay.
+      if (row.effect_kind === 'external_write'
+        && row.outcome_kind === 'succeeded'
+        && row.requires_reconciliation === 0
+        && frozenVerification.status === 'not_applicable'
+        && !db.prepare(`SELECT 1 FROM expected_work_generated_artifact_contracts
+          WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+          .get(contract.identity.sessionId, contract.identity.sourceUserSeq, row.logical_tool_call_id)) {
+        const redeemed = redeemSuccessfulSettlementResultForHost({
+          sessionId: contract.identity.sessionId, sourceUserSeq: contract.identity.sourceUserSeq,
+          acceptedTaskId: contract.acceptedTaskId, logicalToolCallId: row.logical_tool_call_id,
+        });
+        if (redeemed.status === 'ok') return true;
+      }
       return generatedArtifactWriteContentVerified({
         sessionId: contract.identity.sessionId,
         sourceUserSeq: contract.identity.sourceUserSeq,

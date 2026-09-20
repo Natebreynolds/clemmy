@@ -4,7 +4,7 @@ import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { updateEnvKey } from '../tools/shared.js';
-import { claimPlanExecutionIngress, inspectPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
+import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 /**
  * Mobile PWA auth router — mounted at `/m` on the webhook server.
@@ -3892,6 +3892,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           if (rejoinPlanExecution(alias.receipt)) return;
         }
         assertReviewedPlanExecuteSessionIdle(requestedSessionId!, priorExecution?.runId);
+        if (!priorExecution) await preflightPlanExecutionIngress(executeIngress);
       } catch (error) {
         res.status(409).json({ error: 'PLAN_EXECUTE_CONFLICT', message: error instanceof Error ? error.message : 'Selected plan cannot execute.' });
         return;

@@ -318,7 +318,7 @@ test('an unrelated accepted source and check-in alone do not make ordinary chat 
   assert.equal(eligible(false), false);
 });
 
-test('incremental trajectory windows keep exact new content, discovery navigation and reopenable prior coverage', () => {
+test('incremental trajectory windows bound bulk content, keep discovery navigation and reopenable prior coverage', () => {
   const identity = accepted();
   const brief = 'The task brief has a decisive requirement at the end. EXACT_BRIEF_TAIL';
   retainedRead(identity, 'read_file', brief);
@@ -337,7 +337,12 @@ test('incremental trajectory windows keep exact new content, discovery navigatio
   retainedRead(accepted(), 'atlas__other_owner', 'UNRELATED_SOURCE_SECRET');
   events.closeEventLog();
   const second = sourceSettledReadEvidence({ ...identity, afterSettlementIndex: firstCursor });
-  assert.ok(second.summary.includes(docs), 'new documentation is complete, not keyword-filtered or truncated');
+  assert.ok(!second.summary.includes(docs), 'advisory review must not re-inflate a bulk result');
+  const bounded = second.results.find(r => r.toolName === 'atlas__reference');
+  assert.equal(bounded?.contentComplete, false);
+  assert.equal(bounded?.viewBounded, true);
+  assert.ok((bounded?.shownByteCount ?? Infinity) <= DEFAULT_TOOL_RESULT_MAX_CHARS + 1_000);
+  assert.ok(bounded?.resultHandleId && bounded?.contentDigest, 'full source remains addressable');
   assert.equal(second.summary.split('EXACT_DOCUMENTATION_TAIL').length - 1, 1, 'identical bytes expand once');
   assert.doesNotMatch(second.summary, /UNRELATED_SOURCE_SECRET/);
   assert.equal(second.results.find(r => r.toolName === 'read_file')?.contentDisposition, 'prior_review_window');
@@ -396,7 +401,7 @@ test('summarized discovery keeps each operation input contract so a saved action
   assert.doesNotMatch(evidence.summary, /PROSE_ONLY_DESCRIPTION/);
 });
 
-test('a repeated exact call is judged by its latest read; its earlier reads are its history', () => {
+test('repeated exact calls retain distinct observed states for completion review', () => {
   const identity = accepted('Is the export finished?');
   retainedRead(identity, 'workflow_run_status', { status: 'running', step: 'EARLY_POLL' }, false, false, false, { id: 'run-status-1', args: { runId: 'export-1' } });
   retainedRead(identity, 'workflow_run_status', { status: 'completed', step: 'FINAL_STATE' }, false, false, false, { id: 'run-status-2', args: { runId: 'export-1' } });
@@ -405,14 +410,14 @@ test('a repeated exact call is judged by its latest read; its earlier reads are 
   const evidence = sourceSettledReadEvidence(identity);
   assert.equal(evidence.count, 3);
   const [early, final, other] = evidence.results;
-  assert.equal(early?.contentDisposition, 'superseded_read');
-  assert.ok(early?.resultHandleId && early.contentDigest, 'a superseded read keeps its authenticated handle');
+  assert.equal(early?.contentComplete, true);
+  assert.ok(early?.resultHandleId && early.contentDigest, 'each state keeps its authenticated handle');
   assert.equal(final?.contentComplete, true);
   assert.equal(other?.contentComplete, true, 'different arguments are a different call');
-  assert.doesNotMatch(evidence.summary, /EARLY_POLL/);
+  assert.match(evidence.summary, /EARLY_POLL/);
   assert.match(evidence.summary, /FINAL_STATE/);
   assert.match(evidence.summary, /OTHER_RUN/);
-  assert.match(evidence.summary, /the same call ran again later as logicalCall=run-status-2/);
+  assert.equal(early?.contentDisposition, undefined);
 });
 
 test('an image in a retained result is described for review, never inlined as base64', () => {
@@ -853,7 +858,7 @@ test('host reviews the exact refresh objective and curly-apostrophe promise, the
 test('an unchanged honest continuation with no new evidence reuses the rejection', async () => {
   // Live 2026-09-15 ("edit this event and add a description"): the first
   // verdict said not done, the continuation made no further call and answered
-  // "I still can't update it", and the pinned judge was asked again on
+  // the identical failure report, and the pinned judge was asked again on
   // identical evidence — 23–58 s per verdict, three identical negatives in
   // one turn. On an ACTION objective the second honest reply is judge-eligible
   // (the refresh fixture above is tool_intent, so it never was), and the
@@ -887,7 +892,7 @@ test('an unchanged honest continuation with no new evidence reuses the rejection
 test('a corrected read answer gets a fresh verdict without another business call or completion verb', async () => {
   const corrected = 'The inbox contains the 2:05 email and the 9:00 email.';
   const result = await runHost({ captured: true, incoming: true,
-    text: 'List every email in my inbox today.',
+    text: 'Update the inbox summary to list every email received today.',
     firstReply: 'The inbox contains the 9:00 email.', secondReply: corrected,
     readResult: { emails: [{ time: '2:05' }, { time: '9:00' }] },
     firstVerdict: { done: false, reason: 'The 2:05 email is missing from the answer.' },
@@ -1007,9 +1012,9 @@ test('writes that did not complete and calls refused before they ran are evidenc
   assert.equal(sourceIncompleteAttemptsEvidence(accepted('Nothing attempted.')), undefined);
 });
 
-test('a blocked review\'s finding is the note the owner reads; a plain negative keeps the generic note', () => {
+test('a blocked finding replaces the rejected draft; a plain negative keeps the generic note', () => {
   for (const [blocked, expected] of [
-    [true, /Verification note: The invite was not changed because the update was refused before it reached the calendar\./],
+    [true, /^The invite was not changed because the update was refused before it reached the calendar\.$/],
     [false, /Verification note: the completion review found this did not meet the request\./],
   ] as const) {
     const identity = accepted('Update the invite description.');
@@ -1021,6 +1026,12 @@ test('a blocked review\'s finding is the note the owner reads; a plain negative 
     const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
       presentation: { kind: 'answer', text: 'I updated the invite.' } });
     assert.match(committed.presentation.text, expected);
+    if (blocked) {
+      const audit = events.listEvents(identity.sessionId, { types: ['guardrail_tripped'] })
+        .find(event => event.data.kind === 'completion_review_rejected_draft');
+      assert.equal(audit?.data.rejectedText, 'I updated the invite.');
+      assert.equal(committed.event.data.rejectedCompletionText, undefined);
+    }
     assert.notEqual(committed.presentation.status, 'done');
   }
 });

@@ -1,3 +1,4 @@
+import { retainFactEntityLinks } from './retained-fact-entities.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
@@ -12,7 +13,7 @@ import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
 import { captureFactEvidence, getFactEvidence, linkFactEvidence, listMemoryPolicies, syncMemoryPolicyForFact, type FactEvidence } from './temporal-memory.js';
-import { attachGroundedFactResources, resolveEntityIdsForText, setFactEntityLinks } from './relations.js';
+import { attachGroundedFactResources, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
 import {
   requireStandingPolicyDescriptor,
   type StandingPolicyDescriptor,
@@ -294,16 +295,19 @@ function captureEvidenceBestEffort(fact: ConsolidatedFact, input: RememberInput)
 
 /** Direct/manual claims are themselves durable evidence that the named entity
  * belongs to the fact. Promote only entities already resolved by an exact
- * canonical-name/alias match and only after a surviving evidence excerpt was
+ * canonical-name match and only after a surviving evidence excerpt was
  * written; derived facts are linked later by the reflection consolidation
  * service against their original tool episode. */
 function captureDirectFactEntityLinksBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
   if (input.derivedFrom?.callId || input.derivedFrom?.sessionId) return;
   try {
-    const entityIds = resolveEntityIdsForText(fact.content, 8);
-    if (entityIds.length === 0) return;
     const evidence = getFactEvidence(fact.id).find((item) => item.excerpt.trim().length > 0 && (item.status === 'available' || item.status === 'partial'));
     if (!evidence) return;
+    // A unique alias today can prefix a new identity not registered yet.
+    // Alias-only evidence stays available to recall/extraction, not a direct
+    // stored identity assertion. Entity extraction can ground the new name.
+    const entityIds = resolveGroundedEntityIdsForText(fact.content, evidence.excerpt, 8, true);
+    if (entityIds.length === 0) return;
     setFactEntityLinks(fact.id, entityIds, {
       linkType: 'extracted',
       confidence: fact.confidence ?? fact.trustLevel ?? 1,
@@ -603,6 +607,7 @@ export function markFactSupersededBy(
       WHERE id = ? AND active = 1
     `).run(boundary, byFactId, now, id);
     if (Number(changed.changes ?? 0) !== 1) return false;
+    retainFactEntityLinks(db, id, byFactId);
     if (target.pinned && options.transferPin) {
       db.prepare('UPDATE consolidated_facts SET pinned = 1, updated_at = ? WHERE id = ?')
         .run(now, byFactId);
@@ -643,6 +648,7 @@ export function supersedeFact(
       SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
       WHERE id = ?
     `).run(boundary, replacement.id, now, existing.id);
+    retainFactEntityLinks(db, existing.id, replacement.id);
     if (existing.pinned) {
       db.prepare('UPDATE consolidated_facts SET pinned = 1 WHERE id = ?').run(replacement.id);
     }
@@ -1809,11 +1815,15 @@ export const OBSERVATION_AGE_DISCLOSURE_DAYS = 7;
  * July it came from.
  */
 export function observationProvenanceSuffix(
-  fact: Pick<ConsolidatedFact, 'derivedFrom' | 'sourceApp' | 'extractedAt' | 'createdAt'>,
+  fact: Pick<ConsolidatedFact, 'derivedFrom' | 'sourceApp' | 'extractedAt' | 'createdAt'>
+    & Partial<Pick<ConsolidatedFact, 'id' | 'derivationDepth'>>,
   nowMs: number = Date.now(),
 ): string {
   const tool = fact.derivedFrom?.tool?.trim() ?? '';
   const app = fact.sourceApp?.trim() ?? '';
+  if ((fact.derivationDepth ?? 0) > 0 || tool === 'recursive_reflection') {
+    return ` _(inferred pattern${fact.id ? `, fact:${fact.id}` : ''}; verify source scope, not an explicit user rule)_`;
+  }
   // No external origin means nobody observed it — it was stated, not read.
   if (!tool && !app) return '';
   const observedAt = fact.extractedAt ?? fact.createdAt;

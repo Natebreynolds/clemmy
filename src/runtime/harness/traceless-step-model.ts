@@ -19,6 +19,15 @@
 import { Usage, getCurrentTrace } from '@openai/agents-core';
 import type { Model, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
 
+/** Read transport metadata only; never infer the served model from output text. */
+export function providerReportedModel(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const row = value as { providerData?: { model?: unknown }; type?: string; response?: unknown };
+  if (row.type === 'response_done') return providerReportedModel(row.response);
+  const model = row.providerData?.model;
+  return typeof model === 'string' && model.trim() ? model.trim() : undefined;
+}
+
 export function withTracelessStep(inner: Model): Model {
   return {
     async getResponse(request: ModelRequest): Promise<ModelResponse> {
@@ -26,8 +35,10 @@ export function withTracelessStep(inner: Model): Model {
       const stream = inner.getStreamedResponse({ ...request, tracing: false });
       let done: Extract<StreamEvent, { type: 'response_done' }> | undefined;
       let finishReason: unknown;
+      let servedModel: string | undefined;
       for await (const event of stream) {
         if (event.type === 'response_done') done = event;
+        servedModel = providerReportedModel(event) ?? servedModel;
         const metadata = event as { type?: string; event?: { type?: string; finishReason?: unknown } };
         if (metadata.type === 'model' && metadata.event?.type === 'finish') finishReason = metadata.event.finishReason;
       }
@@ -47,6 +58,7 @@ export function withTracelessStep(inner: Model): Model {
         providerData: {
           ...(done.response as { providerData?: Record<string, unknown> }).providerData,
           ...(finishReason === undefined ? {} : { finishReason }),
+          ...(servedModel ? { model: servedModel } : {}),
         },
       };
     },

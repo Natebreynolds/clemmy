@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isProviderCapacityExhausted, providerCapacityErrorText } from './provider-capacity.js';
+import { isProviderCapacityExhausted, providerCapacityErrorText, isProviderExtraUsageUnavailable } from './provider-capacity.js';
 
 test('recognizes Anthropic model-scoped extra-usage exhaustion carried by HTTP 400', () => {
   const live = {
@@ -13,6 +13,7 @@ test('recognizes Anthropic model-scoped extra-usage exhaustion carried by HTTP 4
     },
   };
   assert.equal(isProviderCapacityExhausted(live), true);
+  assert.equal(isProviderExtraUsageUnavailable(live), true);
   assert.match(providerCapacityErrorText(live), /out of extra usage/i);
 });
 
@@ -27,4 +28,7 @@ test('recognizes established plan/quota spellings without treating ordinary 400s
   }
   assert.equal(isProviderCapacityExhausted({ status: 400, message: 'invalid schema' }), false);
   assert.equal(isProviderCapacityExhausted('429 Too Many Requests'), false, 'a short generic 429 is not a durable plan-limit signal');
+  for (const value of ['429 Too Many Requests', 'Weekly limit reached.', 'invalid schema']) {
+    assert.equal(isProviderExtraUsageUnavailable(value), false, 'do not invent an extra-usage scope');
+  }
 });

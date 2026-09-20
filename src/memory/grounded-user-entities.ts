@@ -1,3 +1,4 @@
+import { extractGroundedUserProjects } from './grounded-user-projects.js';
 import { getFact } from './facts.js';
 import { upsertEntity, type EntityIdentifierInput } from './entity-identity.js';
 import { addFactEntityLinks } from './relations.js';
@@ -178,5 +179,39 @@ export function attachGroundedUserPeople(input: {
     }
   }
   result.entityIds = Array.from(new Set(result.entityIds));
+  return result;
+}
+
+
+/** Project nodes preserve a mentioned identity, not proof that every linked
+ * fact applies exclusively to it. Require the exact name in both source and
+ * committed fact, and retain the original episode as grounding. */
+export function attachGroundedUserProjects(input: {
+  factId?: number | null;
+  episodeId: string;
+  sourceText: string;
+  sourceUri?: string | null;
+}): GroundedUserPeopleAttachment {
+  const names = extractGroundedUserProjects(input.sourceText);
+  const result: GroundedUserPeopleAttachment = { extracted: names.length, observed: 0, linked: 0, entityIds: [], failures: [] };
+  const fact = input.factId ? getFact(input.factId) : null;
+  for (const name of names) {
+    // Unlike a broad entity observation, this fast path exists to ground a
+    // stored preference. A missing or differently named fact creates no node.
+    if (!fact || !textMentionsExactName(fact.content, name)) continue;
+    try {
+      const id = upsertEntity({ type: 'project', name, confidence: 1,
+        evidenceEpisodeId: input.episodeId, sourceUri: input.sourceUri ?? undefined,
+        sourceFactId: fact.id, sourceKind: 'user_turn' });
+      result.entityIds.push(id);
+      result.observed += 1;
+      addFactEntityLinks(fact.id, [id], { linkType: 'extracted', confidence: 1,
+        evidenceEpisodeId: input.episodeId, evidenceExcerpt: input.sourceText,
+        sourceUri: input.sourceUri ?? undefined, sourceKind: 'fact_link', incrementMention: false });
+      result.linked += 1;
+    } catch (error) {
+      result.failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 220));
+    }
+  }
   return result;
 }

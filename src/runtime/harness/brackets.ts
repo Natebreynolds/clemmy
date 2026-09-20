@@ -23,7 +23,7 @@ import {
   isTerminalPhysicalDispatchOwner,
 } from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
-import { formatRecallableToolText } from './tool-output-format.js';
+import { formatRecallableToolText, explicitLocalReadPreviewBudget } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -4635,7 +4635,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             ...((shellOutcome
               || bracketOutcome?.carrierMalformed
               || carrierReturnedFailure
-              || typedPreDispatchFailure)
+              || Object.keys(typedResultSignals).length > 0)
               ? {
                   signals: hostSignals,
                 }
@@ -4840,7 +4840,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
-        }, () => formatRecallableToolText(value, { hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
+        }, () => formatRecallableToolText(value, { maxChars: explicitLocalReadPreviewBudget(tool.name, parsedInput), hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
           const result = await invokePromise;
@@ -5164,7 +5164,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         ...((shellOutcome
           || bracketOutcome?.carrierMalformed
           || carrierReturnedFailure
-          || typedPreDispatchFailure)
+          || Object.keys(typedResultSignals).length > 0)
           ? {
               signals: {
                 ...attemptSignalsFromShellExecutionOutcome(shellOutcome),

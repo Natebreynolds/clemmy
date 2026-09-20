@@ -64,10 +64,41 @@ const workspaceDatasetStorage: HostLocalWriteStorageAdapter = Object.freeze({
   },
 });
 
+const localFileStorage: HostLocalWriteStorageAdapter = Object.freeze({
+  async execute(call: AttestedTransportCall): Promise<unknown> {
+    const prepared = prepareReviewedLocalToolExecution(call);
+    if (prepared.adapter !== 'local_file_revision_v1') throw new Error('Not a reviewed file revision');
+    const carrier = await import('./local-file-workflow-carrier.js');
+    return carrier.executeReviewedLocalFile(prepared.args);
+  },
+  async reconcile(input: HostLocalWriteReconcileInput): Promise<AttestedTransportReconcileResult> {
+    const observed = observeReviewedLocalTool(input.operationId);
+    if (!observed || observed.execution.reconciliation !== 'local_file_revision_v1'
+      || !reviewedLocalExpectedIdentityMatches(input, observed)) return { exists: false };
+    const carrier = await import('./local-file-workflow-carrier.js');
+    return carrier.reconcileReviewedLocalFile(input.artifactId);
+  },
+});
+
+const localFileReadStorage: HostLocalWriteStorageAdapter = Object.freeze({
+  async execute(call: AttestedTransportCall): Promise<unknown> {
+    const prepared = prepareReviewedLocalToolExecution(call);
+    if (prepared.adapter !== 'local_file_read_v1') throw new Error('Not a reviewed file read');
+    const { executeLocalFileRead } = await import('../../tools/computer-tools.js');
+    const { InvalidArgumentsPreDispatchResult } = await import('./attempt-settlement.js');
+    const result = await executeLocalFileRead(prepared.args, undefined, undefined, { failOnReadError: true, completeOutput: true });
+    if (result instanceof InvalidArgumentsPreDispatchResult) throw new Error(String(result));
+    return { result: { data: { path: prepared.args.path, content: result } }, complete: true };
+  },
+  async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
+});
+
 export const reviewedLocalStorageCarrier: HostLocalWriteCarrier = Object.freeze({
   select(input: { operationId: string; accountId: string }) {
     if (input.accountId !== REVIEWED_LOCAL_ACCOUNT) return null;
     const observed = observeReviewedLocalTool(input.operationId);
+    if (observed?.execution.adapter === 'local_file_read_v1') return localFileReadStorage;
+    if (observed?.execution.adapter === 'local_file_revision_v1') return localFileStorage;
     if (observed?.execution.adapter !== 'workspace_dataset_v1') return null;
     return workspaceDatasetStorage;
   },

@@ -75,6 +75,8 @@ export const WorkerToolInputSchema = z.object({
     .string()
     .min(1)
     .describe('Every source fact the isolated worker needs.'),
+  retainedResultIds: z.array(z.string().min(1)).max(32).nullable().optional()
+    .describe('Exact parent call IDs or result handles to share read-only with this worker. Query these with tool_output_query; do not copy full payloads into context.'),
   instructions: z
     .string()
     .min(1)
@@ -127,6 +129,11 @@ export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
  * is driving.
  */
 export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
+  itemContexts: z.array(z.object({
+    item: z.string().min(1),
+    context: z.string().min(1),
+  })).max(256).nullable().optional()
+    .describe('Per-item facts; when supplied, exactly one entry per item. Keep context above shared-only. Each worker receives shared context plus its own entry, never sibling entries.'),
   // New live calls must state external authority explicitly. The base packet
   // remains optional for durable pre-upgrade packets recovered from disk.
   externalMcpToolNames: ExternalMcpToolNamesSchema
@@ -147,6 +154,30 @@ export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
 });
 
 export type WorkerToolCall = z.infer<typeof WorkerToolCallSchema>;
+
+/** Validate the whole partition before any child starts; never silently drop
+ * facts for a misspelled, duplicated or missing item. */
+export function workerItemContexts(items: readonly string[], rows: WorkerToolCall['itemContexts']): Map<string, string> {
+  const contexts = new Map<string, string>();
+  if (rows == null) return contexts;
+  const selected = new Set(items);
+  for (const row of rows) {
+    const item = row.item.trim();
+    if (!selected.has(item)) throw new Error(`itemContexts names an unselected item: ${item}`);
+    if (contexts.has(item)) throw new Error(`itemContexts repeats item: ${item}`);
+    if (!row.context.trim()) throw new Error(`itemContexts has no facts for item: ${item}`);
+    contexts.set(item, row.context);
+  }
+  for (const item of items) {
+    if (!contexts.has(item)) throw new Error(`itemContexts is missing item: ${item}`);
+  }
+  return contexts;
+}
+
+export function workerContextForItem(shared: string, contexts: ReadonlyMap<string, string>, item: string): string {
+  const own = contexts.get(item);
+  return own === undefined ? shared : `${shared}\n\nItem context:\n${own}`;
+}
 
 /** A model can serialize an absent item as the LITERAL string "null" (the
  *  connected_account_id:"null" Apify class) — or pass an UNRESOLVED TEMPLATE
@@ -313,6 +344,7 @@ export function workerPacketKey(input: WorkerToolInput): string {
     // exactly (no placeholder field). New typed calls add an explicit
     // discriminator; null/[] are intentionally equivalent local-only leases.
     ...(input.externalMcpToolNames === undefined ? [] : [externalMcpLeaseKey]),
+    ...(input.retainedResultIds?.length ? [`retained-results:${JSON.stringify([...new Set(input.retainedResultIds)].sort())}`] : []),
     input.context,
     input.instructions,
     input.expectedOutput,
@@ -380,7 +412,7 @@ export function buildWorkerJobPrompt(inputOrOptions: WorkerToolInput | WorkerToo
   // empty/disabled). resolvedTools stays authoritative — this only supplements.
   let remembered = '';
   try {
-    remembered = renderToolChoicesForContext(8, undefined, input.objective);
+    remembered = renderToolChoicesForContext(8, undefined, input.objective, input.resolvedTools);
   } catch {
     remembered = '';
   }

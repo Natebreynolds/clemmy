@@ -1,5 +1,8 @@
+import { reviewPlanWithinRepairBudget } from '../runtime/harness/plan-review-repair-policy.js';
 import { retainPlanPreparationDraft, loadRetainedPlanDraft } from '../runtime/harness/plan-preparation-draft.js';
-import { reviewPlanForPublication } from '../runtime/harness/plan-publication-review.js';
+import { reviewPlanForPublication, planReviewDigest } from '../runtime/harness/plan-publication-review.js';
+import { publicationReviewStatus, planPublicationMessage } from '../runtime/harness/plan-publication-receipt.js';
+import { refreshRetainedPlanPreparation, attachReviewedPlanPreparation } from '../runtime/harness/reviewed-plan-runtime.js';
 /** Full plan publication is a host-owned artifact write, never execution admission. */
 import { FreshActionPlanDraftSchema } from './plan-tools.js';
 import { tool } from '@openai/agents';
@@ -9,8 +12,8 @@ import { acceptedTaskModeIdentity } from '../runtime/harness/accepted-task-mode.
 import { parsePlanRevisionRef } from '../runtime/harness/task-mode.js';
 import { getPlanRevision, getPlanRevisionForSource, publishPlanRevision, type PlanStructuredOutline, type PlanArtifactV1 } from '../runtime/harness/plan-artifacts.js';
 import { currentReviewedProviderIdentity, reviewedProviderIdentityMismatch } from '../runtime/harness/reviewed-provider-identity.js';
-import { loadDurableAuthorizedLocalPlanningDefinition, resolveConfiguredLocalPlanningTool } from '../runtime/harness/local-planning-capability.js';
-import { currentPrimaryModelPlanningDescriptor, restoreSelectedPlanningCallable, snapshotPrimaryModelPlanningContext, snapshotPrimaryModelSelectedStagedPlanningDescriptors, type HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
+import { loadDurableAuthorizedLocalPlanningDefinition, observeSelectedLocalPlanningDisclosureCandidate, resolveConfiguredLocalPlanningTool } from '../runtime/harness/local-planning-capability.js';
+import { currentPrimaryModelPlanningDescriptor, disclosePrimaryModelPlanningCapabilities, restoreSelectedPlanningCallable, snapshotPrimaryModelPlanningContext, snapshotPrimaryModelSelectedStagedPlanningDescriptors, type HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { digestSchema } from './tool-contract-store.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../shared/closed-canonical-json.js';
 import { validateProofProviderArguments } from '../runtime/harness/proof-provider-args.js';
@@ -26,7 +29,7 @@ const bindingSchema = z.object({ producerStepId: z.string().min(1), outputPath: 
 const stepSchema = z.object({
   id: z.string().min(1).max(160), action: z.string().min(1),
   effect: z.enum(['none', 'compute', 'read', 'local_write', 'external_write', 'admin']).default('compute').describe('For tool steps the host derives the effect from capabilityRef. For reasoning use none, or compute when recording an output.'),
-  capabilityRef: z.string().nullable().default(null), staticArguments: z.record(z.string(), z.unknown()).default({}),
+  capabilityRef: z.string().nullable().default(null).describe('Exact capabilityRef supplied by the native tool description or discovery; do not use a bare tool name. Null for reasoning steps.'), staticArguments: z.record(z.string(), z.unknown()).default({}),
   dynamicBindings: z.array(bindingSchema).default([]), dependsOn: z.array(z.string()).default([]).describe('Required successful producers, not attempted lookups. A compute step can investigate conditional sources through contextual reads before recording its synthesis; describe that method in action. Do not make an optional lookup and its fallback mandatory dependencies.'),
   subagentRole: z.string().nullable().default(null), verification: z.string().min(1),
   forEach: PlanCollectionSchema.optional().describe('Repeat this one operation over an exact collection, with durable progress per member. Do not duplicate the step for every record.'),
@@ -107,7 +110,7 @@ export const PlanPublicationInputSchema = z.object({
   structured_plan: PlanPublicationOutlineSchema.optional(),
   readiness: z.enum(['ready', 'needs_input']).default('ready'),
   missing_prerequisites: z.array(z.string().min(1)).default([]),
-  base_ref_json: z.string().nullable().default(null),
+  base_ref_json: z.string().nullable().default(null).describe('Exact prior {planId,revision,digest} for a revision. With full_text and structured_plan omitted, reuse that ready plan unchanged and run fresh preparation/review; no need to retransmit it.'),
   draft_digest: z.string().length(64).optional().describe('Repair only: copy the exact digest returned by a failed preparation. Omit this field entirely for a new full plan; never invent a digest. Requires step_patches.'),
   step_patches: z.array(stepPatchSchema).min(1).optional().describe('Repair only: [{step_id, changes}] for existing steps, paired with the returned draft_digest. Put every changed step field inside changes. Omitted steps and full_text are retained. To add, remove or reorder steps, submit the complete structured_plan and full_text without draft_digest or step_patches.'),
 }).strict();
@@ -116,16 +119,18 @@ class RetainedPlanPreparationError extends Error {
   constructor(message: string, readonly draftDigest: string) { super(message); }
 }
 
-function publicationReceipt(artifact: PlanArtifactV1, recovered = false): string {
+export function publicationReceipt(artifact: PlanArtifactV1, recovered = false): string {
+  const reviewStatus = publicationReviewStatus(planReviewDigest({
+    fullText: artifact.fullText, structuredPlan: artifact.structuredPlan,
+    readiness: artifact.readiness, missingPrerequisites: artifact.missingPrerequisites,
+  }), listEvents(artifact.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(event => event.data.sourceUserSeq === artifact.sourceUserSeq).map(event => event.data));
   return JSON.stringify({ ok: true,
     planArtifactRef: { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest },
     readiness: artifact.readiness,
+    reviewStatus,
     ...(recovered ? { status: 'already_published' } : {}),
-    message: recovered
-      ? 'This source already saved the plan referenced here. Return that exact saved plan; no replacement was published. Changes belong in a new Plan turn.'
-      : artifact.readiness === 'needs_input'
-        ? 'The partial plan and question are saved. The answer continues planning; prepare a ready revision before the user selects Execute. No business execution has started.'
-        : 'The full plan is saved for review. The user can Execute this exact revision. No business execution has started.' });
+    message: planPublicationMessage(artifact.readiness, reviewStatus, recovered) });
 }
 
 export function applyPlanDraftPatches(draft: { fullText: string; structuredPlan: PlanStructuredOutline; base: unknown }, args: z.infer<typeof PlanPublicationInputSchema>) {
@@ -348,7 +353,24 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
     const descriptor = (input.planning && step.capabilityRef
       ? currentPrimaryModelPlanningDescriptor({ authority: input.planning.authority, identity: input, capabilityRef: step.capabilityRef })
       : null) ?? descriptors.find(entry => entry.id === step.capabilityRef);
-    const local = step.capabilityRef ? await loadDurableAuthorizedLocalPlanningDefinition({ ...input, capabilityRef: step.capabilityRef }) : null;
+    let local = step.capabilityRef ? await loadDurableAuthorizedLocalPlanningDefinition({ ...input, capabilityRef: step.capabilityRef }) : null;
+    // A ready native plan need not spend a model round trip asking discovery
+    // to copy a schema the host already owns. Reobserve the exact configured
+    // registry contract and publish it through the ordinary source-bound door.
+    // Never replace a changed, ambiguous or corrupt existing disclosure.
+    if (input.planning && step.capabilityRef && local?.ok === false && local.reason === 'not_found'
+      && snapshot?.identity.sessionId === input.sessionId
+      && snapshot.identity.sourceUserSeq === input.sourceUserSeq) {
+      const candidate = await observeSelectedLocalPlanningDisclosureCandidate(step.capabilityRef);
+      if (candidate && !currentToolAbortSignal()?.aborted) {
+        const lease = harnessRunContextStorage.getStore()?.dispatchLease;
+        if (lease) assertDispatchLeaseCurrent(lease);
+        await disclosePrimaryModelPlanningCapabilities({
+          authority: input.planning.authority, signal: currentToolAbortSignal(), candidates: [candidate],
+        });
+        local = await loadDurableAuthorizedLocalPlanningDefinition({ ...input, capabilityRef: step.capabilityRef });
+      }
+    }
     const localDefinition = local?.ok ? local.definition : null;
     const selectedDescriptor = descriptor ?? localDefinition?.descriptor;
     if (!step.capabilityRef || !selectedDescriptor) {
@@ -445,7 +467,7 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
 /** Compile the duplicate tracking representation from reviewed steps and host
  * contracts. No task prose, guessed capability, new effect, or account enters
  * this projection. The full outline remains the immutable Execute contract. */
-function deriveExecutionDraft(
+export function deriveExecutionDraft(
   outline: z.infer<typeof PlanPreparationSchema>,
   descriptors: ReadonlyMap<string, HostCapabilityDescriptorV1>,
 ): z.infer<typeof FreshActionPlanDraftSchema> {
@@ -456,7 +478,17 @@ function deriveExecutionDraft(
     return step.capabilityRef ? [id] : toolDependencies(step.dependsOn);
   }))];
   const writes = toolSteps.filter(step => ['local_write', 'external_write', 'admin'].includes(step.effect));
-  const destination = writes.map(step => descriptors.get(step.id)!).find(row => row.destinationPosture);
+  // A tracking graph can contain several independent artifacts and both
+  // creation and updates. The first write's posture is not a destination for
+  // every other operation. Emit a common posture only when all target-bearing
+  // contracts agree; exact paths, accounts and dynamic handles remain enforced
+  // by the reviewed step bindings at the call boundary.
+  const targets = toolSteps.map(step => descriptors.get(step.id)!).filter(row => row.destinationPosture);
+  const firstTarget = targets[0];
+  const destination = firstTarget && targets.every(row =>
+    row.deliverableKind === firstTarget.deliverableKind
+      && row.destinationPosture === firstTarget.destinationPosture
+      && row.handleRequired === firstTarget.handleRequired) ? firstTarget : null;
   return FreshActionPlanDraftSchema.parse({
     criteria: outline.successCriteria,
     cardinality: null,
@@ -515,6 +547,19 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
         if (!args.draft_digest) throw new Error('Draft repair requires the exact draft_digest returned with the retained draft.');
         draft = applyPlanDraftPatches(loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest }),
           { ...args, structured_plan: undefined, step_patches: args.step_patches ?? [] });
+      } else if (args.base_ref_json && !args.full_text && !args.structured_plan) {
+        const prior = getPlanRevision({ sessionId: context.sessionId, principalId: source.principalId,
+          ref: parsePlanRevisionRef(JSON.parse(args.base_ref_json)) });
+        if (prior.readiness !== 'ready' || prior.missingPrerequisites.length || !prior.structuredPlan) {
+          throw new Error('Only a ready plan without unresolved prerequisites can be reused unchanged.');
+        }
+        const refreshed = await refreshRetainedPlanPreparation(prior);
+        assertActive();
+        if (planning) await attachReviewedPlanPreparation(planning, refreshed.checked);
+        draft = { fullText: prior.fullText, baseRefJson: args.base_ref_json, raw: {
+          steps: refreshed.artifact.structuredPlan!.steps, successCriteria: prior.structuredPlan.successCriteria,
+          subagents: prior.structuredPlan.subagents,
+        } };
       } else {
         if (!args.full_text || (!args.structured_plan && args.readiness !== 'needs_input')) throw new Error('A ready plan requires full_text and structured_plan. For an unresolved user question, publish full_text with readiness needs_input; the executable outline can wait.');
         const completedIds = args.structured_plan ? completedPlanStepIds(args.structured_plan) : [];
@@ -560,23 +605,24 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
       // Review this candidate, not a pending advisory about an earlier draft.
       const candidate = { fullText: draft.fullText, structuredPlan, readiness: args.readiness,
         missingPrerequisites: [...new Set([...args.missing_prerequisites, ...(structuredPlan.preparationIssues as string[])])] };
-      // PLAN IS BEST EFFORT. The completion reviewer catches a plan that
-      // cannot execute; it must not hold a structurally sound plan hostage to
-      // wording. Two send-backs on one source are the budget: the third
-      // candidate publishes, and the reviewer's last note rides along as
-      // advisory (the Execute judge still measures the output).
+      // Bound repair send-backs, not review freshness. Even the final candidate
+      // needs its own verdict: an earlier draft's failure cannot describe the
+      // revised bytes delivered to the user. After the repair budget, publish
+      // this candidate with its actual review disposition and do not loop.
       const priorReviewRounds = listEvents(context.sessionId, { types: ['goal_alignment_judged'] })
         .filter(event => event.data.sourceUserSeq === context.sourceUserSeq && event.data.fulfills === false).length;
-      const review = priorReviewRounds >= PLAN_REVIEW_SEND_BACK_BUDGET ? 'done' : await reviewPlanForPublication(candidate);
+      const review = await reviewPlanWithinRepairBudget(
+        () => reviewPlanForPublication(candidate), priorReviewRounds, PLAN_REVIEW_SEND_BACK_BUDGET,
+      );
       assertActive();
-      if (priorReviewRounds >= PLAN_REVIEW_SEND_BACK_BUDGET) {
+      if (review.budgetSpent) {
         try {
           appendEvent({ sessionId: context.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
             kind: 'plan_review_budget_spent', sourceUserSeq: context.sourceUserSeq, rounds: priorReviewRounds,
           } });
         } catch { /* advisory */ }
       }
-      if (review === 'continue') {
+      if (review.requestRepair) {
         const digest = retainPlanPreparationDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
           fullText: draft.fullText, structuredPlan, baseRefJson: draft.baseRefJson });
         return JSON.stringify({ ok: true, published: false, status: 'review_feedback', draft_digest: digest,

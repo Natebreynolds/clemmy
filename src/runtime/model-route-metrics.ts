@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { providerReportedModel } from './harness/traceless-step-model.js';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -19,6 +20,7 @@ import {
   type ProviderPromptCacheUsageV1,
 } from './harness/prompt-cache-observation.js';
 import { harnessRunContextStorage } from './harness/brackets.js';
+import { appendEvent } from './harness/eventlog.js';
 
 export const MODEL_ROUTE_METRICS_SCHEMA_VERSION = 1;
 
@@ -459,7 +461,9 @@ class ModelRouteMetricsModel implements Model {
       const response = await this.inner.getResponse(request);
       const usage = modelRouteUsageFromResponse(response);
       const resolution = fallbackRouteResolution(response);
-      const outcome = successfulRouteOutcome(resolution, { path: 'getResponse' });
+      const outcome = successfulRouteOutcome(resolution, { path: 'getResponse', responseCompleted: true });
+      const servedModel = providerReportedModel(response);
+      if (servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
       this.finishCall(
         decisionId,
         outcome.status,
@@ -484,17 +488,21 @@ class ModelRouteMetricsModel implements Model {
     const decisionId = this.startCall('getStreamedResponse', promptCacheRequest);
     let usage: ModelRouteCallUsage = {};
     let completed = false;
+    let responseCompleted = false;
+    let servedModel: string | undefined;
     let failed = false;
     let resolution: FallbackRouteResolution | undefined;
     try {
       for await (const event of this.inner.getStreamedResponse(request)) {
+        servedModel = providerReportedModel(event) ?? servedModel;
         const doneUsage = usageFromStreamEvent(event);
-        if (doneUsage) usage = doneUsage;
+        if (doneUsage) { usage = doneUsage; responseCompleted = true; }
         resolution = fallbackRouteResolution(event) ?? resolution;
         yield event;
       }
       completed = true;
-      const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse' });
+      const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse', responseCompleted });
+      if (responseCompleted && servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
       this.finishCall(
         decisionId,
         outcome.status,
@@ -579,6 +587,23 @@ class ModelRouteMetricsModel implements Model {
         ...(usage.promptCacheUsage ? { promptCacheUsage: usage.promptCacheUsage } : {}),
       },
     }, this.db);
+    // A routing decision is intent, not execution. Only a completed provider
+    // response can attest a host worker's actual route; bind it to its attempt.
+    const active = harnessRunContextStorage.getStore();
+    if (!this.db && this.context.role === 'worker' && active?.workerScope === true && active.sessionId
+      && Number.isInteger(active.sourceUserSeq) && active.runAttemptId
+      && (status === 'success' || status === 'fallback') && metadata.responseCompleted === true) {
+      try {
+        appendEvent({ sessionId: active.sessionId, turn: active.turn ?? 0, role: 'system', type: 'worker_model_response_completed', data: {
+          sourceUserSeq: active.sourceUserSeq, runAttemptId: active.runAttemptId, modelCallId: decisionId,
+          model: typeof metadata.actualModel === 'string' ? metadata.actualModel : this.context.resolvedModel,
+          requestedModel: this.context.resolvedModel,
+          ...(typeof metadata.providerReportedModel === 'string' ? { providerReportedModel: metadata.providerReportedModel } : {}),
+          provider: typeof metadata.actualProvider === 'string' ? metadata.actualProvider : this.context.provider,
+          fallover: status === 'fallback' || this.context.source === 'fallback',
+        } });
+      } catch { /* Missing telemetry remains unknown; it must not fail the worker. */ }
+    }
     // A cancelled call is journaled too: the host stall watchdog retires an
     // attempt by aborting it, and that was invisible — a turn that sat 600s
     // and died recorded no failure anywhere (live 2026-09-02).

@@ -62,6 +62,21 @@ export function exactCheckpointReentryExhausted(key: string): boolean {
   return (exactCheckpointReentries.get(key) ?? 0) >= EXACT_CHECKPOINT_REENTRY_BUDGET;
 }
 
+export function exactCheckpointReentryCount(key: string): number {
+  return exactCheckpointReentries.get(key) ?? 0;
+}
+
+export function noteUnchangedCheckpointResume(input: {
+  key: string; countBefore: number;
+  markerBefore: string; markerAfter: string | null;
+  stateBefore: string; stateAfter: string | null;
+}): boolean {
+  if (input.markerBefore !== input.markerAfter || input.stateBefore !== input.stateAfter
+    || exactCheckpointReentryCount(input.key) !== input.countBefore) return false;
+  noteExactCheckpointReentry(input.key);
+  return true;
+}
+
 /** True exactly once per key, so exhaustion is announced once and not on
  * every subsequent tick that skips the same spent checkpoint. */
 export function claimExactCheckpointReentryNotice(key: string): boolean {

@@ -15,16 +15,16 @@ export const WorkflowStepOutputContractSchema = z.object({
   required_keys: z.array(z.string()).optional()
     .describe('For an object output: top-level keys that must be present and non-null.'),
   non_empty: z.array(z.string()).optional()
-    .describe('Dot-paths whose value must be NON-EMPTY (a non-blank string, an array with ≥1 item, or an object with ≥1 key); "" / "." means the whole output. Declare on a data-producing step so a zero-row / blocked-but-shaped result ({prospects: []}) HALTS and reports back instead of feeding empty data downstream.'),
+    .describe('Dot-paths requiring non-blank strings or non-empty arrays/objects; ""/"." means root. Empty results halt before downstream use.'),
   min_items: z.record(z.string(), z.number().int().nonnegative()).optional()
-    .describe('Map of dot-path → minimum array length (e.g. {"prospects": 1}). Stricter form of non_empty for "this source must yield at least N rows".'),
+    .describe('Dot-path → minimum array length, e.g. {"prospects":1}.'),
   verify: z.object({
     path_exists: z.array(z.string()).optional()
-      .describe('File existence checks: use an absolute filename when known, an output dot-path such as artifact.path, or an empty string / dot for a path-valued root output. Every target must exist on disk.'),
+      .describe('Existing file targets: absolute filename, output dot-path (artifact.path), or ""/"." for path-valued root.'),
     url_present: z.array(z.string()).optional()
-      .describe('Dot-paths in the output whose value must be a non-empty http(s) URL.'),
+      .describe('Output dot-paths requiring non-empty http(s) URLs.'),
   }).optional()
-    .describe('Concrete-handle checks — confirm the named output values are REAL (a file that exists, a non-empty URL), so "produced a brief" cannot pass when the file/URL does not actually exist.'),
+    .describe('Check file existence and URL shape.'),
   description: z.string().optional().describe('One-line note on what this step produces.'),
 });
 

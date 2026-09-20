@@ -60,7 +60,7 @@ test('a child that fell over is attributed by its EXECUTED route on worker_resul
   const childStates = new Map<string, { steps: number; packet?: { item: string } }>();
   const falloverItems = new Set(['audit-2', 'audit-5']);
   const originalGetModel = RouterModelProvider.prototype.getModel;
-  RouterModelProvider.prototype.getModel = function () {
+  RouterModelProvider.prototype.getModel = function (modelName) {
     return {
       async getResponse(request: { input: unknown }) {
         const scope = brackets.harnessRunContextStorage.getStore();
@@ -90,6 +90,15 @@ test('a child that fell over is attributed by its EXECUTED route on worker_resul
             reason: 'preselected-rate-limited', fromModel: 'gpt-5.6-terra', fromProvider: 'codex', preselected: true, sourceUserSeq: scope!.sourceUserSeq,
           } });
         }
+        // This test replaces the instrumented provider entirely. Supply its
+        // completed-response receipt too: a route decision alone is not proof.
+        eventlog.appendEvent({ sessionId: scope!.sessionId, turn: 0, role: 'system', type: 'worker_model_response_completed', data: {
+          sourceUserSeq: scope!.sourceUserSeq, runAttemptId: scope!.runAttemptId,
+          modelCallId: `fixture-${packet!.item}-${childSteps}`,
+          model: falloverItems.has(packet!.item) ? FALLOVER_MODEL : modelName,
+          provider: falloverItems.has(packet!.item) ? 'claude' : 'codex',
+          fallover: falloverItems.has(packet!.item),
+        } });
         const text = `ITEM=${packet!.item} NONCE=fixture-${packet!.item}`;
         return { responseId: `child-${packet!.item}-${childSteps}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
           output: childSteps === 1

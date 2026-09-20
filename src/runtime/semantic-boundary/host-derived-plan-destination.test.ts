@@ -214,10 +214,10 @@ test('different exact destination accounts or families are never collapsed into 
     proposal: proposal({ refs: [first.manifestId, second.manifestId] }),
     catalogEntries: frozenEntries(first, second),
   });
-  assert.deepEqual(result, {
-    ok: false,
-    reason: 'host_destination_ambiguous_multiple_exact_targets',
-  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.proposal.work!.destination, null);
+  assert.deepEqual(result.proposal.work!.destinations?.map(row => row.family), ['family-first', 'family-second']);
 });
 
 test('a conflicting destination-list projection fails closed', () => {

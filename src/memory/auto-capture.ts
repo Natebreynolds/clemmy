@@ -1,3 +1,4 @@
+import { savedMemoryCorrectionClaim } from './saved-memory-correction.js';
 import type { ConsolidatedFactKind } from './db.js';
 import type { ConsolidatedFact } from './facts.js';
 import { drainDurableConsolidationCandidates, enqueueAutoCaptureCandidates } from './durable-consolidation.js';
@@ -360,11 +361,13 @@ function hasConcreteStandingTarget(text: string): boolean {
 }
 
 function clean(value: string, maxChars = 260): string {
-  return value
-    .replace(/\s+/g, ' ')
-    .replace(/^["'`]+|["'`]+$/g, '')
-    .trim()
-    .slice(0, maxChars);
+  let text = value.replace(/\s+/g, ' ').trim();
+  // Remove enclosing quotation only. A trailing quote can belong to a quoted
+  // value inside the fact; dropping it changes the owner's recorded text.
+  while (text.length >= 2 && /["'`]/.test(text[0]!) && text[0] === text.at(-1)) {
+    text = text.slice(1, -1).trim();
+  }
+  return text.slice(0, maxChars);
 }
 
 /**
@@ -483,6 +486,7 @@ function stripTerminalMemoryFraming(text: string): string {
     )
     // A standalone final sentence is framing; "I need to confirm" is not.
     .replace(/(?<=[.!?])\s+(?:just\s+)?confirm[.!?]*$/i, '')
+    .replace(/([.!?]["'`]?)\s+(?:please\s+)?(?:briefly\s+|just\s+)?acknowledge(?:\s+(?:it|this))?[.!?]*$/i, '$1')
     .replace(
       /(?<=[.!?])\s+(?:a|an)\s+(?:(?:natural|brief|short|simple)\s+)?(?:acknowledg(?:e)?ment|confirmation|reply)\s+(?:is|will\s+be)\s+(?:enough|sufficient)[.!?]*$/i,
       '',
@@ -567,9 +571,11 @@ const CORRECTION_FACT_RELATION_RE = /\b(?:is|are|was|were|has|have|uses?|prefers
 const CORRECTION_IMPERATIVE_RE = /^\s*(?:please\s+)?(?:add|change|create|delete|edit|format|make|move|remove|rename|rewrite|send|shorten|update|use|write)\b/i;
 
 function isExplicitDurableCorrectionRequest(text: string): boolean {
+  const savedClaim = savedMemoryCorrectionClaim(text);
+  if (savedClaim && savedClaim.length >= 12 && /^from now on\b/i.test(savedClaim)) return true;
   const leader = FUTURE_REFERENCE_CORRECTION_LEADER_RE.exec(text);
-  if (!leader) return false;
-  const claim = text.slice(leader[0].length).trim();
+  if (!leader && savedClaim === null) return false;
+  const claim = savedClaim ?? text.slice(leader![0].length).trim();
   return claim.length >= 12
     && !CORRECTION_IMPERATIVE_RE.test(claim)
     && CORRECTION_FACT_RELATION_RE.test(claim);

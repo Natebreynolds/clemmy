@@ -1,3 +1,4 @@
+import { READ_FILE_PARAMS } from '../../tools/local-file-read-contract.js';
 /**
  * Transport-only crossing for explicitly reviewed Clementine-local tools.
  *
@@ -7,6 +8,7 @@
  * the sealed transport call. It contains no event-log or manifest-store read.
  */
 import { z } from 'zod';
+import { WRITE_FILE_PARAMS } from '../../tools/local-file-write-contract.js';
 
 import {
   normalizeShapeForDeferredJson,
@@ -75,8 +77,12 @@ function exactDeclaration(name: string): ToolDecl | null {
 function validExecutionContract(value: unknown): value is ReviewedLocalExecutionContractV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const contract = value as Partial<ReviewedLocalExecutionContractV1>;
+  if (contract.version === 1 && contract.adapter === 'local_file_read_v1') {
+    return contract.idempotency === 'read_only' && contract.reconciliation === 'none';
+  }
   return contract.version === 1
-    && contract.idempotency === 'content_addressed'
+    && (contract.idempotency === 'content_addressed'
+      || (contract.adapter === 'local_file_revision_v1' && contract.idempotency === 'receipt_reconciled'))
     && (
       (
         contract.adapter === 'artifact_bundle_v1'
@@ -85,6 +91,11 @@ function validExecutionContract(value: unknown): value is ReviewedLocalExecution
       || (
         contract.adapter === 'workspace_dataset_v1'
         && contract.reconciliation === 'workspace_dataset_v1'
+      )
+      || (
+        contract.adapter === 'local_file_revision_v1'
+        && contract.reconciliation === 'local_file_revision_v1'
+        && contract.idempotency === 'receipt_reconciled'
       )
     );
 }
@@ -116,6 +127,7 @@ function normalizedSemantics(semantics: LocalPlanningSemantics): LocalPlanningSe
     outputKind: semantics.outputKind.trim(),
     deliverableKind: semantics.deliverableKind.trim(),
     destinationPosture: semantics.destinationPosture,
+    ...(semantics.destinationPostures ? { destinationPostures: [...semantics.destinationPostures] } : {}),
     advisoryRoles: [...new Set(semantics.advisoryRoles.map((role) => role.trim()).filter(Boolean))],
     ...(semantics.safeMode
       ? {
@@ -172,12 +184,51 @@ function structurallyCarriesSafeMode(
  * importing its durable event-log readers. The byte-identity parity test pins
  * this projection to the host planner's result.
  */
+function deriveReviewedLocalReadDefinition(input: {
+  declaration: ToolDecl; schema: Record<string, unknown>;
+}): AuthorizedLocalPlanningDefinitionV1 | null {
+  const row = input.declaration;
+  if (row.sideEffect !== 'read' || row.localPlanningRead !== true
+    || row.runtimeEffect === 'host_only') return null;
+  const name = safeToken(row.name);
+  if (!name || name !== row.name) return null;
+  const capabilityRef = `cap:local:${name}:read`;
+  const schemaFingerprint = stableJsonDigest(input.schema);
+  const registrySemanticsFingerprint = stableJsonDigest({
+    version: 1, name, sideEffect: row.sideEffect, localPlanningRead: true,
+    localExecution: row.localExecution, runtimeEffect: row.runtimeEffect ?? null,
+  });
+  const envelopeFingerprint = stableJsonDigest({ version: 1,
+    provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, name, carrier: 'work_call',
+    schemaFingerprint, registrySemanticsFingerprint });
+  return {
+    version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, name,
+    carrier: 'work_call', capabilityRef, schemaFingerprint,
+    registrySemanticsFingerprint, envelopeFingerprint, consequence: 'read',
+    reversibility: 'read_only', destructive: false,
+    accountIdentity: REVIEWED_LOCAL_ACCOUNT, safeMode: null,
+    descriptor: {
+      id: capabilityRef, effect: 'read', purpose: row.description ?? 'Read local state.',
+      acceptedInputKinds: ['request', 'evidence'], producedOutputKinds: ['evidence'],
+      applicableDeliverableKinds: ['evidence'], inputShape: 'request',
+      outputShape: 'evidence', outputKind: 'evidence', deliverableKind: 'evidence',
+      destinationPosture: null, evidenceKinds: ['tool_result'], handleRequired: false,
+      readbackRequired: false, accountScope: REVIEWED_LOCAL_ACCOUNT,
+      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      advisoryRoles: ['source', 'collection', 'read'],
+    },
+  };
+}
+
 function deriveReviewedLocalDefinition(input: {
   declaration: ToolDecl;
   schema: Record<string, unknown>;
 }): AuthorizedLocalPlanningDefinitionV1 | null {
   const name = input.declaration.name.trim();
-  const semantics = input.declaration.localPlanning;
+  if (input.declaration.localExecution?.adapter === 'local_file_read_v1') {
+    return deriveReviewedLocalReadDefinition(input);
+  }
+  const semantics = input.declaration.localExecution?.semantics ?? input.declaration.localPlanning;
   if (
     !name
     || input.declaration.sideEffect !== 'write'
@@ -221,6 +272,7 @@ function deriveReviewedLocalDefinition(input: {
     outputKind: normalized.outputKind,
     deliverableKind: normalized.deliverableKind,
     destinationPosture: normalized.destinationPosture,
+    ...(normalized.destinationPostures ? { destinationPostures: normalized.destinationPostures } : {}),
     evidenceKinds: ['local_commit_receipt'],
     handleRequired: normalized.destinationPosture !== null,
     readbackRequired: false,
@@ -257,9 +309,11 @@ function currentReviewedLocalSchema(
   // work_call is the physical carrier for reviewed local mutations. Match its
   // current strict deferred schema bytes (Zod's 2020-12 projection), not the
   // separate first-class provider projection used by direct model calling.
-  const parametersShape = execution.adapter === 'artifact_bundle_v1'
+  const parametersShape = execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
+    : execution.adapter === 'artifact_bundle_v1'
     ? ARTIFACT_BUNDLE_TOOL_PARAMETERS
-    : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
+    : execution.adapter === 'local_file_revision_v1' ? WRITE_FILE_PARAMS
+      : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
   const deferredParameters = z.strictObject(normalizeShapeForDeferredJson(parametersShape));
   const parameters = z.toJSONSchema(deferredParameters);
   const schema = relaxJsonSchemaForDeferred(parameters);
@@ -320,7 +374,7 @@ export function reviewedLocalCapabilityManifest(
     providerVersion: REVIEWED_LOCAL_PROVIDER_VERSION,
     operationVersion: REVIEWED_LOCAL_OPERATION_VERSION,
     definitionFingerprint: observed.definition.envelopeFingerprint,
-    effect: 'local_write',
+    effect: descriptor.effect,
     ...(descriptor.destinationPosture
       ? {
           destination: {
@@ -330,14 +384,16 @@ export function reviewedLocalCapabilityManifest(
         }
       : {}),
     accountId: REVIEWED_LOCAL_ACCOUNT,
-    idempotency: { required: true, policy: 'key_before_dispatch' },
-    reconciliation: { supported: true, policy: 'exact_artifact' },
+    idempotency: descriptor.effect === 'read'
+      ? { required: false, policy: 'none' } : { required: true, policy: 'key_before_dispatch' },
+    reconciliation: descriptor.effect === 'read'
+      ? { supported: false, policy: 'none' } : { supported: true, policy: 'exact_artifact' },
     outputContract: { kind: descriptor.outputKind ?? observed.definition.consequence },
     purpose: descriptor.purpose,
     acceptedInputKinds: [...descriptor.acceptedInputKinds],
     producedOutputKinds: [...descriptor.producedOutputKinds],
     applicableDeliverableKinds: [...descriptor.applicableDeliverableKinds],
-    evidenceContract: { kinds: ['local_commit_receipt'], readbackRequired: false },
+    evidenceContract: { kinds: descriptor.effect === 'read' ? ['tool_result'] : ['local_commit_receipt'], readbackRequired: false },
     provenance: {
       issuer: 'host:reviewed-local-registry',
       issuedAt: '1970-01-01T00:00:00.000Z',
@@ -355,6 +411,9 @@ export function reviewedLocalToolArgumentsMatch(
   observed: ReviewedLocalToolObservation,
   args: Record<string, unknown>,
 ): boolean {
+  if (observed.execution.adapter === 'local_file_read_v1') {
+    return z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
+  }
   if (observed.execution.adapter === 'artifact_bundle_v1') {
     const parsed = z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
     if (!parsed.success) return false;
@@ -364,6 +423,8 @@ export function reviewedLocalToolArgumentsMatch(
     } catch {
       return false;
     }
+  } else if (observed.execution.adapter === 'local_file_revision_v1') {
+    if (!z.strictObject(WRITE_FILE_PARAMS).safeParse(args).success) return false;
   } else {
     return false;
   }
@@ -380,6 +441,13 @@ export function reviewedLocalToolArgumentsMatch(
 }
 
 export type PreparedReviewedLocalToolExecution =
+  | { observed: ReviewedLocalToolObservation; adapter: 'local_file_read_v1';
+      args: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>> }
+  | {
+      observed: ReviewedLocalToolObservation;
+      adapter: 'local_file_revision_v1';
+      args: z.infer<z.ZodObject<typeof WRITE_FILE_PARAMS>>;
+    }
   | {
       observed: ReviewedLocalToolObservation;
       adapter: 'artifact_bundle_v1';
@@ -441,12 +509,20 @@ export function prepareReviewedLocalToolExecution(
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {
     throw new Error('reviewed local execution arguments exceed the declared safe mode');
   }
+  if (observed.execution.adapter === 'local_file_read_v1') {
+    return { observed, adapter: observed.execution.adapter,
+      args: z.strictObject(READ_FILE_PARAMS).parse({ ...call.args, max_chars: call.args.max_chars ?? null }) };
+  }
   if (observed.execution.adapter === 'artifact_bundle_v1') {
     return {
       observed,
       adapter: observed.execution.adapter,
       args: z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args),
     };
+  }
+  if (observed.execution.adapter === 'local_file_revision_v1') {
+    return { observed, adapter: observed.execution.adapter,
+      args: z.strictObject(WRITE_FILE_PARAMS).parse(call.args) };
   }
   return {
     observed,

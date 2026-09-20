@@ -221,6 +221,30 @@ function validateExpression(
       validateExpression(value.each, state, `${at}.each`, depth + 1, true);
       return;
     }
+    case 'sort':
+    case 'unique': {
+      ownKeysOnly(value, op === 'sort' ? ['op', 'value', 'by'] : ['op', 'value', 'keys'], at, state.errors);
+      validateExpression(value.value, state, `${at}.value`, depth + 1, itemScope);
+      const fields = op === 'sort' ? value.by : value.keys;
+      if (!Array.isArray(fields) || fields.length < 1 || fields.length > 32) {
+        state.errors.push(`${at}.${op === 'sort' ? 'by' : 'keys'} must contain 1-32 fields.`);
+        return;
+      }
+      fields.forEach((field, index) => {
+        if (op === 'unique') {
+          safeField(field, `${at}.keys[${index}]`, state.errors);
+        } else if (!isRecord(field)) {
+          state.errors.push(`${at}.by[${index}] must be {column,direction}.`);
+        } else {
+          ownKeysOnly(field, ['column', 'direction'], `${at}.by[${index}]`, state.errors);
+          safeField(field.column, `${at}.by[${index}].column`, state.errors);
+          if (field.direction !== 'asc' && field.direction !== 'desc') {
+            state.errors.push(`${at}.by[${index}].direction must be asc or desc.`);
+          }
+        }
+      });
+      return;
+    }
     case 'select': {
       ownKeysOnly(value, ['op', 'value', 'where', 'columns', 'limit'], at, state.errors);
       validateExpression(value.value, state, `${at}.value`, depth + 1, itemScope);
@@ -373,6 +397,15 @@ function boundedValueBytes(value: unknown, at: string): number {
   return bytes;
 }
 
+/** Missing fields are errors: silently collapsing missing account IDs would
+ * discard unrelated records. Null is an explicit, supported scalar key. */
+function scalarField(row: TableRow, column: string): string | number | boolean | null {
+  const value = Object.hasOwn(row, column) ? row[column] : undefined;
+  if (value === null || typeof value === 'string' || typeof value === 'boolean'
+    || (typeof value === 'number' && Number.isFinite(value))) return value;
+  throw new WorkflowTransformError(`field "${column}" must exist and contain a finite scalar or null.`);
+}
+
 function addCompositeBytes(current: number, value: unknown, at: string): number {
   const next = current + boundedValueBytes(value, at) + 1;
   if (next > WORKFLOW_TRANSFORM_MAX_VALUE_BYTES) {
@@ -450,6 +483,51 @@ function evaluateExpression(
         out.push(child);
       }
       return out;
+    }
+    case 'sort': {
+      const rows = asRows(evaluateExpression(expression.value, context, budget), 'sort', budget);
+      const types = new Map<string, string>();
+      for (const row of rows) for (const { column } of expression.by) {
+        consumeEvaluation(budget);
+        const value = scalarField(row, column);
+        if (value === null) continue;
+        const type = typeof value;
+        if (types.has(column) && types.get(column) !== type) {
+          throw new WorkflowTransformError(`sort field "${column}" contains mixed scalar types.`);
+        }
+        types.set(column, type);
+      }
+      // Stable sorting preserves upstream order for equal keys; never mutate
+      // the evidence supplied by a preceding step. Nulls are always last.
+      return [...rows].sort((left, right) => {
+        for (const { column, direction } of expression.by) {
+          consumeEvaluation(budget);
+          const a = scalarField(left, column);
+          const b = scalarField(right, column);
+          if (a === b) continue;
+          if (a === null) return 1;
+          if (b === null) return -1;
+          const order = a < b ? -1 : 1;
+          return direction === 'asc' ? order : -order;
+        }
+        return 0;
+      });
+    }
+    case 'unique': {
+      const rows = asRows(evaluateExpression(expression.value, context, budget), 'unique', budget);
+      const seen = new Set<string>();
+      return rows.filter((row) => {
+        const tuple = expression.keys.map((column) => {
+          consumeEvaluation(budget);
+          return scalarField(row, column);
+        });
+        // JSON tuples distinguish strings, numbers, null, and embedded
+        // separators, unlike a concatenated/coerced table key.
+        const key = JSON.stringify(tuple);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     }
     case 'select': {
       const rows = asRows(evaluateExpression(expression.value, context, budget), 'select', budget);

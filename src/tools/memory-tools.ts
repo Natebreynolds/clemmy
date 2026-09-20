@@ -17,6 +17,7 @@ import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { addNotification } from '../runtime/notifications.js';
 import { readText, replaceFile, resolveMemoryTarget, textResult } from './shared.js';
 import type { ConsolidatedFact } from '../memory/facts.js';
+import { formatFactRead } from '../memory/fact-read-provenance.js';
 import { openMemoryDb, type EntityType } from '../memory/db.js';
 import { upsertEntity, type EntityIdentifierInput } from '../memory/entity-identity.js';
 import { addFactEntityLinks, recordGroundedEntityRelationship, type EntityRelationshipOutcome } from '../memory/relations.js';
@@ -32,6 +33,12 @@ import {
 /** Live results below this count mean recall came back thin enough to open
  *  the archive (cold tier). At or above it, retired facts stay retired. */
 export const ARCHIVE_FALLBACK_THRESHOLD = 3;
+
+// Retrieval ranks possible evidence; it does not certify a project's scope or
+// exhaust the user's history. Keep that distinction in the actual tool result
+// so both the answering model and completion reviewer see the same limitation.
+const MEMORY_SEARCH_COVERAGE = 'Search coverage: ranked candidates, not an exhaustive inventory. Relevance/support labels do not establish that a fact applies to the requested project. If no applicable record is found, report "no applicable record found in this search" with the coverage limit. Broaden for a specific unresolved lead or an explicitly requested exhaustive audit; repeating semantic searches cannot prove universal absence.';
+
 
 /**
  * Cold-tier fallback (2026-07-31): when an EXPLICIT recall comes back thin,
@@ -587,18 +594,18 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_read',
-    'Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path.',
+    'Read a durable memory reference (fact:<id> or policy:<id>) with recorded source references and bounded source previews, a key memory file, or a path inside the Clementine vault. Use the fact: prefix for fact numbers. Use read_file for local workspace files; a vault lookup cannot establish whether they exist.',
     { target: z.string().min(1) },
     async ({ target }) => {
       const durableRef = /^(?:fact|policy):(\d+)$/i.exec(target.trim());
       if (durableRef) {
         const id = Number(durableRef[1]);
         const fact = getFact(id);
-        if (!fact) return textResult(`Not found: ${target}`);
-        return textResult(`[fact:${fact.id}] ${fact.kind}: ${fact.content}`);
+        if (!fact) return textResult(`Durable memory reference not found: ${target}`);
+        return textResult(formatFactRead(fact, getFact));
       }
       const resolved = resolveMemoryTarget(target);
-      return textResult(readText(resolved, `Not found: ${target}`));
+      return textResult(readText(resolved, `No readable Clementine vault memory for target: ${target}. This lookup is limited to the memory vault; it does not establish whether the requested local filesystem path exists. Use read_file to inspect a local workspace file.`));
     },
   );
 
@@ -944,14 +951,14 @@ export function registerMemoryTools(server: McpServer): void {
         // Attribution must never make a scoped recall unavailable.
       }
       if (facts.length === 0 && archive.lines.length === 0) {
-        return textResult(`No relevant facts found.${recallId ? ` Recall ${recallId}.` : ''}`);
+        return textResult(`No relevant facts found.${recallId ? ` Recall ${recallId}.` : ''}\n${MEMORY_SEARCH_COVERAGE}`);
       }
       const lines = facts.map((fact) => `- [fact:${fact.id}] ${fact.kind}: ${fact.content}`);
       if (archive.lines.length > 0) {
         if (lines.length > 0) lines.push('');
         lines.push(...archive.lines);
       }
-      return textResult(lines.join('\n'));
+      return textResult(`${MEMORY_SEARCH_COVERAGE}\n${lines.join('\n')}`);
     },
   );
 
@@ -991,9 +998,9 @@ export function registerMemoryTools(server: McpServer): void {
       if (result.hits.length === 0) {
         const recall = result.recallId ? ` Recall ${result.recallId}.` : '';
         if (archive.lines.length > 0) {
-          return textResult(`No LIVE memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}\n\n${archive.lines.join('\n')}`);
+          return textResult(`No LIVE memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}\n${MEMORY_SEARCH_COVERAGE}\n\n${archive.lines.join('\n')}`);
         }
-        return textResult(`No relevant memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}`);
+        return textResult(`No relevant memory found across facts, notes, entities, resources, episodes, policies, or procedures.${recall}\n${MEMORY_SEARCH_COVERAGE}`);
       }
       const block = archive.lines.length > 0
         ? `${formatUnifiedRecall(result, 4000)}\n\n${archive.lines.join('\n')}`
@@ -1014,7 +1021,7 @@ export function registerMemoryTools(server: McpServer): void {
         query: objective,
         facts: facts.map((fact) => ({ fact, reason: 'agent-tool-unified-recall' })),
       });
-      return textResult(block);
+      return textResult(`${MEMORY_SEARCH_COVERAGE}\n${block}`);
     },
   );
 

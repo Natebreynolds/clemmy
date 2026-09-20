@@ -211,7 +211,11 @@ function namesAProviderOperation(entry: string): boolean {
   // One question, one owner. `operationIdentity` answers from what an operation
   // declares; `looksLikeProviderOperationName` remains only for a composio slug
   // no registry carries yet, which is the single case identity cannot cover.
-  return Boolean(operationIdentity(entry)) || looksLikeProviderOperationName(entry);
+  // A cold catalog has no identity for an authored MCP name yet. Preserve
+  // its discovery carrier so the current server definition can be acquired.
+  // Recognizing the name here grants no invocation or effect authority.
+  return Boolean(canonicalMcpToolIdentity(entry))
+    || Boolean(operationIdentity(entry)) || looksLikeProviderOperationName(entry);
 }
 
 /**
@@ -749,7 +753,7 @@ export async function buildWorkflowStepAgent(
     && (externalMcpScope.allowedToolNames?.length ?? 0) > 0;
   if (exactLockedExternal) {
     const firstClassNames = new Set(
-      lockedTools
+      tools
         .map((toolRef) => (toolRef as { name?: string }).name ?? '')
         .filter(Boolean),
     );
@@ -759,10 +763,13 @@ export async function buildWorkflowStepAgent(
       deniedNames: WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
       mcpToolScope: externalMcpScope,
     }) as Tool<RuntimeContextValue>;
-    tools = [...lockedTools.filter((toolRef) => toolRef.name !== 'call_tool'), dispatcher];
+    // Retain the scoped discovery tool installed above; rebuilding from
+    // lockedTools discards its current-definition acquisition callback.
+    tools = [...tools.filter((toolRef) => toolRef.name !== 'call_tool'), dispatcher];
     catalogBlock = [
       '[workflow-exact-external-tool] Invoke the exact locked external capability through `call_tool` using one of these names only:',
       ...(externalMcpScope.allowedToolNames ?? []).map((name) => `- ${name}`),
+      'First use tool_search with the exact name to acquire its current schema, then call it with those arguments. Discovery remains restricted to the locked MCP scope.',
       'The host will refuse before provider I/O unless the accepted step owns the exact current manifest, schema, account, configuration, and immutable invoke port.',
     ].join('\n');
   }

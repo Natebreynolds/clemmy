@@ -1082,7 +1082,7 @@ export function collectConstructLineageCompleteness(
   };
 }
 
-function proposalFromDraft(input: {
+export function proposalFromDraft(input: {
   objective: string;
   draft: z.infer<typeof FreshActionPlanDraftSchema>;
 }): TurnSemanticProposalV1 {

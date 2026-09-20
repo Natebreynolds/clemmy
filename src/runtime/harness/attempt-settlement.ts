@@ -186,7 +186,16 @@ export class HostLocalNonWriteResult {
   }
 }
 
+/** Producer-owned proof that a local read completed. File contents are data,
+ * never an envelope whose words or JSON fields determine execution success. */
+export class HostLocalReadSuccessResult {
+  constructor(readonly output: string) {}
+  toString(): string { return this.output; }
+  toJSON(): string { return this.output; }
+}
+
 export function unwrapHostLocalExecutionFailureResult(value: unknown): unknown {
+  if (value instanceof HostLocalReadSuccessResult) return value.output;
   if (value instanceof HostLocalExecutionFailureResult) return value.output;
   if (value instanceof HostLocalNonWriteResult) return value.output;
   return value;
@@ -195,6 +204,7 @@ export function unwrapHostLocalExecutionFailureResult(value: unknown): unknown {
 /** Translate a nominal returned carrier into the shared settlement signals.
  * Provider/model prose can never satisfy this check. */
 export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
+  if (result instanceof HostLocalReadSuccessResult) return { hostExecuted: true, hostReadCompleted: true };
   if (result instanceof InvalidArgumentsPreDispatchResult) {
     return {
       preDispatch: true,
@@ -1071,7 +1081,9 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // dispatched, and told the model its failed Apify probe had "succeeded"
   // (live 2026-08-12, seq 44256). The marker is the identity; honor it on
   // every lane.
-  const notStartedReason = providerNotStartedReason(input.result, input.toolName);
+  const readContent = extracted.hostReadCompleted === true
+    && input.toolName === 'read_file' && input.mutating === false;
+  const notStartedReason = readContent ? null : providerNotStartedReason(input.result, input.toolName);
   if (notStartedReason) {
     extracted.preDispatch = true;
     if (notStartedReason === 'invalid-args') extracted.argumentValidationFailed = true;
@@ -1082,7 +1094,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // classified as a successful host execution and minted evidence for a call
   // that failed (live 2026-08-12, seq 44386: a dispatch-ledger refusal echo
   // settled succeeded with a durable handle). The prefix is the marker.
-  if (extracted.executionFailed === undefined && correctiveFailureProse(input.result)) {
+  if (!readContent && extracted.executionFailed === undefined && correctiveFailureProse(input.result)) {
     extracted.executionFailed = true;
   }
   // SETTLEMENT CARRIES SEMANTIC TRUTH: a string payload never settles success.
@@ -1091,7 +1103,10 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // feeding a fail-closed conversation kill downstream. Order matters: the
   // harness's own refusal prefix is nominal and outranks the generic SDK
   // laundering, which outranks the structural JSON-record verdict.
-  if (extracted.preDispatch === undefined && harnessRefusalString(input.result)) {
+  if (readContent) {
+    // Completion came from the read producer; do not interpret file bytes as
+    // provider or SDK error metadata. Typed truncation below still takes precedence.
+  } else if (extracted.preDispatch === undefined && harnessRefusalString(input.result)) {
     extracted.preDispatch = true;
     extracted.policyRefused = true;
   } else if (providerConfirmedNotFoundString(input.result)) {

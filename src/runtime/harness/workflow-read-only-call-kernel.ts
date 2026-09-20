@@ -9,6 +9,12 @@
  * physical / settlement spine only after workflow_v3_call is durable.
  */
 import { createHash } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { BASE_DIR } from '../../config.js';
+import { withFileLock } from '../atomic-json.js';
+import { observeReviewedLocalTool, reviewedLocalToolArgumentsMatch } from './reviewed-local-tool-transport.js';
+import { isKnownLocalFileCreateConflict } from './local-file-create-conflict.js';
 import { liveReadCompletenessEvidencePaths } from './reviewed-cli-read-config.js';
 
 import {
@@ -620,7 +626,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
    * wins, the kernel must observe and settle the body instead of abandoning an
   * outcome-unknown crossing. GraphNodeCapabilityInvoke has no signal today. */
   signal?: AbortSignal;
-}, port: WorkflowCallAuthorityPort<Proof>): Promise<ExecuteWorkflowCallKernelResult> {
+}, port: WorkflowCallAuthorityPort<Proof>, fileRecoveryOwned = false): Promise<ExecuteWorkflowCallKernelResult> {
   const current = port.read(input.activationId);
   if (current.status !== 'ok') {
     return {
@@ -1012,7 +1018,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
               outcome: classifyAttemptOutcome({
                 executionFailed: true,
                 ...(businessCall && port.mutating
-                  ? { mutating: true, acknowledged: false }
+                  ? { mutating: true, acknowledged: isKnownLocalFileCreateConflict(error, exactPort.capability.providerKind) }
                   : {}),
               }),
               recovery: {
@@ -1204,7 +1210,14 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
           toolName: minted.toolName,
         },
       });
-      if (!claim.claimed) {
+      let recoveredFileResult: unknown;
+      if (!claim.claimed && claim.reason === 'already_claimed' && fileRecoveryOwned) {
+        try {
+          const carrier = await import('./local-file-workflow-carrier.js');
+          recoveredFileResult = await carrier.recoverReviewedLocalFile(parsed.plan.binding.operationId, input.args);
+        } catch { /* No exact landed receipt: retain the original unknown crossing. */ }
+      }
+      if (!claim.claimed && recoveredFileResult === undefined) {
         // A concurrent/restarted reentry can observe the winner's durable I/O
         // claim. It must not redispatch, poison the shared root, or revoke the
         // exact lease while the owning body may still settle beneath it.
@@ -1225,7 +1238,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
       }
       crashForTest('after_io_claim');
 
-      let result: unknown;
+      let result: unknown = recoveredFileResult;
       try {
         const invokeBusiness = () => exactPort.invoke({
             nodeId: workflow.nodeId,
@@ -1254,7 +1267,9 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
               invoke: exactPort.invoke,
             },
           });
-        if (exactPort.invokeWithPreparation) {
+        if (recoveredFileResult !== undefined) {
+          // Receipt-only reconciliation: the business port is never re-entered.
+        } else if (exactPort.invokeWithPreparation) {
           if (!preparationReady) {
             throw new Error('workflow exact port preparation did not become ready');
           }
@@ -1375,7 +1390,18 @@ export async function executeWorkflowV3Call(input: {
       activationId: input.activationId,
     };
   }
-  return executeWorkflowCallKernel(input, workflowV3CallAuthorityPort(parsed.plan.binding.effect));
+  const port = workflowV3CallAuthorityPort(parsed.plan.binding.effect);
+  const observed = observeReviewedLocalTool(parsed.plan.binding.operationId);
+  if (observed?.execution.adapter === 'local_file_revision_v1'
+    && reviewedLocalToolArgumentsMatch(observed, input.args)) {
+    // Serialize the whole original call and recovery, including settlement.
+    // The existing lock checks process liveness; age never steals a live owner.
+    const directory = path.join(BASE_DIR, 'state', 'workflow-file-recovery');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const key = createHash('sha256').update(input.activationId).digest('hex');
+    return withFileLock(path.join(directory, key), () => executeWorkflowCallKernel(input, port, true));
+  }
+  return executeWorkflowCallKernel(input, port);
 }
 
 export type AcquireWorkflowReadOnlyOperationAuthorityResult =
@@ -1412,6 +1438,8 @@ export function acquireWorkflowReadOnlyOperationAuthority(input: {
   requirementId: string;
   logicalCapabilityId: string;
   operationId: string;
+  /** Optional exact source account; absence preserves ambiguity refusal. */
+  accountId?: string;
   args: Record<string, unknown>;
 }): AcquireWorkflowReadOnlyOperationAuthorityResult {
   const factory = peekHostCapabilityCatalogFactory();
@@ -1423,6 +1451,7 @@ export function acquireWorkflowReadOnlyOperationAuthority(input: {
     if (!entry.manifest || !currentCapabilityManifest(entry.manifest)) continue;
     const identity = canonicalCatalogIdentityOf(entry);
     if (!identity || identity.operationId !== input.operationId || identity.effect !== 'read') continue;
+    if (input.accountId !== undefined && identity.account !== input.accountId) continue;
     candidates.push(identity);
   }
   if (candidates.length === 0) {

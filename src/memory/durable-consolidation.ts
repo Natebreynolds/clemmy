@@ -6,8 +6,9 @@ import {
   resolveReflectionCandidateById,
 } from './reflection-candidates.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
-import { attachGroundedUserPeople } from './grounded-user-entities.js';
+import { attachGroundedUserPeople, attachGroundedUserProjects } from './grounded-user-entities.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
+import { explicitMemoryNeedsScopeReview, reviewStandingMemory } from './standing-memory-review.js';
 
 const AUTO_CAPTURE_SOURCE = 'auto_capture' as const;
 const AUTO_CAPTURE_MAX_ATTEMPTS = 8;
@@ -178,6 +179,7 @@ export async function drainDurableConsolidationCandidates(options: {
   limit?: number;
   now?: string;
   resolver?: ConsolidateOptions['resolver'];
+  standingReviewer?: typeof reviewStandingMemory;
 } = {}): Promise<DrainDurableConsolidationResult> {
   const limit = Math.max(1, Math.min(50, options.limit ?? 8));
   const now = options.now ?? new Date().toISOString();
@@ -211,10 +213,29 @@ export async function drainDurableConsolidationCandidates(options: {
     try {
       const sourceText = row.evidence_excerpt?.trim() ?? '';
       if (!sourceText) throw new Error('durable source episode has no evidence excerpt');
-      const excerpt = selectSupportingExcerpt(sourceText, row.text);
+      let candidateText = row.text;
+      const explicitScopeReview = EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason ?? '')
+        && explicitMemoryNeedsScopeReview(sourceText, row.text);
+      if (row.intake_reason === 'standing instruction (marker + concrete target)'
+        || row.intake_reason === 'project requirement signal' || explicitScopeReview) {
+        const review = await (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text,
+          explicitScopeReview ? 'explicit' : 'inferred');
+        if (explicitScopeReview && (review.scope !== 'standing' || !review.text?.includes(row.text))) {
+          throw new Error('Explicit memory scope review lost the authorized candidate');
+        }
+        if (review.scope === 'task') {
+          resolveReflectionCandidateById({ id: row.id, status: 'rejected',
+            reason: `task_scoped:${review.reason}`, now });
+          result.skipped += 1;
+          continue;
+        }
+        if (!review.text || !sourceText.includes(review.text)) throw new Error('Standing review lost its source span');
+        candidateText = review.text;
+      }
+      const excerpt = selectSupportingExcerpt(sourceText, candidateText);
       const outcome = await consolidateFact({
         kind: row.kind,
-        text: row.text,
+        text: candidateText,
         importance: row.importance,
         trustLevel: row.trust_level ?? 1,
         authority: row.authority ?? 'user',
@@ -234,13 +255,22 @@ export async function drainDurableConsolidationCandidates(options: {
         sourceText,
         sourceUri: row.source_uri ?? row.episode_source_uri,
       });
+      const projects = attachGroundedUserProjects({
+        factId: outcome.factId,
+        episodeId: row.episode_id,
+        sourceText,
+        sourceUri: row.source_uri ?? row.episode_source_uri,
+      });
+      const projectDecision = projects.extracted > 0
+        ? `;projects_observed=${projects.observed};project_links=${projects.linked};project_failures=${projects.failures.length}`
+        : '';
       const entityDecision = people.extracted > 0
         ? `;people_observed=${people.observed};person_links=${people.linked};person_failures=${people.failures.length}`
         : '';
       resolveReflectionCandidateById({
         id: row.id,
         status: 'promoted',
-        reason: `consolidation:${outcome.action}${entityDecision}`,
+        reason: `consolidation:${outcome.action}${entityDecision}${projectDecision}`,
         resultingFactId: outcome.factId,
         now,
       });

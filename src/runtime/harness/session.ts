@@ -230,14 +230,21 @@ export class HarnessSession {
    * one before turn_started).
    */
   updateConversationSnapshot(items: AgentInputItem[]): void {
-    const meta = { ...this.row.metadata };
     const snapshot: PersistedConversation = {
       items,
       lastResponseId: this.conversation().lastResponseId,
       updatedAt: new Date().toISOString(),
     };
-    meta[META_CONVERSATION] = snapshot;
-    this.row = updateSession(this.row.id, { metadata: meta });
+    // Compaction may await a model while other owners update this session.
+    // Commit only our conversation field, preserving their newer metadata.
+    const written = openEventLog().prepare(
+      `UPDATE sessions
+          SET metadata_json = json_set(metadata_json, '$.__conversation', json(?)),
+              updated_at = ?
+        WHERE id = ?`,
+    ).run(JSON.stringify(snapshot), snapshot.updatedAt, this.row.id);
+    if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+    this.refresh();
   }
 
   /**

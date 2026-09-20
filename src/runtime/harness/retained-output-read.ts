@@ -1,10 +1,28 @@
-import { listEvents, openEventLog, type ToolOutputRecord } from './eventlog.js';
+import { getSession, getToolOutput, listEvents, openEventLog, type ToolOutputRecord } from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { readSharedWorkerResult } from './worker-retained-results.js';
 
 /** Read-only reference resolution. A receipt is redeemed under its own exact
  * durable identity in this session; a recall call points to its original
  * result through the host's recorded arguments, never its prose preamble. */
 export function resolveRetainedOutputRead(sessionId: string, requestedId: string): {
+  callId: string;
+  receipt?: ToolOutputRecord;
+} {
+  const local = resolveLocalRetainedOutputRead(sessionId, requestedId);
+  if (local.receipt || getToolOutput(sessionId, local.callId)) return local;
+  const session = getSession(sessionId);
+  if (session?.kind !== 'agent' || session.metadata.source !== 'delegated_worker') return local;
+  const receipt = readSharedWorkerResult(requestedId, session.metadata.parentSessionId,
+    session.metadata.retainedResultShares, (parentId, id) => {
+      // No recursive ancestry search: a share names an immediate parent's own result.
+      const parent = resolveLocalRetainedOutputRead(parentId, id);
+      return parent.receipt ?? getToolOutput(parentId, parent.callId);
+    });
+  return receipt ? { callId: requestedId, receipt } : local;
+}
+
+export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: string): {
   callId: string;
   receipt?: ToolOutputRecord;
 } {
@@ -46,5 +64,5 @@ export function resolveRetainedOutputRead(sessionId: string, requestedId: string
     if (typeof sourceId !== 'string' || !sourceId.trim() || visited.has(sourceId)) break;
     callId = sourceId;
   }
-  return callId.startsWith('rh_') ? resolveRetainedOutputRead(sessionId, callId) : { callId };
+  return callId.startsWith('rh_') ? resolveLocalRetainedOutputRead(sessionId, callId) : { callId };
 }

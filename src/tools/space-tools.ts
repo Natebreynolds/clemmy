@@ -19,6 +19,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
+import { selectedSpaceReadAccount } from '../spaces/source-account-binding.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract,
@@ -65,6 +67,7 @@ import {
   WorkspaceSetDataContractError,
 } from '../spaces/workspace-set-data-contract.js';
 import { executeManualWorkspaceSetData } from '../spaces/workspace-set-data-carrier.js';
+import { parseSpaceSourceTransforms } from '../spaces/source-transforms.js';
 import { WorkspaceSetDataExecutionError } from '../spaces/workspace-set-data-executor.js';
 
 // Re-exported for back-compat (space-tools.test.ts imports it from here); the
@@ -201,6 +204,8 @@ const dataSourceShape = z.object({
   runner: z.string().max(120).nullish().describe('Legacy compatibility only: an already-installed source may preserve its runner filename, but new runner data sources are refused. Existing runner entrypoint bytes need a time-bounded pinned-entrypoint approval before refresh; live helpers, packages, CLIs, local files, auth, and network stay outside the digest. Use composio_slug for new sources.'),
   runner_path: z.string().max(1000).nullish().describe('Legacy compatibility only: may update the file of an existing runner-backed source, which invalidates its prior entrypoint grant and requires a fresh pinned-entrypoint approval. New data-source runner installation is refused.'),
   composio_slug: z.string().max(120).nullish().describe('A PROVABLY READ-ONLY Composio tool slug (GET/LIST/SEARCH/FETCH/READ) to call server-side for data. Writes, unknown actions, and runners are refused; credentials resolve server-side, never in the view.'),
+  composio_account_id: z.string().trim().min(1).max(200).nullish().describe('Exact connected account ID from tool discovery for this read source. Save it when multiple accounts are connected; never guess an account.'),
+  transforms_json: z.string().max(65536).nullish().describe('Optional pure pipeline JSON: [{id,transform:{version:1,expression:<workflow transform>}}]. Read result is steps.read.output; reference earlier steps by ID. input.observed_at is the host read timestamp. Final output becomes this source dataset on desktop and phone. No calls or code; 1-16 steps.'),
   composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
   cli_argv: z.array(z.string().min(1).max(1000)).max(64).nullish().describe('OR a frozen READ-ONLY CLI invocation as an argv array (no shell), e.g. ["sf","data","query","-q","SELECT ...","-r","json"]. argv[0] must be a bare installed-command name on PATH. The user approves the exact command once; after that, scheduled and manual refreshes run it unattended. Any argv or schedule change re-asks. Stdout becomes the dataset (JSON parsed when possible, else {stdout}). Declare only commands that read — never ones that create/update/delete.'),
   allow_empty: z.boolean().nullish().describe('Set true only when zero rows is an intentional valid product state (for example a brand-new content calendar). The creation smoke will still run, but will not mislabel that expected empty state as broken.'),
@@ -290,6 +295,11 @@ function toDataSource(
   const runner = declaredRunner(raw.runner, raw.runner_path, `Data source "${ds.id}"`, errors, staged);
   if (runner) ds.runner = runner;
   if (raw.composio_slug && raw.composio_slug.trim()) ds.composioSlug = raw.composio_slug.trim();
+  if (raw.composio_account_id) ds.composioAccountId = raw.composio_account_id;
+  if (raw.transforms_json != null) {
+    try { ds.transforms = parseSpaceSourceTransforms(raw.transforms_json); }
+    catch (error) { errors.push(`Data source "${ds.id}" transforms: ${(error as Error).message}`); }
+  }
   if (raw.cli_argv && raw.cli_argv.length > 0) ds.cliArgv = raw.cli_argv.map((item) => item.trim()).filter(Boolean);
   const composioArgs = parseJsonObjectField(raw.composio_args_json, `Data source "${ds.id}" composio_args_json`, errors);
   if (composioArgs) ds.composioArgs = composioArgs;
@@ -458,24 +468,14 @@ export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_save',
     [
-      'Create or update a Workspace — a persistent HTML surface with stored data and phone content. The full playbook for building one here is the built-in skill workspace-builder; read it with skill_read before creating or redesigning a Workspace. Pass an existing slug to update it. For a static board record edit, read space_get, then pass replacement_data_json, its expected_revision and updated view_html here: data, phone content and view commit together.',
-      `For an ordinary view, pass the complete self-contained HTML directly as view_html (maximum ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes; inline CSS/JS only — external CDNs are blocked by CSP). This keeps creation to one authoritative, versioned space_save commit.`,
-      `view_path is legacy / oversized-file compatibility for an already-authored file inside ${BASE_DIR}; pass exactly one of view_html or view_path when replacing the view.`,
-      'The view runs sandboxed: no network except the injected `clem` bridge (data/history/diff/refresh/note/compose/action). External links open through the desktop; nothing else leaves the frame.',
-      'DESIGN LAYER, HELPER KIT and VIEW STANDARD: every served view already carries a light/dark design layer (semantic --clem-* tokens and .clem-* components such as .clem-app, .clem-kpis, .clem-grid, .clem-section, .clem-list, .clem-table, .clem-btn) and a `clem` helper kit (clem.fmt, clem.ui, clem.rows, clem.pick, clem.sources, clem.mail). Their exact names and signatures, and what a good view shows, are in the workspace-builder skill. Fill the whole frame, never hardcode colors, and after saving call space_preview and fix what you see before reporting done.',
-      'The dataset is planted in every served view as `window.__SPACE_DATA__` BEFORE your script runs, so render straight from it — no await, no polling, no empty first paint. A helper `clem` is auto-injected too, for data that changed since load: `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
-      'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
-      'Optionally declare NEW data_sources as PROVABLY READ-ONLY Composio operations so the workspace can refresh server-side without spending tokens. Only GET/LIST/SEARCH/FETCH/READ-class actions are accepted. Unknown or mutating slugs and new arbitrary runner scripts are refused.',
-      'When the data lives behind a LOCAL CLI the user already authenticated (sf, gh, netlify, aws…), declare the source with cli_argv instead: a frozen read-only argv the user approves ONCE, after which every scheduled/manual refresh runs it unattended. Prefer the CLI\'s JSON output flag so stdout parses into a dataset.',
-      'Compatibility: an already-installed runner-backed data source may retain the same source id + filename. Its first refresh requests one time-bounded human approval bound to the runner entrypoint hash + schedule; entrypoint edits invalidate that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest, so this is not a read-only sandbox. Prefer migrating it to read-only Composio. Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary.',
-      'PROACTIVE WAKE (optional): a scheduled read-only source can be paired with threshold re-engagement guidance; the scheduler dedups a persistent condition so it does not ping on every refresh.',
-      'PHONE VIEW (recommended): the authored HTML view is loopback-only and never reaches the phone, so the mobile app otherwise has to GUESS what matters by sniffing the JSON — and it cannot recover a number your view computes but the data does not contain. Write a `_mobile` key into the dataset so the phone shows what you would have shown: `_mobile: { headline: [{label, value}], breakdowns: [{label, entries:[{label, value}]}], records: { label, total, items: [{primary, fields:[{label, value}]}] } }`. Values are display strings you already computed — pre-format money and dates, keep labels short enough for a 390px screen, and cap it at roughly 6 tiles and 40 records. Every part is optional and a missing or malformed block simply falls back to inference, so it can never make a workspace worse. Prioritise: the two or three numbers someone would want standing in a parking lot, then the rows they would scan. DURABILITY: refresh rebuilds the dataset from each source runner’s output, so a `_mobile` block written directly into the data file is WIPED on the next refresh. Put the `_mobile` block INSIDE the runner’s emitted result instead (the phone reads it one level down, e.g. `weekly._mobile`) — then every refresh re-authors the layout and it can never go stale. A user asking for a “mobile layout” means THIS — rewriting the HTML view changes nothing on their phone.',
-      `ONE-OFF MOBILE CONTENT: when this is a new static report/calendar whose complete content is already in hand, pass initial_data_json in THIS SAME call instead of planning a second space_set_data mutation. It is a create-only, full JSON document capped at ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes and cannot be combined with data_sources. Include top-level _mobile. For long authored copy, each _mobile record may add body (up to 4,000 characters) and links: [{label,url}] (http(s) only), alongside short fields. The single commit makes the view, data, and phone handoff restart-safe together.`,
-      'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
-      'STATIC BOARD EDIT: space_get returns the complete current document and snapshot revision. To update its data and phone content, pass replacement_data_json plus that expected_revision here, with view_html when the view also changes. They commit as one revision. This updates the root document; space_set_data instead edits a named source within a source-based dataset.',
-      'TARGETED EDIT: preserve all content outside the requested change, including existing HTML, stored data and phone content. Do not add explanations, audit notes or other improvements to the saved artifact unless requested. Put any explanation or suggestion in your chat reply.',
-      'Changing a Composio data source auto-refreshes on save and reports the row count. Editing an installed legacy runner requests fresh pinned-entrypoint approval and leaves the Workspace active with its prior dataset until approved.',
-      'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
+      'Create or update a persistent Workspace (Space): desktop HTML, stored data, and phone content. Read skill_read("workspace-builder") before creating or redesigning; it contains the rendering playbook. Reuse an existing slug to update.',
+      `Pass complete self-contained view_html (max ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes), or legacy view_path inside ${BASE_DIR}; exactly one when replacing the view. Inline CSS/JS only. The sandbox blocks network/CDNs except the injected clem bridge; external links open through desktop.`,
+      'Render the initial dataset synchronously from window.__SPACE_DATA__. For updated data use await clem.data() or clem.refresh(sourceId?), which returns {results,data}; access exact declared source IDs. Template placeholders are not expanded. The bridge also provides history/diff/note/compose/action. For an external action, handle {pending:true,approvalId}; report sent only after confirmed execution.',
+      `Static creation: pass initial_data_json (max ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes) with top-level _mobile in the same commit; cannot combine with data_sources. Static edits: read space_get, then submit replacement_data_json with expected_revision and optional updated view_html. The complete root document, phone content and view commit together. Preserve unrelated content. space_set_data instead edits one named source.`,
+      'Phone content comes from data, never desktop HTML. Use _mobile: {headline:[{label,value}], breakdowns:[{label,entries:[{label,value}]}], records:{label,total,items:[{primary,fields:[{label,value}],body?,links?:[{label,url}]}]}}. Preformat display values; roughly 6 tiles/40 records; body max 4000 characters and http(s) links only. For refreshing sources put _mobile inside each source output so refresh preserves it; malformed/missing blocks fall back to inference.',
+      'New data_sources must be provably read-only Composio operations (discover exact operation first), or frozen read-only cli_argv approved once by the owner; prefer JSON output. Unknown/mutating operations and new arbitrary runner scripts are refused. Existing runner sources may retain the same id/filename: first refresh or entrypoint change requires time-bounded approval bound to entrypoint hash and schedule. Helpers/dependencies remain live, not sandboxed. Action runners require per-invocation approval. Prefer read-only Composio when migrating.',
+      'Changed Composio sources refresh on save and return row counts. Legacy runner edits preserve prior data until approved. Optional threshold re-engagement on scheduled sources deduplicates persistent conditions.',
+      'Persist the agreed objective, success_criteria and invariants; omit on updates to preserve them. Preserve all content outside the requested change; explanations belong in chat. Returns URL and summary; prior views are snapshotted for revert.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('Workspace id, lowercase kebab-case (e.g. "sf-daily-report"). Reuse to update.'),
@@ -598,6 +598,20 @@ export function registerSpaceTools(server: McpServer): void {
       // dropped the others; a drop is now an explicit removal.
       const removeIds = new Set((remove_data_sources ?? []).map((id) => id.trim()).filter(Boolean));
       const passedSources = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors, stagedRunners)) : [];
+      const authoringContext = getToolOutputContext();
+      const sourceUserSeq = authoringContext?.sourceUserSeq;
+      const resolutions = authoringContext?.sessionId && Number.isSafeInteger(sourceUserSeq)
+        ? listEvents(authoringContext.sessionId, { types: ['capability_resolution'], sinceSeq: sourceUserSeq! - 1 }).map((event) => event.data)
+        : [];
+      for (const source of passedSources) {
+        if (!source.composioSlug || source.composioAccountId) continue;
+        const prior = existing?.dataSources.find((item) => item.id === source.id
+          && item.composioSlug?.toUpperCase() === source.composioSlug?.toUpperCase());
+        const selected = prior?.composioAccountId ?? (authoringContext?.sessionId && Number.isSafeInteger(sourceUserSeq)
+          ? selectedSpaceReadAccount({ sessionId: authoringContext.sessionId, sourceUserSeq: sourceUserSeq!, operationId: source.composioSlug, resolutions })
+          : undefined);
+        if (selected) source.composioAccountId = selected;
+      }
       const passedById = new Map(passedSources.map((src) => [src.id, src] as const));
       // An explicit empty list is the one partial that cannot be a partial:
       // it clears every source. Anything else merges.
@@ -630,13 +644,14 @@ export function registerSpaceTools(server: McpServer): void {
       // read is judged against a current definition, prepared the same way a
       // refresh prepares it, before the save-time safety check runs.
       const readPreparationNotes: string[] = [];
-      const coldReads = [...new Set(dsList
+      const coldReads = [...new Map(dsList
         .filter((src) => !src.runner?.trim() && !src.cliArgv?.length && src.composioSlug?.trim())
-        .map((src) => src.composioSlug!.trim().toUpperCase())
-        .filter((operationId) => !workspaceComposioIsProvablyReadOnly(operationId)))]
+        .map((src) => ({ operationId: src.composioSlug!.trim().toUpperCase(), accountId: src.composioAccountId }))
+        .filter(({ operationId }) => !workspaceComposioIsProvablyReadOnly(operationId))
+        .map((read) => [JSON.stringify(read), read])).values()]
         .slice(0, SPACE_SAVE_MAX_READ_PREPARATIONS);
-      for (const operationId of coldReads) {
-        const classified = await ensureWorkspaceReadClassification(operationId);
+      for (const { operationId, accountId } of coldReads) {
+        const classified = await ensureWorkspaceReadClassification(operationId, {}, accountId);
         if (!classified.ok) readPreparationNotes.push(`${operationId} could not be confirmed as a read: ${classified.error}`);
       }
       const prep = prepareSpaceForWrite({
@@ -1297,14 +1312,16 @@ export function registerSpaceTools(server: McpServer): void {
 
   server.tool(
     'space_get',
-    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), its dataset, and recent user notes. For live sources the dataset is summarized per source: where the records are, how many, their fields, and trimmed samples. Pass source_id to page through one source\'s records (limit, offset). Use this when re-engaged to see what the workspace shows and what the user did in it, and before writing view code against a source.',
+    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), its dataset, and recent user notes. For live sources the dataset is summarized per source: where the records are, how many, their fields, and trimmed samples. Pass source_id to page through one source\'s records (limit, offset). For view-only or configuration changes, use metadata_only=true to return exact source/action configuration without dataset records. Use this when re-engaged to see what the workspace shows and what the user did in it, and before writing view code against a source.',
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
       source_id: z.string().max(120).nullish().describe('Optional: return this one source\'s records (trimmed) instead of the per-source summary.'),
+      metadata_only: z.boolean().nullish().describe('For view-only or configuration changes: include exact source/action declarations, omit dataset records. Cannot combine with source_id.'),
       limit: z.number().int().min(1).max(60).nullish().describe('With source_id: records per page (default 20).'),
       offset: z.number().int().min(0).nullish().describe('With source_id: first record index (default 0).'),
     },
-    async ({ slug, source_id, limit, offset }) => {
+    async ({ slug, source_id, metadata_only, limit, offset }) => {
+      if (metadata_only && source_id?.trim()) return invalidArgumentsTextResult('Choose metadata_only or source_id, not both.');
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       let rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
@@ -1330,7 +1347,9 @@ export function registerSpaceTools(server: McpServer): void {
       }
       // A static document is edited whole, and a small dataset reads fine
       // whole; live provider payloads are summarized so their shape is visible.
-      const datasetLine = rec.contentMode === 'static_snapshot' || !parsedDataset
+      const datasetLine = metadata_only
+        ? `Source configuration: ${JSON.stringify(rec.dataSources)}\nAction configuration: ${JSON.stringify(rec.actions)}\nDataset omitted (metadata_only). Read space_get without metadata_only for data, or use source_id to inspect records.`
+        : rec.contentMode === 'static_snapshot' || !parsedDataset
         || Buffer.byteLength(dataPreview, 'utf8') <= SPACE_GET_COMPLETE_DATASET_MAX_BYTES
         ? `Dataset (complete JSON): ${dataPreview}`
         : `Dataset (${Buffer.byteLength(dataPreview, 'utf8')} bytes, summarized per source; space_get with source_id pages through one source's records):\n${renderWorkspaceDataDigest(parsedDataset, rec.dataSources.map((source) => source.id))}`;

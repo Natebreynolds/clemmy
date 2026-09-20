@@ -47,7 +47,8 @@ export function acceptedModelMemoryEvidence(identity: Identity): string | undefi
     || row.digest !== hash(row.fragments)) return 'The retained model memory context is unreadable; do not infer that the brain had no remembered context.';
   return 'Memory context actually included in an accepted model request for THIS source:\n'
     + row.fragments.join('\n\n')
-    + '\nThese are remembered preferences and contextual claims, not fresh business observations or permission to act. '
+    + '\nThis is mixed memory context: explicit preferences, observations, and derived inferences, not uniform user instructions, fresh business observations, or permission to act. '
     + 'An empty memory-search result does not negate this separately supplied context. Apply current owner instructions first; '
-    + 'distinguish a remembered preference from a factual assumption, and require material assumptions to be identified in the plan.';
+    + 'verify that a remembered claim applies to this task and its named resource or project. Past task restrictions and inferred patterns are not standing rules; shared keywords do not prove applicability. '
+    + 'Require disclosure only of material unverified assumptions the plan actually relies on. Do not require a memory recap or explanation of context that did not shape the plan, or treat omission of an unadopted inference as incomplete work.';
 }

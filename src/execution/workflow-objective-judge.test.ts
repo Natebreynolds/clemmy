@@ -22,6 +22,36 @@ const judgeReturning = (v: ObjectiveJudgeVerdict) => {
   return { fn, calls: () => calls };
 };
 
+test('target review judges the delivered body rather than an internal step heading', async () => {
+  let reviewed = '';
+  let evidenceSeen = '';
+  const verdict = await judgeWorkflowTarget({
+    workflow: wf({ description: 'Return exactly NATIVE_DIRECT_OK.' }), inputs: {},
+    finalOutput: '## return_literal\nNATIVE_DIRECT_OK',
+    deliveredBody: 'NATIVE_DIRECT_OK',
+    executionEvidence: () => ({ available: true, summary: 'Authenticated step result: NATIVE_DIRECT_OK' }),
+    judgeFn: async (_objective, response, context) => {
+      reviewed = response;
+      evidenceSeen = context?.toolCallSummary ?? '';
+      return { done: response === 'NATIVE_DIRECT_OK', reason: 'Exact delivered result checked.' };
+    },
+  });
+  assert.equal(reviewed, 'NATIVE_DIRECT_OK');
+  assert.match(evidenceSeen, /Authenticated step result/);
+  assert.equal(verdict.judged, true);
+  assert.equal(verdict.reached, true);
+});
+
+test('a wrong delivered result is not rescued by a correct internal rollup', async () => {
+  const verdict = await judgeWorkflowTarget({
+    workflow: wf({ description: 'Return exactly NATIVE_DIRECT_OK.' }), inputs: {},
+    finalOutput: '## return_literal\nNATIVE_DIRECT_OK', deliveredBody: 'WRONG',
+    judgeFn: async (_objective, response) => ({ done: response === 'NATIVE_DIRECT_OK', reason: 'Exact delivered result checked.' }),
+  });
+  assert.equal(verdict.judged, true);
+  assert.equal(verdict.reached, false);
+});
+
 test('workflow review carries complete source evidence and the complete deliverable into the actual judge prompt', async () => {
   const finalOutput = 'start\n' + 'row\n'.repeat(4000) + 'REQUIRED_FINAL_ROW';
   const evidence = 'call_tool -> write_file: succeeded\n' + 'evidence\n'.repeat(2000)

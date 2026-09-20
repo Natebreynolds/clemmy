@@ -1,3 +1,4 @@
+import { normalizeWorkflowCallArguments } from './workflow-call-arguments.js';
 import {
   type WorkflowDefinition,
   type WorkflowEventTrigger,
@@ -188,13 +189,11 @@ type WorkflowStepNormalizeInput = Omit<Partial<WorkflowStepInput>, 'transform'> 
 function optionalTransform(value: unknown): WorkflowStepInput['transform'] | undefined {
   if (value === undefined || value === null) return undefined;
   const parsed = parseWorkflowTransformAuthoringValue(value);
-  // Preserve malformed executable semantics for the canonical validator. A
-  // lossy drop here would turn a rejected transform into an unrelated model
-  // step. The return type is intentionally asserted only at this parse seam;
-  // validation still runs before any enabled definition can execute.
-  return parsed.ok
-    ? parsed.transform
-    : value as WorkflowStepInput['transform'];
+  // Preserve the actual validation error. Returning the original JSON string
+  // after semantic validation failed made the next validator report only
+  // "must be an object", hiding the fields the author needed to repair.
+  if (!parsed.ok) throw new Error(`Invalid workflow transform: ${parsed.message}`);
+  return parsed.transform;
 }
 
 export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): WorkflowStepInput[] {
@@ -219,7 +218,7 @@ export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): Wor
       subgraph: optionalObject<WorkflowStepInput['subgraph']>(s.subgraph),
       transform: optionalTransform(s.transform),
       deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
-      call: optionalObject<WorkflowStepInput['call']>(s.call),
+      call: normalizeWorkflowCallArguments(optionalObject<WorkflowStepInput['call']>(s.call)),
       invocationPlan: optionalObject<WorkflowStepInput['invocationPlan']>(
         s.invocationPlan ?? s.invocation_plan,
       ),

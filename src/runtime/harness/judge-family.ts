@@ -16,21 +16,16 @@
 import { codexQuotaExhausted } from './rate-limit-store.js';
 import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
-import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { getClaudeAuthSnapshot } from '../claude-oauth.js';
 import { classifyModelError } from './resilient-model.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
-
-/** Subscription OAuth access tokens start with this prefix; an api03 API key is
- *  never treated as "available" (preserves the billing guard). */
-const CLAUDE_OAT_PREFIX = 'sk-ant-oat01';
 
 /** Is the Claude (Anthropic) subscription brain logged in + usable right now? */
 export function claudeAvailable(): boolean {
   try {
-    const t = getStoredClaudeTokens();
-    if (!t?.accessToken?.startsWith(CLAUDE_OAT_PREFIX)) return false;
-    if (t.refreshToken) return true; // refreshable → the request path will renew it
-    return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // non-refreshable → must be unexpired
+    // Use the same vault/dead-grant/fallback semantics as Settings. A stored
+    // refresh token alone does not prove that the request path can renew it.
+    return getClaudeAuthSnapshot().configured;
   } catch {
     return false;
   }

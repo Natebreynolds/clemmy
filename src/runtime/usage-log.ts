@@ -6,6 +6,7 @@ import { recordOperationalEvent } from './operational-telemetry.js';
 import { accrueSessionTokens, getSession, type SessionKind } from './harness/eventlog.js';
 import { sealTraceEnvelope } from './trace-envelope.js';
 import type { TraceEnvelope } from './trace-envelope.js';
+import { resolveWorkflowUsageSource } from './workflow-usage-context.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -492,7 +493,7 @@ export function recordModelUsage(args: {
         ),
       }
     : inheritedExact;
-  const source = exactAttribution?.sessionId ?? argsSource;
+  const source = exactAttribution?.sessionId ?? resolveWorkflowUsageSource(argsSource);
   const sourceUserSeq = exactAttribution?.sourceUserSeq;
   const attemptId = exactAttribution?.attemptId ?? (!exactAttribution ? args.attemptId : undefined);
   // Write-time authority: the durable session row knows what this session IS,

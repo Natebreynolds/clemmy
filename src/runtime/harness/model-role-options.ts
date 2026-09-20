@@ -2,6 +2,8 @@ import { debateBrainsAvailable } from './judge-family.js';
 import {
   CLAUDE_MODEL_PRESETS,
   DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_FAST_MODEL,
+  DEFAULT_CLAUDE_FAST_MODEL,
   MODEL_PRESETS,
   MODELS,
   getClaudeBrainModel,
@@ -208,6 +210,16 @@ function falloverCodexModelId(): string {
     if (resolveProvider(MODELS.primary) === 'codex') return MODELS.primary;
   } catch { /* unknown id → use the canonical default */ }
   return DEFAULT_CODEX_MODEL;
+}
+
+/** Commit-safe worker rescue must retain a small worker role, independent of
+ * foreground model settings. all_in preserves subscription isolation. */
+export function falloverWorkerModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {
+  if (getModelRoutingMode() === 'all_in') return [];
+  const out: Array<{ provider: BrainProviderClass; modelId: string }> = [];
+  if (current !== 'codex' && codexModelsAvailable()) out.push({ provider: 'codex', modelId: DEFAULT_CODEX_FAST_MODEL });
+  if (current !== 'claude' && claudeModelsAvailable()) out.push({ provider: 'claude', modelId: DEFAULT_CLAUDE_FAST_MODEL });
+  return out;
 }
 
 export function falloverBrainModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {

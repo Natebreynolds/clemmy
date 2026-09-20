@@ -18,7 +18,7 @@ import {
 } from '../agents/worker-batch-execution.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
-import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
+import { DEFAULT_CLAUDE_FAST_MODEL, getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
@@ -363,7 +363,7 @@ export function registerWorkerTools(server: McpServer): void {
           const next = pickWorkerModelWithFallover([
             benchedRoute.modelId,
             resolveSdkBrainWorker(undefined).modelId,
-            getClaudeBrainModel(),
+            DEFAULT_CLAUDE_FAST_MODEL,
           ]);
           if (next.falloverFrom) {
             return textResult(`Batch failed: ALL ${rendered.length} workers hit a rate limit on worker model "${benchedRoute.modelId}". It is benched for a cooldown and fan-out has AUTO-SWITCHED to "${next.model}" — call run_worker again NOW with the same items; they will dispatch on the healthy model.`);
@@ -623,7 +623,7 @@ export function registerWorkerTools(server: McpServer): void {
       // the backend's real primary id (no-op for owned ids / non-byo providers).
       if (workerProvider === 'byo' && !route.claudeLane) workerModel = repairByoRoutedModelId(workerModel);
       // Fleet resilience: skip a rate-limit-benched worker model at spawn time
-      // (routed → default worker binding → Claude brain). Cross-lane pick only
+      // (routed → default worker binding → small Claude rescue). Cross-lane pick only
       // applies off the pure-Claude lane; the Claude lane's own model is already
       // the last-resort candidate.
       let benchFalloverFrom: string | undefined;
@@ -631,7 +631,7 @@ export function registerWorkerTools(server: McpServer): void {
         const pick = pickWorkerModelWithFallover([
           workerModel,
           resolveSdkBrainWorker(undefined).modelId,
-          getClaudeBrainModel(),
+          DEFAULT_CLAUDE_FAST_MODEL,
         ]);
         if (pick.falloverFrom) {
           benchFalloverFrom = pick.falloverFrom;

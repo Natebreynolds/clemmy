@@ -7,6 +7,7 @@
  * first-class carrier whose inner call still crosses the ordinary harness
  * brackets and capability authority.
  */
+import { isToolMediaContent } from '../runtime/harness/tool-media-content.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Tool } from '@openai/agents';
 import { wrapToolForHarness } from '../runtime/harness/brackets.js';
@@ -153,6 +154,7 @@ export function registerClaudeActionWorkCall(
         JSON.stringify(input),
         { toolCall: { callId } },
       );
+      if (isToolMediaContent(output)) return { content: output };
       const rendered = output instanceof ExternalWritePreDispatchResult
         ? output.output
         : typeof output === 'string'

@@ -1253,12 +1253,13 @@ test('recursive reflection CONSOLIDATES: rolled-up depth-0 sources are demoted (
 
     // Deterministic extractor → one higher-order pattern, token-disjoint from the
     // sources so findSimilarFacts returns nothing → resolveConflict ADDs (no network).
-    const stub = async () => ({ patterns: [{ text: 'ZZZ QQQ XYZZY consolidated rollup token', importance: 7 }] });
+    const cited = [derived[0]!.id, derived[1]!.id, userStated.id, pinnedSrc.id];
+    const stub = async () => ({ patterns: [{ text: 'ZZZ QQQ XYZZY consolidated rollup token', importance: 7, sourceFactIds: cited }] });
     const result = await runRecursiveReflection({ extractor: stub as never });
 
     assert.ok(result.patternsWritten >= 1, 'a higher-order pattern was written');
-    assert.equal(result.sourcesDemoted, 5, 'only the 5 derived depth-0 sources are demoted');
-    for (const f of derived) assert.equal(getFact(f.id)?.importance, 3, 'derived source clamped down to 3');
+    assert.equal(result.sourcesDemoted, 2, 'only cited derived depth-0 sources are demoted');
+    for (const [index, f] of derived.entries()) assert.equal(getFact(f.id)?.importance, index < 2 ? 3 : 5, 'uncited source importance stays unchanged');
     assert.equal(getFact(userStated.id)?.importance, 5, 'user-stated (trust 1.0) source untouched');
     assert.equal(getFact(pinnedSrc.id)?.importance, 5, 'pinned source untouched');
     const rollup = openMemoryDb().prepare("SELECT id, derivation_depth, derived_from_fact_ids FROM consolidated_facts WHERE content = 'ZZZ QQQ XYZZY consolidated rollup token'")
@@ -1267,12 +1268,13 @@ test('recursive reflection CONSOLIDATES: rolled-up depth-0 sources are demoted (
     assert.equal(rollup!.derivation_depth, 1);
     assert.deepEqual(
       (JSON.parse(rollup!.derived_from_fact_ids) as number[]).sort((a, b) => a - b),
-      [...derived.map((fact) => fact.id), userStated.id, pinnedSrc.id].sort((a, b) => a - b),
+      [...cited].sort((a, b) => a - b),
     );
     const evidence = getFactEvidence(rollup!.id);
     assert.equal(evidence.length, 1);
     assert.match(evidence[0].excerpt, new RegExp(`\\[fact:${derived[0].id}\\] Derived signal number 0`));
     assert.doesNotMatch(evidence[0].excerpt, /ZZZ QQQ XYZZY/, 'the generated pattern is never used as its own evidence');
+    assert.doesNotMatch(evidence[0].excerpt, /Derived signal number 2/, 'uncited facts are not pattern evidence');
     const lifecycle = openMemoryDb().prepare(`
       SELECT status, reason, resulting_fact_id FROM memory_reflection_candidates
       WHERE text = 'ZZZ QQQ XYZZY consolidated rollup token'

@@ -1,3 +1,4 @@
+import { resolveAdmittedCapabilityRef } from './admitted-capability-ref.js';
 /**
  * Atomic host boundary: validate → clamp → admit → compile.
  *
@@ -26,10 +27,11 @@ import {
   resolveCurrentSuccessorManifest,
 } from '../harness/capability-manifest-store.js';
 
-function bindCapabilityRefToSuccessor(capabilityRef: string): string {
-  const store = peekCapabilityManifestStore();
-  if (!store) return capabilityRef;
-  return resolveCurrentSuccessorManifest(store, capabilityRef)?.manifest.manifestId ?? capabilityRef;
+function bindCapabilityRefToSuccessor(capabilityRef: string, revalidatedLocalRefs?: ReadonlySet<string>): string {
+  return resolveAdmittedCapabilityRef(capabilityRef, revalidatedLocalRefs, (ref) => {
+    const store = peekCapabilityManifestStore();
+    return store ? resolveCurrentSuccessorManifest(store, ref)?.manifest.manifestId : undefined;
+  });
 }
 
 export type { AdmittedTurnSemantics, AdmittedClampedSemanticsV1 } from '../graph/admitted-turn-semantics.js';
@@ -277,7 +279,7 @@ function clampProjection(
               id: operation.id,
               role: operation.role,
               requestedEffect: canonical.requestedEffect,
-              capabilityRef: bindCapabilityRefToSuccessor(operation.capabilityRef),
+              capabilityRef: bindCapabilityRefToSuccessor(operation.capabilityRef, authority.revalidatedLocalCapabilityRefs),
               dependsOn: canonical.dependsOn,
               evidence: [...operation.evidence],
             };

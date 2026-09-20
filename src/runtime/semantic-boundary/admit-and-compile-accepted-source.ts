@@ -1,3 +1,4 @@
+import { nominatedLivePlanningDescriptors } from './planning-nominations.js';
 /**
  * One atomic host function: load durable source, audience, and one frozen
  * policy snapshot; interpret; validate; admit; compile. Callers do not pass
@@ -176,8 +177,8 @@ type HostDerivedPlanDestinationResult =
  * The model never supplies authority here. Every external/admin write ref must
  * resolve (directly or through the manifest store's current-successor edge) to
  * one exact CURRENT entry in the just-frozen catalog; its declared effect must
- * match the operation. Multiple distinct account/family/posture destinations
- * remain ambiguous and are refused instead of guessed. Clementine-local writes
+ * match the operation. Multiple exact destinations are retained separately;
+ * selecting several operations does not make their known targets ambiguous. Clementine-local writes
  * retain their separate source-bound envelope exception because their target
  * lives in validated invocation arguments rather than a provider destination.
  */
@@ -264,20 +265,17 @@ export function deriveMissingPrimaryPlanDestination(input: {
     });
   }
 
-  const destinationKeys = new Set(destinations.map((destination) => JSON.stringify({
-    account: destination.account,
-    posture: destination.posture,
-    family: destination.family,
-  })));
-  if (destinationKeys.size !== 1) {
-    return { ok: false, reason: 'host_destination_ambiguous_multiple_exact_targets' };
+  // Account identity was checked per selected manifest above and remains at
+  // each execution edge. The semantic projection describes destination kinds,
+  // not a choice between accounts: all of these operations were selected.
+  const projected = new Map<string, { posture: 'create_new' | 'named_existing'; family: string; handleRequired: boolean }>();
+  for (const destination of destinations) {
+    const key = JSON.stringify([destination.posture, destination.family]);
+    const prior = projected.get(key);
+    projected.set(key, { posture: destination.posture, family: destination.family,
+      handleRequired: destination.handleRequired || Boolean(prior?.handleRequired) });
   }
-  const first = destinations[0]!;
-  const derived = {
-    posture: first.posture,
-    family: first.family,
-    handleRequired: destinations.some((destination) => destination.handleRequired),
-  };
+  const derived = [...projected.values()];
   return {
     ok: true,
     derived: true,
@@ -285,8 +283,8 @@ export function deriveMissingPrimaryPlanDestination(input: {
       ...input.proposal,
       work: {
         ...work,
-        destinations: [{ ...derived }],
-        destination: { ...derived },
+        destinations: derived,
+        destination: derived.length === 1 ? derived[0]! : null,
       },
     },
   };
@@ -834,7 +832,6 @@ export function snapshotPrimaryModelSelectedStagedPlanningDescriptors(input: {
     || !Number.isSafeInteger(input.identity.sourceUserSeq)
     || input.identity.sourceUserSeq <= 0
     || !(input.selectedRefs instanceof Set)
-    || input.selectedRefs.size > 32
     || [...input.selectedRefs].some((ref) => (
       typeof ref !== 'string'
       || !ref.startsWith('cap:')
@@ -1079,9 +1076,13 @@ export function promoteSelectedSameSourceStagedPlanningDescriptors(input: {
     preferredLiveIds: input.selectedRefs,
     effectCeiling: input.effectCeiling,
   });
-  return [...input.selectedRefs].every((ref) => (
-    promoted.capabilities.some((descriptor) => descriptor.id === ref)
-  )) ? promoted : null;
+  // The eight-card discovery display is not an execution limit. Every exact
+  // same-source selected descriptor must survive promotion, even when a
+  // reviewed multi-tool task needs more tools than fit on the initial card.
+  const selected = [...input.selectedRefs].map(ref => eligible.get(ref)!);
+  const capabilities = [...selected, ...promoted.capabilities.filter(row => !input.selectedRefs.has(row.id))];
+  const included = new Set(capabilities.map(row => row.id));
+  return { ...promoted, capabilities, withheld: promoted.withheld.filter(row => !included.has(row.id)) };
 }
 
 function planningEffectRank(effect: HostCapabilityDescriptorV1['effect']): number {
@@ -2206,7 +2207,14 @@ export async function primePrimaryModelPlanningCatalog(input: {
   }
   const ranked = rankedLivePlanningDescriptors({
     objective,
-    live: livePlanningDescriptors,
+    // Warm global catalog entries may belong to another task. Only current
+    // nominations enter this initial card; foreground discovery and durable
+    // same-task disclosures below can still expose any configured operation.
+    live: nominatedLivePlanningDescriptors({
+      live: livePlanningDescriptors,
+      advisory: [...proofDescriptors, ...indexedDescriptors],
+      preferredLiveIds: learnedCurrentIds,
+    }),
     // A successor manifest may have a versioned id while its index row keeps
     // the stable base id. Include the exact live rows rehydrated above in the
     // advisory ordering so supply cannot be pushed off the bounded card merely
@@ -2577,7 +2585,19 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       });
       continue;
     }
-    const exact = catalog.disclosureByName.get(name.toLowerCase());
+    const exact = catalog.disclosureByName.get(name.toLowerCase()) ?? (() => {
+      // A reviewed-plan restoration can make an exact provider entry callable
+      // after this source's initial card was built. Disclose that live contract
+      // through the same staging ledger; a model-supplied name alone is not one.
+      const entry = peekHostCapabilityCatalogFactory()?.get(name);
+      if (!entry || !isCurrentCallableCatalogEntry(entry) || !candidate.schema) return undefined;
+      const descriptor = hostDescriptorFromRegistered(entry);
+      const providerDefinition = stagedProviderDefinitionFromRegistered(entry);
+      if (!descriptor || !providerDefinition
+        || providerDefinition.providerInputSchemaDigest !== digestSchema(candidate.schema)) return undefined;
+      return { descriptor, providerDefinition, identifier: entry.manifest.operationId,
+        providerKind: entry.manifest.providerKind };
+    })();
     if (exact) {
       const sourceOwnsExact = (
         candidate.sourceKind === 'authorized_composio'
@@ -2816,6 +2836,7 @@ export type PrepareDurableAcceptedTurnCompileResult =
 export function carryExactDestinationBinding(input: {
   clamped: AdmittedClampedSemanticsV1;
   binding: CanonicalDestinationBindingV1;
+  family?: string;
   /** One additional exactly-bound destination per FURTHER planned write.
    *
    * A plan that creates a thing and then writes into it names two operations.
@@ -2829,7 +2850,9 @@ export function carryExactDestinationBinding(input: {
     family: string;
   }[];
 }): { ok: true; clamped: AdmittedClampedSemanticsV1 } | { ok: false; reason: string } {
-  const admittedDestination = input.clamped.destination;
+  const admittedDestination = (input.family
+    ? input.clamped.destinations?.find(entry => entry.family === input.family)
+    : undefined) ?? input.clamped.destination;
   if (!admittedDestination) {
     return { ok: false, reason: 'destination binding has no admitted destination' };
   }
@@ -2842,20 +2865,15 @@ export function carryExactDestinationBinding(input: {
   const destination = admittedDestination.posture === input.binding.posture
     ? admittedDestination
     : { ...admittedDestination, posture: input.binding.posture };
-  const destinations = input.clamped.destinations?.map((entry) => (
-    entry.posture === input.binding.posture ? entry : { ...entry, posture: input.binding.posture }
-  ));
-  if (destinations && destinations.length !== 1) {
-    return { ok: false, reason: 'one destination binding cannot authorize multiple admitted destinations' };
+  // Several admitted targets are valid when each has its own exact binding.
+  // Do not apply the first operation's posture to unrelated destinations.
+  for (const target of input.clamped.destinations ?? []) {
+    if (target.family === destination.family && target.posture === admittedDestination.posture) continue;
+    if (!(input.additional ?? []).some(entry => entry.family === target.family && entry.binding.posture === target.posture)) {
+      return { ok: false, reason: 'admitted destination lacks its own exact binding' };
+    }
   }
-  const canonical = destinations?.[0] ?? destination;
-  if (
-    canonical.posture !== destination.posture
-    || canonical.family !== destination.family
-    || canonical.handleRequired !== destination.handleRequired
-  ) {
-    return { ok: false, reason: 'admitted destination projections disagree before binding' };
-  }
+  const canonical = destination;
   const existing = canonical.binding ?? destination.binding;
   if (existing && JSON.stringify(existing) !== JSON.stringify(input.binding)) {
     return { ok: false, reason: 'admitted destination already carries a conflicting binding' };
@@ -2875,7 +2893,7 @@ export function carryExactDestinationBinding(input: {
     .map((entry) => ({
       posture: entry.binding.posture,
       family: entry.family,
-      handleRequired: boundDestination.handleRequired,
+      handleRequired: input.clamped.destinations?.find(target => target.family === entry.family)?.handleRequired ?? boundDestination.handleRequired,
       binding: { ...entry.binding },
     }));
   return {
@@ -3765,6 +3783,7 @@ export async function prepareDurableAcceptedTurnCompile(
       const carried = carryExactDestinationBinding({
         clamped,
         binding: destinationBinding,
+        family: primary?.family,
         additional: furtherWrites,
       });
       if (!carried.ok) return carried;

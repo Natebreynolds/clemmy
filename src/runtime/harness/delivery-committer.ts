@@ -9,10 +9,12 @@ import { redactSensitiveText } from '../security.js';
  * into the user-facing terminal payload.
  */
 import { acceptedTaskMode } from './accepted-task-mode.js';
-import { finishRunAttempt } from './eventlog.js';
+import { appendEvent, finishRunAttempt } from './eventlog.js';
 import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
+import { conversationalReviewSkipMatches } from './completion-review-skip.js';
+import { sourceAttemptedCompletionWork } from './host-completion-work.js';
 import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, publishedPlanReplyText, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
 import { planReviewDigest } from './plan-publication-review.js';
 import { sourceRefusedAttempts } from './source-refused-attempts.js';
@@ -58,6 +60,20 @@ import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
 import { getPlanRevisionForSource } from './plan-artifacts.js';
+
+/** A matching blocked review supersedes the rejected draft. Appending a
+ * warning left claims such as "all succeeded" as the headline. Other review
+ * qualifications retain the draft because they do not establish a replacement
+ * account of the outcome. The caller retains the rejected text for audit. */
+export function completionReviewPresentation(input: {
+  authored: string; note: string; blockedFinding: string;
+  objectiveMatches: boolean; replyMatches: boolean;
+}): string {
+  if (input.blockedFinding && input.objectiveMatches && input.replyMatches) {
+    return input.blockedFinding;
+  }
+  return input.authored ? `${input.authored}\n\n${input.note}` : input.note;
+}
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -1182,7 +1198,7 @@ export function commitTurnOutcome(
     ? capturedRead.policy.enabled
     : capturedRead.status === 'absent' && completionReviewEnabled();
   const policyEvidence = capturedRead.status;
-  const reviewDisposition = ((): 'disabled_by_owner' | 'reviewed' | 'enabled_unavailable' => {
+  let reviewDisposition: 'disabled_by_owner' | 'reviewed' | 'enabled_unavailable' | 'not_required' = (() => {
     // A policy we could not read cannot certify anything about this run.
     if (capturedRead.status === 'unreadable') return 'enabled_unavailable';
     if (!reviewWasEnabled) return 'disabled_by_owner';
@@ -1254,6 +1270,20 @@ export function commitTurnOutcome(
     sessionId: proposed.identity.sessionId,
     sourceUserSeq: proposed.identity.sourceUserSeq,
   });
+  // A missing verdict alone proves nothing about WHY no review ran. Label the
+  // narrow conversational skip only from matching host evidence and recheck
+  // current-source work at publication, including after restart/re-entry.
+  if (!publishedVerdict && !publishedPlan && capturedRead.status === 'captured'
+    && reviewWasEnabled && acceptedObjective !== null && settledNow.count === 0
+    && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(proposed.identity)) {
+    try {
+      const skipped = listEvents(proposed.identity.sessionId, { types: ['completion_review_skipped'] })
+        .some((event) => event.role === 'system' && conversationalReviewSkipMatches(event.data, {
+          sourceUserSeq: proposed.identity.sourceUserSeq, objective: acceptedObjective, reply: proposed.text,
+        }));
+      if (skipped) reviewDisposition = 'not_required';
+    } catch { /* Unreadable skip evidence remains unavailable, never invented. */ }
+  }
   const laterReceiptsAfter = (writeOrdinal: number): Map<string, string> => {
     const latest = new Map<string, { ordinal: number; digest: string }>();
     for (const entry of settledNow.artifacts) {
@@ -1395,11 +1425,9 @@ export function commitTurnOutcome(
                   : !artifactsMatch
                     ? 'completion_review_artifact_drift'
                     : 'completion_review_did_not_stand';
-    // The model's own account of the work STAYS — the work happened, and there
-    // is no safe generic substitute for a real account. What was missing is the
-    // HOST's finding: the reply alone read as plain success while verification
-    // had failed. This appends one factual sentence saying what was checked and
-    // what would settle it. It never repeats or undoes a committed effect.
+    // Ordinary qualifications retain the draft plus a note. A matching BLOCKED
+    // finding supersedes the rejected draft below; neither path repeats or
+    // undoes any effect. Retain superseded prose in internal event history.
     const NOTES: Record<string, string> = {
       completion_review_plan_mismatch: 'Verification note: the saved plan differs from the plan that was reviewed. Its final contents need review.',
       completion_review_absent:
@@ -1444,11 +1472,33 @@ export function commitTurnOutcome(
       : NOTES[detail]
         ?? (detail === 'completion_review_blocked' ? NOTES.completion_review_negative! : NOTES.completion_review_did_not_stand!);
     const authored = effectiveOutcome.presentation.text.trim();
+    const reviewedPresentation = completionReviewPresentation({
+      authored, note, blockedFinding, objectiveMatches, replyMatches,
+    });
+    if (reviewedPresentation === blockedFinding && authored !== reviewedPresentation) {
+      // Terminal metadata intentionally excludes arbitrary prose. Keep the
+      // rejected draft in internal history, never in the public answer envelope.
+      const replyDigest = createHash('sha256').update(authored).digest('hex');
+      const prior = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ?
+        AND type = 'guardrail_tripped'
+        AND json_extract(data_json, '$.kind') = 'completion_review_rejected_draft'
+        AND json_extract(data_json, '$.sourceUserSeq') = ?
+        AND json_extract(data_json, '$.replyDigest') = ? LIMIT 1`)
+        .get(proposed.identity.sessionId, proposed.identity.sourceUserSeq, replyDigest);
+      if (!prior) appendEvent({
+        sessionId: proposed.identity.sessionId, turn: 0, role: 'system',
+        type: 'guardrail_tripped', data: {
+          kind: 'completion_review_rejected_draft',
+          sourceUserSeq: proposed.identity.sourceUserSeq, replyDigest,
+          rejectedText: authored, finding: blockedFinding,
+        },
+      });
+    }
     const withNote = {
       ...effectiveOutcome,
       presentation: {
         ...effectiveOutcome.presentation,
-        text: authored ? `${authored}\n\n${note}` : note,
+        text: reviewedPresentation,
       },
     };
     // A REVIEWER THAT CANNOT FIRE FOLLOWS THE BRAIN (owner decision 2026-09-09).

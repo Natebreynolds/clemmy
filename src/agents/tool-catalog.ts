@@ -15,6 +15,7 @@
  */
 import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
+import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
@@ -96,6 +97,16 @@ function namesNamespace(tokens: string[], namespace?: string): boolean {
  * results — first-class on every lane, every turn, never behind a search.
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
+  // Native product operations are instruments Clem owns. Keep their schemas
+  // stable instead of guessing an operation from request words. Explicit Plan
+  // and reviewed Execute still apply their existing surface restrictions.
+  ...NATIVE_PRODUCT_AUTHORING_TOOLS,
+  'space_list',
+  'space_get',
+  'workflow_list',
+  'workflow_get',
+  'workflow_run',
+  'workflow_run_status',
   // Local inspection is an acquisition primitive too. A names-only catalog
   // made list_files(directory) repeatedly arrive as list_files(path), costing
   // a refused call and another model step. Expose the actual small schemas.
@@ -282,6 +293,16 @@ function entryText(e: CatalogEntry): string {
   return `${e.name}\n${e.oneLiner}`;
 }
 
+/** Lexical relevance folds ordinary plural forms; identity and provider
+ * namespace matching continue to use the original names and query. */
+function lexicalTokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map((token) => {
+    if (token.length > 4 && token.endsWith('ies')) return `${token.slice(0, -3)}y`;
+    if (token.length > 3 && token.endsWith('s') && !token.endsWith('ss')) return token.slice(0, -1);
+    return token;
+  });
+}
+
 /** Deterministic lexical fallback when embeddings are off/unhealthy: token overlap
  *  between the query and the tool's name+one-liner. Keeps tool_search useful (and
  *  its tests hermetic) without a live embedding endpoint. */
@@ -291,8 +312,8 @@ function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: Reado
   completeCompoundNameMatch: boolean;
 } {
   if (queryTokens.length === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
-  const descriptionTokens = new Set(e.oneLiner.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
-  const nameTokens = new Set(e.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  const descriptionTokens = new Set(lexicalTokens(e.oneLiner));
+  const nameTokens = new Set(lexicalTokens(e.name));
   let covered = 0;
   let nameHits = 0;
   let queryWeight = 0;
@@ -368,13 +389,13 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   const q = (query ?? '').trim();
   if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
   const querySequence = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  const queryTokens = [...new Set(querySequence)];
+  const queryTokens = [...new Set(lexicalTokens(q))];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.
   const documents = new Map<string, number>();
   for (const entry of entries) {
-    const tokens = new Set(`${entry.name} ${entry.oneLiner}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    const tokens = new Set(lexicalTokens(`${entry.name} ${entry.oneLiner}`));
     for (const token of tokens) documents.set(token, (documents.get(token) ?? 0) + 1);
   }
   const weights = new Map([...documents].map(([token, count]) => [

@@ -26,6 +26,7 @@
  */
 import { WORKSPACE_OPERATIONAL_MANIFEST_KEYS, workspaceManifestAuthoringFields } from './workspace-manifest-authoring.js';
 import { randomUUID } from 'node:crypto';
+import { parseSpaceSourceTransforms, type SpaceSourceTransform } from './source-transforms.js';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
@@ -192,6 +193,10 @@ export interface SpaceDataSource {
   /** OR a stored Composio op + frozen args (creds resolve server-side). */
   composioSlug?: string;
   composioArgs?: Record<string, unknown>;
+  /** Exact connected account for this source; never provider call arguments. */
+  composioAccountId?: string;
+  /** Pure data shaping after a successful read and before observation commit. */
+  transforms?: SpaceSourceTransform[];
   /** Explicit product contract: zero rows is a valid, usable state (for
    * example a new content calendar before its first draft). */
   allowEmpty?: boolean;
@@ -567,6 +572,13 @@ function normDataSource(raw: unknown, manifestErrors: string[], index: number): 
     if (runner) manifestErrors.push(`${label} declares both a runner and cli_argv; declare exactly one execution mode.`);
   }
   const cs = asStr(d.composioSlug) ?? asStr(d.composio_slug); if (cs) ds.composioSlug = cs;
+  const account = asStr(d.composioAccountId) ?? asStr(d.composio_account_id);
+  if (account) ds.composioAccountId = account;
+  const transforms = d.transforms ?? d.transforms_json;
+  if (transforms != null) {
+    try { ds.transforms = parseSpaceSourceTransforms(transforms); }
+    catch (error) { manifestErrors.push(`${label} transforms: ${(error as Error).message}`); }
+  }
   if (cs && ds.cliArgv) manifestErrors.push(`${label} declares both cli_argv and a composio_slug; declare exactly one execution mode.`);
   if (d.composioArgs != null) {
     const ca = parseJsonObjField(d.composioArgs, `${label} composioArgs`, manifestErrors);

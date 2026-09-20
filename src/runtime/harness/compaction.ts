@@ -140,7 +140,7 @@ export interface InFlightCompactionThresholds {
   retainedResultBudgetTokens: number;
   minRetainPairs: number;
   maxRetainPairs: number;
-  /** True on a wire the registry seeds as prompt-caching: each collapse is a
+  /** True on explicit-cache wires and automatic-cache Codex: each collapse is a
    *  frozen checkpoint replayed verbatim on later frames, so the model-facing
    *  history only extends (compactInFlightToolContextStable). */
   checkpointed: boolean;
@@ -207,16 +207,22 @@ export function inFlightCompactionThresholds(
   // registry's conservative default, whose supportsPromptCache is false — so
   // "unknown" fails safe onto the absolute thresholds.
   const cacheScale = inFlightPromptCacheScale(routedModelId);
-  // Checkpointing follows the registry's seeded contract, not a learned rate:
-  // a wire that caches only some calls still prefills the others cold, and the
-  // absolute thresholds exist for exactly that first-byte cost.
+  // Explicit cache markers and stable history are separate concerns. Codex
+  // caches automatically (the registry correctly emits no explicit markers),
+  // but sliding compaction still invalidates its shared input prefix. Freeze
+  // its ledgers without granting the larger explicit-cache retention budget.
+  let seededCacheSupport = false;
   let checkpointed = false;
-  try { checkpointed = resolveModelCapability(routedModelId ?? undefined).supportsPromptCache === true; } catch { /* absolute */ }
+  try {
+    const capability = resolveModelCapability(routedModelId ?? undefined);
+    seededCacheSupport = capability.supportsPromptCache === true;
+    checkpointed = seededCacheSupport || capability.retryClass === 'codex';
+  } catch { /* unknown wires retain the absolute sliding policy */ }
   const scaledTrigger = Math.round(DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS * cacheScale);
   return {
     resultTriggerTokens: positive(
       'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS',
-      checkpointed ? Math.max(scaledTrigger, CHECKPOINTED_MIN_RESULT_TRIGGER_TOKENS) : scaledTrigger,
+      seededCacheSupport ? Math.max(scaledTrigger, CHECKPOINTED_MIN_RESULT_TRIGGER_TOKENS) : scaledTrigger,
     ),
     retainedResultBudgetTokens: positive(
       'CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS',
@@ -1001,6 +1007,20 @@ function replayInFlightCheckpoint(
   return desiredIndex < 0 ? null : insertAtClosedCallBoundary(nextItems, desiredIndex, checkpoint.summary);
 }
 
+/** Read-only working projection for capacity measurement. The SDK's raw input
+ * still contains retired pairs; counting those again forces a new checkpoint
+ * on every subsequent model call even while the actual request fits. */
+export function projectInFlightCompactionCheckpoints(
+  items: AgentInputItem[],
+  state: InFlightCompactionState,
+): AgentInputItem[] {
+  let current = items;
+  for (const checkpoint of state.checkpoints) {
+    current = replayInFlightCheckpoint(current, checkpoint) ?? current;
+  }
+  return current;
+}
+
 /**
  * Model-only compaction for a tool-heavy Runner loop.
  *
@@ -1058,7 +1078,7 @@ export function compactInFlightToolContext(
   const retainedPairs = retainedPairCount(completedResults, retainedBudget, minRetain, maxRetain);
 
   const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId);
-  if (collapsed.collapsed === 0) return unchanged();
+  if (collapsed.collapsed === 0 || estimateInputTokens(collapsed.nextItems) >= beforeTokens) return unchanged();
   return {
     nextItems: collapsed.nextItems,
     applied: true,
@@ -1144,7 +1164,8 @@ export function compactInFlightToolContextStable(
 
   const retainedPairs = retainedPairCount(uncovered, retainedBudget, minRetain, maxRetain);
   const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId);
-  if (collapsed.collapsed === 0 || !collapsed.summary) {
+  if (collapsed.collapsed === 0 || !collapsed.summary
+    || estimateInputTokens(collapsed.nextItems) >= estimateInputTokens(current)) {
     return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });
   }
   state.checkpoints.push({ callIds: new Set(collapsed.callIds), summary: collapsed.summary });
@@ -1418,6 +1439,16 @@ export async function summarizeOlderMessages(
     role: 'system',
     content: `[summary of earlier conversation]\n${sanitized}`,
   } as unknown as AgentInputItem;
+
+  // Judge the replacement itself, not savings from independently removed
+  // reasoning. A larger summary spends tokens and loses detail for no benefit.
+  if (estimateInputTokens([summaryMessage]) >= estimateInputTokens(summarizable)) {
+    return {
+      applied: false, removedItems: 0, summaryItems: 0,
+      callIdsReferenced: [], hallucinatedCallIds: hallucinated,
+      modelUsed: summarizerResult.modelUsed, error: 'summary_not_smaller',
+    };
+  }
 
   // Reassemble in original order, replacing the first summarizable run with
   // the new summary and preserving exact tool/recall state where it already was.

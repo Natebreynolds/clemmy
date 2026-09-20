@@ -12,10 +12,12 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import type { DispatchLeaseRef } from './dispatch-lease.js';
 import { buildWorkerJobPrompt, workerPacketKey, type WorkerToolInput } from '../../agents/worker-job-packet.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
+import { prepareWorkerResultShares } from './worker-retained-results.js';
+import { resolveLocalRetainedOutputRead } from './retained-output-read.js';
 import { acceptedTaskIdFor, currentLogicalCall } from './attempt-identity.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import {
-  appendEvent, beginRunAttempt, createSession, finishRunAttempt, getSession,
+  appendEvent, beginRunAttempt, createSession, finishRunAttempt, getSession, getToolOutput,
   listEvents, recordRunAttemptUserInput,
 } from './eventlog.js';
 import {
@@ -46,6 +48,15 @@ export async function runPacketWorkerWithHost(input: {
     return 'ERROR: worker packet has no exact accepted parent call; no worker ran.';
   }
   const inheritedMode = parseTaskMode(source.data.taskMode);
+  let retainedResultShares;
+  try {
+    retainedResultShares = prepareWorkerResultShares(input.parentSessionId, input.input.retainedResultIds ?? [], id => {
+      const resolved = resolveLocalRetainedOutputRead(input.parentSessionId, id);
+      return resolved.receipt ?? getToolOutput(input.parentSessionId, resolved.callId);
+    });
+  } catch (error) {
+    return `ERROR: ${error instanceof Error ? error.message : String(error)} No worker ran.`;
+  }
   const packetKey = workerPacketKey(input.input);
   const packetDigest = createHash('sha256').update(JSON.stringify(input.input)).digest('hex');
   const lineage = {
@@ -56,7 +67,7 @@ export async function runPacketWorkerWithHost(input: {
   const childId = `sess-worker-${createHash('sha256').update(JSON.stringify(lineage)).digest('hex').slice(0, 40)}`;
   const session = getSession(childId) ?? createSession({
     id: childId, kind: 'agent', title: `Worker: ${input.input.item}`,
-    metadata: { source: 'delegated_worker', workerScope: true, ...lineage },
+    metadata: { source: 'delegated_worker', workerScope: true, ...lineage, retainedResultShares },
   });
   const attempt = beginRunAttempt(session.id);
   const prompt = buildWorkerJobPrompt(input.input);
@@ -148,7 +159,7 @@ export async function runPacketWorkerWithHost(input: {
             }
           }
         : undefined;
-      const { hostRunRunner } = await import('./host-turn-runner.js');
+      const { hostRunRunner, HostRecoveryState } = await import('./host-turn-runner.js');
       // A PROVEN WRITE IS CREDITED EVEN WHEN THE CHILD DIES AFTER IT.
       // The child can settle its item and then trip its tool ceiling, be
       // killed, or abort; hostRunRunner throws and the normal-return path
@@ -171,13 +182,29 @@ export async function runPacketWorkerWithHost(input: {
       };
       let outcome;
       try {
-        outcome = await hostRunRunner(new Runner({ groupId: input.parentSessionId }) as never,
-          agent, [{ type: 'message', role: 'user', content: prompt }] as never, {
-            maxTurns: input.maxTurns, hostTurnEngine: 'host_v1',
-            context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
-            ...(input.signal ? { signal: input.signal } : {}),
-            ...(onHostArmed ? { onHostArmed } : {}),
-          } as never);
+        const runner = new Runner({ groupId: input.parentSessionId });
+        const options = {
+          maxTurns: input.maxTurns, hostTurnEngine: 'host_v1',
+          context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(onHostArmed ? { onHostArmed } : {}),
+        };
+        outcome = await hostRunRunner(runner as never,
+          agent, [{ type: 'message', role: 'user', content: prompt }] as never, options as never);
+        const resumed = new Set<string>();
+        // Recovery is an unfinished child, not its answer. Re-enter the exact
+        // checkpoint: it carries the step index, no-progress budget and balanced
+        // tool history, so already-settled commands are not dispatched again.
+        // Bound store-recovery churn as well as the host's cumulative turn cap.
+        while (outcome.hold && outcome.serializedRecoveryState) {
+          const blob = outcome.serializedRecoveryState;
+          const digest = createHash('sha256').update(blob).digest('hex');
+          if (resumed.has(digest) || resumed.size >= input.maxTurns * 2 + 2) break;
+          if (input.signal?.aborted) break;
+          resumed.add(digest);
+          const recovery = HostRecoveryState.fromString(blob);
+          outcome = await hostRunRunner(runner as never, agent, recovery as never, options as never);
+        }
       } finally {
         creditDelegatedItem();
       }
@@ -190,23 +217,24 @@ export async function runPacketWorkerWithHost(input: {
         // THIS attempt only: the child session id is deterministic per lineage,
         // so a replayed dispatch reuses it and an earlier attempt's fallover
         // must not label this run.
-        const routed = listEvents(session.id, { types: ['turn_model_routed'], sinceSeq: childSource.seq - 1 });
-        const last = routed.length ? routed[routed.length - 1]!.data as { model?: unknown; provider?: unknown; routeKind?: unknown; fallover?: unknown } : undefined;
-        const executedModel = typeof last?.model === 'string' && last.model ? last.model : input.modelId;
-        const executedProvider = typeof last?.provider === 'string' && last.provider
-          ? last.provider
-          : resolveEffectiveProviderForModel(executedModel);
-        appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_model_executed', data: {
-          ...lineage, executed: true, childSessionId: session.id,
-          plannedModel: input.modelId, plannedProvider: resolveEffectiveProviderForModel(input.modelId),
-          model: executedModel, effectiveModel: executedModel, provider: executedProvider,
-          fallover: last?.fallover === true || last?.routeKind === 'harness_fallover',
-        } });
+        const responses = listEvents(session.id, { types: ['worker_model_response_completed'], sinceSeq: childSource.seq - 1 })
+          .filter(event => event.data.sourceUserSeq === childSource.seq && event.data.runAttemptId === attempt.attemptId);
+        const last = responses.at(-1)?.data;
+        if (typeof last?.model === 'string' && last.model && typeof last.provider === 'string' && last.provider !== 'unknown') {
+          appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_model_executed', data: {
+            ...lineage, executed: true, childSessionId: session.id,
+            childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId,
+            evidenceKind: 'completed_model_response', modelCallId: last.modelCallId,
+            plannedModel: input.modelId, plannedProvider: resolveEffectiveProviderForModel(input.modelId),
+            model: last.model, effectiveModel: last.model, provider: last.provider,
+            fallover: responses.some(event => event.data.fallover === true),
+          } });
+        }
       } catch { /* attribution is best-effort telemetry, never a result */ }
-      if (outcome.hasInterruptions || outcome.terminal?.status === 'blocked') {
-        return `ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`;
+      if (outcome.hold || outcome.hasInterruptions || outcome.terminal) {
+        return `ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? outcome.hold?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`;
       }
-      const text = normalizeWorkerOutput(outcome);
+      const text = normalizeWorkerOutput(outcome.finalOutput);
       completed = !/^\s*(?:ERROR|PARTIAL):/i.test(text);
       return text;
     });

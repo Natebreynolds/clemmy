@@ -148,7 +148,7 @@ test('whole-plan bind requires exact one-to-one operation coverage', () => {
   assert.ok(replay);
 });
 
-test('referenced 17KB descriptor omitted from the judge request is blocked with no receipt', () => {
+test('large selected descriptor is included, and a receipt for a different disclosure is rejected', () => {
   const huge: HostCapabilityDescriptorV1 = {
     id: 'cap:huge',
     effect: 'read',
@@ -171,9 +171,9 @@ test('referenced 17KB descriptor omitted from the judge request is blocked with 
     descriptors: [huge],
     referencedIds: ['cap:huge'],
   });
-  assert.equal(shown.ok, false);
-  if (shown.ok) return;
-  assert.equal(shown.code, 'grounding_descriptor_omitted');
+  assert.equal(shown.ok, true);
+  if (!shown.ok) return;
+  assert.deepEqual(shown.shown.map(row => row.id), ['cap:huge']);
   const bound = bindPlanGroundingReceipt({
     judged: {
       verdict: 'entailed',
@@ -385,6 +385,12 @@ test('a 1000-capability catalog stays in the byte budget and shows every referen
   const boundedAll = boundHostCapabilityDescriptors(descriptors);
   assert.ok(boundedAll.length <= 32);
   assert.ok(Buffer.byteLength(JSON.stringify(boundedAll), 'utf8') <= 16_384);
+  // Execution selection is not the initial discovery card. Every selected
+  // operation remains groundable even past both display budgets.
+  const allSelected = shownGroundingDescriptors({ descriptors, referencedIds: descriptors.map(row => row.id) });
+  assert.equal(allSelected.ok, true);
+  if (allSelected.ok) assert.equal(allSelected.shown.length, 1000);
+  assert.equal(shownGroundingDescriptors({ descriptors, referencedIds: ['cap:missing'] }).ok, false);
 });
 
 test('RESERVED NAMESPACE: a model verdict cannot claim host deterministic-bind authority', () => {

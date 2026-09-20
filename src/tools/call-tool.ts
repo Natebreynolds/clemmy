@@ -396,7 +396,7 @@ async function invokeCurrentCatalogProductionPort(input: {
 
 const DESCRIPTION = [
   'Invoke a catalog built-in that is not one of your first-class tools: exact `name` (from the catalog / tool_search) plus `args_json`, a JSON object string of its arguments ("{}" for none).',
-  'call_tool never prompts on its own — the target\'s own classification decides: a read runs immediately; a write/send/irreversible target gates exactly as if called directly. http_fetch, web_fetch, web_fetch_simple and fetch_url are bounded read-only aliases of the curl path when run_shell_command is allowed.',
+  'call_tool never prompts on its own — the target\'s own classification decides: a read runs immediately; a write/send/irreversible target gates exactly as if called directly. http_read is a dedicated bounded read-only HTTP GET tool. Legacy http_fetch, web_fetch, web_fetch_simple and fetch_url aliases require the allowed curl path.',
   'Arguments that miss the schema make NO change and return the schema — fix and retry without broad discovery; call tool_search once only for an unresolved capability.',
 ].join(' ');
 

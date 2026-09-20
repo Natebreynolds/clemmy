@@ -298,7 +298,7 @@ test('empty home accounts exact live preparation and business workflow crossings
   assert.equal(installed.manifest.effect, 'read');
   assert.equal(installed.attestation.effectAttestation, 'carrier_declared');
   assert.match(installed.manifest.providerIdentity, /^mcp-config:/);
-  assert.match(installed.manifest.providerVersion, /^mcp-catalog-v1:/);
+  assert.match(installed.manifest.providerVersion, /^mcp-config-v1:/);
   assert.match(installed.manifest.accountId, /^native_mcp:/);
   assert.match(installed.manifest.operationVersion, /^mcp-tool-v1:/);
   assert.match(installed.manifest.invokePortId, /^host:test-native-mcp-read:/);

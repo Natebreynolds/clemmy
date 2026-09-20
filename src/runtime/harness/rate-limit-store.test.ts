@@ -19,6 +19,7 @@ const {
   recordByoRateLimit,
   getRateLimitSnapshot,
   classifyCodexQuota,
+  discardAmbiguousCodexPercentages,
   __resetRateLimitStoreForTests,
 } = await import('./rate-limit-store.js');
 
@@ -59,12 +60,34 @@ test('works with a real Headers object (not just a plain record)', () => {
   assert.equal(getRateLimitSnapshot().codex?.primary?.usedPercent, 90);
 });
 
-test('percentages clamp to 0–100 and round', () => {
+test('percentages clamp to 0–100', () => {
   __resetRateLimitStoreForTests();
   recordCodexRateLimit({ 'x-codex-primary-used-percent': '142.6', 'x-codex-secondary-used-percent': '-5' });
   const { codex } = getRateLimitSnapshot();
   assert.equal(codex?.primary?.usedPercent, 100);
   assert.equal(codex?.secondary?.usedPercent, 0);
+});
+
+test('Codex low percentages never become fractions or falsely exhaust the judge', () => {
+  for (const used of [0, 0.5, 1, 1.1, 99.9, 100]) {
+    __resetRateLimitStoreForTests();
+    recordCodexRateLimit({
+      'x-codex-primary-used-percent': String(used),
+      'x-codex-primary-window-minutes': '10080',
+      'x-codex-primary-reset-after-seconds': '604800',
+    });
+    assert.equal(classifyCodexQuota(getRateLimitSnapshot().codex).weekly?.usedPercent, used);
+    assert.equal(codexQuotaExhausted(), used === 100);
+  }
+});
+
+test('legacy percentage migration drops ambiguous windows but preserves real 429 backoff', () => {
+  const old = { codex: { primary: { usedPercent: 100 }, capturedAt: 123, exhaustedUntil: 456 }, byo: {} };
+  assert.deepEqual(discardAmbiguousCodexPercentages(old), {
+    codex: { capturedAt: 123, exhaustedUntil: 456 }, byo: {},
+  });
+  const fresh = { ...old, codex: { ...old.codex, percentUnit: 'percent' as const } };
+  assert.equal(discardAmbiguousCodexPercentages(fresh), fresh);
 });
 
 test('malformed headers never throw (best-effort capture)', () => {

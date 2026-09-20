@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { claudeAvailable } from './harness/judge-family.js';
 import { parseClaudeCredential, assertSubscriptionToken, loadFreshClaudeAccessToken, claudeVaultRefreshDead, claudeVaultFallbackReady, getClaudeAuthSnapshot, ClaudeAuthError, __test__ } from './claude-oauth.js';
 
 const FUTURE = Date.now() + 60 * 60_000;
@@ -287,17 +288,23 @@ test('fallback readiness does not advertise an expired vault token with a known-
   });
   try {
     assert.equal(claudeVaultFallbackReady(), true, 'before the server rejects it, an expired refreshable vault grant is a candidate');
+    assert.equal(claudeAvailable(), true);
     await loadFreshClaudeAccessToken();
     assert.equal(claudeVaultRefreshDead(), true);
     assert.equal(claudeVaultFallbackReady(), false, 'expired access + known-dead refresh must not be advertised as a fallback brain');
+    assert.equal(claudeAvailable(), true, 'valid subscription fallback remains available');
+    __test__.setRawCredentialReaderForTests(() => null);
+    assert.equal(claudeAvailable(), false, 'dead vault with no usable fallback is unavailable to judges too');
 
     vault.expiresAt = Date.now() + 60 * 60_000;
     assert.equal(claudeVaultFallbackReady(), true, 'a still-valid access token can run even when the refresh grant is dead');
+    assert.equal(claudeAvailable(), true);
 
     vault.expiresAt = Date.now() - 60_000;
     vault.refreshToken = 'new-refresh';
     assert.equal(claudeVaultRefreshDead(), false);
     assert.equal(claudeVaultFallbackReady(), true, 'a new re-auth refresh token restores fallback readiness');
+    assert.equal(claudeAvailable(), true);
   } finally {
     __test__.setVaultTokenReaderForTests(null);
     __test__.setRawCredentialReaderForTests(null);

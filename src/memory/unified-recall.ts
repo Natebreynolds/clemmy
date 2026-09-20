@@ -180,7 +180,11 @@ export function formatUnifiedPrimer(result: UnifiedRecallResult, maxChars = 1800
 function unifiedRecallHeader(result: UnifiedRecallResult): string {
   const recallTag = result.recallId ? `; recall: ${result.recallId}` : '';
   const scope = result.purpose === 'ambient' ? '; scope: ambient task context' : '';
-  return `[RELEVANT MEMORY — evidence-backed; answerability: ${result.answerability ?? 'partial'}${scope}${recallTag}]`;
+  // Ranking and source provenance do not establish semantic entailment,
+  // project applicability, or exhaustive coverage of the requested answer.
+  // Keep the legacy answerability field for ranking/telemetry consumers; never
+  // advertise it as a verified answer to the model.
+  return `[RELEVANT MEMORY — ranked candidates; coverage: non-exhaustive; applicability: check cited scope${scope}${recallTag}]`;
 }
 
 function unifiedTimeEvidence(hit: UnifiedHit): string {
@@ -201,7 +205,7 @@ function unifiedRecallLine(hit: UnifiedHit): string {
   const why = (hit.whyRecalled ?? []).filter(Boolean).slice(0, 3);
   const reasons = why.length > 0 ? ` [why: ${why.join('; ')}]` : '';
   const ref = unifiedHitRecallRef(hit);
-  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${hit.title}${hit.snippet ? `: ${hit.snippet}` : ''}${evidence}${sources}${reasons}${unifiedTimeEvidence(hit)}`;
+  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${hit.title}${hit.snippet ? `: ${hit.snippet}` : ''}${hit.truncated ? ' [excerpt; reopen ref for full value]' : ''}${evidence}${sources}${reasons}${unifiedTimeEvidence(hit)}`;
 }
 
 function compactText(value: string | undefined, maxChars: number): string {
@@ -232,7 +236,7 @@ function unifiedPrimerLine(hit: UnifiedHit): string {
     .map((item) => item.sourceUri?.trim())
     .filter((uri): uri is string => Boolean(uri)))]
     .find((uri) => uri !== hit.ref && uri.length <= 240);
-  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${source ? ` [source: ${source}]` : ''}${unifiedTimeEvidence(hit)}`;
+  return `- [${label[hit.type]}] [ref ${ref.type}:${ref.id}] ${title}${snippet ? `: ${snippet}` : ''}${hit.truncated || snippet !== hit.snippet.replace(/\s+/g, ' ').trim() ? ' [excerpt; reopen ref for full value]' : ''}${source ? ` [source: ${source}]` : ''}${unifiedTimeEvidence(hit)}`;
 }
 
 /** Exact visible candidate set for a bounded recall block. Attribution must

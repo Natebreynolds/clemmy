@@ -35,3 +35,18 @@ test('a matching posture is carried unchanged', () => {
   assert.equal(carried.ok, true);
   if (carried.ok) assert.equal(carried.clamped.destination?.posture, 'named_existing');
 });
+
+test('multiple targets retain their own exact bindings and evidence requirements', () => {
+  const clamped = { destination: { posture: 'create_new', family: 'crawl', handleRequired: true },
+    destinations: [{ posture: 'create_new', family: 'crawl', handleRequired: true },
+      { posture: 'named_existing', family: 'sheet', handleRequired: false }] } as unknown as Parameters<typeof carryExactDestinationBinding>[0]['clamped'];
+  const crawl = { ...binding, operationId: 'crawl', posture: 'create_new' as const };
+  const sheet = { ...binding, operationId: 'sheet' };
+  assert.equal(carryExactDestinationBinding({ clamped, binding: crawl, family: 'crawl' }).ok, false);
+  const carried = carryExactDestinationBinding({ clamped, binding: crawl, family: 'crawl', additional: [{ family: 'sheet', binding: sheet }] });
+  assert.equal(carried.ok, true, JSON.stringify(carried));
+  if (carried.ok) {
+    assert.deepEqual(carried.clamped.destinations?.map(row => [row.family, row.posture, row.binding?.operationId, row.handleRequired]),
+      [['crawl', 'create_new', 'crawl', true], ['sheet', 'named_existing', 'sheet', false]]);
+  }
+});

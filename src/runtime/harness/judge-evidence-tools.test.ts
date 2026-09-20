@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-const { judgeEvidenceTools, judgeEvidenceGuidance, JUDGE_EVIDENCE_LOOKUP_BUDGET } = await import('./judge-evidence-tools.js');
+const { judgeEvidenceTools, judgeEvidenceGuidance, judgeEvidenceReferences, JUDGE_EVIDENCE_LOOKUP_BUDGET } = await import('./judge-evidence-tools.js');
 
 const triage = {
   mailbox: 'owner',
@@ -68,4 +68,14 @@ test('lookups stop at the budget so a review stays short', async () => {
   assert.match(await open_evidence({ ref: 'triage' }), /Lookup budget spent \(2\)/);
   assert.match(judgeEvidenceGuidance(source), new RegExp(`at most ${JUDGE_EVIDENCE_LOOKUP_BUDGET} lookups`));
   assert.match(judgeEvidenceGuidance(source), /step ids of this run/);
+});
+
+
+test('review-specific references do not change tool schemas or stable guidance', () => {
+  const other = { ...source, refs: () => ['other-current-result'] };
+  assert.deepEqual(JSON.parse(JSON.stringify(judgeEvidenceTools(source))), JSON.parse(JSON.stringify(judgeEvidenceTools(other))));
+  assert.equal(judgeEvidenceGuidance(source), judgeEvidenceGuidance(other));
+  assert.match(judgeEvidenceReferences(source), /triage, report, raw_json_text/);
+  assert.equal(judgeEvidenceReferences(other), 'Valid refs: other-current-result.');
+  assert.doesNotMatch(JSON.stringify(judgeEvidenceTools(source)), /raw_json_text/);
 });

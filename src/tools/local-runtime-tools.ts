@@ -27,6 +27,7 @@ import { registerGoalTools } from './goal-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
+import { registerHttpReadTools } from './http-read-tools.js';
 import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerAutomationOpportunityTools } from './automation-opportunity-tools.js';
@@ -331,6 +332,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerHomeTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
+  registerHttpReadTools(server);
   registerMcpServerTools(server);
   const dynamicToolStart = captured.length;
   registerDynamicTools(server);
@@ -424,14 +426,25 @@ export function recoverOmittedNullableFields(
   const first = parameters.safeParse(parsedInput);
   if (first.success) return null;
   const omitted = first.error.issues.filter((issue) => (
-    issue.path.length === 1
-    && typeof issue.path[0] === 'string'
+    issue.path.length > 0
+    && issue.path.every((key) => typeof key === 'string' || typeof key === 'number')
     && /received undefined/i.test(issue.message)
   ));
   if (omitted.length === 0 || omitted.length !== first.error.issues.length) return null;
 
-  const repaired: Record<string, unknown> = { ...(parsedInput as Record<string, unknown>) };
-  for (const issue of omitted) repaired[issue.path[0] as string] = null;
+  const repaired = structuredClone(parsedInput) as Record<string, unknown>;
+  for (const issue of omitted) {
+    let parent: unknown = repaired;
+    for (const key of issue.path.slice(0, -1)) {
+      if (!parent || typeof parent !== 'object' || !Object.hasOwn(parent, key)) return null;
+      parent = (parent as Record<PropertyKey, unknown>)[key];
+    }
+    const key = issue.path.at(-1)!;
+    if (!parent || typeof parent !== 'object' || typeof key !== 'string' || Object.hasOwn(parent, key)) return null;
+    // Define an own property: even a schema's unusual key must not mutate a
+    // prototype. Never construct missing parents or guess array elements.
+    Object.defineProperty(parent, key, { value: null, enumerable: true, configurable: true, writable: true });
+  }
   return parameters.safeParse(repaired).success ? repaired : null;
 }
 
@@ -484,14 +497,15 @@ export function buildLocalToolErrorFunction(
     }
     // Proceeding turns a refusal into a real invocation, so only completions
     // that cannot change what was asked for may proceed. A read refused for an
-    // omitted optional field or a renamed identifier can simply run. A write
-    // proceeds only when the call's own fields form exactly one valid item of
-    // the list it omitted: nothing dropped, nothing invented. Sends, admin
+    // omitted optional field or a renamed identifier can simply run. An ordinary
+    // write may also fill omitted nullable fields after nominal SDK validation
+    // proves the handler never started, or wrap one exact item into its list.
+    // Nothing is dropped and no required value is invented. Sends, admin
     // changes, and every other invalid write keep the visible refusal.
     const sideEffect = registeredToolSideEffect(localTool.name);
     const normalizedShape = normalizeShapeForResponses(localTool.parameters);
-    const repaired = (sideEffect === 'read'
-      ? recoverOmittedNullableFields(error, z.object(normalizedShape))
+    const repaired = (sideEffect === 'read' || (sideEffect === 'write' && isSdkToolInputValidationError(error))
+      ? recoverOmittedNullableFields(error, z.strictObject(normalizedShape))
       : null)
       // Unknown fields must be visible to be completed, so this check is strict.
       ?? completeExactNativeArguments(error, z.strictObject(normalizedShape), sideEffect);

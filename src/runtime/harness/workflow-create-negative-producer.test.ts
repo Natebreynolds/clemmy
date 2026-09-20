@@ -50,19 +50,20 @@ function accepted() {
 }
 
 async function invokeAndSettle(identity: ReturnType<typeof accepted>, args: Record<string, unknown>,
-  logicalToolCallId: string, override?: () => Promise<unknown>) {
+  logicalToolCallId: string, override?: () => Promise<unknown>, toolName = 'workflow_create') {
   // Host-only physical admission is real; there is no provider or judge mock.
   const opened = dispatch.beginPhysicalDispatch({ identity: { ...identity, logicalToolCallId,
     physicalDispatchId: `host:${logicalToolCallId}`, ordinal: 0 },
-    tool: 'workflow_create', args, executionSite: 'host' });
+    tool: toolName, args, executionSite: 'host' });
   assert.equal(opened.status, 'inserted', JSON.stringify(opened));
   if (opened.status !== 'inserted') throw new Error('Host fixture admission failed');
-  const result = override ? await override() : await create.invoke({ context: identity } as never,
+  const adapter = toolName === 'workflow_create' ? create : getLocalDeferredDispatchTools().find((tool) => tool.type === 'function' && tool.name === toolName)!;
+  const result = override ? await override() : await adapter.invoke({ context: identity } as never,
     JSON.stringify(args), { toolCall: { callId: logicalToolCallId } } as never);
   assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity,
-    tool: 'workflow_create', outcome: 'returned' }).status, 'inserted');
+    tool: toolName, outcome: 'returned' }).status, 'inserted');
   const settlement = settleToolAttempt({ ...identity, callId: logicalToolCallId,
-    toolName: 'workflow_create', args, lane: 'byo', mutating: true, businessCall: true, result });
+    toolName, args, lane: 'byo', mutating: true, businessCall: true, result });
   return { result, settlement };
 }
 
@@ -150,4 +151,24 @@ test('a succeeded workflow_create with a genuinely missing promised receipt stil
   assert.equal(evidence.count, 1);
   assert.equal(evidence.artifacts[0]?.evidenceContract, 'unknown');
   assert.equal(evidence.artifacts[0]?.unresolvedReason, 'promised_receipt_missing_or_malformed');
+});
+
+
+test('rejected update normalization leaves no phantom write after a valid repair', async () => {
+  const identity = accepted();
+  const name = `negative-update-${serial}`;
+  await invokeAndSettle(identity, { ...base(name), enabled: false }, 'update-fixture-create');
+  const before = readFileSync(readWorkflow(name)!.filePath);
+  const invalid = await invokeAndSettle(identity, { name, steps: [{ id: 'echo',
+    sideEffect: 'read', transform: '{"version":1,"expression":{"operation":"get","from":"input.text"}}' }] },
+    'update-invalid-transform', undefined, 'workflow_update');
+  assert.ok(invalid.result instanceof HostLocalNonWriteResult);
+  assert.equal(invalid.settlement.outcome.kind, 'invalid_arguments');
+  assert.deepEqual(readFileSync(readWorkflow(name)!.filePath), before);
+  await invokeAndSettle(identity, { name, description: 'Repaired named test workflow.' },
+    'update-valid-repair', undefined, 'workflow_update');
+  const current = settledSourceArtifacts(identity).artifacts.filter((artifact) => !artifact.superseded);
+  assert.equal(current.length, 1);
+  assert.equal(current[0]?.evidenceContract, 'file');
+  assert.equal(current[0]?.digestMatches, true);
 });

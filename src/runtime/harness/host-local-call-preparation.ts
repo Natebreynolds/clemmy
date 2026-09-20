@@ -50,6 +50,21 @@ export async function prepareHostLocalCall(agent: object, call: LocalCall): Prom
   return nominateDisclosedLocalPlanningDefinition({ ...call, effect: 'local_write' }) !== null;
 }
 
+/** Direct native authoring gets its requirement from the live configured
+ * definition, not from an argument invented by the model. Publication alone
+ * grants no consent or execution; the normal host call boundary still owns it. */
+export async function prepareDirectHostLocalCall(
+  agent: object,
+  call: Omit<LocalCall, 'capabilityRef'>,
+): Promise<string | null> {
+  const current = await currentLocalWriteDefinitions(agent, call);
+  if (!current || current.definitions.length !== 1) return null;
+  const capabilityRef = current.definitions[0]!.capabilityRef;
+  await disclosePrimaryModelPlanningCapabilities({ authority: current.authority, candidates: [current.candidate] });
+  return nominateDisclosedLocalPlanningDefinition({ ...call, capabilityRef, effect: 'local_write' })
+    ? capabilityRef : null;
+}
+
 /** The requirement an exact native write runs under, or null.
  *
  * A requirement id copied from ANOTHER configured local operation (the one the
@@ -77,7 +92,7 @@ export async function resolveHostLocalCallRequirement(agent: object, call: Local
 
 /** The named operation's current write definitions that match these exact
  * arguments, from the live registry and this agent's configured surface. */
-async function currentLocalWriteDefinitions(agent: object, call: LocalCall) {
+async function currentLocalWriteDefinitions(agent: object, call: Omit<LocalCall, 'capabilityRef'>) {
   const bound = preparations.get(agent);
   if (!bound || !bound.configuredNames.has(call.operationId)) return null;
   const current = snapshotPrimaryModelPlanningContext(bound.planning.authority);

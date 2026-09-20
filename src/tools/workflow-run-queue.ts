@@ -1,3 +1,5 @@
+import { matchingPendingWorkflowVerification, disabledWorkflowRunMessage } from './workflow-verification-state.js';
+import { currentDispatchLease } from '../runtime/harness/dispatch-lease.js';
 import {
   closeSync,
   existsSync,
@@ -1253,6 +1255,8 @@ function normalizeWorkflowRunRecoveryIntent(
  * identical run is already queued/running.
  */
 export interface QueueWorkflowRunOptions {
+  /** False verifies a requested draft without granting activation on success. */
+  activateAfterCreationTest?: boolean;
   /** Gap E: the chat/agent session that should hear the outcome in-context.
    *  Written into the run record so the runner re-enters it on a terminal
    *  state. Omit for scheduled/cron/dashboard/webhook runs (notification-only). */
@@ -1353,6 +1357,8 @@ export interface QueueWorkflowRunOptions {
   /** One-shot user request for a uniquely named catalog workflow. The runner
    *  may execute this run even when the workflow is still disabled for cron. */
   acceptDisabled?: boolean;
+  /** Exact in-flight verification required before this requested run can execute. */
+  verificationRunId?: string;
   /** Internal authority used only by the runner after the source execution has
    *  fully settled but before its terminal run record is installed. External
    *  retry surfaces must leave this unset so a live source can never race a
@@ -2696,6 +2702,7 @@ function queueWorkflowRunUnlocked(
       ...(triggerReceiptId ? { triggerReceiptId } : {}),
       ...(targetStepId ? { targetStepId } : {}),
       ...(opts?.acceptDisabled === true ? { acceptDisabled: true } : {}),
+      ...(opts?.verificationRunId ? { verificationRunId: opts.verificationRunId } : {}),
       ...(readPilotAdmission?.ok
         ? { workflowReadPilotAdmission: readPilotAdmission.admission }
         : {}),
@@ -2901,6 +2908,11 @@ export function queueWorkflowCreationTest(
   ensureDir(WORKFLOW_RUNS_DIR);
   const createdAt = new Date().toISOString();
   const { snapshot: workflowDefinitionSnapshot } = admittedWorkflowDefinition(name, createdAt);
+  const lease = currentDispatchLease();
+  const creationTestSource = lease?.sourceUserSeq && lease.logicalToolCallId
+    && lease.sessionId === opts?.originSessionId
+    ? { sessionId: lease.sessionId, sourceUserSeq: lease.sourceUserSeq, logicalToolCallId: lease.logicalToolCallId }
+    : undefined;
   const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
   const origin = origins[0];
   const source = normalizedOptionalString(opts?.source);
@@ -2909,6 +2921,8 @@ export function queueWorkflowCreationTest(
     workflow: name,
     inputs: normalizedInputs,
     status: 'creation_test',
+    ...(opts?.activateAfterCreationTest === false ? { activateAfterCreationTest: false } : {}),
+    ...(creationTestSource ? { creationTestSource } : {}),
     mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
     ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
     ...(typeof opts?.autoRetestDepth === 'number' && opts.autoRetestDepth > 0
@@ -2926,9 +2940,25 @@ export function queueWorkflowCreationTest(
       `Saved "${name}" as DISABLED and started a creation test (run ${id}) — `
       + `it's running the read-only steps now against the real tools to confirm they return data, `
       + `and previewing (not executing) any send/write steps. `
-      + `Tell the user it's being tested and that it will auto-enable here on pass (or report what to fix on fail). `
+      + (opts?.activateAfterCreationTest === false
+        ? `It will remain DISABLED after verification, as requested (or report what to fix on fail). `
+        : `Tell the user it's being tested and that it will auto-enable here on pass (or report what to fix on fail). `)
       + `Do NOT wait, poll, or do the work yourself.`,
   };
+}
+
+/** Read-only lifecycle evidence; never grants execution authority. */
+export function pendingWorkflowVerification(name: string, definition: WorkflowDefinition): string | undefined {
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return undefined;
+  const definitionHash = workflowDefinitionHash(definition);
+  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
+    const runId = file.slice(0, -5);
+    try {
+      const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf8'));
+      if (matchingPendingWorkflowVerification(record, { runId, workflowName: name, definitionHash })) return runId;
+    } catch { /* Unreadable records cannot prove pending verification. */ }
+  }
+  return undefined;
 }
 
 export interface ResumeWorkflowRunResult {
@@ -2952,25 +2982,16 @@ export function resumeWorkflowRun(
 ): ResumeWorkflowRunResult {
   const workflow = listWorkflows().find((entry) => entry.data.name === name);
   if (!workflow) return { status: 'not_found', message: `Workflow "${name}" not found.` };
-  // Disabled means "do not run this saved definition", never "do not do this
-  // work". Live 2026-09-03 run 29: the model matched a saved workflow, was told
-  // it is disabled, and ended the turn on that sentence — zero business calls on
-  // a request it was equipped to carry out directly.
-  if (!workflow.data.enabled) {
-    return {
-      status: 'disabled',
-      message: `Workflow "${name}" is disabled, so it will not be run. That does not `
-        + `block the request: carry it out directly with the tools you already have `
-        + `(tool_search for the exact operations, then plan and act as usual). `
-        + `Do not re-attempt this workflow.`,
-    };
+  const verificationRunId = !workflow.data.enabled ? pendingWorkflowVerification(name, workflow.data) : undefined;
+  if (!workflow.data.enabled && !verificationRunId) {
+    return { status: 'disabled', message: disabledWorkflowRunMessage(name) };
   }
   const normalized = normalizeWorkflowRunInputs(rawInputs);
   const missing = missingWorkflowRunInputs(workflow.data, normalized);
   if (missing.length > 0) {
     return { status: 'missing_inputs', missing, message: `Still missing: ${missing.join(', ')}.` };
   }
-  const queued = queueWorkflowRun(name, normalized, opts);
+  const queued = queueWorkflowRun(name, normalized, { ...opts, ...(verificationRunId ? { verificationRunId } : {}) });
   return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };
 }
 

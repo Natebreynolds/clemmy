@@ -63,7 +63,7 @@ function schema(input: z.ZodType): Record<string, unknown> {
   return z.toJSONSchema(input, { unrepresentable: 'any', io: 'input' }) as Record<string, unknown>;
 }
 
-function refHint(source: JudgeEvidenceSource): string {
+export function judgeEvidenceReferences(source: JudgeEvidenceSource): string {
   const refs = source.refs();
   return refs.length <= LISTED_REFS
     ? `Valid refs: ${refs.join(', ') || '(none)'}.`
@@ -90,11 +90,22 @@ function at(value: unknown, path: string): unknown {
   return current;
 }
 
-function jsonValue(entry: JudgeEvidenceEntry): unknown {
+export function judgeEvidenceJsonValue(entry: JudgeEvidenceEntry): unknown {
   let value = entry.value !== undefined ? entry.value : entry.text;
   // A result that is a JSON document in a string is queried as that document.
-  for (let depth = 0; depth < 2 && typeof value === 'string'; depth += 1) {
-    try { value = JSON.parse(value); } catch { break; }
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); continue; } catch { break; }
+    }
+    // Query the document inside a single-text MCP response. Mixed content and
+    // error envelopes stay intact; open_evidence always retains original text.
+    const envelope = value as { content?: Array<{ type?: string; text?: unknown }>; isError?: boolean } | null;
+    if (envelope && !Array.isArray(envelope) && envelope.isError !== true
+      && Array.isArray(envelope.content) && envelope.content.length === 1
+      && envelope.content[0]?.type === 'text' && typeof envelope.content[0].text === 'string') {
+      try { value = JSON.parse(envelope.content[0].text); continue; } catch { break; }
+    }
+    break;
   }
   return value;
 }
@@ -155,12 +166,12 @@ export function judgeEvidenceTools(
     }
     used += 1;
     const entry = source.resolve(ref.trim());
-    return entry ?? `No retained result for ref ${JSON.stringify(ref)}. ${refHint(source)}`;
+    return entry ?? `No retained result for ref ${JSON.stringify(ref)}. ${judgeEvidenceReferences(source)}`;
   };
   return [
     tool({
       name: 'open_evidence',
-      description: `Read a retained result under review as text, from an offset. Returns the requested characters and the total length. ${refHint(source)}`,
+      description: 'Read a retained result under review as text, from an offset. Returns the requested characters and the total length. Use a ref listed in the review evidence references.',
       parameters: schema(openInput) as never,
       strict: false,
       execute: async (raw) => {
@@ -174,14 +185,14 @@ export function judgeEvidenceTools(
     }),
     tool({
       name: 'query_evidence',
-      description: `Query the records of a retained JSON result under review: choose the list (path, default its main list), keep records whose where_field equals or contains a value, return chosen fields, with the true match count. ${refHint(source)}`,
+      description: 'Query the records of a retained JSON result under review: choose the list (path, default its main list), keep records whose where_field equals or contains a value, return chosen fields, with the true match count. Use a ref listed in the review evidence references.',
       parameters: schema(queryInput) as never,
       strict: false,
       execute: async (raw) => {
         const input = queryInput.parse(raw);
         const entry = lookup(input.ref);
         if (typeof entry === 'string') return entry;
-        const records = recordsOf(jsonValue(entry), input.path);
+        const records = recordsOf(judgeEvidenceJsonValue(entry), input.path);
         if (typeof records === 'string') return records;
         let rows = records.rows;
         if (input.where_field && (input.equals !== undefined || input.contains !== undefined)) {

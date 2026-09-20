@@ -188,6 +188,8 @@ export interface JudgeWorkflowTargetInput {
   workflow: WorkflowTargetFields;
   inputs: Record<string, unknown>;
   finalOutput: unknown;
+  /** Exact host-rendered result intended for delivery; takes precedence over the internal rollup. */
+  deliveredBody?: string;
   /** Optional explicit/provisional goal. Legacy workflows pass a derived one. */
   goal?: Pick<LegacyWorkflowRunGoal, 'objective' | 'successCriteria'>;
   /** Humanized success body — fallback deliverable text when finalOutput is thin. */
@@ -223,7 +225,11 @@ export async function judgeWorkflowTarget(
   }
   const objective = opts.goal?.objective ?? buildWorkflowObjective(opts.workflow, opts.inputs);
   const evidence = opts.executionEvidence?.();
-  const deliverable = renderDeliverableForJudge(opts.finalOutput, opts.fallbackBody, Boolean(opts.executionEvidence));
+  const deliverable = renderDeliverableForJudge(
+    opts.deliveredBody ?? opts.finalOutput,
+    opts.deliveredBody === undefined ? opts.fallbackBody : undefined,
+    Boolean(opts.executionEvidence),
+  );
   if (!objective || !deliverable) {
     return {
       reached: true,
@@ -267,6 +273,7 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
+      ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),
       ...(opts.reviewPolicy?.status === 'captured' ? { boundaryJudgeSelection: opts.reviewPolicy.judgeSelection } : {}),
     } : undefined));
     if (!verdict || verdict.failedOpen) {

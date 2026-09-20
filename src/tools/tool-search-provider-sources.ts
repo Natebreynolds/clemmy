@@ -1,5 +1,6 @@
 import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { createProductionMcpReadCarrier } from '../runtime/harness/production-mcp-read-carrier.js';
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
@@ -261,10 +262,9 @@ function discoveryStillActive(input: {
     && (input.deadlineAt === undefined || Date.now() < input.deadlineAt);
 }
 
-/** One explicit registered Composio action is selection, not fuzzy intent.
- * Unknown namespaces and prose containing two action identities remain normal
- * fuzzy searches; neither can make token/list order choose authority. */
-function exactComposioOperationFromQuery(query: string): string | null {
+/** Explicit registered actions are independent exact lookups, not fuzzy intent.
+ * Returning several schemas does not select execution authority for any of them. */
+export function exactComposioOperationsFromQuery(query: string): string[] {
   const operations = new Set<string>();
   const pattern = /(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?=$|[^A-Za-z0-9_])/g;
   for (const match of query.matchAll(pattern)) {
@@ -291,7 +291,7 @@ function exactComposioOperationFromQuery(query: string): string | null {
     ) continue;
     operations.add(operation);
   }
-  return operations.size === 1 ? [...operations][0]! : null;
+  return [...operations];
 }
 
 /** Fast-path memory must be evidence, not merely a plausible lexical hint.
@@ -2027,7 +2027,22 @@ export function buildAuthorizedToolSearchCandidateSources(
       if (!discoveryStillActive(guard)) return null;
       // Non-read operations keep their metadata and existing exact native
       // disclosure path. Failure to acquire a read never invents a read proof.
-      if (acquired.status === 'blocked') return candidate;
+      if (acquired.status === 'blocked') {
+        // Workflow call_tool discovery has no foreground planning publisher.
+        // Generic MCP operations (including APIs supporting reads and writes)
+        // cannot acquire a read-only proof, but still need the same exact live
+        // materialization used by foreground disclosure. This installs the
+        // observed effect/account/schema/port, never a synthetic read grant;
+        // the invocation gate still evaluates the actual requested call.
+        if (carrier === 'call_tool' && discoveryStillActive(guard)) {
+          await createProductionMcpReadCarrier({ serverName }).materializeExact({
+            operationId: operation,
+            inputSchema: candidate.schema,
+          });
+          if (!discoveryStillActive(guard)) return null;
+        }
+        return candidate;
+      }
       const issued = issueAuthorizedLiveReadPlanningAuthority({
         identity: planningIdentity,
         materialized: acquired,
@@ -2172,72 +2187,77 @@ export function buildAuthorizedToolSearchCandidateSources(
     async search({ query, signal, deadlineAt, accountSelection, deferPreparation }) {
       preparedSearchCandidates.clear();
       if (signal?.aborted) return [];
-      const exactOperation = exactComposioOperationFromQuery(query);
-      if (exactOperation) {
-        const exactToolkit = registeredToolkitOfSlug(exactOperation).trim().toLowerCase();
+      const exactOperations = exactComposioOperationsFromQuery(query);
+      if (exactOperations.length > 0) {
         const connectionDeadlineAt = exactDiscoveryDeadline(deadlineAt);
         const currentConnections = await freshConnectionsWithin({
           signal,
           deadlineAt: connectionDeadlineAt,
         });
         if (signal?.aborted) return [];
-        if (
-          currentConnections
-          && !currentConnections.some((connection) => (
-            connection.slug.trim().toLowerCase() === exactToolkit
-            && /active|enabled|initiat/i.test(connection.status ?? '')
-          ))
-        ) {
-          throw new CandidateSourceUnavailableError(
-            'no_connections',
-            `No current ${exactToolkit} connection can authorize ${exactOperation}.`,
-            {
-              kind: 'exact_capability_connection',
-              toolkit: exactToolkit,
-              capability: exactOperation,
-              capabilityRef: `cap:resolved:${exactOperation.toLowerCase()}`,
-            },
-          );
-        }
-        // A current schema lease plus a live connection is the remembered
-        // contract. Re-fetching the same slug from the provider is how
-        // the Outlook create-event operation still cost 32s after the first
-        // discovery in the same session. Drift retires the memo; it does
-        // not mint a capabilityRef.
-        if (currentConnections) {
-          const lease = rememberedExactComposioLease(exactOperation);
-          if (lease) {
-            reconcileExactSlugMemory(exactOperation, lease.fingerprint);
-            const memo = composioMemoriesForSlug(exactOperation)[0];
-            return [rememberPreparedSearchCandidate(exactComposioSearchCandidate(
-              exactOperation,
-              lease.schema,
-              memo?.description,
-            ))];
+        const exactCandidates: ToolSearchBrokerCandidate[] = [];
+        for (const exactOperation of exactOperations) {
+          const exactToolkit = registeredToolkitOfSlug(exactOperation).trim().toLowerCase();
+          if (
+            currentConnections
+            && !currentConnections.some((connection) => (
+              connection.slug.trim().toLowerCase() === exactToolkit
+              && /active|enabled|initiat/i.test(connection.status ?? '')
+            ))
+          ) {
+            throw new CandidateSourceUnavailableError(
+              'no_connections',
+              `No current ${exactToolkit} connection can authorize ${exactOperation}.`,
+              {
+                kind: 'exact_capability_connection',
+                toolkit: exactToolkit,
+                capability: exactOperation,
+                capabilityRef: `cap:resolved:${exactOperation.toLowerCase()}`,
+              },
+            );
           }
+          // A current schema lease plus a live connection is the remembered
+          // contract. Re-fetching the same slug from the provider is how
+          // the Outlook create-event operation still cost 32s after the first
+          // discovery in the same session. Drift retires the memo; it does
+          // not mint a capabilityRef.
+          if (currentConnections) {
+            const lease = rememberedExactComposioLease(exactOperation);
+            if (lease) {
+              reconcileExactSlugMemory(exactOperation, lease.fingerprint);
+              const memo = composioMemoriesForSlug(exactOperation)[0];
+              exactCandidates.push(rememberPreparedSearchCandidate(exactComposioSearchCandidate(
+                exactOperation,
+                lease.schema,
+                memo?.description,
+              )));
+              continue;
+            }
+          }
+          const exact = await materializeNamedComposioOperation({
+            operation: exactOperation,
+            signal,
+            deadlineAt,
+          });
+          if (signal?.aborted) return [];
+          const liveFingerprint = liveComposioSchemaFingerprint(exactOperation);
+          if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint);
+          exactCandidates.push(...exact.map((candidate): ToolSearchBrokerCandidate => ({
+            name: candidate.slug,
+            summary: candidate.description?.trim()
+              || `${candidate.name} (${candidate.toolkit})`,
+            schema: candidate.inputParameters,
+            carrier: 'work_call',
+            score: composioDiscoveryScore(1, registeredToolkitOfSlug(candidate.slug), candidate.slug),
+            invocation: {
+              name: 'composio_execute_tool',
+              fixedArgs: { tool_slug: candidate.slug },
+              payloadField: 'arguments',
+            },
+            guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
+          })).map(rememberPreparedSearchCandidate));
         }
-        const exact = await materializeNamedComposioOperation({
-          operation: exactOperation,
-          signal,
-          deadlineAt,
-        });
-        if (signal?.aborted) return [];
-        const liveFingerprint = liveComposioSchemaFingerprint(exactOperation);
-        if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint);
-        return exact.map((candidate): ToolSearchBrokerCandidate => ({
-          name: candidate.slug,
-          summary: candidate.description?.trim()
-            || `${candidate.name} (${candidate.toolkit})`,
-          schema: candidate.inputParameters,
-          carrier: 'work_call',
-          score: composioDiscoveryScore(1, registeredToolkitOfSlug(candidate.slug), candidate.slug),
-          invocation: {
-            name: 'composio_execute_tool',
-            fixedArgs: { tool_slug: candidate.slug },
-            payloadField: 'arguments',
-          },
-          guidance: `For publish_plan, staticArgumentsJson contains only the direct ${candidate.slug} input fields from this exact schema. For work_call execution, use inner name composio_execute_tool, tool_slug ${candidate.slug}, and serialize those direct action fields into the carrier arguments field.`,
-        })).map(rememberPreparedSearchCandidate);
+        return exactCandidates;
       }
       // A strict confident Tool Memory hit gets one exact provider
       // revalidation and no fuzzy request. Account resolution intentionally

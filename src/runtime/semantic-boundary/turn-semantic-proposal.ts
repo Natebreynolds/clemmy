@@ -249,7 +249,7 @@ const proposedSemanticWorkV1BaseSchema = z.object({
    * (`semantic-schema-strictness` pins exactly this — the same trap recorded
    * after the last occurrence).
    */
-  destinations: z.array(proposedDestinationSchema).max(8).nullish(),
+  destinations: z.array(proposedDestinationSchema).nullish(),
   /** Projection of destinations[0] for existing proposal authors. */
   destination: proposedDestinationSchema.nullable(),
   requestedEffect: requestedEffectSchema,
@@ -643,8 +643,9 @@ export function shownGroundingDescriptors(input: {
     selected.push(descriptor);
     if (!boundRefs.includes(descriptor.id)) boundRefs.push(descriptor.id);
   }
-  const bounded = boundHostCapabilityDescriptors(selected);
-  const shown = bounded.map((entry) => groundingDescriptorViewFromHost(entry));
+  // These are exact selected operations, not discovery suggestions. Display
+  // budgets must not silently discard part of an executable plan.
+  const shown = selected.map((entry) => groundingDescriptorViewFromHost(entry));
   const shownIds = shown.map((entry) => entry.id);
   for (const id of boundRefs) {
     const count = shownIds.filter((shownId) => shownId === id).length;

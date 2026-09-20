@@ -80,14 +80,17 @@ export type EnsureWorkspaceReadClassificationResult =
 export async function ensureWorkspaceReadClassification(
   toolSlug: string,
   dependencies: WorkflowStepExternalCatalogDependencies = {},
+  accountId?: string,
 ): Promise<EnsureWorkspaceReadClassificationResult> {
   const operationId = toolSlug.trim().toUpperCase();
   if (!operationId) return { ok: false, operationId, error: 'workspace read operation is blank' };
-  if (workspaceComposioIsProvablyReadOnly(operationId)) return { ok: true, operationId };
+  // A warm operation can belong to a different account. Prepare the exact
+  // saved account even when another account already supplied a read entry.
+  if (!accountId && workspaceComposioIsProvablyReadOnly(operationId)) return { ok: true, operationId };
   let prepared: Awaited<ReturnType<typeof prepareWorkflowStepExternalCatalog>>;
   try {
     prepared = await exactSpaceReadCatalogPreparer({
-      immutablePrompt: '',
+      immutablePrompt: accountId ?? '',
       allowedTools: [operationId],
     }, dependencies);
   } catch (error) {
@@ -103,7 +106,9 @@ export async function ensureWorkspaceReadClassification(
     return {
       ok: false,
       operationId,
-      error: prepared.status === 'none'
+      error: prepared.status === 'refused' && prepared.reason === 'ambiguous_current_manifest'
+        ? `Clementine could not match this source to one connected account for ${operationId}. ${accountId ? 'Check the saved account for this source.' : 'Choose and save the intended account for this source.'} No provider call was made.`
+        : prepared.status === 'none'
         ? `no durable current manifest is available for "${operationId}"`
         : [
             `exact read catalog preparation was refused (${prepared.reason})`,
@@ -138,12 +143,13 @@ export async function prepareAndAcquireSpaceReadAuthority(
     slug: string;
     sourceId: string;
     toolSlug: string;
+    accountId?: string;
     args: Record<string, unknown>;
     cause: string;
   },
   dependencies: WorkflowStepExternalCatalogDependencies = {},
 ): Promise<AcquireSpaceReadAuthorityResult> {
-  const classified = await ensureWorkspaceReadClassification(input.toolSlug, dependencies);
+  const classified = await ensureWorkspaceReadClassification(input.toolSlug, dependencies, input.accountId);
   if (!classified.ok) return { ok: false, error: classified.error };
   return acquireSpaceReadAuthority({ ...input, toolSlug: classified.operationId });
 }
@@ -224,6 +230,7 @@ export function acquireSpaceReadAuthority(input: {
   slug: string;
   sourceId: string;
   toolSlug: string;
+  accountId?: string;
   args: Record<string, unknown>;
   /** Provenance only; it never widens what the activation may execute. */
   cause: string;
@@ -257,6 +264,7 @@ export function acquireSpaceReadAuthority(input: {
     requirementId: exactIdOrDigest(`workspace:${input.slug}:source:${input.sourceId}`),
     logicalCapabilityId: exactIdOrDigest(`workspace.read:${input.toolSlug}`),
     operationId: input.toolSlug,
+    accountId: input.accountId,
     args: input.args,
   });
   if (acquired.status !== 'armed') return { ok: false, error: acquired.reason };

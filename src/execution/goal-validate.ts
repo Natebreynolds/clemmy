@@ -35,6 +35,7 @@ import {
   type SkillExecutionContext,
 } from '../runtime/harness/objective-judge.js';
 import type { JudgeEvidenceSource } from '../runtime/harness/judge-evidence-tools.js';
+import { workflowFileEvidence } from './workflow-file-evidence.js';
 
 export interface GoalCriterionVerdict {
   criterion: string;
@@ -151,6 +152,8 @@ export interface ValidateGoalInput {
    *  its own note admitted they were present — 86% false alarm + a scary
    *  "re-run could double the notify" escalation on a 7/7 run). */
   stepOutputs?: Record<string, unknown>;
+  /** Retained, run-scoped source reads available on demand to the judge. */
+  readEvidence?: JudgeEvidenceSource;
 }
 
 export interface ValidateGoalDeps {
@@ -228,14 +231,21 @@ function defaultJudge(objective: string, evidenceText: string, context?: SkillEx
 /** The run's complete step outputs, for a reviewer to open. Its evidence text
  * shows each output as a bounded projection (arrays as count + sample), which
  * cannot prove a criterion about every record; the reviewer reads the rest. */
-export function stepOutputEvidence(stepOutputs: Record<string, unknown> | undefined): JudgeEvidenceSource | undefined {
-  if (!stepOutputs || Object.keys(stepOutputs).length === 0) return undefined;
+export function stepOutputEvidence(stepOutputs: Record<string, unknown> | undefined, readEvidence?: JudgeEvidenceSource): JudgeEvidenceSource | undefined {
+  if (!stepOutputs || Object.keys(stepOutputs).length === 0) return readEvidence;
+  // Separate namespaces prevent an authored step id from shadowing a receipt.
+  const readRefs = new Map((readEvidence?.refs() ?? []).map(ref => {
+    let exposed = ref;
+    while (Object.prototype.hasOwnProperty.call(stepOutputs, exposed)) exposed = `read/${exposed}`;
+    return [exposed, ref];
+  }));
   return {
-    refKind: 'step ids of this run',
-    refs: () => Object.keys(stepOutputs),
+    refKind: 'step ids and run-scoped read_receipts refs (open read_receipts to verify input origin and invocation scope; open file-write steps for receipt-verified file content)',
+    refs: () => [...Object.keys(stepOutputs), ...readRefs.keys()],
     resolve(ref) {
+      if (readRefs.has(ref)) return readEvidence?.resolve(readRefs.get(ref)!);
       if (!Object.prototype.hasOwnProperty.call(stepOutputs, ref)) return undefined;
-      const value = stepOutputs[ref];
+      const value = workflowFileEvidence(stepOutputs[ref]);
       return { text: typeof value === 'string' ? value : JSON.stringify(value, null, 1) ?? String(value), value };
     },
   };
@@ -252,7 +262,7 @@ export async function validateGoal(
 ): Promise<GoalValidationResult> {
   const fileExists = deps.fileExists ?? existsSync;
   const judge = deps.judge ?? defaultJudge;
-  const evidence = stepOutputEvidence(input.stepOutputs);
+  const evidence = stepOutputEvidence(input.stepOutputs, input.readEvidence);
   const judgeContext: SkillExecutionContext | undefined = evidence ? { skills: [], toolCallSummary: '', evidence } : undefined;
   const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter((c) => c.length > 0);
 

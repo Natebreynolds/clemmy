@@ -2064,6 +2064,19 @@ export function buildComposioStatusPayload(
   };
 }
 
+/** Keep connection details once in model context, without changing API aliases. */
+export function compactComposioStatusPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...payload };
+  const sameList = (left: unknown, right: unknown): boolean =>
+    Array.isArray(left) && Array.isArray(right) && JSON.stringify(left) === JSON.stringify(right);
+  if (sameList(result.connectedAccounts, result.connections)
+    || sameList(result.connectedAccounts, result.usableConnections)) {
+    delete result.connectedAccounts;
+  }
+  if (sameList(result.connections, result.usableConnections)) delete result.connections;
+  return result;
+}
+
 /** Deterministic ASK for a genuinely-ambiguous multi-mailbox toolkit — never
  *  dispatch under a guessed/default account. Lists the candidate mailboxes WITH
  *  their saved names and connection ids so the model can pin the named one on
@@ -5158,7 +5171,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       const connections = credentials.enabled ? await listUsableConnectedToolkits() : [];
       const suppressedConnections = credentials.enabled ? await listSuppressedConnectedToolkits() : [];
       return formatComposioToolOutput(
-        buildComposioStatusPayload(credentials as unknown as Record<string, unknown>, connections, suppressedConnections),
+        compactComposioStatusPayload(buildComposioStatusPayload(credentials as unknown as Record<string, unknown>, connections, suppressedConnections)),
         { context, details, toolName: 'composio_status' },
       );
     },

@@ -487,13 +487,12 @@ async function freshSnapshot(input: {
   await server.invalidateToolsCache();
   const rawTools = await server.listTools();
   const tools = parseClosedToolList(rawTools, input.serverSlug);
-  const catalogBytes = closedCanonicalJson(
-    tools.map((entry) => entry.bytes).sort(),
-    CLOSED_TOOL_LIST_OPTIONS,
-  );
   const observedAt = Date.now();
   const providerIdentity = `mcp-config:${input.serverSlug}:${config.digest}`;
-  const providerVersion = `mcp-catalog-v${MCP_CARRIER_VERSION}:${sha256(`${config.bytes}\0${catalogBytes}`)}`;
+  // A worker's exact lease exposes fewer tools than its parent's catalog.
+  // Visibility is not provider drift. The provider version binds configuration;
+  // each operationVersion below separately binds its complete tool definition.
+  const providerVersion = `mcp-config-v${MCP_CARRIER_VERSION}:${sha256(config.bytes)}`;
   const accountId = `native_mcp:${input.serverSlug}:${config.digest}`;
   const invoke = portIdentity(input.runtime);
   const definitions = tools.map(({ tool, bytes, parsedName }) => {
@@ -809,6 +808,13 @@ async function executeWithRuntime(
   const result = runtime.invokePreparedOperation
     ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, call.args)
     : await prepared.snapshot.server.callTool(call.operationId, call.args);
+  return normalizeProductionMcpResult(result);
+}
+
+/** At this boundary the value is a returned MCP tools/call result. MCP defines
+ * omitted isError as false; persist that protocol fact before generic outcome
+ * classification, without inferring success from arbitrary text/payloads. */
+export function normalizeProductionMcpResult(result: unknown): unknown {
   const metadata = result as unknown as { isError?: unknown; content?: unknown; structuredContent?: unknown };
   if (metadata?.isError === true) {
     // The SDK can return an Array carrying MCP metadata as own properties.
@@ -823,7 +829,14 @@ async function executeWithRuntime(
       ? JSON.stringify(metadata.structuredContent) : '');
     throw new Error(detail ? `native MCP operation failed: ${detail}` : 'native MCP operation returned isError');
   }
-  if (!Array.isArray(result)) return result;
+  if (metadata?.isError !== undefined && typeof metadata.isError !== 'boolean') {
+    throw new Error('native MCP operation returned a malformed isError flag');
+  }
+  if (!Array.isArray(result)) {
+    return metadata && Array.isArray(metadata.content)
+      ? { ...metadata, isError: false }
+      : result;
+  }
   // The Agents SDK represents tools/call content as an Array with MCP result
   // metadata assigned as own properties. JSON serialization would retain the
   // blocks but silently discard `structuredContent`, `isError`, and `_meta`.
@@ -835,9 +848,7 @@ async function executeWithRuntime(
     ...(Object.prototype.hasOwnProperty.call(own, 'structuredContent')
       ? { structuredContent: own.structuredContent }
       : {}),
-    ...(Object.prototype.hasOwnProperty.call(own, 'isError')
-      ? { isError: own.isError }
-      : {}),
+    isError: false,
     ...(Object.prototype.hasOwnProperty.call(own, '_meta')
       ? { _meta: own._meta }
       : {}),

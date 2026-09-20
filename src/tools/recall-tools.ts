@@ -24,8 +24,9 @@ import { projectProviderResultEvidenceView } from '../runtime/harness/result-fac
  *
  * Scoping: reads the session id from the harness AsyncLocalStorage
  * (brackets.ts:harnessRunContextStorage). Cross-session call_id lookups
- * are forbidden — call_ids from different sessions live in different
- * scopes and the table primary key (session_id, call_id) enforces it.
+ * are forbidden except for exact parent results explicitly shared by the host
+ * with a delegated worker. Those reads verify the stored content fingerprint;
+ * arbitrary session lookup remains unavailable.
  *
  * Budget: 3 calls + 60KB per turn (defaults in loop.ts when the
  * HarnessRunContext is built). Beyond budget, returns an error string

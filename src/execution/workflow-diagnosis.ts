@@ -1,3 +1,4 @@
+import { workflowResultSteps } from './workflow-result-steps.js';
 /**
  * Workflow self-heal (flag: WORKFLOW_SELF_HEAL, default on).
  *
@@ -1178,16 +1179,16 @@ function renderStructuredResult(root: Record<string, unknown>): string | null {
 /**
  * Build the success-case completion body. Prefers the synthesis text
  * (already human prose) when the workflow has a synthesis pass; otherwise
- * humanizes each step's structured result instead of dumping raw JSON.
+ * humanizes terminal results. Intermediate evidence stays in the run record.
  */
 export function renderSuccessBody(opts: {
-  steps: Array<{ id: string }>;
+  steps: Array<{ id: string; dependsOn?: string[] }>;
   stepOutputs: Record<string, unknown>;
   finalOutput: string;
   hasSynthesis: boolean;
 }): string {
   if (opts.hasSynthesis && opts.finalOutput.trim()) return opts.finalOutput.trim();
-  const shown = opts.steps.filter((s) => opts.stepOutputs[s.id] !== undefined);
+  const shown = workflowResultSteps(opts.steps, opts.stepOutputs);
   if (shown.length === 0) return opts.finalOutput.trim() || '✓ completed';
   if (shown.length === 1) return humanizeStepOutput(opts.stepOutputs[shown[0].id]);
   return shown.map((s) => `**${s.id}**: ${humanizeStepOutput(opts.stepOutputs[s.id])}`).join('\n');

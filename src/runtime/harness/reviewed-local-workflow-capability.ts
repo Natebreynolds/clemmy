@@ -41,6 +41,27 @@ import {
   type ReviewedLocalToolObservation,
 } from './reviewed-local-tool-carrier.js';
 
+/** Materialize the registered file tool's optional invocation defaults before
+ * freezing args. Missing mode still means create; explicit append/overwrite
+ * and the append flag retain their registered precedence. */
+export function normalizeReviewedLocalWorkflowArguments(
+  operationId: string, args: Record<string, unknown>,
+): Record<string, unknown> {
+  const observed = observeReviewedLocalTool(operationId);
+  if (observed?.execution.adapter === 'local_file_read_v1') {
+    const normalized = { ...args };
+    if (normalized.max_chars === null) delete normalized.max_chars;
+    return normalized;
+  }
+  if (observed?.execution.adapter !== 'local_file_revision_v1') return args;
+  const normalized: Record<string, unknown> = { ...args, mode: args.mode ?? 'create' };
+  // null means "use mode" on the registered tool. The workflow plan carries
+  // concrete JSON values, so omit this optional no-op flag rather than freeze
+  // a null binding that its argument language cannot represent.
+  if (normalized.append === null) delete normalized.append;
+  return normalized;
+}
+
 export type EnsureReviewedLocalWorkflowCapabilityResult =
   | {
       ok: true;

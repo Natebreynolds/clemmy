@@ -14,6 +14,19 @@ import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output
 // window (compactionBudgetForModel) instead of a fixed 200K.
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 
+/** These local readers already validate max_chars and format their preview.
+ * The outer bracket must not silently impose its smaller default afterwards.
+ * Smaller previews remain the handler's responsibility; unrelated tools do
+ * not gain a larger result budget from an arbitrary argument of this name. */
+export function explicitLocalReadPreviewBudget(toolName: string, args: unknown): number | undefined {
+  if (!['read_file', 'convert_to_markdown'].includes(toolName)
+    || !args || typeof args !== 'object' || Array.isArray(args)) return undefined;
+  const requested = (args as Record<string, unknown>).max_chars;
+  return typeof requested === 'number' && Number.isSafeInteger(requested)
+    && requested > DEFAULT_TOOL_RESULT_MAX_CHARS ? requested : undefined;
+}
+
+
 // Host commentary explains a provider result; it never displaces it. The
 // annotation block receives at most this share of the result budget, each note
 // shortened within it, and the provider result keeps the remainder.

@@ -34,6 +34,8 @@ import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { harnessRunContextStorage } from './brackets.js';
 import {
+  DEFAULT_CODEX_FAST_MODEL,
+  DEFAULT_CLAUDE_FAST_MODEL,
   getActiveAuthMode,
   getByoBackendConfig,
   getClaudeBrainModel,
@@ -58,7 +60,7 @@ const logger = pino({ name: 'clementine.router-model' });
 export type BrainProvider = 'codex' | 'claude' | 'byo';
 
 type SyncModelProvider = {
-  getModel(modelName?: string): Model;
+  getModel(modelName?: string, options?: { allowOverloadFallback?: boolean }): Model;
 };
 
 /** Narrow dependency seam for deterministic route tests. Production callers
@@ -275,7 +277,7 @@ export class RouterModelProvider implements ModelProvider {
     switch (effectiveProvider) {
       case 'claude':
         logger.debug({ requested: name, backend: 'claude' }, 'route');
-        return { model: this.claude.getModel(name), provider: 'claude', label: name };
+        return { model: this.claude.getModel(name, { allowOverloadFallback: harnessRunContextStorage.getStore()?.workerScope !== true }), provider: 'claude', label: name };
       case 'byo': {
         // Exact ownership declared by a named BYO provider beats model-id
         // regexes. This is how an OpenAI-compatible endpoint can intentionally
@@ -300,7 +302,7 @@ export class RouterModelProvider implements ModelProvider {
         if (getActiveAuthMode() === 'claude_oauth' && !this.codexAvailable()) {
           const id = getClaudeBrainModel();
           logger.debug({ requested: name, routedTo: id, backend: 'claude' }, 'route (active claude, no codex)');
-          return { model: this.claude.getModel(id), provider: 'claude', label: id };
+          return { model: this.claude.getModel(id, { allowOverloadFallback: harnessRunContextStorage.getStore()?.workerScope !== true }), provider: 'claude', label: id };
         }
         logger.debug({ requested: name, backend: 'codex' }, 'route');
         return { model: this.codex.getModel(name), provider: 'codex', label: name };
@@ -370,7 +372,8 @@ export class RouterModelProvider implements ModelProvider {
     // user wants instead of an error card. No connected subscription → the
     // original isolation holds by construction.
     if (getModelRoutingMode() === 'all_in') {
-      const workerScope = Boolean(harnessRunContextStorage.getStore()?.guardrailScopeId);
+      const context = harnessRunContextStorage.getStore();
+      const workerScope = context?.workerScope === true || Boolean(context?.guardrailScopeId);
       if (workerScope) return chain;
       // Sibling BYO backends first: all_in means subscriptions are last resort.
       if (primary.provider === 'byo') chain.push(...this.byoSiblingTargets(primary));
@@ -392,6 +395,21 @@ export class RouterModelProvider implements ModelProvider {
           getModel: () => this.claude.getModel(model),
           supportsRequest: claudeHarnessSupportsRequest,
         });
+      }
+      return chain;
+    }
+    // Workers retain their role on provider failure. Foreground brain settings
+    // (and arbitrary BYO siblings of unknown size) must not silently promote a
+    // small delegated task to a large model. Explicit primary pins stay intact.
+    if (harnessRunContextStorage.getStore()?.workerScope === true) {
+      if (primary.provider !== 'codex' && this.codexAvailable()) {
+        chain.push({ label: DEFAULT_CODEX_FAST_MODEL, provider: 'codex', model: DEFAULT_CODEX_FAST_MODEL,
+          getModel: () => this.codex.getModel(DEFAULT_CODEX_FAST_MODEL) });
+      }
+      if (primary.provider !== 'claude' && this.claudeAvailable()) {
+        chain.push({ label: DEFAULT_CLAUDE_FAST_MODEL, provider: 'claude', model: DEFAULT_CLAUDE_FAST_MODEL,
+          getModel: () => this.claude.getModel(DEFAULT_CLAUDE_FAST_MODEL, { allowOverloadFallback: false }),
+          supportsRequest: claudeHarnessSupportsRequest });
       }
       return chain;
     }

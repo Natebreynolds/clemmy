@@ -833,6 +833,25 @@ export async function issueAuthorizedLocalPlanningDisclosureCandidate(input: {
 }
 
 /** Model/candidate bytes cannot manufacture this WeakMap-backed fact. */
+export async function observeSelectedLocalPlanningDisclosureCandidate(
+  capabilityRef: string,
+): Promise<AuthorizedLocalPlanningDisclosureCandidate | null> {
+  // A model's ref only nominates a registry name. The current configured
+  // schema, carrier and registry semantics must independently derive that
+  // exact ref; an invented variant or effect cannot acquire a definition.
+  const match = /^cap:local:([a-z0-9][a-z0-9._/-]{0,63}):([a-z0-9][a-z0-9._/-]{0,63})$/.exec(capabilityRef);
+  if (!match || !isRegistryDeclaredLocalPlanningCapability(match[1]!)) return null;
+  const configured = await resolveConfiguredLocalPlanningTool(match[1]!, 'work_call');
+  if (!configured || configured.name !== match[1]) return null;
+  const candidate = await issueAuthorizedLocalPlanningDisclosureCandidate({
+    name: configured.name, carrier: 'work_call', configuredNames: new Set([configured.name]),
+  });
+  if (!candidate || 'refused' in candidate
+    || !candidate.capabilityVariants.some(variant => variant.capabilityRef === capabilityRef)) return null;
+  return candidate;
+}
+
+/** Model/candidate bytes cannot manufacture this WeakMap-backed fact. */
 export function inspectAuthorizedLocalPlanningDisclosureCandidate(
   candidate: object,
 ): AuthorizedLocalPlanningDefinitionV1 | null {

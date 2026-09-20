@@ -1,3 +1,5 @@
+import { READ_FILE_PARAMS } from './local-file-read-contract.js';
+import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
@@ -6,7 +8,7 @@ import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { canonicalLocalFileTarget, commitLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
+import { canonicalLocalFileTarget, commitLocalFileRevision, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
 import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { reviewedFileCorrectionPrecondition } from '../runtime/harness/reviewed-file-correction.js';
 import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
@@ -21,7 +23,8 @@ import {
   getWorkspaceDirs,
   isSdkToolInputValidationError,
 } from './shared.js';
-import { InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
+import { HostLocalReadSuccessResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
+import { LocalFileCreateConflict } from '../runtime/harness/local-file-create-conflict.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
@@ -1320,23 +1323,136 @@ function listDirectory(dir: string, limit: number): string {
  *  run_shell_command. The tool() defs below build their `parameters` from these,
  *  and the gated MCP lane (gated-mutating-tools.ts) derives its Claude-facing
  *  schema from them too, so the two can never drift (TOOL-REGISTRY-PLAN C3). */
-export const WRITE_FILE_PARAMS = {
-  path: z.string().min(1),
-  content: z.string(),
-  mode: z.enum(['create', 'append', 'overwrite']).nullable(),
-  // Chunked-by-construction: append:true appends (creating if absent) — the
-  // continuation call for a large file. append:false starts the file fresh
-  // (overwrite). Omitted/null → fall back to `mode` (backward compatible — a
-  // caller that never sends `append` behaves exactly as before, so it is OPTIONAL,
-  // unlike the always-present `mode`).
-  append: z.boolean().nullable().optional(),
-} satisfies z.ZodRawShape;
+export { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 
 export const RUN_SHELL_COMMAND_PARAMS = {
   command: z.string().min(1),
   cwd: z.string().nullable(),
   timeout_ms: z.number().min(1000).max(120000).nullable(),
 } satisfies z.ZodRawShape;
+
+/** Shared registered file body. Callers retain responsibility for dispatch authority. */
+export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WRITE_FILE_PARAMS>>, options?: { preserveCreateConflict: boolean; operationKey?: string; recoveryOnly?: boolean }): Promise<string> {
+  const filePath = resolveAllowedPath(input.path);
+  const canonicalTarget = canonicalLocalFileTarget(filePath);
+  if (loadProactivityPolicy().autoApproveScope !== 'yolo'
+    && !workspaceRoots().some(root => isInside(path.dirname(canonicalLocalFileTarget(path.join(root, '.clem-path-check'))), canonicalTarget))) {
+    throw new Error(`Path is outside allowed workspace roots: ${canonicalTarget}.`);
+  }
+  if (isProtectedInstalledSkillSourcePath(filePath) || isProtectedInstalledSkillSourcePath(canonicalTarget)) {
+    return [
+      `Refused to write ${filePath}: installed skill source files are read-only during skill runs.`,
+      'Write generated artifacts under the skill output/, outputs/, runs/, artifacts/, reports/, or tmp/ directory, or update the skill package through the skill install/update path.',
+    ].join(' ');
+  }
+  const teamNotice = typedClementineStateWriteNotice(filePath) ?? typedClementineStateWriteNotice(canonicalTarget);
+  if (teamNotice) return teamNotice;
+  if (writeTargetsAuthorizationState(filePath) || writeTargetsAuthorizationState(canonicalTarget)) {
+    return `Refused to write ${filePath}: Clementine authorization state cannot be mutated through write_file. Use the purpose-built approval, pending-action, workflow, or settings tools instead.`;
+  }
+  // The explicit `append` flag wins over `mode`: true → append (create if
+  // absent), false → overwrite (start a fresh chunked file). null → use `mode`.
+  const mode = input.append === true ? 'append'
+    : input.append === false ? 'overwrite'
+    : (input.mode ?? 'create');
+  // Protected own-stores (2026-07-21): write_file must not clobber the
+  // databases/secrets that every other guard depends on. Path-resolved
+  // check (the shell guard's regex twin).
+  if (writeTargetsProtectedOwnStore(filePath) || writeTargetsProtectedOwnStore(canonicalTarget)) {
+    return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
+  }
+  let revision: ReturnType<typeof commitLocalFileRevision>;
+  try {
+    const bound = currentExpectedWorkBinding();
+    const expectedContentDigest = bound ? reviewedFileCorrectionPrecondition(bound, { target: canonicalTarget, content: input.content, mode }) : undefined;
+    if (options?.recoveryOnly && !options.operationKey) throw new Error('File recovery requires an operation identity.');
+    const revise = options?.recoveryOnly
+      ? (value: Parameters<typeof commitLocalFileRevision>[0]) => recoverLocalFileRevision({ ...value, operationKey: options.operationKey! })
+      : commitLocalFileRevision;
+    revision = revise({ target: canonicalTarget, content: input.content, mode, expectedContentDigest,
+      ...(options?.operationKey ? { operationKey: options.operationKey } : {}) });
+  }
+  catch (error) {
+    if (error instanceof LocalFileRevisionConflict) return new InvalidArgumentsPreDispatchResult(error.message) as unknown as string;
+    if (error instanceof LocalFileCreateConflict && !options?.preserveCreateConflict) return error.message;
+    throw error;
+  }
+  if (!options?.recoveryOnly) teeFileDeliverable(filePath);
+  const notice = workspaceAuthoringNotice(filePath);
+  const text = revision.unchanged
+    ? `No changes needed for ${filePath} (${input.content.length} chars already present).`
+    : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
+  return withHostLocalWriteCommitFromFile({ ...revision,
+    result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
+}
+
+export async function executeLocalFileRead(
+  input: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>>,
+  runContext?: unknown, details?: unknown,
+  options?: { failOnReadError?: boolean; completeOutput?: boolean },
+) {
+  const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string, maxChars?: number): string => {
+    const redacted = redactSensitiveText(output);
+    // A structured workflow consumes data, not a model-facing preview. Its
+    // invocation kernel retains these complete bytes before downstream use.
+    if (options?.completeOutput) return redacted;
+    return formatRecallableToolText(redacted, {
+      toolName, sessionId: sessionIdFromRunContext(runContext),
+      callId: callIdFromToolDetails(details), maxChars,
+    });
+  };
+  const filePath = resolveAllowedPath(input.path);
+  // Credential material is refused, never asked about (owner rule
+  // 2026-08-07). The secret stays out of the model's context and the
+  // autonomous run is not interrupted for a question with one answer.
+  if (isSensitivePath(filePath)) {
+    if (options?.failOnReadError) return new InvalidArgumentsPreDispatchResult('Credential files cannot be read.');
+    return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
+      + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
+      + 'the connection/toolkit directly (composio_status for configuration state).';
+  }
+  if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
+  if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
+  // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
+  // HTML, so routing it through markitdown strips the tags (and was erroring
+  // on workspace views: "An error occurred while running the tool"). Only
+  // non-text formats (PDF/Word/Excel/audio/images) take the ingest path.
+  const readExt = path.extname(filePath).toLowerCase();
+  const isHtmlSource = readExt === '.html' || readExt === '.htm';
+  if (isConvertibleExtension(filePath) && !isHtmlSource) {
+    // Route through the unified ingestion pipeline so audio→Whisper,
+    // image→vision OCR, and docs→markitdown all behave identically here.
+    const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
+    if (ingested.error) {
+      const detail = `Could not read ${path.basename(filePath)}: ${ingested.error}`;
+      return options?.failOnReadError ? new InvalidArgumentsPreDispatchResult(detail) : detail;
+    }
+    return formatToolOutput(
+      'read_file',
+      runContext,
+      details,
+      ingested.markdown ?? '',
+      input.max_chars ?? undefined,
+    );
+  }
+  return formatToolOutput(
+    'read_file',
+    runContext,
+    details,
+    readFileSync(filePath, 'utf-8'),
+    input.max_chars ?? undefined,
+  );
+}
+
+/** The SDK surface carries nominal completion alongside its unchanged text.
+ * Workflow callers still consume executeLocalFileRead's complete raw output. */
+export async function executeLocalFileReadForTool(
+  input: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>>,
+  runContext?: unknown, details?: unknown,
+) {
+  const result = await executeLocalFileRead(input, runContext, details, { failOnReadError: true });
+  return typeof result === 'string' ? new HostLocalReadSuccessResult(result) : result;
+}
 
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string, maxChars?: number): string =>
@@ -1381,50 +1497,9 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
       'UTF-8 text is returned as-is. Other formats are transparently extracted to Markdown: PDF/Word/Excel/PowerPoint/EPub via the bundled markitdown runtime, images via vision OCR, and audio via transcription. The first markitdown conversion may take ~30-60s while the runtime warms.',
     ].join('\n'),
-    parameters: z.object({
-      path: z.string().min(1),
-      max_chars: z.number().int().min(1).nullable(),
-    }),
+    parameters: z.object(READ_FILE_PARAMS),
     needsApproval: needsApprovalForReadFile(),
-    execute: async (input, runContext, details) => {
-      const filePath = resolveAllowedPath(input.path);
-      // Credential material is refused, never asked about (owner rule
-      // 2026-08-07). The secret stays out of the model's context and the
-      // autonomous run is not interrupted for a question with one answer.
-      if (isSensitivePath(filePath)) {
-        return 'Refused: that file holds credential material, and Clementine never needs raw secrets to do work. '
-          + 'Nothing was read and no approval is needed — the provider connections are already authenticated, so use '
-          + 'the connection/toolkit directly (composio_status for configuration state).';
-      }
-      if (!existsSync(filePath)) return new InvalidArgumentsPreDispatchResult(`File does not exist: ${filePath}`);
-      if (!statSync(filePath).isFile()) return new InvalidArgumentsPreDispatchResult(`Not a file: ${filePath}`);
-      // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
-      // HTML, so routing it through markitdown strips the tags (and was erroring
-      // on workspace views: "An error occurred while running the tool"). Only
-      // non-text formats (PDF/Word/Excel/audio/images) take the ingest path.
-      const readExt = path.extname(filePath).toLowerCase();
-      const isHtmlSource = readExt === '.html' || readExt === '.htm';
-      if (isConvertibleExtension(filePath) && !isHtmlSource) {
-        // Route through the unified ingestion pipeline so audio→Whisper,
-        // image→vision OCR, and docs→markitdown all behave identically here.
-        const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });
-        if (ingested.error) return `Could not read ${path.basename(filePath)}: ${ingested.error}`;
-        return formatToolOutput(
-          'read_file',
-          runContext,
-          details,
-          ingested.markdown ?? '',
-          input.max_chars ?? undefined,
-        );
-      }
-      return formatToolOutput(
-        'read_file',
-        runContext,
-        details,
-        readFileSync(filePath, 'utf-8'),
-        input.max_chars ?? undefined,
-      );
-    },
+    execute: executeLocalFileReadForTool,
   });
 
   const convert_to_markdown = tool({
@@ -1476,54 +1551,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     ].join('\n'),
     parameters: z.object(WRITE_FILE_PARAMS),
     needsApproval: needsApprovalForWriteFile(),
-    execute: async (input) => {
-      const filePath = resolveAllowedPath(input.path);
-      const canonicalTarget = canonicalLocalFileTarget(filePath);
-      if (loadProactivityPolicy().autoApproveScope !== 'yolo'
-        && !workspaceRoots().some(root => isInside(path.dirname(canonicalLocalFileTarget(path.join(root, '.clem-path-check'))), canonicalTarget))) {
-        throw new Error(`Path is outside allowed workspace roots: ${canonicalTarget}.`);
-      }
-      if (isProtectedInstalledSkillSourcePath(filePath) || isProtectedInstalledSkillSourcePath(canonicalTarget)) {
-        return [
-          `Refused to write ${filePath}: installed skill source files are read-only during skill runs.`,
-          'Write generated artifacts under the skill output/, outputs/, runs/, artifacts/, reports/, or tmp/ directory, or update the skill package through the skill install/update path.',
-        ].join(' ');
-      }
-      const teamNotice = typedClementineStateWriteNotice(filePath) ?? typedClementineStateWriteNotice(canonicalTarget);
-      if (teamNotice) return teamNotice;
-      if (writeTargetsAuthorizationState(filePath) || writeTargetsAuthorizationState(canonicalTarget)) {
-        return `Refused to write ${filePath}: Clementine authorization state cannot be mutated through write_file. Use the purpose-built approval, pending-action, workflow, or settings tools instead.`;
-      }
-      // The explicit `append` flag wins over `mode`: true → append (create if
-      // absent), false → overwrite (start a fresh chunked file). null → use `mode`.
-      const mode = input.append === true ? 'append'
-        : input.append === false ? 'overwrite'
-        : (input.mode ?? 'create');
-      // Protected own-stores (2026-07-21): write_file must not clobber the
-      // databases/secrets that every other guard depends on. Path-resolved
-      // check (the shell guard's regex twin).
-      if (writeTargetsProtectedOwnStore(filePath) || writeTargetsProtectedOwnStore(canonicalTarget)) {
-        return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
-      }
-      let revision: ReturnType<typeof commitLocalFileRevision>;
-      try {
-        const bound = currentExpectedWorkBinding();
-        const expectedContentDigest = bound ? reviewedFileCorrectionPrecondition(bound, { target: canonicalTarget, content: input.content, mode }) : undefined;
-        revision = commitLocalFileRevision({ target: canonicalTarget, content: input.content, mode, expectedContentDigest });
-      }
-      catch (error) {
-        if (error instanceof LocalFileRevisionConflict) return new InvalidArgumentsPreDispatchResult(error.message) as unknown as string;
-        if (error instanceof Error && error.message.startsWith('Refused to overwrite existing file:')) return error.message;
-        throw error;
-      }
-      teeFileDeliverable(filePath);
-      const notice = workspaceAuthoringNotice(filePath);
-      const text = revision.unchanged
-        ? `No changes needed for ${filePath} (${input.content.length} chars already present).`
-        : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
-      return withHostLocalWriteCommitFromFile({ ...revision,
-        result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
-    },
+    execute: (input) => executeLocalFileWrite(input),
   });
 
   const run_shell_command = tool({

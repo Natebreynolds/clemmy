@@ -335,3 +335,23 @@ test('2d: an action whose operation requires an input neither the template nor t
   // No schema requirements known: not checked.
   assert.equal(analyzeSpaceGaps(record, call('{ comment: text }'), []).some((g) => g.question.includes('requires')), false);
 });
+
+
+test('whole scoped dataset rendered as JSON references every source', () => {
+  const record = rec({ dataSources: [{ id: 'calendar', composioSlug: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW' }] });
+  for (const callback of ['function(data)', '(data)=>', 'data=>']) {
+    const html = `<pre id="data"></pre><script>clem.data().then(${callback}{document.getElementById('data').textContent=JSON.stringify(data,null,2);});</script>`;
+    assert.equal(analyzeSpaceGaps(record, html).some(g => g.unreferenced === 'source'), false);
+  }
+});
+
+test('unused JSON or a different object does not prove source rendering', () => {
+  const record = rec({ dataSources: [{ id: 'calendar', composioSlug: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW' }] });
+  for (const body of ["console.log(JSON.stringify(data));", "document.getElementById('data').textContent=JSON.stringify(other,null,2);", "document.getElementById('data').textContent=JSON.stringify(data.wrongKey,null,2);"]) {
+    assert.equal(analyzeSpaceGaps(record, `<script>clem.data().then(function(data){${body}});</script>`).some(g => g.unreferenced === 'source'), true);
+  }
+});
+
+test('whole-dataset renderer still needs its display element', () => {
+  assert.equal(analyzeSpaceGaps(rec({ dataSources: [{ id: 'calendar' }] }), `<script>clem.data().then(data=>{document.getElementById('missing').textContent=JSON.stringify(data);});</script>`).some(g => g.unreferenced === 'source'), true);
+});

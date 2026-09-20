@@ -157,7 +157,8 @@ test('a provider write card copies the published effect and distinguishes plan i
   assert.equal(row.effect, entry!.manifest!.effect);
   assert.equal(row.invocation.name, 'composio_execute_tool');
   assert.equal(row.invocation.payloadField, 'arguments');
-  assert.match(row.planArgumentsHint, /staticArgumentsJson contains only the direct OUTLOOK_CREATE_DRAFT input fields/);
+  assert.equal(row.planArgumentsHint, undefined);
+  assert.match(response.body.planning_arguments_hint, /staticArgumentsJson contains only the selected tool's direct input fields/);
   assert.match(response.body.hint, /For publish_plan, use its exact effect/);
   assert.match(response.body.guidance[operation], /For publish_plan, staticArgumentsJson contains only the direct/);
   assert.equal(f.counts.business, 0);

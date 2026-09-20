@@ -1,5 +1,5 @@
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
-import { claimPlanExecutionIngress, inspectPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
+import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
@@ -548,6 +548,7 @@ import {
   requeueWorkflowFailedItemsFromRun,
   requeueWorkflowFromRun,
   resumeWorkflowRun,
+  pendingWorkflowVerification,
   type QueueWorkflowRunRecoveryIntentInput,
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
@@ -6364,7 +6365,11 @@ export function registerConsoleRoutes(
       return;
     }
     if (!dryRun && !targetStepId && entry.data.enabled === false) {
-      res.status(409).json({ error: 'workflow is disabled — approve it first' }); return;
+      const verificationRunId = pendingWorkflowVerification(entry.data.name, entry.data);
+      if (!verificationRunId) {
+        res.status(409).json({ status: 'disabled', error: 'workflow is disabled — approve it first' });
+        return;
+      }
     }
 
     const normalizedInputs = normalizeWorkflowRunInputs(inputs as Record<string, string>);
@@ -16001,6 +16006,7 @@ export function registerConsoleRoutes(
           if (rejoinPlanExecution(alias.receipt)) return;
         }
         assertReviewedPlanExecuteSessionIdle(sessionId, priorExecution?.runId);
+        if (!priorExecution) await preflightPlanExecutionIngress(executeIngress);
       } catch (error) {
         res.status(409).json({ error: error instanceof Error ? error.message : 'Selected plan cannot execute.', code: 'PLAN_EXECUTE_CONFLICT' });
         return;

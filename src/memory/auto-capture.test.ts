@@ -157,6 +157,20 @@ test('explicit remember cleaner does not strip a fact whose substance ends in "c
   assert.equal(candidates[0]?.content, 'I need to confirm.');
 });
 
+test('explicit memory omits a terminal acknowledgement request while preserving project scope', () => {
+  for (const ending of ['Briefly acknowledge.', 'Please acknowledge this.', 'Just acknowledge.']) {
+    const claim = 'for future reports about Project Orchard, always include AMBER in assumptions. This applies only to that project.';
+    const candidates = extractAutoMemoryCandidates(`Remember this: ${claim} ${ending}`);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.content, claim);
+  }
+  const standing = 'For Project Orchard, always acknowledge customer requests.';
+  assert.equal(extractAutoMemoryCandidates(`Remember this: ${standing}`)[0]?.content, standing);
+  const quoted = 'The Project Orchard button reads "Briefly acknowledge."';
+  assert.equal(extractAutoMemoryCandidates(`Remember this: ${quoted}`)[0]?.content, quoted);
+  assert.equal(extractAutoMemoryCandidates(`Remember this: ${quoted} Briefly acknowledge.`)[0]?.content, quoted);
+});
+
 test('explicit remember honors short user-authored facts down to the memory schema minimum', () => {
   const candidates = extractAutoMemoryCandidates('Remember this: blue.');
 
