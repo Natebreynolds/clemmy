@@ -82,18 +82,18 @@ export function homeRows(blocks: readonly HomeBlockId[]): HomeBlockId[][] {
 export interface PresenceCounts {
   needsYou: number;
   running: number;
-  done: number;
-  paused: number;
+  updates: number;
+  attention: number;
 }
 
-/** "2 need you · 1 running · 2 done and 1 paused while you were away". */
+/** Delivered notifications are updates, not proof that work completed. */
 export function presenceLine(counts: PresenceCounts): string {
   const parts: string[] = [];
   if (counts.needsYou > 0) parts.push(`${counts.needsYou} need${counts.needsYou === 1 ? 's' : ''} you`);
   if (counts.running > 0) parts.push(`${counts.running} running`);
   const away: string[] = [];
-  if (counts.done > 0) away.push(`${counts.done} done`);
-  if (counts.paused > 0) away.push(`${counts.paused} paused`);
+  if (counts.updates > 0) away.push(`${counts.updates} update${counts.updates === 1 ? '' : 's'}`);
+  if (counts.attention > 0) away.push(`${counts.attention} to review`);
   if (away.length > 0) parts.push(`${away.join(' and ')} while you were away`);
   return parts.length > 0 ? parts.join(' · ') : 'Nothing needs you right now.';
 }
@@ -138,12 +138,12 @@ export function agoLabel(createdAt?: string): string {
   return rel === 'now' ? 'just now' : `${rel} ago`;
 }
 
-export type AwayOutcome = 'success' | 'warning';
+export type AwayOutcome = 'update' | 'warning';
 
-/** Check for a settled result; the warning glyph for a report that did not
- *  land (undelivered) — the two outcomes the durable feed distinguishes. */
+/** The feed includes informational notices, including disconnected accounts.
+ * Delivery alone does not establish a successful task outcome. */
 export function awayOutcome(item: HomeFeedItem): AwayOutcome {
-  return item.notDelivered || item.kind === 'exec' ? 'warning' : 'success';
+  return item.notDelivered || item.kind === 'exec' ? 'warning' : 'update';
 }
 
 export function awayTarget(item: HomeFeedItem): string | null {
@@ -172,14 +172,14 @@ export function clockLabel(iso?: string): string {
     .replace(/\s?(AM|PM)$/i, (m) => m.toLowerCase());
 }
 
-export function awayCounts(items: readonly HomeFeedItem[]): { done: number; paused: number } {
-  let done = 0;
-  let paused = 0;
+export function awayCounts(items: readonly HomeFeedItem[]): { updates: number; attention: number } {
+  let updates = 0;
+  let attention = 0;
   for (const item of items) {
-    if (awayOutcome(item) === 'warning') paused += 1;
-    else done += 1;
+    if (awayOutcome(item) === 'warning') attention += 1;
+    else updates += 1;
   }
-  return { done, paused };
+  return { updates, attention };
 }
 
 // ─── Running ───────────────────────────────────────────────────────────────

@@ -66,6 +66,13 @@
         "to": "daemon/package.json"
       },
       {
+        "from": "../../builtin-skills",
+        "to": "daemon/builtin-skills",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../mobile-web/dist",
         "to": "daemon/apps/mobile-web/dist",
         "filter": [

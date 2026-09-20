@@ -191,15 +191,15 @@ test('a pane between them breaks the pair, and the composer never pairs', () => 
 
 test('the headline counts what is actually happening, in one sentence', () => {
   assert.equal(
-    presenceLine({ needsYou: 6, running: 6, done: 8, paused: 0 }),
-    '6 need you · 6 running · 8 done while you were away',
+    presenceLine({ needsYou: 6, running: 6, updates: 8, attention: 0 }),
+    '6 need you · 6 running · 8 updates while you were away',
   );
   assert.equal(
-    presenceLine({ needsYou: 1, running: 0, done: 0, paused: 1 }),
-    '1 needs you · 1 paused while you were away',
+    presenceLine({ needsYou: 1, running: 0, updates: 0, attention: 1 }),
+    '1 needs you · 1 to review while you were away',
   );
 });
 
 test('an idle console says so plainly rather than showing an empty headline', () => {
-  assert.equal(presenceLine({ needsYou: 0, running: 0, done: 0, paused: 0 }), 'Nothing needs you right now.');
+  assert.equal(presenceLine({ needsYou: 0, running: 0, updates: 0, attention: 0 }), 'Nothing needs you right now.');
 });

@@ -195,8 +195,8 @@ function LiveHome() {
     : presenceLine({
         needsYou: needsYou.length,
         running: workingView.running,
-        done: away.done,
-        paused: away.paused,
+        updates: away.updates,
+        attention: away.attention,
       });
 
   return (

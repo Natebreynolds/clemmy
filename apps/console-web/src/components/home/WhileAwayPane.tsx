@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { AlertCircle, Check } from 'lucide-react';
+import { AlertCircle, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { awayMeta, awayOutcome, awayTarget, clockLabel, type HomeFeedItem } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
@@ -7,9 +7,8 @@ import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeade
 const MAX_ROWS = 6;
 
 /**
- * WHILE YOU WERE AWAY — the durable results feed (settled writes, delivered
- * reports, finished tasks). Never inferred from chat prose: every row is a
- * record the daemon wrote when the work actually finished.
+ * WHILE YOU WERE AWAY — durable updates, including informational notices.
+ * Notification delivery must not be presented as task completion.
  */
 export function WhileAwayPane({
   items,
@@ -42,7 +41,7 @@ export function WhileAwayPane({
         ) : error ? (
           <LoadFailedLine what="recent results" onRetry={onRetry} />
         ) : visible.length === 0 ? (
-          <QuietLine>Nothing new yet — finished work lands here.</QuietLine>
+          <QuietLine>Nothing new yet — updates land here.</QuietLine>
         ) : (
           visible.map((item, index) => {
             const outcome = awayOutcome(item);
@@ -52,16 +51,16 @@ export function WhileAwayPane({
             const body = (
               <>
                 <span
-                  className={cn('inline-flex shrink-0', outcome === 'success' ? 'text-success' : 'text-warning')}
-                  aria-label={outcome === 'success' ? 'Done' : 'Needs a look'}
+                  className={cn('inline-flex shrink-0', outcome === 'update' ? 'text-muted' : 'text-warning')}
+                  aria-label={outcome === 'update' ? 'Update' : 'Needs a look'}
                   role="img"
                 >
-                  {outcome === 'success'
-                    ? <Check className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden />
+                  {outcome === 'update'
+                    ? <Info className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden />
                     : <AlertCircle className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden />}
                 </span>
                 <span className="min-w-0 shrink-0 max-w-[55%] truncate text-body font-medium text-fg" title={item.title}>
-                  {item.title ?? 'Finished'}
+                  {item.title ?? 'Update from Clem'}
                 </span>
                 {meta && <span className="min-w-0 flex-1 truncate text-body text-muted" title={meta}>{meta}</span>}
                 {time && <span className="ml-auto shrink-0 text-caption text-faint">{time}</span>}

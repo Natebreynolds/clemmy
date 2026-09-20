@@ -154,14 +154,11 @@ function EmptyWorkspaces({ spaces, onOpen, startIndex }: {
  * her the exact request instead of leaving a button that fails or a screen
  * that looks broken.
  */
-const FIX_REFRESH_ASK = 'This workspace has no registered data source, so Refresh does nothing. '
-  + 'Please convert its refresh into a proper data-source runner on the workspace '
-  + '(so refreshes flow through observations and survive restarts), and have that runner '
-  + 'emit a `_mobile` block so the phone view stays current too.';
+const FIX_REFRESH_ASK = 'Connect this Space to the read-only sources it needs so Refresh works '
+  + 'and its data stays current on desktop and phone. Preserve its existing content and behavior.';
 
-const PHONE_LAYOUT_ASK = 'Please give this workspace a proper phone layout: have its data-source runner '
-  + 'emit a `_mobile` block with the two or three numbers worth seeing at a glance and the rows worth '
-  + 'scanning, so my phone stops guessing from the raw JSON.';
+const PHONE_LAYOUT_ASK = 'Improve this Space’s phone layout. Show two or three key numbers and useful rows, '
+  + 'and keep them in sync with the underlying data. Preserve the desktop view and existing actions.';
 
 function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void }) {
   const [refreshing, setRefreshing] = useState(false);

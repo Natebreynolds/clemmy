@@ -311,13 +311,13 @@ function WorkspaceViewForId({ id }: { id: string }) {
             {chat.messages.length === 0 ? (
               pendingObjective ? (
                 <div className="rounded-lg border border-border bg-surface p-4 shadow-xs">
-                  <p className="text-small font-semibold text-fg">Ready to build</p>
+                  <p className="text-small font-semibold text-fg">Your Space’s goal</p>
                   <p className="mt-1 text-small text-muted">{pendingObjective}</p>
-                  <Button className="mt-3" size="sm" onClick={() => { void chat.send({ text: pendingObjective }); }}>Start building</Button>
+                  <Button className="mt-3" size="sm" onClick={() => { void chat.send({ text: pendingObjective }); }}>Work on this goal</Button>
                 </div>
               ) : (
                 <p className="px-1 pt-6 text-center text-small text-muted">
-                  Ask for a change — “add a bar per rep”, “hide closed-lost” — or “what changed since the last refresh?”
+                  Ask a question or describe a change to this Space.
                 </p>
               )
             ) : (
@@ -338,7 +338,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
           </div>
           <div className="border-t border-border p-2.5">
             <RunningTasksDrawer className="mb-1" composerRef={composerRef} />
-            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask for a change — “add a bar per rep”, “hide closed-lost”" />
+            <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask a question or describe a change…" />
           </div>
         </aside>
       )}
