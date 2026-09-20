@@ -3,6 +3,16 @@ export type NativeSource = 'claude-code' | 'cowork' | 'codex';
 export type Lane = 'native' | 'clementine';
 export type CacheDialect = 'inclusive' | 'exclusive' | 'none' | 'unknown';
 
+export interface ModelSlice {
+  model: string;
+  uncachedWork: number;
+  promptTokens: number;
+  cachedRead: number;
+  outputTokens: number;
+  calls: number;
+  subagentCalls: number;
+}
+
 export interface CanonicalCall {
   id: string;
   at: string;
@@ -13,6 +23,8 @@ export interface CanonicalCall {
   model: string;
   kind?: string;
   brain?: string;
+  agentId?: string;
+  isSubagent?: boolean;
   entrypoint?: string;
   promptSource?: string;
   cwd?: string;
@@ -46,10 +58,12 @@ export interface LaneTotals {
   cacheWrite: number;
   outputTokens: number;
   calls: number;
+  subagentCalls: number;
   hitRate: number;
   firstAt?: string;
   lastAt?: string;
   models: string[];
+  byModel: ModelSlice[];
   warmStart: boolean;
   promptComponents: Record<string, number>;
   sparkline: number[];

@@ -44,6 +44,19 @@ async function api(path, body) {
   return res.json();
 }
 
+function modelStrip(byModel) {
+  const rows = (byModel || []).slice(0, 4);
+  if (!rows.length) return '';
+  const max = Math.max(1, ...rows.map((m) => m.uncachedWork));
+  return `<ul class="models">${rows.map((m) => `
+    <li>
+      <span class="model-name">${m.model}</span>
+      <span class="model-bar" aria-hidden="true"><i style="width:${Math.round((m.uncachedWork / max) * 100)}%"></i></span>
+      <span class="num">${fmt(m.uncachedWork)}</span>
+      <span class="meta">${m.calls}${m.subagentCalls ? ` · ${m.subagentCalls} nested` : ''}</span>
+    </li>`).join('')}</ul>`;
+}
+
 function spark(values) {
   const slice = (values || []).slice(-40);
   if (!slice.length) return '';
@@ -59,10 +72,11 @@ function sourceCard(id, totals) {
       <h2>${LABELS[id] || id}${live ? ' · emitting' : ''}</h2>
       <div class="hero num">${fmt(totals.uncachedWork)}<span class="hero-unit">uncached</span></div>
       <div class="stats">
-        <div><b class="num">${totals.calls}</b>calls</div>
+        <div><b class="num">${totals.calls || 0}</b>calls</div>
         <div><b class="num">${pct(totals.hitRate)}</b>cache hit</div>
-        <div><b class="num">${fmt(totals.outputTokens)}</b>out</div>
+        <div><b class="num">${totals.subagentCalls || 0}</b>nested</div>
       </div>
+      ${modelStrip(totals.byModel)}
       ${spark(totals.sparkline)}
     </section>
   `;
@@ -70,13 +84,15 @@ function sourceCard(id, totals) {
 
 function taskRow(t) {
   const short = t.id.length > 18 ? `${t.id.slice(0, 16)}…` : t.id;
-  const bits = [LABELS[t.source] || t.source, t.brain, t.kind, t.model].filter(Boolean);
+  const models = (t.totals?.byModel || []).map((m) => m.model).join(' + ') || t.model || '';
+  const nested = t.subagents ? `${t.subagents} subagent${t.subagents === 1 ? '' : 's'}` : '';
+  const bits = [LABELS[t.source] || t.source, t.brain, t.kind, nested].filter(Boolean);
   return `
     <li class="task ${t.live ? 'live' : ''}">
       <span class="live-dot ${t.live ? '' : 'off'}"></span>
       <div>
         <div><b>${bits[0]}</b> · ${short}</div>
-        <div class="meta">${bits.slice(1).join(' · ') || '—'}</div>
+        <div class="meta">${[models, ...bits.slice(1)].filter(Boolean).join(' · ') || '—'}</div>
       </div>
       <div class="task-nums">
         <b class="num">${fmt(t.totals.uncachedWork)}</b>
@@ -98,7 +114,7 @@ function tape(calls) {
         <tbody>
           ${calls.map((c) => `<tr>
             <td>${ago(c.at)}</td>
-            <td>${LABELS[c.source] || c.source}${c.kind ? ` · ${c.kind}` : ''}</td>
+            <td>${LABELS[c.source] || c.source}${c.isSubagent ? ' · nested' : ''}${c.kind ? ` · ${c.kind}` : ''}</td>
             <td class="num">${(c.rootSessionId || c.sessionId).slice(0, 12)}</td>
             <td>${c.model || '—'}</td>
             <td class="num">${fmt(c.uncachedWorkTokens)}</td>

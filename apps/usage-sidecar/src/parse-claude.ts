@@ -7,6 +7,8 @@ export interface ClaudeFileMeta {
   promptSource?: string;
   cwd?: string;
   model?: string;
+  agentId?: string;
+  isSidechain?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -32,6 +34,8 @@ export function updateClaudeMeta(line: unknown, meta: ClaudeFileMeta): ClaudeFil
   if (typeof row.entrypoint === 'string' && row.entrypoint) next.entrypoint = row.entrypoint;
   if (typeof row.promptSource === 'string' && row.promptSource) next.promptSource = row.promptSource;
   if (typeof row.cwd === 'string' && row.cwd) next.cwd = row.cwd;
+  if (typeof row.agentId === 'string' && row.agentId) next.agentId = row.agentId;
+  if (row.isSidechain === true) next.isSidechain = true;
   const message = asRecord(row.message);
   if (typeof message?.model === 'string' && message.model) next.model = message.model;
   return next;
@@ -45,7 +49,7 @@ function thinkingTokens(usage: Record<string, unknown>): number {
 export function parseClaudeAssistantUsage(
   line: unknown,
   meta: ClaudeFileMeta,
-  opts: { source: NativeSource; rootSessionId: string; skipSdk: boolean },
+  opts: { source: NativeSource; rootSessionId: string; skipSdk: boolean; fromSubagentPath?: boolean },
 ): CanonicalCall | null {
   const row = asRecord(line);
   if (!row || row.type !== 'assistant') return null;
@@ -65,6 +69,13 @@ export function parseClaudeAssistantUsage(
     : (typeof row.session_id === 'string' && row.session_id
       ? row.session_id
       : (merged.sessionId ?? opts.rootSessionId));
+  const agentId = typeof row.agentId === 'string' && row.agentId
+    ? row.agentId
+    : merged.agentId;
+  const isSubagent = row.isSidechain === true
+    || merged.isSidechain === true
+    || opts.fromSubagentPath === true
+    || Boolean(agentId);
   const accounted = canonicalCacheAccounting({
     cacheDialect: 'exclusive',
     inputTokens: num(usage.input_tokens),
@@ -80,8 +91,10 @@ export function parseClaudeAssistantUsage(
     lane: 'native',
     source: opts.source,
     sessionId,
-    rootSessionId: opts.rootSessionId,
+    rootSessionId: sessionId || opts.rootSessionId,
     model,
+    agentId,
+    isSubagent,
     entrypoint: merged.entrypoint,
     promptSource: merged.promptSource,
     cwd: merged.cwd,

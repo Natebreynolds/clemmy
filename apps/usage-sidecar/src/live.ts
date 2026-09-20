@@ -16,6 +16,7 @@ export interface LiveTask {
   firstAt: string;
   lastAt: string;
   live: boolean;
+  subagents: number;
   totals: LaneTotals;
 }
 
@@ -64,17 +65,20 @@ export function buildLiveSnapshot(calls: CanonicalCall[], watchingSince: string,
   for (const list of byTask.values()) {
     const first = list[0];
     const last = list[list.length - 1];
+    const totals = rollupLane(list);
+    const agents = new Set(list.filter((c) => c.isSubagent && c.agentId).map((c) => c.agentId as string));
     tasks.push({
       id: first.rootSessionId,
       source: liveSourceOf(first),
-      model: last.model || first.model,
+      model: totals.byModel[0]?.model || last.model || first.model,
       kind: last.kind || first.kind,
       brain: last.brain || first.brain,
       cwd: last.cwd || first.cwd,
       firstAt: first.at,
       lastAt: last.at,
       live: now - Date.parse(last.at) <= LIVE_WINDOW_MS,
-      totals: rollupLane(list),
+      subagents: agents.size || (totals.subagentCalls > 0 ? 1 : 0),
+      totals,
     });
   }
   tasks.sort((a, b) => {

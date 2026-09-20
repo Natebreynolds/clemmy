@@ -13,6 +13,23 @@ export function isClementineChatKind(kind: string | undefined): boolean {
   return CHAT_KINDS.has(kind ?? '');
 }
 
+/** Roll workflow steps and nested worker sessions onto one task id. */
+export function clementineRootSessionId(source: string, runId?: string): string {
+  if (runId && runId.trim()) return `run:${runId.trim()}`;
+  if (source.startsWith('workflow:')) {
+    const run = source.split(':')[1];
+    if (run) return `run:${run}`;
+  }
+  if (source.startsWith('sess-')) {
+    const head = source.split(':')[0];
+    return head || source;
+  }
+  if (source.startsWith('execution:') || source.startsWith('background:') || source.startsWith('agent:')) {
+    return source.split(':').slice(0, 2).join(':');
+  }
+  return source;
+}
+
 export function parseClementineUsage(line: unknown): CanonicalCall | null {
   const row = asRecord(line);
   if (!row) return null;
@@ -53,16 +70,23 @@ export function parseClementineUsage(line: unknown): CanonicalCall | null {
   const responseId = typeof row.responseId === 'string' && row.responseId
     ? row.responseId
     : `${source}:${at}`;
+  const runId = typeof row.runId === 'string' ? row.runId : undefined;
+  const stepId = typeof row.stepId === 'string' ? row.stepId : undefined;
+  const kind = typeof row.kind === 'string' ? row.kind : undefined;
+  const rootSessionId = clementineRootSessionId(source, runId);
+  const isSubagent = Boolean(stepId) && rootSessionId !== source;
   return {
     id: responseId,
     at,
     lane: 'clementine',
     source: 'clementine',
     sessionId: source,
-    rootSessionId: source,
+    rootSessionId,
     model,
-    kind: typeof row.kind === 'string' ? row.kind : undefined,
+    kind,
     brain,
+    agentId: stepId,
+    isSubagent,
     inputTokens: num(row.inputTokens),
     cachedReadTokens: accounted.cachedReadTokens,
     cacheWriteTokens: 'cacheWriteTokens' in accounted ? accounted.cacheWriteTokens : num(row.cacheCreationInputTokens),

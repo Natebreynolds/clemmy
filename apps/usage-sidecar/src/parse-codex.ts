@@ -7,7 +7,36 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function parseCodexTokenUsage(line: unknown, rootSessionId: string): CanonicalCall | null {
+export interface CodexFileMeta {
+  sessionId?: string;
+  threadId?: string;
+  parentThreadId?: string;
+  model?: string;
+  isSubagent?: boolean;
+  agentId?: string;
+}
+
+export function updateCodexMeta(line: unknown, meta: CodexFileMeta): CodexFileMeta {
+  const row = asRecord(line);
+  if (!row) return meta;
+  const payload = asRecord(row.payload);
+  if (!payload) return meta;
+  const next = { ...meta };
+  if (typeof payload.session_id === 'string' && payload.session_id) next.sessionId = payload.session_id;
+  if (typeof payload.id === 'string' && payload.id && row.type === 'session_meta') next.threadId = payload.id;
+  if (typeof payload.parent_thread_id === 'string' && payload.parent_thread_id) {
+    next.parentThreadId = payload.parent_thread_id;
+  }
+  if (payload.thread_source === 'subagent' || asRecord(payload.source)?.subagent) next.isSubagent = true;
+  if (typeof payload.agent_nickname === 'string' && payload.agent_nickname) next.agentId = payload.agent_nickname;
+  if (typeof payload.model === 'string' && payload.model.trim()) next.model = payload.model.trim();
+  const collab = asRecord(payload.collaboration_mode);
+  const settings = asRecord(collab?.settings);
+  if (typeof settings?.model === 'string' && settings.model.trim()) next.model = settings.model.trim();
+  return next;
+}
+
+export function parseCodexTokenUsage(line: unknown, meta: CodexFileMeta, fileRoot: string): CanonicalCall | null {
   const row = asRecord(line);
   if (!row || row.type !== 'token_usage_record') return null;
   const payload = asRecord(row.payload);
@@ -17,7 +46,10 @@ export function parseCodexTokenUsage(line: unknown, rootSessionId: string): Cano
   if (!at) return null;
   const threadId = typeof payload?.thread_id === 'string' && payload.thread_id
     ? payload.thread_id
-    : rootSessionId;
+    : (meta.threadId ?? fileRoot);
+  const sessionId = typeof payload?.session_id === 'string' && payload.session_id
+    ? payload.session_id
+    : (meta.sessionId ?? threadId);
   const responseId = typeof payload?.response_id === 'string' && payload.response_id
     ? payload.response_id
     : `${threadId}:${at}`;
@@ -36,14 +68,19 @@ export function parseCodexTokenUsage(line: unknown, rootSessionId: string): Cano
     reasoningTokens: reasoning,
     totalTokens: total,
   });
+  const isSubagent = meta.isSubagent === true
+    || Boolean(meta.parentThreadId && meta.parentThreadId !== threadId)
+    || (sessionId !== threadId);
   return {
     id: responseId,
     at,
     lane: 'native',
     source: 'codex',
     sessionId: threadId,
-    rootSessionId: threadId,
-    model: typeof payload?.model === 'string' ? payload.model : '',
+    rootSessionId: sessionId,
+    model: (typeof payload?.model === 'string' && payload.model.trim()) || meta.model || '',
+    agentId: meta.agentId,
+    isSubagent,
     inputTokens: input,
     cachedReadTokens: accounted.cachedReadTokens,
     cacheWriteTokens: accounted.cacheWriteTokens,
@@ -61,7 +98,8 @@ export function codexModelFromLine(line: unknown): string | undefined {
   if (!row) return undefined;
   const payload = asRecord(row.payload);
   if (typeof payload?.model === 'string' && payload.model.trim()) return payload.model.trim();
-  const nested = asRecord(payload?.info) ?? asRecord(row.info);
-  if (typeof nested?.model === 'string' && nested.model.trim()) return nested.model.trim();
+  const collab = asRecord(payload?.collaboration_mode);
+  const settings = asRecord(collab?.settings);
+  if (typeof settings?.model === 'string' && settings.model.trim()) return settings.model.trim();
   return undefined;
 }

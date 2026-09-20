@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { claudeRootSessionId, parseClaudeAssistantUsage, updateClaudeMeta } from './parse-claude.js';
 import { parseCodexTokenUsage } from './parse-codex.js';
-import { parseClementineUsage } from './parse-clementine.js';
+import { clementineRootSessionId, parseClementineUsage } from './parse-clementine.js';
 import { acceptCall, armTrial, bindLane, createTrial, dedupeCalls, rollupLane, sealLane, verdictFor } from './trial.js';
 import type { CanonicalCall } from './types.js';
 
@@ -72,7 +72,7 @@ test('Cowork audit.jsonl uses the same exclusive parser and keeps sdk rows (skip
   assert.ok(call);
   assert.equal(call.source, 'cowork');
   assert.equal(call.uncachedWorkTokens, 12);
-  assert.equal(call.rootSessionId, 'c8060d9f');
+  assert.equal(call.rootSessionId, '431c1ce2');
 });
 
 test('claudeRootSessionId prefers parent folder for subagents and local_ for cowork', () => {
@@ -88,6 +88,58 @@ test('claudeRootSessionId prefers parent folder for subagents and local_ for cow
     claudeRootSessionId('/Claude/local-agent-mode-sessions/a/b/local_c8060d9f-bf50/audit.jsonl'),
     'c8060d9f-bf50',
   );
+});
+
+test('Claude sidechain usage rolls up to the parent sessionId, not the agent file name', () => {
+  const line = {
+    type: 'assistant',
+    isSidechain: true,
+    agentId: 'a3395312c1a828e96',
+    timestamp: '2026-08-24T03:29:35.105Z',
+    sessionId: '347a498f-6255-4337-9f55-205df95a99a5',
+    entrypoint: 'cli',
+    message: {
+      id: 'msg_sub',
+      model: 'claude-haiku-4-5',
+      usage: { input_tokens: 2, cache_read_input_tokens: 100, cache_creation_input_tokens: 50, output_tokens: 8 },
+    },
+  };
+  const call = parseClaudeAssistantUsage(line, {}, {
+    source: 'claude-code',
+    rootSessionId: 'agent-a3395312c1a828e96',
+    skipSdk: true,
+    fromSubagentPath: true,
+  });
+  assert.ok(call);
+  assert.equal(call.rootSessionId, '347a498f-6255-4337-9f55-205df95a99a5');
+  assert.equal(call.isSubagent, true);
+  assert.equal(call.model, 'claude-haiku-4-5');
+});
+
+test('Codex subagent thread rolls up to session_id and keeps per-call usage', () => {
+  const line = {
+    timestamp: '2026-09-06T03:43:50.781Z',
+    type: 'token_usage_record',
+    payload: {
+      thread_id: 'thread-sub',
+      session_id: 'session-parent',
+      response_id: 'resp_sub',
+      usage: {
+        input_tokens: 100,
+        cached_input_tokens: 80,
+        output_tokens: 10,
+        total_tokens: 110,
+      },
+      thread_token_usage: { input_tokens: 999999, total_tokens: 1000000 },
+    },
+  };
+  const call = parseCodexTokenUsage(line, { model: 'gpt-5.6-terra', isSubagent: true, agentId: 'Goodall' }, 'rollout-sub');
+  assert.ok(call);
+  assert.equal(call.rootSessionId, 'session-parent');
+  assert.equal(call.sessionId, 'thread-sub');
+  assert.equal(call.isSubagent, true);
+  assert.equal(call.model, 'gpt-5.6-terra');
+  assert.equal(call.uncachedWorkTokens, 30);
 });
 
 test('Codex uses per-call usage, not thread totals', () => {
@@ -113,7 +165,7 @@ test('Codex uses per-call usage, not thread totals', () => {
       },
     },
   };
-  const call = parseCodexTokenUsage(line, 'thread-1');
+  const call = parseCodexTokenUsage(line, {}, 'thread-1');
   assert.ok(call);
   assert.equal(call.uncachedWorkTokens, 110 - 80);
   assert.ok(call.uncachedWorkTokens < 1000);
@@ -148,6 +200,22 @@ test('Clementine chat row uses stored canonical; workflow is rejected by trial b
   });
   assert.ok(chat);
   assert.equal(chat.uncachedWorkTokens, 150);
+  assert.equal(clementineRootSessionId('workflow:trigger-abc:wrap_up', 'trigger-abc'), 'run:trigger-abc');
+  const wfParsed = parseClementineUsage({
+    at: '2026-09-18T12:00:01.000Z',
+    source: 'workflow:trigger-abc:wrap_up',
+    kind: 'workflow',
+    model: 'gpt-5.6-luna',
+    runId: 'trigger-abc',
+    stepId: 'wrap_up',
+    trace: { brain: 'codex' },
+    canonical: { certified: true, promptTokens: 10, cachedReadTokens: 0, uncachedWorkTokens: 11 },
+    inputTokens: 10,
+    outputTokens: 1,
+    responseId: 'resp_step',
+  });
+  assert.equal(wfParsed?.rootSessionId, 'run:trigger-abc');
+  assert.equal(wfParsed?.isSubagent, true);
   let trial = createTrial({ name: 't', pairing: 'codex', nativeSource: 'codex', now: new Date('2026-09-18T11:00:00Z') });
   trial = armTrial(trial, '2026-09-18T11:59:00.000Z');
   trial = bindLane(trial, 'clementine', 'sess-clem');

@@ -1,4 +1,5 @@
-import { modelsComparable, primaryModel } from './models.js';
+import { modelsComparable, normalizeModel, primaryModel } from './models.js';
+import type { ModelSlice } from './types.js';
 import { clementineBrainMatches, isClementineChatKind } from './parse-clementine.js';
 import type {
   CanonicalCall, Lane, LaneTotals, Pairing, Trial, Verdict,
@@ -10,7 +11,8 @@ const SPARK_MAX = 48;
 export function emptyLane(): LaneTotals {
   return {
     uncachedWork: 0, promptTokens: 0, cachedRead: 0, cacheWrite: 0, outputTokens: 0,
-    calls: 0, hitRate: 0, models: [], warmStart: false, promptComponents: {}, sparkline: [],
+    calls: 0, subagentCalls: 0, hitRate: 0, models: [], byModel: [],
+    warmStart: false, promptComponents: {}, sparkline: [],
   };
 }
 
@@ -91,7 +93,8 @@ export function rollupLane(calls: CanonicalCall[]): LaneTotals {
   let cachedRead = 0;
   let cacheWrite = 0;
   let outputTokens = 0;
-  const models: string[] = [];
+  let subagentCalls = 0;
+  const modelMap = new Map<string, ModelSlice>();
   const components: Record<string, number> = {};
   const sparkline: number[] = [];
   for (const call of unique) {
@@ -100,14 +103,28 @@ export function rollupLane(calls: CanonicalCall[]): LaneTotals {
     cachedRead += call.cachedReadTokens;
     cacheWrite += call.cacheWriteTokens;
     outputTokens += call.outputTokens;
-    if (call.model) models.push(call.model);
+    if (call.isSubagent) subagentCalls += 1;
     sparkline.push(call.uncachedWorkTokens);
+    const modelKey = normalizeModel(call.model) || 'unknown';
+    const slice = modelMap.get(modelKey) ?? {
+      model: call.model || 'unknown',
+      uncachedWork: 0, promptTokens: 0, cachedRead: 0, outputTokens: 0, calls: 0, subagentCalls: 0,
+    };
+    if (call.model && slice.model === 'unknown') slice.model = call.model;
+    slice.uncachedWork += call.uncachedWorkTokens;
+    slice.promptTokens += call.promptTokens;
+    slice.cachedRead += call.cachedReadTokens;
+    slice.outputTokens += call.outputTokens;
+    slice.calls += 1;
+    if (call.isSubagent) slice.subagentCalls += 1;
+    modelMap.set(modelKey, slice);
     if (call.promptComponents) {
       for (const [name, value] of Object.entries(call.promptComponents)) {
         if (Number.isFinite(value) && value > 0) components[name] = (components[name] ?? 0) + value;
       }
     }
   }
+  const byModel = [...modelMap.values()].sort((a, b) => b.uncachedWork - a.uncachedWork);
   const first = unique[0];
   const last = unique[unique.length - 1];
   return {
@@ -117,10 +134,12 @@ export function rollupLane(calls: CanonicalCall[]): LaneTotals {
     cacheWrite,
     outputTokens,
     calls: unique.length,
+    subagentCalls,
     hitRate: promptTokens > 0 ? cachedRead / promptTokens : 0,
     firstAt: first?.at,
     lastAt: last?.at,
-    models: [...new Set(models)],
+    models: byModel.map((m) => m.model),
+    byModel,
     warmStart: first ? first.hitRate >= WARM_HIT : false,
     promptComponents: components,
     sparkline: sparkline.slice(-SPARK_MAX),

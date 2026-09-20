@@ -7,7 +7,7 @@ import { emptyTail, parseJsonLine, primeToEnd, readNewLines, type TailState } fr
 import {
   claudeRootSessionId, isSdkSession, parseClaudeAssistantUsage, updateClaudeMeta, type ClaudeFileMeta,
 } from './parse-claude.js';
-import { codexModelFromLine, parseCodexTokenUsage } from './parse-codex.js';
+import { parseCodexTokenUsage, updateCodexMeta, type CodexFileMeta } from './parse-codex.js';
 import { parseClementineUsage } from './parse-clementine.js';
 import {
   acceptCall, armTrial, bindLane, createTrial, dedupeCalls, emptyLane, rollupLane, sealLane, verdictFor,
@@ -77,7 +77,7 @@ export class MeterEngine {
   private calls: CanonicalCall[] = [];
   private tails = new Map<string, TailState>();
   private claudeMeta = new Map<string, ClaudeFileMeta>();
-  private codexModel = new Map<string, string>();
+  private codexMeta = new Map<string, CodexFileMeta>();
   private watchers: FSWatcher[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private discoverPoll: ReturnType<typeof setInterval> | null = null;
@@ -287,11 +287,14 @@ export class MeterEngine {
     this.tails.set(file, state);
     let meta = this.claudeMeta.get(file) ?? {};
     const root = claudeRootSessionId(file);
+    const fromSubagentPath = file.includes(`${path.sep}subagents${path.sep}`);
     for (const line of lines) {
       const parsed = parseJsonLine(line);
       if (parsed == null) continue;
       meta = updateClaudeMeta(parsed, meta);
-      const call = parseClaudeAssistantUsage(parsed, meta, { source, rootSessionId: root, skipSdk });
+      const call = parseClaudeAssistantUsage(parsed, meta, {
+        source, rootSessionId: root, skipSdk, fromSubagentPath,
+      });
       if (call) this.pushCall(call);
     }
     this.claudeMeta.set(file, meta);
@@ -303,17 +306,15 @@ export class MeterEngine {
     const { lines, state } = readNewLines(file, this.tails.get(file) ?? emptyTail());
     this.tails.set(file, state);
     const root = path.basename(file).replace(/\.jsonl$/, '');
+    let meta = this.codexMeta.get(file) ?? {};
     for (const line of lines) {
       const parsed = parseJsonLine(line);
       if (parsed == null) continue;
-      const hinted = codexModelFromLine(parsed);
-      if (hinted) this.codexModel.set(file, hinted);
-      const call = parseCodexTokenUsage(parsed, root);
-      if (call) {
-        if (!call.model && this.codexModel.get(file)) call.model = this.codexModel.get(file)!;
-        this.pushCall(call);
-      }
+      meta = updateCodexMeta(parsed, meta);
+      const call = parseCodexTokenUsage(parsed, meta, root);
+      if (call) this.pushCall(call);
     }
+    this.codexMeta.set(file, meta);
   }
 
   private ingestClementine(file: string): void {
