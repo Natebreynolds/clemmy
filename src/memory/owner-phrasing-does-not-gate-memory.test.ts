@@ -74,3 +74,57 @@ test('the drain routes the unjudged marker to the model reviewer', async () => {
     'unjudged owner statements must reach reviewStandingMemory, never consolidateFact directly',
   );
 });
+
+/**
+ * The volunteered-review contract.
+ *
+ * An unmatched owner statement must reach the reviewer in `volunteered` mode,
+ * not `inferred`. The distinction is not cosmetic: the base instructions were
+ * written to validate a span somebody had already judged memory-worthy, so they
+ * treat a missing "always"/"from now on" marker as evidence against standing
+ * scope. Asked the different question — "did this person state a preference in
+ * passing?" — that conservatism rejects ordinary preferences.
+ *
+ * Measured live on four real phrasings: "btw when in doubt draft it, don't send
+ * it" was promoted while "heads up i never take meetings before 9" was rejected
+ * as a "one-off heads-up in a schedule query". Same shape, opposite verdicts —
+ * the judge had no rule, so it guessed. Of the four, exactly one was a
+ * preference the in-turn model did not also record, and that one was rejected,
+ * making the whole path net-zero before this mode existed.
+ */
+test('an unjudged owner statement reaches the reviewer in volunteered mode', async () => {
+  const {
+    drainDurableConsolidationCandidates,
+    enqueueAutoCaptureCandidates,
+    UNJUDGED_OWNER_STATEMENT_REASON: reason,
+  } = await import('./durable-consolidation.js');
+
+  const message = 'how many open deals do we have. quick note, i like numbers first and the commentary after';
+  const queued = enqueueAutoCaptureCandidates({
+    message,
+    sessionId: 'volunteered-mode-routing',
+    sourceEventId: 'turn:volunteered',
+    occurredAt: '2026-09-21T04:00:00.000Z',
+    candidates: [{ kind: 'user', content: message, reason }],
+  });
+
+  const modes: string[] = [];
+  const recordingReviewer = async (
+    _source: string,
+    candidate: string,
+    mode: 'inferred' | 'explicit' | 'volunteered' = 'inferred',
+  ) => {
+    modes.push(mode);
+    return { scope: 'standing' as const, text: candidate, reason: 'test stub' };
+  };
+
+  await drainDurableConsolidationCandidates({
+    ids: queued.candidateIds,
+    resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: recordingReviewer,
+  });
+
+  assert.deepEqual(modes, ['volunteered'],
+    'a statement nothing has judged yet must not be reviewed under the instructions '
+    + 'that assume an explicit memory marker');
+});

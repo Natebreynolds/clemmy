@@ -237,8 +237,16 @@ export async function drainDurableConsolidationCandidates(options: {
         || row.intake_reason === 'project requirement signal'
         || row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON
         || explicitScopeReview) {
-        const review = await (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text,
-          explicitScopeReview ? 'explicit' : 'inferred');
+        // An unjudged owner statement is a different question from the other
+        // two. Here nothing has yet decided the text is memory-worthy, and the
+        // owner was asking for something else when they said it — so the base
+        // instructions' demand for an explicit future/recurring marker rejects
+        // ordinary preferences. `volunteered` asks whether the statement is
+        // about the task or about how the owner wants things done.
+        const reviewMode = explicitScopeReview
+          ? 'explicit'
+          : row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON ? 'volunteered' : 'inferred';
+        const review = await (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text, reviewMode);
         if (explicitScopeReview && (review.scope !== 'standing' || !review.text?.includes(row.text))) {
           throw new Error('Explicit memory scope review lost the authorized candidate');
         }
