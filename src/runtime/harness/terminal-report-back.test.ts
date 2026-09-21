@@ -594,3 +594,95 @@ test('a run that needs the owner still leads with its status', async () => {
   assert.match(notification.title, /^Chat run needs you:/);
   assert.match(notification.title, /send the client export/);
 });
+
+/**
+ * A report names what it produced.
+ *
+ * 31 deliverables were written in a fortnight and every one was reachable only
+ * from inside the chat thread that made it, so finding last week's report meant
+ * remembering which conversation produced it. The run's own event window
+ * already holds the names.
+ */
+test('a report names the files the run produced', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-deliverables';
+  createSession({ id: sessionId, kind: 'chat', title: 'weekly report' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'build the weekly report' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'compose', callId: `deliv-${i}` },
+    });
+  }
+  appendEvent({
+    sessionId, turn: 1, role: 'assistant', type: 'deliverable_saved',
+    data: { name: 'orchard-birch-weekly-report.md', dir: 'reports' },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    // Her prose does NOT mention the filename — the gap this fills.
+    presentation: { kind: 'answer', text: 'Pulled the numbers and wrote it up for you.' },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
+  );
+  assert.ok(notification, 'a run that produced a file reports back');
+  assert.match(
+    notification.body,
+    /Saved: orchard-birch-weekly-report\.md/,
+    `the report must name what it produced, got: ${notification.body}`,
+  );
+  const deliverables = notification.metadata?.deliverables as Array<{ name: string; dir: string | null }>;
+  assert.ok(Array.isArray(deliverables), 'structured copy rides the metadata for an open affordance');
+  assert.equal(deliverables[0]?.name, 'orchard-birch-weekly-report.md');
+  assert.equal(deliverables[0]?.dir, 'reports');
+});
+
+/** Repeating a filename she already wrote would read as the assistant talking
+ *  to itself. The appended line fills a gap; it does not echo. */
+test('a report does not repeat a filename its own words already gave', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-deliverables-named';
+  createSession({ id: sessionId, kind: 'chat', title: 'discovery summary' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'summarize it' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'compose', callId: `named-${i}` },
+    });
+  }
+  appendEvent({
+    sessionId, turn: 1, role: 'assistant', type: 'deliverable_saved',
+    data: { name: 'discovery-call-summary.txt', dir: null },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text: 'Saved discovery-call-summary.txt for you.' },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
+  );
+  assert.ok(notification);
+  assert.doesNotMatch(notification.body, /Saved: discovery-call-summary/);
+  // Still structured, so a surface can offer to open it.
+  const deliverables = notification.metadata?.deliverables as Array<{ name: string }>;
+  assert.equal(deliverables?.[0]?.name, 'discovery-call-summary.txt');
+});

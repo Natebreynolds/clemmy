@@ -323,10 +323,45 @@ function reportHeadline(body: string): string | null {
   return `${(lastSpace > REPORT_HEADLINE_MAX / 2 ? cut.slice(0, lastSpace) : cut).trim()}…`;
 }
 
+/**
+ * What this run actually produced, from the run's own event window.
+ *
+ * A report that does not name its output makes the owner go looking for it. 31
+ * deliverables were written in a fortnight and every one of them was reachable
+ * only from inside the chat thread that made it — so finding last week's report
+ * meant remembering which conversation produced it. The durable names are right
+ * here in the window the report-back already bounds.
+ *
+ * `deliverable_saved` is published with a validated basename and one parent
+ * segment, never an absolute path, so nothing here can leak a home directory.
+ */
+function deliverablesForRun(
+  sessionId: string,
+  startSeq: number,
+  terminalSeq: number,
+): Array<{ name: string; dir: string | null }> {
+  let rows: readonly EventRow[] = [];
+  try {
+    rows = listEvents(sessionId, { types: ['deliverable_saved'], sinceSeq: startSeq });
+  } catch { return []; }
+  const out: Array<{ name: string; dir: string | null }> = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (row.seq > terminalSeq) break;
+    const data = (row.data ?? {}) as { name?: unknown; dir?: unknown };
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, dir: typeof data.dir === 'string' && data.dir.trim() ? data.dir.trim() : null });
+  }
+  return out;
+}
+
 function emitTerminalReportBack(
   facts: TerminalRunFacts,
   session: { title: string | null; userId: string | null },
   body: string,
+  terminalSeq: number,
 ): void {
   const label = (session.title ?? '').trim() || 'your request';
   const titlePrefix: Record<TurnOutcomeStatus, string> = {
@@ -346,11 +381,22 @@ function emitTerminalReportBack(
   const title = facts.outcome === 'done'
     ? reportHeadline(body) ?? `${titlePrefix[facts.outcome]}: ${label}`
     : `${titlePrefix[facts.outcome]}: ${label}`;
+  const produced = deliverablesForRun(facts.sessionId, facts.startSeq, terminalSeq);
+  // Say what was produced when her own words did not already. Appending a name
+  // she just wrote in prose would read as the assistant repeating itself, so
+  // this only fills a genuine gap — and it fills it on EVERY surface at once,
+  // which is the point: the Inbox, push, and a Discord or Slack DM all render
+  // this one body.
+  const unnamed = produced.filter((file) => !body.includes(file.name));
+  const reportBody = unnamed.length > 0
+    ? `${body}${body ? '\n\n' : ''}Saved: ${unnamed.map((file) => file.name).join(', ')}`
+    : body;
+
   addNotification({
     id: `foreground-report-back-${facts.sessionId}-${facts.startSeq}`,
     kind: 'execution',
     title,
-    body,
+    body: reportBody,
     createdAt: new Date().toISOString(),
     read: false,
     metadata: {
@@ -363,6 +409,10 @@ function emitTerminalReportBack(
       foregroundRun: true,
       status: facts.outcome,
       needsAttention: facts.outcome !== 'done',
+      // Structured alongside the prose so a surface can offer "open" instead of
+      // making the owner copy a filename out of a sentence. Absent when the run
+      // produced nothing — never an empty array claiming a file list exists.
+      ...(produced.length > 0 ? { deliverables: produced } : {}),
     },
   });
 }
@@ -527,6 +577,7 @@ function processPendingTerminalReport(id: string): void {
       facts,
       { title: pending.title, userId: pending.userId },
       pending.presentationText,
+      pending.terminalSeq,
     );
     // Notification first, then outbox acknowledgement. A crash between these
     // writes replays the stable notification id and cannot duplicate delivery.
