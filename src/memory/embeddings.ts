@@ -488,7 +488,15 @@ const LOCAL_PROVIDER_DESCRIPTOR: EmbeddingProvider = {
 function localProviderSync(): EmbeddingProvider | null {
   if (localProvider) return localProvider;
   if (localProvider === null) return null; // probed and unavailable
-  void loadLocalProvider(); // unprobed: start the load, answer from constants
+  // Deliberately does NOT start the load. The descriptor answers model/dim from
+  // constants, and its embed() awaits the weights when something actually
+  // embeds — so a SYNC read never puts native ONNX work on the caller's path.
+  //
+  // It used to `void loadLocalProvider()` here. Live 2026-09-21 that ran the
+  // native load during daemon boot on a keyed machine, the load SIGTRAPed, the
+  // supervisor restarted, and it loaded again: 493 restarts and 346 provider
+  // loads before the override was pulled. A sync accessor that can crash the
+  // process is not an accessor.
   return LOCAL_PROVIDER_DESCRIPTOR;
 }
 
@@ -798,16 +806,18 @@ export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined
 // process. Live 2026-09-21 with CLEMMY_EMBED_PROVIDER=local and a key present:
 // `isEmbeddingsEnabled() === false` and similarity search silently degraded to
 // LIKE while 1,013 perfectly good local vectors sat in the store.
-if (
-  !CUTOVER_HOLD
-  && localEmbeddingsAllowed()
-  && providerOverride() !== 'off'
-  && providerOverride() !== 'openai'
-  && !embeddingsDisabledByEnv()
-  && (providerOverride() === 'local' || !getOpenAiApiKey())
-) {
-  void loadLocalProvider();
-}
+// NO EAGER WARMUP. This block used to call loadLocalProvider() at module import
+// so isEmbeddingsEnabled() would read true before the first recall. The
+// descriptor above now answers that from compile-time constants, so warming
+// bought nothing except native ONNX work on the daemon's boot path — and when
+// that load SIGTRAPs, the supervisor restarts into the same load. Live
+// 2026-09-21: 493 restarts. The weights now load on first real embed(), which
+// is already async and already off the boot path.
+//
+// Kept as a reference to the conditions that used to gate it, because the next
+// person to want warmup should know why it is absent:
+//   localEmbeddingsAllowed() && override not off/openai && not disabled
+//   && (override === 'local' || no OpenAI key)
 
 /**
  * Convert a Float32Array to a Buffer for SQLite BLOB storage.
