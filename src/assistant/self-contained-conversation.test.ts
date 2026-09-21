@@ -82,3 +82,42 @@ test('arithmetic is identified positively, not by what it lacks', () => {
   // No digits at all is not a computation.
   assert.equal(isSelfContainedComputation('what is a crm'), false);
 });
+
+// ─── The hole the first fix left open ──────────────────────────────────────
+// Adversarial review, 2026-09-20: trusting intent==='casual' reinstated the
+// absence test one level down. classifyMessageIntent's casual branch guards
+// itself with greetingOpensHostedOrLookupAsk, whose body IS
+// refersToUserOrHostedWorld — and it strips only greeting openers, never
+// acknowledgements. Measured on the shipped classifier before this pin:
+// "ok what meetings does tim have tomorrow" -> casual/0.9 -> zero tools. That
+// is the incident sentence with one word in front.
+
+test('an opener does not make what follows it closed-world', () => {
+  for (const text of [
+    'ok what meetings does tim have tomorrow',
+    'hey when is the acme renewal',
+    'hey check salesforce for tim',
+    'thanks, does acme have an open deal?',
+    'yo did tim reply',
+    'cool who owns the acme account',
+    'hi is tim out today',
+    'perfect, and acme?',
+    'hey can you check tim\u2019s calendar',
+  ]) assert.equal(cheap(text), false, text);
+});
+
+test('an opener with nothing after it is still cheap', () => {
+  for (const text of [
+    'hey', 'hi', 'thanks!', 'good morning', 'ok', 'perfect', 'cool',
+    'hey hows it going', 'whats up', 'you there', 'later',
+  ]) assert.equal(cheap(text), true, text);
+});
+
+test('a run of openers is still a closed turn', () => {
+  assert.equal(cheap('hey ok thanks'), true);
+});
+
+test('an opener in front of arithmetic stays cheap', () => {
+  assert.equal(cheap('ok what is 2x3'), true);
+  assert.equal(cheap('thanks, whats 15% of 80'), true);
+});

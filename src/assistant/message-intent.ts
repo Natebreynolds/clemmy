@@ -381,10 +381,52 @@ export function selfContainedConversation(
 ): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
-  // A greeting/acknowledgement matched by pattern, length and the action,
-  // hosted-ask and external-effect guards in classifyMessageIntent.
-  if (verdict.intent === 'casual' && verdict.confidence >= 0.9) return true;
-  return isSelfContainedComputation(trimmed);
+  if (isSelfContainedComputation(trimmed)) return true;
+  if (verdict.intent !== 'casual' || verdict.confidence < 0.9) return false;
+  // A GREETING IS NOT A VERDICT ON WHAT FOLLOWS IT.
+  //
+  // Trusting intent==='casual' alone reinstated the very test this predicate
+  // replaced, one level down: classifyMessageIntent's casual branch guards
+  // itself with greetingOpensHostedOrLookupAsk, whose body is
+  // refersToUserOrHostedWorld — the first-person / eight-noun / six-preposition
+  // absence test. It also strips only hey|hi|hello|yo|sup|howdy|good-morning,
+  // so an acknowledgement opener ("ok", "thanks", "cool") never even reached
+  // the check. Measured on the shipped classifier: "ok what meetings does tim
+  // have tomorrow" — the incident question with one word in front — came back
+  // casual/0.9 and was handed a zero-tool surface, as did "hey check salesforce
+  // for tim" and "thanks, does acme have an open deal?".
+  //
+  // So the opener is stripped here and whatever remains must stand on its own.
+  // "hey" closes a turn; "hey" plus a question about Tim does not.
+  const remainder = remainderAfterConversationalOpeners(trimmed);
+  return remainder === '' || isSelfContainedComputation(remainder);
+}
+
+/** Every opener CASUAL_PATTERNS can match — greetings, acknowledgements and
+ *  sign-offs — so the remainder is judged on its own merits rather than on
+ *  which of two opener lists happened to match. */
+const CONVERSATIONAL_OPENER_RE = new RegExp(
+  '^(?:'
+  + 'hey|hi|hello|yo|sup|howdy'
+  + '|good\\s+(?:morning|afternoon|evening|night)'
+  + '|thanks|thank\\s+you|ty|cheers|appreciate\\s+it'
+  + '|ok|okay|cool|got\\s+it|sounds\\s+good|nice|sweet|perfect'
+  + '|lol|haha|lmao|awesome|amazing'
+  + '|bye|gn|goodnight|see\\s+ya|talk\\s+later|later'
+  + '|what\'?s\\s+up|how\'?s\\s+it\\s+going|how\\s+are\\s+you|you\\s+there|wyd'
+  + ')\\b[\\s,;:.!?\u2014\u2013-]*',
+  'i',
+);
+
+function remainderAfterConversationalOpeners(text: string): string {
+  let current = text.trim();
+  // "hey ok thanks" is still a closed turn; a short run of openers is stripped.
+  for (let i = 0; i < 4; i += 1) {
+    const next = current.replace(CONVERSATIONAL_OPENER_RE, '').trim();
+    if (next === current) break;
+    current = next;
+  }
+  return current;
 }
 
 export function hasDiscourseReferent(text: string): boolean {
