@@ -40,10 +40,32 @@ const rows = db.prepare(`
 db.close();
 
 if (rows.length === 0) {
+  // Two different reasons for zero, and they call for different action. Say
+  // which, rather than reporting a blank that reads as a clean result.
+  let keyed = false;
+  try {
+    const { readFileSync } = await import('node:fs');
+    const vault = readFileSync(`${process.env.HOME}/.clementine-next/state/secrets-vault.json`, 'utf8');
+    keyed = /typesafe/i.test(vault);
+  } catch { /* absence of a vault is absence of a key */ }
+  try {
+    const { readFileSync } = await import('node:fs');
+    keyed = keyed || /^TYPESAFE_API_KEY=.+/m.test(readFileSync(`${process.env.HOME}/.clementine-next/.env`, 'utf8'));
+  } catch { /* no .env is fine */ }
+
   console.log(`No shadow verdicts in the last ${hours}h.`);
-  console.log('Expected while no TYPESAFE_API_KEY is configured — tryJevGroundingVerdict');
-  console.log('returns null without a key, so the shadow records nothing. This is not a');
-  console.log('failure; it means the gate has not been exercised with Jev connected yet.');
+  if (!keyed) {
+    console.log('No Jev key is configured, so tryJevGroundingVerdict returns null and the');
+    console.log('shadow records nothing. Paste a key to start collecting.');
+  } else {
+    console.log('A Jev key IS configured, so this is not a wiring problem: the grounding');
+    console.log('gate only fires on an IRREVERSIBLE EXTERNAL WRITE that has session');
+    console.log('artifacts to verify against. Ordinary chat traffic never reaches it.');
+    console.log('');
+    console.log('So agreement cannot be measured by using Clem normally — it needs real');
+    console.log('sends. Until some happen, this is an untested gate with a live key, not');
+    console.log('a gate with a clean record.');
+  }
   process.exit(0);
 }
 
