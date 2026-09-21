@@ -128,6 +128,67 @@ function jsonChars(value: unknown): number {
   return JSON.stringify(value).length;
 }
 
+/**
+ * Which keys in a sibling record set actually distinguish one record from
+ * another, computed from the payload and nothing else.
+ *
+ * The hardcoded priority list below is news/web-scrape shaped (publishedAt,
+ * publisher, snippet, markdown, images). For any payload outside it EVERY key
+ * ties at lowest priority, so keys survive by original object order and
+ * allocateJsonBudgets then water-fills them EQUALLY. That systematically buys
+ * the cheapest fields and omits the informative ones.
+ *
+ * Live 2026-09-21, source 276961, "whats on my calendar today": each of 5
+ * events got ~28 chars per key, so `isAllDay: false` (5 chars) fit exactly
+ * while `subject` (44) did not. The brain received 21 key names per record with
+ * `categories: []`, `importance: "normal"`, `onlineMeeting: null` — 127 keys and
+ * 56 values omitted, none of them the answer — and had to spend a second round
+ * on tool_output_query asking for subject/start/end/location, which returned
+ * 5,428 bytes against the 2,948 it already had.
+ *
+ * A key whose value is IDENTICAL across every sibling record cannot distinguish
+ * them, however cheap it is to include; one that differs everywhere is what the
+ * reader came for. That is information content, available from the data, with no
+ * tool, vendor or domain knowledge in it — so it generalizes to any provider
+ * rather than needing a list entry per payload shape.
+ *
+ * Returns keys ordered most-discriminating first. An empty or single-record set
+ * yields null: with nothing to compare against, the existing order stands.
+ */
+function discriminatingKeyOrder(records: readonly unknown[]): readonly string[] | null {
+  const siblings = records.filter((entry): entry is Record<string, unknown> => (
+    typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+  ));
+  if (siblings.length < 2) return null;
+  const distinct = new Map<string, Set<string>>();
+  const cost = new Map<string, number>();
+  for (const sibling of siblings) {
+    for (const [key, value] of Object.entries(sibling)) {
+      let seen = distinct.get(key);
+      if (!seen) { seen = new Set(); distinct.set(key, seen); }
+      let serialized: string;
+      // Bounded: a long value's identity is its leading 256 chars. Two records
+      // differing only past that are treated as the same for ranking, which is
+      // the conservative direction — it never promotes a key on noise alone.
+      try { serialized = JSON.stringify(value); } catch { serialized = '"[unreadable]"'; }
+      seen.add(serialized.slice(0, 256));
+      cost.set(key, Math.max(cost.get(key) ?? 0, serialized.length));
+    }
+  }
+  // Spread dominates, then CHEAPEST first. Information alone is not enough: on
+  // the live calendar payload ten keys tied at maximum spread and an
+  // alphabetical tiebreak put `attendees` (3,213 bytes) second, where it
+  // consumed the whole record budget and pushed `subject` (44 bytes) into the
+  // shared tail — the same failure in a new order. Cost is the max across
+  // siblings, so a key that is huge in any one record is treated as expensive.
+  return [...distinct.entries()]
+    .map(([key, seen]) => ({ key, spread: seen.size, bytes: cost.get(key) ?? 0 }))
+    .sort((left, right) => (
+      right.spread - left.spread || left.bytes - right.bytes || left.key.localeCompare(right.key)
+    ))
+    .map(({ key }) => key);
+}
+
 function projectionKeyPriority(key: string): number {
   const priority = [
     'data', 'successful', 'success', 'error',
@@ -165,6 +226,51 @@ function allocateJsonBudgets(sizes: number[], available: number): number[] {
   return budgets;
 }
 
+/**
+ * Spend the budget by COMPLETING fields in the order given, rather than
+ * splitting it equally.
+ *
+ * allocateJsonBudgets water-fills: every field gets the same share, so a record
+ * of 21 fields on a ~590-char budget gives each ~28 chars. A 5-char boolean fits
+ * exactly and a 44-char subject does not, which is how a calendar record arrived
+ * as 21 key names with the answer omitted.
+ *
+ * Completing in order means the first fields arrive WHOLE and the tail is
+ * omitted — and the tail is, by construction, the fields that distinguish these
+ * records least. Fewer fields complete beats more fields empty, because an
+ * omitted value forces the reader to fetch it and an empty key set cannot be
+ * read at all.
+ *
+ * Applied only where a sibling ranking exists (inside a record array), so
+ * single objects and envelopes keep their existing equal-share behaviour
+ * exactly. Any leftover is water-filled across the remainder, so a record that
+ * fits entirely is unaffected.
+ */
+function allocateJsonBudgetsInOrder(sizes: number[], available: number): number[] {
+  const budgets = new Array<number>(sizes.length).fill(0);
+  let remaining = available;
+  let firstUnfunded = sizes.length;
+  for (let index = 0; index < sizes.length; index += 1) {
+    const size = sizes[index]!;
+    if (size <= remaining) {
+      budgets[index] = size;
+      remaining -= size;
+    } else {
+      firstUnfunded = index;
+      break;
+    }
+  }
+  if (firstUnfunded < sizes.length && remaining > 0) {
+    // Whatever is left is shared by the fields that did not fit whole, so a
+    // near-miss still arrives clipped rather than absent.
+    const tail = allocateJsonBudgets(sizes.slice(firstUnfunded), remaining);
+    for (let offset = 0; offset < tail.length; offset += 1) {
+      budgets[firstUnfunded + offset] = tail[offset]!;
+    }
+  }
+  return budgets;
+}
+
 function compactJsonString(value: string, budget: number, stats: StructuredProjectionStats): unknown {
   const serialized = JSON.stringify(value);
   if (serialized.length <= budget) return value;
@@ -194,6 +300,10 @@ function compactJsonValue(
   budget: number,
   stats: StructuredProjectionStats,
   depth = 0,
+  /** Sibling ranking from the enclosing array, most-discriminating first. Used
+   *  only to break the flat priority tie among keys the hardcoded list does not
+   *  name; a listed key keeps its existing rank. */
+  siblingOrder: readonly string[] | null = null,
 ): unknown {
   const fullSize = jsonChars(value);
   // The allocator gives already-fitting scalar values their exact size. A
@@ -223,9 +333,11 @@ function compactJsonValue(
     const overhead = 2 + Math.max(0, shown - 1);
     const sizes = value.slice(0, shown).map(jsonChars);
     const budgets = allocateJsonBudgets(sizes, budget - overhead);
+    // Computed once for the whole array: which keys distinguish these records.
+    const order = discriminatingKeyOrder(value.slice(0, shown));
     const compact: unknown[] = [];
     for (let index = 0; index < shown; index += 1) {
-      const entry = compactJsonValue(value[index], budgets[index]!, stats, depth + 1);
+      const entry = compactJsonValue(value[index], budgets[index]!, stats, depth + 1, order);
       // JSON arrays cannot express a hole without inventing null or shifting
       // source indices. Retain a contiguous prefix and report the suffix as
       // omitted; callers can query the original at its unchanged offsets.
@@ -240,9 +352,21 @@ function compactJsonValue(
 
   const record = value as Record<string, unknown>;
   const originalKeys = Object.keys(record);
+  // A key the list names keeps its rank. An unlisted key — every key of a
+  // calendar, CRM or mailbox record — is ordered by how much it distinguishes
+  // this record from its siblings, instead of tying and surviving on object
+  // order. `rank` is only ever a tiebreak WITHIN the unlisted group, so listed
+  // keys cannot be displaced.
+  const rankOf = (key: string): number => {
+    if (!siblingOrder) return 0;
+    const at = siblingOrder.indexOf(key);
+    return at < 0 ? siblingOrder.length : at;
+  };
   let keys = originalKeys
-    .map((key, index) => ({ key, index, priority: projectionKeyPriority(key) }))
-    .sort((left, right) => left.priority - right.priority || left.index - right.index)
+    .map((key, index) => ({ key, index, priority: projectionKeyPriority(key), rank: rankOf(key) }))
+    .sort((left, right) => (
+      left.priority - right.priority || left.rank - right.rank || left.index - right.index
+    ))
     .slice(0, MAX_STRUCTURED_PROJECTION_KEYS)
     .map(({ key }) => key);
   while (keys.length > 0) {
@@ -258,7 +382,12 @@ function compactJsonValue(
     + Math.max(0, keys.length - 1)
     + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
   const sizes = keys.map((key) => jsonChars(record[key]));
-  const budgets = allocateJsonBudgets(sizes, budget - overhead);
+  // Inside a record array the keys are already ordered most-discriminating
+  // first, so completing them in order spends the budget on what the reader
+  // came for. Outside one, nothing has ranked them and equal-share stands.
+  const budgets = siblingOrder
+    ? allocateJsonBudgetsInOrder(sizes, budget - overhead)
+    : allocateJsonBudgets(sizes, budget - overhead);
   const compact: Record<string, unknown> = {};
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
