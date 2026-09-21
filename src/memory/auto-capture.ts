@@ -1,7 +1,11 @@
 import { savedMemoryCorrectionClaim } from './saved-memory-correction.js';
 import type { ConsolidatedFactKind } from './db.js';
 import type { ConsolidatedFact } from './facts.js';
-import { drainDurableConsolidationCandidates, enqueueAutoCaptureCandidates } from './durable-consolidation.js';
+import {
+  drainDurableConsolidationCandidates,
+  enqueueAutoCaptureCandidates,
+  UNJUDGED_OWNER_STATEMENT_REASON,
+} from './durable-consolidation.js';
 import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
@@ -687,6 +691,38 @@ export function extractProfilePatchFromMessage(message: string): Record<string, 
   return Object.keys(patch).length > 0 ? patch : undefined;
 }
 
+/**
+ * Producing no candidates has two very different meanings, and only one of them
+ * may ever be overridden.
+ *
+ * A REFUSAL is an instruction: the owner said "do not save this as memory", the
+ * text is a harness re-prompt rather than the owner's words at all, or it is a
+ * smoke-test probe describing this turn. Every path must honor that.
+ *
+ * A NON-MATCH is only silence — the phrasing patterns did not recognize the
+ * sentence. That carries no instruction, and it is what the model reviewer
+ * exists to judge again.
+ *
+ * Before these were separated, both produced a bare `[]`, so the only way to
+ * re-judge unfamiliar phrasing would also have resurrected memories the owner
+ * explicitly declined. That is why this predicate exists rather than a second
+ * copy of the conditions.
+ */
+export function durableCaptureRefused(message: string): boolean {
+  const text = clean(message, Infinity);
+  if (!text) return false;
+  if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return true;
+  // An isolated "remember X" clause is explicit durable authority and overrides
+  // the whole-turn task/probe scopes below — but never the harness check above,
+  // which is about whether these are the owner's words in the first place.
+  if (explicitMemoryInstructionFor(text)) return false;
+  // One-off validation/probe prompts often contain durable-looking words such as
+  // "instead of" or "must", but they describe this smoke turn, not user memory.
+  // An explicit current-task scope likewise belongs in working memory, even when
+  // the sentence also contains durable-looking markers such as "always".
+  return isOneOffValidationOrToolProbe(text) || EXPLICIT_EPHEMERAL_SCOPE_RE.test(text);
+}
+
 export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   if (!text || LOW_SIGNAL.test(text)) return [];
@@ -697,19 +733,12 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // recorded as user_input_received but must NEVER become durable "user" facts —
   // they were being pinned as "Standing prohibition" and injected into every
   // chat + voice prompt (2026-06-23 fact pollution).
-  if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return [];
+  if (durableCaptureRefused(text)) return [];
   // Parse explicit durable authority before applying whole-turn task/probe
   // heuristics. The parser isolates a separate "remember X" clause, while the
   // suppression check keeps same-content and turn-wide privacy language
   // authoritative.
   const explicitMemoryInstruction = explicitMemoryInstructionFor(text);
-  // One-off validation/probe prompts often contain durable-looking words such as
-  // "instead of" or "must", but they describe this smoke turn, not user memory.
-  if (isOneOffValidationOrToolProbe(text) && !explicitMemoryInstruction) return [];
-  // An explicit current-task scope belongs in working memory, even when the
-  // sentence also contains durable-looking markers such as "always". A separate
-  // isolated memory command is the only exception.
-  if (EXPLICIT_EPHEMERAL_SCOPE_RE.test(text) && !explicitMemoryInstruction) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
@@ -943,6 +972,29 @@ function isDurableDeclarative(text: string): boolean {
   return true;
 }
 
+/** Shortest owner message that could carry a durable fact, and the longest one
+ *  worth paying a reviewer call for. Both are structural: they ask how much
+ *  text there is, never what it says. Every judgment about MEANING belongs to
+ *  the reviewer, which is the whole point of this path. */
+const MIN_REVIEWABLE_OWNER_CHARS = 12;
+const MAX_REVIEWABLE_OWNER_CHARS = 2000;
+
+/**
+ * The unmatched-message fallback. Deliberately carries no `pin` and the neutral
+ * `user` kind: this candidate asserts nothing about the message except that a
+ * model should look at it. If the reviewer says `task`, the drain rejects it and
+ * the outcome is identical to the drop that happens today.
+ */
+function unjudgedOwnerStatement(message: string): AutoMemoryCandidate[] {
+  const text = message.trim();
+  // An explicit decline outranks the reviewer. Re-judging is for phrasing the
+  // patterns did not recognize, never for something the owner refused.
+  if (durableCaptureRefused(text)) return [];
+  if (text.length < MIN_REVIEWABLE_OWNER_CHARS) return [];
+  if (text.length > MAX_REVIEWABLE_OWNER_CHARS) return [];
+  return [{ kind: 'user', content: text, reason: UNJUDGED_OWNER_STATEMENT_REASON }];
+}
+
 export function captureInteractionSignals(input: {
   message: string;
   sessionId?: string;
@@ -974,7 +1026,13 @@ export function captureInteractionSignals(input: {
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(input.message)) {
     return emptyAutoCaptureResult();
   }
-  const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
+  const matched = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
+  // When no pattern matched, that is not evidence the owner said nothing worth
+  // keeping — only that they did not phrase it the way the battery expects.
+  // Hand the message to the model reviewer the drain already runs rather than
+  // discarding it. `task` drops it exactly as today; `standing` is a preference
+  // that no phrasing could reach before.
+  const candidates = matched.length > 0 ? matched : unjudgedOwnerStatement(input.message);
 
   // Persist the exact source turn + replayable claim rows synchronously, then
   // run the semantic conflict resolver off the response path. A daemon restart

@@ -20,6 +20,23 @@ const EXPLICIT_STABLE_CONTEXT_REASONS = new Set([
   'explicit durable correction',
 ]);
 
+/**
+ * Intake reason for an owner message that the phrasing patterns in auto-capture
+ * did not match. It carries no claim that the message IS durable — it says the
+ * opposite: nothing has judged this yet, so route it to the model reviewer
+ * below instead of promoting it.
+ *
+ * This exists because the patterns decided durability from ENGLISH SHAPE (a
+ * first-person possessive plus a stative verb from a fixed list), so a
+ * preference stated any other way was dropped as ephemeral and no path ever saw
+ * it again. Widening the patterns has repeatedly cost recall elsewhere — the
+ * battery already carries a guard added after "can I have the body of the
+ * emails" was stored because "I have" matched. The reviewer answers 'task',
+ * which drops the message exactly as today, or 'standing', which is currently
+ * unreachable no matter how plainly the owner states a preference.
+ */
+export const UNJUDGED_OWNER_STATEMENT_REASON = 'owner statement — model decides durability';
+
 export interface DurableAutoCaptureCandidate {
   kind: ConsolidatedFactKind;
   content: string;
@@ -217,7 +234,9 @@ export async function drainDurableConsolidationCandidates(options: {
       const explicitScopeReview = EXPLICIT_STABLE_CONTEXT_REASONS.has(row.intake_reason ?? '')
         && explicitMemoryNeedsScopeReview(sourceText, row.text);
       if (row.intake_reason === 'standing instruction (marker + concrete target)'
-        || row.intake_reason === 'project requirement signal' || explicitScopeReview) {
+        || row.intake_reason === 'project requirement signal'
+        || row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON
+        || explicitScopeReview) {
         const review = await (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text,
           explicitScopeReview ? 'explicit' : 'inferred');
         if (explicitScopeReview && (review.scope !== 'standing' || !review.text?.includes(row.text))) {
