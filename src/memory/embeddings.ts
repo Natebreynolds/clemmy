@@ -745,13 +745,21 @@ export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined
 // Eager local warmup on no-key installs so isEmbeddingsEnabled() flips true
 // before the first recall, instead of reporting "off" for the first turn.
 // Fire-and-forget; failures already degrade to lexical inside loadLocalProvider.
+// Warm up whenever local is the provider this process will actually resolve to.
+// That is either an explicit `local` override or the no-key install; keying it
+// to key-ABSENCE alone silently skipped warmup on a keyed machine that had
+// chosen local, and then every sync gate (isEmbeddingsEnabled, findSimilarFacts,
+// the recall fast path) read null and answered lexical-only for the life of the
+// process. Live 2026-09-21 with CLEMMY_EMBED_PROVIDER=local and a key present:
+// `isEmbeddingsEnabled() === false` and similarity search silently degraded to
+// LIKE while 1,013 perfectly good local vectors sat in the store.
 if (
   !CUTOVER_HOLD
   && localEmbeddingsAllowed()
   && providerOverride() !== 'off'
   && providerOverride() !== 'openai'
   && !embeddingsDisabledByEnv()
-  && !getOpenAiApiKey()
+  && (providerOverride() === 'local' || !getOpenAiApiKey())
 ) {
   void loadLocalProvider();
 }
