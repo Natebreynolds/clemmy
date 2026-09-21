@@ -50,9 +50,47 @@ function running() {
   }
 }
 
+/** Seconds since the newest event that is not the known restart-recovery loop. */
+async function idleSeconds() {
+  try {
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(`${process.env.HOME}/.clementine-next/state/harness.db`, { readonly: true });
+    const row = db.prepare(
+      "SELECT created_at FROM events WHERE session_id != ? ORDER BY seq DESC LIMIT 1",
+    ).get('sess-desktop-3f470fbb78675aff366300c6');
+    db.close();
+    if (!row) return Infinity;
+    const at = typeof row.created_at === 'number' ? row.created_at : Date.parse(row.created_at);
+    return Number.isFinite(at) ? (Date.now() - at) / 1000 : Infinity;
+  } catch {
+    return NaN; // unknown — treat as busy and make the caller decide
+  }
+}
+
+const IDLE_REQUIRED_SECONDS = 90;
+
 if (running()) {
-  console.error('REFUSED: Clementine is running. Quit it first so the active run finishes cleanly.');
-  process.exit(1);
+  const idle = await idleSeconds();
+  if (!Number.isFinite(idle)) {
+    console.error('REFUSED: could not read the event log to confirm Clementine is idle. Quit it yourself, then re-run.');
+    process.exit(1);
+  }
+  if (idle < IDLE_REQUIRED_SECONDS) {
+    console.error(`REFUSED: a run finished ${Math.round(idle)}s ago — Clementine may still be working.`);
+    console.error(`Wait until it has been quiet for ${IDLE_REQUIRED_SECONDS}s, or quit it yourself and re-run.`);
+    process.exit(1);
+  }
+  console.log(`Clementine is running and has been idle ${Math.round(idle)}s — quitting it cleanly.`);
+  execFileSync('osascript', ['-e', 'quit app "Clementine"']);
+  for (let i = 0; i < 20; i += 1) {
+    if (!running()) break;
+    execFileSync('sleep', ['1']);
+  }
+  if (running()) {
+    console.error('REFUSED: Clementine did not quit within 20s. Quit it yourself, then re-run.');
+    process.exit(1);
+  }
+  console.log('quit cleanly.\n');
 }
 
 const home = process.env.HOME ?? '';
