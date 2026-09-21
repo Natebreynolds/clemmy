@@ -288,6 +288,41 @@ export function buildTerminalReportBody(input: {
  * one piece of work. The stable-id dedup inside addNotification then makes every
  * later arm for the same request a no-op.
  */
+/** How much of the report a title can carry before it stops being scannable. */
+const REPORT_HEADLINE_MAX = 90;
+
+/**
+ * Lead a finished report with what Clem CONCLUDED, not with what was asked.
+ *
+ * The title was `${status}: ${session.title}`, and a session title is derived
+ * from the owner's own opening words — so a list of reports read as a list of
+ * the owner's own questions: "Chat run completed: anything urgent in my inbox?
+ * btw when in doubt draft it, don…". Every answer was one click away, on every
+ * surface, which is why finding a result was hard in the Inbox and worse in a
+ * Discord or Slack DM where the title is most of what you see.
+ *
+ * The body already holds the report. This takes its opening thought as the
+ * headline. It is formatting Clem's OWN prose for display and makes no decision
+ * from it — no behaviour keys off this string.
+ */
+function reportHeadline(body: string): string | null {
+  const firstLine = body.split('\n').map((line) => line.trim()).find((line) => line.length > 0);
+  if (!firstLine) return null;
+  const plain = firstLine
+    .replace(/^#{1,6}\s+/, '')   // a markdown heading is still the opening thought
+    .replace(/^[-*+]\s+/, '')    // a leading bullet is formatting, not content
+    .replace(/\*\*|__|`/g, '')   // inline emphasis is noise once it is a title
+    .trim();
+  if (plain.length < 3) return null;
+  if (plain.length <= REPORT_HEADLINE_MAX) return plain;
+  // Prefer ending on a finished thought over a hard character cut.
+  const cut = plain.slice(0, REPORT_HEADLINE_MAX);
+  const sentenceEnd = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
+  if (sentenceEnd > REPORT_HEADLINE_MAX / 2) return cut.slice(0, sentenceEnd + 1).trim();
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > REPORT_HEADLINE_MAX / 2 ? cut.slice(0, lastSpace) : cut).trim()}…`;
+}
+
 function emitTerminalReportBack(
   facts: TerminalRunFacts,
   session: { title: string | null; userId: string | null },
@@ -305,7 +340,12 @@ function emitTerminalReportBack(
     transferred: 'Chat run moved to the background',
     uncertain: 'Chat run needs reconciliation',
   };
-  const title = `${titlePrefix[facts.outcome]}: ${label}`;
+  // A finished run leads with its answer. Anything else leads with its status,
+  // because a stop the owner has to act on is not scannable as prose — they
+  // need to see that it needs them, and which request it belongs to.
+  const title = facts.outcome === 'done'
+    ? reportHeadline(body) ?? `${titlePrefix[facts.outcome]}: ${label}`
+    : `${titlePrefix[facts.outcome]}: ${label}`;
   addNotification({
     id: `foreground-report-back-${facts.sessionId}-${facts.startSeq}`,
     kind: 'execution',

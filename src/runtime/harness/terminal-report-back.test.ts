@@ -491,3 +491,106 @@ test('a run long enough to outgrow a read window still reports back', () => {
 });
 
 process.on('exit', () => { rmSync(TMP_HOME, { recursive: true, force: true }); });
+
+/**
+ * A finished report is titled with its ANSWER, not with the owner's question.
+ *
+ * Live 2026-09-21 the Inbox read:
+ *   Chat run completed: anything urgent in my inbox? btw when in doubt draft…
+ *   Chat run completed: pull up the pipeline. also i go by Nate not Nathan…
+ * Every row echoed the owner's own words, so a list of Clem's reports was a
+ * list of the owner's questions and each answer sat one click away. That same
+ * title is most of what a Discord or Slack DM shows, which is where the owner
+ * noticed it first.
+ */
+test('a completed report is titled with what Clem concluded', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-headline-done';
+  createSession({ id: sessionId, kind: 'chat', title: 'how many meetings does tim have tomorrow' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'how many meetings does tim have tomorrow' },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  // A report-back only arms for a SUBSTANTIVE run (external writes, elapsed
+  // time, or tool calls). These runs are synthetic and instant, so give them
+  // the tool calls a real one would have.
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'lookup', callId: `${sessionId}-${i}` },
+    });
+  }
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: {
+      kind: 'answer',
+      text: 'Tim has 0 meetings in Salesforce tomorrow. Nothing on his calendar as owner or invitee.',
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
+  );
+  assert.ok(notification, 'a completed run reports back');
+  assert.ok(
+    notification.title.startsWith('Tim has 0 meetings'),
+    `title must lead with the answer, got: ${notification.title}`,
+  );
+  assert.doesNotMatch(
+    notification.title,
+    /how many meetings does tim/i,
+    'the title must not echo the question back at the owner',
+  );
+  assert.ok(notification.title.length <= 95, `title stays scannable, got ${notification.title.length}`);
+});
+
+/**
+ * A stop the owner must act on keeps its status lead. Prose does not scan when
+ * the point is "this needs you", and the owner still has to see which request
+ * is waiting on them.
+ */
+test('a run that needs the owner still leads with its status', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-report-headline-needs';
+  createSession({ id: sessionId, kind: 'chat', title: 'send the client export' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'send it' },
+  });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  // A report-back only arms for a SUBSTANTIVE run (external writes, elapsed
+  // time, or tool calls). These runs are synthetic and instant, so give them
+  // the tool calls a real one would have.
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'lookup', callId: `${sessionId}-${i}` },
+    });
+  }
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'approval' },
+    presentation: {
+      kind: 'approval',
+      text: 'Approval required for Send Slack message. Review apr-3lmm to continue.',
+      approvalId: 'apr-3lmm',
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const notification = listNotifications(100).find(
+    (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
+  );
+  assert.ok(notification, 'a run needing the owner reports back');
+  assert.match(notification.title, /^Chat run needs you:/);
+  assert.match(notification.title, /send the client export/);
+});
