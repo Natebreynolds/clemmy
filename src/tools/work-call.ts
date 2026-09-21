@@ -28,7 +28,7 @@ import {
   type ExpectedWorkCallBinding,
   type ExpectedWorkUniverseSelectorV1,
 } from '../runtime/harness/expected-work-admission.js';
-import { attestToolLocalInputInvalidity, harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { attestToolLocalInputInvalidity, harnessRunContextStorage, ToolGuardrailEscalated } from '../runtime/harness/brackets.js';
 import {
   loadExpectedWorkContract,
   prepareActionExpectedWorkContract,
@@ -1348,7 +1348,20 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     // pending signal must cross both SDK FunctionTool wrappers unchanged so
     // the host keeps R open and schedules getter-only recovery; serializing it
     // here would fabricate a tool result and trigger nested-settlement adoption.
-    propagateInvocationError: isHostDurableContinuationPendingError,
+    // A guardrail escalation is a terminal, not an invocation error. call-tool's
+    // errorFunction stringifies whatever it is not told to propagate, so an
+    // escalation thrown from inside a work_call became a model-visible error
+    // string and the loop kept going. Live 2026-09-18 turn:233895: the guardrail
+    // escalated 12 times over 4 minutes and the turn then ran 90 more model
+    // calls, 2,650,221 uncached tokens and 9.4 more minutes until the owner
+    // pressed stop. The re-entry governor does bound this at 200 settled calls
+    // (loop.ts:3902) — it just arrives ~10x too late to be the backstop.
+    // Same treatment ToolCallsLimitExceeded already gets one line above it in
+    // call-tool.ts, for the reason its own comment gives: "never soften the
+    // deterministic turn ceiling."
+    propagateInvocationError: (error: unknown) => (
+      error instanceof ToolGuardrailEscalated || isHostDurableContinuationPendingError(error)
+    ),
     aroundResolvedDispatch: async (resolved, dispatch) => {
       const frame = workCallStorage.getStore();
       const refuse = (
