@@ -242,7 +242,11 @@ test('findSimilarFacts skips query embedding when the fact pool has no stored ve
 });
 
 test('findSimilarFacts falls back to LIKE when embeddings are disabled', async () => {
+  // Removing the key is NOT how embeddings get disabled any more: a keyless
+  // install is exactly who the bundled local embedder serves, so no-key now
+  // means local, not off. Disabling takes the explicit switch.
   delete process.env.OPENAI_API_KEY;
+  process.env.CLEMMY_EMBED_PROVIDER = 'off';
   try {
     assert.equal(isEmbeddingsEnabled(), false);
     rememberFact({ kind: 'user', content: 'Alexander prefers concise replies in markdown.' });
@@ -255,6 +259,7 @@ test('findSimilarFacts falls back to LIKE when embeddings are disabled', async (
     assert.equal(fetchCalls, 0, 'no embedding network call when disabled');
   } finally {
     process.env.OPENAI_API_KEY = 'sk-test-fact-embeddings';
+    delete process.env.CLEMMY_EMBED_PROVIDER;
   }
 });
 
@@ -422,7 +427,10 @@ test('triggerEmbedAtWrite is a no-op when the kill-switch is off', async () => {
 
 test('triggerEmbedAtWrite is a no-op when embeddings are disabled', async () => {
   _resetEmbedAtWriteForTest();
+  // See above: no-key resolves to the local embedder now, so "disabled" has to
+  // be stated rather than implied by an absent key.
   delete process.env.OPENAI_API_KEY;
+  process.env.CLEMMY_EMBED_PROVIDER = 'off';
   try {
     const f = rememberFact({ kind: 'user', content: 'A fact written with embeddings disabled.' });
     await triggerEmbedAtWrite();
@@ -430,6 +438,7 @@ test('triggerEmbedAtWrite is a no-op when embeddings are disabled', async () => 
     assert.equal(fetchCalls, 0, 'no network call');
   } finally {
     process.env.OPENAI_API_KEY = 'sk-test-fact-embeddings';
+    delete process.env.CLEMMY_EMBED_PROVIDER;
   }
 });
 

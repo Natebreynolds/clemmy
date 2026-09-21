@@ -450,6 +450,48 @@ let injectedProvider: EmbeddingProvider | null | undefined = undefined;
  *  model load. See localEmbeddingsAllowed(). */
 let localProviderSeededForTest = false;
 
+/**
+ * The local provider as it can be known SYNCHRONOUSLY, before its weights load.
+ *
+ * `model` and `dim` are compile-time constants, and that is all any READ path
+ * needs: every recall query filters `WHERE model = ? AND dim = ?`, so it only
+ * has to know which vector space is authoritative — not how to produce a new
+ * vector. Producing one needs the weights, and `embed` is already async, so the
+ * 573 ms load happens where an await already exists.
+ *
+ * This is what lets local be the default. `OPENAI_PROVIDER` is a plain constant
+ * and so is synchronously available; local was only ever reachable through a
+ * loaded singleton, so `activeProviderSync()` answered null until warmup
+ * finished and every sync gate — isEmbeddingsEnabled, findSimilarFacts, and the
+ * maintenance backfill that was supposed to fix it — read "embeddings off".
+ * Inverting the provider priority without this descriptor broke 11 of 51
+ * embedding tests for exactly that reason.
+ */
+const LOCAL_PROVIDER_DESCRIPTOR: EmbeddingProvider = {
+  name: 'local',
+  model: LOCAL_EMBEDDING_MODEL,
+  dim: LOCAL_EMBEDDING_DIM,
+  async embed(texts: string[]): Promise<Float32Array[]> {
+    const loaded = await loadLocalProvider();
+    // Only reachable if the weights turn out to be unusable. Throwing is right:
+    // the caller is writing vectors, and a silent empty result would persist
+    // rows that claim this model without being in its space.
+    if (!loaded) throw new Error('local embedding model is unavailable');
+    return loaded.embed(texts);
+  },
+};
+
+/** The local provider for SYNC callers: the real one once loaded, the
+ *  descriptor while genuinely unprobed, and null once probing has PROVEN it
+ *  unavailable. The last case matters — claiming a capability we have disproven
+ *  is worse than reporting lexical-only, so optimism stops at first evidence. */
+function localProviderSync(): EmbeddingProvider | null {
+  if (localProvider) return localProvider;
+  if (localProvider === null) return null; // probed and unavailable
+  void loadLocalProvider(); // unprobed: start the load, answer from constants
+  return LOCAL_PROVIDER_DESCRIPTOR;
+}
+
 /** Attempt local provider on no-key installs unless explicitly disabled.
  *
  * A SEEDED provider outranks the env gate. That gate exists to stop unit tests
@@ -680,18 +722,21 @@ function activeProviderSync(): EmbeddingProvider | null {
   // Demoted → local only. Deliberately NOT falling back to OPENAI_PROVIDER
   // while the local model is still loading: OpenAI is known-bad here, and a
   // brief lexical-only window beats re-poisoning recall with timeouts.
-  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return localProvider ?? null;
+  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return localProviderSync();
   if (override !== 'local' && getOpenAiApiKey()) {
     if (override !== 'openai' && providerCooldown(OPENAI_PROVIDER)) {
       if (!localEmbeddingsAllowed()) return null;
-      void loadLocalProvider();
-      return localProvider ?? null;
+      return localProviderSync();
     }
     return OPENAI_PROVIDER;
   }
   if (override === 'openai') return null;
   if (!localEmbeddingsAllowed()) return null;
-  return localProvider ?? null; // null until warmup completes
+  // Answers from constants while the weights load instead of null. That null is
+  // what made every sync gate read "embeddings off" on a local install — and it
+  // disabled the maintenance backfill that was supposed to populate the store,
+  // so the condition could not clear itself.
+  return localProviderSync();
 }
 
 export function activeEmbeddingModel(): string | null { return activeProviderSync()?.model ?? null; }
