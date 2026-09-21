@@ -2,6 +2,8 @@
   "label": "no-jev-baseline",
   "shapeSet": "zero-tool+one-read+multi-step+ambiguous",
   "capturedAt": "2026-09-21T05:20:06.807Z",
+  "contaminated": true,
+  "contamination": "Usage ledgers for one-read (271641) and multi-step (271690) contain jev-1.13.0 calls. Do not use as a Jev-off control.",
   "results": [
     {
       "key": "zero-tool",
@@ -18,6 +20,7 @@
       "output": 28,
       "toolCalls": 0,
       "toolSearches": 0,
+      "jevCalls": 0,
       "status": "done",
       "judgeFulfills": null,
       "reply": "779."
@@ -37,6 +40,7 @@
       "output": 771,
       "toolCalls": 3,
       "toolSearches": 1,
+      "jevCalls": 2,
       "status": "done",
       "judgeFulfills": true,
       "reply": "Monday 9/21, four things: - **9:00–9:45** Team Meet up (you, scorpion.co/nate) — overlaps **9:00–10:00** Yachtly Crew Beginning of the Week (Darrin, scorpion.co"
@@ -56,6 +60,7 @@
       "output": 2090,
       "toolCalls": 15,
       "toolSearches": 2,
+      "jevCalls": 3,
       "status": "done",
       "judgeFulfills": true,
       "reply": "Tim Demik is in Salesforce — active BGC, reports to you (`tim.demik@scorpion.co`). He’s on your calendar this week: **Team Meet up** Mon 9/21 9:00–9:45am PT, **"
@@ -75,6 +80,7 @@
       "output": 855,
       "toolCalls": 26,
       "toolSearches": 0,
+      "jevCalls": 0,
       "status": "needs_input",
       "judgeFulfills": null,
       "reply": "What should I tidy, Nate? Retained work (durable checkpoint): - Source/tool workspace_roots: completed result retained as rh_f1cd13c807ba08d0f9ec47a0ae9bc9ab. -"
@@ -92,6 +98,7 @@
     "output": 3744,
     "toolCalls": 44,
     "toolSearches": 3,
+    "jevCalls": 5,
     "terminals": 4,
     "judgePass": 2,
     "judgeSeen": 2

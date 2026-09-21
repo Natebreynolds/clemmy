@@ -603,7 +603,15 @@ export async function evaluateOutputGrounding(
   }
   let verdict: OutputGroundingVerdict;
   try {
-    verdict = await (judgeOverride ?? runOutputGroundingJudge)(residual, sources);
+    if (judgeOverride) {
+      verdict = await judgeOverride(residual, sources);
+    } else {
+      const { tryJevOutputGroundingVerdict } = await import('../jev/control-plane.js');
+      const fast = await tryJevOutputGroundingVerdict(residual, sources, { sessionId });
+      verdict = fast
+        ? { verdict: fast.verdict, reason: fast.reason, offending: [] }
+        : await runOutputGroundingJudge(residual, sources);
+    }
   } catch {
     // Judge OUTAGE with residual figures that did NOT deterministically clear:
     // don't SILENTLY pass them (the fail-open that let ungrounded/fabricated

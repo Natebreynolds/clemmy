@@ -15,6 +15,7 @@ import { resolveModelCapability } from './model-wire-registry.js';
 import {
   JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
+import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -123,6 +124,16 @@ export interface ObjectiveJudgeVerdict {
   /** Not done, and another attempt by the assistant cannot change that; the
    * reason is written for the owner. The caller does not re-run the work. */
   blocked?: boolean;
+  /** Typed Jev (or similar) prefilter produced this verdict. */
+  fast?: boolean;
+  /** Jev ran even when the Settings judge remained authoritative. */
+  jevAttempt?: {
+    choice?: string;
+    confidence?: number;
+    replyMatchesReceipts?: number;
+    accepted: boolean;
+    coverageComplete: boolean;
+  };
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -196,6 +207,18 @@ export interface ObjectiveJudgeGateInput {
    * does not.
    */
   claimedCompletedWork?: boolean;
+  /**
+   * The turn asked for NO tool work — a greeting, an acknowledgement, or a
+   * deictic aside (intentRequestsNoToolWork: 'casual' or 'conversation').
+   * Only here may a promise-shaped reply go unjudged: "I'll keep that in
+   * mind" after "thanks" is not deferred work.
+   *
+   * This is NOT "not an action". A lookup is a request, and a promise is how
+   * a lookup gets deferred instead of answered. Absent/false keeps the
+   * promise contract below intact, so a caller that does not know the intent
+   * never silently loses the review.
+   */
+  conversationalIntent?: boolean;
 }
 
 /**
@@ -227,7 +250,19 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     !input.openApprovalCard &&
     (input.continuationsUsed < input.maxContinuations
       || (input.reviewAtContinuationLimit === true && input.continuationsUsed === input.maxContinuations)) &&
-    (Boolean(input.promiseShaped)
+    (
+      // A PROMISE IS JUDGED ON ANY TURN THAT ASKED FOR SOMETHING.
+      // Requiring actionIntent here dropped the review on a LOOKUP turn whose
+      // reply deferred the lookup — "Read the current harness status and report
+      // it." answered with "I will read the status." and nothing called yet, so
+      // actionIntent, meaningfulToolEvidence and sourceWorkAttempted were all
+      // false and the promise became the final answer. That is the exact turn
+      // this branch exists to catch, and the owner should never have to nudge.
+      // The intended exemption was chit-chat, so that is what is exempted.
+      (Boolean(input.promiseShaped)
+        && (input.conversationalIntent !== true
+          || Boolean(input.meaningfulToolEvidence)
+          || input.sourceWorkAttempted === true))
       // Attempted work on an ACTION turn, or an attempted BUSINESS call on any
       // turn, is review-eligible however the reply is worded (repair verdicts,
       // inspection-once, warm reads all rest on this). The only exemption is a
@@ -247,7 +282,8 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
       || (input.actionIntent && input.claimedCompletedWork === true && settledWrites === 0)
       || (!input.acceptedExecutionEvidence
         && input.actionIntent
-        && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
+        && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective)))
+    )
   );
 }
 
@@ -459,6 +495,12 @@ export function composeJudgedObjective(input: string, priorUserMessages: string[
 export interface SkillExecutionContext {
   skills: SessionSkill[];
   toolCallSummary: string;
+  /** Accepted chat session, used to attribute a Jev fast-path verdict. */
+  sessionId?: string;
+  /** Compact verified-read receipts shown ahead of other judge evidence. */
+  verifiedReads?: string;
+  /** Structured read settlements for coverage checks (not a character heuristic). */
+  verifiedReadResults?: CompletionEvidenceRow[];
   /** Source-authenticated host evidence is kept whole until the selected
    * model's request admission. Never independently clip the reply or skills
    * while claiming this is a complete evidence review. */
@@ -467,6 +509,144 @@ export interface SkillExecutionContext {
   boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
   /** Retained results the reviewer may open with read-only evidence tools. */
   evidence?: JudgeEvidenceSource;
+}
+
+export interface CompletionEvidenceRow {
+  toolName: string;
+  outcome: string;
+  status?: string;
+  contentComplete?: boolean;
+  contentDisposition?: string;
+  evidenceKind?: string;
+  /** Identity of this settled row (source result or projection call). */
+  logicalToolCallId?: string;
+  resultHandleId?: string;
+  physicalDispatchId?: string;
+  contentDigest?: string;
+  /** Projection → source result. A retained_projection names the call it reads. */
+  sourceLogicalToolCallId?: string;
+  sourceResultHandleId?: string;
+  sourcePhysicalDispatchId?: string;
+}
+
+function isSucceededReceipt(row: CompletionEvidenceRow): boolean {
+  return row.outcome === 'succeeded' || row.outcome === 'empty_result';
+}
+
+function isCompleteRetainedProjection(row: CompletionEvidenceRow): boolean {
+  return row.evidenceKind === 'retained_projection'
+    && isSucceededReceipt(row)
+    && row.contentComplete !== false
+    && row.status !== 'not_succeeded'
+    && row.status !== 'unavailable';
+}
+
+/** Discovery/control rows are execution of search or host control, not outcome evidence.
+ *  A complete retained projection is the inspectable content of a business result
+ *  that was too large to keep inline. */
+function isNonOutcomeEvidence(row: CompletionEvidenceRow): boolean {
+  if (row.contentDisposition === 'discovery_navigation') return true;
+  if (isCompleteRetainedProjection(row)) return false;
+  return actionTopologyRoleFor(row.toolName) === 'control';
+}
+
+function isInspectableOutcomeEvidence(row: CompletionEvidenceRow): boolean {
+  if (isNonOutcomeEvidence(row)) return false;
+  if (!isSucceededReceipt(row)) return false;
+  if (row.status === 'not_succeeded' || row.status === 'unavailable') return false;
+  if (row.contentComplete === false) return false;
+  return true;
+}
+
+function isFailedOutcomeAttempt(row: CompletionEvidenceRow): boolean {
+  if (isNonOutcomeEvidence(row)) return false;
+  return !isSucceededReceipt(row);
+}
+
+function evidenceLineageIds(row: CompletionEvidenceRow): string[] {
+  const ids: string[] = [];
+  for (const value of [
+    row.logicalToolCallId,
+    row.resultHandleId,
+    row.physicalDispatchId,
+    row.contentDigest,
+    row.sourceLogicalToolCallId,
+    row.sourceResultHandleId,
+    row.sourcePhysicalDispatchId,
+  ]) {
+    if (typeof value === 'string' && value.length > 0) ids.push(value);
+  }
+  return ids;
+}
+
+function sharesEvidenceLineage(a: CompletionEvidenceRow, b: CompletionEvidenceRow): boolean {
+  const other = new Set(evidenceLineageIds(b));
+  if (other.size === 0) return false;
+  return evidenceLineageIds(a).some((id) => other.has(id));
+}
+
+/** A complete retained_projection covers only the source result it projects. */
+function projectionCompletesSource(
+  source: CompletionEvidenceRow,
+  projection: CompletionEvidenceRow,
+  all: readonly CompletionEvidenceRow[],
+): boolean {
+  if (!isCompleteRetainedProjection(projection)) return false;
+  const seen = new Set<CompletionEvidenceRow>();
+  const visit = (row: CompletionEvidenceRow): boolean => {
+    if (seen.has(row)) return false;
+    seen.add(row);
+    if (sharesEvidenceLineage(source, row)) return true;
+    for (const next of all) {
+      if (next === row || next === source || seen.has(next)) continue;
+      if (next.evidenceKind !== 'retained_projection') continue;
+      if (!sharesEvidenceLineage(row, next)) continue;
+      if (visit(next)) return true;
+    }
+    return false;
+  };
+  return visit(projection);
+}
+
+function isIncompleteOutcomeReceipt(row: CompletionEvidenceRow, all: readonly CompletionEvidenceRow[]): boolean {
+  if (isNonOutcomeEvidence(row)) return false;
+  if (!isSucceededReceipt(row)) return false;
+  if (row.contentComplete !== false) return false;
+  return !all.some((other) => projectionCompletesSource(row, other, all));
+}
+
+/**
+ * Deterministic evidence identity and completeness. Does not parse the
+ * objective for vendor or task names. A succeeded control/discovery call
+ * proves that search ran, not that the requested outcome exists.
+ * A retained_projection completes only the source result it projects.
+ * Partial work (an incomplete sibling receipt or a failed business attempt)
+ * keeps coverage.complete false.
+ */
+export function assessCompletionEvidenceCoverage(input: {
+  objective: string;
+  results?: CompletionEvidenceRow[] | null;
+}): {
+  outcomeEvidence: CompletionEvidenceRow[];
+  failedAttempts: CompletionEvidenceRow[];
+  incompleteReceipts: CompletionEvidenceRow[];
+  missingCoverage: boolean;
+  complete: boolean;
+} {
+  const results = input.results ?? [];
+  const outcomeEvidence = results.filter(isInspectableOutcomeEvidence);
+  const failedAttempts = results.filter(isFailedOutcomeAttempt);
+  const incompleteReceipts = results.filter((row) => isIncompleteOutcomeReceipt(row, results));
+  const missingCoverage = outcomeEvidence.length === 0;
+  return {
+    outcomeEvidence,
+    failedAttempts,
+    incompleteReceipts,
+    missingCoverage,
+    complete: outcomeEvidence.length > 0
+      && incompleteReceipts.length === 0
+      && failedAttempts.length === 0,
+  };
 }
 
 export type ObjectiveJudgeFn = (
@@ -971,21 +1151,118 @@ export async function judgeObjectiveComplete(
   if (!objective.trim() || !assistantResponse.trim()) {
     return { done: true, reason: 'insufficient text to judge — accepting completion' };
   }
+  // Connecting Jev is the owner opt-in: a confident typed verdict (~300ms)
+  // skips the 3–25s hedged chat-model judge. The configured judge remains the
+  // backstop when confidence is low, Jev times out, or the key is absent.
+  let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
+  /** Jev's own reading of THIS reply, kept past the try so the unreachable
+   *  path below can still use it. Without this it was computed, recorded as
+   *  telemetry, and thrown away at the one moment it was the only reviewer
+   *  left. */
+  let jevSaid: { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null = null;
+  try {
+    const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
+    const coverage = assessCompletionEvidenceCoverage({
+      objective,
+      results: skillContext?.verifiedReadResults,
+    });
+    const fast = await tryJevCompletionVerdict(objective, assistantResponse, {
+      sessionId: skillContext?.sessionId,
+      toolCallSummary: skillContext?.toolCallSummary,
+      verifiedReads: skillContext?.verifiedReads,
+      coverage: {
+        complete: coverage.complete,
+        outcomeEvidence: coverage.outcomeEvidence.map((row) => ({
+          toolName: row.toolName,
+          outcome: row.outcome,
+          contentComplete: row.contentComplete,
+        })),
+      },
+    });
+    const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
+    // Accept a Jev verdict only when coverage supports it. DONE without
+    // receipts is not completion; BLOCKED without a failed attempt is not a
+    // stop. INCOMPLETE is accepted only for missingCoverage; complete
+    // receipts never coerce INCOMPLETE to DONE from reply similarity.
+    const acceptJev = Boolean(fast) && (
+      (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
+      || (awaitingQuestion)
+      || (fast!.blocked === true && coverage.failedAttempts.length > 0)
+      || (!fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.missingCoverage)
+    );
+    if (fast) {
+      jevSaid = { done: fast.done,
+        ...(fast.reason ? { reason: fast.reason } : {}),
+        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+        ...(fast.blocked ? { blocked: true } : {}) };
+    }
+    jevAttempt = fast
+      ? {
+          accepted: acceptJev,
+          coverageComplete: coverage.complete,
+          ...(fast.choice ? { choice: fast.choice } : {}),
+          ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
+          ...(typeof fast.replyMatchesReceipts === 'number'
+            ? { replyMatchesReceipts: fast.replyMatchesReceipts }
+            : {}),
+        }
+      : undefined;
+    if (fast && acceptJev) {
+      return {
+        done: fast.done,
+        reason: fast.reason,
+        judgeModelId: fast.judgeModelId,
+        fast: true,
+        ...(jevAttempt ? { jevAttempt } : {}),
+        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+        ...(fast.blocked ? { blocked: true } : {}),
+        ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+      };
+    }
+  } catch { /* configured judge remains the backstop */ }
   const run = await runCompletionJudge(objective, assistantResponse, skillContext);
   if (!run.verdict) {
+    // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
+    //
+    // Live 2026-09-21, a BYO setup with no reachable checker: Clem said "I'll
+    // resolve that and turn it on, then run the first batch as the test",
+    // stopped, and attached "it stands unreviewed. The review model is not
+    // reachable with the current model setup." The owner got a promise and a
+    // dead end, and the only way forward was to nudge.
+    //
+    // Jev had already read that same reply. Its finding was computed and then
+    // discarded here in favour of done:true. So when the configured reviewer
+    // cannot run, a NOT-DONE finding from Jev now drives the ordinary bounded
+    // continuation — the harness does the work instead of describing it.
+    //
+    // One direction only: a Jev DONE still fails open below, because "the
+    // reviewer was unreachable" must never be delivered as "this was reviewed".
+    // failedOpen stays set, so nothing downstream claims a completed review.
+    if (jevSaid && !jevSaid.done && !jevSaid.awaitingUser) {
+      return {
+        done: false,
+        failedOpen: true,
+        reason: jevSaid.reason?.trim()
+          ? jevSaid.reason
+          : 'The configured completion reviewer could not be reached; the fast check found the objective unmet.',
+        ...(jevSaid.blocked ? { blocked: true } : {}),
+        ...(jevAttempt ? { jevAttempt } : {}),
+      };
+    }
     if (run.unavailableReason) return { done: true, failedOpen: true,
-      reason: run.unavailableReason };
+      reason: run.unavailableReason, ...(jevAttempt ? { jevAttempt } : {}) };
     const why =
       run.failure === 'timeout'
         ? 'The completion reviewer timed out; no review was completed.'
         : run.failure === 'invalid'
           ? 'The completion reviewer returned an unreadable verdict; no review was completed.'
           : 'The completion reviewer was unavailable; no review was completed.';
-    return { done: true, reason: why, failedOpen: true };
+    return { done: true, reason: why, failedOpen: true, ...(jevAttempt ? { jevAttempt } : {}) };
   }
   return {
     done: run.verdict.done,
     reason: run.verdict.reason,
+    ...(jevAttempt ? { jevAttempt } : {}),
     ...(run.verdict.repairScope ? { repairScope: run.verdict.repairScope } : {}),
     selfJudge: run.routing?.selfJudge === true,
     ...(run.routing?.ownerSelectedJudge ? { ownerSelectedJudge: true } : {}),

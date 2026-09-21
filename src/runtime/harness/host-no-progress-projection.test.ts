@@ -2704,3 +2704,102 @@ test('three reads of different content no longer exhaust the governor before a w
   }
   assert.equal(stopped, true, 'reading nothing new still exhausts the budget');
 });
+
+test('repeated identical-args local reads with unchanged retained bytes project identicalOutcome', () => {
+  const identity = accepted('identical-local-read');
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE logical_call_settlements (
+      logical_tool_call_id TEXT NOT NULL,
+      observer_call_id TEXT,
+      execution_kind TEXT NOT NULL,
+      outcome_kind TEXT NOT NULL,
+      recovery_action TEXT NOT NULL,
+      business_call INTEGER NOT NULL,
+      mutating INTEGER NOT NULL,
+      requires_reconciliation INTEGER NOT NULL,
+      physical_crossing_count INTEGER NOT NULL,
+      host_crossing_count INTEGER,
+      outcome_detail TEXT,
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL
+    );
+    CREATE TABLE logical_tool_calls (
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL,
+      logical_tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      argument_digest TEXT NOT NULL
+    );
+    CREATE TABLE tool_outputs (
+      session_id TEXT NOT NULL,
+      call_id TEXT NOT NULL,
+      output_full TEXT NOT NULL
+    );
+  `);
+  const digest = 'a'.repeat(64);
+  const retained = '{"roots":[]}';
+  const insertSettlement = db.prepare(`
+    INSERT INTO logical_call_settlements
+      (logical_tool_call_id, observer_call_id, execution_kind, outcome_kind,
+       recovery_action, business_call, mutating, requires_reconciliation,
+       physical_crossing_count, host_crossing_count, outcome_detail,
+       session_id, source_user_seq)
+    VALUES (?, ?, 'local_execution', 'succeeded', 'continue', 1, 0, 0, 0, 0, NULL, ?, ?)
+  `);
+  const insertCall = db.prepare(`
+    INSERT INTO logical_tool_calls
+      (session_id, source_user_seq, logical_tool_call_id, tool_name, argument_digest)
+    VALUES (?, ?, ?, 'read_file', ?)
+  `);
+  const insertOutput = db.prepare(`
+    INSERT INTO tool_outputs (session_id, call_id, output_full) VALUES (?, ?, ?)
+  `);
+  insertSettlement.run('call-local-read-1', 'call-local-read-1', identity.sessionId, identity.sourceUserSeq);
+  insertCall.run(identity.sessionId, identity.sourceUserSeq, 'call-local-read-1', digest);
+  insertOutput.run(identity.sessionId, 'call-local-read-1', retained);
+  const first = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-local-read-1', 'read_file', { path: '/tmp/retained-local-read.txt' }),
+      result('call-local-read-1', 'read_file', retained),
+    ],
+  }, db);
+  assert.equal(first.status, 'ok');
+  if (first.status === 'ok') {
+    assert.equal(first.attemptClass, 'task_work');
+    assert.equal(first.identicalOutcome, undefined);
+  }
+
+  insertSettlement.run('call-local-read-2', 'call-local-read-2', identity.sessionId, identity.sourceUserSeq);
+  insertCall.run(identity.sessionId, identity.sourceUserSeq, 'call-local-read-2', digest);
+  insertOutput.run(identity.sessionId, 'call-local-read-2', retained);
+
+  const repeated = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-local-read-2', 'read_file', { path: '/tmp/retained-local-read.txt' }),
+      result('call-local-read-2', 'read_file', retained),
+    ],
+  }, db);
+  assert.equal(repeated.status, 'ok');
+  if (repeated.status === 'ok') {
+    assert.equal(repeated.attemptClass, 'task_work');
+    assert.equal(repeated.identicalOutcome, true);
+  }
+
+  db.prepare(`UPDATE tool_outputs SET output_full = ? WHERE call_id = ?`).run('{"roots":["/tmp/other"]}', 'call-local-read-2');
+  const changed = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-local-read-2', 'read_file', { path: '/tmp/retained-local-read.txt' }),
+      result('call-local-read-2', 'read_file', '{"roots":["/tmp/other"]}'),
+    ],
+  }, db);
+  assert.equal(changed.status, 'ok');
+  if (changed.status === 'ok') {
+    assert.equal(changed.attemptClass, 'task_work');
+    assert.equal(changed.identicalOutcome, undefined, 'changing retained bytes are a poll, not a stall');
+  }
+  db.close();
+});

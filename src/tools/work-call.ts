@@ -1269,6 +1269,49 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
   disclosedOperations?: readonly HostCapabilityDescriptorV1[];
 }
 
+/** Present disclosed local and resolved-provider operations as callable work_call rows. */
+export function disclosedWorkCallReadyOperations(
+  descriptors: readonly HostCapabilityDescriptorV1[],
+): Array<{
+  name: string;
+  capability_selector: string;
+  tool_slug?: string;
+  effect: HostCapabilityDescriptorV1['effect'];
+  purpose: string;
+  deliverableKind?: string;
+  destinationPostures?: Array<'create_new' | 'named_existing'>;
+}> {
+  return descriptors.flatMap((entry) => {
+    const local = /^cap:local:([^:]+):/.exec(entry.id);
+    if (local) {
+      return [{
+        name: local[1]!,
+        capability_selector: entry.id,
+        effect: entry.effect,
+        purpose: entry.purpose,
+        deliverableKind: entry.deliverableKind,
+        destinationPostures: [
+          ...(entry.destinationPosture ? [entry.destinationPosture] : []),
+          ...(entry.destinationPostures ?? []),
+        ],
+      }];
+    }
+    const resolved = /^cap:resolved:([^:]+)/.exec(entry.id);
+    if (!resolved) return [];
+    const slug = resolved[1]!.split(':')[0]!.toUpperCase();
+    if (!slug) return [];
+    return [{
+      name: 'composio_execute_tool',
+      capability_selector: entry.id,
+      tool_slug: slug,
+      effect: entry.effect,
+      purpose: entry.purpose,
+      deliverableKind: entry.deliverableKind,
+      destinationPostures: [],
+    }];
+  });
+}
+
 export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeContextValue> {
   const {
     settlementLane = 'agents_runner',
@@ -1966,27 +2009,13 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       // explicit desktop/mobile Plan and exact Execute are unchanged.
       ...(disclosedOperations && disclosedOperations.length > 0
         ? (() => {
-            const ready = disclosedOperations.flatMap((entry) => {
-              // Local registry refs are `cap:local:<callable name>:<variant>`.
-              const match = /^cap:local:([^:]+):/.exec(entry.id);
-              return match
-                ? [{
-                    name: match[1]!,
-                    capability_selector: entry.id,
-                    effect: entry.effect,
-                    purpose: entry.purpose,
-                    deliverableKind: entry.deliverableKind,
-                    destinationPostures: [
-                      ...(entry.destinationPosture ? [entry.destinationPosture] : []),
-                      ...(entry.destinationPostures ?? []),
-                    ],
-                  }]
-                : [];
-            });
+            const ready = disclosedWorkCallReadyOperations(disclosedOperations);
             if (ready.length === 0) return [];
-            return [
-              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
-              `Invocation shape for a direct call: ${JSON.stringify({
+            const hasLocal = ready.some((row) => row.capability_selector.startsWith('cap:local:'));
+            const hasResolved = ready.some((row) => row.capability_selector.startsWith('cap:resolved:'));
+            const shapes: unknown[] = [];
+            if (hasLocal) {
+              shapes.push({
                 requirement_id: 'cap:local:<name>:<variant>',
                 name: '<name>',
                 args_json: '{"<arg>":"<value>"}',
@@ -1995,7 +2024,23 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
                 seal_amendment: null,
                 source_call_ids: null,
                 source_record_ids: null,
-              })}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
+              });
+            }
+            if (hasResolved) {
+              shapes.push({
+                requirement_id: 'cap:resolved:<operation>',
+                name: 'composio_execute_tool',
+                args_json: '{"tool_slug":"<OPERATION>","arguments":{"<argument>":"<value>"}}',
+                universe_item_id: null,
+                universe_selector: null,
+                seal_amendment: null,
+                source_call_ids: null,
+                source_record_ids: null,
+              });
+            }
+            return [
+              `Operations already disclosed for this request and callable here now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
+              `Invocation shape for a direct call: ${JSON.stringify(shapes.length === 1 ? shapes[0] : shapes)}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
               'Use the exact argument schema already provided. If it is missing, call tool_search with the exact operation name before invoking. Do not guess argument names and learn them from a refusal.',
               'Ordinary native work, including contextual reads, one authorized reversible write and its readback, may proceed directly through these operations without plan_task. Planning stays required for coordinated business dependencies, each/set, admin, destructive or unknown-effect work, and the explicit desktop/mobile Plan review path is unchanged.',
             ];

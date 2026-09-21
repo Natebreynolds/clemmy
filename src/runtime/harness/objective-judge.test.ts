@@ -4,10 +4,16 @@
  * Pure + fail-open behavior of the objective judge. The live model call is
  * NOT unit-tested (covered via the loop's injected judgeFn tests).
  */
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
+const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict, assessCompletionEvidenceCoverage } = await import('./objective-judge.js');
+const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../jev/client.js');
+
+afterEach(() => {
+  _setTypesafeKeyForTests(undefined);
+  _setSystemOneFetchForTests(undefined);
+});
 
 test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
   assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
@@ -55,6 +61,27 @@ const baseGate = {
 
 test('gate: fires for an explicit ACTION intent without meaningful evidence', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true }), true);
+});
+
+test('gate: a promised lookup on a deictic conversation turn does not start completion review', () => {
+  // The exemption is the CONVERSATION, not the absence of action intent. Left
+  // as "actionIntent: false" alone it also swallowed a real lookup whose reply
+  // deferred the lookup, which is the one turn the promise branch exists for.
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate, actionIntent: false, conversationalIntent: true, promiseShaped: true,
+  }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, promiseShaped: true }), true);
+});
+
+test('gate: a promise that defers a LOOKUP is still reviewed', () => {
+  // "Read the current harness status and report it." -> "I will read the
+  // status." Intent is lookup, so actionIntent is false and nothing has been
+  // called yet; the owner must not have to nudge for the read.
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate, actionIntent: false, conversationalIntent: false, promiseShaped: true,
+  }), true);
+  // Unset is the same as false: a caller that does not know the intent keeps the review.
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, promiseShaped: true }), true);
 });
 
 test('gate: skips concrete successful tool-backed completions instead of re-running work', () => {
@@ -259,6 +286,348 @@ test('judgeObjectiveComplete fails OPEN (done:true) when there is no response te
 test('judgeObjectiveComplete fails OPEN when the objective is empty', async () => {
   const v = await judgeObjectiveComplete('', 'some response');
   assert.equal(v.done, true);
+});
+
+test('judgeObjectiveComplete uses a confident Jev verdict and skips the chat-model judge', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'done',
+          probabilities: { done: 0.91, incomplete: 0.09 },
+          confidence: 0.88,
+        },
+        matches: { type: 'noul', noul: 0.9 },
+      },
+      usage: { input_tokens: 36, output_tokens: 4 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'Create /tmp/jev.txt containing JEV_OK',
+    'Created /tmp/jev.txt with exactly JEV_OK plus one newline.',
+    {
+      sessionId: 'probe-jev-complete',
+      skills: [],
+      toolCallSummary: 'write_file succeeded',
+      verifiedReadResults: [
+        { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      ],
+    },
+  );
+  assert.equal(v.done, true);
+  assert.equal(v.judgeModelId, 'jev-1.13.0');
+  assert.equal(v.failedOpen, undefined);
+});
+
+test('evidence coverage uses registry role and completeness, not vendor names', () => {
+  const empty = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [],
+  });
+  assert.equal(empty.missingCoverage, true);
+  assert.equal(empty.complete, false);
+
+  const discoveryOnly = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'tool_search', outcome: 'succeeded', contentDisposition: 'discovery_navigation', contentComplete: false },
+    ],
+  });
+  assert.equal(discoveryOnly.missingCoverage, true);
+  assert.equal(discoveryOnly.complete, false);
+
+  const renamedCapability = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record',
+    results: [
+      { toolName: 'acme_record_lookup', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+    ],
+  });
+  assert.equal(renamedCapability.complete, true, 'unfamiliar business names still count as outcome evidence');
+
+  const executionWithoutOutcome = assessCompletionEvidenceCoverage({
+    objective: 'write the fixture',
+    results: [
+      { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result' },
+    ],
+  });
+  assert.equal(executionWithoutOutcome.complete, false, 'a succeeded call with an incomplete receipt is not outcome coverage');
+  assert.equal(executionWithoutOutcome.incompleteReceipts.length, 1);
+
+  const pagedSameCall = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'tool_search', outcome: 'succeeded', contentDisposition: 'discovery_navigation', contentComplete: false },
+      { toolName: 'calendar_list_view', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', logicalToolCallId: 'call-a', resultHandleId: 'rh_a', physicalDispatchId: 'disp-a' },
+      { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'retained_projection', logicalToolCallId: 'query-a', sourceLogicalToolCallId: 'call-a', sourceResultHandleId: 'rh_a', sourcePhysicalDispatchId: 'disp-a' },
+    ],
+  });
+  assert.equal(pagedSameCall.complete, true, 'a complete projection of the same call covers that truncated source');
+  assert.equal(pagedSameCall.missingCoverage, false);
+  assert.equal(pagedSameCall.incompleteReceipts.length, 0);
+
+  const pagedDifferentCall = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'calendar_list_view', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', logicalToolCallId: 'call-a', resultHandleId: 'rh_a' },
+      { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'retained_projection', logicalToolCallId: 'query-b', sourceLogicalToolCallId: 'call-b', sourceResultHandleId: 'rh_b' },
+    ],
+  });
+  assert.equal(pagedDifferentCall.complete, false, 'a projection of a different call does not complete this source');
+  assert.equal(pagedDifferentCall.incompleteReceipts.length, 1);
+
+  const pagedUnlinkedProjection = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'calendar_list_view', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result' },
+      { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'retained_projection' },
+    ],
+  });
+  assert.equal(pagedUnlinkedProjection.complete, false, 'an unlinked projection does not complete an incomplete source');
+  assert.equal(pagedUnlinkedProjection.incompleteReceipts.length, 1);
+
+  const twoDeliverablesOneProjection = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'record_lookup', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', logicalToolCallId: 'call-a' },
+      { toolName: 'window_lookup', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', logicalToolCallId: 'call-b' },
+      { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'retained_projection', logicalToolCallId: 'query-a', sourceLogicalToolCallId: 'call-a' },
+    ],
+  });
+  assert.equal(twoDeliverablesOneProjection.complete, false, 'one of two deliverables remaining is not complete');
+  assert.equal(twoDeliverablesOneProjection.incompleteReceipts.length, 1);
+
+  const twoDeliverablesOneFailed = assessCompletionEvidenceCoverage({
+    objective: 'look up the named record and its window',
+    results: [
+      { toolName: 'record_lookup', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result', logicalToolCallId: 'call-a' },
+      { toolName: 'window_lookup', outcome: 'failed', evidenceKind: 'source_result', logicalToolCallId: 'call-b' },
+    ],
+  });
+  assert.equal(twoDeliverablesOneFailed.complete, false, 'a failed sibling deliverable keeps coverage incomplete');
+  assert.equal(twoDeliverablesOneFailed.failedAttempts.length, 1);
+});
+
+test('Jev DONE after discovery-only execution is not accepted as completion', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'done',
+          probabilities: { done: 0.9, incomplete: 0.1 },
+          confidence: 0.84,
+        },
+      },
+      usage: { input_tokens: 20, output_tokens: 2 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'look up the named record',
+    'Found it.',
+    {
+      sessionId: 'probe',
+      skills: [],
+      verifiedReadResults: [
+        { toolName: 'tool_search', outcome: 'succeeded', contentDisposition: 'discovery_navigation', contentComplete: false },
+      ],
+    },
+  );
+  assert.notEqual(v.judgeModelId, 'jev-1.13.0');
+});
+
+test('judgeObjectiveComplete keeps a Jev incomplete verdict when there are no verified reads', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'incomplete',
+          probabilities: { incomplete: 0.8, done: 0.2 },
+          confidence: 0.84,
+        },
+      },
+      usage: { input_tokens: 36, output_tokens: 4 },
+    }),
+  }));
+  const empty = await judgeObjectiveComplete(
+    'find tim in salesforce and tell me if he is on my calendar this week',
+    'Tim Demik is in Salesforce and on the calendar.',
+    { sessionId: 'probe', skills: [], toolCallSummary: 'none' },
+  );
+  assert.equal(empty.judgeModelId, 'jev-1.13.0');
+  assert.equal(empty.done, false);
+});
+
+test('an unreachable reviewer plus a Jev NOT-DONE finding continues instead of delivering the promise', async () => {
+  // Live 2026-09-21, a BYO setup with no reachable checker: Clem replied "I'll
+  // resolve that and turn it on, then run the first batch as the test", stopped,
+  // and attached "it stands unreviewed". Jev had already read that reply and
+  // found the objective unmet; the verdict was discarded in favour of done:true,
+  // so the promise WAS the answer and the owner had to nudge.
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: { type: 'choice', choice: 'incomplete', probabilities: { incomplete: 0.86, done: 0.14 }, confidence: 0.85 },
+        // Jev's own 'matches' criterion for false is "or only promises the work".
+        matches: { type: 'noul', noul: 0.08 },
+      },
+      usage: { input_tokens: 30, output_tokens: 4 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'Turn the workflow on and run the first batch as the test.',
+    "I'll resolve that and turn it on, then run the first batch as the test.",
+    {
+      sessionId: 'probe-unreachable-reviewer',
+      skills: [],
+      toolCallSummary: 'tool_search succeeded',
+      // Coverage is COMPLETE, so the strict acceptJev rules reject this
+      // incomplete verdict and the configured reviewer is the only lane left.
+      verifiedReadResults: [
+        { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      ],
+    },
+  );
+  // The reviewer could not run, so nothing may claim a completed review...
+  assert.equal(v.failedOpen, true);
+  // ...but a promise is not a result: the turn continues rather than settling.
+  assert.equal(v.done, false);
+  assert.ok((v.reason ?? '').trim().length > 0, 'the continuation carries a reason');
+});
+
+test('Jev incomplete after a paged read is not coerced to done from reply similarity', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'incomplete',
+          probabilities: { incomplete: 0.88, done: 0.12 },
+          confidence: 0.88,
+        },
+        matches: { type: 'noul', noul: 0.79 },
+      },
+      usage: { input_tokens: 40, output_tokens: 6 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'look up the named record and its window',
+    'The named record is present in the verified window.',
+    {
+      sessionId: 'probe-paged-read',
+      skills: [],
+      verifiedReadResults: [
+        { toolName: 'tool_search', outcome: 'succeeded', contentDisposition: 'discovery_navigation', contentComplete: false },
+        { toolName: 'calendar_list_view', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', logicalToolCallId: 'call-a' },
+        { toolName: 'tool_output_query', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'retained_projection', logicalToolCallId: 'query-a', sourceLogicalToolCallId: 'call-a' },
+      ],
+    },
+  );
+  assert.equal(v.jevAttempt?.coverageComplete, true);
+  assert.equal(v.jevAttempt?.accepted, false);
+  assert.equal(v.jevAttempt?.replyMatchesReceipts, 0.79);
+  assert.notEqual(v.fast, true);
+  assert.notEqual(v.judgeModelId, 'jev-1.13.0');
+  assert.notEqual(v.reason, 'Jev found the response reports the verified receipts.');
+});
+
+test('Jev incomplete with complete receipts falls through; reply similarity does not force done', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'incomplete',
+          probabilities: { incomplete: 0.7, done: 0.3 },
+          confidence: 0.84,
+        },
+        matches: { type: 'noul', noul: 0.82 },
+      },
+      usage: { input_tokens: 40, output_tokens: 6 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'Create /tmp/jev.txt containing JEV_OK',
+    'Created /tmp/jev.txt with exactly JEV_OK.',
+    {
+      sessionId: 'probe-jev-match',
+      skills: [],
+      verifiedReadResults: [
+        { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      ],
+    },
+  );
+  assert.equal(v.jevAttempt?.accepted, false);
+  assert.equal(v.jevAttempt?.coverageComplete, true);
+  assert.equal(v.jevAttempt?.replyMatchesReceipts, 0.82);
+  assert.notEqual(v.fast, true);
+  assert.notEqual(v.judgeModelId, 'jev-1.13.0');
+  assert.notEqual(v.reason, 'Jev found the response reports the verified receipts.');
+});
+
+test('judgeObjectiveComplete still uses Jev when a captured judge selection is present', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'done',
+          probabilities: { done: 0.9, incomplete: 0.1 },
+          confidence: 0.84,
+        },
+        matches: { type: 'noul', noul: 0.9 },
+      },
+      usage: { input_tokens: 36, output_tokens: 4 },
+    }),
+  }));
+  const v = await judgeObjectiveComplete(
+    'Create /tmp/jev.txt containing JEV_OK',
+    'Created /tmp/jev.txt with exactly JEV_OK plus one newline.',
+    {
+      sessionId: 'probe-jev-complete',
+      skills: [],
+      toolCallSummary: 'write_file succeeded',
+      verifiedReadResults: [
+        { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      ],
+      boundaryJudgeSelection: {
+        status: 'captured',
+        role: { modelId: 'grok-4.3', provider: 'byo', source: 'settings' },
+        crossFamily: true,
+        defaultModels: { claude: 'claude-haiku-4-5', codex: 'gpt-5-mini' },
+      },
+    },
+  );
+  assert.equal(v.judgeModelId, 'jev-1.13.0');
 });
 
 test('buildObjectiveJudgePrompt frames retained skills as references applicable to the accepted objective', async () => {

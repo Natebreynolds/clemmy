@@ -2,12 +2,32 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   assessAutoMemoryAdmission,
+  captureInteractionSignals,
   explicitMemoryInstructionFor,
   extractAutoMemoryCandidates,
   extractProfilePatchFromMessage,
   isEligibleAutoCaptureSourceProvenance,
   parseExplicitMemoryInstruction,
 } from './auto-capture.js';
+
+test('a self-contained computation is not queued as an owner statement', () => {
+  const captured = captureInteractionSignals({
+    message: 'What is 12 times 12? Reply with the number only.',
+    sessionId: 'sess-1',
+    sourceEventId: 'user-source:7',
+    sourceProvenance: {
+      authority: 'accepted_user_input',
+      sessionId: 'sess-1',
+      eventId: 'evt-1',
+      seq: 7,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'What is 12 times 12? Reply with the number only.' },
+    },
+  });
+  assert.equal(captured.candidates.length, 0);
+  assert.equal(captured.queuedCandidateIds?.length ?? 0, 0);
+});
 
 test('accepted-source provenance admits a mid-run steer note only under its own source-event identity', () => {
   const steer = {

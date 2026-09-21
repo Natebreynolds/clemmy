@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 
 const {
   getRunStrategyLearningStats,
+  listMatchingRunStrategies,
   recordRunStrategy,
   renderRunStrategiesForContext,
   strategyKeywords,
@@ -54,6 +55,9 @@ test('record + recall: a similar objective recalls the proven shape, unrelated d
   assert.match(hit, /~11 min/);
   assert.equal(renderRunStrategiesForContext('compose a birthday song for grandma'), '', 'unrelated objective renders nothing');
   assert.equal(renderRunStrategiesForContext(''), '', 'empty objective renders nothing');
+  const listed = listMatchingRunStrategies('research personal injury law firms comparison');
+  assert.ok(listed.length >= 1);
+  assert.ok(listed[0]!.strategy.toolsUsed.includes('run_worker'));
 });
 
 test('near-duplicate objectives accumulate evidence instead of new rows', () => {

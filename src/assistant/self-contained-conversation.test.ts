@@ -73,6 +73,16 @@ test('arithmetic stays cheap', () => {
   }
 });
 
+test('an answer-shape sentence after arithmetic stays cheap', () => {
+  assert.equal(cheap('What is 12 times 12? Reply with the number only.'), true);
+  assert.equal(isSelfContainedComputation('What is 12 times 12? Reply with the number only.'), true);
+});
+
+test('a second sentence that opens retrieval is not cheap', () => {
+  assert.equal(cheap('What is 12 times 12? Check salesforce.'), false);
+  assert.equal(cheap('What is 12 times 12? Email it to me.'), false);
+});
+
 test('arithmetic is identified positively, not by what it lacks', () => {
   assert.equal(isSelfContainedComputation('2x3'), true);
   assert.equal(isSelfContainedComputation('15% of 80'), true);

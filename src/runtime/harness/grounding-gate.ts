@@ -44,7 +44,7 @@ import {
   claimApprovedResendConsent,
   hasApprovedResendConsent,
 } from './approval-registry.js';
-import { searchToolOutputs, resolveToolOutputEvidenceExcerptsForAuthority } from './eventlog.js';
+import { appendEvent, searchToolOutputs, resolveToolOutputEvidenceExcerptsForAuthority } from './eventlog.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config + pure classification
@@ -735,16 +735,39 @@ export async function evaluateGrounding(
     return { action: 'allow', reason: 'no session artifacts mention this target — nothing to verify against', targets, sourceCallIds: [] };
   }
   const payload = renderPayloadForJudge(toolName, rawArgs);
+  const sourceCallIds = sources.map((s) => s.callId);
+  // Shadow Jev on this gate. A Jev throw or failed dynamic import must not
+  // open an irreversible write while the configured judge can still run.
+  // Jev is not authoritative here until agreement is measured on live traffic.
+  const jevShadow = shadowJevGrounding(payload, sources, sessionId);
   let verdict: GroundingVerdict;
   try {
     verdict = await (judgeOverride ?? runGroundingJudge)(payload, sources);
   } catch {
-    return { action: 'allow', reason: 'grounding judge unavailable — fail open', targets, sourceCallIds: sources.map((s) => s.callId) };
+    return { action: 'allow', reason: 'grounding judge unavailable — fail open', targets, sourceCallIds };
+  }
+  const shadow = await jevShadow;
+  if (shadow) {
+    try {
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'jev_grounding_shadow',
+          jevGrounded: shadow.grounded,
+          judgeGrounded: verdict.grounded,
+          agree: shadow.grounded === verdict.grounded,
+          jevModel: shadow.model,
+        },
+      });
+    } catch { /* shadow telemetry never blocks the write */ }
   }
   const targetKey = `${sessionId}::${targets[0]}`;
   if (verdict.grounded) {
     failureCounts.delete(targetKey);
-    return { action: 'allow', reason: verdict.reason, targets, sourceCallIds: sources.map((s) => s.callId) };
+    return { action: 'allow', reason: verdict.reason, targets, sourceCallIds };
   }
   const failures = (failureCounts.get(targetKey) ?? 0) + 1;
   failureCounts.set(targetKey, failures);
@@ -752,9 +775,24 @@ export async function evaluateGrounding(
     action: 'block',
     reason: verdict.reason,
     targets,
-    sourceCallIds: sources.map((s) => s.callId),
+    sourceCallIds,
     failureCount: failures,
   };
+}
+
+async function shadowJevGrounding(
+  payload: string,
+  sources: GroundingSource[],
+  sessionId: string,
+): Promise<{ grounded: boolean; model?: string } | null> {
+  try {
+    const { tryJevGroundingVerdict } = await import('../jev/control-plane.js');
+    const jevVerdict = await tryJevGroundingVerdict(payload, sources, { sessionId, recordMetric: false });
+    if (!jevVerdict) return null;
+    return { grounded: jevVerdict.grounded, model: jevVerdict.model };
+  } catch {
+    return null;
+  }
 }
 
 /**

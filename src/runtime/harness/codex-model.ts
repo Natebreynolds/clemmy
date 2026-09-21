@@ -511,6 +511,7 @@ export class CodexResponsesModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     for (let attempt = 0; attempt <= CODEX_TRANSPARENT_MAX_RETRIES; attempt++) {
       const events: AnyCodexEvent[] = [];
+      const startedAt = Date.now();
       try {
         for await (const evt of this.streamCodex(request)) {
           events.push(evt);
@@ -524,7 +525,7 @@ export class CodexResponsesModel implements Model {
         }
         const response = assembleModelResponse(events);
         const completed = events.find((e) => e.type === 'response.completed' || e.type === 'response.done');
-        recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId);
+        recordCodexHarnessUsage(completed?.response?.usage, this.modelId, response.responseId, Date.now() - startedAt);
         return response;
       } catch (err) {
         const yieldedRealContent = events.some(isRealContentCodexEvent);
@@ -562,6 +563,7 @@ export class CodexResponsesModel implements Model {
       const seenOutputItems: CodexOutputItem[] = [];
       let responseId: string | undefined;
       let completedEvent: AnyCodexEvent | undefined;
+      const startedAt = Date.now();
       const diag: StreamDiagnostics = {};
       lastDiag = diag;
       // Retry-safety gate: ONLY text deltas + output_item.done count as
@@ -679,7 +681,7 @@ export class CodexResponsesModel implements Model {
         // details fields). Mirror the OpenAIResponsesModel's streaming
         // shape: snake_case detail spreads, camelCase token counts.
         const u = completedEvent?.response?.usage ?? {};
-        recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id);
+        recordCodexHarnessUsage(u, this.modelId, responseId ?? completedEvent?.response?.id, Date.now() - startedAt);
         // Proven-acceptance learning: a request the provider ACCEPTED at more
         // input than we believed raises the window floor (writes only when it
         // beats the current belief — steady-state cost is zero).
@@ -1806,6 +1808,7 @@ export function recordCodexHarnessUsage(
   usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number; input_tokens_details?: Record<string, unknown>; output_tokens_details?: Record<string, unknown> } | undefined,
   modelId: string,
   responseId?: string,
+  durationMs?: number,
 ): void {
   try {
     if (!usage) return;
@@ -1832,6 +1835,7 @@ export function recordCodexHarnessUsage(
       totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens,
       responseId,
       promptComponents: harnessContext?.promptComponents,
+      ...(typeof durationMs === 'number' && durationMs >= 0 ? { durationMs } : {}),
     });
   } catch { /* fail-silent */ }
 }

@@ -55,6 +55,18 @@ export type MessageIntent =
   | 'meta_clarify'  // questions about the agent itself / how to use it
   | 'tool_intent';  // default — needs tools, but not necessarily multi-step
 
+/**
+ * Did the turn ask for no tool work at all? Reads the union's own two
+ * no-work members rather than inferring conversation from the ABSENCE of
+ * action — the error this file's own selfContainedConversation docstring
+ * warns about ("absence of a recognised referent is not evidence of
+ * self-containment"). A lookup is a request; a greeting and a deictic aside
+ * are not.
+ */
+export function intentRequestsNoToolWork(intent: MessageIntent): boolean {
+  return intent === 'casual' || intent === 'conversation';
+}
+
 export interface IntentClassification {
   intent: MessageIntent;
   confidence: number; // 0..1
@@ -309,6 +321,27 @@ const CURRENT_ENVIRONMENT_QUESTION_RE =
  *  operator list and it is not enough on its own to open the factory. */
 const DISCOURSE_REFERENT_RE = /\b(?:they|them|their|theirs|these|those)\b/i;
 
+/** Closed-class English demonstratives. Same structural family as they/them. */
+const DEMONSTRATIVE_WORDS = new Set(['that', 'this', 'it', 'those', 'these', 'them', 'they']);
+const ANAPHOR_FUNCTION_WORDS = new Set([
+  'please', 'kindly', 'can', 'could', 'would', 'will', 'you', 'i', 'we', 'me', 'my',
+  'for', 'to', 'the', 'a', 'an', 'up', 'and', 'or',
+]);
+
+/**
+ * The sentence's object is only a demonstrative (this/that/it). No named
+ * noun remains after function words. Verb identity is not consulted.
+ */
+export function isBareDeicticFollowUp(text: string): boolean {
+  const tokens = text.trim().toLowerCase().replace(/[\u2018\u2019\u201B]/g, "'")
+    .replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const content = tokens.filter((token) => !ANAPHOR_FUNCTION_WORDS.has(token));
+  if (content.length === 0) return false;
+  const demonstratives = content.filter((token) => DEMONSTRATIVE_WORDS.has(token));
+  const named = content.filter((token) => !DEMONSTRATIVE_WORDS.has(token));
+  return demonstratives.length >= 1 && named.length <= 1;
+}
+
 export interface ClassifyMessageIntentOptions {
   /** This session already compiled a retrieve/act (the user's hosted world
    *  is open). A closed-world-looking question that still points at that
@@ -343,7 +376,14 @@ const COMPUTATION_WORDS: ReadonlySet<string> = new Set([
   'sqrt', 'to', 'the', 'power', 'and', 'x',
 ]);
 
-export function isSelfContainedComputation(text: string): boolean {
+function splitSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])(?:\s+|$)/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isArithmeticSentence(text: string): boolean {
   const body = text.trim().replace(/\?+$/, '').replace(COMPUTATION_FRAME_RE, '').trim();
   if (!body || !/\d/.test(body)) return false;
   return body.split(/\s+/).every((raw) => {
@@ -352,6 +392,26 @@ export function isSelfContainedComputation(text: string): boolean {
     if (/^[0-9+\-*/x×÷^%().]+$/.test(token)) return true;
     return COMPUTATION_WORDS.has(token);
   });
+}
+
+/** Extra sentences may constrain answer shape. They may not open retrieval or an effect. */
+function sentenceRequestsExternalWork(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (refersToUserOrHostedWorld(trimmed)) return true;
+  if (CURRENT_ENVIRONMENT_QUESTION_RE.test(trimmed)) return true;
+  const stripped = trimmed.replace(/^(?:please|kindly)\s+/i, '');
+  if (READ_ONLY_OPERATION_START_RE.test(stripped)) return true;
+  if (DURABLE_OR_TOOL_BEARING_TARGET_RE.test(trimmed)) return true;
+  if (CURRENT_WORLD_MATERIAL_RE.test(trimmed)) return true;
+  return false;
+}
+
+export function isSelfContainedComputation(text: string): boolean {
+  const sentences = splitSentences(text.trim());
+  if (sentences.length === 0) return false;
+  if (!sentences.some(isArithmeticSentence)) return false;
+  return sentences.every((sentence) => isArithmeticSentence(sentence) || !sentenceRequestsExternalWork(sentence));
 }
 
 /**

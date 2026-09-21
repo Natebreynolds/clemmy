@@ -380,6 +380,7 @@ test('a recalled page is shown whole, as the answerer received it, while its ove
   const recalled = evidence.results.find((row) => row.toolName === 'recall_tool_result');
   assert.equal(source?.viewBounded, true);
   assert.equal(recalled?.evidenceKind, 'retained_projection');
+  assert.equal(recalled?.sourceLogicalToolCallId, source?.logicalToolCallId);
   assert.equal(recalled?.contentComplete, true);
   assert.equal(recalled?.viewBounded, undefined);
   assert.ok(evidence.summary.includes(page), 'the recalled page reaches the judge whole');

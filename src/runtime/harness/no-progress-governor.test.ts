@@ -349,6 +349,40 @@ test('task work and terminal projection never spend the no-progress retry', () =
   assert.equal(terminal.state.noProgressAttempts, 0);
 });
 
+test('unmetered task work with an identical retained outcome cannot continue indefinitely', () => {
+  const held = snapshot({ evidence: ['evidence:read:one'] });
+  const initial = initializeNoProgressGovernor({
+    taskKey: 'accepted:identical-outcome',
+    authority: held,
+  });
+  const first = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'task_work',
+    authority: held,
+  });
+  assert.equal(first.reason, 'unmetered_attempt');
+  assert.equal(first.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
+
+  let cursor = first;
+  for (let index = 0; index < NO_PROGRESS_RETRY_BUDGET; index += 1) {
+    cursor = observeNoProgress(cursor.state, {
+      taskKey: initial.taskKey,
+      attemptClass: 'task_work',
+      authority: held,
+      identicalOutcome: true,
+    });
+    assert.equal(cursor.action, 'continue');
+    assert.equal(cursor.reason, 'retry_available');
+  }
+  const terminal = observeNoProgress(cursor.state, {
+    taskKey: initial.taskKey,
+    attemptClass: 'task_work',
+    authority: held,
+    identicalOutcome: true,
+  });
+  assert.equal(terminal.action, 'terminalize');
+});
+
 test('task work still resets a previously spent retry when it earns evidence', () => {
   const initial = initializeNoProgressGovernor({
     taskKey: 'accepted:work-progress',

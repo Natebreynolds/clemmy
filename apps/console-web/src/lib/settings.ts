@@ -113,7 +113,22 @@ export interface SettingsSnapshot {
   judgeMetrics?: JudgeMetricsSnapshot;
   /** Whether the desktop Developer panel is revealed (CLEMMY_DEV_MODE=on). */
   developerMode?: boolean;
+  jev?: JevStatus;
 }
+
+export interface JevStatus {
+  configured: boolean;
+  enabled: boolean;
+  model: string;
+  endpoint: string;
+  keySource: 'vault' | 'env' | 'override' | 'missing';
+  warning?: string;
+}
+export const getJevStatus = () => apiGet<JevStatus>('/api/console/jev');
+export const connectJev = (apiKey: string) =>
+  api<JevStatus>('/api/console/jev', { method: 'POST', body: JSON.stringify({ apiKey }) });
+export const disconnectJev = () =>
+  api<JevStatus>('/api/console/jev', { method: 'DELETE' });
 
 // Developer feature-flags panel: a curated view over the CLEMMY_* kill-switches,
 // flippable at runtime (live + persisted, no restart). `value` is the effective
@@ -302,6 +317,7 @@ export interface JudgeMetricLaneSnapshot {
   errors: number;
   avgMs: number;
   maxMs: number;
+  fastDecisions?: number;
   lastOutcome?: JudgeMetricOutcome;
   lastDurationMs?: number;
   lastModelId?: string;

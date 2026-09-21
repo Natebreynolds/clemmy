@@ -641,6 +641,8 @@ export const EVENT_TYPES = [
   // settings change cannot relabel an already-running task.
   'completion_policy_captured',
   'completion_review_skipped',
+  'run_strategy_learned',
+  'proven_operation_selected',
   // The scope one accepted source froze for its mutations. Read back by the
   // consent boundary so a later call cannot widen the job by proposing more.
   'accepted_mutation_scope',
@@ -8055,8 +8057,16 @@ function carrierMirrorInvocationOutput(
     || authorityEventString(occurrence.call, 'accounting') !== 'top_level'
   ) return null;
   const carrierRows = rows.filter((row) => row.tool === occurrence.tool);
-  const innerRows = rows.filter((row) => row.tool === effectiveTool);
+  let innerRows = rows.filter((row) => row.tool === effectiveTool);
+  // Live 2026-09-21 source 272188: work_call stores effectiveTool as the
+  // operation (OUTLOOK_GET_CALENDAR_VIEW) while the transport-mirror
+  // invocation is composio_execute_tool. That is still one carrier dispatch.
+  if (innerRows.length !== 1 && carrierRows.length === 1) {
+    const gateway = rows.filter((row) => row.tool === 'composio_execute_tool');
+    if (gateway.length === 1) innerRows = gateway;
+  }
   if (carrierRows.length !== 1 || innerRows.length !== 1) return null;
+  const innerTool = innerRows[0]!.tool;
   const mirrors = (db.prepare(`
     SELECT seq, id, session_id, turn, role, type, parent_event_id, data_json, created_at
       FROM events
@@ -8065,7 +8075,8 @@ function carrierMirrorInvocationOutput(
        AND json_extract(data_json, '$.callId') = ?
   `).all(sessionId, callId) as RawEventRow[]).map((row) => rowToEvent(row))
     .filter((event) => authorityEventString(event, 'accounting') === 'transport_mirror'
-      && authorityEventString(event, 'tool') === effectiveTool);
+      && (authorityEventString(event, 'tool') === effectiveTool
+        || authorityEventString(event, 'tool') === innerTool));
   const mirrorCalls = mirrors.filter((event) => event.type === 'tool_called');
   const mirrorReturns = mirrors.filter((event) => event.type === 'tool_returned');
   if (mirrorCalls.length !== 1 || mirrorReturns.length !== 1) return null;

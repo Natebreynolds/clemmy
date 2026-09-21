@@ -57,6 +57,7 @@ import {
 import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-manifest.js';
 import { constrainNeedsInputPresentationForRecovery } from './recovery-presentation-truth.js';
 import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
+import { learnHostRunStrategyForAcceptedTask } from './host-run-strategy-learning.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
 import { getPlanRevisionForSource } from './plan-artifacts.js';
@@ -1435,10 +1436,14 @@ export function commitTurnOutcome(
         + 'has confirmed the result. Ask me to check it.',
       completion_review_failed_open:
         'Verification note: I could not get this result independently reviewed, so it stands unreviewed. '
-        + 'The review model is not reachable with the current model setup; the console has the details.',
+        + 'The review model is not reachable with the current model setup. Ask me to re-check it, '
+        + 'or choose a reachable review model in your model settings.',
       completion_review_negative:
-        'Verification note: the completion review found this did not meet the request. Ask '
-        + 'me what is missing before relying on it.',
+        'Verification note: the completion review did not accept this write-up. '
+        + (publishedVerdict?.reason
+          ? `${publishedVerdict.reason.replace(/\s+/g, ' ').trim().slice(0, 240)} `
+          : '')
+        + 'The tool receipts from this request are still retained; I can re-read those next.',
       completion_review_evidence_unreadable:
         'Verification note: I could not read the record of what this request wrote, so I '
         + 'cannot confirm the result. Ask me to re-check it.',
@@ -1732,6 +1737,12 @@ export function commitTurnOutcome(
       sessionId: persisted.identity.sessionId,
       sourceUserSeq: persisted.identity.sourceUserSeq,
     }).catch(() => {});
+    try {
+      learnHostRunStrategyForAcceptedTask({
+        sessionId: persisted.identity.sessionId,
+        sourceUserSeq: persisted.identity.sourceUserSeq,
+      });
+    } catch { /* strategy recall stays additive */ }
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish

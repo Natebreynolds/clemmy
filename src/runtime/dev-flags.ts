@@ -65,6 +65,7 @@ export const DEV_FLAG_REGISTRY: DevFlagDef[] = [
   { key: 'CLEMMY_WORKER_THRASH_GUARD', label: 'Worker thrash guard', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Per-worker loop-detection so parallel workers don’t poison one tracker.' },
   { key: 'CLEMMY_DYNAMIC_REASONING', label: 'Dynamic reasoning effort', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Pick the per-turn reasoning effort tier from the turn’s intent.' },
   { key: 'CLEMMY_CONTINUATION_CLASSIFY', label: 'Continuation goal classify', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'Classify the GOAL (not boilerplate) on continuation turns.' },
+  { key: 'CLEMMY_JEV', label: 'Jev fast decisions', category: 'Tools & efficiency', type: 'boolean', default: 'on', description: 'When a TypeSafe key is connected, Jev answers completion, ranking, and primer questions first. A confident verdict skips the Settings judge; write grounding stays on the configured judge until agreement is measured. Off keeps the chat-model judge path.' },
 
   // ── Goals & autonomy ──
   { key: 'CLEMMY_GOAL_CONTRACT', label: 'Goal contracts (master)', category: 'Goals & autonomy', type: 'boolean', default: 'on', description: 'The parked-goal contract loop. OFF disables self-drive + re-orient too.' },

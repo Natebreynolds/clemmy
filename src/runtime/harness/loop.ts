@@ -259,6 +259,7 @@ import type {
   TaskContinuationContext,
 } from '../../types.js';
 import {
+  bareDeicticClarificationForAcceptedSource,
   freshHostConversationSurfaceOnly,
   primePrimaryModelPlanningCatalog,
   type HostFreshPlanningContextV1,
@@ -1732,6 +1733,57 @@ export function reofferUnresolvedAcceptedSourceClarification(input: {
       done: false,
       nextAction: 'awaiting_user_input',
       reason: 'continuation_unresolved_reoffer',
+    },
+    publicPresentation: committed.presentation,
+  };
+}
+
+function offerBareDeicticClarification(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+}): RunConversationResult | null {
+  const prepared = bareDeicticClarificationForAcceptedSource(input);
+  if (!prepared) return null;
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: prepared.question,
+      purpose: 'clarification',
+      source: 'bare_deictic_clarification',
+      sourceUserSeq: input.sourceUserSeq,
+    },
+  });
+  const identity = standardTurnIdentity(input);
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: prepared.question },
+  }, {
+    legacyReason: 'awaiting_user_input',
+    metadata: {
+      steps: 0,
+      reason: 'bare_deictic_clarification',
+    },
+  });
+  return {
+    sessionId: input.sessionId,
+    status: 'awaiting_user_input',
+    steps: 0,
+    lastTurn: input.turn,
+    lastDecision: {
+      summary: prepared.question,
+      reply: prepared.question,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'bare_deictic_clarification',
     },
     publicPresentation: committed.presentation,
   };
@@ -3319,6 +3371,8 @@ export interface RunTurnOptions {
    * query embedding and the visible vault primer. This is a cost optimization
    * only; any uncertain/action-shaped turn omits it and retains full recall. */
   skipAutomaticMemoryPrimer?: true;
+  /** Jev-selected proven past run; skip tool_search when this is set. */
+  provenOperationText?: string;
   /** The same accepted-source proof also mounted an exact zero-tool agent.
    * This permits action-only context ranking to be omitted without changing
    * the model-visible user message or conversational context. */
@@ -5886,6 +5940,12 @@ async function runConversationWithinRuntimeConfig(
       turn: acceptedSource.turn,
     });
     if (reoffered) return reoffered;
+    const deictic = offerBareDeicticClarification({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+      turn: acceptedSource.turn,
+    });
+    if (deictic) return deictic;
   }
   const hostPlanningCatalog = hostOwnsFreshTurn && !hostPlainConversation
     ? await primePrimaryModelPlanningCatalog({
@@ -6138,6 +6198,33 @@ async function runConversationWithinRuntimeConfig(
       } else {
         await resolveContext();
       }
+      let provenOperationText: string | undefined;
+      if (!hostPlainConversation) {
+        try {
+          const proven = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
+            query: String(options.semanticTaskInput ?? options.input ?? ''),
+            sessionId: options.sessionId,
+            sourceUserSeq,
+          });
+          if (proven.text) {
+            provenOperationText = proven.text;
+            appendEvent({
+              sessionId: options.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'proven_operation_selected',
+              data: {
+                sourceUserSeq,
+                strategyId: proven.strategyId,
+                tools: proven.tools,
+                skipDiscoverySearch: proven.skipDiscoverySearch,
+                capabilityRefs: proven.capabilityRefs,
+                descriptors: proven.descriptors,
+              },
+            });
+          }
+        } catch { /* proven recall is fail-open */ }
+      }
       await resolveCapability?.();
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
       const hostTurnOptions: RunTurnOptions = {
@@ -6175,6 +6262,7 @@ async function runConversationWithinRuntimeConfig(
               plainConversationSurface: true as const,
             }
           : {}),
+        ...(provenOperationText ? { provenOperationText } : {}),
       };
       const turnResult = await modelCheckInForExhaustedTurn(
         hostAccountQuestionForExhaustedTurn(await runTurn(hostTurnOptions), { sessionId: options.sessionId, sourceUserSeq }),
@@ -10970,6 +11058,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     },
   });
   const contextPacket = canonicalContext.turn;
+  if (contextPacket.skills.length > 1) {
+    try {
+      const { rerankNamedCandidatesWithJev } = await import('../jev/control-plane.js');
+      contextPacket.skills = await rerankNamedCandidatesWithJev(
+        classifierInput,
+        contextPacket.skills,
+        { label: (skill) => skill.description, sessionId: options.sessionId },
+      );
+    } catch { /* fail-open: keep lexical skill ranking */ }
+  }
   let preparedPreflight: {
     identity: TurnIdentity;
     decision: ReturnType<typeof classifyTurnPreflight>;
@@ -11400,6 +11498,15 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           input: [
             ...modelData.input,
             { role: 'system', content: turnMemoryPrimer.text } as AgentInputItem,
+          ],
+          instructions: modelData.instructions,
+        };
+      }
+      if (options.provenOperationText) {
+        modelData = {
+          input: [
+            ...modelData.input,
+            { role: 'system', content: options.provenOperationText } as AgentInputItem,
           ],
           instructions: modelData.instructions,
         };

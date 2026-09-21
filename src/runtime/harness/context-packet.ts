@@ -319,7 +319,7 @@ function candidateScore(queryTokens: string[], fields: Array<{ text: string; wei
   return { score, matched: Array.from(matched).slice(0, 5) };
 }
 
-function rankSkills(
+export function rankSkills(
   input: string,
   opts: { includeSemanticallyMatchedDrafts?: boolean } = {},
 ): RankedContextCandidate[] {

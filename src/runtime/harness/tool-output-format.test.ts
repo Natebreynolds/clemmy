@@ -30,6 +30,7 @@ const {
   densifyMarkdownForModelHead,
   exactToolOutputForInvocation,
   truncateToolText,
+  PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
 } = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 const { textResult } = await import('../../tools/shared.js');
@@ -61,6 +62,35 @@ test('formatRecallableToolText stores full output and returns canonical recall s
   const row = getToolOutput(sess.id, 'call_global_clip');
   assert.ok(row);
   assert.equal(row.output, full);
+});
+
+test('control-topology parked results keep the full default budget', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const full = `${'schema '.repeat(1_200)}END`;
+  const visible = formatRecallableToolText(full, {
+    sessionId: sess.id,
+    callId: 'call_control_inline',
+    toolName: 'tool_search',
+  });
+  assert.ok(full.length < 20_000);
+  assert.equal(visible, full);
+  assert.equal(getToolOutput(sess.id, 'call_control_inline')?.output, full);
+});
+
+test('a parked result uses the prompt-inline budget and a recall handle by default', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const full = `${'row '.repeat(2_000)}END`;
+  const visible = formatRecallableToolText(full, {
+    sessionId: sess.id,
+    callId: 'call_prompt_inline',
+    toolName: 'list_records',
+  });
+  assert.ok(full.length > PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+  assert.ok(visible.length <= PROMPT_INLINE_RECALLABLE_RESULT_CHARS + 400);
+  assert.match(visible, /recall_tool_result \{"call_id":"call_prompt_inline"\}/);
+  assert.equal(getToolOutput(sess.id, 'call_prompt_inline')?.output, full);
 });
 
 test('an exact output receipt remains valid when trusted provider annotations follow it', () => {

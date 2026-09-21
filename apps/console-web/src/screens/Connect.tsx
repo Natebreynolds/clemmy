@@ -80,7 +80,7 @@ export function Connect() {
   // half of the SAME sign-in as the access token (one "Codex sign-in" row
   // represents the pair; storage keeps both), and the webhook secret is the
   // console's own auth — editing it here would only log the user out.
-  const HIDDEN_CREDENTIAL_ROWS = new Set(['codex_oauth_refresh_token', 'webhook_secret']);
+  const HIDDEN_CREDENTIAL_ROWS = new Set(['codex_oauth_refresh_token', 'webhook_secret', 'typesafe_api_key']);
   const credentialRows = normalizeCredentialRows(creds.data?.rows)
     .filter((row) => !HIDDEN_CREDENTIAL_ROWS.has(row.name ?? ''));
   const descriptors = creds.data?.descriptors ?? {};

@@ -10,7 +10,7 @@ import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
 import { isHarnessInjectedInput } from '../runtime/harness/objective-judge.js';
-import { EXPLICIT_MEMORY_INSTRUCTION_RE } from '../assistant/message-intent.js';
+import { EXPLICIT_MEMORY_INSTRUCTION_RE, isSelfContainedComputation } from '../assistant/message-intent.js';
 import pino from 'pino';
 
 /** Defense-in-depth (2026-06-23): auto-memory must learn only from REAL user
@@ -1024,6 +1024,9 @@ export function captureInteractionSignals(input: {
   // recorded as user_input_received but are NOT user messages — never learn from
   // them. (Defense-in-depth; the loop also gates capture to the first chat turn.)
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(input.message)) {
+    return emptyAutoCaptureResult();
+  }
+  if (isSelfContainedComputation(input.message)) {
     return emptyAutoCaptureResult();
   }
   const matched = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);

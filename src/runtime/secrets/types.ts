@@ -45,6 +45,7 @@ export type SecretName =
   | 'composio_api_key'
   | 'recall_api_key'
   | 'browser_use_api_key'
+  | 'typesafe_api_key'
   | 'codex_oauth_access_token'
   | 'codex_oauth_refresh_token'
   | 'webhook_secret'

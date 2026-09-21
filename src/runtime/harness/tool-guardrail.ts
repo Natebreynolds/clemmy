@@ -1334,8 +1334,10 @@ export function evaluateToolCall(
   //     hardens in tone once we pass blockAt+2 ("provably stuck").
   //   - >= hardStopAt            → TERMINAL escalate (end the turn). This is
   //     the runaway/budget backstop that still stops the 84×/3-min hang; it
-  //     just fires far later, after a long advisory window. Read/idempotent
-  //     tools NEVER escalate (polling is legitimate).
+  //     just fires far later, after a long advisory window. Changing-world
+  //     polls (identical args, different retained bytes) stay exempt. Identical
+  //     retained results are not a poll — they terminalize at the same bound
+  //     even for a non-mutating business read. Fan-out refusals stay recoverable.
   // A CONTROL-plane call repeated with identical arguments is not polling.
   // Polling is legitimate because the WORLD may change between reads; a
   // control call whose answer is computed from the same inputs cannot become
@@ -1344,7 +1346,9 @@ export function evaluateToolCall(
   // byte-identical deterministic refusal, burning five minutes and the turn's
   // whole budget before parking — the read exemption let a provably stuck
   // loop run to exhaustion. Control repeats now reach the same terminal
-  // backstop mutations do; genuine reads keep their exemption.
+  // backstop mutations do. Live 2026-09-21: a recovered source looped a
+  // first-class local read 150× with identical args and identical retained
+  // bytes while unmetered task_work kept continuing.
   const controlPlaneRepeat = actionTopologyRoleFor(toolName) === 'control';
   if ((isMut || controlPlaneRepeat) && exactCount >= thresholds.exactArgsHardStopAt) {
     return {
@@ -1384,6 +1388,24 @@ export function evaluateToolCall(
       dangerousWrite,
       ...(fanoutNudge ? { fanoutNudge } : {}),
       ...(cachedCallId ? { cachedCallId, cachedAgeMs, cachedLabel } : {}),
+    };
+  }
+  if (
+    !isMut
+    && !controlPlaneRepeat
+    && !fanoutBlock
+    && exactCount >= thresholds.exactArgsHardStopAt
+  ) {
+    return {
+      action: 'escalate',
+      signature,
+      toolName,
+      reason: `${toolName} called ${exactCount}× with IDENTICAL arguments and unchanged retained results — not a changing-world poll. Ending the turn.`,
+      rule: 'exact_args_repeat',
+      count: exactCount,
+      mutating: isMut,
+      effect: classified.effect,
+      dangerousWrite,
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
@@ -1721,6 +1743,7 @@ export function _peekTracker(sessionId: string): Readonly<{
 export function _resetAllTrackersForTests(): void {
   trackers.clear();
   semanticRefusalLoops.clear();
+  recentOutputFps.clear();
 }
 
 /**

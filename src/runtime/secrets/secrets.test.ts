@@ -55,6 +55,7 @@ beforeEach(() => {
   delete process.env.DISCORD_BOT_TOKEN;
   delete process.env.COMPOSIO_API_KEY;
   delete process.env.BROWSER_USE_API_KEY;
+  delete process.env.TYPESAFE_API_KEY;
 });
 
 // ─── Registry ────────────────────────────────────────────────────
@@ -75,6 +76,13 @@ test('registry: getSecretDescriptor throws on unknown name', () => {
 
 test('registry: KEYCHAIN_SERVICE is the stable v1 name (NEVER change)', () => {
   assert.equal(KEYCHAIN_SERVICE, 'com.clemmy.desktop.v1');
+});
+
+test('registry: typesafe_api_key validates against /v1/systemone', () => {
+  const d = getSecretDescriptor('typesafe_api_key');
+  assert.equal(d.envVarName, 'TYPESAFE_API_KEY');
+  assert.match(d.setupHint ?? '', /systemone/);
+  assert.equal(typeof d.validate, 'function');
 });
 
 test('keychain backend: resolves bundled keytar from Electron resources path', async () => {

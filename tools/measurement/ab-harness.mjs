@@ -56,6 +56,28 @@ function usageSince(sessionId, sinceIso) {
   return rows;
 }
 
+function jevCallsIn(rows) {
+  return rows.filter((r) => String(r.model || '').includes('jev')).length;
+}
+
+async function jevStatus() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/api/console/jev`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    if (!res.ok) return { configured: null, enabled: null, keySource: 'unknown', httpStatus: res.status };
+    const body = await res.json();
+    return {
+      configured: Boolean(body.configured),
+      enabled: Boolean(body.enabled),
+      keySource: body.keySource ?? 'unknown',
+      model: body.model ?? null,
+    };
+  } catch (err) {
+    return { configured: null, enabled: null, keySource: 'unreachable', error: String(err) };
+  }
+}
+
 async function runShape(shape) {
   const before = maxSeq();
   const sinceIso = new Date().toISOString();
@@ -125,13 +147,14 @@ async function runShape(shape) {
     output,
     toolCalls: toolCalls.length,
     toolSearches: toolCalls.filter((n) => n === 'tool_search').length,
+    jevCalls: jevCallsIn(u),
     status: t.presentation?.status ?? t.turnOutcome?.status ?? (terminal ? '?' : 'NO_TERMINAL'),
     judgeFulfills: judged.length ? judged.every(Boolean) : null,
     reply: String(t.reply ?? t.presentation?.text ?? '').replace(/\s+/g, ' ').slice(0, 160),
   };
 }
 
-const TOTALS = ['wallMs', 'modelMs', 'toolMs', 'gapMs', 'modelCalls', 'input', 'cached', 'uncached', 'output', 'toolCalls', 'toolSearches'];
+const TOTALS = ['wallMs', 'modelMs', 'toolMs', 'gapMs', 'modelCalls', 'input', 'cached', 'uncached', 'output', 'toolCalls', 'toolSearches', 'jevCalls'];
 
 function summarize(results) {
   const out = {};
@@ -147,16 +170,37 @@ if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true });
 
 if (mode === 'capture') {
   if (!a) { console.error('usage: ab-harness.mjs capture <label>'); process.exit(1); }
-  console.log(`capturing "${a}"   shapes: ${SHAPE_SET_ID}\n`);
+  const intervention = await jevStatus();
+  console.log(`capturing "${a}"   shapes: ${SHAPE_SET_ID}   jev configured=${intervention.configured} enabled=${intervention.enabled} source=${intervention.keySource}\n`);
   const results = [];
   for (const shape of SHAPES) {
     const r = await runShape(shape);
     results.push(r);
     console.log(`  ${shape.key.padEnd(11)} ${String((r.wallMs / 1000).toFixed(1)).padStart(6)}s  `
-      + `uncached ${String(r.uncached ?? 0).padStart(7)}  searches ${r.toolSearches ?? 0}  ${r.status ?? r.error}`);
+      + `uncached ${String(r.uncached ?? 0).padStart(7)}  searches ${r.toolSearches ?? 0}  jev ${r.jevCalls ?? 0}  ${r.status ?? r.error}`);
   }
-  const run = { label: a, shapeSet: SHAPE_SET_ID, capturedAt: new Date().toISOString(), results, totals: summarize(results) };
+  const totals = summarize(results);
+  const claimsNoJev = /no-?jev|jev-off/i.test(a);
+  // A control is contaminated when Jev RAN, not when a key merely exists. The
+  // first version tested `configured`, which rejected the only clean way to run
+  // this: same key in the vault, same everything, CLEMMY_JEV flipped. Requiring
+  // an absent key would change key-presence AND the flag between arms, so a
+  // difference could not be attributed to either. `enabled` is the intervention;
+  // `configured` is the environment, and the environment should match.
+  const contaminated = claimsNoJev && (totals.jevCalls > 0 || intervention.enabled === true);
+  const run = {
+    label: a,
+    shapeSet: SHAPE_SET_ID,
+    capturedAt: new Date().toISOString(),
+    intervention,
+    contaminated,
+    results,
+    totals,
+  };
   writeFileSync(`${DIR}/${a}.json`, JSON.stringify(run, null, 2) + '\n');
+  if (contaminated) {
+    console.log(`CONTAMINATED: label "${a}" claims Jev off but configured=${intervention.configured} jevCalls=${totals.jevCalls}`);
+  }
   console.log(`\nsaved ${DIR}/${a}.json`);
   const t = run.totals;
   console.log(`totals: wall ${(t.wallMs / 1000).toFixed(1)}s  model ${(t.modelMs / 1000).toFixed(1)}s  `
@@ -169,6 +213,17 @@ if (mode === 'capture') {
   const B = JSON.parse(readFileSync(`${DIR}/${b}.json`, 'utf8'));
   if (A.shapeSet !== B.shapeSet) {
     console.log(`REFUSED: different shape sets (${A.shapeSet} vs ${B.shapeSet}) — not comparable.`);
+    process.exit(2);
+  }
+  const aJev = A.totals.jevCalls ?? A.results.reduce((n, r) => n + (r.jevCalls ?? 0), 0);
+  const bJev = B.totals.jevCalls ?? B.results.reduce((n, r) => n + (r.jevCalls ?? 0), 0);
+  if (A.contaminated || B.contaminated || (/no-?jev|jev-off/i.test(A.label) && aJev > 0) || (/no-?jev|jev-off/i.test(B.label) && bJev > 0)) {
+    console.log('REFUSED: a labeled no-Jev control actually ran Jev. Do not treat this pair as causal.');
+    console.log('  A clean control is: key still in the vault, CLEMMY_JEV=off, daemon RESTARTED');
+    console.log('  (getRuntimeEnv reads process.env first, so editing .env alone changes nothing),');
+    console.log('  and /api/console/jev reporting enabled=false with jevCalls=0.');
+    console.log(`  ${A.label} jevCalls=${aJev} contaminated=${Boolean(A.contaminated)}`);
+    console.log(`  ${B.label} jevCalls=${bJev} contaminated=${Boolean(B.contaminated)}`);
     process.exit(2);
   }
   const pct = (x, y) => (x === 0 ? (y === 0 ? '0%' : 'n/a') : `${(((y - x) / x) * 100).toFixed(1)}%`);

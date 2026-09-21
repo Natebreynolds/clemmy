@@ -89,6 +89,8 @@ import {
   snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
+import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
+import { resolveCallableProvenDiscoverySkip } from '../runtime/jev/proven-operation.js';
 import { actionExpectedWorkCarrierSelection } from '../runtime/harness/action-expected-work-boundary.js';
 import {
   formatFrozenNodeBindings,
@@ -1849,6 +1851,48 @@ export function recentConversationTextsForFanout(
   }
 }
 
+function provenOperationDisclosureForTurn(
+  sessionId: string | null | undefined,
+  sourceUserSeq: number | undefined,
+): { skipDiscoverySearch: boolean; descriptors: HostCapabilityDescriptorV1[] } {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+    return { skipDiscoverySearch: false, descriptors: [] };
+  }
+  try {
+    const selected = listEvents(sessionId, { types: ['proven_operation_selected'] })
+      .filter((event) => event.data.sourceUserSeq === sourceUserSeq)
+      .at(-1);
+    if (!selected) return { skipDiscoverySearch: false, descriptors: [] };
+    const descriptors = Array.isArray(selected.data.descriptors)
+      ? selected.data.descriptors.filter((entry: unknown): entry is HostCapabilityDescriptorV1 => (
+        Boolean(entry)
+        && typeof entry === 'object'
+        && typeof (entry as { id?: unknown }).id === 'string'
+      ))
+      : [];
+    return resolveCallableProvenDiscoverySkip({
+      skipDiscoverySearch: selected.data.skipDiscoverySearch === true,
+      descriptors,
+    });
+  } catch {
+    return { skipDiscoverySearch: false, descriptors: [] };
+  }
+}
+
+function mergeWorkCallDisclosures(
+  planning: HostFreshPlanningContextV1 | undefined,
+  proven: readonly HostCapabilityDescriptorV1[],
+): HostCapabilityDescriptorV1[] {
+  const seen = new Set<string>();
+  const merged: HostCapabilityDescriptorV1[] = [];
+  for (const entry of [...(planning?.capabilities ?? []), ...proven]) {
+    if (!entry?.id || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
   Agent<RuntimeContextValue, any>
 > {
@@ -1908,6 +1952,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     ? options.taskContinuation?.activeTaskInput ?? currentUserInput
     : acceptedPlanOwnerScopeInput(options.sessionId, options.sourceUserSeq, currentUserInput);
   const hostFreshPlanning = options.hostFreshPlanning;
+  const provenDisclosure = provenOperationDisclosureForTurn(options.sessionId, options.sourceUserSeq);
+  const disclosedOperations = mergeWorkCallDisclosures(hostFreshPlanning, provenDisclosure.descriptors);
   const actionWork = (() => {
     if (options.acceptedRoute !== 'act') return false;
     // The host-fresh lane intentionally constructs the model surface before a
@@ -3644,8 +3690,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ? {
             ...dispatcherOptions,
             frozenContract,
+            ...(disclosedOperations.length > 0 ? { disclosedOperations } : {}),
             ...(hostFreshPlanning ? {
-              disclosedOperations: hostFreshPlanning.capabilities,
               requireHostPlan: true,
               hostPlanningReady: () => {
                 const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
@@ -3782,8 +3828,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       deniedNames: excludes,
       mcpToolScope,
       frozenContract,
+      ...(disclosedOperations.length > 0 ? { disclosedOperations } : {}),
       ...(hostFreshPlanning ? {
-        disclosedOperations: hostFreshPlanning.capabilities,
         requireHostPlan: true,
         hostPlanningReady: () => {
           const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
@@ -3905,11 +3951,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const name = (toolRef as { name?: string }).name ?? '';
     return !name || !structuralToolNames.has(name);
   });
+  const skipDiscoverySearch = provenDisclosure.skipDiscoverySearch;
   const assembledTools = turnStateToolsLast([
     ...structuralTools,
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
     ...(callTool ? [callTool] : []),
-    ...nonStructuralDiscovery,
+    ...nonStructuralDiscovery.filter((toolRef) => (
+      !skipDiscoverySearch || (toolRef as { name?: string }).name !== 'tool_search'
+    )),
   ]);
   searchFirstClassCount = assembledTools.length;
   searchFirstClassTokens = Math.round(

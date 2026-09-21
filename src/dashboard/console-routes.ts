@@ -8351,7 +8351,7 @@ export function registerConsoleRoutes(
     };
   };
 
-  app.get('/api/console/settings', (req, res) => {
+  app.get('/api/console/settings', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const profile = loadUserProfile();
@@ -8382,10 +8382,41 @@ export function registerConsoleRoutes(
         health: getFusionHealthSnapshot(),
       };
       const modelOptionCatalog = modelRoleOptionCatalogSnapshot();
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: modelOptionCatalog.providerSnapshots, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(modelOptionCatalog), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled() });
+      const { getJevStatus } = await import('../runtime/jev/connect.js');
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: modelOptionCatalog.providerSnapshots, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(modelOptionCatalog), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled(), jev: await getJevStatus() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.get('/api/console/jev', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { getJevStatus } = await import('../runtime/jev/connect.js');
+      res.json(await getJevStatus());
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+
+  app.post('/api/console/jev', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey : '';
+    if (!apiKey.trim()) { res.status(400).json({ error: 'apiKey required' }); return; }
+    try {
+      const { connectJevKey } = await import('../runtime/jev/connect.js');
+      res.json(await connectJevKey(apiKey));
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(code === 'invalid_key' ? 400 : 500).json({ error: message });
+    }
+  });
+
+  app.delete('/api/console/jev', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { disconnectJevKey } = await import('../runtime/jev/connect.js');
+      res.json(await disconnectJevKey());
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
   });
 
   /**
@@ -14012,7 +14043,7 @@ export function registerConsoleRoutes(
       workingNow.push(...workingNowCollapsed);
 
       const credentialRows = credentialHealth
-        .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'browser_use_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
+        .filter((row) => ['openai_api_key', 'discord_bot_token', 'composio_api_key', 'recall_api_key', 'browser_use_api_key', 'typesafe_api_key', 'codex_oauth_access_token', 'codex_oauth_refresh_token'].includes(row.name))
         .map((row) => ({
           name: row.name,
           label: row.name === 'openai_api_key' ? 'OpenAI API'
@@ -14020,6 +14051,7 @@ export function registerConsoleRoutes(
               : row.name === 'composio_api_key' ? 'Composio'
                 : row.name === 'recall_api_key' ? 'Recall'
                   : row.name === 'browser_use_api_key' ? 'Browser Use'
+                    : row.name === 'typesafe_api_key' ? 'Jev (TypeSafe)'
                     : row.name === 'codex_oauth_access_token' ? 'Codex access'
                       : 'Codex refresh',
           status: row.status,

@@ -1,4 +1,5 @@
 import type { SecretDescriptor, SecretName, SecretValidationResult } from './types.js';
+import { probeTypesafeApiKey } from '../jev/system-one.js';
 
 // Generic HTTP probe used by validators. 401/403 → invalid; 2xx → valid;
 // everything else (5xx, timeout, DNS) → unknown so the user can still
@@ -123,6 +124,14 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'BROWSER_USE_API_KEY',
     required: false,
     setupHint: 'Create one at https://cloud.browser-use.com/new-api-key. Local Chrome Browser Harness does not require this.',
+  },
+  {
+    name: 'typesafe_api_key',
+    description: 'TypeSafe Jev API key — fast typed decisions (Choice / Score / Noul) that skip the Settings judge on confident completion, ranking, and primer questions.',
+    envVarName: 'TYPESAFE_API_KEY',
+    required: false,
+    setupHint: 'Create one at https://console.typesafe.ai/keys. Clem uses POST https://api.typesafe.ai/v1/systemone, not chat completions.',
+    validate: (value) => probeTypesafeApiKey(value),
   },
   {
     name: 'codex_oauth_access_token',

@@ -138,6 +138,19 @@ test('judge metrics snapshot aggregates outcomes and latency by lane', () => {
     assert.equal(snapshot.total.advisory, 1);
     assert.equal(snapshot.total.avgMs, 150);
     assert.equal(snapshot.total.maxMs, 300);
+    assert.equal(snapshot.total.fastDecisions, 0);
+
+    recordJudgeMetric({
+      lane: 'completion',
+      outcome: 'passed',
+      durationMs: 280,
+      modelId: 'jev-1.13.0',
+      fast: true,
+    });
+    const afterFast = getJudgeMetricsSnapshot();
+    assert.equal(afterFast.total.calls, 4);
+    assert.equal(afterFast.total.fastDecisions, 1);
+    assert.equal(afterFast.lanes.find((lane) => lane.lane === 'completion')?.fastDecisions, 1);
 
     const completion = snapshot.lanes.find((lane) => lane.lane === 'completion');
     assert.equal(completion?.calls, 2);

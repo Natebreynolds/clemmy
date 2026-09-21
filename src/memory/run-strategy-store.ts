@@ -155,21 +155,31 @@ function renderOne(s: RunStrategyRecord): string {
   return `- A similar past run ("${s.objective}") succeeded with: ${s.toolsUsed.join(', ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}${produced}.`;
 }
 
-/** Render the top-matching strategies for an objective, or '' when nothing
- *  clears the relevance floor (additive injection contract). */
-export function renderRunStrategiesForContext(objective: string | undefined, limit = 2): string {
-  if (!objective?.trim()) return '';
+export interface MatchedRunStrategy {
+  strategy: RunStrategyRecord;
+  score: number;
+}
+
+/** Ranked proven strategies for this objective. Empty when nothing clears the floor. */
+export function listMatchingRunStrategies(objective: string | undefined, limit = 4): MatchedRunStrategy[] {
+  if (!objective?.trim()) return [];
   const keywords = strategyKeywords(objective);
-  if (keywords.length === 0) return '';
+  if (keywords.length === 0) return [];
   const file = readStore();
-  const scored = file.strategies
+  return file.strategies
     .filter((s) => isValidLearningReceipt(s.learningReceipt, { target: 'strategy' }))
-    .map((s) => ({ s, score: overlapScore(keywords, s.keywords) }))
+    .map((s) => ({ strategy: s, score: overlapScore(keywords, s.keywords) }))
     .filter((x) => x.score >= 0.34)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+}
+
+/** Render the top-matching strategies for an objective, or '' when nothing
+ *  clears the relevance floor (additive injection contract). */
+export function renderRunStrategiesForContext(objective: string | undefined, limit = 2): string {
+  const scored = listMatchingRunStrategies(objective, limit);
   if (scored.length === 0) return '';
-  return scored.map((x) => renderOne(x.s)).join('\n');
+  return scored.map((x) => renderOne(x.strategy)).join('\n');
 }
 
 export interface RunStrategyLearningStats {

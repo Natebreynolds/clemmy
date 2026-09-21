@@ -1378,6 +1378,17 @@ export function registerToolSearchTool(
           rankedWindow = [named!, ...rankedWindow];
         }
       }
+      // Jev reranks fuzzy neighbors only. Exact-name and exact-id hits stay
+      // first; a missing key or timeout leaves the lexical window unchanged.
+      if (!selectedExactly && rankedWindow.length > 1) {
+        const exactNames = new Set(rankedWindow
+          .filter((row) => queryExplicitlyNamesTool(query, row.name)
+            || (requestedOperationInQuery && sameOperationName(row.name, requestedOperationInQuery)))
+          .map((row) => row.name));
+        const leading = rankedWindow.filter((row) => exactNames.has(row.name));
+        const fuzzy = rankedWindow.filter((row) => !exactNames.has(row.name));
+        rankedWindow = [...leading, ...fuzzy];
+      }
       // Only sources with an exact selected-candidate contract may defer a
       // durable page. Existing opaque live-read authority keeps its old path.
       const canDeferPages = Boolean(!selectedExactly && opts.discloseForPlanning

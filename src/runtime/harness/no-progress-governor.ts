@@ -322,6 +322,12 @@ export interface ObserveNoProgressInput {
   readonly attemptClass: NoProgressAttemptClass;
   readonly authority: AuthorityProgressSnapshot;
   readonly consequence?: NoProgressConsequence;
+  /**
+   * Host-projected: this frame's settled calls reused a prior signature and
+   * the same retained result bytes. That is not progress, even for unmetered
+   * task_work. The governor never sees tool names or payload text.
+   */
+  readonly identicalOutcome?: boolean;
 }
 
 export type NoProgressContinueReason =
@@ -573,6 +579,8 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
  * after the retry budget runs out. Repeating a pre-dispatch model repair can
  * only spend remaining retries; other repeated consequences stop. Unmetered
  * task work never spends the budget, though its evidence/effects still reset it.
+ * An identical retained outcome with no new authority is not unmetered: it
+ * spends the same retry floor as a metered miss.
  */
 export function observeNoProgress(
   state: NoProgressGovernorState,
@@ -643,7 +651,7 @@ export function observeNoProgress(
     });
   }
 
-  if (!METERED_ATTEMPTS.has(input.attemptClass)) {
+  if (!METERED_ATTEMPTS.has(input.attemptClass) && input.identicalOutcome !== true) {
     const next = Object.freeze({
       ...state,
       authority,

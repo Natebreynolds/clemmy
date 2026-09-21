@@ -356,6 +356,15 @@ test('bad args return the schema with error=arg_validation and NO dispatch', asy
   assert.ok(!getHotSet('sess-argval').includes(target!), 'a validation miss must not dispatch');
 });
 
+test('session_context_read empty args name the locators to use next', async () => {
+  _resetHotSetForTest();
+  _resetCallToolSchemaCacheForTest();
+  const out = JSON.parse(String(await invokeCallTool('sess-argval-context', 'session_context_read', '{}')));
+  assert.equal(out.error, 'arg_validation');
+  assert.match(String(out.next ?? ''), /record_id/);
+  assert.match(String(out.next ?? ''), /ask what to act on/i);
+});
+
 test('a schema refusal carries repair material keyed on the failing paths', async () => {
   // Live 2026-09-05, from the owner's phone: "find and add <person> to that"
   // refused three carrier attempts as schema-invalid. None carried repair

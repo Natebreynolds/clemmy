@@ -76,7 +76,7 @@ import {
   rehydrateConsumedClarificationContext,
   verifyDurableClarificationContext,
 } from '../harness/task-continuity-runtime.js';
-import { classifyMessageIntent, selfContainedConversation } from '../../assistant/message-intent.js';
+import { classifyMessageIntent, isBareDeicticFollowUp, selfContainedConversation } from '../../assistant/message-intent.js';
 import {
   markAdmissionCapabilityResolutionSuperseded,
   provenCapabilityEntriesForTurn,
@@ -381,6 +381,11 @@ function conversationShortCircuit(
     // evidence of self-containment; it is the ordinary state of a sentence the
     // lists did not foresee.
     if (!continuesHostedWork && selfContainedConversation(durableText, verdict)) return true;
+    // A deictic follow-up is not closed-world just because no retrieve/act
+    // has run. Chat text and attachments are referents; when they identify
+    // work, keep discovery. When they do not, the host asks immediately
+    // instead of a tool-less model that then fails completion review
+    // (live source 272550: three negative reviews of an intent-only reply).
     const resolution = resolveTurnCapabilities(durableText, { sessionId: identity.sessionId });
     if (resolution.entries.some((entry) => entry.status === 'proven')) return false;
     return false;
@@ -408,6 +413,74 @@ export function freshHostConversationSurfaceOnly(input: {
     return Boolean(text) && conversationShortCircuit(input, text);
   } catch {
     return false;
+  }
+}
+
+function acceptedUserSource(input: { sessionId: string; sourceUserSeq: number }): EventRow | undefined {
+  return listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.sourceUserSeq);
+}
+
+function eventHasAttachments(data: Record<string, unknown> | undefined): boolean {
+  if (!data) return false;
+  if (data.displayText === 'Attached file') return true;
+  for (const key of ['attachmentIds', 'attachments', 'files', 'media']) {
+    const value = data[key];
+    if (Array.isArray(value) && value.length > 0) return true;
+  }
+  return false;
+}
+
+/** Prior chat text or this-turn attachments. Retrieve/act is a separate signal. */
+export function sessionHasConversationalReferent(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const source = acceptedUserSource(input);
+    const data = source?.data ?? {};
+    if (eventHasAttachments(data)) return true;
+    const display = typeof data.displayText === 'string' ? data.displayText.trim() : '';
+    const text = typeof data.text === 'string' ? data.text.trim() : '';
+    // Folded attachments lengthen `text` past the deictic display line.
+    if (text && display && text !== display && text.length > display.length + 20) return true;
+    const priorUsers = listEvents(input.sessionId, { types: ['user_input_received'] })
+      .filter((event) => event.seq < input.sourceUserSeq && event.data.synthetic !== true)
+      .some((event) => String(event.data.text ?? event.data.displayText ?? '').trim().length > 0);
+    if (priorUsers) return true;
+    return listEvents(input.sessionId, { types: ['conversation_completed'] })
+      .filter((event) => event.seq < input.sourceUserSeq)
+      .some((event) => {
+        const presentation = event.data.presentation as { text?: unknown } | undefined;
+        return String(presentation?.text ?? event.data.reply ?? '').trim().length > 0;
+      });
+  } catch {
+    return false;
+  }
+}
+
+export function deicticClarificationQuestion(_text: string): string {
+  return 'What should I work on? This conversation has no prior message or attachment to use as the target.';
+}
+
+/** Host-owned ask when a deictic follow-up has no chat or attachment referent. */
+export function bareDeicticClarificationForAcceptedSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): { question: string } | null {
+  try {
+    const source = acceptedUserSource(input);
+    const display = typeof source?.data.displayText === 'string' ? source.data.displayText.trim() : '';
+    const text = typeof source?.data.text === 'string' ? source.data.text.trim() : '';
+    const line = display || text;
+    if (!line || !isBareDeicticFollowUp(line)) return null;
+    if (sessionHasConversationalReferent(input)) return null;
+    return { question: deicticClarificationQuestion(line) };
+  } catch {
+    return null;
   }
 }
 

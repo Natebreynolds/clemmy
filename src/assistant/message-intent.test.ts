@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   classifyMessageIntent,
   hasDiscourseReferent,
+  isBareDeicticFollowUp,
   isCasualCheckIn,
   memoryBudgetFor,
   refersToUserOrHostedWorld,
@@ -28,6 +29,20 @@ test('casual: short acknowledgements', () => {
   for (const msg of ['thanks', 'thanks!', 'ok', 'cool', 'got it', 'sounds good', 'sweet', 'perfect']) {
     assert.equal(classifyMessageIntent(msg).intent, 'casual', `"${msg}" should be casual`);
   }
+});
+
+test('anaphor-only object is structural; named objects are not', () => {
+  for (const msg of [
+    'can you tidy that up for me',
+    'handle that',
+    'please do it',
+    'update this',
+    'pick this up',
+  ]) {
+    assert.equal(isBareDeicticFollowUp(msg), true, msg);
+  }
+  assert.equal(isBareDeicticFollowUp('send the weekly note to the team'), false);
+  assert.equal(isBareDeicticFollowUp('look up the named record in the directory'), false);
 });
 
 test('conversation: closed-world questions do not become lookups', () => {

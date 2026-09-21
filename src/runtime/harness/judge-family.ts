@@ -216,6 +216,8 @@ export interface JudgeMetricRecord {
   judgeFamily?: ModelProviderClass;
   brainFamily?: ModelProviderClass;
   selfJudge?: boolean;
+  /** Typed Jev (or similar) prefilter that skipped the chat-model judge. */
+  fast?: boolean;
 }
 
 export interface JudgeMetricLaneSnapshot {
@@ -229,6 +231,7 @@ export interface JudgeMetricLaneSnapshot {
   errors: number;
   avgMs: number;
   maxMs: number;
+  fastDecisions: number;
   lastOutcome?: JudgeMetricOutcome;
   lastDurationMs?: number;
   lastModelId?: string;
@@ -264,6 +267,7 @@ function emptyJudgeMetricAggregate(lane: JudgeMetricLane): JudgeMetricAggregate 
     errors: 0,
     avgMs: 0,
     maxMs: 0,
+    fastDecisions: 0,
     totalMs: 0,
   };
 }
@@ -280,6 +284,7 @@ function publicLaneSnapshot(agg: JudgeMetricAggregate): JudgeMetricLaneSnapshot 
     errors: agg.errors,
     avgMs: agg.avgMs,
     maxMs: agg.maxMs,
+    fastDecisions: agg.fastDecisions,
   };
   if (agg.lastOutcome !== undefined) snapshot.lastOutcome = agg.lastOutcome;
   if (agg.lastDurationMs !== undefined) snapshot.lastDurationMs = agg.lastDurationMs;
@@ -302,6 +307,7 @@ function publicTotalSnapshot(snapshot: JudgeMetricLaneSnapshot): Omit<JudgeMetri
     errors: snapshot.errors,
     avgMs: snapshot.avgMs,
     maxMs: snapshot.maxMs,
+    fastDecisions: snapshot.fastDecisions,
   };
   if (snapshot.lastOutcome !== undefined) total.lastOutcome = snapshot.lastOutcome;
   if (snapshot.lastDurationMs !== undefined) total.lastDurationMs = snapshot.lastDurationMs;
@@ -326,6 +332,7 @@ export function recordJudgeMetric(record: JudgeMetricRecord): void {
   else if (record.outcome === 'timeout') agg.timeouts += 1;
   else if (record.outcome === 'invalid') agg.invalid += 1;
   else agg.errors += 1;
+  if (record.fast) agg.fastDecisions += 1;
   agg.lastOutcome = record.outcome;
   agg.lastDurationMs = durationMs;
   delete agg.lastModelId;
@@ -352,6 +359,7 @@ export function getJudgeMetricsSnapshot(): JudgeMetricsSnapshot {
     totalInternal.timeouts += agg.timeouts;
     totalInternal.invalid += agg.invalid;
     totalInternal.errors += agg.errors;
+    totalInternal.fastDecisions += agg.fastDecisions;
     totalInternal.totalMs += agg.totalMs;
     totalInternal.maxMs = Math.max(totalInternal.maxMs, agg.maxMs);
     if (agg.lastOutcome && (!totalInternal.updatedAt || (agg.updatedAt ?? '') > totalInternal.updatedAt)) {

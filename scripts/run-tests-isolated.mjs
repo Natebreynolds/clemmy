@@ -62,6 +62,7 @@ for (const key of [
   'RECALL_API_KEY',
   'SLACK_APP_TOKEN',
   'SLACK_BOT_TOKEN',
+  'TYPESAFE_API_KEY',
   'WEBHOOK_SECRET',
 ]) {
   delete testEnv[key];

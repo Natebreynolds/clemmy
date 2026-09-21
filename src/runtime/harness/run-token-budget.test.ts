@@ -135,6 +135,7 @@ test('recordCodexHarnessUsage records under the ALS run session (the false-pass 
       { input_tokens: 10_000, output_tokens: 2_000, total_tokens: 12_000, input_tokens_details: { cached_tokens: 4_000 } },
       'gpt-5.6-codex',
       'resp-1',
+      1_234,
     );
   });
   assert.equal(getSessionTokensUsed(sess), 8_000, 'the Codex harness lane now meters (uncached)');
@@ -151,6 +152,7 @@ test('recordCodexHarnessUsage records under the ALS run session (the false-pass 
     brain: 'codex',
     modelCallId: 'resp-1',
   });
+  assert.equal(usage?.durationMs, 1_234);
 });
 
 test('turn-wide usage attribution covers post-run models and selects explicit child tuples atomically', () => {

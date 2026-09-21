@@ -178,6 +178,37 @@ function carriedCallWithTwoOutputs(
   });
 }
 
+test('work_call plus composio_execute_tool under one call id is one invocation', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'outlook-carrier' });
+  const callId = 'call-92bc06de-calendar-view';
+  const lease = { dispatchLeaseId: 'lease-272188' };
+  const call = eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'top_level', tool: 'work_call', effect: 'read',
+      effectiveTool: 'OUTLOOK_GET_CALENDAR_VIEW', ...lease },
+  });
+  const mirrorCall = eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_called',
+    data: { callId, accounting: 'transport_mirror', tool: 'composio_execute_tool', effect: 'read' },
+  });
+  const inner = '{"data":{"value":[{"subject":"Team Meet up"}]}} END-CALENDAR';
+  eventlog.writeToolOutput({ sessionId: s.id, callId, tool: 'composio_execute_tool', output: inner, invocationNonce: `${callId}-inner` });
+  eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_returned', parentEventId: mirrorCall.id,
+    data: { callId, accounting: 'transport_mirror', tool: 'composio_execute_tool', result: inner.slice(0, 40) },
+  });
+  eventlog.writeToolOutput({ sessionId: s.id, callId, tool: 'work_call', output: inner.slice(0, 80), invocationNonce: `${callId}-carrier` });
+  eventlog.appendEvent({
+    sessionId: s.id, turn: 1, role: 'system', type: 'tool_returned', parentEventId: call.id,
+    data: { callId, accounting: 'top_level', tool: 'work_call', effect: 'read',
+      effectiveTool: 'OUTLOOK_GET_CALENDAR_VIEW', result: inner.slice(0, 40), ...lease },
+  });
+  const resolved = eventlog.resolveToolOutputForAuthority(s.id, callId);
+  assert.equal(resolved.status, 'ok', JSON.stringify(resolved).slice(0, 400));
+  if (resolved.status !== 'ok') return;
+  assert.match(resolved.record.output, /END-CALENDAR/);
+});
+
 test('a carried call whose carrier and inner tool both stored output resolves to the complete inner bytes', () => {
   const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'carried-two-outputs' });
   const inner = `Workspace "My Day" (my-day) — active. Dataset: ${'x'.repeat(4_000)} END-OF-INNER`;

@@ -8,6 +8,7 @@ import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { CodexLoginForm } from './CodexLoginForm';
 import { XaiLoginForm } from './XaiLoginForm';
 import { ConnectedModelsStrip } from './ConnectedModelsStrip';
+import { JevConnectForm } from './JevConnectForm';
 import { UsageMetersPanel } from '@/components/ModelStatusChips';
 
 /** Settings › Models: who thinks, who does the legwork, who checks. */
@@ -28,7 +29,8 @@ export function ConnectedSection() {
   const mr = r.mr;
   const groups = mr?.available ?? [];
   const claude = r.claudeAuth;
-  const chips: Array<{ key: string; provider: string; label: string; detail: string; on: boolean }> = [];
+  const jev = r.settings?.jev;
+  const chips: Array<{ key: string; provider: string; label: string; detail: string; on: boolean; color?: string }> = [];
   const claudeModels = groups.find((g) => g.provider === 'claude')?.models ?? [];
   chips.push({ key: 'claude', provider: 'claude', label: 'Claude', on: Boolean(claude?.configured), detail: claude?.configured ? (claudeModels.length ? claudeModels.slice(0, 2).map((m) => m.label).join(', ') : 'signed in') : 'not signed in' });
   const codexModels = groups.find((g) => g.provider === 'codex')?.models ?? [];
@@ -37,6 +39,7 @@ export function ConnectedSection() {
     if (g.provider === 'claude' || g.provider === 'codex') continue;
     chips.push({ key: `${g.provider}:${g.label}`, provider: g.provider, label: g.label, on: g.models.length > 0, detail: g.models.length ? `API key · ${g.models.slice(0, 2).map((m) => m.label).join(', ')}` : 'no models' });
   }
+  chips.push({ key: 'jev', provider: 'unknown', label: 'Jev', on: Boolean(jev?.configured), detail: jev?.configured ? 'Fast decisions' : 'not connected', color: '#E551BA' });
   return (
     <section id="connected" className="scroll-mt-16">
       <h2 className="mb-1 text-h2 text-fg">Connected</h2>
@@ -47,7 +50,7 @@ export function ConnectedSection() {
       <div className="flex flex-wrap gap-2">
         {chips.map((c) => (
           <span key={c.key} className={cn('inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1.5 pl-2.5 pr-3 text-small', !c.on && 'text-faint')}>
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: PROVIDER_DOT[(c.provider as keyof typeof PROVIDER_DOT)] ?? PROVIDER_DOT.unknown, opacity: c.on ? 1 : 0.4 }} aria-hidden />
+            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color ?? PROVIDER_DOT[(c.provider as keyof typeof PROVIDER_DOT)] ?? PROVIDER_DOT.unknown, opacity: c.on ? 1 : 0.4 }} aria-hidden />
             <span className="font-semibold text-fg">{c.label}</span>
             <span className="text-caption">{c.detail}</span>
           </span>
@@ -64,6 +67,7 @@ export function ConnectedSection() {
             <div className="rounded-lg border border-border bg-canvas p-4"><ClaudeLoginForm embedded /></div>
             <div className="rounded-lg border border-border bg-canvas p-4"><XaiLoginForm embedded /></div>
           </div>
+          <JevConnectForm status={jev} onDone={r.refresh} />
           <ConnectedModelsStrip />
         </div>
       )}

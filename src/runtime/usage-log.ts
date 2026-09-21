@@ -465,6 +465,9 @@ export function recordModelUsage(args: {
   windowUtilization?: number;
   /** Spawn → first stream message (Claude SDK lane cold-start latency). */
   firstByteMs?: number;
+  /** Call-site attribution (Jev channel, judge lane). Survives NDJSON. */
+  ok?: boolean;
+  failReason?: string;
 }): void {
   const attribution = modelUsageAttributionStorage.getStore();
   const argsSource = args.sessionId?.trim() || 'unknown';
@@ -545,6 +548,8 @@ export function recordModelUsage(args: {
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
+    channel: args.channel,
+    ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
     promptComponents: reconcilePromptComponents(args.promptComponents, args.inputTokens),

@@ -162,21 +162,29 @@ test('evaluateToolCall: mutating tool with N distinct arg sets hits warn at 3, h
   assert.equal(d8.action, 'halt');
 });
 
-test('evaluateToolCall: a looping composio READ slug never escalates to a turn-kill', () => {
+test('evaluateToolCall: a looping composio READ slug is not classified as a write runaway', () => {
   // Regression guard for the 2026-06-01 live incident: AIRTABLE_LIST_RECORDS
-  // (a READ) repeated 7× got escalate-KILLED with a raw error because
-  // composio_execute_tool was classified flatly mutating. A read slug must
-  // never escalate — repeating it wastes budget but cannot corrupt state, so
-  // it gets the soft 'block' corrective instead.
+  // (a READ) repeated 7× got escalate-KILLED because composio_execute_tool was
+  // classified flatly mutating. The advisory window must still be a READ block.
+  // Unchanged retained bytes then share the identical-result hardStop (below);
+  // a changing-world poll stays exempt.
   _resetAllTrackersForTests();
   const readArgs = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"baseId":"app1","tableIdOrName":"tbl1"}' };
   let last;
-  for (let i = 0; i < 12; i += 1) {
+  for (let i = 0; i < 6; i += 1) {
     last = evaluateToolCall('sess-read', 'composio_execute_tool', readArgs);
   }
-  // After many identical repeats it is blocked (corrective), NOT escalated.
-  assert.notEqual(last?.action, 'escalate');
+  assert.equal(last?.mutating, false);
   assert.equal(last?.action, 'block');
+
+  _resetAllTrackersForTests();
+  const pollScope = 'sess-read-poll';
+  for (let i = 0; i < 20; i += 1) {
+    last = evaluateToolCall(pollScope, 'composio_execute_tool', readArgs);
+    noteGuardrailToolResult(pollScope, 'composio_execute_tool', readArgs, `completed:${i}`);
+  }
+  assert.notEqual(last?.action, 'escalate');
+  assert.equal(last?.action, 'allow');
 
   // A WRITE slug with the same repetition DOES escalate (turn-kill is correct).
   _resetAllTrackersForTests();
@@ -314,11 +322,14 @@ test('evaluateToolCall: read slugs with SET/ADD SUBSTRINGS are not misclassified
   for (const readSlug of ['HUBSPOT_LIST_OFFSET_RECORDS', 'CRM_GET_ADDRESS', 'X_GET_ASSET_LIST']) {
     _resetAllTrackersForTests();
     const args = { tool_slug: readSlug, arguments: '{}' };
+    const scope = `sess-sub-${readSlug}`;
     let last;
     for (let i = 0; i < 12; i += 1) {
-      last = evaluateToolCall('sess-sub', 'composio_execute_tool', args);
+      last = evaluateToolCall(scope, 'composio_execute_tool', args);
+      noteGuardrailToolResult(scope, 'composio_execute_tool', args, `page-${i}`);
     }
-    assert.notEqual(last?.action, 'escalate', `${readSlug} (a read) must never escalate-kill`);
+    assert.equal(last?.mutating, false, `${readSlug} must classify as a read`);
+    assert.notEqual(last?.action, 'escalate', `${readSlug} changing retained bytes are a poll`);
   }
 });
 
@@ -1430,5 +1441,36 @@ test('the same-tool halt enforces only at the irreversible boundary or for a del
   assert.equal(last?.rule, 'same_mut_tool_repeat', JSON.stringify(last));
   assert.equal(last?.reversibilityKnown, false, JSON.stringify(last));
   assert.equal(last?.action, 'halt', JSON.stringify(last));
+});
+
+test('a generic local read with identical args and identical retained results escalates at hardStop', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-identical-local-read';
+  const args = { path: '/tmp/retained-local-read.txt' };
+  const retained = 'byte-identical-local-read-result';
+  let last;
+  for (let i = 0; i < 40; i += 1) {
+    last = applyMode(evaluateToolCall(scope, 'read_file', args), 'warn');
+    noteGuardrailToolResult(scope, 'read_file', args, retained);
+    if (last?.action === 'escalate') break;
+  }
+  assert.equal(last?.action, 'escalate', 'unchanged retained bytes are not a poll');
+  assert.equal(last?.rule, 'exact_args_repeat');
+  assert.equal(last?.mutating, false);
+});
+
+test('a generic local read whose retained bytes keep changing does not escalate', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-changing-local-read';
+  const args = { path: '/tmp/changing-local-read.txt' };
+  let last;
+  for (let i = 0; i < 20; i += 1) {
+    last = applyMode(evaluateToolCall(scope, 'read_file', args), 'warn');
+    noteGuardrailToolResult(scope, 'read_file', args, `poll-bytes-${i}`);
+  }
+  assert.notEqual(last?.action, 'escalate');
+  assert.equal(last?.action, 'allow');
 });
 

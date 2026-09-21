@@ -17,7 +17,8 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { appendEvent, resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
+const { appendEvent, listEvents, resetEventLog, createSession, writeToolOutput } = await import('./eventlog.js');
+const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../jev/client.js');
 const {
   argsHaveSendTarget,
   isMeaningfulPayloadValue,
@@ -399,6 +400,70 @@ test('evaluateGrounding: reused call id drops stale target bytes before the writ
     assert.deepEqual(result.sourceCallIds, []);
   } finally {
     _setGroundingJudgeForTests(null);
+  }
+});
+
+test('evaluateGrounding: a Jev throw still runs the configured judge', async () => {
+  resetEventLog();
+  _resetGroundingStateForTests();
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => { throw new Error('typesafe down'); });
+  const sess = createSession({ kind: 'chat' });
+  writeAuthoritativeOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.example Denver' });
+  let judged = 0;
+  _setGroundingJudgeForTests(async () => {
+    judged += 1;
+    return { grounded: false, reason: 'Payload contradicts Denver.' };
+  });
+  try {
+    const r = await evaluateGrounding(sess.id, 'composio_execute_tool', {
+      arguments: JSON.stringify({ to_email: 'target@firm.example', body: 'Houston' }),
+    });
+    assert.equal(judged, 1, 'configured judge still ran');
+    assert.equal(r.action, 'block');
+  } finally {
+    _setGroundingJudgeForTests(null);
+    _setTypesafeKeyForTests(undefined);
+    _setSystemOneFetchForTests(undefined);
+  }
+});
+
+test('evaluateGrounding: Jev is a shadow — the configured judge stays authoritative', async () => {
+  resetEventLog();
+  _resetGroundingStateForTests();
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'ungrounded',
+          probabilities: { ungrounded: 0.95, grounded: 0.05 },
+          confidence: 0.9,
+        },
+      },
+      usage: { input_tokens: 20, output_tokens: 2 },
+    }),
+  }));
+  const sess = createSession({ kind: 'chat' });
+  writeAuthoritativeOutput({ sessionId: sess.id, callId: 'c1', tool: 'run_worker', output: 'research about target@firm.example Denver' });
+  _setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'Consistent with Denver.' }));
+  try {
+    const r = await evaluateGrounding(sess.id, 'composio_execute_tool', {
+      arguments: JSON.stringify({ to_email: 'target@firm.example', body: 'Denver' }),
+    });
+    assert.equal(r.action, 'allow', 'Jev ungrounded does not open or block the write');
+    const shadow = listEvents(sess.id).find((event) => event.type === 'guardrail_tripped'
+      && (event.data as { kind?: string })?.kind === 'jev_grounding_shadow');
+    assert.ok(shadow, 'shadow agreement is logged');
+    assert.equal((shadow?.data as { agree?: boolean })?.agree, false);
+  } finally {
+    _setGroundingJudgeForTests(null);
+    _setTypesafeKeyForTests(undefined);
+    _setSystemOneFetchForTests(undefined);
   }
 });
 

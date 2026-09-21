@@ -42,6 +42,9 @@ export type HostNoProgressAttemptProjection =
       status: 'ok';
       attemptClass: NoProgressAttemptClass;
       consequence?: NoProgressConsequence;
+      /** True when every succeeded non-mutating business call in this frame
+       *  reused a prior signature and the same retained result bytes. */
+      identicalOutcome?: true;
     }
   | { status: 'unavailable'; reason: string };
 
@@ -1349,6 +1352,88 @@ const TURN_LOCAL_RESULT_READERS: ReadonlySet<string> = new Set([
   'tool_output_query',
 ]);
 
+function retainedOutcomeIdentity(
+  operation: string,
+  argumentDigest: string,
+  resultText: string,
+): string {
+  const resultDigest = createHash('sha256').update(resultText, 'utf8').digest('hex');
+  return createHash('sha256').update(JSON.stringify({
+    version: 1,
+    operation,
+    argumentDigest,
+    resultDigest,
+  }), 'utf8').digest('hex');
+}
+
+/**
+ * True when this frame is only successful non-mutating business reads whose
+ * (operation, argument digest, retained result bytes) already exist on this
+ * accepted source. Changing-world polls mint a new result digest. Missing
+ * tables fail open so sparse projection fixtures stay consequence-free.
+ */
+function identicalRetainedOutcomeStall(input: {
+  identity: HostNoProgressIdentity;
+  calls: readonly HistoryCall[];
+  matchedSettlements: readonly {
+    settlement: NoProgressSettlementRow;
+    call: HistoryCall;
+  }[];
+  resultTextByCallId: ReadonlyMap<string, string>;
+  database: Database.Database;
+}): boolean {
+  try {
+    const succeeded = input.matchedSettlements.filter(({ settlement }) => (
+      (settlement.business_call === 1 || settlement.mutating === 1)
+      && (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
+    ));
+    if (succeeded.length === 0) return false;
+    if (succeeded.some(({ settlement }) => settlement.mutating === 1 || settlement.business_call !== 1)) {
+      return false;
+    }
+    const currentIds = [...new Set(succeeded.map(({ call }) => call.callId))];
+    if (currentIds.length === 0) return false;
+    const currentRows = rows<{
+      logical_tool_call_id: string;
+      tool_name: string;
+      argument_digest: string;
+    }>(input.database, `
+      SELECT logical_tool_call_id, tool_name, argument_digest
+        FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ?
+         AND logical_tool_call_id IN (${currentIds.map(() => '?').join(', ')})
+    `, [input.identity.sessionId, input.identity.sourceUserSeq, ...currentIds]);
+    if (currentRows.length !== currentIds.length) return false;
+    const currentById = new Map(currentRows.map((row) => [row.logical_tool_call_id, row] as const));
+    const currentIdentities = succeeded.map(({ call }) => {
+      const row = currentById.get(call.callId);
+      const resultText = input.resultTextByCallId.get(call.callId);
+      if (!row || resultText === undefined) return null;
+      return retainedOutcomeIdentity(row.tool_name, row.argument_digest, resultText);
+    });
+    if (currentIdentities.some((value) => value === null)) return false;
+    const prior = rows<{
+      logical_tool_call_id: string;
+      tool_name: string;
+      argument_digest: string;
+      output_full: string;
+    }>(input.database, `
+      SELECT c.logical_tool_call_id, c.tool_name, c.argument_digest, o.output_full
+        FROM logical_tool_calls c
+        INNER JOIN tool_outputs o
+          ON o.session_id = c.session_id AND o.call_id = c.logical_tool_call_id
+       WHERE c.session_id = ? AND c.source_user_seq = ?
+         AND c.logical_tool_call_id NOT IN (${currentIds.map(() => '?').join(', ')})
+    `, [input.identity.sessionId, input.identity.sourceUserSeq, ...currentIds]);
+    const priorIdentities = new Set(prior.map((row) => (
+      retainedOutcomeIdentity(row.tool_name, row.argument_digest, row.output_full)
+    )));
+    return currentIdentities.every((value) => value !== null && priorIdentities.has(value));
+  } catch {
+    return false;
+  }
+}
+
 export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
   historyDelta: readonly unknown[];
 }, database: Database.Database = openEventLog()): HostNoProgressAttemptProjection {
@@ -1420,7 +1505,20 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
     if (matchedSettlements.some(({ settlement }) => (
       (settlement.business_call === 1 || settlement.mutating === 1)
       && (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
-    ))) return { status: 'ok', attemptClass: 'task_work' };
+    ))) {
+      const identicalOutcome = identicalRetainedOutcomeStall({
+        identity,
+        calls,
+        matchedSettlements,
+        resultTextByCallId,
+        database,
+      });
+      return {
+        status: 'ok',
+        attemptClass: 'task_work',
+        ...(identicalOutcome ? { identicalOutcome: true as const } : {}),
+      };
+    }
 
     if (input.historyDelta.some(refusedPreDispatch)) {
       const refusedMarkers = refusedPreDispatchMarkersByCallId(input.historyDelta);

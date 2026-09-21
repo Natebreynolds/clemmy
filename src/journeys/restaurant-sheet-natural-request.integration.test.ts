@@ -1900,7 +1900,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       assert.ok(delivery.edits.at(-1)?.startsWith(`${BOUNDED_SUCCESS}\n\nVerification note:`));
       // The unavailability reason stays on the review row for the console;
       // the chat gets one plain sentence saying the result stands unreviewed.
-      assert.match(delivery.edits.at(-1) ?? '', /I could not get this result independently reviewed, so it stands unreviewed\. The review model is not reachable with the current model setup; the console has the details\./);
+      assert.match(delivery.edits.at(-1) ?? '', /I could not get this result independently reviewed, so it stands unreviewed\. The review model is not reachable with the current model setup\. Ask me to re-check it, or choose a reachable review model in your model settings\./);
       assert.ok(!delivery.edits.at(-1)?.includes(String(boundedReview?.data.reason)), 'operator diagnosis stays out of the chat');
     },
   );

@@ -41,6 +41,7 @@ import {
   attestToolLocalInputInvalidity,
   ToolCallsCounter,
   ToolCallsLimitExceeded,
+  ToolGuardrailEscalated,
 } from '../runtime/harness/brackets.js';
 import {
   authorizeResolvedLogicalCallContract,
@@ -891,6 +892,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     // result would cost zero calls and could be retried forever.
     errorFunction: (_context, error) => {
       if (error instanceof ToolCallsLimitExceeded) throw error;
+      if (error instanceof ToolGuardrailEscalated) throw error;
       if (options.propagateInvocationError?.(error) === true) throw error;
       const details = error instanceof Error ? error.toString() : String(error);
       const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
@@ -1299,8 +1301,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       }
       const prepared = await prepareNativeToolArguments(target, resolvedArgs);
       if (prepared.status === 'invalid') {
+        const next = missingRequiredNextAction(
+          target,
+          prepared.schema,
+          resolvedArgs && typeof resolvedArgs === 'object' && !Array.isArray(resolvedArgs)
+            ? resolvedArgs as Record<string, unknown>
+            : {},
+        );
         return refuse({ error: 'arg_validation', schema: prepared.schema,
           ...(prepared.guidance ? { guidance: prepared.guidance } : {}),
+          ...(next ? { next } : {}),
           detail: prepared.detail, violations: prepared.violations });
       }
       const dispatchArgs = prepared.status === 'prepared' ? prepared.args : resolvedArgs;
@@ -1514,6 +1524,23 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     if (typeof rawInput !== 'string') return 'unproven';
     return parameters.safeParse(parsedInput).success ? 'unproven' : 'invalid';
   });
+}
+
+function missingRequiredNextAction(
+  target: string,
+  schema: unknown,
+  args: Record<string, unknown>,
+): string | undefined {
+  const required = schema && typeof schema === 'object' && !Array.isArray(schema)
+    && Array.isArray((schema as { required?: unknown }).required)
+    ? (schema as { required: unknown[] }).required.filter((key): key is string => typeof key === 'string')
+    : [];
+  const missing = required.filter((key) => {
+    const value = args[key];
+    return value === undefined || value === null || value === '';
+  });
+  if (missing.length === 0) return undefined;
+  return `${target} needs ${missing.join(', ')}. If those locators are not in this conversation, ask what to act on instead of guessing.`;
 }
 
 /**

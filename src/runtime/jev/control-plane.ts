@@ -1,0 +1,432 @@
+/**
+ * Control-plane adapters: catalog/skill ranking, primer relevance, grounding.
+ * Every function fail-opens to the caller’s existing order/verdict.
+ */
+
+import { evaluateSystemOne } from './client.js';
+import type { ChoiceAnswer, NoulAnswer, SystemOneQuestions } from './system-one.js';
+
+const RANK_TIMEOUT_MS = 1_200;
+const PRIMER_TIMEOUT_MS = 1_200;
+const GATE_TIMEOUT_MS = 1_500;
+const PRIMER_DROP_BELOW = 0.25;
+const GROUNDING_CONFIDENCE_MIN = 0.55;
+const COMPLETION_CONFIDENCE_MIN = 0.6;
+const COMPLETION_TIMEOUT_MS = 1_500;
+
+export interface NamedCandidate {
+  name: string;
+}
+
+export interface PrimerHitLike {
+  title: string;
+  snippet: string;
+  score: number;
+}
+
+export async function prepareSharedEvidenceDecisionsWithJev<
+  S extends NamedCandidate,
+  H extends PrimerHitLike,
+>(
+  query: string,
+  input: {
+    candidates?: S[];
+    hits?: H[];
+    label?: (candidate: S) => string;
+    timeoutMs?: number;
+    sessionId?: string;
+  },
+): Promise<{ candidates: S[]; hits: H[] }> {
+  const candidates = input.candidates ?? [];
+  const hits = input.hits ?? [];
+  const windowCandidates = candidates.slice(0, 255);
+  const restCandidates = candidates.slice(255);
+  const windowHits = hits.slice(0, 24);
+  if (windowCandidates.length < 2 && windowHits.length === 0) {
+    return { candidates, hits };
+  }
+  const questions: SystemOneQuestions = {};
+  if (windowCandidates.length >= 2) {
+    const criteria: Record<string, string | null> = {};
+    for (const candidate of windowCandidates) {
+      const label = input.label?.(candidate)?.replace(/\s+/g, ' ').trim().slice(0, 240);
+      criteria[candidate.name] = label || null;
+    }
+    questions.which = {
+      type: 'choice',
+      instructions: 'Which of these operations or skills, if any, best matches the user request? Prefer an exact capability over a near-miss.',
+      criteria,
+    };
+  }
+  for (const [index, hit] of windowHits.entries()) {
+    questions[`hit_${index}`] = {
+      type: 'noul',
+      instructions: `Is this memory relevant to the current request? Title: ${hit.title.slice(0, 160)}. Snippet: ${hit.snippet.slice(0, 360)}`,
+      criteria: {
+        true: 'It states a fact, preference, or artifact the request needs.',
+        false: 'It is off-topic, stale, or a weak neighbor of the request.',
+      },
+    };
+  }
+  const channel = windowCandidates.length >= 2 && windowHits.length > 0
+    ? 'jev-prepare'
+    : windowCandidates.length >= 2
+      ? 'jev-rank'
+      : 'jev-primer';
+  const result = await evaluateSystemOne({
+    state: { request: query.replace(/\s+/g, ' ').trim().slice(0, 800) },
+    questions,
+    timeoutMs: input.timeoutMs ?? Math.max(RANK_TIMEOUT_MS, PRIMER_TIMEOUT_MS),
+    sessionId: input.sessionId,
+    channel,
+  });
+  let nextCandidates = candidates;
+  if (result.ok && windowCandidates.length >= 2) {
+    const answer = result.answers.which as ChoiceAnswer | undefined;
+    if (answer) {
+      const ranked = [...windowCandidates].sort((left, right) => {
+        const leftScore = answer.probabilities[left.name] ?? 0;
+        const rightScore = answer.probabilities[right.name] ?? 0;
+        return rightScore - leftScore || windowCandidates.indexOf(left) - windowCandidates.indexOf(right);
+      });
+      nextCandidates = restCandidates.length ? [...ranked, ...restCandidates] : ranked;
+    }
+  }
+  let nextHits = hits;
+  if (result.ok && windowHits.length > 0) {
+    const kept: H[] = [];
+    for (const [index, hit] of windowHits.entries()) {
+      const answer = result.answers[`hit_${index}`] as NoulAnswer | undefined;
+      if (!answer || answer.noul >= PRIMER_DROP_BELOW) kept.push(hit);
+    }
+    nextHits = kept.length === 0
+      ? [windowHits[0]!, ...hits.slice(windowHits.length)]
+      : [...kept, ...hits.slice(windowHits.length)];
+  }
+  return { candidates: nextCandidates, hits: nextHits };
+}
+
+export async function rerankNamedCandidatesWithJev<T extends NamedCandidate>(
+  query: string,
+  candidates: T[],
+  opts?: { label?: (candidate: T) => string; timeoutMs?: number; sessionId?: string },
+): Promise<T[]> {
+  if (candidates.length < 2) return candidates;
+  const prepared = await prepareSharedEvidenceDecisionsWithJev(query, {
+    candidates,
+    label: opts?.label,
+    timeoutMs: opts?.timeoutMs,
+    sessionId: opts?.sessionId,
+  });
+  return prepared.candidates;
+}
+
+export async function filterPrimerHitsWithJev<T extends PrimerHitLike>(
+  query: string,
+  hits: T[],
+  opts?: { sessionId?: string },
+): Promise<T[]> {
+  if (hits.length === 0) return hits;
+  const prepared = await prepareSharedEvidenceDecisionsWithJev(query, {
+    hits,
+    sessionId: opts?.sessionId,
+  });
+  return prepared.hits;
+}
+
+export interface ProvenStrategyCandidate {
+  id: string;
+  objective: string;
+  toolsUsed: string[];
+}
+
+const PROVEN_STRATEGY_CONFIDENCE_MIN = 0.6;
+const PROVEN_STRATEGY_NOUL_MIN = 0.6;
+const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
+
+/** Pick one proven past run that can skip discovery, or none. Fail-open to null. */
+export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCandidate>(
+  query: string,
+  strategies: T[],
+  opts?: { sessionId?: string },
+): Promise<T | null> {
+  if (strategies.length === 0) return null;
+  const window = strategies.slice(0, 8);
+  if (window.length === 1) {
+    const only = window[0]!;
+    const result = await evaluateSystemOne({
+      state: {
+        request: query.replace(/\s+/g, ' ').trim().slice(0, 800),
+        proven: { objective: only.objective, toolsUsed: only.toolsUsed },
+      },
+      questions: {
+        match: {
+          type: 'noul',
+          instructions: 'Does this proven past run match the current request well enough to skip tool discovery?',
+          criteria: {
+            true: 'Same job. The proven tools will fulfill this request.',
+            false: 'Different job, extra tools needed, or not sure.',
+          },
+        },
+      },
+      timeoutMs: PROVEN_STRATEGY_TIMEOUT_MS,
+      sessionId: opts?.sessionId,
+      channel: 'jev-proven-strategy',
+    });
+    if (!result.ok) return null;
+    const answer = result.answers.match as NoulAnswer | undefined;
+    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) return null;
+    return only;
+  }
+  const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
+  for (const strategy of window) {
+    criteria[strategy.id] = `${strategy.objective.slice(0, 160)} · ${strategy.toolsUsed.join(', ')}`.slice(0, 240);
+  }
+  const result = await evaluateSystemOne({
+    state: { request: query.replace(/\s+/g, ' ').trim().slice(0, 800) },
+    questions: {
+      which: {
+        type: 'choice',
+        instructions: 'Which proven past run matches this request well enough to skip tool discovery? Choose none unless the same tools will fulfill it.',
+        criteria,
+      },
+    },
+    timeoutMs: PROVEN_STRATEGY_TIMEOUT_MS,
+    sessionId: opts?.sessionId,
+    channel: 'jev-proven-strategy',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.which as ChoiceAnswer | undefined;
+  if (!answer || answer.choice === 'none' || answer.confidence < PROVEN_STRATEGY_CONFIDENCE_MIN) return null;
+  return window.find((strategy) => strategy.id === answer.choice) ?? null;
+}
+
+export async function tryJevGroundingVerdict(
+  payload: string,
+  sources: Array<{ excerpt: string }>,
+  opts?: { sessionId?: string; recordMetric?: boolean },
+): Promise<{ grounded: boolean; reason: string; model: string } | null> {
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: [
+        'Verify an irreversible outgoing payload against the session source artifacts for the same target.',
+        'Mark ungrounded only for a concrete load-bearing contradiction.',
+        'A SUCCESS: send-confirmation proves a send happened, not that its content was correct. Prefer research/extraction artifacts.',
+        'If two sources contradict each other about a load-bearing fact for this target, the payload is not grounded.',
+      ].join(' '),
+      criteria: {
+        grounded: 'The payload is consistent with the sources, or any mismatch is generic/unverifiable.',
+        ungrounded: 'A load-bearing fact in the payload contradicts the sources (identity, geography, numbers, claimed research), or two sources contradict each other about that fact.',
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: {
+      payload: payload.slice(0, 6_000),
+      sources: sources.map((source) => source.excerpt.slice(0, 5_000)),
+    },
+    questions,
+    timeoutMs: GATE_TIMEOUT_MS,
+    sessionId: opts?.sessionId,
+    channel: 'jev-grounding',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || answer.confidence < GROUNDING_CONFIDENCE_MIN) return null;
+  const durationMs = Date.now() - started;
+  const record = opts?.recordMetric !== false;
+  if (answer.choice === 'ungrounded') {
+    if (record) await recordJevJudgeMetric('grounding', 'blocked', result.model, durationMs);
+    return { grounded: false, reason: 'Jev found a load-bearing contradiction between the payload and the session sources.', model: result.model };
+  }
+  if (answer.choice === 'grounded') {
+    if (record) await recordJevJudgeMetric('grounding', 'passed', result.model, durationMs);
+    return { grounded: true, reason: 'Jev found no load-bearing contradiction with the session sources.', model: result.model };
+  }
+  return null;
+}
+
+export interface JevCompletionVerdict {
+  done: boolean;
+  reason: string;
+  awaitingUser?: boolean;
+  blocked?: boolean;
+  repairScope?: 'reply_format';
+  judgeModelId: string;
+  choice?: string;
+  confidence?: number;
+  replyMatchesReceipts?: number;
+}
+
+const COMPLETION_REASONS = {
+  done: 'Jev found verifiable evidence of the named deliverable.',
+  incomplete: 'Jev found named work still missing.',
+  awaiting: 'Jev found a genuine question for the user.',
+  blocked: 'Jev found the work cannot finish with available tools.',
+  revise_reply: 'Jev found only a final-answer format issue.',
+} as const;
+
+function mapCompletionChoice(choice: string): Omit<JevCompletionVerdict, 'judgeModelId'> | null {
+  const key = choice.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (key === 'done') return { done: true, reason: COMPLETION_REASONS.done };
+  if (key === 'incomplete') return { done: false, reason: COMPLETION_REASONS.incomplete };
+  if (key === 'awaiting') return { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting };
+  if (key === 'blocked') return { done: false, blocked: true, reason: COMPLETION_REASONS.blocked };
+  if (key === 'revise_reply' || key === 'revisereply') {
+    return { done: false, repairScope: 'reply_format', reason: COMPLETION_REASONS.revise_reply };
+  }
+  return null;
+}
+
+/**
+ * Fast completion gate. A confident Choice skips the Settings judge; low
+ * confidence, timeout, or a missing key returns null so that judge still runs.
+ */
+export async function tryJevCompletionVerdict(
+  objective: string,
+  assistantResponse: string,
+  opts?: {
+    sessionId?: string;
+    toolCallSummary?: string;
+    verifiedReads?: string;
+    coverage?: {
+      complete: boolean;
+      outcomeEvidence: Array<{ toolName: string; outcome: string; contentComplete?: boolean }>;
+    };
+  },
+): Promise<JevCompletionVerdict | null> {
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: [
+        'Audit whether the assistant finished the user objective.',
+        'coverage.outcomeEvidence lists settled business receipts for this source. Discovery/control rows are not receipts.',
+        'DONE when those receipts cover the named work and the response reports them (quoted output, path, handle, or listed values).',
+        'A successful write or read receipt is execution of that work. Do not mark INCOMPLETE merely because the receipt is a write rather than a read.',
+        'Do not accept a plan or "task complete" as done.',
+        'AWAITING if the response asks the user a genuine direction or authorization question.',
+        'BLOCKED if another attempt cannot finish it (missing access, missing record, refused tool).',
+        'REVISE_REPLY only for format or extra wording when the work itself is verified.',
+        'INCOMPLETE if a named deliverable has no receipt and another attempt could still fetch it.',
+      ].join(' '),
+      criteria: {
+        done: 'Verified receipts cover the named work, and the response reports them.',
+        incomplete: 'A named deliverable has no verified receipt and another attempt could still fetch it.',
+        awaiting: 'The response asks the user a genuine direction or authorization question.',
+        blocked: 'The work cannot finish with available tools or access.',
+        revise_reply: 'Work is verified; only final-answer format or extra wording is wrong.',
+      },
+    },
+  };
+  if (opts?.coverage?.complete) {
+    questions.matches = {
+      type: 'noul',
+      instructions: 'Does the assistant response report the verified receipts without inventing extra load-bearing facts?',
+      criteria: {
+        true: 'The response states the receipt values (paths, records, events, counts) without adding unsupported specifics.',
+        false: 'The response invents load-bearing facts, omits a named receipt, or only promises the work.',
+      },
+    };
+  }
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: {
+      objective: objective.replace(/\s+/g, ' ').trim().slice(0, 1_200),
+      response: assistantResponse.replace(/\s+/g, ' ').trim().slice(0, 6_000),
+      ...(opts?.coverage
+        ? {
+            coverage: {
+              complete: opts.coverage.complete,
+              outcomeEvidence: opts.coverage.outcomeEvidence.slice(0, 12).map((row) => ({
+                toolName: row.toolName,
+                outcome: row.outcome,
+                contentComplete: row.contentComplete !== false,
+              })),
+            },
+          }
+        : {}),
+      ...(opts?.verifiedReads
+        ? { verifiedReads: opts.verifiedReads.replace(/\s+/g, ' ').trim().slice(0, 4_000) }
+        : {}),
+      ...(opts?.toolCallSummary ? { evidence: opts.toolCallSummary.replace(/\s+/g, ' ').trim().slice(0, 2_500) } : {}),
+    },
+    questions,
+    timeoutMs: COMPLETION_TIMEOUT_MS,
+    sessionId: opts?.sessionId,
+    channel: 'jev-completion',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || answer.confidence < COMPLETION_CONFIDENCE_MIN) return null;
+  const mapped = mapCompletionChoice(answer.choice);
+  if (!mapped) return null;
+  const matches = result.answers.matches as NoulAnswer | undefined;
+  const durationMs = Date.now() - started;
+  const passed = mapped.done;
+  await recordJevJudgeMetric('completion', passed ? 'passed' : 'blocked', result.model, durationMs);
+  return {
+    ...mapped,
+    judgeModelId: result.model,
+    choice: answer.choice,
+    confidence: answer.confidence,
+    ...(typeof matches?.noul === 'number' ? { replyMatchesReceipts: matches.noul } : {}),
+  };
+}
+
+export async function tryJevOutputGroundingVerdict(
+  claims: Array<{ raw: string; context?: string }>,
+  sources: Array<{ excerpt: string }>,
+  opts?: { sessionId?: string },
+): Promise<{ verdict: 'grounded' | 'contradicted' | 'unverifiable'; reason: string } | null> {
+  if (claims.length === 0) return null;
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: 'Verify load-bearing figures against the session sources. Accept rounding, aggregation, and unit conversion. Contradicted only when a source gives a different value that no rounding reconciles. Unverifiable only when nothing in the sources could produce the figure.',
+      criteria: {
+        grounded: 'Every figure is consistent with the sources, including derived/rounded/aggregated values.',
+        contradicted: 'A figure conflicts with a source value that no rounding or aggregation reconciles.',
+        unverifiable: 'A load-bearing figure has no plausible source.',
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: {
+      figures: claims.slice(0, 16).map((claim) => `${claim.raw}${claim.context ? ` — ${claim.context.slice(0, 120)}` : ''}`),
+      sources: sources.slice(0, 8).map((source) => source.excerpt.slice(0, 1_500)),
+    },
+    questions,
+    timeoutMs: GATE_TIMEOUT_MS,
+    sessionId: opts?.sessionId,
+    channel: 'jev-output-grounding',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || answer.confidence < GROUNDING_CONFIDENCE_MIN) return null;
+  const choice = answer.choice.trim().toLowerCase();
+  if (choice !== 'grounded' && choice !== 'contradicted' && choice !== 'unverifiable') return null;
+  const durationMs = Date.now() - started;
+  const outcome = choice === 'grounded' ? 'passed' : choice === 'contradicted' ? 'blocked' : 'advisory';
+  await recordJevJudgeMetric('output_grounding', outcome, result.model, durationMs);
+  const reason = choice === 'grounded'
+    ? 'Jev found the figures consistent with the session sources.'
+    : choice === 'contradicted'
+      ? 'Jev found a figure that conflicts with the session sources.'
+      : 'Jev found a load-bearing figure with no plausible source.';
+  return { verdict: choice, reason };
+}
+
+async function recordJevJudgeMetric(
+  lane: 'completion' | 'grounding' | 'output_grounding',
+  outcome: 'passed' | 'blocked' | 'advisory',
+  modelId: string,
+  durationMs: number,
+): Promise<void> {
+  try {
+    const { recordJudgeMetric } = await import('../harness/judge-family.js');
+    recordJudgeMetric({ lane, outcome, durationMs, modelId, fast: true });
+  } catch { /* metrics never block the gate */ }
+}

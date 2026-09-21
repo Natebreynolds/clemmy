@@ -14208,7 +14208,7 @@ async function processOneRunFile(
           ? autoRetestRunId
             ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); ${activateAfterCreationTest ? "it'll auto-enable here on pass" : 'it will remain disabled'}.\n\n${lines.join('\n')}`
             : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
-        : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nFix the flagged step(s) with workflow_update (e.g. bind the right tool), then re-test. To run it as-is anyway: workflow_set_enabled.`;
+        : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rebind them and re-test. If you'd rather run it as it stands, say so and I'll enable it.`;
       const report = {
         workflowName: workflow.data.name,
         outcome: creationReady ? 'done' as const : 'blocked' as const,

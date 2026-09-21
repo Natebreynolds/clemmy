@@ -167,6 +167,8 @@ export async function buildUnifiedTurnPrimer(input: {
     return true;
   });
 
+  const retrievedBeforeFilter = result.hits.length;
+
   const recallId = createRecallRunId();
   result.recallId = recallId;
   const preamble = '[MEMORY PRIMER]';
@@ -186,7 +188,7 @@ export async function buildUnifiedTurnPrimer(input: {
   // goes to the hits themselves.
   const maxChars = Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
   const recallBudget = Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
-  const retrievedHitCount = result.hits.length;
+  const retrievedHitCount = retrievedBeforeFilter;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget);
   result.answerability = projectedRecallAnswerability(result, result.hits);
   const useRule = result.purpose === 'ambient'

@@ -124,7 +124,7 @@ import pino from 'pino';
 import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
 import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
 import * as approvalRegistry from './approval-registry.js';
-import { classifyMessageIntent } from '../../assistant/message-intent.js';
+import { classifyMessageIntent, selfContainedConversation, intentRequestsNoToolWork } from '../../assistant/message-intent.js';
 import {
   honestFailureReportSettles,
   resolveJudgeResponder,
@@ -143,6 +143,8 @@ import {
   observeWorkerFanoutStart,
   rearmedWatcherCadence,
   shouldStartWatcherCheck,
+  watcherFanoutRearmDelayMs,
+  watcherEscalation,
   summarizeWorkerProgressForWatcher,
   watcherCheckIntervalTools,
   watcherJudgeEnabled,
@@ -3342,6 +3344,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
+  /** A drift verdict is outstanding. Keeps the watcher WATCHING after it has
+   *  spent its right to speak — see shouldStartWatcherCheck. Cleared by the
+   *  next on_track. */
+  let hostWatcherUnresolvedDrift = false;
+  /** Steers the model actually RECEIVED. An injected-but-undelivered steer was
+   *  never seen, so it is not a warning anyone ignored. */
+  let hostWatcherDeliveredSteers = 0;
   let hostWatcherLastCheckedAt = 0;
   let hostWatcherCheckInFlight = false;
   let hostWatcherLastFailureSeq = 0;
@@ -3384,6 +3393,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     checksUsed: hostWatcherChecksUsed,
     maxChecks: MAX_WATCHER_CHECKS,
     checkInFlight: hostWatcherCheckInFlight,
+    unresolvedDrift: hostWatcherUnresolvedDrift,
   });
   /** One NON-BLOCKING trajectory check (the caller has already passed the
    * gate). Reads the parent trajectory plus whatever the children have logged
@@ -3442,7 +3452,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity) !== workerProgress
             ? 'worker_progress_changed' : undefined;
         const stale = staleReason !== undefined;
+        // Outstanding drift keeps the watch alive; an on_track clears it. The
+        // escalation is RECORDED, not yet enforced: `bound` would end a turn,
+        // and a change that can end the owner's work has to be observed on real
+        // traffic before it is trusted — the same shadow-first discipline the
+        // grounding gate adopted. Live 2026-09-21 this state was reached at
+        // 18:37 and the turn then ran six unsupervised minutes.
+        if (verdict) hostWatcherUnresolvedDrift = !verdict.onTrack;
+        const escalation = watcherEscalation({
+          verdict: verdict ? (verdict.onTrack ? 'on_track' : 'drift') : null,
+          deliveredSteers: hostWatcherDeliveredSteers,
+          maxInjections: MAX_WATCHER_INJECTIONS,
+          hasSteer: Boolean(verdict?.steer && String(verdict.steer).trim()),
+        });
         recordWatcherReview('completed', { reviewId, objectiveDigest,
+          escalation,
+          deliveredSteers: hostWatcherDeliveredSteers,
+          unresolvedDrift: hostWatcherUnresolvedDrift,
           verdict: verdict ? (verdict.onTrack ? 'on_track' : 'drift') : 'unavailable',
           stale, ...(staleReason ? { staleReason } : {}),
           miss: verdict?.miss, steer: verdict?.steer, review: verdict?.review,
@@ -3468,7 +3494,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     })();
   };
   /** A quick worker batch already reaches the ordinary continuation and final
-   * review. Only re-arm the extra in-flight review if it lasts 30 seconds;
+   * review. Only re-arm the extra in-flight review once the batch has run for
+   * watcherFanoutRearmDelayMs;
    * launching it at the first worker start reviews an incomplete dispatch and
    * spends a model call even when all children finish moments later. */
   const withHostWatcherFanoutRearm = async <T>(
@@ -3488,7 +3515,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         };
         if (parentScope) harnessRunContextStorage.run(parentScope, start);
         else start();
-      }, 30_000);
+      }, watcherFanoutRearmDelayMs());
       reviewTimer.unref();
     }, exactHostIdentity().sourceUserSeq);
     try {
@@ -3762,9 +3789,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // wording or whether one business call happened to succeed. Keep the
     // legacy zero-tool fallback, but never let it waive attempted work.
     const judgedText = decision?.reply ?? replyText;
+    const intent = classifyMessageIntent(objective);
+    if (
+      selfContainedConversation(objective, intent)
+      && businessCalls.length === 0
+      && settled.count === 0
+    ) {
+      try {
+        appendEvent({
+          sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_review_skipped',
+          data: {
+            sourceUserSeq: identity.sourceUserSeq,
+            reason: 'self_contained_computation',
+            objective, reply: judgedText,
+          },
+        });
+      } catch { /* skip is observability */ }
+      return 'done';
+    }
     const gateInput = {
       optIn: true,
-      actionIntent: classifyMessageIntent(objective).intent === 'action',
+      actionIntent: intent.intent === 'action',
       meaningfulToolEvidence: businessCalls.length > 0,
       sourceWorkAttempted: sourceAttemptedCompletionWork(identity),
       settledSourceEffects: settled.count,
@@ -3779,6 +3824,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       nextAction: decision?.nextAction ?? 'completed',
       promiseShaped: isPromiseShapedReply(judgedText),
       claimedCompletedWork: replyClaimsCompletedWork(judgedText),
+      conversationalIntent: intentRequestsNoToolWork(intent.intent),
       openApprovalCard,
     };
     const gate = shouldRunObjectiveJudge(gateInput);
@@ -3870,6 +3916,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
       verdict = await hostObjectiveJudge(objective, judgedReply, {
+        sessionId: identity.sessionId,
+        verifiedReads: readEvidence.summary,
+        verifiedReadResults: readEvidence.results,
         fullSourceEvidence: true,
         ...(policy.status === 'captured' ? { boundaryJudgeSelection: policy.policy.judgeSelection } : {}),
         // The reviewer opens retained results itself when its verdict depends
@@ -3948,6 +3997,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           lane: 'host_v1',
           kind: 'completion',
           fulfills: verdict.done && !verdict.awaitingUser,
+          ...(verdict.fast ? { fast: true } : {}),
+          ...(verdict.jevAttempt ? { jevAttempt: verdict.jevAttempt } : {}),
           ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
           reason: verdict.reason.slice(0, 600),
           ...(blockedByReview ? { blocked: true } : {}),
@@ -8459,6 +8510,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               attemptClass: attempt.attemptClass,
               authority: authority.authority,
               ...(attempt.consequence ? { consequence: attempt.consequence } : {}),
+              ...(attempt.identicalOutcome ? { identicalOutcome: true } : {}),
             });
             noProgressState = decision.state;
             // GOVERNOR VISIBILITY. Every termination on 2026-09-03 was
@@ -8753,6 +8805,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         if (watcherObjectiveForStep === judgedObjective()) {
           modelInput.push({ role: 'user', content: watcherDirectiveForStep });
           hostWatcherInjectionsUsed += 1;
+          hostWatcherDeliveredSteers += 1;
           recordWatcherReview('injected', { reviewId: watcherReviewForStep });
         } else {
           recordWatcherReview('discarded', { reviewId: watcherReviewForStep, reason: 'objective_changed' });
@@ -10544,6 +10597,7 @@ export function completionVerdictForAcceptedSource(input: {
   /** The reviewer's finding, as recorded. */
   reason?: string;
   judgeModelId?: string;
+  fast?: boolean;
   judgeProvider?: 'claude' | 'codex' | 'byo';
   judgeProviderId?: string;
   objectiveDigest?: string;
@@ -10597,6 +10651,7 @@ export function completionVerdictForAcceptedSource(input: {
         ...(typeof data.settledEffectCount === 'number'
           ? { settledEffectCount: data.settledEffectCount } : {}),
         ...(typeof data.judgeModelId === 'string' ? { judgeModelId: data.judgeModelId } : {}),
+        ...(data.fast === true ? { fast: true } : {}),
         ...(data.judgeProvider === 'claude' || data.judgeProvider === 'codex' || data.judgeProvider === 'byo'
           ? { judgeProvider: data.judgeProvider } : {}),
         ...(typeof data.judgeProviderId === 'string' ? { judgeProviderId: data.judgeProviderId } : {}),

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
+import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -13,6 +14,9 @@ import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output
 // owned by compaction, which is now budgeted from the routed model's REAL
 // window (compactionBudgetForModel) instead of a fixed 200K.
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
+/** When the full payload is parked for recall, the prompt keeps a smaller
+ *  field/index view plus a source reference instead of re-reading the dump. */
+export const PROMPT_INLINE_RECALLABLE_RESULT_CHARS = 4_000;
 
 /** These local readers already validate max_chars and format their preview.
  * The outer bracket must not silently impose its smaller default afterwards.
@@ -288,11 +292,14 @@ export function formatRecallableToolText(
   text: string,
   options: RecallableToolTextOptions = {},
 ): string {
-  const maxChars = options.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS;
   const active = getToolOutputContext();
   const sessionId = options.sessionId ?? active?.sessionId;
   const callId = options.callId ?? active?.callId;
   const toolName = options.toolName ?? active?.toolName ?? 'tool';
+  const maxChars = options.maxChars
+    ?? (sessionId && callId && actionTopologyRoleFor(toolName) !== 'control'
+      ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS
+      : DEFAULT_TOOL_RESULT_MAX_CHARS);
   let persistenceFailed = false;
   let hostAnnotations = [...(options.hostAnnotations ?? [])].filter((note) => note.length > 0);
 
