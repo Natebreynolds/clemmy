@@ -60,6 +60,22 @@ export function watcherCheckIntervalTools(): number {
   return Number.isFinite(raw) && raw >= 2 ? raw : 12;
 }
 
+/**
+ * How long a worker fan-out must stay in flight before it earns its own
+ * trajectory check. A quick batch already reaches the ordinary continuation
+ * review, so re-arming immediately reviews an incomplete dispatch and spends a
+ * model call for nothing.
+ *
+ * It is configurable because a wall-clock delay is otherwise untestable: a
+ * batch that settles in milliseconds can never cross a hardcoded 30 seconds,
+ * so the fan-out re-arm pin silently stopped proving anything when the delay
+ * landed. The default is the production value.
+ */
+export function watcherFanoutRearmDelayMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_WATCHER_FANOUT_REARM_MS', '30000') ?? '30000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+}
+
 /** Hard cap on steers per turn — the watcher nudges, it never nags. */
 export const MAX_WATCHER_INJECTIONS = 2;
 
@@ -96,16 +112,80 @@ export interface WatcherGateInput {
   maxChecks: number;
   /** A previous check is still in flight — never stack checks. */
   checkInFlight: boolean;
+  /** The last completed verdict was `drift` and its steer has not produced a
+   *  correction. Keeps the watcher WATCHING after it has stopped nudging.
+   *  Absent/false preserves the original gate exactly. */
+  unresolvedDrift?: boolean;
 }
 
+/**
+ * NAGGING AND WATCHING ARE DIFFERENT THINGS.
+ *
+ * The injection cap exists so the watcher does not repeat itself, and that is
+ * right. But it gated the CHECK, so two delivered steers ended supervision
+ * outright — and a turn that ignored both then ran unobserved.
+ *
+ * Live 2026-09-21, "create a workflow for my old market leader accounts": the
+ * watcher caught drift 90 seconds in and said exactly the right thing —
+ * "publish the required plan of substance now, before loading skills" — then
+ * said it again. Both were injected AND delivered. The model kept searching.
+ * Injections hit 2 of 2 at 18:36:08, the gate closed, and the turn ran
+ * unsupervised from 18:37 to 18:43 while repeating three tool_search queries it
+ * had already run. The owner stopped it at 8.5 minutes, 90 tool calls and
+ * 282,762 uncached tokens, with no plan published.
+ *
+ * So an exhausted injection budget now silences the steer, not the watch:
+ * while drift is unresolved the check still runs, and `watcherEscalation`
+ * decides whether that check may speak. maxChecks remains the real bound.
+ */
 export function shouldStartWatcherCheck(input: WatcherGateInput): boolean {
+  const mayStillSteer = input.injectionsUsed < input.maxInjections;
   return (
     input.enabled &&
     !input.checkInFlight &&
-    input.injectionsUsed < input.maxInjections &&
+    (mayStillSteer || input.unresolvedDrift === true) &&
     input.checksUsed < input.maxChecks &&
     input.totalToolCalls - input.lastCheckedAtToolCalls >= input.checkIntervalTools
   );
+}
+
+/**
+ * What a completed check is allowed to DO, once it has something to say.
+ *
+ * A steer the model ignored is evidence the steer is not working. Repeating it
+ * a third time is the definition of nagging, and doing nothing is how a turn
+ * burns six unsupervised minutes. So the third finding on unresolved drift
+ * stops being advice and becomes a bound: end the turn and deliver the
+ * reviewer's own words, resumable, with the work kept.
+ *
+ *   observe — nothing is wrong, or nothing new to say
+ *   steer   — say it; the model has not been told this yet
+ *   bound   — it has been told, twice, and did not comply
+ *
+ * `bound` is not a hard block on a write: it ends a turn that is spending the
+ * owner's money without converging, and the owner can continue from it. That
+ * keeps the guardrails-inform rule while still being a stop the model cannot
+ * simply decline.
+ */
+export type WatcherEscalation = 'observe' | 'steer' | 'bound';
+
+export interface WatcherEscalationInput {
+  /** The verdict this check just produced. */
+  verdict: 'on_track' | 'drift' | null;
+  /** Steers actually DELIVERED to the model — an injected-but-undelivered
+   *  steer was never seen, so it cannot count as having been told. */
+  deliveredSteers: number;
+  maxInjections: number;
+  /** Does the finding carry words to act on? A drift verdict with an empty
+   *  steer has nothing to deliver and must not bound a turn on silence. */
+  hasSteer: boolean;
+}
+
+export function watcherEscalation(input: WatcherEscalationInput): WatcherEscalation {
+  if (input.verdict !== 'drift') return 'observe';
+  if (!input.hasSteer) return 'observe';
+  if (input.deliveredSteers < input.maxInjections) return 'steer';
+  return 'bound';
 }
 
 /**

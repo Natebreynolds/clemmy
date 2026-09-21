@@ -32,6 +32,11 @@ process.env.CLEMMY_DEBATE_MODE = 'off';
 // fires and every observed check is attributable to the fan-out re-arm.
 delete process.env.CLEMMY_WATCHER_JUDGE;
 delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
+// The re-arm waits for the batch to prove it is long-running before spending a
+// model call. In production that is 30 seconds; a fixture batch settles in
+// milliseconds, so the wall-clock delay is the one thing here that MUST be
+// scaled or this pin can never observe the window it exists to prove.
+process.env.CLEMMY_WATCHER_FANOUT_REARM_MS = '25';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'watcher-fanout-rearm-fixture\n');
 
