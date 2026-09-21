@@ -47,6 +47,9 @@ function JudgeMetrics({ metrics }: { metrics?: JudgeMetricsSnapshot }) {
               avg <span className="text-fg">{formatJudgeDuration(total.avgMs)}</span>,
               max <span className="text-fg">{formatJudgeDuration(total.maxMs)}</span>,
               cap <span className="text-fg">{formatJudgeDuration(metrics?.timeoutMs)}</span>.
+              {(total.fastDecisions ?? 0) > 0 && (
+                <> {total.fastDecisions} fast.</>
+              )}
               {(total.timeouts > 0 || total.errors > 0 || total.invalid > 0) && (
                 <> {total.timeouts} timeout, {total.errors} error, {total.invalid} invalid.</>
               )}
@@ -162,12 +165,32 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           </Select>,
           <>
             {inactive('judge')}
+            {/* The owner connected a typed fast checker, watched it serve real
+                verdicts, and found nothing about it on the page that claims to
+                say "who checks". It is deliberately NOT a dropdown option: it
+                answers FIRST and the selected judge backstops it, so offering
+                it as a peer choice would let someone remove their own backstop
+                without being told. Naming the arrangement is the honest fix.
+                Shown only once it has actually served — a count from the
+                ledger, never a claim that it is configured. */}
+            {(judgeMetrics?.total?.fastDecisions ?? 0) > 0 && (
+              <div className="mt-1 text-caption text-muted">
+                A fast checker answered first on{' '}
+                <span className="text-fg">{judgeMetrics?.total?.fastDecisions}</span>{' '}
+                {judgeMetrics?.total?.fastDecisions === 1 ? 'check' : 'checks'} — this model backstops it.
+              </div>
+            )}
             {secondOpinionOn && judgeSameAsBrain && (
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is the same model as the brain, so a second opinion adds little.</div>
             )}
           </>)}
         {row('Second opinion', 'A different family re-checks consequential work',
-          seg(fusionWhen, [['off', 'Off'], ['high', 'Consequential'], ['all', 'Everything']], (v) => void onFusion(v as 'off' | 'high' | 'all'), busy === 'fusion'),
+          // "Off" sat directly beneath the Judge row and read as "the judge is
+          // off" — the owner said so. It never meant that: the judge always
+          // runs, this only decides whether a SECOND family re-checks it.
+          // Naming the state after what still happens removes the ambiguity
+          // without moving anything.
+          seg(fusionWhen, [['off', 'Judge only'], ['high', 'Consequential'], ['all', 'Everything']], (v) => void onFusion(v as 'off' | 'high' | 'all'), busy === 'fusion'),
           fusion?.active ? <div className="mt-1 text-caption text-success">Active now.</div>
             : secondOpinionOn ? <div className="mt-1 text-caption text-warning">Configured but inactive — the judge is not available yet.</div> : null)}
         <details className="group border-t border-border">
