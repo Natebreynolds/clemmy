@@ -38,7 +38,7 @@ import {
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
 import { isDestructiveToolInvocation } from '../../agents/tool-invocation.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { actionTopologyRoleFor, toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { getRuntimeEnv } from '../../config.js';
 import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
 import { catalogOperationIdentityKey } from './runtime-tool-identity.js';
@@ -1369,9 +1369,12 @@ export function evaluateToolCall(
   }
   // Polling, not looping: a non-mutating identical-args repeat whose RESULTS
   // keep changing is legitimate progress — no advisory (see the result-change
-  // block above).
+  // block above). Re-reading already-parked bytes is not a world poll even
+  // when the wrapper text changes (live 2026-09-21: tool_output_query dummy
+  // queries looped under "changing results").
   if (
     (!isMut || pollExemptSlugEvidence(toolName, args))
+    && !toolReadsRetainedOutput(toolName)
     && exactCount >= thresholds.exactArgsWarnAt
     && trackerScopeId
     && identicalCallResultsAreChanging(trackerScopeId, signature)
@@ -1390,11 +1393,15 @@ export function evaluateToolCall(
       ...(cachedCallId ? { cachedCallId, cachedAgeMs, cachedLabel } : {}),
     };
   }
+  const retainedOutputRepeat = toolReadsRetainedOutput(toolName);
+  const identicalArgsHardStopAt = retainedOutputRepeat
+    ? thresholds.exactArgsBlockAt + 1
+    : thresholds.exactArgsHardStopAt;
   if (
     !isMut
     && !controlPlaneRepeat
     && !fanoutBlock
-    && exactCount >= thresholds.exactArgsHardStopAt
+    && exactCount >= identicalArgsHardStopAt
   ) {
     return {
       action: 'escalate',

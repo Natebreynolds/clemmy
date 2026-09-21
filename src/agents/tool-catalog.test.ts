@@ -18,6 +18,8 @@ const {
   rankCatalog,
   rankCatalogEntriesLexically,
   executionLaneToolSearchEnabled,
+  applyProvenSkipToHotSet,
+  PROVEN_SKIP_KEEP_LOADED,
 } = await import('./tool-catalog.js');
 const { recordToolHit, getHotSet, _resetHotSetForTest } = await import('./tool-hotset.js');
 const { TOOL_REGISTRY } = await import('../tools/tool-registry.js');
@@ -94,6 +96,22 @@ test('skill_read stays in the schema kernel so the packet instruction is callabl
   assert.ok(TOOL_SEARCH_ALWAYS_LOADED.has('skill_read'));
   const hot = resolveHotSet('sess-skill-read-kernel', 'hello there');
   assert.ok(hot.has('skill_read'), 'call skill_read must be first-class without a discovery round');
+});
+
+test('a proven skip drops acquisition-kernel schemas except ask', () => {
+  const hot = resolveHotSet('sess-proven-skip', 'whats on my calendar the rest of the day');
+  const thinned = applyProvenSkipToHotSet(hot);
+  assert.equal(thinned.has('workspace_roots'), false);
+  assert.equal(thinned.has('list_files'), false);
+  assert.equal(thinned.has('read_file'), false);
+  assert.equal(thinned.has('tool_search'), false);
+  assert.equal(thinned.has('tool_output_query'), false);
+  assert.equal(thinned.has('recall_tool_result'), false);
+  assert.equal(thinned.has('check_in'), false);
+  for (const name of PROVEN_SKIP_KEEP_LOADED) {
+    if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
+  }
+  assert.ok(thinned.size < hot.size, 'proven skip must shrink the first-class schema surface');
 });
 
 test('resolveHotSet does not inherit the broad legacy JIT core', () => {

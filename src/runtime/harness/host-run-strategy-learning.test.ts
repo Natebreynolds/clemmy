@@ -12,12 +12,24 @@ process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const { createSession, appendEvent } = await import('./eventlog.js');
-const { learnHostRunStrategyForAcceptedTask } = await import('./host-run-strategy-learning.js');
+const { learnHostRunStrategyForAcceptedTask, selectLearnedStrategyTools } = await import('./host-run-strategy-learning.js');
 const { evaluateLearningCandidate } = await import('../../memory/learning-receipt.js');
 const { renderRunStrategiesForContext } = await import('../../memory/run-strategy-store.js');
 
 after(() => {
   try { rmSync(HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('learned strategies drop kernel inspection tools when a business tool settled', () => {
+  assert.deepEqual(
+    selectLearnedStrategyTools(['workspace_roots', 'outlook_get_calendar_view', 'tool_search']),
+    ['outlook_get_calendar_view'],
+  );
+  assert.deepEqual(
+    selectLearnedStrategyTools(['read_file']),
+    ['read_file'],
+    'a local-read run still teaches the tool that did the work',
+  );
 });
 
 test('a host done terminal without settlements does not invent a strategy', () => {

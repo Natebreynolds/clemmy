@@ -3079,6 +3079,17 @@ export async function startDaemon(
   const watchdogTimer = setInterval(tickWatchdog, 60_000);
   watchdogTimer.unref?.();
 
+  // Schema heartbeat: park proven-tool contracts in memory so turn-start Jev
+  // can plate the active brain. Not a reply model. Fail-open.
+  const tickActiveSurface = () => {
+    void import('../runtime/jev/active-surface-heartbeat.js')
+      .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
+      .catch(() => { /* heartbeat never takes down the daemon */ });
+  };
+  setTimeout(tickActiveSurface, 8_000).unref?.();
+  const activeSurfaceTimer = setInterval(tickActiveSurface, 60_000);
+  activeSurfaceTimer.unref?.();
+
   // Proactive Codex auth keepalive: refresh a soon-to-expire token while idle and
   // surface a re-auth prompt EARLY (not mid-task). Routes through the existing
   // single-flight + lock, so it adds no reuse-revoke risk.

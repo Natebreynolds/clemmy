@@ -71,7 +71,7 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet } from './tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import {
   composeSessionFromStore,
@@ -3572,23 +3572,28 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ...[...policyAllowed].filter((name) => isRegistryDeclaredNativePlanningRead(name)
           && workCallLocalSchemaNames.has(name)),
       ]);
-      const visibleFirstClassNames = carrierWork
-        ? new Set([...firstClassNames].filter((name) => (
-            (actionControlNames.has(name) || isRegistryDeclaredRead(name))
-            && actionControlContextFor(name) !== 'task_recovery'
-            // Planning binds BUSINESS work. Hot-set controls stay first-class:
-            // a uniquely named saved workflow is invoked with workflow_run, not
-            // reconstructed through tool_search (live 2026-08-29: planning
-            // stripped every control except tool_search, so "run my platform 49
-            // workflow" became a Composio hunt).
-            // On an action turn these exact mutations must cross work_call's
-            // requirement binder. Their ordinary graph-neutral control
-            // exposure is unchanged on non-action turns.
-            && (!localPlanningCapabilityNames.has(name)
-              || (Boolean(hostFreshPlanning) && !planMode && taskMode?.kind !== 'execute'
-                && !frozenContract && NATIVE_PRODUCT_AUTHORING_TOOLS.has(name)))
-          )))
-        : firstClassNames;
+      const visibleFirstClassNames = (() => {
+        const visible = carrierWork
+          ? new Set([...firstClassNames].filter((name) => (
+              (actionControlNames.has(name) || isRegistryDeclaredRead(name))
+              && actionControlContextFor(name) !== 'task_recovery'
+              // Planning binds BUSINESS work. Hot-set controls stay first-class:
+              // a uniquely named saved workflow is invoked with workflow_run, not
+              // reconstructed through tool_search (live 2026-08-29: planning
+              // stripped every control except tool_search, so "run my platform 49
+              // workflow" became a Composio hunt).
+              // On an action turn these exact mutations must cross work_call's
+              // requirement binder. Their ordinary graph-neutral control
+              // exposure is unchanged on non-action turns.
+              && (!localPlanningCapabilityNames.has(name)
+                || (Boolean(hostFreshPlanning) && !planMode && taskMode?.kind !== 'execute'
+                  && !frozenContract && NATIVE_PRODUCT_AUTHORING_TOOLS.has(name)))
+            )))
+          : firstClassNames;
+        return provenDisclosure.skipDiscoverySearch
+          ? applyProvenSkipToHotSet(visible)
+          : visible;
+      })();
       const deferredActionControlNames = new Set([...actionControlNames]
         .filter((name) => !visibleFirstClassNames.has(name)));
       // Registry-declared BUSINESS READS ride the control dispatcher too: a
@@ -3953,9 +3958,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   });
   const skipDiscoverySearch = provenDisclosure.skipDiscoverySearch;
   const assembledTools = turnStateToolsLast([
-    ...structuralTools,
+    ...structuralTools.filter((toolRef) => (
+      !skipDiscoverySearch || (toolRef as { name?: string }).name !== 'run_worker'
+    )),
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
-    ...(callTool ? [callTool] : []),
+    // Live 277906: skip already published the op on work_call; grok wrapped
+    // it through call_tool and spent a second frame. Live 278113: grok then
+    // fanned out run_worker onto the worker-lane model (requested glm-5.2)
+    // for a single disclosed read. Proven skip keeps the disclosed carrier
+    // and ask; fan-out and generic dispatch stay off this surface.
+    ...((callTool && !skipDiscoverySearch) ? [callTool] : []),
     ...nonStructuralDiscovery.filter((toolRef) => (
       !skipDiscoverySearch || (toolRef as { name?: string }).name !== 'tool_search'
     )),

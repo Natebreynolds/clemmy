@@ -160,6 +160,13 @@ export interface MatchedRunStrategy {
   score: number;
 }
 
+/** Every receipt-backed strategy, newest-used first. Heartbeat schema staging reads this. */
+export function listVerifiedRunStrategies(): RunStrategyRecord[] {
+  return readStore().strategies
+    .filter((strategy) => isValidLearningReceipt(strategy.learningReceipt, { target: 'strategy' }))
+    .sort((a, b) => (b.lastUsedAt ?? b.createdAt).localeCompare(a.lastUsedAt ?? a.createdAt));
+}
+
 /** Ranked proven strategies for this objective. Empty when nothing clears the floor. */
 export function listMatchingRunStrategies(objective: string | undefined, limit = 4): MatchedRunStrategy[] {
   if (!objective?.trim()) return [];

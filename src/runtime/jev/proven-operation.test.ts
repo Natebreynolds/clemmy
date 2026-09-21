@@ -11,7 +11,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-proven-op-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip } = await import('./proven-operation.js');
+const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries } = await import('./proven-operation.js');
 const {
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
@@ -42,6 +42,7 @@ function descriptor(id: string): HostCapabilityDescriptorV1 {
 }
 
 const { recordRunStrategy } = await import('../../memory/run-strategy-store.js');
+const { selectLearnedStrategyTools } = await import('../harness/host-run-strategy-learning.js');
 const { evaluateLearningCandidate } = await import('../../memory/learning-receipt.js');
 
 after(() => {
@@ -75,6 +76,60 @@ test('proven operation guidance tells the brain to skip tool_search when an invo
   assert.match(text, /start_datetime/);
 });
 
+test('paraphrases and same-tool strategies bind without exact wording', async () => {
+  const receipt = evaluateLearningCandidate({
+    target: 'strategy',
+    authority: 'background_delivery_verifier',
+    sessionId: 'background:cal-para',
+    sourceId: 'cal-para',
+    terminalSuccess: true,
+    controllerValidation: true,
+  }).receipt!;
+  recordRunStrategy({
+    objective: 'whats on my calendar today',
+    toolsUsed: ['outlook_get_calendar_view'],
+    workerCount: 0,
+    durationMs: 40_000,
+    learningReceipt: receipt,
+  });
+  recordRunStrategy({
+    objective: 'what is on my calendar tomorrow',
+    toolsUsed: ['outlook_get_calendar_view'],
+    workerCount: 0,
+    durationMs: 40_000,
+    learningReceipt: evaluateLearningCandidate({
+      target: 'strategy',
+      authority: 'background_delivery_verifier',
+      sessionId: 'background:cal-tom',
+      sourceId: 'cal-tom',
+      terminalSuccess: true,
+      controllerValidation: true,
+    }).receipt!,
+  });
+  const paraphrased = await prepareProvenOperationForRequest({ query: 'what on my calendar today' });
+  assert.ok(paraphrased.text);
+  assert.deepEqual(paraphrased.tools, ['outlook_get_calendar_view']);
+
+  const sameTools = pickProvenRunStrategy([
+    { score: 0.67, strategy: { id: 'a', objective: 'whats on my calendar today', keywords: ['calendar', 'today'], toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 1, createdAt: '', uses: 1 } },
+    { score: 0.5, strategy: { id: 'b', objective: 'what is on my calendar tomorrow', keywords: ['calendar', 'tomorrow'], toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 1, createdAt: '', uses: 1 } },
+  ]);
+  assert.equal(sameTools?.id, 'a');
+
+  const polluted = pickProvenRunStrategy([
+    { score: 0.8, strategy: { id: 'dirty', objective: 'whats on my calendar today', keywords: ['calendar', 'today'], toolsUsed: ['workspace_roots', 'outlook_get_calendar_view'], workerCount: 0, durationMs: 1, createdAt: '', uses: 7 } },
+    { score: 0.67, strategy: { id: 'clean', objective: 'what on my calendar today', keywords: ['calendar', 'today'], toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 1, createdAt: '', uses: 1 } },
+  ]);
+  assert.equal(polluted?.toolsUsed.includes('outlook_get_calendar_view'), true);
+  assert.equal(selectLearnedStrategyTools(polluted!.toolsUsed).join(), 'outlook_get_calendar_view');
+
+  const disagree = pickProvenRunStrategy([
+    { score: 0.6, strategy: { id: 'cal', objective: 'calendar today', keywords: ['calendar'], toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 1, createdAt: '', uses: 1 } },
+    { score: 0.55, strategy: { id: 'sf', objective: 'find tim', keywords: ['tim'], toolsUsed: ['salesforce_sf_soql_query'], workerCount: 0, durationMs: 1, createdAt: '', uses: 1 } },
+  ]);
+  assert.equal(disagree, null);
+});
+
 test('an exact prior successful run names the proven tools without withholding search until they are callable', async () => {
   const receipt = evaluateLearningCandidate({
     target: 'strategy',
@@ -97,6 +152,10 @@ test('an exact prior successful run names the proven tools without withholding s
   assert.equal(prepared.skipDiscoverySearch, false);
   assert.equal(prepared.capabilityRefs.length, 0);
   assert.match(prepared.text!, /outlook_get_calendar_view/);
+});
+
+test('cached proven skip entries require a unique active connection and a schema', () => {
+  assert.deepEqual(buildCachedProvenResolutionEntries(['OUTLOOK_GET_CALENDAR_VIEW']), []);
 });
 
 test('skipDiscoverySearch stays off when a recorded skip has no currently callable ref', () => {

@@ -8,8 +8,13 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { listMatchingRunStrategies, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
-import { composioSlugLooksWellFormed } from '../../integrations/composio/toolkit-slug.js';
+import { listMatchingRunStrategies, listVerifiedRunStrategies, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { readActiveToolSurface } from '../../memory/active-tool-surface.js';
+import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
+import { peekConnectedToolkits } from '../../integrations/composio/client.js';
+import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
+import { classifyComposioSlugEffect } from '../../integrations/composio/slug-effect.js';
+import type { CapabilityResolutionEntry } from '../harness/capability-resolution.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
@@ -164,6 +169,96 @@ function descriptorFromCatalogEntry(entry: {
   };
 }
 
+function uniqueActiveConnection(toolkit: string): { connectionId: string } | null {
+  try {
+    const rows = peekConnectedToolkits().filter((row) => (
+      row.slug.trim().toLowerCase() === toolkit.trim().toLowerCase()
+      && /^active$/i.test(row.status.trim())
+    ));
+    if (rows.length !== 1) return null;
+    const connectionId = rows[0]!.connectionId.trim();
+    return connectionId ? { connectionId } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function buildCachedProvenResolutionEntries(slugs: readonly string[]): CapabilityResolutionEntry[] {
+  const entries: CapabilityResolutionEntry[] = [];
+  for (const slug of slugs) {
+    const schema = schemaForTool(slug);
+    if (!schema) continue;
+    const toolkit = registeredToolkitOfSlug(slug);
+    const connection = uniqueActiveConnection(toolkit);
+    if (!connection) continue;
+    const effect = classifyComposioSlugEffect(slug);
+    entries.push({
+      intent: 'cached proven operation for this request',
+      kind: 'composio',
+      identifier: slug,
+      status: 'proven',
+      connection: 'active',
+      accountIdentity: connection.connectionId,
+      effectClass: effect === 'external_write' ? 'write' : 'read',
+      matchedTokens: [toolkit],
+    });
+  }
+  return entries;
+}
+
+async function publishCachedProvenOperations(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedInput: string;
+  slugs: readonly string[];
+}): Promise<Array<{ slug: string; capabilityId: string; descriptor: HostCapabilityDescriptorV1 }>> {
+  const { ensureToolSchema } = await import('../../tools/composio-schema-cache.js');
+  for (const slug of input.slugs) {
+    if (schemaForTool(slug)) continue;
+    try { await ensureToolSchema(slug); } catch { /* cache miss stays fail-open */ }
+  }
+  const entries = buildCachedProvenResolutionEntries(input.slugs);
+  if (entries.length === 0) return [];
+  const { recordAdmissionCapabilityResolution } = await import('../harness/capability-resolution.js');
+  const { registerProofProvisionedCapabilities } = await import('../harness/proof-provisioned-catalog.js');
+  recordAdmissionCapabilityResolution({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedInput: input.acceptedInput,
+    entries,
+  });
+  await registerProofProvisionedCapabilities({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  return publishedProvenOperations(input.slugs);
+}
+
+function bindPublishedSkip(
+  published: Array<{ slug: string; capabilityId: string; descriptor: HostCapabilityDescriptorV1 }>,
+): {
+  skipDiscoverySearch: boolean;
+  capabilityRefs: string[];
+  descriptors: HostCapabilityDescriptorV1[];
+  invocations: unknown[];
+} {
+  const capabilityRefs = published.map((row) => row.capabilityId);
+  return {
+    skipDiscoverySearch: capabilityRefs.length > 0,
+    capabilityRefs,
+    descriptors: published.map((row) => row.descriptor),
+    invocations: published.map((row) => renderCarrierInvocationExample(
+      'work_call',
+      {
+        name: 'composio_execute_tool',
+        fixedArgs: { tool_slug: row.slug },
+        payloadField: 'arguments',
+      },
+      row.capabilityId,
+    )),
+  };
+}
+
 function publishedProvenOperations(slugs: readonly string[]): Array<{
   slug: string;
   capabilityId: string;
@@ -231,6 +326,63 @@ export function renderProvenOperationGuidance(
   ].join('\n');
 }
 
+function toolSignature(tools: readonly string[]): string {
+  return selectLearnedStrategyTools(tools).map((name) => name.toLowerCase()).sort().join('\0');
+}
+
+/**
+ * Bind a proven run without exact wording. One matching strategy is enough.
+ * Several matches that used the same tools are the same job (today vs
+ * tomorrow calendar). Jev is only needed when proven tools disagree.
+ */
+export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): RunStrategyRecord | null {
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0]!.strategy;
+  const signatures = new Set(matches.map((row) => toolSignature(row.strategy.toolsUsed)));
+  if (signatures.size === 1) return matches[0]!.strategy;
+  return null;
+}
+
+function stagedCandidatesForJev(): Array<{ id: string; objective: string; toolsUsed: string[]; record: RunStrategyRecord }> {
+  const staged = readActiveToolSurface().tools.filter((row) => row.schemaReady).slice(0, 8);
+  if (staged.length === 0) return [];
+  const proven = listVerifiedRunStrategies();
+  return staged.map((row) => {
+    const record = proven.find((strategy) => (
+      strategy.toolsUsed.some((name) => name.trim().toLowerCase() === row.name.toLowerCase())
+    ));
+    return {
+      id: record?.id ?? `surface:${row.name}`,
+      objective: record?.objective ?? row.name.replace(/_/g, ' '),
+      toolsUsed: record?.toolsUsed ?? [row.name],
+      record: record ?? {
+        id: `surface:${row.name}`,
+        objective: row.name.replace(/_/g, ' '),
+        keywords: [],
+        toolsUsed: [row.name],
+        workerCount: 0,
+        durationMs: 0,
+        createdAt: new Date().toISOString(),
+        uses: 0,
+      },
+    };
+  });
+}
+
+async function pickStagedSurfaceStrategy(query: string, sessionId?: string): Promise<RunStrategyRecord | null> {
+  const staged = stagedCandidatesForJev();
+  if (staged.length === 0) return null;
+  const jev = await selectProvenRunStrategyWithJev(
+    query,
+    staged.map((row) => ({ id: row.id, objective: row.objective, toolsUsed: row.toolsUsed })),
+    { sessionId },
+  );
+  if (jev.strategy) {
+    return staged.find((row) => row.id === jev.strategy!.id)?.record ?? null;
+  }
+  return null;
+}
+
 export async function prepareProvenOperationForRequest(input: {
   query: string;
   sessionId?: string;
@@ -243,22 +395,30 @@ export async function prepareProvenOperationForRequest(input: {
     capabilityRefs: [],
     descriptors: [],
   };
+  void import('./active-surface-heartbeat.js')
+    .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
+    .catch(() => { /* heartbeat never blocks the live turn */ });
   const matches = listMatchingRunStrategies(input.query, 4);
-  if (matches.length === 0) return empty;
-  const exact = matches.length === 1 && matches[0]!.score >= 0.8
-    ? matches[0]!.strategy
-    : null;
-  const selected = exact ?? await selectProvenRunStrategyWithJev(
-    input.query,
-    matches.map((row) => ({
-      id: row.strategy.id,
-      objective: row.strategy.objective,
-      toolsUsed: row.strategy.toolsUsed,
-    })),
-    { sessionId: input.sessionId },
-  );
-  if (!selected) return empty;
-  const strategy = exact ?? matches.find((row) => row.strategy.id === selected.id)?.strategy;
+  const lexical = pickProvenRunStrategy(matches);
+  let strategy = lexical;
+  if (!strategy && matches.length > 0) {
+    const jev = await selectProvenRunStrategyWithJev(
+      input.query,
+      matches.map((row) => ({
+        id: row.strategy.id,
+        objective: row.strategy.objective,
+        toolsUsed: row.strategy.toolsUsed,
+      })),
+      { sessionId: input.sessionId },
+    );
+    strategy = (jev.strategy
+      ? matches.find((row) => row.strategy.id === jev.strategy!.id)?.strategy
+      : null)
+      ?? (jev.failedOpen ? matches[0]!.strategy : null);
+  }
+  if (!strategy) {
+    strategy = await pickStagedSurfaceStrategy(input.query, input.sessionId);
+  }
   if (!strategy) return empty;
   const schemas: Record<string, unknown> = {};
   for (const name of strategy.toolsUsed) {
@@ -281,31 +441,31 @@ export async function prepareProvenOperationForRequest(input: {
       const acceptedInput = input.acceptedInput?.trim()
         || acceptedTextForSource(input.sessionId, input.sourceUserSeq as number)
         || input.query;
-      const { provisionExactWorkflowProviderOperations } = await import(
-        '../../tools/tool-search-provider-sources.js'
-      );
-      const provisioned = await provisionExactWorkflowProviderOperations({
+      const identity = {
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq as number,
         acceptedInput,
-        operationIds: composioSlugs,
-        deadlineAt: Date.now() + PROVEN_PROVISION_BUDGET_MS,
-      });
-      if (provisioned.ok) {
-        const published = publishedProvenOperations(composioSlugs);
-        capabilityRefs = published.map((row) => row.capabilityId);
-        descriptors = published.map((row) => row.descriptor);
-        invocations = published.map((row) => renderCarrierInvocationExample(
-          'work_call',
-          {
-            name: 'composio_execute_tool',
-            fixedArgs: { tool_slug: row.slug },
-            payloadField: 'arguments',
-          },
-          row.capabilityId,
-        ));
-        skipDiscoverySearch = capabilityRefs.length > 0;
+        slugs: composioSlugs,
+      };
+      let published = await publishCachedProvenOperations(identity);
+      if (published.length === 0) {
+        const { provisionExactWorkflowProviderOperations } = await import(
+          '../../tools/tool-search-provider-sources.js'
+        );
+        const provisioned = await provisionExactWorkflowProviderOperations({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          acceptedInput,
+          operationIds: composioSlugs,
+          deadlineAt: Date.now() + PROVEN_PROVISION_BUDGET_MS,
+        });
+        if (provisioned.ok) published = publishedProvenOperations(composioSlugs);
       }
+      const bound = bindPublishedSkip(published);
+      skipDiscoverySearch = bound.skipDiscoverySearch;
+      capabilityRefs = bound.capabilityRefs;
+      descriptors = bound.descriptors;
+      invocations = bound.invocations;
     } catch { /* proven provision is fail-open: keep tool_search */ }
   }
 

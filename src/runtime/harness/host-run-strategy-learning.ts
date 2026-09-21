@@ -16,6 +16,19 @@ import {
 } from '../../memory/learning-receipt.js';
 import { recordRunStrategy } from '../../memory/run-strategy-store.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
+
+/** Prefer the settled business tools. Kernel inspection tools only count when
+ *  they were the whole run — otherwise they pollute the next proven skip. */
+export function selectLearnedStrategyTools(toolNames: readonly string[]): string[] {
+  const business = [...new Set(
+    toolNames
+      .map((name) => name.trim())
+      .filter((name) => name && actionTopologyRoleFor(name) !== 'control'),
+  )];
+  const proven = business.filter((name) => !TOOL_SEARCH_ALWAYS_LOADED.has(name));
+  return (proven.length > 0 ? proven : business).slice(0, 8);
+}
 
 function toolsUsedForSource(input: { sessionId: string; sourceUserSeq: number }): string[] {
   try {
@@ -29,10 +42,7 @@ function toolsUsedForSource(input: { sessionId: string; sourceUserSeq: number })
          AND s.outcome_kind IN ('succeeded', 'empty_result')
        ORDER BY s.rowid
     `).all(input.sessionId, input.sourceUserSeq) as Array<{ toolName: string }>;
-    const names = rows
-      .map((row) => row.toolName.trim())
-      .filter((name) => name && actionTopologyRoleFor(name) !== 'control');
-    return [...new Set(names)].slice(0, 8);
+    return selectLearnedStrategyTools(rows.map((row) => row.toolName));
   } catch {
     return [];
   }

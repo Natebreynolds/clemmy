@@ -5,7 +5,7 @@ import {
   openEventLog,
   type EventRow,
 } from './eventlog.js';
-import { hostControlFrameFor } from '../../tools/tool-registry.js';
+import { hostControlFrameFor, toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import {
   HOST_TOOL_DISPOSITION_PROTOCOL,
 } from './host-model-result-receipt.js';
@@ -1357,6 +1357,15 @@ function retainedOutcomeIdentity(
   argumentDigest: string,
   resultText: string,
 ): string {
+  // Parked-output reads are the same stall when the args match, even if the
+  // wrapper text changes. Dummy-query loops were treated as polls.
+  if (toolReadsRetainedOutput(operation)) {
+    return createHash('sha256').update(JSON.stringify({
+      version: 2,
+      operation,
+      argumentDigest,
+    }), 'utf8').digest('hex');
+  }
   const resultDigest = createHash('sha256').update(resultText, 'utf8').digest('hex');
   return createHash('sha256').update(JSON.stringify({
     version: 1,
@@ -1383,12 +1392,18 @@ function identicalRetainedOutcomeStall(input: {
   database: Database.Database;
 }): boolean {
   try {
-    const succeeded = input.matchedSettlements.filter(({ settlement }) => (
-      (settlement.business_call === 1 || settlement.mutating === 1)
-      && (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
+    const succeeded = input.matchedSettlements.filter(({ settlement, call }) => (
+      (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
+      && (
+        (settlement.business_call === 1 && settlement.mutating !== 1)
+        || (
+          toolReadsRetainedOutput(call.name)
+          && input.matchedSettlements.every((row) => toolReadsRetainedOutput(row.call.name))
+        )
+      )
     ));
     if (succeeded.length === 0) return false;
-    if (succeeded.some(({ settlement }) => settlement.mutating === 1 || settlement.business_call !== 1)) {
+    if (succeeded.some(({ settlement }) => settlement.mutating === 1)) {
       return false;
     }
     const currentIds = [...new Set(succeeded.map(({ call }) => call.callId))];
@@ -1502,10 +1517,16 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       consequence: failed.consequence,
     };
 
+    const parkedQueryFrame = matchedSettlements.length > 0
+      && matchedSettlements.every(({ call, settlement }) => (
+        toolReadsRetainedOutput(call.name)
+        && settlement.mutating !== 1
+        && (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
+      ));
     if (matchedSettlements.some(({ settlement }) => (
       (settlement.business_call === 1 || settlement.mutating === 1)
       && (settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result')
-    ))) {
+    )) || parkedQueryFrame) {
       const identicalOutcome = identicalRetainedOutcomeStall({
         identity,
         calls,

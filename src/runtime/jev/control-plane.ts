@@ -142,15 +142,22 @@ export interface ProvenStrategyCandidate {
 
 const PROVEN_STRATEGY_CONFIDENCE_MIN = 0.6;
 const PROVEN_STRATEGY_NOUL_MIN = 0.6;
-const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
+const PROVEN_STRATEGY_TIMEOUT_MS = 3_500;
 
-/** Pick one proven past run that can skip discovery, or none. Fail-open to null. */
+export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
+  strategy: T | null;
+  /** Transport/timeout/disabled — caller may keep the top memory match. */
+  failedOpen: boolean;
+}
+
+/** Pick one proven past run that can skip discovery, or none.
+ *  A confident "none" is a real no. Timeout/error is failedOpen. */
 export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCandidate>(
   query: string,
   strategies: T[],
   opts?: { sessionId?: string },
-): Promise<T | null> {
-  if (strategies.length === 0) return null;
+): Promise<ProvenStrategyJevPick<T>> {
+  if (strategies.length === 0) return { strategy: null, failedOpen: false };
   const window = strategies.slice(0, 8);
   if (window.length === 1) {
     const only = window[0]!;
@@ -173,10 +180,10 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
       sessionId: opts?.sessionId,
       channel: 'jev-proven-strategy',
     });
-    if (!result.ok) return null;
+    if (!result.ok) return { strategy: null, failedOpen: true };
     const answer = result.answers.match as NoulAnswer | undefined;
-    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) return null;
-    return only;
+    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) return { strategy: null, failedOpen: false };
+    return { strategy: only, failedOpen: false };
   }
   const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
   for (const strategy of window) {
@@ -195,10 +202,15 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
     sessionId: opts?.sessionId,
     channel: 'jev-proven-strategy',
   });
-  if (!result.ok) return null;
+  if (!result.ok) return { strategy: null, failedOpen: true };
   const answer = result.answers.which as ChoiceAnswer | undefined;
-  if (!answer || answer.choice === 'none' || answer.confidence < PROVEN_STRATEGY_CONFIDENCE_MIN) return null;
-  return window.find((strategy) => strategy.id === answer.choice) ?? null;
+  if (!answer || answer.choice === 'none' || answer.confidence < PROVEN_STRATEGY_CONFIDENCE_MIN) {
+    return { strategy: null, failedOpen: false };
+  }
+  return {
+    strategy: window.find((strategy) => strategy.id === answer.choice) ?? null,
+    failedOpen: false,
+  };
 }
 
 export async function tryJevGroundingVerdict(

@@ -972,6 +972,30 @@ export async function runHedgedJudge<T>(
   }
 }
 
+type CompletionJudgeImpl = (
+  objective: string,
+  assistantResponse: string,
+  skillContext?: SkillExecutionContext,
+) => Promise<CompletionJudgeRun>;
+
+let completionJudgeForTests: CompletionJudgeImpl | null = null;
+
+export function _setCompletionJudgeForTests(fn: CompletionJudgeImpl | null): void {
+  completionJudgeForTests = fn;
+}
+
+function startCompletionJudge(
+  objective: string,
+  assistantResponse: string,
+  skillContext?: SkillExecutionContext,
+): Promise<CompletionJudgeRun> {
+  const run = completionJudgeForTests ?? runCompletionJudge;
+  return run(objective, assistantResponse, skillContext).catch((err): CompletionJudgeRun => {
+    logDebugSafe(err);
+    return { verdict: null, failure: 'error' };
+  });
+}
+
 async function runCompletionJudge(
   objective: string,
   assistantResponse: string,
@@ -1154,73 +1178,84 @@ export async function judgeObjectiveComplete(
   // Connecting Jev is the owner opt-in: a confident typed verdict (~300ms)
   // skips the 3–25s hedged chat-model judge. The configured judge remains the
   // backstop when confidence is low, Jev times out, or the key is absent.
+  //
+  // Start both immediately. A serialized Jev await made every rejected fast
+  // path pay Jev's full latency before grok even started (live ~30ms gap after
+  // Jev returned). Overlap makes a Jev miss free on the wall clock; a Jev hit
+  // still returns without waiting for the Settings judge.
+  const coverage = assessCompletionEvidenceCoverage({
+    objective,
+    results: skillContext?.verifiedReadResults,
+  });
+  const jevPromise = (async () => {
+    try {
+      const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
+      return await tryJevCompletionVerdict(objective, assistantResponse, {
+        sessionId: skillContext?.sessionId,
+        toolCallSummary: skillContext?.toolCallSummary,
+        verifiedReads: skillContext?.verifiedReads,
+        coverage: {
+          complete: coverage.complete,
+          outcomeEvidence: coverage.outcomeEvidence.map((row) => ({
+            toolName: row.toolName,
+            outcome: row.outcome,
+            contentComplete: row.contentComplete,
+          })),
+        },
+      });
+    } catch {
+      return null;
+    }
+  })();
+  const judgePromise = startCompletionJudge(objective, assistantResponse, skillContext);
   let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
   /** Jev's own reading of THIS reply, kept past the try so the unreachable
    *  path below can still use it. Without this it was computed, recorded as
    *  telemetry, and thrown away at the one moment it was the only reviewer
    *  left. */
   let jevSaid: { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null = null;
-  try {
-    const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
-    const coverage = assessCompletionEvidenceCoverage({
-      objective,
-      results: skillContext?.verifiedReadResults,
-    });
-    const fast = await tryJevCompletionVerdict(objective, assistantResponse, {
-      sessionId: skillContext?.sessionId,
-      toolCallSummary: skillContext?.toolCallSummary,
-      verifiedReads: skillContext?.verifiedReads,
-      coverage: {
-        complete: coverage.complete,
-        outcomeEvidence: coverage.outcomeEvidence.map((row) => ({
-          toolName: row.toolName,
-          outcome: row.outcome,
-          contentComplete: row.contentComplete,
-        })),
-      },
-    });
-    const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
-    // Accept a Jev verdict only when coverage supports it. DONE without
-    // receipts is not completion; BLOCKED without a failed attempt is not a
-    // stop. INCOMPLETE is accepted only for missingCoverage; complete
-    // receipts never coerce INCOMPLETE to DONE from reply similarity.
-    const acceptJev = Boolean(fast) && (
-      (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
-      || (awaitingQuestion)
-      || (fast!.blocked === true && coverage.failedAttempts.length > 0)
-      || (!fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.missingCoverage)
-    );
-    if (fast) {
-      jevSaid = { done: fast.done,
-        ...(fast.reason ? { reason: fast.reason } : {}),
-        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
-        ...(fast.blocked ? { blocked: true } : {}) };
-    }
-    jevAttempt = fast
-      ? {
-          accepted: acceptJev,
-          coverageComplete: coverage.complete,
-          ...(fast.choice ? { choice: fast.choice } : {}),
-          ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
-          ...(typeof fast.replyMatchesReceipts === 'number'
-            ? { replyMatchesReceipts: fast.replyMatchesReceipts }
-            : {}),
-        }
-      : undefined;
-    if (fast && acceptJev) {
-      return {
-        done: fast.done,
-        reason: fast.reason,
-        judgeModelId: fast.judgeModelId,
-        fast: true,
-        ...(jevAttempt ? { jevAttempt } : {}),
-        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
-        ...(fast.blocked ? { blocked: true } : {}),
-        ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
-      };
-    }
-  } catch { /* configured judge remains the backstop */ }
-  const run = await runCompletionJudge(objective, assistantResponse, skillContext);
+  const fast = await jevPromise;
+  const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
+  // Accept a Jev verdict only when coverage supports it. DONE without
+  // receipts is not completion; BLOCKED without a failed attempt is not a
+  // stop. INCOMPLETE is accepted only for missingCoverage; complete
+  // receipts never coerce INCOMPLETE to DONE from reply similarity.
+  const acceptJev = Boolean(fast) && (
+    (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
+    || (awaitingQuestion)
+    || (fast!.blocked === true && coverage.failedAttempts.length > 0)
+    || (!fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.missingCoverage)
+  );
+  if (fast) {
+    jevSaid = { done: fast.done,
+      ...(fast.reason ? { reason: fast.reason } : {}),
+      ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+      ...(fast.blocked ? { blocked: true } : {}) };
+  }
+  jevAttempt = fast
+    ? {
+        accepted: acceptJev,
+        coverageComplete: coverage.complete,
+        ...(fast.choice ? { choice: fast.choice } : {}),
+        ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
+        ...(typeof fast.replyMatchesReceipts === 'number'
+          ? { replyMatchesReceipts: fast.replyMatchesReceipts }
+          : {}),
+      }
+    : undefined;
+  if (fast && acceptJev) {
+    return {
+      done: fast.done,
+      reason: fast.reason,
+      judgeModelId: fast.judgeModelId,
+      fast: true,
+      ...(jevAttempt ? { jevAttempt } : {}),
+      ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+      ...(fast.blocked ? { blocked: true } : {}),
+      ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+    };
+  }
+  const run = await judgePromise;
   if (!run.verdict) {
     // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
     //

@@ -6199,7 +6199,7 @@ async function runConversationWithinRuntimeConfig(
         await resolveContext();
       }
       let provenOperationText: string | undefined;
-      if (!hostPlainConversation) {
+      if (!hostPlainConversation && !isUnattendedSession(options.sessionId)) {
         try {
           const proven = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
             query: String(options.semanticTaskInput ?? options.input ?? ''),

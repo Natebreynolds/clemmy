@@ -92,7 +92,8 @@ test('selectProvenRunStrategyWithJev picks a matching past run and fails open to
   const picked = await selectProvenRunStrategyWithJev('whats on my calendar today', [
     { id: 'strat-cal', objective: 'whats on my calendar today', toolsUsed: ['outlook_get_calendar_view'] },
   ]);
-  assert.equal(picked?.id, 'strat-cal');
+  assert.equal(picked.strategy?.id, 'strat-cal');
+  assert.equal(picked.failedOpen, false);
 
   _setSystemOneFetchForTests(async () => ({
     status: 200,
@@ -114,7 +115,20 @@ test('selectProvenRunStrategyWithJev picks a matching past run and fails open to
     { id: 'strat-cal', objective: 'whats on my calendar today', toolsUsed: ['outlook_get_calendar_view'] },
     { id: 'strat-mail', objective: 'send the standup email', toolsUsed: ['outlook_send_email'] },
   ]);
-  assert.equal(skipped, null);
+  assert.equal(skipped.strategy, null);
+  assert.equal(skipped.failedOpen, false);
+
+  _setSystemOneFetchForTests(async () => ({
+    status: 504,
+    ok: false,
+    text: async () => '',
+  }));
+  const timedOut = await selectProvenRunStrategyWithJev('what on my calendar today', [
+    { id: 'strat-cal', objective: 'whats on my calendar today', toolsUsed: ['outlook_get_calendar_view'] },
+    { id: 'strat-sf', objective: 'find tim in salesforce', toolsUsed: ['salesforce_sf_soql_query'] },
+  ]);
+  assert.equal(timedOut.strategy, null);
+  assert.equal(timedOut.failedOpen, true);
 });
 
 test('prepareSharedEvidenceDecisionsWithJev ranks skills and filters primer hits in one request', async () => {

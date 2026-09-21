@@ -1018,3 +1018,69 @@ test('a dispatch rejection after exact workflow activation preserves transferred
     .find((event) => event.data.phase === 'dispatch_failed');
   assert.equal(privateFailure?.data.error, 'provider failed after durable workflow dispatch transfer');
 });
+
+test('an interruption bounded across RESTARTS: a spent frame stops being re-admitted and gets an honest terminal', async () => {
+  // Live 2026-09-20/21: one Plan->Execute turn was re-admitted 3,292 times over
+  // 43 hours. The per-process re-entry budget is deliberately reset by a restart
+  // ("a restart starts over"), so each daemon start handed the dead frame five
+  // fresh attempts: claims ran at 5x the restart count, exhaustion skips at 1x.
+  // Nothing bounded the interruption itself, and the owner was never told.
+  const fixture = interruptedExactCheckpointSession('durable-bound');
+  const since = HarnessSession.load(fixture.sessionId)?.runInFlightSince();
+  assert.ok(since, 'the fixture is interrupted');
+
+  // The engine's own durable record of this interruption: a budget was already
+  // spent once (proof the frame stopped advancing), then it was re-admitted
+  // well past the durable ceiling across many process lifetimes.
+  appendEvent({
+    sessionId: fixture.sessionId, turn: 0, role: 'system', type: 'restart_recovery_decision',
+    data: { phase: 'policy_decided', interruptedAt: since, autoResumeSkipped: 'reentry_budget',
+      sourceUserSeq: fixture.sourceUserSeq },
+  });
+  for (let i = 0; i < 30; i += 1) {
+    appendEvent({
+      sessionId: fixture.sessionId, turn: 0, role: 'system', type: 'run_resumed',
+      data: { reason: 'restart_checkpoint_recovery', interruptedAt: since,
+        sourceUserSeq: fixture.sourceUserSeq, autoResume: true },
+    });
+  }
+
+  let dispatched = 0;
+  const summary = recoverInterruptedChatRuns(Date.now, async () => { dispatched += 1; });
+  const record = summary.records.find((row) => row.sessionId === fixture.sessionId);
+  assert.ok(record, 'the interrupted session is still scanned');
+  assert.equal(record.autoResumeSkipped, 'recovery_window_exhausted',
+    `expected the durable bound, got ${JSON.stringify(record.autoResumeSkipped)}`);
+  assert.equal(dispatched, 0, 'a spent frame is not handed another attempt by this restart');
+
+  // NO DEAD ENDS: it stops, and it says so, with a next edge.
+  const terminals = listEvents(fixture.sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'exactly one honest terminal is committed');
+  const text = JSON.stringify(terminals[0]?.data ?? {});
+  assert.match(text, /continue/i, 'the terminal carries the continue next edge');
+  assert.doesNotMatch(text, /pick up where it left off/i,
+    'it must not promise an exact resume of a frame that never advanced');
+});
+
+test('attempt count alone never bounds a recovery that is still advancing', async () => {
+  // The durable ceiling requires the engine's OWN proof of non-advancement
+  // first. Without a spent budget, many re-admissions are just a long job.
+  const fixture = interruptedExactCheckpointSession('still-advancing');
+  const since = HarnessSession.load(fixture.sessionId)?.runInFlightSince();
+  assert.ok(since);
+  for (let i = 0; i < 40; i += 1) {
+    appendEvent({
+      sessionId: fixture.sessionId, turn: 0, role: 'system', type: 'run_resumed',
+      data: { reason: 'restart_checkpoint_recovery', interruptedAt: since,
+        sourceUserSeq: fixture.sourceUserSeq, autoResume: true },
+    });
+  }
+  let dispatched = 0;
+  const summary = recoverInterruptedChatRuns(Date.now, async () => { dispatched += 1; });
+  const record = summary.records.find((row) => row.sessionId === fixture.sessionId);
+  assert.ok(record);
+  assert.notEqual(record.autoResumeSkipped, 'recovery_window_exhausted',
+    'no budget was ever spent, so nothing proves this frame is stuck');
+  assert.equal(dispatched, 1, 'a progressing recovery still gets its turn');
+  assert.ok(HarnessSession.load(fixture.sessionId)?.loadRecoveryState(), 'its work is kept');
+});

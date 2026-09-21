@@ -7,13 +7,23 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict, assessCompletionEvidenceCoverage } = await import('./objective-judge.js');
+const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict, assessCompletionEvidenceCoverage, _setCompletionJudgeForTests } = await import('./objective-judge.js');
 const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../jev/client.js');
+
+function unavailableSettingsJudge() {
+  return Promise.resolve({
+    verdict: null,
+    failure: 'error' as const,
+    unavailableReason: 'A completion reviewer was unavailable; no review was completed.',
+  });
+}
 
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+  _setCompletionJudgeForTests(unavailableSettingsJudge);
 });
+_setCompletionJudgeForTests(unavailableSettingsJudge);
 
 test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
   assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
@@ -588,6 +598,53 @@ test('Jev incomplete with complete receipts falls through; reply similarity does
   assert.notEqual(v.fast, true);
   assert.notEqual(v.judgeModelId, 'jev-1.13.0');
   assert.notEqual(v.reason, 'Jev found the response reports the verified receipts.');
+});
+
+test('the Settings judge starts before Jev returns so a miss does not serialize', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let judgeStartedAt = 0;
+  _setCompletionJudgeForTests(async () => {
+    judgeStartedAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return { verdict: { done: false, reason: 'settings-judge' }, failure: null };
+  });
+  let jevEndedAt = 0;
+  _setSystemOneFetchForTests(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    jevEndedAt = Date.now();
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          verdict: {
+            type: 'choice',
+            choice: 'done',
+            probabilities: { done: 0.91, incomplete: 0.09 },
+            confidence: 0.88,
+          },
+          matches: { type: 'noul', noul: 0.9 },
+        },
+        usage: { input_tokens: 36, output_tokens: 4 },
+      }),
+    };
+  });
+  const v = await judgeObjectiveComplete(
+    'Create /tmp/jev.txt containing JEV_OK',
+    'Created /tmp/jev.txt with exactly JEV_OK plus one newline.',
+    {
+      sessionId: 'probe-jev-overlap',
+      skills: [],
+      verifiedReadResults: [
+        { toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      ],
+    },
+  );
+  assert.equal(v.fast, true);
+  assert.equal(v.judgeModelId, 'jev-1.13.0');
+  assert.ok(judgeStartedAt > 0, 'Settings judge must start');
+  assert.ok(judgeStartedAt < jevEndedAt, 'Settings judge must overlap Jev, not wait for it');
 });
 
 test('judgeObjectiveComplete still uses Jev when a captured judge selection is present', async () => {

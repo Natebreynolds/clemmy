@@ -85,6 +85,78 @@ const AUTO_RESUME_MAX_PER_BOOT = 3;
 const EXACT_CHECKPOINT_RESUME_MAX_PER_PASS = 3;
 const AUTO_RESUME_MAX_AGE_MS = 2 * 60 * 60_000;
 
+/**
+ * DURABLE ceiling on how many times ONE interruption may be re-admitted.
+ *
+ * The exact-checkpoint re-entry budget is deliberately per-process and
+ * per-(session, source, phase, frame): "a new checkpoint (progress) starts a
+ * new count, and a restart starts over, so a genuinely transient store failure
+ * is never permanently terminalized." Both properties are pinned, and both are
+ * right. Together they mean nothing bounds an interruption ACROSS restarts.
+ *
+ * Live 2026-09-20/21, one Plan->Execute turn ("Execute this reviewed plan
+ * exactly and verify the saved result.", interrupted 04:44Z): 3,292 re-admissions
+ * over 43 hours, still going. The hourly shape shows the mechanism exactly —
+ * claims ran at 5x the daemon-restart count and exhaustion skips at 1x, i.e.
+ * every restart handed a dead checkpoint five fresh attempts, forever. The turn
+ * never completed, never gave up, and never told its owner, while reporting
+ * resumable:true about a frame that had already failed thousands of times.
+ *
+ * This bound counts ATTEMPTS, not wall clock: a machine asleep for three days
+ * must not spend a recovery that never got to run. It is deliberately ~6x the
+ * handful of continuations a real crash-safe resume needs (the incident behind
+ * the guards above was "the fourth crash-safe continuation"), and it only
+ * applies once a re-entry budget has ALREADY been exhausted for this same
+ * interruption — proof from this engine's own record that the checkpoint is not
+ * advancing. Work that progresses never exhausts a budget, so it is never
+ * bounded here.
+ */
+const EXACT_CHECKPOINT_REENTRY_DURABLE_MAX = 25;
+
+/** How many times this exact interruption has already been re-admitted, read
+ *  from the durable log so a restart cannot reset it. Bounded scan: the cap is
+ *  all we need to know, so stop counting once it is reached. */
+function durableCheckpointReadmissions(sessionId: string, interruptedAt: string): number {
+  try {
+    const rows = listEvents(sessionId, {
+      types: ['run_resumed'],
+      desc: true,
+      limit: EXACT_CHECKPOINT_REENTRY_DURABLE_MAX * 2,
+    });
+    let seen = 0;
+    for (const row of rows) {
+      const data = objectRecord(row.data) ?? {};
+      if (data.interruptedAt !== interruptedAt) continue;
+      if (data.reason !== 'restart_checkpoint_recovery') continue;
+      seen += 1;
+      if (seen >= EXACT_CHECKPOINT_REENTRY_DURABLE_MAX) break;
+    }
+    return seen;
+  } catch {
+    // An unreadable log is not evidence of exhaustion. Preserve recovery.
+    return 0;
+  }
+}
+
+/** Has THIS interruption already spent a re-entry budget at least once? That is
+ *  the engine's own durable proof that the checkpoint stopped advancing, and it
+ *  is what separates a stuck frame from a slow but progressing one. */
+function checkpointReentryBudgetSpentBefore(sessionId: string, interruptedAt: string): boolean {
+  try {
+    const rows = listEvents(sessionId, {
+      types: ['restart_recovery_decision'],
+      desc: true,
+      limit: 200,
+    });
+    return rows.some((row) => {
+      const data = objectRecord(row.data) ?? {};
+      return data.interruptedAt === interruptedAt && data.autoResumeSkipped === 'reentry_budget';
+    });
+  } catch {
+    return false;
+  }
+}
+
 /* The exact-checkpoint re-entry budget moved to ./exact-checkpoint-reentry.js
  * so the host runner can share one Map with this scanner without an import
  * cycle (restart-recovery -> delivery-committer -> host-turn-runner). It is
@@ -641,6 +713,10 @@ const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
 const PREPARED_DISPATCH_HELD_REPLY =
   'This run was interrupted after background work was admitted but before its dispatch could be finalized. Reply `continue` to resume the same accepted work safely.';
+const RECOVERY_WINDOW_EXHAUSTED_REPLY =
+  'This run kept stopping at the same point every time I picked it back up, so I stopped retrying '
+  + 'it instead of looping on it. Nothing was lost and nothing was repeated. Reply `continue` and '
+  + 'I will take it from here fresh.';
 const STOPPED_REPLY =
   'This run was stopped as requested. A restart happened before it could finish shutting down, but it will not resume.';
 const REPLAY_PRIMER_PREFIX = '[restart-recovery]';
@@ -677,6 +753,7 @@ export interface RestartRecoveryRecord {
   autoResumeSkipped?:
     | 'disabled'
     | 'reentry_budget'
+    | 'recovery_window_exhausted'
     | 'no_dispatcher'
     | 'external_write'
     | 'too_old'
@@ -1420,6 +1497,16 @@ export function recoverInterruptedChatRuns(
       && checkpointRecovery
       && exactCheckpointReentryExhausted(exactCheckpointReentryKey(row.id, checkpointRecovery))
     ) record.autoResumeSkipped = 'reentry_budget';
+    // The same checkpoint across RESTARTS. The branch above resets with the
+    // process, so on its own it grants a dead frame five more attempts every
+    // boot. Requires the engine's own proof of non-advancement first, so a
+    // progressing recovery is never terminalized by an attempt count.
+    else if (
+      exactCheckpointRecovery
+      && checkpointRecovery
+      && checkpointReentryBudgetSpentBefore(row.id, since)
+      && durableCheckpointReadmissions(row.id, since) >= EXACT_CHECKPOINT_REENTRY_DURABLE_MAX
+    ) record.autoResumeSkipped = 'recovery_window_exhausted';
     // Exact private HostRecoveryState has already been admitted and owns no
     // model-selected retry. Applying the generic fan-out cap to it terminalized
     // the fourth crash-safe continuation and erased its only owner. Keep the cap
@@ -1544,16 +1631,23 @@ export function recoverInterruptedChatRuns(
 
     // Commit user-facing text only for an honest terminal. Automatic recovery
     // remains nonterminal until the resumed brain reports its real outcome.
+    const recoveryWindowExhausted = record.autoResumeSkipped === 'recovery_window_exhausted';
     const noticeReply = pendingDispatchOwnership
       ? PREPARED_DISPATCH_HELD_REPLY
       : userStopped
         ? STOPPED_REPLY
-        : INTERRUPTED_REPLY;
+        // "pick up where it left off" would over-promise on a frame that
+        // demonstrably did not advance across every prior attempt.
+        : recoveryWindowExhausted
+          ? RECOVERY_WINDOW_EXHAUSTED_REPLY
+          : INTERRUPTED_REPLY;
     const noticeReason = pendingDispatchOwnership
       ? 'prepared_workflow_dispatch_interrupted'
       : userStopped
         ? 'stopped_before_restart'
-        : 'interrupted_by_restart';
+        : recoveryWindowExhausted
+          ? 'recovery_window_exhausted'
+          : 'interrupted_by_restart';
     // A notice already on record for this exact interruption is not repeated
     // and does not ping the user again.
     let noticeRepeated = false;

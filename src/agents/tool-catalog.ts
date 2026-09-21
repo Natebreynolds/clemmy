@@ -150,6 +150,26 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * On a proven-operation skip the carrier already has the callable schema.
+ * Keep ask/check-in. Recall/query tools stay off this surface until a
+ * result has landed: first-class tool_output_query with nothing to query
+ * became a dummy-query loop instead of the disclosed carrier
+ * (live 2026-09-21 source 277962).
+ */
+export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
+  'ask_user_question',
+]);
+
+export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {
+  const next = new Set<string>();
+  for (const name of hot) {
+    if (TOOL_SEARCH_ALWAYS_LOADED.has(name) && !PROVEN_SKIP_KEEP_LOADED.has(name)) continue;
+    next.add(name);
+  }
+  return next;
+}
+
+/**
  * Alternate discovery / memory-admin doors. They stay callable this turn
  * through `tool_search` → `call_tool` / `work_call`, but they must not become
  * first-class just because recall or the session LRU touched them. Otherwise
