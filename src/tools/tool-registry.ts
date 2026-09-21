@@ -397,7 +397,15 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'mcp_list_tools', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Search one configured external MCP server for exact callable names and the best match\'s real input schema.' },
   { name: 'mcp_reconnect', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Recover an external MCP server that is degraded/unavailable (stuck in the connection back…' },
   { name: 'mcp_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Inspect configured external MCP servers available to Clementine.' },
-  { name: 'memory_embed_backfill', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Compute embeddings for vault chunks and/or durable facts using the active embedding provi…' },
+  // 'orchestrator' because a cli-only lane made this unreachable from chat and
+  // the owner cannot see lanes. Asked live to run it, Clem spent 301s and 70
+  // tool calls trying to do it by hand (list_files, read_file, local_cli_probe)
+  // and never reached a terminal — an absent capability does not refuse, it
+  // flails. It is a safer write than its cli+orchestrator siblings beside it:
+  // memory_forget soft-deletes a fact, memory_pin changes standing context,
+  // while this only recomputes embeddings that the maintenance tick already
+  // recomputes on its own schedule.
+  { name: 'memory_embed_backfill', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Compute embeddings for vault chunks and/or durable facts using the active embedding provi…' },
   { name: 'memory_forget', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Soft-delete a fact by id (sets active=0).' },
   { name: 'memory_import', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Import ANOTHER agent\'s memory files (Claude Code memories, OpenClaw/Fermis stores, bare m…' },
   { name: 'memory_list_facts', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List or query durable facts as filterable JSON. Pass query for targeted lookup.' },
