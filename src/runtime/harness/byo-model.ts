@@ -36,7 +36,7 @@ import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
-import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrder } from './model-wire-registry.js';
+import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -198,12 +198,32 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
     });
   }
 
-  // Restore legacy (dynamic-first) order in system message(s) — a BYO backend
-  // never caches via breakpoints, so its wire stays BYTE-IDENTICAL to pre-parity.
+  // Keep the assembled (stable-first) order and strip only the harness's own
+  // layer markers.
+  //
+  // This used to call restoreLegacyInstructionOrder, which moves the dynamic
+  // memory context IN FRONT of the stable role instructions, on the reasoning
+  // that "a BYO backend never caches via breakpoints". That conflates two
+  // different mechanisms. `supportsPromptCache` in model-wire-registry means
+  // explicit Anthropic-style breakpoints are not needed — and its own comment
+  // says why: "OpenAI/codex cache automatically server-side". An automatic
+  // server-side cache keys on a STABLE PREFIX, so putting per-turn memory at
+  // byte 0 means no prefix is ever repeated and nothing can ever hit.
+  //
+  // Measured on the installed build, live 2026-09-20 source for "how many
+  // meetings does tim have tomorrow...": six grok-4.6 calls, 25,007 -> 38,353
+  // input tokens each, 236,961 input total, CACHED 0 — for 2,087 output tokens.
+  // The judge, whose prompt does not carry this reordered block, was caching on
+  // the same provider in the same period.
+  //
+  // Byte-identity with the pre-parity wire was a migration guarantee, not a
+  // correctness one. The content is unchanged; only the order of two blocks
+  // within the system message differs, and this is the order every other wire
+  // already sends.
   if (Array.isArray(next.messages)) {
     next.messages = (next.messages as Array<Record<string, unknown>>).map((m) =>
       m?.role === 'system' && typeof m.content === 'string'
-        ? { ...m, content: restoreLegacyInstructionOrder(m.content) }
+        ? { ...m, content: stripPromptCacheLayerSentinels(m.content) }
         : m,
     );
   }
