@@ -13200,7 +13200,7 @@ export interface CreationTestStepResult {
    * (append a row, read it back; upsert a record, confirm it) is the exact
    * pattern the evidence architecture asks users to build.
    */
-  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable';
+  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice';
   detail?: string;
 }
 export interface CreationTestResult {
@@ -13238,6 +13238,39 @@ export function creationTestVerdict(stepId: string, out: unknown): CreationTestS
   const deep = deepSelfReportedFailure(out);
   if (deep) return { stepId, status: 'failed', detail: deep.slice(0, 200) };
   return { stepId, status: 'ok' };
+}
+
+/**
+ * A recoverable capability pause during authoring is a QUESTION, not a broken
+ * step. It arrives as the same typed WorkflowCapabilityBlockedError a scheduled
+ * run raises — "control flow, not a failed task" — and the creation test used
+ * to flatten it into `status: 'error'` with a string, discarding the reason and
+ * the bounded account choices the error already carries. The owner was told to
+ * "choose the exact account" and given neither the list nor a way to choose.
+ *
+ * The question text comes from workflowCapabilityNotificationPresentation so
+ * authoring and a parked run ask it the same way.
+ */
+function creationTestCapabilityQuestion(
+  workflowName: string,
+  error: WorkflowCapabilityBlockedError,
+): string {
+  const at = new Date(0).toISOString();
+  const presentation = workflowCapabilityNotificationPresentation(workflowName, {
+    stepId: error.stepId,
+    tool: error.tool,
+    toolkit: error.toolkit,
+    reason: error.reason,
+    message: error.message,
+    blockedAt: at,
+    retryAt: at,
+    retryCount: 0,
+    provenNoDispatch: true,
+    state: 'blocked',
+    ...(error.accountChoiceSet ? { accountChoiceSet: error.accountChoiceSet } : {}),
+  });
+  const question = presentation.choiceQuestion.trim();
+  return (question || presentation.detail.trim() || error.message).slice(0, 1_200);
 }
 
 export async function runCreationTest(
@@ -13281,6 +13314,14 @@ export async function runCreationTest(
   const previewTainted = new Set<string>();
   const dependsOnPreview = (step: WorkflowStepInput): boolean =>
     (step.dependsOn ?? []).some((dep) => previewTainted.has(dep));
+  // Steps waiting on a step that needs the owner's choice. Reporting them as
+  // FAILED was pure noise and read as a second, independent defect: live
+  // 2026-09-21 "build_batch: failed — query_accounts is blocked with
+  // creation-test error" sat under the one real question and made a single
+  // unanswered choice look like a broken workflow.
+  const choiceBlocked = new Set<string>();
+  const dependsOnChoiceBlock = (step: WorkflowStepInput): boolean =>
+    (step.dependsOn ?? []).some((dep) => choiceBlocked.has(dep));
   let guard = 0;
   while (completed.size < steps.length && guard++ < steps.length + 2) {
     const readyIds = new Set(resolveWorkflowReadiness(steps, completed).readyStepIds);
@@ -13294,6 +13335,14 @@ export async function runCreationTest(
         stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
         results.push({ stepId: step.id, status: 'previewed' });
         previewTainted.add(step.id);
+      } else if (dependsOnChoiceBlock(step)) {
+        choiceBlocked.add(step.id);
+        stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on is waiting for your choice' };
+        results.push({
+          stepId: step.id,
+          status: 'unverifiable',
+          detail: 'waits on a step that needs your choice first',
+        });
       } else if (dependsOnPreview(step)) {
         // Verifying a write that was intentionally skipped is not possible.
         // Run nothing, claim nothing, and do not hold activation hostage.
@@ -13314,8 +13363,20 @@ export async function runCreationTest(
           stepOutputs[step.id] = out;
           results.push(creationTestVerdict(step.id, out));
         } catch (err) {
-          stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
-          results.push({ stepId: step.id, status: 'error', detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+          if (err instanceof WorkflowCapabilityBlockedError
+            && workflowCapabilityBlockIsRecoverable(err.reason)) {
+            // Proven pre-dispatch: nothing ran. Ask, do not fail.
+            choiceBlocked.add(step.id);
+            stepOutputs[step.id] = { blocked: true, reason: 'awaiting an exact capability choice' };
+            results.push({
+              stepId: step.id,
+              status: 'needs_choice',
+              detail: creationTestCapabilityQuestion(workflow.name, err),
+            });
+          } else {
+            stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
+            results.push({ stepId: step.id, status: 'error', detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+          }
         }
       }
       completed.add(step.id);
@@ -14194,6 +14255,11 @@ async function processOneRunFile(
       }
       const lines = result.steps.map((s) => {
         if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
+        // The one answerable thing leads with the question itself, indented so
+        // the enumerated choices stay readable inside the step list.
+        if (s.status === 'needs_choice') {
+          return [`- ${s.stepId}: ❓ needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
+        }
         if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
         // Unverifiable is honest, not alarming: it names WHY the check could
         // not run so the report never implies a broken step.
@@ -14208,7 +14274,12 @@ async function processOneRunFile(
           ? autoRetestRunId
             ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); ${activateAfterCreationTest ? "it'll auto-enable here on pass" : 'it will remain disabled'}.\n\n${lines.join('\n')}`
             : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
-        : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rebind them and re-test. If you'd rather run it as it stands, say so and I'll enable it.`;
+        : result.steps.some((s) => s.status === 'needs_choice')
+          // NOT a broken workflow — one unanswered question. Everything else
+          // that stopped is downstream of it. Ask for the answer and say what
+          // happens next, so answering is the whole of the owner's part.
+          ? `"${workflow.data.name}" is ready except for one thing I can't decide for you — left DISABLED until it's settled.\n\n${lines.join('\n')}\n\nAnswer that and I'll bind it to the step, re-run the creation test, and enable it if it passes.`
+          : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rebind them and re-test. If you'd rather run it as it stands, say so and I'll enable it.`;
       const report = {
         workflowName: workflow.data.name,
         outcome: creationReady ? 'done' as const : 'blocked' as const,

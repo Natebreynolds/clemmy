@@ -323,3 +323,67 @@ for (const effect of ['read', 'external_write'] as const) {
     }
   });
 }
+
+test('an unanswered account choice during authoring is a QUESTION, and its dependents are not reported broken', async () => {
+  // Live 2026-09-21: "query_accounts: error — 13 accounts are registered for
+  // salesforce_sf_soql_query; choose the exact account" with no list and no way
+  // to choose, then "build_batch: failed — query_accounts is blocked with
+  // creation-test error", then "Fix the flagged step(s) with workflow_update
+  // ... To run it as-is anyway: workflow_set_enabled". One unanswered question
+  // read as a broken workflow the owner was told to repair with engine calls.
+  const operationId = 'GENERIC_AUTHORING_CHOICE_QUERY';
+  const manifests = [
+    manifestFor({ operationId, manifestId: 'cap:generic-authoring-choice:account-a', accountId: 'account-a' }),
+    manifestFor({ operationId, manifestId: 'cap:generic-authoring-choice:account-b', accountId: 'account-b' }),
+  ];
+  const store = manifestStores.createCapabilityManifestStore(manifests);
+  manifestStores.installCapabilityManifestStore(store);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  for (const manifest of manifests) {
+    const observe = () => ({
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+      accountId: manifest.accountId,
+      observedAt: Date.now(),
+    });
+    assert.equal(ports.registerFixtureCapabilityPort(
+      ports.productionPortIdentityFromManifest(manifest),
+      { observe, invoke: async () => ({ data: { value: [{ id: manifest.accountId }] } }) },
+    ).ok, true);
+  }
+  adapters.installProductionCapabilityAdapter(adapters.createProductionCapabilityAdapter({ factory, store }));
+
+  const saved = workflows.writeWorkflow('authoring-choice-canary', {
+    name: 'Authoring Choice Canary',
+    description: 'A read whose account is ambiguous, and a step that depends on it.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'query_accounts', prompt: '', sideEffect: 'read', call: { tool: operationId, args: { scope: 'newest' } } },
+      { id: 'build_batch', prompt: '', sideEffect: 'read', dependsOn: ['query_accounts'],
+        call: { tool: operationId, args: { scope: 'newest' } } },
+    ],
+  });
+
+  const result = await runner.runCreationTest(
+    saved.data,
+    saved.name,
+    'creation-test-authoring-choice',
+    {},
+    new Proxy({}, { get: () => { throw new Error('model fallback was consulted'); } }) as never,
+  );
+
+  assert.equal(result.pass, false, 'an unanswered choice still leaves the draft disabled');
+  const query = result.steps.find((step) => step.stepId === 'query_accounts');
+  assert.equal(query?.status, 'needs_choice', `expected a question, got ${JSON.stringify(query)}`);
+  // The owner is given the actual choices, which the old error text withheld.
+  assert.match(query?.detail ?? '', /account-a/);
+  assert.match(query?.detail ?? '', /account-b/);
+  // The dependent stopped because of the question, not because it is broken.
+  const dependent = result.steps.find((step) => step.stepId === 'build_batch');
+  assert.equal(dependent?.status, 'unverifiable', `expected no cascade failure, got ${JSON.stringify(dependent)}`);
+  assert.equal(result.steps.some((step) => step.status === 'error' || step.status === 'failed'), false,
+    `nothing is reported broken: ${JSON.stringify(result.steps)}`);
+});
