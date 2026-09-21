@@ -139,3 +139,7 @@ output/
 /pi-law-firms-comparison.md
 /harbor-vine-index.html
 /artifacts/
+
+# Measurement RUN OUTPUTS carry the operator home path, name and email.
+# The harness that produces them is tracked; its results are not.
+tools/measurement/ab-runs/

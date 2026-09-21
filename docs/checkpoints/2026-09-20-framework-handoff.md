@@ -4,7 +4,7 @@ User priority: high intelligence, accurate execution, speed and token efficiency
 
 ## Ownership and running patch
 
-- Shared checkout `/Users/nathan.reynolds/clementine-next`, branch `main`, last checked HEAD `e5a75f5a`. Other Claude agent works in this checkout. Preserve all existing changes and `apps/usage-sidecar`; do not stage or revert the entire worktree.
+- Shared checkout `~/clementine-next`, branch `main`, last checked HEAD `e5a75f5a`. Other Claude agent works in this checkout. Preserve all existing changes and `apps/usage-sidecar`; do not stage or revert the entire worktree.
 - Other agent owns UI and final merge. This work is framework-only; no final commit/tag/push made here.
 - Installed app `~/Applications/Clementine.app`, live home `~/.clementine-next`, version3.18.17/schema81. Current installed fingerprint `30a87ba1c633a4787d389aa4990c425684a5965fe096bdc3795139ac94d231ad` (supersedes f920aea3; see optional-null correction below).
 - User requires installed hotpatch/live-home acceptance. Never run destructive test resets against live home. Pure/read-only retained-evidence checks are distinct from model acceptance.

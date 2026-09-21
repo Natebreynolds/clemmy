@@ -99,7 +99,7 @@ Codex is authenticated through native credentials, independently of CLI auth. It
 
 ```json
 {
-  "dbPath": "/Users/nathan.reynolds/.clementine-next/state/memory.db",
+  "dbPath": "~/.clementine-next/state/memory.db",
   "dbPresent": true,
   "dbBytes": 128557056,
   "indexedFiles": 555,

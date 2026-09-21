@@ -24,7 +24,7 @@ These totals come from the session-linked usage records over each turn, not bill
 
 The immediate implementation order is therefore: trustworthy benchmark labels; actionable completion review and continuation; efficient ambiguous-reference resolution; schema/result-handle recovery; then the broader memory, worker, and proactive improvements below. The latest runs do not yet establish a speed benefit from Jev. Smaller workers are configured but were not exercised by these four turns, so their efficiency benefit remains unmeasured.
 
-Evidence locations: `/Users/nathan.reynolds/.clementine-next/state/harness.db` (`events`, keyed by the source IDs above), `/Users/nathan.reynolds/.clementine-next/state/token-usage/`, and the two existing measurement JSON files. Read them without mutating the live databases. Recheck for newer runs and coordinate current ownership before implementing.
+Evidence locations: `~/.clementine-next/state/harness.db` (`events`, keyed by the source IDs above), `~/.clementine-next/state/token-usage/`, and the two existing measurement JSON files. Read them without mutating the live databases. Recheck for newer runs and coordinate current ownership before implementing.
 
 ## Mission
 
@@ -36,7 +36,7 @@ This is framework work. Do not repair personal Spaces, migrate business data, mo
 
 ## Start here: checkout, continuity, and ownership
 
-The checkout inspected for this brief is `/Users/nathan.reynolds/clementine-next`, branch `main`. This is an observation, not an instruction to switch branches blindly. Recheck the active agents' actual checkout, branch, changes, and recent commits before editing. Preserve all unrelated edits, especially `apps/usage-sidecar` and UI work. Agree on ownership of overlapping files before changing them; work on independent areas while ownership is being resolved.
+The checkout inspected for this brief is `~/clementine-next`, branch `main`. This is an observation, not an instruction to switch branches blindly. Recheck the active agents' actual checkout, branch, changes, and recent commits before editing. Preserve all unrelated edits, especially `apps/usage-sidecar` and UI work. Agree on ownership of overlapping files before changing them; work on independent areas while ownership is being resolved.
 
 Read these first, interpreting dated observations against current code and running configuration:
 
@@ -51,7 +51,7 @@ Inspect the existing implementation before deciding what remains. The review beh
 
 ### Where to work
 
-Paths below are relative to `/Users/nathan.reynolds/clementine-next`.
+Paths below are relative to `~/clementine-next`.
 
 | Area | Existing entry points | Ownership guidance |
 | --- | --- | --- |

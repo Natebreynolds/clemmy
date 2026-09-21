@@ -1146,7 +1146,7 @@ a failed observation in the existing Space, preserving its previous data.
 ## Space account-binding candidate — 2026-09-19 19:53 UTC
 
 Original source event 229088 in sess-desktop-96804f24f6fe16dfc0e80cb3 records
-calendar operation account ca_uDzrJqqniJFk, identity nathan.reynolds@scorpion.co,
+calendar operation account ca_uDzrJqqniJFk, identity operator@example.com,
 source 229017, host:read_default. This is evidence for the original account,
 not a newly guessed choice. Candidate adds composioAccountId (tool spelling
 composio_account_id) to saved read sources, carries it to exact catalog

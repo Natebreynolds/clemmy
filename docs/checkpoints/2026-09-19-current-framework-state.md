@@ -1796,7 +1796,7 @@ Goalactive; docsafterbuild meanrebuildbeforefuturehotpatch.
 
 ## Mixed remember requests hid native tools — fixed and live accepted
 Continuation after status check: main e5a75f5a; Claude PID80577 still cwd
-/Users/nathan.reynolds/clementine-next. Installed92e4 fingerprint verified.
+~/clementine-next. Installed92e4 fingerprint verified.
 New live request sess-desktop-a671c5024c94eb37b231a424 source246642 began
 "Remember this reporting preference ... Then read [absolute local file]".
 Memory3800 correctly saved, but localMemoryBuiltinScope treated prefix "Remember
@@ -4085,7 +4085,7 @@ Installed Salesforce core AuthInfoConfig.create for same username, without
 printing config contents, reproduced deeper SetCredentialError:
 security: SecKeychainItemCreateFromContent (<default>): The user name or
 passphrase you entered is not correct. Global.DIR and os.homedir resolve to
-actual /Users/nathan.reynolds/.sfdx and /Users/nathan.reynolds, respectively.
+actual ~/.sfdx and ~, respectively.
 This establishes local Salesforce credential/keychain access failure; it does
 not establish revoked remote credentials or a wrong HOME from Clem. The CLI
 OrgAccessor catches this auth-file initialization error and then AuthInfo
