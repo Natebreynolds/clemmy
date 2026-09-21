@@ -326,6 +326,67 @@ export function refersToUserOrHostedWorld(text: string): boolean {
     || CURRENT_ENVIRONMENT_QUESTION_RE.test(trimmed);
 }
 
+/**
+ * A closed-form computation: the whole ask is arithmetic the model can do from
+ * the sentence itself. Positively identified — every token after the question
+ * frame is a number, an operator, or one of a small fixed set of arithmetic
+ * words. A single domain noun ("meetings", "tim", "salesforce") fails it.
+ *
+ * This is the ONLY content class besides a matched greeting that may skip tool
+ * acquisition, because it is the only one whose self-containment can be shown
+ * rather than assumed.
+ */
+const COMPUTATION_FRAME_RE =
+  /^(?:what(?:'?s| is| are)?|how much is|how many is|calculate|compute|solve)\s+/i;
+const COMPUTATION_WORDS: ReadonlySet<string> = new Set([
+  'plus', 'minus', 'times', 'divided', 'by', 'of', 'percent', 'squared', 'cubed',
+  'sqrt', 'to', 'the', 'power', 'and', 'x',
+]);
+
+export function isSelfContainedComputation(text: string): boolean {
+  const body = text.trim().replace(/\?+$/, '').replace(COMPUTATION_FRAME_RE, '').trim();
+  if (!body || !/\d/.test(body)) return false;
+  return body.split(/\s+/).every((raw) => {
+    const token = raw.replace(/[.,!]+$/, '').toLowerCase();
+    if (!token) return true;
+    if (/^[0-9+\-*/x×÷^%().]+$/.test(token)) return true;
+    return COMPUTATION_WORDS.has(token);
+  });
+}
+
+/**
+ * POSITIVE evidence that a turn can be answered with no external data.
+ *
+ * THE FAILURE THIS REPLACES (live 2026-09-20, source 268980). The zero-tool
+ * shortcut asked the opposite question: it fired when the text contained no
+ * first-person pronoun, no possessive noun from a list of eight, and none of
+ * six prepositions. "how many meetings does tim have tomorrow checking
+ * salesforce and for who" contains none of those, so it was ruled closed-world,
+ * every tool was stripped before discovery, and Clem announced a Salesforce
+ * check she had no authority to perform. Spelling was not the cause: the
+ * correctly spelled sentence fails identically, while "in salesforce" passes —
+ * the difference is a preposition.
+ *
+ * Absence of a recognised referent is not evidence of self-containment. It is
+ * the ordinary condition of any sentence phrased in a way the list did not
+ * anticipate, and of every question about a third person. So the test is now
+ * the affirmative one: a matched greeting, or arithmetic. Everything else —
+ * including anything the classifier called closed-world purely because it
+ * recognised nothing — pays full admission and keeps its tools, which is what
+ * this predicate's own contract always said ("every doubt pays full admission").
+ */
+export function selfContainedConversation(
+  text: string,
+  verdict: Pick<IntentClassification, 'intent' | 'confidence'>,
+): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  // A greeting/acknowledgement matched by pattern, length and the action,
+  // hosted-ask and external-effect guards in classifyMessageIntent.
+  if (verdict.intent === 'casual' && verdict.confidence >= 0.9) return true;
+  return isSelfContainedComputation(trimmed);
+}
+
 export function hasDiscourseReferent(text: string): boolean {
   return DISCOURSE_REFERENT_RE.test(text.trim());
 }

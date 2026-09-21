@@ -76,7 +76,7 @@ import {
   rehydrateConsumedClarificationContext,
   verifyDurableClarificationContext,
 } from '../harness/task-continuity-runtime.js';
-import { classifyMessageIntent, refersToUserOrHostedWorld } from '../../assistant/message-intent.js';
+import { classifyMessageIntent, selfContainedConversation } from '../../assistant/message-intent.js';
 import {
   markAdmissionCapabilityResolutionSuperseded,
   provenCapabilityEntriesForTurn,
@@ -323,6 +323,30 @@ export function unboundDestinationUsesOnlyRevalidatedLocalEnvelopes(input: {
  * falls through to an untyped tool loop. Nothing here may choose effect,
  * provider, topology, or completion.
  */
+/**
+ * Has completion review already reported this accepted source unanswerable for
+ * want of external evidence? Then the cheap surface is disproven for this turn:
+ * whatever it skipped is exactly what the answer needed.
+ */
+function priorCompletionWantedEvidence(
+  identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>,
+): boolean {
+  try {
+    return listEvents(identity.sessionId, {
+      sinceSeq: identity.sourceUserSeq,
+      types: ['goal_alignment_judged'],
+      limit: 40,
+    }).some((event) => {
+      const data = event.data as { fulfills?: unknown; sourceUserSeq?: unknown; kind?: unknown };
+      return data.fulfills === false
+        && data.kind === 'completion'
+        && Number(data.sourceUserSeq) === identity.sourceUserSeq;
+    });
+  } catch {
+    return false;
+  }
+}
+
 function conversationShortCircuit(
   identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>,
   durableText: string,
@@ -339,17 +363,24 @@ function conversationShortCircuit(
     const verdict = classifyMessageIntent(durableText, {
       continueHostedWorld: continuesHostedWork,
     });
+    // A turn whose answer was already judged to be missing external evidence
+    // must not be re-offered the same tool-less surface. Live 2026-09-20: two
+    // completion reviews correctly reported no Salesforce result and asked for
+    // continuation, and every retry recomputed this same shortcut from the same
+    // accepted source — three attempts, zero tool calls, 124 seconds.
+    if (priorCompletionWantedEvidence(identity)) return false;
     // Closed-world talk skips the semantic port. A hosted-world retrieve still
     // pays admission so connected capabilities can bind — skipping lookup is
-    // how a connected directory or store never gets used. A greeting prefix
-    // does not make "what's on my calendar" closed-world: that ask names the
-    // user's world even when the classifier's short-message casual gate fires.
-    if (
-      !continuesHostedWork
-      && !refersToUserOrHostedWorld(durableText)
-      && (verdict.intent === 'casual' || verdict.intent === 'conversation')
-      && verdict.confidence >= 0.8
-    ) return true;
+    // how a connected directory or store never gets used.
+    //
+    // The test is POSITIVE on purpose. It used to fire on the absence of a
+    // first-person pronoun, a possessive noun from a list of eight, and six
+    // prepositions — so a question about a third person, or one phrased with an
+    // unanticipated verb, was ruled closed-world and stripped of every tool
+    // before discovery could run. Absence of a recognised referent is not
+    // evidence of self-containment; it is the ordinary state of a sentence the
+    // lists did not foresee.
+    if (!continuesHostedWork && selfContainedConversation(durableText, verdict)) return true;
     const resolution = resolveTurnCapabilities(durableText, { sessionId: identity.sessionId });
     if (resolution.entries.some((entry) => entry.status === 'proven')) return false;
     return false;
