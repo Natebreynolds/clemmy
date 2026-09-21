@@ -61,6 +61,27 @@ test('auto capture durably records the exact source and replay payload before co
   assert.equal(readReflectionCandidateHealth().orphanedPending, 0, 'episode-backed queued work is not orphaned');
 });
 
+/**
+ * Hermetic stand-in for reviewStandingMemory.
+ *
+ * An intake reason in EXPLICIT_STABLE_CONTEXT_REASONS routes the drain through
+ * a scope review whenever the owner's memory clause has trailing text after it
+ * — which every compound turn below does. That review is a live model call, so
+ * without this stub these tests reach the network and fail wherever a boundary
+ * judge is unreachable, which reads as a memory-path defect rather than a
+ * missing seam.
+ *
+ * Returning the candidate unchanged is the real reviewer's own documented
+ * behaviour for this case: "If the candidate already contains the complete
+ * remembered claim, return it unchanged." The drain still enforces that the
+ * returned span is present in the source, so the assertions keep their teeth.
+ */
+const keepsTheAuthorizedClaim = async (_source: string, candidate: string) => ({
+  scope: 'standing' as const,
+  text: candidate,
+  reason: 'test stub — explicit claim already complete',
+});
+
 test('compound explicit memory queues only the isolated claim while retaining the exact source episode', async () => {
   const message = 'Remember this: Cedar is Cedar-17. Also give me three launch ideas. Just confirm.';
   const candidates = extractAutoMemoryCandidates(message);
@@ -90,6 +111,7 @@ test('compound explicit memory queues only the isolated claim while retaining th
   assert.equal((await drainDurableConsolidationCandidates({
     ids: queued.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
   const fact = db.prepare(`
     SELECT content FROM consolidated_facts WHERE active = 1
@@ -110,7 +132,9 @@ test('maintenance replay promotes one canonical fact with the original user-turn
     }],
   });
 
-  const replay = await drainDurableConsolidationCandidates({ ids: queued.candidateIds });
+  const replay = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+    standingReviewer: keepsTheAuthorizedClaim,
+  });
   assert.equal(replay.promoted, 1);
   const db = openMemoryDb();
   const candidate = db.prepare(`
@@ -158,10 +182,14 @@ test('redelivery and worker replay are idempotent at both candidate and fact lay
     }],
   };
   const first = enqueueAutoCaptureCandidates(input);
-  assert.equal((await drainDurableConsolidationCandidates({ ids: first.candidateIds })).promoted, 1);
+  assert.equal((await drainDurableConsolidationCandidates({ ids: first.candidateIds,
+    standingReviewer: keepsTheAuthorizedClaim,
+  })).promoted, 1);
   const redelivery = enqueueAutoCaptureCandidates(input);
   assert.deepEqual(redelivery.candidateIds, first.candidateIds);
-  assert.equal((await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds })).selected, 0);
+  assert.equal((await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds,
+    standingReviewer: keepsTheAuthorizedClaim,
+  })).selected, 0);
   const db = openMemoryDb();
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM memory_reflection_candidates').get() as { count: number }).count, 1);
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM consolidated_facts').get() as { count: number }).count, 1);
@@ -184,6 +212,7 @@ test('explicit durable memory bumps the stable-context generation only after can
   assert.equal((await drainDurableConsolidationCandidates({
     ids: implicit.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
   assert.equal(stableContextGeneration(), startGeneration, 'incidental reflection churn remains deferred');
 
@@ -202,6 +231,7 @@ test('explicit durable memory bumps the stable-context generation only after can
   assert.equal((await drainDurableConsolidationCandidates({
     ids: remembered.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
   assert.equal(stableContextGeneration(), startGeneration + 1, 'an explicit ADD invalidates every frozen stable prefix');
 
@@ -219,6 +249,7 @@ test('explicit durable memory bumps the stable-context generation only after can
   assert.equal((await drainDurableConsolidationCandidates({
     ids: correction.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
   assert.equal(stableContextGeneration(), startGeneration + 2, 'an explicit SUPERSEDE invalidates every frozen stable prefix');
 
@@ -234,7 +265,9 @@ test('explicit durable memory bumps the stable-context generation only after can
     }],
   });
   assert.deepEqual(redelivery.candidateIds, correction.candidateIds);
-  assert.equal((await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds })).selected, 0);
+  assert.equal((await drainDurableConsolidationCandidates({ ids: redelivery.candidateIds,
+    standingReviewer: keepsTheAuthorizedClaim,
+  })).selected, 0);
   assert.equal(stableContextGeneration(), startGeneration + 2, 'idempotent replay cannot churn the stable prefix');
 });
 
@@ -253,6 +286,7 @@ test('a failed immediate resolver remains visible and succeeds on bounded replay
     ids: queued.candidateIds,
     now: '2026-07-15T19:00:00.000Z',
     resolver: async () => { throw new Error('temporary resolver outage'); },
+    standingReviewer: keepsTheAuthorizedClaim,
   });
   assert.equal(failed.retried, 1);
   let row = openMemoryDb().prepare(`
@@ -271,6 +305,7 @@ test('a failed immediate resolver remains visible and succeeds on bounded replay
     ids: queued.candidateIds,
     now: '2026-07-15T19:00:16.000Z',
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   });
   assert.equal(recovered.promoted, 1);
   row = openMemoryDb().prepare(`
@@ -322,12 +357,14 @@ test('an older overlapping capture cannot resurrect after a newer explicit cross
       await holdOlder;
       return { decision: 'ADD' as const };
     },
+    standingReviewer: keepsTheAuthorizedClaim,
   });
 
   await olderStarted;
   const newerDrain = await drainDurableConsolidationCandidates({
     ids: correction.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   });
   assert.equal(newerDrain.promoted, 1, 'the newer source event commits while the older resolver is still in flight');
   releaseOlder();
@@ -369,6 +406,7 @@ test('a normal-order explicit cross-kind correction deterministically retires th
   assert.equal((await drainDurableConsolidationCandidates({
     ids: stale.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const correction = enqueueAutoCaptureCandidates({
@@ -387,6 +425,7 @@ test('a normal-order explicit cross-kind correction deterministically retires th
     // A same-kind-only implementation would never surface the project row to
     // this resolver and would therefore leave both values active.
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const rows = openMemoryDb().prepare(`
@@ -422,6 +461,7 @@ test('a real future-reference correction survives admission and deterministicall
   assert.equal((await drainDurableConsolidationCandidates({
     ids: stale.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const correctionMessage = "Small correction for later: Cedar's current release number is Cedar-17. Cedar-12 is retired and must not be used as current. A natural acknowledgement is enough.";
@@ -446,6 +486,7 @@ test('a real future-reference correction survives admission and deterministicall
       resolverCalls += 1;
       return { decision: 'ADD' as const };
     },
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
   assert.equal(resolverCalls, 0, 'one evidence-backed correction uses the deterministic transition');
 
@@ -491,6 +532,7 @@ test('a quoted retired identifier cannot cross conflicting claim subjects', asyn
   assert.equal((await drainDurableConsolidationCandidates({
     ids: stale.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const correction = enqueueAutoCaptureCandidates({
@@ -507,6 +549,7 @@ test('a quoted retired identifier cannot cross conflicting claim subjects', asyn
   assert.equal((await drainDurableConsolidationCandidates({
     ids: correction.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const active = openMemoryDb().prepare(`
@@ -532,6 +575,7 @@ test('a split identifier alone is not enough to prove an otherwise unanchored co
   assert.equal((await drainDurableConsolidationCandidates({
     ids: stale.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const correction = enqueueAutoCaptureCandidates({
@@ -548,6 +592,7 @@ test('a split identifier alone is not enough to prove an otherwise unanchored co
   assert.equal((await drainDurableConsolidationCandidates({
     ids: correction.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const active = openMemoryDb().prepare(`
@@ -595,12 +640,14 @@ test('a correction rechecks older targets after its resolver wait before committ
       await holdCorrection;
       return { decision: 'ADD' as const };
     },
+    standingReviewer: keepsTheAuthorizedClaim,
   });
 
   await correctionStarted;
   assert.equal((await drainDurableConsolidationCandidates({
     ids: stale.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1, 'the older source commits while the newer resolver is waiting');
   releaseCorrection();
   assert.equal((await correctionDrain).promoted, 1);
@@ -641,6 +688,7 @@ test('an explicit correction does not collapse an unrelated cross-kind fact', as
   assert.equal((await drainDurableConsolidationCandidates({
     ids: unrelated.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const correction = enqueueAutoCaptureCandidates({
@@ -657,6 +705,7 @@ test('an explicit correction does not collapse an unrelated cross-kind fact', as
   assert.equal((await drainDurableConsolidationCandidates({
     ids: correction.candidateIds,
     resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
   })).promoted, 1);
 
   const active = openMemoryDb().prepare(`
@@ -691,7 +740,9 @@ test('an explicitly taught reporting procedure retains its late conditions throu
     sourceEventId: 'turn:long-procedure', candidates });
   closeMemoryDb();
   assert.equal((await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
-    resolver: async () => ({ decision: 'ADD' as const }) })).promoted, 1);
+    resolver: async () => ({ decision: 'ADD' as const }),
+    standingReviewer: keepsTheAuthorizedClaim,
+  })).promoted, 1);
   closeMemoryDb();
   const fact = openMemoryDb().prepare('SELECT content FROM consolidated_facts WHERE active = 1').get() as { content: string };
   assert.equal(fact.content, procedure);
