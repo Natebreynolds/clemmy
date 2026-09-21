@@ -13,7 +13,14 @@
  */
 import { useState } from 'react';
 import { FileText, Send, BookOpen, Brain, Wrench } from 'lucide-react';
-import { evidenceChips, openableEvidence, type EvidenceChip, type TerminalFacts } from '@clem/chat-engine';
+import {
+  evidenceChips,
+  observedEvidenceChips,
+  openableEvidence,
+  type ActivityItem,
+  type EvidenceChip,
+  type TerminalFacts,
+} from '@clem/chat-engine';
 import { localPathFromUri, openFile } from '@/lib/files';
 
 const ICON: Record<EvidenceChip['kind'], typeof FileText> = {
@@ -24,9 +31,19 @@ const ICON: Record<EvidenceChip['kind'], typeof FileText> = {
   tool_result: Wrench,
 };
 
-export function TurnEvidenceLine({ terminal }: { terminal?: TerminalFacts }) {
+export function TurnEvidenceLine(
+  { terminal, activity }: { terminal?: TerminalFacts; activity?: readonly ActivityItem[] },
+) {
   const [problem, setProblem] = useState('');
-  const chips = evidenceChips(terminal?.evidenceRefs);
+  // The terminal's own refs win when the harness supplied them — that is its
+  // statement about its own work. They arrive on ~4% of terminals, so without a
+  // second route this row almost never drew and "done" went back to resting on
+  // the prose above it. `activity` is the same facts observed from projected
+  // events (tool_returned, deliverable_saved, external_write_succeeded), which
+  // is what the row is for: showing what the turn touched, not waiting for
+  // permission to say so.
+  const proven = evidenceChips(terminal?.evidenceRefs);
+  const chips = proven.length > 0 ? proven : observedEvidenceChips(activity);
   if (chips.length === 0) return null;
 
   const reveal = (uri: string) => {

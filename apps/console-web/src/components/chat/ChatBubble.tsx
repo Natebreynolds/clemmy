@@ -496,7 +496,7 @@ export function ChatBubble({
         {/* The harness's own ledger for this turn: what it wrote, saved, read
             and remembered. Renders only when the typed terminal carried proof,
             so an ordinary conversational reply stays a reply. */}
-        <TurnEvidenceLine terminal={message.terminal} />
+        <TurnEvidenceLine terminal={message.terminal} activity={message.activity} />
       </div>
     </div>
   );

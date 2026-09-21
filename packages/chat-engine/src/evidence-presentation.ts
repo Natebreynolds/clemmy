@@ -85,3 +85,70 @@ export function openableEvidence(refs: readonly TurnEvidenceRef[] | undefined): 
     typeof ref?.uri === 'string' && ref.uri.length > 0
   ));
 }
+
+/**
+ * The same receipt, derived from what the CLIENT WATCHED instead of from the
+ * terminal's refs.
+ *
+ * evidenceChips above reads `evidenceRefs`, which is the harness's own proof.
+ * That field is populated on ~4% of terminals, so the receipt row almost never
+ * drew and the reply's "done" went back to resting on its prose — the exact
+ * thing the row exists to replace.
+ *
+ * But the client is not short of evidence. `tool_called`, `tool_returned`,
+ * `deliverable_saved` and `external_write_succeeded` are all PROJECTED, and the
+ * activity fold already reduces them into rows carrying a write disposition and
+ * a rolling file count. So the receipt can be assembled from the same facts the
+ * server would have used, arriving by a different route, with no server change.
+ *
+ * Two honesty rules, because observation and proof are not the same thing:
+ *
+ *   - A write says "confirmed" ONLY on disposition 'confirmed', which is set by
+ *     external_write_succeeded — the very event a server-side receipt would cite.
+ *     'reserved' and 'orphaned' are not claims of landing and are left out; a
+ *     dispatched-but-unobserved write must never read as a settled one.
+ *   - Read work becomes a `tool_result` chip, the weakest kind, and never a
+ *     `source` chip. A source claims Clem read a named artifact; all the client
+ *     saw was a tool return. Overstating that is how a receipt stops being one.
+ *
+ * Terminal refs still win when present: they are the harness's own statement.
+ */
+export function observedEvidenceChips(
+  items: readonly ObservedActivity[] | undefined,
+): EvidenceChip[] {
+  if (!items?.length) return [];
+  const counts = new Map<TurnEvidenceKind, number>();
+  const bump = (kind: TurnEvidenceKind, by = 1): void => {
+    if (by > 0) counts.set(kind, (counts.get(kind) ?? 0) + by);
+  };
+
+  for (const item of items) {
+    // A settled external write is the one thing here that is genuinely proof.
+    if (item.write?.disposition === 'confirmed') bump('external_receipt');
+    // The deliverables row is a rolling aggregate, so its own count is the total.
+    else if (item.id === 'deliverables') bump('artifact', item.count ?? 1);
+    else if (item.effect === 'local_write' && item.status === 'done') bump('artifact');
+    else if (item.kind === 'tool' && item.status === 'done' && item.effect !== 'external_write') {
+      bump('tool_result', item.repeats ?? 1);
+    }
+  }
+
+  const chips: EvidenceChip[] = [];
+  for (const kind of ORDER) {
+    const count = counts.get(kind) ?? 0;
+    if (count > 0) chips.push({ kind, label: PHRASING[kind](count), count, refs: [] });
+  }
+  return chips;
+}
+
+/** The fields observedEvidenceChips reads. Structurally a subset of
+ *  ActivityItem, declared separately so this module keeps no import cycle. */
+export interface ObservedActivity {
+  id: string;
+  kind: string;
+  status: string;
+  effect?: string;
+  count?: number;
+  repeats?: number;
+  write?: { disposition: string };
+}
