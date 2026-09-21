@@ -1,8 +1,13 @@
 import type { ChatMessage, MessageStatus, TerminalFacts, TurnEvidenceRef } from './types.js';
 import { humanHarnessText } from './types.js';
 
-export const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
-export const EMPTY_COMPLETION_ERROR = 'The run ended without a usable answer, so I haven’t marked it complete. Check the activity above or try again.';
+/** Every user-visible terminal string in this module must name a NEXT EDGE —
+ *  something the reader can say or do — because a stop that only reports its own
+ *  failure makes the owner nudge the assistant to get anywhere. "Try again" is
+ *  not an edge: it hands the work back without saying what changes on a retry.
+ *  `terminal-next-edge.test.ts` locks this for every export here. */
+export const GENERIC_TURN_ERROR = 'That turn stopped before I had an answer for you. Say “continue” and I’ll pick it back up.';
+export const EMPTY_COMPLETION_ERROR = 'I worked through the steps but didn’t come out with an answer worth giving you. Say “continue” and I’ll take another run at it.';
 
 type CanonicalTerminalStatus =
   | 'done'
@@ -151,7 +156,10 @@ function terminalCompletionPresentationCore(
   }
   if (canonicalStatus === 'needs_input' || awaitingUser) {
     return {
-      text: 'I need your input before I can continue.',
+      // Reaching here means the server typed the stop as needs_input but the
+      // question itself did not survive. Saying only "I need your input" makes
+      // the owner guess what is wanted — name the edge that recovers it.
+      text: 'I need something from you before I can continue, but my question didn’t come through — say “continue” and I’ll ask it again.',
       status: 'awaiting-reply',
       progress: undefined,
     };

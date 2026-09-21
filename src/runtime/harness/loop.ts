@@ -1225,7 +1225,12 @@ function reduceStandardConversationTerminal(input: {
             resumable: false,
             presentation: {
               kind: 'stopped',
-              text: 'Stopped — this turn was cancelled. Nothing further will execute.',
+              // A cancelled turn is still not allowed to be a dead end. The
+              // status carries resumable:false (the schema requires it here),
+              // so the EDGE has to live in the words — as it already does on
+              // the sibling stop in claude-agent-brain.ts. Without this the
+              // owner is told only that nothing will happen, and has to nudge.
+              text: 'Stopped — this turn was cancelled. Nothing further will execute; tell me how you’d like to proceed and I’ll start from there.',
             },
           };
       legacyReason = transfer ? 'transferred' : 'cancelled';
