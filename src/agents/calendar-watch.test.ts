@@ -123,21 +123,38 @@ test('an existing overlap does not re-fire; a self-created block is not an invit
   assert.deepEqual(detect([a, b, self], [a, b, self]), []);
 });
 
-test('the Outlook parser reads Graph shapes; the Google parser reads the self response', () => {
+test('the Outlook parser reads Graph shapes; the Google parser reads the self response', async () => {
   const outlook = calendarReadOperation('OUTLOOK_GET_CALENDAR_VIEW')!;
   const parsed = outlook.parse({ data: { value: [{
     id: 'x', subject: 'Canceled: Nate 1:1', start: { dateTime: '2026-09-22T18:00:00.0000000' }, end: { dateTime: '2026-09-22T18:30:00.0000000' },
     isAllDay: false, isCancelled: false, showAs: 'free', responseStatus: { response: 'organizer' }, attendees: [{}], organizer: { emailAddress: { name: 'Tim' } },
-  }] } });
+  }] } }, { timezone: 'America/Los_Angeles' });
   assert.equal(parsed.length, 1);
   assert.equal(parsed[0]!.isCancelled, true, 'a "Canceled:" subject from Graph counts as cancelled');
-  assert.equal(parsed[0]!.startMs, Date.parse('2026-09-22T18:00:00Z'), 'a bare Graph datetime is UTC');
+  assert.equal(parsed[0]!.startMs, Date.parse('2026-09-22T18:00:00Z'), 'a bare Graph datetime with no zone label is UTC');
   assert.equal(parsed[0]!.organizer, 'Tim');
+  // Live 2026-09-22: the read asks for the owner's zone, so Graph returns
+  // wall-clock times labelled with it. 09:00 in Los Angeles is 16:00Z.
+  const zoned = outlook.parse({ data: { value: [{
+    id: 'z', subject: 'Weekly Recruiting Meeting', start: { dateTime: '2026-09-22T09:00:00.0000000', timeZone: 'America/Los_Angeles' }, end: { dateTime: '2026-09-22T10:00:00.0000000', timeZone: 'America/Los_Angeles' }, attendees: [{}, {}],
+  }, {
+    id: 'w', subject: 'Windows label', start: { dateTime: '2026-09-22T09:00:00.0000000', timeZone: 'Pacific Standard Time' }, end: { dateTime: '2026-09-22T10:00:00.0000000', timeZone: 'Pacific Standard Time' }, attendees: [{}],
+  }, {
+    id: 'u', subject: 'Explicit UTC', start: { dateTime: '2026-09-22T16:00:00.0000000', timeZone: 'UTC' }, end: { dateTime: '2026-09-22T17:00:00.0000000', timeZone: 'UTC' }, attendees: [{}],
+  }] } }, { timezone: 'America/Los_Angeles' });
+  assert.equal(zoned[0]!.startMs, Date.parse('2026-09-22T16:00:00Z'));
+  assert.equal(zoned[0]!.endMs, Date.parse('2026-09-22T17:00:00Z'));
+  assert.equal(zoned[1]!.startMs, Date.parse('2026-09-22T16:00:00Z'), 'an unknown zone label means the zone the read asked for');
+  assert.equal(zoned[2]!.startMs, Date.parse('2026-09-22T16:00:00Z'));
+  // A DST edge: 01:30 on the November fall-back day in New York is 05:30Z (EDT) on the first pass.
+  const { wallClockToUtcMs } = await import('./calendar-watch.js');
+  assert.equal(wallClockToUtcMs('2026-01-15T09:00:00', 'America/New_York'), Date.parse('2026-01-15T14:00:00Z'));
+  assert.equal(wallClockToUtcMs('2026-07-15T09:00:00', 'America/New_York'), Date.parse('2026-07-15T13:00:00Z'));
   const args = outlook.args({ startIso: 's', endIso: 'e', top: 50, timezone: 'America/Los_Angeles' });
   assert.deepEqual(Object.keys(args).sort(), ['end_datetime', 'orderby', 'start_datetime', 'timezone', 'top']);
 
   const google = calendarReadOperation('googlecalendar_events_list')!;
-  const g = google.parse({ items: [{ id: 'g1', summary: 'Sync', start: { dateTime: '2026-09-22T18:00:00Z' }, end: { dateTime: '2026-09-22T19:00:00Z' }, attendees: [{ self: true, responseStatus: 'needsAction' }, { email: 'b@x' }] }] });
+  const g = google.parse({ items: [{ id: 'g1', summary: 'Sync', start: { dateTime: '2026-09-22T18:00:00Z' }, end: { dateTime: '2026-09-22T19:00:00Z' }, attendees: [{ self: true, responseStatus: 'needsAction' }, { email: 'b@x' }] }] }, { timezone: 'UTC' });
   assert.equal(g[0]!.myResponse, 'needsAction');
   assert.equal(g[0]!.attendeeCount, 2);
 });

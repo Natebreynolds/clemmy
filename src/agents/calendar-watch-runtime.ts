@@ -397,7 +397,7 @@ export async function readCalendarAccountsAttested(
         operationId: operation.operationId,
         accountId: read.accountId,
         accountLabel: accountLabels.get(read.accountId) ?? read.accountId,
-        events: operation.parse(read.payload),
+        events: operation.parse(read.payload, { timezone: window.timezone }),
       });
     }
   }

@@ -246,11 +246,46 @@ function pick(obj: unknown, ...keys: string[]): unknown {
   return cur;
 }
 function str(x: unknown): string { return typeof x === 'string' ? x : ''; }
-/** Graph datetimes come back without an offset but in UTC; a bare datetime is UTC. */
 function parseMs(dt: string): number {
   if (!dt) return NaN;
   const hasZone = dt.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(dt);
   return Date.parse(hasZone ? dt : `${dt}Z`);
+}
+
+function zoneOffsetMs(zone: string, atMs: number): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone,
+    hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date(atMs));
+  const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+  return asUtc - Math.floor(atMs / 1000) * 1000;
+}
+
+/**
+ * Graph returns `start.dateTime` as a WALL-CLOCK time in `start.timeZone`:
+ * UTC when nothing was asked for, the requested zone otherwise (the watch
+ * asks for the owner's zone, so a 9:00 meeting comes back as "09:00" with
+ * timeZone "America/Los_Angeles"). A bare datetime is therefore converted
+ * from that zone; treating it as UTC put every item seven hours early
+ * (live 2026-09-22, "Tue 2:00 AM" for a 9:00 AM meeting).
+ */
+export function wallClockToUtcMs(dt: string, zone: string | undefined): number {
+  if (!dt) return NaN;
+  const hasZone = dt.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(dt);
+  if (hasZone) return Date.parse(dt);
+  const asUtc = Date.parse(`${dt}Z`);
+  if (!Number.isFinite(asUtc) || !zone || zone.toUpperCase() === 'UTC') return asUtc;
+  try {
+    // Two passes settle a DST edge: the offset at the guessed instant, then
+    // the offset at the corrected instant.
+    let instant = asUtc - zoneOffsetMs(zone, asUtc);
+    instant = asUtc - zoneOffsetMs(zone, instant);
+    return instant;
+  } catch {
+    return asUtc; // an unknown zone label: keep the bare reading rather than drop the event
+  }
 }
 export function locateCalendarEvents(payload: unknown): unknown[] {
   return asArray(
@@ -269,7 +304,9 @@ export function locateCalendarEvents(payload: unknown): unknown[] {
 export interface CalendarReadOperation {
   operationId: string;
   args: (window: { startIso: string; endIso: string; top: number; timezone: string }) => Record<string, unknown>;
-  parse: (payload: unknown) => CalEvent[];
+  /** `timezone` is the zone the read asked for; a provider that labels its
+   * wall-clock times with an unknown zone is read in that one. */
+  parse: (payload: unknown, context: { timezone: string }) => CalEvent[];
 }
 
 const OUTLOOK: CalendarReadOperation = {
@@ -282,11 +319,11 @@ const OUTLOOK: CalendarReadOperation = {
     top,
     orderby: 'start/dateTime asc',
   }),
-  parse: (payload) => locateCalendarEvents(payload).map((e): CalEvent => ({
+  parse: (payload, context) => locateCalendarEvents(payload).map((e): CalEvent => ({
     id: str(pick(e, 'id')),
     subject: str(pick(e, 'subject')) || '(no title)',
-    startMs: parseMs(str(pick(e, 'start', 'dateTime'))),
-    endMs: parseMs(str(pick(e, 'end', 'dateTime'))),
+    startMs: wallClockToUtcMs(str(pick(e, 'start', 'dateTime')), zoneLabel(str(pick(e, 'start', 'timeZone')), context.timezone)),
+    endMs: wallClockToUtcMs(str(pick(e, 'end', 'dateTime')), zoneLabel(str(pick(e, 'end', 'timeZone')), context.timezone)),
     isAllDay: pick(e, 'isAllDay') === true,
     isCancelled: pick(e, 'isCancelled') === true || /^canceled:|^cancelled:/i.test(str(pick(e, 'subject'))),
     showAs: str(pick(e, 'showAs')),
@@ -298,6 +335,21 @@ const OUTLOOK: CalendarReadOperation = {
     ...(str(pick(e, 'location', 'displayName')) ? { location: str(pick(e, 'location', 'displayName')) } : {}),
   })).filter((e) => e.id && Number.isFinite(e.startMs)),
 };
+
+/** Graph labels the zone it converted to: 'UTC', an IANA name, or a Windows
+ * display name when the caller asked with one. Only UTC and IANA names are
+ * convertible here; anything else means "the zone we asked for". */
+function zoneLabel(label: string, requested: string): string {
+  const trimmed = label.trim();
+  if (!trimmed) return 'UTC';
+  if (trimmed.toUpperCase() === 'UTC') return 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: trimmed });
+    return trimmed;
+  } catch {
+    return requested;
+  }
+}
 
 const GOOGLE: CalendarReadOperation = {
   operationId: 'googlecalendar_events_list',
