@@ -1,3 +1,4 @@
+import { warmDurableProviderOperation } from './workflow-live-call-compiler.js';
 import {
   revalidateSelectedComposioDefinitions,
   type RevalidatedComposioDefinition,
@@ -68,6 +69,10 @@ export interface WorkflowStepExternalCatalogDependencies {
   manifestStore?: CapabilityManifestStore | null;
   /** Refresh the independent crossing-time observation of a selected manifest. */
   refreshObservation?: (manifest: CapabilityManifestV1) => Promise<unknown>;
+  /** Rebuild the process state a durable provider operation needs before it
+   * can be revalidated or observed here: the provider schema lease and the
+   * connected toolkits, then one observation per account. */
+  warm?: (operationId: string) => Promise<unknown>;
   /** Route an ambiguous operation to the account the run's ORIGIN source
    * already established (the same host policy a chat turn uses). Returns the
    * connection id, or null when the origin established nothing. */
@@ -529,6 +534,18 @@ export async function prepareWorkflowStepExternalCatalog(input: {
   }
 
   if (selected.length > 0) {
+    // A durable manifest's provider schema lease and the connected toolkits
+    // are process state that chat rebuilds through discovery; a step on a
+    // freshly launched daemon never did, so revalidation and the observation
+    // below refused a connected provider (live 2026-09-22: 12 runs parked
+    // "not connected" after launches, Outlook and Sheets connected the whole
+    // time). Supply only; the revalidator still decides.
+    const warm = dependencies.warm ?? (dependencies.revalidate ? null : warmDurableProviderOperation);
+    if (warm) {
+      for (const operationId of new Set(selected.map((entry) => entry.manifest.operationId))) {
+        try { await warm(operationId); } catch { /* supply, never authority */ }
+      }
+    }
     const revalidate = dependencies.revalidate ?? revalidateSelectedComposioDefinitions;
     let revalidated = await revalidate(selected.map(selectionFromManifest));
     // A DEFINITION DRIFT (input/output schema, fingerprint, or a non-label

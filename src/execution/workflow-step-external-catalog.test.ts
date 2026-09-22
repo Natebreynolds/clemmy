@@ -1136,3 +1136,37 @@ test('a schema drift re-provisions the stored manifest as its recorded successor
   assert.equal(provisioned, 1);
   assert.equal(revalidations, 2);
 });
+
+test('a selected durable operation is warmed in this process before it is revalidated', async () => {
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const calendar = manifest('OUTLOOK_GET_CALENDAR_VIEW', 'read');
+  const store = createCapabilityManifestStore([calendar]);
+  const factory = createHostCapabilityCatalogFactory();
+  const session = createSession({ kind: 'workflow', userId: 'workflow:warm' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'immutable warm step' },
+  });
+  const order: string[] = [];
+  const result = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: 'Read the calendar with OUTLOOK_GET_CALENDAR_VIEW.',
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'immutable warm step' },
+  }, {
+    manifestStore: store,
+    catalogFactory: factory,
+    warm: async (operationId) => { order.push(`warm:${operationId}`); },
+    revalidate: async (selections) => {
+      order.push(`revalidate:${selections.map((entry) => entry.identifier).join(',')}`);
+      return { ok: true, definitions: new Map([[calendar.operationId.toLowerCase(), revalidated(calendar)]]) };
+    },
+  });
+  // The typed catalog's own readiness is pinned elsewhere; the connection here
+  // is the order: the process is warmed for the operation before anything
+  // judges its definition.
+  assert.deepEqual(order, ['warm:OUTLOOK_GET_CALENDAR_VIEW', 'revalidate:OUTLOOK_GET_CALENDAR_VIEW'], `the warm precedes the revalidation (${JSON.stringify(result)})`);
+});
