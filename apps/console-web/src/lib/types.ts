@@ -78,6 +78,10 @@ export interface CommandCenterItem {
    *  POST /api/console/inbox/dismiss. */
   dismissKind?: 'checkin' | 'plan' | 'proposal' | 'notif';
   dismissId?: string;
+  /** "Not now" key (`approval:<id>`, `plan:<id>`): POST
+   *  /api/console/home/needs-you/snooze hides the card from Home for a few
+   *  hours; the decision stays pending in Needs you. */
+  snoozeKey?: string;
 }
 
 export interface CommandCenter {

@@ -129,7 +129,8 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
-import { presentApprovalForHumans } from './approval-presentation.js';
+import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
+import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -885,6 +886,26 @@ function extractRuntimeApprovalArgs(approval: PendingApproval): Record<string, u
 function approvalSummaryFromArgs(args: Record<string, unknown> | undefined, fallback: string): string {
   const subject = pickApprovalString(args, ['subject', 'title', 'name']);
   return trimConsoleTitle(subject || fallback || 'Approval required', 180);
+}
+
+/**
+ * What an approval does, in words: one line for Home, the board and Needs
+ * you. A carrier (work_call, composio_execute_tool) is unwrapped first — its
+ * `name` is the inner tool's id, and live 2026-09-22 that id became the title
+ * ("Approve: composio_execute_tool") for a Slack send.
+ */
+function approvalHeadline(
+  tool: string | null | undefined,
+  args: Record<string, unknown> | undefined,
+  fallback: string,
+): string {
+  const call = unwrapApprovalCall(tool, args);
+  if (!call.unwrapped) return approvalSummaryFromArgs(args, fallback);
+  const inner = call.args && typeof call.args === 'object' && !Array.isArray(call.args)
+    ? call.args as Record<string, unknown>
+    : undefined;
+  const named = pickApprovalString(inner, ['subject', 'title']);
+  return trimConsoleTitle(named || presentApprovalForHumans({ tool, args }).action, 180);
 }
 
 function approvalReasonFromArgs(args: Record<string, unknown> | undefined): string {
@@ -11498,8 +11519,8 @@ export function registerConsoleRoutes(
           channelId: undefined as string | undefined,
           requestedAt: approval.createdAt,
           expiresAt: undefined as string | undefined,
-          subject: `Approve: ${summarizeApprovalAction(approval)}`,
-          summary: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          subject: `Approve: ${approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval))}`,
+          summary: approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval)),
           reason: approvalReasonFromArgs(args),
           preview: normalizeApprovalPreview(args?.preview),
           pendingAction: pendingActionApprovalViewFromArgs(args),
@@ -12380,7 +12401,7 @@ export function registerConsoleRoutes(
           title: row.subject || 'Approval required',
           column: 'needs_you',
           status: 'awaiting_approval',
-          progressHint: approvalSummaryFromArgs(row.args ?? undefined, row.subject),
+          progressHint: approvalHeadline(row.tool, row.args ?? undefined, row.subject),
           sessionId: row.sessionId,
           ageMs: ageMs(row.requestedAt),
           updatedAt: row.requestedAt,
@@ -12416,10 +12437,10 @@ export function registerConsoleRoutes(
         cards.push({
           id: `approval:${approval.id}`,
           sourceKind: 'approval',
-          title: `Approve: ${summarizeApprovalAction(approval)}`,
+          title: `Approve: ${approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval))}`,
           column: 'needs_you',
           status: 'awaiting_approval',
-          progressHint: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          progressHint: approvalReasonFromArgs(args),
           sessionId: approval.sessionId,
           ageMs: ageMs(approval.createdAt),
           updatedAt: approval.createdAt,
@@ -13645,6 +13666,21 @@ export function registerConsoleRoutes(
     }
   });
 
+  // "Not now": the decision leaves Home for a while and stays pending in
+  // Needs you. It never approves or declines anything.
+  app.post('/api/console/home/needs-you/snooze', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!isValidSnoozeKey(key)) { res.status(400).json({ error: 'key must be approval:<id> or plan:<id>' }); return; }
+    const hours = typeof req.body?.hours === 'number' ? req.body.hours : DEFAULT_SNOOZE_HOURS;
+    try {
+      const until = await snoozeHomeItem(key, hours);
+      res.json({ ok: true, key, until });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/home/command-center', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -13732,7 +13768,11 @@ export function registerConsoleRoutes(
         ...approvals.map((approval) => {
           const args = extractRuntimeApprovalArgs(approval);
           const task = backgroundTaskByApprovalId.get(approval.id);
-          const summary = approvalSummaryFromArgs(args, summarizeApprovalAction(approval));
+          // One presenter for every surface: the provider call behind any
+          // carrier, never the carrier's name (live 2026-09-22 Home showed
+          // "Approve: composioexecutetool · work_call" for a Slack send).
+          const presentation = presentApprovalForHumans({ tool: approval.toolName, args });
+          const summary = approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval));
           const reason = approvalReasonFromArgs(args);
           const preview = normalizeApprovalPreview(args?.preview);
           const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
@@ -13740,10 +13780,12 @@ export function registerConsoleRoutes(
             kind: task ? 'background-approval' : 'approval',
             title: `Approve: ${summary}`,
             meta: [
-              task ? `background ${task.id}` : approval.toolName,
+              task ? 'from a background task' : presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
               previewMeta,
-            ].filter(Boolean).join(' · ') || `${approval.sessionId || approval.id}`,
+            ].filter(Boolean).join(' · '),
+            unwrapped: presentation.unwrapped,
+            snoozeKey: `approval:${approval.id}`,
             panel: 'approvals',
             urgency: 'high',
             approvalKind: 'runtime',
@@ -13754,15 +13796,20 @@ export function registerConsoleRoutes(
           const reason = approvalReasonFromArgs(approval.args ?? undefined);
           const preview = normalizeApprovalPreview(approval.args?.preview);
           const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
+          // The same words Needs you and the phone use: the request's own
+          // subject, else the unwrapped provider call. Never the carrier.
+          const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject });
+          const headline = approval.subject?.trim() || presentation.action;
           return {
             kind: 'harness-approval',
-            title: `Approve: ${approvalSummaryFromArgs(approval.args ?? undefined, approval.subject)}`,
+            title: `Approve: ${headline}`,
             meta: [
-              approval.approvalId,
-              approval.tool || approval.sessionId,
+              presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
               previewMeta,
             ].filter(Boolean).join(' · '),
+            unwrapped: presentation.unwrapped,
+            snoozeKey: `approval:${approval.approvalId}`,
             panel: 'approvals',
             urgency: 'high',
             approvalKind: 'harness',
@@ -13792,6 +13839,7 @@ export function registerConsoleRoutes(
           panel: 'settings',
           urgency: 'high',
           planProposalId: proposal.id,
+          snoozeKey: `plan:${proposal.id}`,
           dismissKind: 'plan',
           dismissId: proposal.id,
         })),
@@ -13881,7 +13929,7 @@ export function registerConsoleRoutes(
             : undefined;
           const args = runtimeApproval ? extractRuntimeApprovalArgs(runtimeApproval) : undefined;
           const summary = runtimeApproval
-            ? approvalSummaryFromArgs(args, summarizeApprovalAction(runtimeApproval))
+            ? approvalHeadline(runtimeApproval.toolName, args, summarizeApprovalAction(runtimeApproval))
             : task.title;
           // Clean meta: a short check-in line (ids stripped) or a relative
           // age — never the raw bg-… id.
@@ -14202,6 +14250,11 @@ export function registerConsoleRoutes(
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
       const waitingCount = needsYouMerged.length;
+      const snoozes = activeHomeSnoozes();
+      const isSnoozed = (item: unknown): boolean => {
+        const key = (item as { snoozeKey?: unknown }).snoozeKey;
+        return typeof key === 'string' && snoozes.has(key);
+      };
       const currentObjective = workingNow[0]?.title
         ?? needsYouMerged[0]?.title
         ?? (memoryWarnings.length ? 'Memory needs attention before the graph is fully trustworthy.' : 'Standing by for the next useful task.');
@@ -14226,8 +14279,11 @@ export function registerConsoleRoutes(
           runningWorkflows: pendingWorkflowRuns.length,
           backgroundActive: activeBackgroundTasks.length,
           requiredSetupMissing: requiredMissing,
+          snoozed: needsYouMerged.filter(isSnoozed).length,
         },
-        needsYou: needsYouMerged,
+        // A snoozed decision ("Not now") leaves Home for a while but still
+        // needs you: it stays in `waiting` and in Needs you.
+        needsYou: needsYouMerged.filter((item) => !isSnoozed(item)),
         // workingNow was REMOVED from this payload. It was a second, parallel
         // answer to "what is running" with its own staleness heuristic, and no
         // client read it — the badge, drawer, /tasks, and mobile all read the

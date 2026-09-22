@@ -362,6 +362,10 @@ export const listNotifications = () =>
 export const dismissInboxItem = (kind: string, id: string) =>
   apiPost(`/api/console/inbox/dismiss`, { kind, id });
 
+/** "Not now": off Home for a few hours, still pending in Needs you. Never a decline. */
+export const snoozeNeedsYou = (key: string) =>
+  apiPost<{ ok: true; key: string; until: string }>(`/api/console/home/needs-you/snooze`, { key });
+
 export const markNotificationRead = (id: string) =>
   apiPost(`/api/notifications/${encodeURIComponent(id)}/read`);
 

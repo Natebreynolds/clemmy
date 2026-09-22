@@ -1,4 +1,5 @@
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
+import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
@@ -477,12 +478,16 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
   tool: string | null;
   args: Record<string, unknown> | null;
   presentation: ApprovalPresentation;
+  /** The draft being approved (message body, post copy), so the phone shows
+   *  the words before "Yes, do it" — the same preview the desktop card shows. */
+  contentPreview?: ApprovalContentPreview;
   status: approvalRegistry.PendingApprovalStatus;
   resolution: approvalRegistry.ApprovalResolution | null;
 } {
   return {
     kind: 'harness',
     presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject }),
+    contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
     approvalId: row.approvalId,
     sessionId: row.sessionId,
     channel: row.channel,

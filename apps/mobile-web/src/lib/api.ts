@@ -373,6 +373,8 @@ export interface ApprovalRow {
   tool: string | null;
   args: unknown;
   presentation?: { action: string; app?: string; operation?: string; details: Array<{ label: string; value: string; long: boolean }>; unwrapped: boolean };
+  /** The draft being approved; shown on the card before the buttons. */
+  contentPreview?: { body?: string; imageUrl?: string };
   status: 'pending' | 'resolved' | 'expired' | 'cancelled';
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';

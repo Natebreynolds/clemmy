@@ -809,6 +809,27 @@ input, textarea, select { font: inherit; font-size: 16px; }
   white-space: pre-wrap;
 }
 .approval-detail-long { grid-template-columns: 1fr !important; gap: 4px !important; }
+.approval-draft {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+}
+.approval-draft figcaption {
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+  font-weight: 700;
+}
+.approval-draft p {
+  margin: var(--sp-1) 0 0;
+  color: var(--fg);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.approval-draft .link-btn { min-height: 44px; padding-bottom: 0; }
 .card-actions { flex-wrap: wrap; }
 .card-actions > .btn-reply { flex: 1 1 100%; }
 

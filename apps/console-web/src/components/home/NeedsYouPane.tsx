@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, CheckCircle2, AlertCircle, X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { answerInboxQuestion, decideApproval, decidePlanProposal, dismissInboxItem, listInboxQuestions, type InboxQuestionRow } from '@/lib/inbox';
+import { answerInboxQuestion, decideApproval, dismissInboxItem, listInboxQuestions, snoozeNeedsYou, type InboxQuestionRow } from '@/lib/inbox';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
@@ -85,7 +85,7 @@ function AnswerRow({
 
 
 interface RowState {
-  busy?: 'approve' | 'reject' | 'dismiss' | 'answer';
+  busy?: 'approve' | 'snooze' | 'dismiss' | 'answer';
   notice?: { tone: 'success' | 'error'; text: string };
 }
 
@@ -106,9 +106,10 @@ interface RowState {
  */
 
 /**
- * NEEDS YOU — the command center's list, rendered as decisions. Inline
- * Approve / Not now appear only where the Inbox already exposes that exact
- * approve/reject call; every other card opens where the Inbox would.
+ * NEEDS YOU — the command center's list, rendered as decisions. An approval
+ * can be approved inline; "Not now" sets it aside (it stays pending in Needs
+ * you — it used to decline it for good). Declining and every plan are
+ * reviewed where the Inbox shows the draft and the steps.
  */
 export function NeedsYouPane({
   items,
@@ -177,21 +178,17 @@ export function NeedsYouPane({
     }
   };
 
-  const decide = async (key: string, item: HomeFeedItem, decision: 'approve' | 'reject') => {
+  // Home approves inline only; declining is a considered choice that lives
+  // in Needs you, next to the draft. A plan is always reviewed first.
+  const approve = async (key: string, item: HomeFeedItem) => {
     const target = needsYouDecision(item);
-    if (!target || rows[key]?.busy) return;
-    setRows((prev) => ({ ...prev, [key]: { busy: decision } }));
+    if (!target || target.kind !== 'approval' || rows[key]?.busy) return;
+    setRows((prev) => ({ ...prev, [key]: { busy: 'approve' } }));
     try {
-      if (target.kind === 'approval') await decideApproval(target.id, decision, { kind: target.approvalKind });
-      else await decidePlanProposal(target.id, decision);
+      await decideApproval(target.id, 'approve', { kind: target.approvalKind });
       setRows((prev) => ({
         ...prev,
-        [key]: {
-          notice: {
-            tone: 'success',
-            text: decision === 'approve' ? 'Approved — Clementine is carrying on.' : 'Declined — this won’t run.',
-          },
-        },
+        [key]: { notice: { tone: 'success', text: 'Approved — Clementine is carrying on.' } },
       }));
     } catch (err) {
       setRows((prev) => ({
@@ -199,7 +196,31 @@ export function NeedsYouPane({
         [key]: {
           notice: {
             tone: 'error',
-            text: err instanceof Error && err.message.trim() ? err.message : `Couldn’t ${decision} this.`,
+            text: err instanceof Error && err.message.trim() ? err.message : 'Couldn’t approve this.',
+          },
+        },
+      }));
+    } finally {
+      settle();
+    }
+  };
+
+  const snooze = async (key: string, item: HomeFeedItem) => {
+    if (!item.snoozeKey || rows[key]?.busy) return;
+    setRows((prev) => ({ ...prev, [key]: { busy: 'snooze' } }));
+    try {
+      await snoozeNeedsYou(item.snoozeKey);
+      setRows((prev) => ({
+        ...prev,
+        [key]: { notice: { tone: 'success', text: 'Later — it’s waiting in Needs you when you’re ready.' } },
+      }));
+    } catch (err) {
+      setRows((prev) => ({
+        ...prev,
+        [key]: {
+          notice: {
+            tone: 'error',
+            text: err instanceof Error && err.message.trim() ? err.message : 'Couldn’t set this aside.',
           },
         },
       }));
@@ -292,33 +313,33 @@ export function NeedsYouPane({
                           onAnswer={(text) => void answer(key, item.questionId!, text)}
                         />
                       )}
-                      {decision && (
-                        <>
-                          <Button
-                            size="sm"
-                            className="h-8 px-3 text-small"
-                            disabled={Boolean(state.busy)}
-                            onClick={() => void decide(key, item, 'approve')}
-                          >
-                            <Check className="h-3.5 w-3.5" aria-hidden />
-                            {state.busy === 'approve' ? 'Approving…' : 'Approve'}
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            className="h-8 px-3 text-small"
-                            disabled={Boolean(state.busy)}
-                            onClick={() => void decide(key, item, 'reject')}
-                          >
-                            {state.busy === 'reject' ? 'Declining…' : 'Not now'}
-                          </Button>
-                        </>
+                      {decision?.kind === 'approval' && (
+                        <Button
+                          size="sm"
+                          className="h-8 px-3 text-small"
+                          disabled={Boolean(state.busy)}
+                          onClick={() => void approve(key, item)}
+                        >
+                          <Check className="h-3.5 w-3.5" aria-hidden />
+                          {state.busy === 'approve' ? 'Approving…' : 'Approve'}
+                        </Button>
+                      )}
+                      {decision && item.snoozeKey && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="h-8 px-3 text-small"
+                          disabled={Boolean(state.busy)}
+                          onClick={() => void snooze(key, item)}
+                        >
+                          {state.busy === 'snooze' ? 'Setting aside…' : 'Not now'}
+                        </Button>
                       )}
                       <Link
                         to={href}
                         className="inline-flex h-8 items-center rounded-md px-3 text-small font-semibold text-muted transition-colors hover:bg-hover hover:text-fg"
                       >
-                        {decision ? 'Preview' : 'Open'}
+                        {decision?.kind === 'plan' ? 'Review plan' : decision ? 'Review' : 'Open'}
                       </Link>
                     </div>
                   )}

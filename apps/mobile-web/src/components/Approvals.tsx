@@ -266,6 +266,12 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
   const isWorkflowGate = row.tool === 'workflow_approval_gate';
   const [changing, setChanging] = useState(false);
   const [changeNote, setChangeNote] = useState('');
+  // The words being approved, before the buttons: the first lines always,
+  // the rest one tap away.
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const [draftOpen, setDraftOpen] = useState(false);
+  const draftIsLong = draft.length > 320;
+  const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 319)}…` : draft;
   return (
     <article id={`inbox-approval:${row.approvalId}`} class="card card-approval rise" style={{ '--i': index }} tabIndex={-1}>
       <header class="card-head">
@@ -280,6 +286,17 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
       <h2 class="card-title">{approvalQuestion(row.subject)}</h2>
       {row.resourceFingerprint?.warning ? (
         <p class="card-warn">{row.resourceFingerprint.warning}</p>
+      ) : null}
+      {draft ? (
+        <figure class="approval-draft" aria-label="What you are approving">
+          <figcaption>Draft</figcaption>
+          <p>{shownDraft}</p>
+          {draftIsLong ? (
+            <button type="button" class="link-btn" aria-expanded={draftOpen} onClick={() => setDraftOpen(!draftOpen)}>
+              {draftOpen ? 'Show less' : 'Show the whole draft'}
+            </button>
+          ) : null}
+        </figure>
       ) : null}
       {details.length > 0 ? (
         <>
