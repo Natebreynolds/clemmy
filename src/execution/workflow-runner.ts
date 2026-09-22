@@ -232,7 +232,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
-import { readWorkflowTargetEvidence } from './workflow-target-evidence.js';
+import { humanDecisionBlocks, readWorkflowTargetEvidence } from './workflow-target-evidence.js';
 import { captureWorkflowTargetReviewPolicy, type WorkflowTargetReviewPolicy } from './workflow-target-review-policy.js';
 import {
   runWatcherJudge,
@@ -15359,7 +15359,13 @@ async function processOneRunFile(
         goalVerdict = await validateGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
-          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), readExecutions].filter(Boolean).join("\n\n"),
+          // The goal reviewer reads its own evidence text, not the target
+          // judge's. A person's decision on a review gate belongs in both:
+          // live 2026-09-22 the owner approved the draft on the card, the
+          // gated save ran four seconds later, and this reviewer scored the
+          // run 4/5 for "saved without your review" because it never saw the
+          // approval.
+          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), humanDecisionBlocks(run.id).join('\n'), readExecutions].filter(Boolean).join("\n\n"),
           // Structured outputs unlock the required-keys deterministic class —
           // key-presence criteria are checked in code, never by the judge
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).

@@ -33,7 +33,7 @@ export interface WorkflowTargetEvidence {
  * A human decision recorded before a step ran is the strongest evidence a
  * "review first" criterion can have; say it, exactly, with who and when.
  */
-function humanDecisionBlocks(runId: string): string[] {
+export function humanDecisionBlocks(runId: string): string[] {
   try {
     const rows = openEventLog().prepare(`
       SELECT approval_id, session_id, status, resolution, resolver, requested_at, resolved_at
