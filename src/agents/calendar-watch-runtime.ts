@@ -32,11 +32,12 @@ import { addNotification, getNotification, markNotificationRead } from '../runti
 import { loadUserProfile } from '../runtime/user-profile.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import {
-  CALENDAR_READ_OPERATIONS,
   DEFAULT_CALENDAR_WATCH_CONFIG,
+  calendarReadOperation,
   emptyCalendarWatchState,
   formatWhen,
   processCalendarWatchTick,
+  type CalendarReadOperation,
   type CalendarWatchAccountRead,
   type CalendarWatchChange,
   type CalendarWatchConfig,
@@ -59,6 +60,8 @@ const STATE_FILE = path.join(BASE_DIR, 'state', 'calendar-watch.json');
 export const CALENDAR_WATCH_HEARTBEAT_MS = 60_000;
 const FIRST_HEARTBEAT_DELAY_MS = 30_000;
 const READ_DEADLINE_MS = 45_000;
+/** A tick whose reads all failed retries sooner than the cadence. */
+const FAILED_READ_RETRY_MS = 5 * 60_000;
 
 // ── state file ────────────────────────────────────────────────────────────────
 export function loadCalendarWatchState(): CalendarWatchState {
@@ -104,21 +107,31 @@ function ensureWatchSession(): HarnessSession {
   });
 }
 
+export interface ConnectedCalendarOperation {
+  /** The operation id exactly as the durable manifest spells it. The catalog
+   * identity, the acquisition registry and the compiler all match on that
+   * exact string; the watch never re-spells it. */
+  operationId: string;
+  provider: CalendarReadOperation;
+}
+
 /** Operations that have a CURRENT durable manifest. Nothing is acquired or
  * searched for a provider the owner never connected; that keeps a quiet tick
  * free of discovery work. */
-export function connectedCalendarOperations(): string[] {
+export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
   const store = peekCapabilityManifestStore();
   if (!store) return [];
-  const present = new Set<string>();
+  const present = new Map<string, ConnectedCalendarOperation>();
   for (const entry of store.list()) {
     const manifest = entry.manifest as { operationId?: unknown; lifecycle?: { state?: unknown } };
     const state = manifest.lifecycle?.state;
     if (state !== undefined && state !== 'current') continue;
-    const op = typeof manifest.operationId === 'string' ? manifest.operationId.toLowerCase() : '';
-    if (CALENDAR_READ_OPERATIONS.some((known) => known.operationId === op)) present.add(op);
+    if (typeof manifest.operationId !== 'string') continue;
+    const provider = calendarReadOperation(manifest.operationId);
+    if (!provider) continue;
+    if (!present.has(manifest.operationId)) present.set(manifest.operationId, { operationId: manifest.operationId, provider });
   }
-  return [...present];
+  return [...present.values()];
 }
 
 type AccountRead =
@@ -140,8 +153,10 @@ async function readOneAccount(input: {
     expectedEffect: 'read',
     deadlineAt: Date.now() + READ_DEADLINE_MS,
   });
-  if (acquisition.status === 'unavailable') {
-    return { ok: false, ...(input.selectedAccount ? { accountId: input.selectedAccount.accountId } : {}), reason: `capability unavailable: ${acquisition.detail ?? 'unknown'}` };
+  if (acquisition.status !== 'present') {
+    // Supply only, exactly as the workflow runner treats it: the compiler
+    // below re-materializes the durable manifests and decides for itself.
+    logger.debug({ operationId: input.operationId, acquisition }, 'calendar watch: live read acquisition');
   }
   const compiled = compileLiveCatalogWorkflowCallPlan({
     ownerId: WATCH_OWNER_ID,
@@ -207,8 +222,7 @@ export async function readCalendarAccountsAttested(
   }
   const sessionId = ensureWatchSession().id;
   const accountLabels = accountLabelsByConnectionId();
-  for (const operationId of operations) {
-    const operation = CALENDAR_READ_OPERATIONS.find((op) => op.operationId === operationId)!;
+  for (const { operationId, provider: operation } of operations) {
     const args = operation.args(window);
     const first = await readOneAccount({ operationId, args, tickId, sessionId });
     const perAccount: AccountRead[] = [];
@@ -235,7 +249,7 @@ export async function readCalendarAccountsAttested(
         continue;
       }
       reads.push({
-        operationId,
+        operationId: operation.operationId,
         accountId: read.accountId,
         accountLabel: accountLabels.get(read.accountId) ?? read.accountId,
         events: operation.parse(read.payload),
@@ -390,7 +404,10 @@ export function isCalendarWatchDue(nowMs = Date.now()): { due: boolean; reason: 
   if (!policy.enabled) return { due: false, reason: 'disabled' };
   if (policy.quietHoursActive) return { due: false, reason: 'quiet_hours' };
   const state = loadCalendarWatchState();
-  const intervalMs = policy.cadenceMinutes * 60_000;
+  const lastReadFailed = Boolean(state.lastFinding && state.lastFinding.accounts === 0 && state.lastFinding.readFailures > 0);
+  const intervalMs = lastReadFailed
+    ? Math.min(policy.cadenceMinutes * 60_000, FAILED_READ_RETRY_MS)
+    : policy.cadenceMinutes * 60_000;
   const last = state.lastTickAt ? Date.parse(state.lastTickAt) : NaN;
   if (!Number.isFinite(last)) return { due: true, reason: 'never_ran' };
   const nextAt = last + intervalMs;
@@ -451,7 +468,7 @@ export function calendarWatchStatus(nowMs = Date.now()): CalendarWatchStatus {
     .sort((a, b) => (b.retiredAt ?? '').localeCompare(a.retiredAt ?? ''))
     .slice(0, 8);
   let connectedOperations: string[] = [];
-  try { connectedOperations = connectedCalendarOperations(); } catch { /* status stays honest with an empty list */ }
+  try { connectedOperations = connectedCalendarOperations().map((op) => op.operationId); } catch { /* status stays honest with an empty list */ }
   return {
     id: 'calendar',
     title: 'Calendar watch',
