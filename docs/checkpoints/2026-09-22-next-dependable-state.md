@@ -1,7 +1,7 @@
 # Next dependable state — 2026-09-22
 
-Candidate delivered against `docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md`. Fourteen
-commits on shared `main`, `8c11aa3c` → `a1f1f986`, accepted in the installed app
+Candidate delivered against `docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md`. Eighteen
+commits on shared `main`, `8c11aa3c` → `67ae7ea3` (one measured-and-reverted pair among them), accepted in the installed app
 against the live home. No release was published; the working tree holds only the
 other agent's uncommitted handoff document.
 
@@ -10,8 +10,8 @@ other agent's uncommitted handoff document.
 | Item | Value |
 |---|---|
 | Bundle | `~/Applications/Clementine.app`, sealed **3.18.19** (reinstalled from the updater's own signed zip after a broken-seal launch, see below) |
-| Daemon dist | hotpatched to commit `a1f1f986`, fingerprint `3402954c67e25ec34f11418b1639ed564c99b8c6b9290d8b5ad8f02eeed21df6`, schema 81 |
-| Daemon pid at acceptance | 49129, started 05:49:51Z |
+| Daemon dist | hotpatched to commit `67ae7ea3`, fingerprint `8d1e5e409a6e03a2746ddb3136d72174d72bb3a2ed44b741383e94b178b7aabc`, schema 81 (daemon pid 77947, started 06:08:17Z) |
+| Daemon pid at first acceptance | 49129 (`a1f1f986`); final closing turn on `67ae7ea3`: done, 74 s, 3 calls, 74k prompt, Jev accepted, reviewer not started |
 | Web apps in the bundle | `console-web` and `mobile-web` dists rebuilt from the same commits |
 | Live home | `~/.clementine-next` |
 | Served models | brain grok-4.6, judge grok-4.3, worker claude-haiku-4-5 (moved to glm-5.2 for the test window, restored), Jev `jev-1.13.0` served for `jev-latest` |
@@ -95,6 +95,34 @@ needs the owner's PIN or a handoff from a paired phone. Not physically verified.
 Jev on the candidate: hits at 270–988 ms, one timeout at 1,525 ms (before the
 timeout change). With the hedge, an accepted Jev verdict no longer starts the
 reviewer (`jevAttempt.reviewerStarted` records it per turn).
+
+## Jev and cache, second pass (measured on the installed build)
+
+- **Reviewer hedge, live:** calendar turn on `a1f1f986` — Jev completion
+  accepted at 280 ms, `reviewerStarted:false`; the turn's grok-4.3 lane fell
+  from 2 calls / 7.0 s (v2) to 1 call / 4.2 s (the remaining call is not a
+  hedged-judge call and still carries no lane).
+- **Proven-strategy Jev call:** median 740 ms, p90 2,980 ms across ten calls,
+  on the critical path before the first frame. Timeout capped at 2 s
+  (`67ae7ea3`); past it the top lexical match already stands in.
+- **Pre-first-frame overhead** on a calendar turn: 9.7 s = 3.9 s before
+  routing (no model call in that window; next thing to explain), 2.9 s of
+  capability provisioning including the Jev proven-strategy call, 1.4 s of
+  memory primer. The first frame then takes 14–19 s of grok-4.6 time.
+- **Cache, measured, then reverted:** the per-turn instruction layers were
+  moved out of the system message to sit before the current user message
+  (`e1f10d2b`). Result on two back-to-back turns in one session: the second
+  turn's first frame still cached 512 tokens, and the first turn's frames
+  cached 512/512/512/8,064 — no better than before. Two facts explain it and
+  both are outside the wire layout: (1) each turn's dynamic block is wire-only
+  and absent from stored history, so the next turn's prefix diverges right
+  after the stable text under either layout; (2) within a turn the provider's
+  cache write lags roughly 6–20 s, so a frame that starts within a few seconds
+  of the previous one never reuses it (frame 4 reused frame 2, never frame
+  3). Reverted (`b13e67bf`). The lever that did move tokens was fewer, larger
+  frames — 16 calls → 3 on the calendar read. Cross-turn reuse would need the
+  dynamic block persisted into history, which costs history tokens every
+  later frame; measure that trade before building it.
 
 ## Removed or retired
 
