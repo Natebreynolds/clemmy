@@ -13,7 +13,7 @@ import { evaluateSystemOne } from '../runtime/jev/client.js';
 import type { ChoiceAnswer, SystemOneQuestions } from '../runtime/jev/system-one.js';
 import { recordJudgeMetric } from '../runtime/harness/judge-family.js';
 
-export const REVISION_JUDGE_TIMEOUT_MS = 2_500;
+export const REVISION_JUDGE_TIMEOUT_MS = 4_000;
 export const REVISION_JUDGE_CONFIDENCE_MIN = 0.6;
 const MAX_TEXT_CHARS = 6_000;
 
@@ -21,8 +21,56 @@ export interface RevisionVerdict {
   verdict: 'applied' | 'not_applied' | 'unverified';
   confidence?: number;
   reason: string;
-  judge: 'jev' | 'none';
+  judge: 'jev' | 'model' | 'none';
+  modelId?: string;
   durationMs: number;
+}
+
+/** Parse the backstop judge's one-line verdict; anything else is unverified. */
+export function parseRevisionModelVerdict(raw: string): { verdict: 'applied' | 'not_applied' | 'unverified'; reason: string } {
+  const text = (raw ?? '').trim();
+  const match = /^\s*(APPLIED|NOT_APPLIED)\s*:?\s*(.*)$/im.exec(text);
+  if (!match) return { verdict: 'unverified', reason: text ? `no APPLIED/NOT_APPLIED verdict (got: ${text.slice(0, 120)})` : 'judge timeout' };
+  const reason = (match[2] || '').trim().slice(0, 400) || (match[1] === 'APPLIED' ? 'the revised draft applies the change request' : 'the revised draft does not apply the change request as written');
+  return { verdict: match[1].toUpperCase() === 'APPLIED' ? 'applied' : 'not_applied', reason };
+}
+
+/** The judge model backstops Jev: when the fast judge is absent, slow or
+ *  unsure, the configured judge answers the same question in one line. */
+export async function judgeRevisionWithModel(input: {
+  note: string;
+  previous?: string;
+  revised: unknown;
+}): Promise<{ verdict: 'applied' | 'not_applied' | 'unverified'; reason: string; modelId?: string }> {
+  try {
+    const { Agent, run } = await import('@openai/agents');
+    const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+    const { withJudgeTimeout } = await import('../runtime/harness/judge-family.js');
+    const judge = resolveRoleModel('judge');
+    if (!judge?.modelId) return { verdict: 'unverified', reason: 'no judge model bound' };
+    const agent = new Agent({
+      name: 'RevisionJudge',
+      instructions: [
+        'A reviewer declined a draft and wrote a change request. The author produced a revised draft.',
+        'Decide whether the revised draft APPLIES the change request: everything the reviewer asked for is present, and what the reviewer did not mention was left as it was.',
+        'A revision that adds what was asked but also rewrites unrelated parts is NOT applied. A revision that leaves the request out is NOT applied.',
+        'Reply with EXACTLY ONE LINE: "APPLIED: <one-sentence reason>" or "NOT_APPLIED: <one-sentence reason>".',
+      ].join('\n'),
+      model: judge.modelId,
+      modelSettings: { reasoning: { effort: 'low' } },
+      tools: [],
+    });
+    const prompt = [
+      `Change request: ${input.note}`,
+      ...(input.previous ? [`Previous draft:\n${clip(input.previous)}`] : []),
+      `Revised draft:\n${clip(renderRevisionText(input.revised))}`,
+    ].join('\n\n');
+    const result = await withJudgeTimeout(run(agent, prompt));
+    const parsed = parseRevisionModelVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
+    return { ...parsed, modelId: judge.modelId };
+  } catch (error) {
+    return { verdict: 'unverified', reason: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function clip(text: string): string {
@@ -35,6 +83,27 @@ export function renderRevisionText(value: unknown): string {
 }
 
 export async function judgeRevisionApplied(input: {
+  note: string;
+  previous?: string;
+  revised: unknown;
+  sessionId?: string;
+  evaluate?: typeof evaluateSystemOne;
+  /** Test seam for the judge-model backstop. */
+  modelJudge?: typeof judgeRevisionWithModel;
+}): Promise<RevisionVerdict> {
+  const fast = await judgeRevisionWithJev(input);
+  if (fast.verdict !== 'unverified') return fast;
+  const started = Date.now();
+  const backstop = await (input.modelJudge ?? judgeRevisionWithModel)({ note: input.note, previous: input.previous, revised: input.revised });
+  const durationMs = fast.durationMs + (Date.now() - started);
+  if (backstop.verdict === 'unverified') {
+    return { ...fast, reason: `${fast.reason}; the judge model could not decide either (${backstop.reason})`, durationMs };
+  }
+  try { recordJudgeMetric({ lane: 'revision', outcome: backstop.verdict === 'applied' ? 'passed' : 'blocked', durationMs: Date.now() - started, modelId: backstop.modelId }); } catch { /* metrics never block */ }
+  return { verdict: backstop.verdict, reason: backstop.reason, judge: 'model', ...(backstop.modelId ? { modelId: backstop.modelId } : {}), durationMs };
+}
+
+async function judgeRevisionWithJev(input: {
   note: string;
   previous?: string;
   revised: unknown;

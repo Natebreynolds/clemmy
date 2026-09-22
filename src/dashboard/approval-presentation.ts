@@ -1,9 +1,8 @@
 /**
  * An approval card is read by a person: what will happen, to whom or where,
  * through which app — never the carrier envelope. Live 2026-09-22: a chat
- * send showed `{"requirement_id":"cap:resolved:slack_send_message…",
- * "name":"composio_execute_tool","args_json":"{\"tool_slug\"…"}` as its
- * details. The carriers (work_call, composio_execute_tool) are unwrapped
+ * send showed the work_call envelope (a cap:resolved requirement id, the
+ * carrier name and an escaped args_json string) as its details. The carriers (work_call, composio_execute_tool) are unwrapped
  * here, once, for desktop and mobile alike; the raw arguments stay available
  * behind a disclosure.
  */
@@ -82,7 +81,7 @@ function appLabel(operation: string | undefined, tool: string): string | undefin
   return undefined;
 }
 
-/** "SLACK_SEND_MESSAGE" → "send message"; "write_file" → "write file". */
+/** A provider id such as `<APP>_SEND_MESSAGE` → "send message"; "write_file" → "write file". */
 function operationPhrase(operation: string | undefined, tool: string, app: string | undefined): string {
   const source = operation ?? tool.split('__').at(-1) ?? tool;
   let phrase = words(source);
