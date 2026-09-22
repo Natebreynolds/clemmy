@@ -12452,9 +12452,13 @@ export function reapResolvedParkedRuns(): void {
       const revisedStepIds = revisableUpstreamStepIds(snapshotSteps, changeRequest.stepId);
       if (revisedStepIds.length > 0 && (run.revisions?.length ?? 0) < 5) {
         const appliedAt = new Date().toISOString();
+        // The run's own step events live under the durable slug; the resume
+        // reads that directory, so the invalidation must land there too
+        // (live: written under the display name, the step was never re-run).
+        const eventWorkflowDir = run.workflowSlug ?? run.workflow;
         for (const stepId of revisedStepIds) {
           try {
-            appendWorkflowEvent(run.workflow, run.id, {
+            appendWorkflowEvent(eventWorkflowDir, run.id, {
               kind: 'step_invalidated',
               stepId,
               meta: { approvalId: stopped.approvalId, gatedStepId: changeRequest.stepId, note: changeRequest.note },
