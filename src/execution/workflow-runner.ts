@@ -1226,9 +1226,34 @@ function workflowRunOriginSource(runId: string): { sessionId: string; sourceUser
       return { sessionId: creation.sessionId, sourceUserSeq: creation.sourceUserSeq };
     }
     const origin = typeof record.originSessionId === 'string' ? record.originSessionId.trim() : '';
-    if (!origin) return null;
-    const latest = listHarnessEvents(origin, { types: ['user_input_received'], limit: 1, desc: true })[0];
-    return latest ? { sessionId: origin, sourceUserSeq: latest.seq } : null;
+    if (origin) {
+      const latest = listHarnessEvents(origin, { types: ['user_input_received'], limit: 1, desc: true })[0];
+      if (latest) return { sessionId: origin, sourceUserSeq: latest.seq };
+    }
+    // A console or scheduled run has no conversation of its own. The
+    // conversation that authored the workflow still names its operating
+    // account: reuse the newest creation test's recorded source (live
+    // 2026-09-22: the creation test passed on the author's routed account,
+    // the first console run parked on the same operation as ambiguous).
+    return workflowCreationOriginSource(record.workflow);
+  } catch {
+    return null;
+  }
+}
+
+function workflowCreationOriginSource(workflowName: string): { sessionId: string; sourceUserSeq: number } | null {
+  try {
+    if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
+    const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse();
+    for (const file of files.slice(0, 400)) {
+      const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, file));
+      if (!record || record.workflow !== workflowName) continue;
+      const creation = record.creationTestSource;
+      if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {
+        return { sessionId: creation.sessionId, sourceUserSeq: creation.sourceUserSeq };
+      }
+    }
+    return null;
   } catch {
     return null;
   }
