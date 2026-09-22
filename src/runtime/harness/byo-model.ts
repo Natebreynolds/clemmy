@@ -36,58 +36,13 @@ import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
-import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
 import pino from 'pino';
-
-/**
- * Split the harness system message at the stable/dynamic boundary. The stable
- * half stays where it is; the dynamic half (turn context, memory context)
- * becomes its own system message immediately before the last user message.
- * A system message without the boundary is only stripped of layer markers.
- * Exported for the wire test; pure.
- */
-export function placeDynamicInstructionLayersBeforeCurrentMessage(
-  messages: Array<Record<string, unknown>>,
-): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  let dynamic: string | null = null;
-  for (const m of messages) {
-    if (m?.role === 'system' && typeof m.content === 'string' && dynamic === null) {
-      const at = m.content.indexOf(INSTRUCTION_CACHE_DELIM);
-      if (at >= 0) {
-        const stable = m.content.slice(0, at);
-        const rest = stripPromptCacheLayerSentinels(m.content.slice(at + INSTRUCTION_CACHE_DELIM.length)).trim();
-        out.push({ ...m, content: stripPromptCacheLayerSentinels(stable).trimEnd() });
-        if (rest) dynamic = rest;
-        continue;
-      }
-      out.push({ ...m, content: stripPromptCacheLayerSentinels(m.content) });
-      continue;
-    }
-    out.push(m?.role === 'system' && typeof m.content === 'string'
-      ? { ...m, content: stripPromptCacheLayerSentinels(m.content) }
-      : m);
-  }
-  if (dynamic === null) return out;
-  let lastUser = -1;
-  for (let i = out.length - 1; i >= 0; i -= 1) {
-    if (out[i]?.role === 'user') { lastUser = i; break; }
-  }
-  const dynamicMessage = { role: 'system', content: dynamic };
-  if (lastUser < 0) {
-    // No user message: keep it as the second system message so nothing is lost.
-    const firstSystem = out.findIndex((m) => m?.role === 'system');
-    out.splice(firstSystem + 1, 0, dynamicMessage);
-    return out;
-  }
-  out.splice(lastUser, 0, dynamicMessage);
-  return out;
-}
 
 const logger = pino({ name: 'clementine.byo-model' });
 
@@ -265,21 +220,11 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   // correctness one. The content is unchanged; only the order of two blocks
   // within the system message differs, and this is the order every other wire
   // already sends.
-  //
-  // Measured again on the accepted candidate, live 2026-09-22: with the
-  // dynamic layers kept INSIDE the system message (after the stable text),
-  // every turn's first frame cached exactly 512 tokens — five turns, 3.9% —
-  // because the per-turn text still sits ahead of the tool schemas and the
-  // whole history in the provider's prefix. Within a turn the frames lag one
-  // cache write behind each other; across turns nothing past the stable text
-  // can ever match. So the dynamic layers leave the system message: the stable
-  // instructions stay at byte 0, the tools and the prior history follow them
-  // unchanged, and the per-turn context rides as its own system message placed
-  // right before the current user message, where it is still read before the
-  // model answers and breaks nothing that precedes it.
   if (Array.isArray(next.messages)) {
-    next.messages = placeDynamicInstructionLayersBeforeCurrentMessage(
-      next.messages as Array<Record<string, unknown>>,
+    next.messages = (next.messages as Array<Record<string, unknown>>).map((m) =>
+      m?.role === 'system' && typeof m.content === 'string'
+        ? { ...m, content: stripPromptCacheLayerSentinels(m.content) }
+        : m,
     );
   }
 
