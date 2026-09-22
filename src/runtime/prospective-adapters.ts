@@ -169,10 +169,9 @@ export function workflowProspectiveDefinitions(
 }
 
 export function monitorProspectiveDefinitions(policy: ProactivityPolicy): ProspectiveIntentionDefinition[] {
-  if (!policy.enabled) return [];
   const definitions: ProspectiveIntentionDefinition[] = [];
-  const pausedMonitor = (sourceId: 'inbox' | 'calendar', intervalMs: number): ProspectiveIntentionDefinition => {
-    const label = sourceId === 'inbox' ? 'inbox' : 'calendar';
+  const pausedMonitor = (sourceId: 'inbox', intervalMs: number): ProspectiveIntentionDefinition => {
+    const label = sourceId;
     return {
       id: prospectiveIntentionId('monitor', sourceId),
       sourceKind: 'monitor',
@@ -209,11 +208,31 @@ export function monitorProspectiveDefinitions(policy: ProactivityPolicy): Prospe
       },
     };
   };
-  if (policy.inboxWatchEnabled) {
+  if (policy.enabled && policy.inboxWatchEnabled) {
     definitions.push(pausedMonitor('inbox', policy.inboxWatchMinutes * 60_000));
   }
+  // The calendar watch runs on its own switch through the prepared read path
+  // (calendar-watch-runtime.ts); it does not depend on the global proactive
+  // switch because it only reads and raises items.
   if (policy.calendarWatchEnabled) {
-    definitions.push(pausedMonitor('calendar', policy.calendarWatchMinutes * 60_000));
+    const intervalMs = policy.calendarWatchMinutes * 60_000;
+    definitions.push({
+      id: prospectiveIntentionId('monitor', 'calendar'),
+      sourceKind: 'monitor',
+      sourceId: 'calendar',
+      objective: 'Calendar watch: one item per meaningful change in the next 24 hours (cancellations, double-bookings, invites awaiting a reply, moves that matter)',
+      trigger: { kind: 'state', channel: 'calendar', intervalMs },
+      action: { kind: 'notify', ref: 'calendar-watch', summary: 'Raise a needs-you item for each meaningful calendar change' },
+      risk: 'read',
+      approvalMode: 'enforce_at_action',
+      recurring: true,
+      metadata: {
+        availability: 'active',
+        readPath: 'prepared_workflow_read',
+        requestedMonitor: 'calendar',
+        requestedIntervalMs: intervalMs,
+      },
+    });
   }
   return definitions;
 }

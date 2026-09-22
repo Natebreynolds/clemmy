@@ -2108,11 +2108,13 @@ export async function startDaemon(
       },
     });
   }
-  // The old ambient inbox/calendar implementations call the raw provider
-  // client and have no accepted logical/physical read authority. Keep their
-  // user settings intact, but do not schedule them until they are migrated to
-  // the prepared terminal path. This warning is explicit readiness truth, not
-  // a fabricated claim that monitoring is active.
+  // The old ambient inbox implementation calls the raw provider client and
+  // has no accepted logical/physical read authority. Keep its user settings
+  // intact, but do not schedule it until it is migrated to the prepared
+  // terminal path. This warning is explicit readiness truth, not a fabricated
+  // claim that monitoring is active. The calendar watch was migrated: it reads
+  // through the prepared workflow read path and is armed below, after the
+  // typed execution runtime installs the live catalog.
   const configuredAmbientComposioMonitors: AmbientComposioMonitorPolicy[] = (() => {
     try {
       const policy = getProactivityPolicySnapshot().policy;
@@ -2121,11 +2123,6 @@ export async function startDaemon(
           monitor: 'inbox' as const,
           intervalMinutes: policy.inboxWatchMinutes,
           maxItems: policy.inboxWatchMax,
-        }] : []),
-        ...(policy.enabled && policy.calendarWatchEnabled ? [{
-          monitor: 'calendar' as const,
-          intervalMinutes: policy.calendarWatchMinutes,
-          maxItems: policy.calendarWatchMax,
         }] : []),
       ];
     } catch {
@@ -3330,6 +3327,22 @@ export async function startDaemon(
     setImmediate(drainWorkflowRunsTick);
     const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);
     workflowRunTimer.unref?.();
+  }
+
+  // Calendar watch heartbeat: a minute-level check that ticks on the policy
+  // cadence, reads every connected calendar through the prepared read path,
+  // diffs deterministically, and asks Jev only about low-signal changes. It
+  // has its own switch (calendarWatchEnabled) and respects quiet hours.
+  try {
+    const { calendarWatchPolicy, startCalendarWatchHeartbeat } = await import('../agents/calendar-watch-runtime.js');
+    const watchPolicy = calendarWatchPolicy();
+    startCalendarWatchHeartbeat();
+    logger.info(
+      { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
+      watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',
+    );
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Calendar watch heartbeat failed to arm');
   }
 
   // RELEASE BOUNDARY: listeners must not accept a fresh mutation while the

@@ -8710,6 +8710,49 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Watches: what each background watch is for, its last finding, its open
+  // items and its controls. The calendar watch is the first one on the
+  // heartbeat contract (calendar-watch.ts). "Check now" runs one tick.
+  app.get('/api/console/watches', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { calendarWatchStatus } = await import('../agents/calendar-watch-runtime.js');
+      res.json({ watches: [calendarWatchStatus()] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/watches/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (req.params.id !== 'calendar') { res.status(404).json({ error: 'unknown watch' }); return; }
+    try {
+      const { calendarWatchStatus, setCalendarWatchPolicy } = await import('../agents/calendar-watch-runtime.js');
+      const body = (req.body ?? {}) as { enabled?: unknown; cadenceMinutes?: unknown };
+      setCalendarWatchPolicy({
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+        ...(typeof body.cadenceMinutes === 'number' && Number.isFinite(body.cadenceMinutes) ? { cadenceMinutes: body.cadenceMinutes } : {}),
+      });
+      res.json({ watch: calendarWatchStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/watches/:id/tick', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (req.params.id !== 'calendar') { res.status(404).json({ error: 'unknown watch' }); return; }
+    try {
+      const { calendarWatchStatus, runCalendarWatchTick } = await import('../agents/calendar-watch-runtime.js');
+      const tick = await runCalendarWatchTick({ source: 'manual', force: true });
+      const { seenEvents, ...summary } = tick;
+      const includeEvents = req.query.events === '1';
+      res.json({ tick: includeEvents ? { ...summary, seenEvents } : summary, watch: calendarWatchStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Developer feature-flags panel: read the curated CLEMMY_* kill-switch snapshot.
   app.get('/api/console/settings/developer-flags', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

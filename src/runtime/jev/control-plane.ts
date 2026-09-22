@@ -268,6 +268,9 @@ export async function tryJevGroundingVerdict(
 }
 
 const TRAJECTORY_TIMEOUT_MS = 1_500;
+/** A watch item is a background decision; a slow answer is worth less than the rule. */
+const WATCH_CHANGE_TIMEOUT_MS = 1_500;
+const WATCH_CHANGE_CONFIDENCE_MIN = 0.6;
 
 export interface JevTrajectoryVerdict {
   onTrack: boolean;
@@ -455,6 +458,58 @@ export async function tryJevCompletionVerdict(
   };
 }
 
+export interface JevWatchChangeVerdict {
+  surface: boolean;
+  confidence: number;
+  model: string;
+  durationMs: number;
+}
+
+/**
+ * "Does this calendar change matter to the owner right now?" — asked only for
+ * LOW-signal changes the deterministic watch already classified (a moved
+ * meeting). Cancellations, new double-bookings and unanswered invites never
+ * reach this question; they always surface. Null = unavailable/timeout/low
+ * confidence, and the caller fails open to its rule.
+ */
+export async function tryJevWatchChangeVerdict(input: {
+  watch: string;
+  change: Record<string, unknown>;
+  sessionId?: string;
+}): Promise<JevWatchChangeVerdict | null> {
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: [
+        `The owner runs a ${input.watch} watch that lists items they must act on.`,
+        'Deterministic rules already surface cancellations, new double-bookings and unanswered invites; this change is one of the remaining, lower-signal kinds.',
+        'SURFACE when the change affects what the owner must do, attend, prepare, reply to, or decide.',
+        'SKIP when nothing the owner does changes: a small shift of a self-created block, a hold with no one else, a change already reflected in their response.',
+      ].join(' '),
+      criteria: {
+        surface: 'The owner needs to see this now: a decision, reply, reschedule or preparation is affected.',
+        skip: 'Routine: nothing the owner does changes because of it.',
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: { watch: input.watch, change: input.change },
+    questions,
+    timeoutMs: WATCH_CHANGE_TIMEOUT_MS,
+    sessionId: input.sessionId,
+    channel: 'jev-watch',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || answer.confidence < WATCH_CHANGE_CONFIDENCE_MIN) return null;
+  const choice = String(answer.choice).trim().toLowerCase();
+  if (choice !== 'surface' && choice !== 'skip') return null;
+  const durationMs = Date.now() - started;
+  await recordJevJudgeMetric('calendar_watch', choice === 'surface' ? 'passed' : 'blocked', result.model, durationMs);
+  return { surface: choice === 'surface', confidence: answer.confidence, model: result.model, durationMs };
+}
+
 export async function tryJevOutputGroundingVerdict(
   claims: Array<{ raw: string; context?: string }>,
   sources: Array<{ excerpt: string }>,
@@ -500,7 +555,7 @@ export async function tryJevOutputGroundingVerdict(
 }
 
 async function recordJevJudgeMetric(
-  lane: 'completion' | 'grounding' | 'output_grounding',
+  lane: 'completion' | 'grounding' | 'output_grounding' | 'calendar_watch',
   outcome: 'passed' | 'blocked' | 'advisory',
   modelId: string,
   durationMs: number,

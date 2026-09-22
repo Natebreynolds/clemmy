@@ -106,25 +106,39 @@ test('monitor, check-in, and background adapters stay read-only and omit disable
     calendarWatchEnabled: true,
   });
   assert.deepEqual(monitors.map((item) => item.id), ['monitor:inbox', 'monitor:calendar']);
-  for (const monitor of monitors) {
-    assert.equal(monitor.risk, 'read');
-    assert.equal(monitor.approvalMode, 'enforce_at_action');
-    assert.equal(monitor.recurring, false);
-    assert.deepEqual(monitor.trigger, { kind: 'manual' });
-    assert.equal(monitor.action.kind, 'notify');
-    assert.equal(monitor.action.ref, 'automation_opportunity_propose');
-    assert.equal(monitor.metadata?.availability, 'paused');
-    assert.equal(monitor.metadata?.reason, 'prepared_read_authority_unavailable');
-    assert.match(monitor.objective, /paused until an exact read pilot is reviewed and approved/i);
-    const setup = monitor.metadata?.setupAction as Record<string, unknown>;
-    assert.equal(setup.firstTool, 'automation_opportunity_propose');
-    assert.deepEqual(setup.authorityPath, [
-      'automation_opportunity_propose',
-      'automation_opportunity_review_request',
-      'automation_read_pilot_request',
-      'automation_recurrence_request',
-    ]);
-  }
+  const [inbox, calendar] = monitors;
+  assert.equal(inbox!.risk, 'read');
+  assert.equal(inbox!.approvalMode, 'enforce_at_action');
+  assert.equal(inbox!.recurring, false);
+  assert.deepEqual(inbox!.trigger, { kind: 'manual' });
+  assert.equal(inbox!.action.kind, 'notify');
+  assert.equal(inbox!.action.ref, 'automation_opportunity_propose');
+  assert.equal(inbox!.metadata?.availability, 'paused');
+  assert.equal(inbox!.metadata?.reason, 'prepared_read_authority_unavailable');
+  assert.match(inbox!.objective, /paused until an exact read pilot is reviewed and approved/i);
+  const setup = inbox!.metadata?.setupAction as Record<string, unknown>;
+  assert.equal(setup.firstTool, 'automation_opportunity_propose');
+  assert.deepEqual(setup.authorityPath, [
+    'automation_opportunity_propose',
+    'automation_opportunity_review_request',
+    'automation_read_pilot_request',
+    'automation_recurrence_request',
+  ]);
+  // The calendar watch was migrated to the prepared read path: it is an
+  // ACTIVE recurring state watch on its own switch, still read-only.
+  assert.equal(calendar!.risk, 'read');
+  assert.equal(calendar!.approvalMode, 'enforce_at_action');
+  assert.equal(calendar!.recurring, true);
+  assert.deepEqual(calendar!.trigger, { kind: 'state', channel: 'calendar', intervalMs: DEFAULT_PROACTIVITY_POLICY.calendarWatchMinutes * 60_000 });
+  assert.equal(calendar!.action.kind, 'notify');
+  assert.equal(calendar!.action.ref, 'calendar-watch');
+  assert.equal(calendar!.metadata?.availability, 'active');
+  assert.equal(calendar!.metadata?.readPath, 'prepared_workflow_read');
+  assert.match(calendar!.objective, /one item per meaningful change/i);
+  // Its own switch: the global proactive switch off does not pause it.
+  const globalOff = monitorProspectiveDefinitions({ ...DEFAULT_PROACTIVITY_POLICY, enabled: false, inboxWatchEnabled: true, calendarWatchEnabled: true });
+  assert.deepEqual(globalOff.map((item) => item.id), ['monitor:calendar']);
+  assert.deepEqual(monitorProspectiveDefinitions({ ...DEFAULT_PROACTIVITY_POLICY, calendarWatchEnabled: false, inboxWatchEnabled: false }), []);
 
   const checkIn: CheckInTemplate = {
     id: 'check-a',
