@@ -940,6 +940,44 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
  * (where that surface owns delivery), and activation. It never invokes a
  * model, provider, or business tool. Carrier-owned delivery remains explicitly
  * held for the ordinary channel resumer that can reconstruct its exact target. */
+/**
+ * Commit the one honest terminal for a preparation whose retry window passed
+ * with nothing dispatched. Idempotent by construction: the eventlog refuses a
+ * second logical terminal for the same accepted source, and the recovery
+ * candidate query excludes any source that has one. Never throws.
+ */
+async function terminalizeExpiredPlanTaskPreparation(
+  candidate: { sessionId: string; sourceUserSeq: number },
+  reason: string,
+): Promise<void> {
+  try {
+    const source = listEvents(candidate.sessionId, {
+      sinceSeq: candidate.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === candidate.sourceUserSeq);
+    if (!source) return;
+    const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+    const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+    const identity = { sessionId: candidate.sessionId, turn: source.turn, sourceUserSeq: candidate.sourceUserSeq };
+    commitTurnOutcome({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'continue' },
+      presentation: {
+        kind: 'continue',
+        text: 'I stopped setting this up: Clementine restarted while it was being prepared and the retry window has passed. Nothing was sent or changed. Say continue if you still want it and I will start again from your request.',
+      },
+    }, {
+      legacyReason: `plan_preparation_expired: ${reason}`.slice(0, 400),
+      metadata: { steps: 0 },
+    });
+  } catch { /* a competing terminal or a store hiccup leaves the next tick to say it */ }
+}
+
 export async function recoverPendingPlanTaskBindingSealPreparations(input: {
   limit?: number;
 } = {}): Promise<{
@@ -981,7 +1019,16 @@ export async function recoverPendingPlanTaskBindingSealPreparations(input: {
     const preparation = await recoverPlanTaskBindingSealPreparation(candidate);
     if (preparation.status === 'held' || preparation.status === 'expired') {
       if (preparation.status === 'held') summary.held += 1;
-      else summary.expired += 1;
+      else {
+        summary.expired += 1;
+        // An expired preparation with no terminal is re-claimed by every tick
+        // forever (live 2026-09-22: one source re-logged as `expired` every
+        // 16 s for hours). The fresh-turn owner that would "report it
+        // factually" is long gone, so report it here, once, as the honest
+        // typed terminal the candidate query already excludes. Nothing ran;
+        // `continue` takes it from there.
+        await terminalizeExpiredPlanTaskPreparation(candidate, preparation.reason);
+      }
       summary.records.push({
         ...candidate,
         preparation: preparation.status,
