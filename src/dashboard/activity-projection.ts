@@ -69,6 +69,12 @@ import {
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 
 interface RawRunRecordLike {
+  /** Set when the boot-resume cap parked this run (see workflow-runner). */
+  bootResumeParkedAt?: unknown;
+  bootResumeCount?: unknown;
+  bootResumeMark?: unknown;
+  /** Approval-park state; absent on a boot-resume-cap park. */
+  parked?: unknown;
   id?: unknown;
   workflow?: unknown;
   status?: unknown;
@@ -200,6 +206,16 @@ export function projectWorkflowRunActivity(
   if (!id || !workflow) return null;
   const status = text(raw.status) ?? 'unknown';
   const terminalOutcome = canonicalWorkflowOutcome(raw, status);
+  // Two runs say `parked` and mean different things. A run parked ON AN
+  // APPROVAL carries `parked.parkedSteps` and is awaiting approval. A run the
+  // boot-resume cap parked carries `bootResumeParkedAt` and no approval at
+  // all: Clementine stopped re-running it after repeated restarts and is
+  // waiting for a person to resume or skip it. Live 2026-09-22: eleven of the
+  // second kind, up to eleven days old, sat on Home as "Waiting for approval"
+  // with no approval to give.
+  const restartCapParked = status === 'parked'
+    && typeof raw.bootResumeParkedAt === 'string'
+    && !(raw.parked && typeof raw.parked === 'object');
   const lifecycle: SurfaceLifecycle = terminalOutcome === 'blocked'
     ? 'blocked'
     : terminalOutcome === 'succeeded'
@@ -208,7 +224,9 @@ export function projectWorkflowRunActivity(
         ? 'failed'
         : terminalOutcome === 'cancelled'
           ? 'cancelled'
-          : LIFECYCLES[status] ?? 'accepted';
+          : restartCapParked
+            ? 'paused_budget'
+            : LIFECYCLES[status] ?? 'accepted';
   const terminal = workflowTerminalForOutcome(terminalOutcome, raw);
 
   const block = raw.capabilityBlock && typeof raw.capabilityBlock === 'object'
@@ -242,7 +260,12 @@ export function projectWorkflowRunActivity(
         // still strips it with every other detail.
         : lifecycle === 'awaiting_input' && text(raw.awaitingInput?.question)
           ? { detail: text(raw.awaitingInput?.question)!.slice(0, 300) }
-          : {}),
+          : restartCapParked
+            ? {
+                detail: text(raw.error)?.slice(0, 300)
+                  ?? `Paused after ${typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : 'repeated'} automatic restarts. Resume it when you're ready, or skip it.`,
+              }
+            : {}),
     startedAt: text(raw.startedAt) ?? text(raw.createdAt) ?? observedAt,
     // Durable-evidence time only: the record's own timestamps, never poll time.
     lastEvidenceAt,

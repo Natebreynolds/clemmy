@@ -13751,6 +13751,33 @@ export function registerConsoleRoutes(
           panel: 'approvals',
           urgency: 'high',
         })),
+        // Runs the boot-resume cap parked are a DECISION, not running work:
+        // Clementine stopped re-running them after repeated restarts and is
+        // waiting for a person to resume or skip. Live 2026-09-22: eleven of
+        // them, up to eleven days old, showed under Running as "Waiting for
+        // approval" while this list said one thing needed you. One queue.
+        ...pendingWorkflowRuns.filter((run) => run.runStatus === 'parked').flatMap((run) => {
+          try {
+            const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
+            if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) return [];
+            const count = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : null;
+            const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
+            const workflow = readWorkflow(run.workflowName);
+            const title = workflow?.data?.name ?? run.workflowName;
+            return [{
+              kind: 'workflow-paused',
+              title: `Paused after ${count ?? 'repeated'} automatic restarts: ${title}`,
+              meta: [since ? relAge(since) : '', 'resume it, or skip it'].filter(Boolean).join(' · '),
+              panel: 'workflows',
+              urgency: 'low',
+              actionKind: 'workflow-run',
+              workflowName: run.workflowName,
+              runId: run.runId,
+            }];
+          } catch {
+            return [];
+          }
+        }),
       ].map((item) => ({
         ...item,
         title: trimConsoleTitle(stripConsoleIds(item.title), 140),
