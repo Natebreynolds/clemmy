@@ -13756,28 +13756,43 @@ export function registerConsoleRoutes(
         // waiting for a person to resume or skip. Live 2026-09-22: eleven of
         // them, up to eleven days old, showed under Running as "Waiting for
         // approval" while this list said one thing needed you. One queue.
-        ...pendingWorkflowRuns.filter((run) => run.runStatus === 'parked').flatMap((run) => {
-          try {
-            const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
-            if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) return [];
-            const count = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : null;
-            const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
-            const workflow = readWorkflow(run.workflowName);
-            const title = workflow?.data?.name ?? run.workflowName;
-            return [{
+        // One item per WORKFLOW: ten paused standup-email occurrences are one
+        // decision ("resume or skip these"), not ten cards saying the same thing.
+        ...(() => {
+          const byWorkflow = new Map<string, { workflowName: string; runIds: string[]; oldest: string; restarts: number }>();
+          for (const run of pendingWorkflowRuns) {
+            if (run.runStatus !== 'parked') continue;
+            try {
+              const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
+              if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) continue;
+              const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
+              const restarts = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : 0;
+              const group = byWorkflow.get(run.workflowName) ?? { workflowName: run.workflowName, runIds: [], oldest: since, restarts: 0 };
+              group.runIds.push(run.runId);
+              if (since && (!group.oldest || since < group.oldest)) group.oldest = since;
+              group.restarts = Math.max(group.restarts, restarts);
+              byWorkflow.set(run.workflowName, group);
+            } catch { /* an unreadable record is not a decision */ }
+          }
+          return [...byWorkflow.values()].map((group) => {
+            const workflow = readWorkflow(group.workflowName);
+            const title = workflow?.data?.name ?? group.workflowName;
+            const n = group.runIds.length;
+            return {
               kind: 'workflow-paused',
-              title: `Paused after ${count ?? 'repeated'} automatic restarts: ${title}`,
-              meta: [since ? relAge(since) : '', 'resume it, or skip it'].filter(Boolean).join(' · '),
+              title: n === 1
+                ? `Paused after repeated restarts: ${title}`
+                : `${n} paused runs of ${title} after repeated restarts`,
+              meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
               panel: 'workflows',
               urgency: 'low',
               actionKind: 'workflow-run',
-              workflowName: run.workflowName,
-              runId: run.runId,
-            }];
-          } catch {
-            return [];
-          }
-        }),
+              workflowName: group.workflowName,
+              runId: group.runIds[0],
+              count: n,
+            };
+          });
+        })(),
       ].map((item) => ({
         ...item,
         title: trimConsoleTitle(stripConsoleIds(item.title), 140),
