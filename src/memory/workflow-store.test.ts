@@ -581,3 +581,49 @@ test('a role never implies capability or effect', () => {
   assert.equal(step.requiresApproval, undefined, 'a role adds no approval');
   assert.equal(step.sideEffect, 'read', 'a role does not change effect class');
 });
+
+test('a step call account binding round-trips through write→read and a malformed one is dropped', () => {
+  const digest = 'a'.repeat(64);
+  writeWorkflow('call-account-rt', {
+    name: 'call-account-rt',
+    description: 'the owner chose an account for this step',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'query_accounts',
+        prompt: 'Query accounts.',
+        sideEffect: 'read',
+        call: {
+          tool: 'salesforce_sf_soql_query',
+          args: { query: 'SELECT Id FROM Account' },
+          account: { capabilityId: 'cap:sf:acct-b', accountId: 'acct-b', choiceSetDigest: digest, selectedAt: '2026-09-22T00:00:00.000Z', selectedBy: 'desktop' },
+        },
+      },
+      {
+        id: 'bad_binding',
+        prompt: 'Malformed binding must never bind.',
+        sideEffect: 'read',
+        call: {
+          tool: 'salesforce_sf_soql_query',
+          // digest is not 64 hex → dropped on read, never a silent partial bind
+          account: { capabilityId: 'cap:sf:acct-b', accountId: 'acct-b', choiceSetDigest: 'nope' } as never,
+        },
+      },
+    ],
+  });
+  const wf = readWorkflow('call-account-rt');
+  assert.ok(wf);
+  const bound = wf!.data.steps.find((s) => s.id === 'query_accounts');
+  assert.deepEqual(bound?.call?.account, {
+    capabilityId: 'cap:sf:acct-b',
+    accountId: 'acct-b',
+    choiceSetDigest: digest,
+    selectedAt: '2026-09-22T00:00:00.000Z',
+    selectedBy: 'desktop',
+  });
+  assert.deepEqual(bound?.call?.args, { query: 'SELECT Id FROM Account' });
+  const malformed = wf!.data.steps.find((s) => s.id === 'bad_binding');
+  assert.equal(malformed?.call?.tool, 'salesforce_sf_soql_query');
+  assert.equal(malformed?.call?.account, undefined);
+});

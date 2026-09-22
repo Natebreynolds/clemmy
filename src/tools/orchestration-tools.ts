@@ -2330,10 +2330,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       });
       if (!resolved.ok) return textResult(`${resolved.message} Nothing was dispatched.`);
       requestWorkflowRunDrainKick([run_id]);
+      const creationTest = resolved.mode === 'creation_test';
       return textResult(
         resolved.status === 'already_selected'
           ? `Account ${resolved.accountId} was already saved for step ${resolved.stepId}; run ${resolved.runId} remains on its same-run resume path. No duplicate dispatch was authorized.`
-          : `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed run ${resolved.runId}. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
+          : creationTest
+            ? `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed the creation test as run ${resolved.runId} — mutations stay previewed; it enables on a pass. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`
+            : `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed run ${resolved.runId}. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
       );
     },
   );

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
@@ -1138,6 +1139,76 @@ export interface ParkedStepRef {
 interface ParkedRunState {
   parkedSteps: ParkedStepRef[];
   parkedAt: string;
+  /** "Request changes": the reviewer declined the exact draft AND said what to
+   * change. Recorded before the approval row resolves, on the run itself, so
+   * a restart or another device cannot lose it. The stop report carries it
+   * back to the originating conversation bound to this run and step. */
+  changeRequest?: {
+    approvalId: string;
+    stepId: string;
+    note: string;
+    requestedAt: string;
+    requestedBy: string;
+  };
+}
+
+/**
+ * Record a reviewer's change request on the parked run that owns the gate
+ * approval. Pure bookkeeping: it neither resolves the approval nor resumes
+ * anything. Returns the exact run/step it landed on, or why it could not.
+ */
+export function recordWorkflowGateChangeRequest(input: {
+  approvalId: string;
+  sessionId: string;
+  note: string;
+  by: string;
+}): { ok: true; runId: string; stepId: string } | { ok: false; reason: string } {
+  const match = /^workflow-gate:([A-Za-z0-9_.:-]+):([^:]+)$/.exec(input.sessionId.trim());
+  if (!match) return { ok: false, reason: 'not a workflow approval gate' };
+  const runId = match[1]!;
+  const note = input.note.replace(/\s+/g, ' ').trim().slice(0, 2_000);
+  if (!note) return { ok: false, reason: 'empty note' };
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  return withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current || current.status !== 'parked' || !current.parked) {
+      return { ok: false, reason: 'the run is not parked on an approval' } as const;
+    }
+    const parkedStep = current.parked.parkedSteps.find((step) => step.approvalIds.includes(input.approvalId));
+    if (!parkedStep) return { ok: false, reason: 'the approval does not belong to this run' } as const;
+    writeRunRecord(filePath, {
+      ...current,
+      parked: {
+        ...current.parked,
+        changeRequest: {
+          approvalId: input.approvalId,
+          stepId: parkedStep.stepId,
+          note,
+          requestedAt: new Date().toISOString(),
+          requestedBy: input.by.replace(/\s+/g, ' ').trim().slice(0, 120) || 'user',
+        },
+      },
+    });
+    return { ok: true, runId, stepId: parkedStep.stepId } as const;
+  });
+}
+
+/** The reviewable material for a gate: the outputs the gated step consumes,
+ * bounded, so the card shows the actual draft rather than a step id. */
+function gateDraftExcerpt(step: WorkflowStepInput, ctx: StepExecutionContext, maxChars = 3_000): string {
+  const parts: string[] = [];
+  for (const dep of step.dependsOn ?? []) {
+    const value = ctx.stepOutputs[dep];
+    if (value === undefined || value === null) continue;
+    const text = typeof value === 'string'
+      ? value
+      : (() => { try { return JSON.stringify(value, null, 2); } catch { return String(value); } })();
+    const clean = text.replace(/\r\n/g, '\n').trim();
+    if (!clean) continue;
+    parts.push((step.dependsOn ?? []).length > 1 ? `[${dep}]\n${clean}` : clean);
+  }
+  const joined = parts.join('\n\n');
+  return joined.length > maxChars ? `${joined.slice(0, maxChars - 1)}…` : joined;
 }
 
 function readRunRecord(filePath: string): QueuedRunRecord | null {
@@ -2089,6 +2160,21 @@ export interface WorkflowCapabilityBlockState {
   };
   resumedAt?: string;
   resumeAuthorityConsumedAt?: string;
+  /**
+   * The status the run held when it parked, when that was not an ordinary
+   * run. A creation test that pauses on an account question must resume AS
+   * a creation test: readmitting it as `running` would turn the preview into
+   * a real run and dispatch the steps it had only previewed (the gap named at
+   * 641b1769). Absent = `running`.
+   */
+  resumeStatus?: 'creation_test';
+}
+
+/** The status a parked run returns to. */
+export function capabilityBlockResumeStatus(
+  block: Pick<WorkflowCapabilityBlockState, 'resumeStatus'> | undefined,
+): 'running' | 'creation_test' {
+  return block?.resumeStatus === 'creation_test' ? 'creation_test' : 'running';
 }
 
 export interface WorkflowMutationAmbiguityBlockState {
@@ -3324,12 +3410,23 @@ async function executeWorkflowCallNode(
           + (reviewedLocal.detail ? `: ${reviewedLocal.detail}` : ''),
       });
     }
-    const persistedAccountSelection = (
+    const runLevelAccountSelection = (
       ctx.capabilityResume?.state === 'retrying'
       && ctx.capabilityResume.reason === 'ambiguous-account'
       && ctx.capabilityResume.stepId === step.id
       && ctx.capabilityResume.tool === call.tool
     ) ? ctx.capabilityResume.accountSelection : undefined;
+    // The owner's answer outlives one run: a binding saved on the definition
+    // step is the same exact (capability, account, choice-set digest) triple
+    // and is revalidated identically below. A fresh run-level choice wins.
+    const persistedAccountSelection = runLevelAccountSelection
+      ?? (step.call?.account
+        ? {
+            capabilityId: step.call.account.capabilityId,
+            accountId: step.call.account.accountId,
+            choiceSetDigest: step.call.account.choiceSetDigest,
+          }
+        : undefined);
     // A saved READ operation with no durable manifest yet (reviewed CLI or
     // configured MCP) is acquired through the same attested carrier path a
     // foreground disclosure uses, so a scheduled call step is never reported
@@ -5993,11 +6090,31 @@ async function awaitDeclarativeStepApproval(
   const pending = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'pending' });
   let row = pending[0];
   if (!row) {
-    const subject = (step.approvalPreview && step.approvalPreview.trim())
+    // The preview may name the draft it gates ({{steps.draft.output}}); render
+    // it with the same template engine the call args use, so the card says
+    // what will actually go out, not the template.
+    const renderedPreview = step.approvalPreview && step.approvalPreview.trim()
+      ? renderTemplate(step.approvalPreview.trim(), ctx.inputs, ctx.stepOutputs).trim()
+      : '';
+    const subject = renderedPreview
       // Legibility (#1): show WHAT the step will do, not just its id — so the
       // approver (gated) or the audit stream (unattended/yolo) sees the real
       // action. Flows to the dashboard card, the notification, and Discord/Slack.
       || `Approve "${ctx.workflow.name}" step "${step.id}": ${describeWorkflowStepAction(step)}`;
+    // The reviewer inspects the DRAFT, not a step id: the outputs this step
+    // consumes ride on the approval row (desktop content preview, mobile
+    // "Review details", command-center sample) bounded and never re-fetched.
+    const draft = gateDraftExcerpt(step, ctx);
+    const gateArgs: Record<string, unknown> = {
+      workflow: ctx.workflow.name,
+      runId: ctx.runId,
+      stepId: step.id,
+      action: describeWorkflowStepAction(step),
+      ...(draft ? { body: draft } : {}),
+      ...(draft
+        ? { preview: { samples: [{ label: 'Draft', value: draft.slice(0, 180) }] } }
+        : {}),
+    };
     // The approvals table has `session_id REFERENCES sessions(id)` with
     // foreign_keys=ON, so a gate approval can only be registered once a
     // sessions row exists for the gate id. The declarative gate uses its
@@ -6025,6 +6142,7 @@ async function awaitDeclarativeStepApproval(
       sessionId: gateSessionId,
       subject,
       tool: 'workflow_approval_gate',
+      args: gateArgs,
       ttlMs: WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS,
     });
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
@@ -6037,7 +6155,7 @@ async function awaitDeclarativeStepApproval(
         id: `approval-${row.approvalId}`,
         kind: 'approval',
         title: `Workflow ${ctx.workflow.name} · ${step.id} needs approval`,
-        body: `**${subject}**\n\nApprove to let the workflow continue, or reject to stop it — reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`. The run is parked on \`${step.id}\` until you respond.`,
+        body: `**${subject}**${draft ? `\n\n${draft.length > 1_200 ? `${draft.slice(0, 1_199)}…` : draft}` : ''}\n\nApprove to let the workflow continue, request changes with a note, or reject to stop it — reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`. The run is parked on \`${step.id}\` until you respond.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { approvalId: row.approvalId, workflowName: ctx.workflow.name, stepId: step.id, gate: true },
@@ -11373,7 +11491,7 @@ function readmitCapabilityBlockedRun(
     ) return null;
     return writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      status: capabilityBlockResumeStatus(currentBlock),
       capabilityBlock: {
         ...currentBlock,
         state: 'retrying',
@@ -11381,7 +11499,11 @@ function readmitCapabilityBlockedRun(
       },
     }).record;
   });
-  if (!resumedRecord || isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  if (
+    !resumedRecord
+    || isTerminalRunRecord(resumedRecord)
+    || resumedRecord.status !== capabilityBlockResumeStatus(resumedRecord.capabilityBlock)
+  ) return false;
   try {
     markWorkflowCapabilityNotificationsSettled(run.id, {
       capabilityResolutionStatus: 'readmitted',
@@ -11439,6 +11561,8 @@ export type ResolveWorkflowCapabilityAccountChoiceResult =
       stepId: string;
       capabilityId: string;
       accountId: string;
+      /** What the answer resumed: an ordinary run, or the creation test. */
+      mode: 'run' | 'creation_test';
     }
   | {
       ok: false;
@@ -11488,6 +11612,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     const sameSelection = block.accountSelection?.capabilityId === input.capabilityId
       && block.accountSelection.accountId === input.accountId
       && block.accountSelection.choiceSetDigest === input.choiceSetDigest;
+    const resumeStatus = capabilityBlockResumeStatus(block);
     if (
       sameCoordinates
       && sameSelection
@@ -11500,6 +11625,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
         stepId: input.stepId,
         capabilityId: input.capabilityId,
         accountId: input.accountId,
+        mode: resumeStatus === 'creation_test' ? 'creation_test' : 'run',
       };
     }
     if (
@@ -11536,7 +11662,9 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     const selectedBy = input.selectedBy?.replace(/\s+/g, ' ').trim().slice(0, 120) || 'user';
     const written = writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      // A parked creation test resumes AS a creation test; only an ordinary
+      // run resumes as running. Never promote a preview into execution here.
+      status: resumeStatus,
       capabilityBlock: {
         ...block,
         state: 'retrying',
@@ -11551,7 +11679,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
       },
     }).record;
     if (
-      written.status !== 'running'
+      written.status !== resumeStatus
       || written.capabilityBlock?.state !== 'retrying'
       || written.capabilityBlock.accountSelection?.capabilityId !== selected.capabilityId
       || written.capabilityBlock.accountSelection.accountId !== selected.accountId
@@ -11577,8 +11705,11 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     try {
       addRunEvent(runId, {
         type: 'run_resumed',
+        // Activity status describes the activity, which is running either way.
         status: 'running',
-        message: `Account ${selected.accountId} selected for ${block.stepId}; resuming the same run.`,
+        message: resumeStatus === 'creation_test'
+          ? `Account ${selected.accountId} selected for ${block.stepId}; re-running the creation test with it (mutations stay previewed).`
+          : `Account ${selected.accountId} selected for ${block.stepId}; resuming the same run.`,
         data: {
           workflow: current.workflow,
           workflowSlug: admitted.snapshot.workflowSlug,
@@ -11596,6 +11727,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
       stepId: block.stepId,
       capabilityId: selected.capabilityId,
       accountId: selected.accountId,
+      mode: resumeStatus === 'creation_test' ? 'creation_test' : 'run',
     };
   });
   if (result.ok) {
@@ -11651,7 +11783,8 @@ export function resolveWorkflowCapabilityRetry(input: {
     const sameCoordinates = block.stepId === stepId
       && block.tool === tool
       && block.retryCount === input.retryCount;
-    if (sameCoordinates && current.status === 'running' && (block.state === 'retrying' || block.state === 'consumed')) {
+    const resumeStatus = capabilityBlockResumeStatus(block);
+    if (sameCoordinates && current.status === resumeStatus && (block.state === 'retrying' || block.state === 'consumed')) {
       return { ok: true, status: 'already_resumed', runId, stepId } as const;
     }
     if (!sameCoordinates) {
@@ -11689,11 +11822,11 @@ export function resolveWorkflowCapabilityRetry(input: {
     }
     const written = writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      status: resumeStatus,
       capabilityBlock: { ...block, state: 'retrying', resumedAt },
     }).record;
     if (
-      written.status !== 'running'
+      written.status !== resumeStatus
       || written.capabilityBlock?.stepId !== stepId
       || written.capabilityBlock.tool !== tool
       || written.capabilityBlock.retryCount !== input.retryCount
@@ -11982,7 +12115,13 @@ export function reapResolvedParkedRuns(): void {
           : stopped.resolution === 'cancelled_by_system'
             ? 'closed by Clementine because its owning session ended'
             : 'cancelled by the user';
-      const reason = `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
+      const changeRequest = stopped.resolution === 'rejected'
+        && run.parked.changeRequest?.approvalId === stopped.approvalId
+        ? run.parked.changeRequest
+        : undefined;
+      const reason = changeRequest
+        ? `You asked for changes to step "${changeRequest.stepId}" of "${run.workflow}": "${changeRequest.note}". This occurrence stopped before the protected step ran; everything completed before it stands and nothing was sent. Ask me to revise that draft with your note and run it again.`
+        : `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
 
       // Approval rejection is a cancellation producer too. Publish through
       // the one shared cancellation boundary before mutating SDK/activity
@@ -11991,7 +12130,7 @@ export function reapResolvedParkedRuns(): void {
       const cancellation = cancelWorkflowRunAtBoundary({
         runId: run.id,
         reason,
-        source: `approval-${stopped.resolution ?? 'not-approved'}`,
+        source: changeRequest ? 'approval-changes-requested' : `approval-${stopped.resolution ?? 'not-approved'}`,
       });
       if (cancellation.status !== 'cancelled' && cancellation.status !== 'already_cancelled') continue;
       const stoppedRecord = cancellation.run as QueuedRunRecord;
@@ -13202,10 +13341,75 @@ export interface CreationTestStepResult {
    */
   status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice';
   detail?: string;
+  /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
+   * creation test can PARK on it like any run instead of only describing it. */
+  block?: WorkflowCapabilityBlockedError;
 }
 export interface CreationTestResult {
   pass: boolean;
   steps: CreationTestStepResult[];
+}
+
+/** One line per creation-test step, shared by the parked report and the terminal. */
+export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
+  return steps.map((s) => {
+    if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
+    // The one answerable thing leads with the question itself, indented so
+    // the enumerated choices stay readable inside the step list.
+    if (s.status === 'needs_choice') {
+      return [`- ${s.stepId}: ❓ needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
+    }
+    if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
+    // Unverifiable is honest, not alarming: it names WHY the check could
+    // not run so the report never implies a broken step.
+    if (s.status === 'unverifiable') return `- ${s.stepId}: 🔍 not checked — ${s.detail ?? 'verifies a previewed mutation'}`;
+    return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
+  });
+}
+
+/**
+ * Save a human account choice on the definition step it answered. Returns
+ * true when the saved workflow changed. Exact by construction: the step must
+ * still exist with the same call tool, and the binding carries the choice-set
+ * digest the compiler revalidates on every dispatch. `enabled` is untouched —
+ * this narrows an already-admitted operation to one of its own current
+ * accounts; it grants nothing new.
+ */
+export function persistStepAccountBinding(
+  workflowSlug: string,
+  block: Pick<WorkflowCapabilityBlockState, 'stepId' | 'tool' | 'accountSelection'>,
+): boolean {
+  const selection = block.accountSelection;
+  if (!selection) return false;
+  const entry = readWorkflow(workflowSlug);
+  if (!entry) return false;
+  const steps = entry.data.steps ?? [];
+  const index = steps.findIndex((step) => step.id === block.stepId && step.call?.tool === block.tool);
+  if (index < 0) return false;
+  const current = steps[index]!.call!;
+  if (
+    current.account
+    && current.account.capabilityId === selection.capabilityId
+    && current.account.accountId === selection.accountId
+    && current.account.choiceSetDigest === selection.choiceSetDigest
+  ) return false;
+  const next = steps.map((step, position) => (position === index
+    ? {
+        ...step,
+        call: {
+          ...current,
+          account: {
+            capabilityId: selection.capabilityId,
+            accountId: selection.accountId,
+            choiceSetDigest: selection.choiceSetDigest,
+            selectedAt: selection.selectedAt,
+            selectedBy: selection.selectedBy,
+          },
+        },
+      }
+    : step));
+  writeWorkflowAndSyncTriggers(workflowSlug, { ...entry.data, steps: next });
+  return true;
 }
 
 /** Verdict for a read-only step's output: did it actually return data? */
@@ -13279,6 +13483,7 @@ export async function runCreationTest(
   runId: string,
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
+  options: { capabilityResume?: WorkflowCapabilityBlockState } = {},
 ): Promise<CreationTestResult> {
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
@@ -13359,6 +13564,9 @@ export async function runCreationTest(
             workflow, workflowSlug, runId, inputs, stepOutputs,
             assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
             creationTest: true,
+            // An answered account question resumes THIS test with the exact
+            // selection, mutations still previewed.
+            ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
           });
           stepOutputs[step.id] = out;
           results.push(creationTestVerdict(step.id, out));
@@ -13372,6 +13580,7 @@ export async function runCreationTest(
               stepId: step.id,
               status: 'needs_choice',
               detail: creationTestCapabilityQuestion(workflow.name, err),
+              block: err,
             });
           } else {
             stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
@@ -13758,6 +13967,28 @@ export function resolveWorkflowDefinitionForRun(
  * main execution heartbeat (exact-schema preflight) and from the execution
  * catch (gateway/auth/boundary refusal), so every such refusal has the same
  * durable same-run recovery semantics. */
+/** The name a person knows a connection by, keyed by its connection id. A
+ * choice must be answerable: live 2026-09-09 an owner was asked to pick
+ * between three ca_… ids for their own mailboxes. Never throws. */
+function connectedAccountLabelsByConnectionId(): Map<string, string> {
+  const labels = new Map<string, string>();
+  try {
+    for (const connection of peekConnectedToolkits()) {
+      const id = String(connection.connectionId ?? '').trim();
+      if (!id) continue;
+      const label = [
+        connection.accountLabel,
+        connection.alias,
+        connection.accountEmail,
+        connection.accountName,
+        connection.wordId,
+      ].map((value) => String(value ?? '').trim()).find(Boolean);
+      if (label && !labels.has(id)) labels.set(id, label);
+    }
+  } catch { /* labels are presentation only */ }
+  return labels;
+}
+
 export function workflowCapabilityNotificationPresentation(
   workflowName: string,
   block: WorkflowCapabilityBlockState,
@@ -13777,7 +14008,12 @@ export function workflowCapabilityNotificationPresentation(
   const accountChoiceBlock = block.reason === 'ambiguous-account'
     ? block.accountChoiceSet
     : undefined;
-  const accountChoices = accountChoiceBlock?.candidates ?? [];
+  const creationTest = block.resumeStatus === 'creation_test';
+  const labelsByAccount = connectedAccountLabelsByConnectionId();
+  const accountChoices = (accountChoiceBlock?.candidates ?? []).map((candidate) => ({
+    ...candidate,
+    label: labelsByAccount.get(candidate.accountId) ?? candidate.accountId,
+  }));
   const resolution = accountChoiceBlock
     ? {
         kind: 'choose_account' as const,
@@ -13804,17 +14040,23 @@ export function workflowCapabilityNotificationPresentation(
     ? [
         `Which ${block.toolkit} account should I use for step "${block.stepId}"?`,
         ...accountChoices.map((candidate, index) => (
-          `${index + 1}. ${candidate.accountId} (capability ${candidate.capabilityId})`
+          candidate.label !== candidate.accountId
+            ? `${index + 1}. ${candidate.label} (account ${candidate.accountId})`
+            : `${index + 1}. ${candidate.accountId} (capability ${candidate.capabilityId})`
         )),
         accountChoiceBlock.truncated
           ? `Only ${accountChoices.length} of ${accountChoiceBlock.total} exact account bindings are shown; connect fewer accounts or choose one of these.`
           : '',
-        'Choose the exact account ID in Needs You. I will save that choice and resume this same run.',
+        creationTest
+          ? 'Choose the account in Needs You. I will save it on that step, re-run the creation test with it (mutations stay previewed), and enable the workflow if it passes.'
+          : 'Choose the exact account ID in Needs You. I will save that choice and resume this same run.',
       ].filter(Boolean).join('\n')
     : '';
   const detail = [
     accountChoiceBlock
-      ? `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
+      ? creationTest
+        ? `I paused the creation test of "${workflowName}" at step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
+        : `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
       : exactSchemaBlock
         ? `I paused "${workflowName}" at step "${block.stepId}" because the exact action schema could not be proven at the provider boundary.`
         : couldNotCheck
@@ -13823,7 +14065,9 @@ export function workflowCapabilityNotificationPresentation(
             ? `I paused "${workflowName}" at step "${block.stepId}" because the step did not say which ${block.toolkit} account to use. Your connection is fine.`
             : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
     block.message,
-    `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
+    creationTest
+      ? `Nothing ran for real — a creation test previews every mutation. No ${block.tool} dispatch occurred.`
+      : `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
     accountChoiceBlock
       ? choiceQuestion
       : exactSchemaBlock
@@ -13840,7 +14084,9 @@ export function workflowCapabilityNotificationPresentation(
     choiceQuestion,
     detail,
     title: accountChoiceBlock
-      ? `Workflow needs you — choose an account for ${block.toolkit}`
+      ? creationTest
+        ? `Workflow setup needs you — choose an account for ${block.toolkit}`
+        : `Workflow needs you — choose an account for ${block.toolkit}`
       : exactSchemaBlock
         ? 'Workflow paused — exact action metadata unavailable'
         : couldNotCheck
@@ -13898,6 +14144,8 @@ function parkWorkflowCapabilityBlockedRun(input: {
   run: QueuedRunRecord;
   workflow: WorkflowCatalogEntry;
   error: WorkflowCapabilityBlockedError;
+  /** Set when the parked run was a creation test; it resumes as one. */
+  resumeStatus?: 'creation_test';
 }): void {
   const { filePath, run, workflow, error } = input;
   const blockedAtMs = Date.now();
@@ -13916,6 +14164,7 @@ function parkWorkflowCapabilityBlockedRun(input: {
     provenNoDispatch: true,
     state: 'blocked',
     ...(error.accountChoiceSet ? { accountChoiceSet: error.accountChoiceSet } : {}),
+    ...(input.resumeStatus ? { resumeStatus: input.resumeStatus } : {}),
   };
   const blockedRecord = writeRunRecord(filePath, {
     ...run,
@@ -13960,7 +14209,13 @@ function parkWorkflowCapabilityBlockedRun(input: {
   // Preflight schema refusal occurs before the ordinary activity start. The
   // upsert is also safe for an already-running workflow caught at the gateway.
   try {
-    startWorkflowActivityRun(run, workflow.data.name, `Running workflow "${workflow.data.name}"`);
+    startWorkflowActivityRun(
+      run,
+      workflow.data.name,
+      input.resumeStatus === 'creation_test'
+        ? `Creation-testing workflow "${workflow.data.name}"`
+        : `Running workflow "${workflow.data.name}"`,
+    );
     finishRun(run.id, {
       status: 'awaiting_input',
       message: accountChoiceBlock
@@ -14180,11 +14435,55 @@ async function processOneRunFile(
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
         ...(run.inputs ?? {}),
       });
+      const creationTestResume = run.capabilityBlock?.state === 'retrying'
+        && run.capabilityBlock.provenNoDispatch === true
+        ? run.capabilityBlock
+        : undefined;
       let result: CreationTestResult;
       try {
-        result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant);
+        result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant, {
+          ...(creationTestResume ? { capabilityResume: creationTestResume } : {}),
+        });
       } catch (err) {
         result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
+      }
+      // An unanswered account question is a PAUSE of this creation test, not
+      // its verdict. Park exactly like a run does — same durable gate, same
+      // Needs You card on desktop/mobile, same chat tool — and resume as a
+      // creation test when answered, so the previewed mutations stay
+      // previewed. Steps that failed on their own are named alongside the
+      // question so one answer is never mistaken for "everything else passed".
+      const choiceStep = result.steps.find((entry) => (
+        entry.status === 'needs_choice'
+        && entry.block?.reason === 'ambiguous-account'
+        && Boolean(entry.block.accountChoiceSet)
+      ));
+      if (choiceStep?.block) {
+        const independentProblems = result.steps.filter((entry) => (
+          entry.status === 'error' || entry.status === 'failed' || entry.status === 'empty'
+        ));
+        const message = [
+          `Creation test of "${workflow.data.name}" paused at step "${choiceStep.stepId}".`,
+          creationTestStepLines(result.steps).join('\n'),
+          independentProblems.length > 0
+            ? `Independent of that question, ${independentProblems.length} step${independentProblems.length === 1 ? '' : 's'} failed on ${independentProblems.length === 1 ? 'its' : 'their'} own (${independentProblems.map((entry) => entry.stepId).join(', ')}) and will still need fixing after you answer.`
+            : '',
+        ].filter(Boolean).join('\n\n');
+        parkWorkflowCapabilityBlockedRun({
+          filePath,
+          run,
+          workflow,
+          error: new WorkflowCapabilityBlockedError({
+            stepId: choiceStep.block.stepId,
+            tool: choiceStep.block.tool,
+            toolkit: choiceStep.block.toolkit,
+            reason: choiceStep.block.reason,
+            message,
+            ...(choiceStep.block.accountChoiceSet ? { accountChoiceSet: choiceStep.block.accountChoiceSet } : {}),
+          }),
+          resumeStatus: 'creation_test',
+        });
+        return;
       }
       let activationCompatible = true;
       let activationBlockedReason = '';
@@ -14253,19 +14552,7 @@ async function processOneRunFile(
           if (requeued.status === 'queued' && requeued.id) autoRetestRunId = requeued.id;
         } catch { /* self-heal is additive — fall back to the manual message */ }
       }
-      const lines = result.steps.map((s) => {
-        if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
-        // The one answerable thing leads with the question itself, indented so
-        // the enumerated choices stay readable inside the step list.
-        if (s.status === 'needs_choice') {
-          return [`- ${s.stepId}: ❓ needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
-        }
-        if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
-        // Unverifiable is honest, not alarming: it names WHY the check could
-        // not run so the report never implies a broken step.
-        if (s.status === 'unverifiable') return `- ${s.stepId}: 🔍 not checked — ${s.detail ?? 'verifies a previewed mutation'}`;
-        return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
-      });
+      const lines = creationTestStepLines(result.steps);
       const body = creationReady
         ? activateAfterCreationTest
           ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
@@ -14287,10 +14574,25 @@ async function processOneRunFile(
       };
       const terminalRecord = writeRunRecord(
         filePath,
-        { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' },
+        {
+          ...run,
+          status: 'creation_test',
+          finishedAt: new Date().toISOString(),
+          output: result.pass ? 'creation test passed' : 'creation test found issues',
+          ...(run.capabilityBlock ? { capabilityBlock: { ...run.capabilityBlock, state: 'consumed' as const } } : {}),
+        },
         report,
       );
       if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      // The owner's account answer outlives this test: save it on the step so
+      // the next test and every scheduled run start from it instead of
+      // asking again. Best-effort and exact — same step id, same tool, and the
+      // compiler still revalidates the choice-set digest before any dispatch.
+      if (creationTestResume?.accountSelection) {
+        try {
+          persistStepAccountBinding(workflow.name, creationTestResume);
+        } catch { /* the run's own selection already governed this test */ }
+      }
       startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
       // Only the process that published this creation-test terminal may enable
       // the draft or clear its failure history. A cancellation/other terminal

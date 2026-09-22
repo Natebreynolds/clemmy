@@ -81,7 +81,9 @@ export function projectWorkflowCapabilityInboxGate(
           const capabilityId = text(candidate.capabilityId, 500);
           const accountId = text(candidate.accountId, 500);
           if (!capabilityId || !accountId) return [];
-          return [{ label: accountId, capabilityId, accountId }];
+          // A choice must be answerable: the connection's own name/email when
+          // the host recorded one, the raw id only as the last resort.
+          return [{ label: text(candidate.label, 200) ?? accountId, capabilityId, accountId }];
         })
       : [];
     if (/^[a-f0-9]{64}$/.test(digest ?? '') && total !== null && total >= candidates.length && candidates.length > 0) {
