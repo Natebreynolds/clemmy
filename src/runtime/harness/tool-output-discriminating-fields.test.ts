@@ -89,3 +89,35 @@ test('a generous budget is unchanged — nothing is dropped that used to fit', (
     'when everything fits, ranking must not elide anything');
   assert.ok(text.includes('"omittedValues":0'), `nothing omitted at a generous budget: ${text.slice(-160)}`);
 });
+
+
+test('opaque per-record tokens never outrank the fields that answer — the live 278624 etag shape', () => {
+  // Shaped like the live Graph payload: every record carries a unique weak
+  // etag plus a stable id, and the answering fields are subject/start/end.
+  const events = Array.from({ length: 9 }, (_, i) => ({
+    '@odata.etag': `W/"jPZmOK6sNU66YoHZ4KQWdAACOw9V${String(i).padStart(2, '0')}=="`,
+    id: `AAMkAGE1M2IyNGNmLTI5MTktNDUyZi1iOTVl${String(i).padStart(4, '0')}LTUzNjA3AAA=`,
+    subject: i % 3 === 0 ? 'Morning Huddle' : `Meeting ${i}`,
+    start: { dateTime: `2026-09-22T${String(8 + i).padStart(2, '0')}:00:00.0000000`, timeZone: 'UTC' },
+    end: { dateTime: `2026-09-22T${String(9 + i).padStart(2, '0')}:00:00.0000000`, timeZone: 'UTC' },
+    isAllDay: false,
+    showAs: 'busy',
+  }));
+  // The live projection had ~2,600 chars for these nine records.
+  const out = compactStructuredJsonToolOutput(JSON.stringify({ data: { value: events } }), {
+    maxChars: 2600,
+    exactOutputReceipt: '[receipt]',
+  } as never);
+  const text = typeof out === 'string' ? out : JSON.stringify(out);
+  assert.ok(text.includes('Morning Huddle'), `subject must survive: ${text.slice(0, 400)}`);
+  assert.ok(text.includes('2026-09-22T'), `event times must survive: ${text.slice(0, 400)}`);
+  // Tighter still: the opaque tokens are the FIRST to go, never the answer.
+  const tight = compactStructuredJsonToolOutput(JSON.stringify({ data: { value: events } }), {
+    maxChars: 1900,
+    exactOutputReceipt: '[receipt]',
+  } as never);
+  const tightText = typeof tight === 'string' ? tight : JSON.stringify(tight);
+  assert.ok(tightText.includes('2026-09-22T'), `event times must survive a tight budget: ${tightText.slice(0, 300)}`);
+  assert.ok(!tightText.includes('jPZmOK6sNU66'), 'an opaque etag must not consume a tight budget');
+  assert.ok(!tightText.includes('AAMkAGE1M2IyNGNm'), 'an opaque id must not consume a tight budget');
+});

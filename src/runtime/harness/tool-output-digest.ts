@@ -181,12 +181,58 @@ function discriminatingKeyOrder(records: readonly unknown[]): readonly string[] 
   // consumed the whole record budget and pushed `subject` (44 bytes) into the
   // shared tail — the same failure in a new order. Cost is the max across
   // siblings, so a key that is huge in any one record is treated as expensive.
+  //
+  // Spread is necessary but not sufficient. Live 2026-09-22, source 278624,
+  // "whats on my calendar tomorrow": `@odata.etag` differs on every record and
+  // is cheap, so it ranked first and every record arrived as an etag plus at
+  // most a subject — `start` and `end` were among 174 omitted keys, and the
+  // brain re-called the provider three times to learn the start times. A value
+  // that is an opaque token (a version tag, a hash, a base64 blob, a GUID)
+  // varies on every record BECAUSE it is opaque; that variation is not
+  // information a reader can use. Such keys keep their place only after every
+  // readable one. Still data-derived: decided from the value's shape across
+  // siblings, never from a provider field list.
+  const opaque = new Set<string>();
+  for (const [key, seen] of distinct) {
+    if (keyLooksLikeMetadata(key) || [...seen].every(valueLooksOpaque)) opaque.add(key);
+  }
   return [...distinct.entries()]
-    .map(([key, seen]) => ({ key, spread: seen.size, bytes: cost.get(key) ?? 0 }))
+    .map(([key, seen]) => ({ key, spread: seen.size, bytes: cost.get(key) ?? 0, opaque: opaque.has(key) ? 1 : 0 }))
     .sort((left, right) => (
-      right.spread - left.spread || left.bytes - right.bytes || left.key.localeCompare(right.key)
+      left.opaque - right.opaque
+      || right.spread - left.spread
+      || left.bytes - right.bytes
+      || left.key.localeCompare(right.key)
     ))
     .map(({ key }) => key);
+}
+
+/** Protocol/metadata keys carry no answer: OData/JSON-API annotations, etags,
+ * hypermedia links. Shape of the KEY, not a vendor list. */
+function keyLooksLikeMetadata(key: string): boolean {
+  return key.startsWith('@') || key.startsWith('_') || /(^|[._-])(etag|links?|self|href)$/i.test(key);
+}
+
+/** A serialized value that is one unbroken machine token. Readable text has
+ * spaces, punctuation or a recognisable structure (an ISO date, an email, a
+ * number, a short word); a version tag, hash, GUID or base64 blob does not. */
+function valueLooksOpaque(serialized: string): boolean {
+  if (!serialized.startsWith('"')) return false;
+  let value: string;
+  try { value = JSON.parse(serialized) as string; } catch { return false; }
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (text.length < 16 || /\s/.test(text)) return false;
+  // Structured-but-readable tokens a reader does use as-is.
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return false; // ISO date/time
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(text)) return false; // email
+  if (/^(https?:)?\/\//i.test(text)) return false; // url
+  // Weak-etag / quoted-token wrappers, then the token body.
+  const body = text.replace(/^W\//i, '').replace(/^"|"$/g, '');
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body)) return true; // GUID
+  if (/^[0-9a-f]{16,}$/i.test(body)) return true; // hex digest
+  // base64 / url-safe token: long, no vowels-and-spaces rhythm of prose.
+  return /^[A-Za-z0-9+/_=-]{16,}$/.test(body) && !/^[a-z]+$/i.test(body);
 }
 
 function projectionKeyPriority(key: string): number {

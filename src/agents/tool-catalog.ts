@@ -151,21 +151,26 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
 
 /**
  * On a proven-operation skip the carrier already has the callable schema.
- * Keep ask. Recall/query tools stay off this surface until a result has
- * landed: first-class tool_output_query with nothing to query became a
- * dummy-query loop instead of the disclosed carrier (live 2026-09-21 source
- * 277962).
+ * Keep ask, discovery, and the two retained-output readers.
  *
  * tool_search STAYS. A remembered operation accelerates selection; it must
  * not close the tool universe for the turn. The guidance says "search if
- * these cannot fulfil the request" — that promise needs a reachable door,
- * and the same live source showed what happens when the only doors left are
- * ask and a query tool with nothing to query. The schema is small and stable,
- * so the prompt-cache prefix does not churn.
+ * these cannot fulfil the request" — that promise needs a reachable door.
+ *
+ * tool_output_query / recall_tool_result STAY. They were pulled from this
+ * surface after live 277962 (a cap:… ref sent to tool_output_query looped 13×);
+ * that defect is now answered at the source — the reader names the ref for
+ * what it is and hands back the carrier. Hiding the readers created the
+ * opposite dead end (live 2026-09-22 source 278624): every projected result
+ * ends with a recovery pointer to exactly these tools, the model searched for
+ * them twelve times, and re-called the provider three times to get the fields
+ * the projection had dropped. A surface that advertises a door must have it.
  */
 export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'ask_user_question',
   'tool_search',
+  'tool_output_query',
+  'recall_tool_result',
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {

@@ -108,8 +108,10 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   // the proven op cannot fulfil the request, the model needs a way to widen
   // in the same turn instead of looping on ask/query.
   assert.equal(thinned.has('tool_search'), true);
-  assert.equal(thinned.has('tool_output_query'), false);
-  assert.equal(thinned.has('recall_tool_result'), false);
+  // Every projected result points at these two readers for the fields it
+  // dropped; a surface that names them must keep them callable.
+  assert.equal(thinned.has('tool_output_query'), true);
+  assert.equal(thinned.has('recall_tool_result'), true);
   assert.equal(thinned.has('check_in'), false);
   for (const name of PROVEN_SKIP_KEEP_LOADED) {
     if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
