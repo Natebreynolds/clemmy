@@ -59,6 +59,25 @@ test('describeSchedule: scheduled with timezone and paused state', () => {
 
 // ─── describeInputs ──────────────────────────────────────────────────
 
+test('describeInputs: a non-string default renders instead of crashing the description', () => {
+  // Live 2026-09-20: workflow_update threw "meta?.default?.trim is not a
+  // function" on an input whose default was a number, so the brain could
+  // not save its fix.
+  const def = wf({
+    inputs: {
+      limit: { type: 'number', default: 25 as unknown as string },
+      dry: { type: 'boolean', default: false as unknown as string },
+      filter: { type: 'object', default: { team: 'A' } as unknown as string },
+      name: { type: 'string', default: '  padded ' },
+    },
+  } as Partial<WorkflowDefinition>);
+  const line = describeInputs(def);
+  assert.match(line, /limit \(defaults to "25"\)/);
+  assert.match(line, /dry \(defaults to "false"\)/);
+  assert.match(line, /filter \(defaults to "\{"team":"A"\}"\)/);
+  assert.match(line, /name \(defaults to "padded"\)/);
+});
+
 test('describeInputs: none / required / defaulted', () => {
   assert.match(describeInputs(wf()), /Nothing/);
   assert.match(

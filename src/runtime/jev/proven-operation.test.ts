@@ -97,6 +97,11 @@ test('proven operation guidance tells the brain to skip tool_search when an invo
   [{ slug: 'OUTLOOK_GET_CALENDAR_VIEW', accountId: 'ca_one', label: 'alex@corp.example' }]);
   assert.match(bound, /Operating account already bound by the host/);
   assert.match(bound, /no account_selection and no tool_search/);
+  // The turn that holds exact operation ids is the turn that can author them
+  // as exact call steps instead of prompt steps that re-describe the read.
+  assert.match(bound, /If this becomes a saved workflow, author these as exact call steps: call\.tool = the operation id \(outlook_get_calendar_view\)/);
+  assert.match(bound, /\{\{now\}\}, \{\{now\+24h\}\}/);
+  assert.match(bound, /the host binds the account/);
   assert.match(bound, /OUTLOOK_GET_CALENDAR_VIEW: alex@corp\.example \(ca_one\)/);
 });
 

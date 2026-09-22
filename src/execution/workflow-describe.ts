@@ -96,13 +96,23 @@ export function describeSchedule(def: WorkflowDefinition): string {
 
 // ─── inputs ──────────────────────────────────────────────────────────
 
+/** A default as the author typed it: a string trimmed, a number or boolean
+ *  as itself, an object as JSON. A non-string default is legal on the
+ *  definition and must never crash the description of the workflow. */
+export function describeInputDefault(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
 /** One-line "what it needs from you" phrase. */
 export function describeInputs(def: WorkflowDefinition): string {
   const entries = Object.entries(def.inputs ?? {});
   if (entries.length === 0) return 'Nothing — it runs on its own.';
   return entries
     .map(([key, meta]) => {
-      const dflt = meta?.default?.trim();
+      const dflt = describeInputDefault(meta?.default);
       if (dflt) return `${key} (defaults to "${dflt}")`;
       return `${key} (${meta?.required === false ? 'optional' : 'required'})`;
     })

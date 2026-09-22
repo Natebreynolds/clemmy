@@ -2957,7 +2957,30 @@ export interface WorkflowCreationTestSettlement {
   enabled: boolean;
   /** The creation-test report the daemon wrote (step lines, what to fix). */
   body: string;
+  /** Per-step verdicts as the test recorded them (structured; may be empty for
+   * a notification written by an older daemon). */
+  steps: WorkflowCreationTestStepVerdict[];
   waitedMs: number;
+}
+
+export interface WorkflowCreationTestStepVerdict {
+  stepId: string;
+  status: string;
+  detail?: string;
+}
+
+function creationTestStepVerdicts(raw: unknown): WorkflowCreationTestStepVerdict[] {
+  if (!Array.isArray(raw)) return [];
+  const out: WorkflowCreationTestStepVerdict[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue;
+    const stepId = (row as { stepId?: unknown }).stepId;
+    const status = (row as { status?: unknown }).status;
+    if (typeof stepId !== 'string' || typeof status !== 'string') continue;
+    const detail = (row as { detail?: unknown }).detail;
+    out.push({ stepId, status, ...(typeof detail === 'string' ? { detail } : {}) });
+  }
+  return out;
 }
 
 /** Longest a creation test is awaited inside the authoring tool. Below the
@@ -2999,6 +3022,7 @@ export async function awaitWorkflowCreationTestSettlement(
         activationCompatible: notification?.metadata?.activationCompatible !== false,
         enabled,
         body: notification?.body ?? '',
+        steps: creationTestStepVerdicts(notification?.metadata?.steps),
         waitedMs: Date.now() - started,
       };
     }

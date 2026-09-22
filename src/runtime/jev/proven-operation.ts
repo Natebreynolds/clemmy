@@ -361,6 +361,10 @@ export function renderProvenOperationGuidance(
           ...boundAccounts.map((row) => `- ${row.slug}: ${row.label ? `${row.label} (${row.accountId})` : row.accountId}`),
         ]
       : []),
+    // The moment the brain holds exact operation ids is the moment it can
+    // author them: a saved workflow step for one of these is an exact `call`,
+    // never a prompt step that re-describes the read.
+    `If this becomes a saved workflow, author these as exact call steps: call.tool = the operation id (${tools.join(', ')}), literal args with time tokens ({{now}}, {{now+24h}}, {{date}}); the host binds the account.`,
     ...schemaLines,
   ].join('\n');
 }

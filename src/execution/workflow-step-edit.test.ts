@@ -13,7 +13,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 const TEST_HOME = '/tmp/clemmy-test-wf-step-edit';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { applyStepPromptAddendum, applyStepPromptEdit, revertStepEdit, listStepEditBackups } = await import('./workflow-step-edit.js');
+const { applyStepPromptAddendum, applyStepPromptEdit, applyStepPatch, revertStepEdit, listStepEditBackups } = await import('./workflow-step-edit.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { fireWorkflowSystemEvent, closeWorkflowTriggerDbForTest } = await import('./workflow-trigger-engine.js');
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
@@ -170,4 +170,87 @@ test('step edits that introduce readiness gaps keep the workflow ENABLED', () =>
   // questions keeps the workflow enabled; the questions ride as advisories.
   assert.doesNotMatch(edited.message, /stayed DISABLED/);
   assert.equal(readWorkflow('gap-edit-wf')!.data.enabled, true);
+});
+
+// ─── applyStepPatch: the repair path for everything that is not prompt text ──
+
+function callDef(): WorkflowDefinition {
+  return {
+    name: 'patch-wf',
+    description: 'patch test',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'read_digest',
+        prompt: '',
+        call: {
+          tool: 'read_file',
+          args: { path: '/tmp/digets.txt' },
+          account: { capabilityId: 'cap-1', accountId: 'acct-1', choiceSetDigest: 'a'.repeat(64) },
+        } as never,
+        output: { type: 'object', description: 'file' },
+        sideEffect: 'read',
+      },
+      { id: 'summarize', prompt: 'Summarize the digest in one line.', dependsOn: ['read_digest'], sideEffect: 'read' },
+    ],
+  } as WorkflowDefinition;
+}
+
+test('a patch changes only the named fields of one step, keeps the host account binding, and is reversible', () => {
+  // Live 2026-09-22: fixing one wrong path meant re-reading the definition
+  // and resending the whole step graph through workflow_update.
+  writeWorkflow('patch-wf', callDef());
+  const r = applyStepPatch('patch-wf', 'read_digest', {
+    call: { tool: 'read_file', args_json: JSON.stringify({ path: '/tmp/digest.txt' }) },
+  }, { nowIso: NOW });
+  assert.equal(r.ok, true, r.message);
+  assert.match(r.message, /\(call\)/, 'the receipt names what changed');
+  const saved = readWorkflow('patch-wf')!.data;
+  const read = saved.steps[0] as unknown as { call: { tool: string; args: Record<string, unknown>; account?: unknown }; output?: unknown; sideEffect?: string };
+  assert.deepEqual(read.call.args, { path: '/tmp/digest.txt' }, 'args_json is normalized into args');
+  assert.deepEqual(read.output, { type: 'object', description: 'file' }, 'untouched fields survive');
+  assert.equal(read.sideEffect, 'read');
+  assert.equal(saved.steps[1].prompt, 'Summarize the digest in one line.', 'sibling steps are untouched');
+  assert.equal(saved.steps.length, 2);
+  const rev = revertStepEdit(r.backupId!);
+  assert.equal(rev.ok, true);
+  assert.deepEqual((readWorkflow('patch-wf')!.data.steps[0] as unknown as { call: { args: unknown } }).call.args, { path: '/tmp/digets.txt' });
+});
+
+test('a patch that leaves the call alone keeps call.account byte for byte; null removes a field', () => {
+  writeWorkflow('patch-wf', callDef());
+  const r = applyStepPatch('patch-wf', 'read_digest', { output: null, requiresApproval: true, approvalPreview: 'Check the file first' }, { nowIso: NOW });
+  assert.equal(r.ok, true, r.message);
+  const step = readWorkflow('patch-wf')!.data.steps[0] as unknown as { call: { account?: { accountId: string } }; output?: unknown; requiresApproval?: boolean; approvalPreview?: string };
+  assert.equal(step.call.account?.accountId, 'acct-1', 'the owner\'s account choice is not lost by an unrelated patch');
+  assert.equal(step.output, undefined, 'null removes the field');
+  assert.equal(step.requiresApproval, true);
+  assert.equal(step.approvalPreview, 'Check the file first');
+});
+
+test('a patch refuses unknown fields, a rename, an empty patch and a no-op, with the allowed list', () => {
+  writeWorkflow('patch-wf', callDef());
+  const unknown = applyStepPatch('patch-wf', 'read_digest', { colour: 'blue' }, { nowIso: NOW });
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.message, /Unknown step field\(s\) in patch: colour/);
+  assert.match(unknown.message, /Patchable fields: prompt, call/);
+  const rename = applyStepPatch('patch-wf', 'read_digest', { id: 'other' }, { nowIso: NOW });
+  assert.equal(rename.ok, false);
+  assert.match(rename.message, /cannot rename/);
+  const empty = applyStepPatch('patch-wf', 'read_digest', {}, { nowIso: NOW });
+  assert.equal(empty.ok, false);
+  const noop = applyStepPatch('patch-wf', 'summarize', { prompt: 'Summarize the digest in one line.' }, { nowIso: NOW });
+  assert.equal(noop.ok, false);
+  assert.match(noop.message, /nothing to change/);
+  const missing = applyStepPatch('patch-wf', 'nope', { prompt: 'x' }, { nowIso: NOW });
+  assert.equal(missing.ok, false);
+  assert.match(missing.message, /Step "nope" not found/);
+});
+
+test('a patch that breaks the graph is validated before anything is written', () => {
+  writeWorkflow('patch-wf', callDef());
+  const r = applyStepPatch('patch-wf', 'summarize', { dependsOn: ['ghost'] }, { nowIso: NOW });
+  assert.equal(r.ok, false);
+  assert.deepEqual(readWorkflow('patch-wf')!.data.steps[1].dependsOn, ['read_digest'], 'nothing written');
 });

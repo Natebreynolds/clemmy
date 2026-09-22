@@ -373,6 +373,23 @@ async function routeOriginAccountByHostPolicy(input: {
   }
 }
 
+/** Route a multi-account operation to the connected account the host's own
+ *  source-account policy picks for a conversation (the run's origin). Null
+ *  when the policy cannot decide; the caller then parks on the exact choice. */
+export async function routeOriginAccountForOperation(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  operation: string;
+}): Promise<string | null> {
+  const operation = input.operation.trim().toUpperCase();
+  return routeOriginAccountByHostPolicy({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    toolkit: registeredToolkitOfSlug(operation).trim().toLowerCase(),
+    operation,
+  });
+}
+
 export async function prepareWorkflowStepExternalCatalog(input: {
   immutablePrompt: string;
   allowedTools: readonly string[];

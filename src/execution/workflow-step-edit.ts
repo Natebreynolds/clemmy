@@ -21,7 +21,7 @@ import { STATE_DIR } from '../memory/db.js';
 import { readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
-import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
+import { normalizeWorkflowSteps, prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
 
 const BACKUPS_DIR = path.join(STATE_DIR, 'workflow-step-edit-backups');
 
@@ -139,6 +139,85 @@ export function applyStepPromptEdit(
     message: id
       ? `Updated "${workflow}" step "${stepId}"${occNote}.${readinessNote} Revert with revertStepEdit("${id}") if it doesn't help.`
       : `Updated "${workflow}" step "${stepId}"${occNote} (backup unavailable — not reversible).${readinessNote}`,
+  };
+}
+
+/** The step fields a targeted patch may change. Everything the authoring
+ *  schema accepts for a step except its id; the host owns `call.account`. */
+export const STEP_PATCH_FIELDS = [
+  'prompt', 'call', 'transform', 'dependsOn', 'allowedTools', 'requiresApproval', 'approvalPreview',
+  'inputs', 'output', 'sideEffect', 'forEach', 'forEachNewOnly', 'model', 'intent', 'tier', 'maxTurns',
+  'useHarness', 'usesSkill', 'project', 'loopUntil', 'loopSafe', 'retryBudget', 'subgraph',
+] as const;
+
+/**
+ * Make a TARGETED, reversible patch to ONE step: only the named fields change,
+ * `null` removes a field, and the merged step passes the same normalization
+ * and validation an authored step passes. This is the repair path for
+ * everything that is not prompt text (a wrong call argument, a missing output
+ * contract, an approval flag); it never needs the whole step graph resent.
+ */
+export function applyStepPatch(
+  workflow: string,
+  stepId: string,
+  patch: Record<string, unknown>,
+  opts: { description?: string; nowIso?: string } = {},
+): StepEditResult {
+  const entry = readWorkflow(workflow);
+  if (!entry) return { ok: false, message: `Workflow "${workflow}" not found.` };
+  const def = entry.data;
+  const idx = def.steps.findIndex((s) => s.id === stepId);
+  if (idx < 0) return { ok: false, message: `Step "${stepId}" not found in "${workflow}".` };
+  const keys = Object.keys(patch);
+  if (keys.length === 0) return { ok: false, message: 'Empty patch — name at least one step field to change.' };
+  if ('id' in patch && patch.id !== stepId) {
+    return { ok: false, message: 'A patch cannot rename a step; edit the graph with workflow_update to change ids.' };
+  }
+  const allowed = new Set<string>(STEP_PATCH_FIELDS);
+  const unknown = keys.filter((key) => key !== 'id' && !allowed.has(key));
+  if (unknown.length > 0) {
+    return {
+      ok: false,
+      message: `Unknown step field(s) in patch: ${unknown.join(', ')}. Patchable fields: ${STEP_PATCH_FIELDS.join(', ')}.`,
+    };
+  }
+  const current = def.steps[idx] as unknown as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === 'id') continue;
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  let normalized: WorkflowDefinition['steps'][number];
+  try {
+    normalized = normalizeWorkflowSteps([merged as never])[0] as unknown as WorkflowDefinition['steps'][number];
+  } catch (error) {
+    return { ok: false, message: `That patch is not a valid step: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  // A patch that does not touch the call keeps the host's own bindings on it
+  // (the exact account the owner chose) byte for byte.
+  if (!('call' in patch) && current.call !== undefined) {
+    (normalized as unknown as Record<string, unknown>).call = current.call;
+  }
+  const changed = keys.filter((key) => key !== 'id' && JSON.stringify(current[key] ?? null) !== JSON.stringify((normalized as unknown as Record<string, unknown>)[key] ?? null));
+  if (changed.length === 0) return { ok: false, message: 'That patch leaves the step exactly as it is — nothing to change.' };
+  const updated: WorkflowDefinition = {
+    ...def,
+    steps: def.steps.map((s, i) => (i === idx ? normalized : s)),
+  };
+  const prepared = prepareStepEditedWorkflow(def, updated);
+  if (!prepared.ok) return prepared;
+
+  const at = opts.nowIso ?? new Date().toISOString();
+  const id = recordBackup(workflow, stepId, def, opts.description ?? `patch to ${stepId} (${changed.join(', ')})`, at);
+  writeWorkflowAndSyncTriggers(workflow, prepared.def);
+  const readinessNote = prepared.readinessHeld ? ` ${renderReadinessHold(workflow)}` : '';
+  return {
+    ok: true,
+    backupId: id ?? undefined,
+    message: id
+      ? `Updated "${workflow}" step "${stepId}" (${changed.join(', ')}).${readinessNote} Revert with revertStepEdit("${id}") if it doesn't help.`
+      : `Updated "${workflow}" step "${stepId}" (${changed.join(', ')}) (backup unavailable — not reversible).${readinessNote}`,
   };
 }
 

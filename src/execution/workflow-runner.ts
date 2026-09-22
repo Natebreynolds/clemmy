@@ -1446,6 +1446,27 @@ export function catalogPreparationRefusalToCapabilityBlock(
 }
 
 /** The current durable manifests for one operation, as an exact choice set. */
+/** The exact account the run's origin conversation would use for a multi-
+ *  account operation, as a selection over the live choice set — or null. */
+async function routeBareCallAccountByOrigin(
+  runId: string,
+  operationId: string,
+  choiceSet: WorkflowCapabilityAccountChoiceSetV1,
+): Promise<WorkflowCapabilityAccountSelectionV1 | null> {
+  const origin = workflowRunOriginSource(runId);
+  if (!origin) return null;
+  try {
+    const { routeOriginAccountForOperation } = await import('./workflow-step-external-catalog.js');
+    const routed = await routeOriginAccountForOperation({ ...origin, operation: operationId });
+    if (!routed) return null;
+    const candidate = choiceSet.candidates.find((row) => row.accountId === routed);
+    if (!candidate) return null;
+    return { capabilityId: candidate.capabilityId, accountId: candidate.accountId, choiceSetDigest: choiceSet.digest };
+  } catch {
+    return null;
+  }
+}
+
 function currentAccountChoiceSetForOperation(operationId: string): WorkflowCapabilityAccountChoiceSetV1 | null {
   try {
     const store = peekCapabilityManifestStore();
@@ -2604,6 +2625,24 @@ function projectContextValue(project: WorkflowStepProjectContext | undefined, ke
   return undefined;
 }
 
+// ── time tokens ─────────────────────────────────────────────────────────────
+// {{now}} is the run instant (ISO 8601, UTC); {{now+24h}} / {{now-90m}} /
+// {{now+2d}} shift it. {{date}} is today's UTC date; {{date+1d}} / {{date-7d}}
+// shift it. A relative window ("the next 24 hours") is therefore an exact
+// call: {{now}} .. {{now+24h}}, and a scheduled read never needs a model step
+// to compute its own dates.
+const TIME_TOKEN_RE = /\{\{\s*((?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}/g;
+const TIME_TOKEN_EXACT_RE = /^(now|date)(?:([+-])(\d{1,5})([mhd]))?$/;
+
+export function resolveTimeToken(token: string, at: Date = new Date()): string | null {
+  const m = TIME_TOKEN_EXACT_RE.exec(token.trim());
+  if (!m) return null;
+  const unitMs = m[4] === 'm' ? 60_000 : m[4] === 'h' ? 3_600_000 : m[4] === 'd' ? 86_400_000 : 0;
+  const delta = m[2] && m[3] ? (m[2] === '-' ? -1 : 1) * Number(m[3]) * unitMs : 0;
+  const shifted = new Date(at.getTime() + delta);
+  return m[1] === 'now' ? shifted.toISOString() : shifted.toISOString().slice(0, 10);
+}
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
@@ -2612,7 +2651,7 @@ function renderTemplate(
   project?: WorkflowStepProjectContext,
 ): string {
   return template
-    .replace(/\{\{date\}\}/g, new Date().toISOString().slice(0, 10))
+    .replace(TIME_TOKEN_RE, (_m, token: string) => resolveTimeToken(token) ?? '')
     .replace(/\{\{project\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => {
       const value = projectContextValue(project, key);
       return value === undefined || value === null ? '' : String(value);
@@ -2644,7 +2683,7 @@ function renderTemplate(
 // A call arg value that is EXACTLY one template token resolves to the RAW
 // upstream value (object/array preserved, so a whole step output can be handed
 // to a tool). An embedded token ("prefix {{input.x}}") renders as a string.
-const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|date)\s*\}\}\s*$/;
+const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|(?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}\s*$/;
 
 function pathGet(value: unknown, dotted: string): unknown {
   if (!dotted) return value;
@@ -2657,7 +2696,8 @@ function pathGet(value: unknown, dotted: string): unknown {
 }
 
 function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown, project?: WorkflowStepProjectContext): unknown {
-  if (token === 'date') return new Date().toISOString().slice(0, 10);
+  const time = resolveTimeToken(token);
+  if (time !== null) return time;
   if (token.startsWith('project.')) return projectContextValue(project, token.slice(8));
   if (token.startsWith('input.')) return inputs[token.slice(6)];
   if (token === 'item') return item;
@@ -3532,7 +3572,7 @@ async function executeWorkflowCallNode(
         'workflow call step live read acquisition',
       );
     }
-    const compiled = compileLiveCatalogWorkflowCallPlan({
+    let compiled = compileLiveCatalogWorkflowCallPlan({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,
       operationId: call.tool,
@@ -3540,6 +3580,38 @@ async function executeWorkflowCallNode(
       expectedEffect: structuredCallSideEffectClass(step),
       ...(persistedAccountSelection ? { selectedAccount: persistedAccountSelection } : {}),
     });
+    // Several connected accounts and no saved choice: the host routes the
+    // account the way it routes the conversation that authored or asked for
+    // this run, re-proves the compile against that exact candidate, and saves
+    // the binding on the step so later runs start from it. Only when the
+    // policy cannot decide does the run park on the exact choice set.
+    if (!compiled.ok && compiled.recoverable && compiled.reason === 'ambiguous-account' && !persistedAccountSelection && compiled.accountChoiceSet) {
+      const routed = await routeBareCallAccountByOrigin(ctx.runId, call.tool, compiled.accountChoiceSet);
+      if (routed) {
+        const recompiled = compileLiveCatalogWorkflowCallPlan({
+          ownerId: ctx.workflowSlug,
+          nodeId: step.id,
+          operationId: call.tool,
+          args: renderedArgs,
+          expectedEffect: structuredCallSideEffectClass(step),
+          selectedAccount: routed,
+        });
+        if (recompiled.ok) {
+          compiled = recompiled;
+          try {
+            persistStepAccountBinding(ctx.workflowSlug, {
+              stepId: step.id,
+              tool: call.tool,
+              accountSelection: { ...routed, selectedAt: new Date().toISOString(), selectedBy: 'host-origin-routing' },
+            });
+          } catch { /* the routed choice already governs this run */ }
+          logger.info(
+            { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, accountId: routed.accountId },
+            'workflow call step account routed from the run origin',
+          );
+        }
+      }
+    }
     if (!compiled.ok) {
       if (compiled.recoverable) {
         throw new WorkflowCapabilityBlockedError({
@@ -14733,6 +14805,14 @@ async function processOneRunFile(
           activationCompatible,
           definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
           codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
+          // The per-step verdicts, structured, so the authoring tool that
+          // awaits this test can hand the brain the flagged step's authorable
+          // shape and the exact repair call instead of prose to re-parse.
+          steps: result.steps.map((s) => ({
+            stepId: s.stepId,
+            status: s.status,
+            ...(s.detail ? { detail: s.detail.slice(0, 600) } : {}),
+          })),
         },
       });
       markRunNotified(filePath);
@@ -16920,6 +17000,14 @@ export function parkRunsExceedingBootResumeCap(
       withWorkflowRunRecordLock(filePath, () => {
         const record = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
         if (!record || isTerminalRunRecord(record)) return;
+        // A parked run is a decision waiting for a person (capability choice,
+        // or this cap already stopped it). Boot never resumes it, never counts
+        // it again and never re-raises its card: counting it each launch turned
+        // one paused occurrence into hundreds of "restarts" on the record.
+        if (record.status === 'parked') {
+          parked.add(run.runId);
+          return;
+        }
         // Progress since we last counted means this run is not looping — it is
         // simply long-lived across restarts. Start its budget over.
         const mark = run.lastEventAt ?? null;

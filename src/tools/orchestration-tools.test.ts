@@ -976,6 +976,38 @@ test('workflow_set_enabled requires smoke inputs before approving external-read 
   assert.equal(readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).length, 1);
 });
 
+test('workflow_edit_step patch fixes one call argument on a disabled draft without the step graph', async () => {
+  writeWorkflow('digest-check', {
+    name: 'Digest check',
+    description: 'read then summarize',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'read_digest', prompt: '', call: { tool: 'read_file', args: { path: '/x/digets.txt' } }, output: { type: 'object' }, sideEffect: 'read' },
+      { id: 'summarize', prompt: 'Summarize it.', dependsOn: ['read_digest'], sideEffect: 'read' },
+    ],
+  } as never);
+
+  const bad = await workflowEditStep()({ name: 'Digest check', step_id: 'read_digest', patch: '[1,2]' });
+  assert.match(resultText(bad), /patch must be JSON object text/);
+  const neither = await workflowEditStep()({ name: 'Digest check', step_id: 'read_digest' });
+  assert.match(resultText(neither), /Provide either patch/);
+
+  const fixed = await workflowEditStep()({
+    name: 'Digest check',
+    step_id: 'read_digest',
+    patch: JSON.stringify({ call: { tool: 'read_file', args_json: JSON.stringify({ path: '/x/digest.txt' }) } }),
+  });
+  const text = resultText(fixed);
+  assert.match(text, /Updated "Digest check" step "read_digest" \(call\)/);
+  assert.match(text, /Revert with revertStepEdit\("wfedit-/);
+  const saved = readWorkflow('digest-check')!.data;
+  assert.deepEqual((saved.steps[0] as unknown as { call: { args: unknown } }).call.args, { path: '/x/digest.txt' });
+  assert.equal(saved.steps[1].prompt, 'Summarize it.');
+  assert.equal(saved.enabled, false, 'a disabled draft stays disabled; enabling runs the test');
+  assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/, 'no creation test is queued for a disabled draft');
+});
+
 test('workflow_contract_proposals reports upgrades without mutating workflow files', async () => {
   writeWorkflow('legacy-contract-wf', {
     name: 'legacy-contract-wf',
