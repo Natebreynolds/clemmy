@@ -263,6 +263,67 @@ export async function tryJevGroundingVerdict(
   return null;
 }
 
+const TRAJECTORY_TIMEOUT_MS = 1_500;
+
+export interface JevTrajectoryVerdict {
+  onTrack: boolean;
+  confidence: number;
+  model: string;
+  durationMs: number;
+}
+
+/**
+ * Shadow trajectory verdict. The watcher lane spent 94 unattributed grok-4.3
+ * calls in one live day (2026-09-22) deciding "still on track?" mid-turn; a
+ * typed Jev choice costs ~600 input tokens and under a second. Before Jev may
+ * DECIDE here, its agreement with the configured watcher has to be observed on
+ * real traffic — the same shadow-first discipline the grounding gate used —
+ * so this verdict is recorded beside the watcher's, never acted on. Fail-open:
+ * any miss returns null and changes nothing.
+ */
+export async function tryJevTrajectoryVerdict(input: {
+  objective: string;
+  successCriteria?: readonly string[];
+  toolCallSummary: string;
+  latestAssistantNote: string;
+  toolCallCount: number;
+  sessionId?: string;
+}): Promise<JevTrajectoryVerdict | null> {
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: [
+        'You are watching an assistant work toward a user goal, mid-run.',
+        'Judge only whether the work so far is heading toward the stated goal. This is advisory, never completion certification.',
+        'Drift means the assistant is doing something the goal did not ask for, has abandoned a required part, or is repeating a failing step.',
+        'Ordinary preparation, discovery, reading, or partial progress toward the goal is on track.',
+      ].join(' '),
+      criteria: {
+        on_track: 'The tool calls and the assistant\'s latest note are consistent with reaching the stated goal.',
+        drift: 'The work has left the goal: unrelated actions, an abandoned required part, or the same failing step repeated.',
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: {
+      goal: input.objective.slice(0, 2_000),
+      ...(input.successCriteria?.length ? { successCriteria: input.successCriteria.slice(0, 10) } : {}),
+      toolCalls: input.toolCallSummary.slice(0, 4_000),
+      latestNote: input.latestAssistantNote.slice(0, 2_000),
+      toolCallCount: input.toolCallCount,
+    },
+    questions,
+    timeoutMs: TRAJECTORY_TIMEOUT_MS,
+    sessionId: input.sessionId,
+    channel: 'jev-trajectory',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || (answer.choice !== 'on_track' && answer.choice !== 'drift')) return null;
+  return { onTrack: answer.choice === 'on_track', confidence: answer.confidence, model: result.model, durationMs: Date.now() - started };
+}
+
 export interface JevCompletionVerdict {
   done: boolean;
   reason: string;

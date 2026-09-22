@@ -290,6 +290,9 @@ export interface WatcherVerdict {
   miss: string;
   /** !onTrack → the one-sentence corrective instruction to inject. */
   steer: string;
+  /** Jev's shadow reading of the same trajectory, recorded for agreement
+   * measurement only. `agrees` compares it with THIS verdict's onTrack. */
+  jevShadow?: { onTrack: boolean; confidence: number; model: string; durationMs: number; agrees: boolean };
 }
 
 export function parseWatcherVerdict(finalOutput: unknown): WatcherVerdict | null {
@@ -392,6 +395,27 @@ export function currentWatcherJudge(): WatcherJudgeFn {
  */
 export async function runWatcherJudge(input: WatcherJudgeInput): Promise<WatcherVerdict | null> {
   if (!input.objective.trim()) return null;
+  // Shadow Jev alongside the configured watcher: same inputs, its own timeout,
+  // never consulted before the watcher's own verdict is known. Fail-open.
+  const shadow = (async () => {
+    try {
+      const { tryJevTrajectoryVerdict } = await import('../jev/control-plane.js');
+      return await tryJevTrajectoryVerdict({
+        objective: input.objective,
+        ...(input.successCriteria ? { successCriteria: input.successCriteria } : {}),
+        toolCallSummary: input.toolCallSummary,
+        latestAssistantNote: input.latestAssistantNote,
+        toolCallCount: input.toolCallCount,
+      });
+    } catch {
+      return null;
+    }
+  })();
+  const withShadow = async (verdict: WatcherVerdict | null): Promise<WatcherVerdict | null> => {
+    if (!verdict) return verdict;
+    const jev = await shadow;
+    return jev ? { ...verdict, jevShadow: { ...jev, agrees: jev.onTrack === verdict.onTrack } } : verdict;
+  };
   try {
     const { runHedgedJudge, completionJudgeContextAdmission } = await import('./objective-judge.js');
     const { resolveBoundaryJudge } = await import('./debate-model.js');
@@ -422,10 +446,10 @@ export async function runWatcherJudge(input: WatcherJudgeInput): Promise<Watcher
         } : {}) };
       }
     }
-    return verdict && evidence !== undefined ? { ...verdict, coverage: {
+    return withShadow(verdict && evidence !== undefined ? { ...verdict, coverage: {
       complete: true, portions: prompts.length, chars: evidence.length,
       sha256: createHash('sha256').update(evidence).digest('hex'),
-    } } : verdict;
+    } } : verdict);
   } catch (error) {
     input.onUnavailable?.(error instanceof Error ? error.message : 'watcher_unknown_error');
     return null;

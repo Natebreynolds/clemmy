@@ -3473,6 +3473,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           stale, ...(staleReason ? { staleReason } : {}),
           miss: verdict?.miss, steer: verdict?.steer, review: verdict?.review,
           ...(verdict?.coverage ? { coverage: verdict.coverage } : {}),
+          // Shadow-first: Jev's reading and whether it agreed, for the record.
+          ...(verdict?.jevShadow ? { jevShadow: verdict.jevShadow } : {}),
           ...(!verdict ? { unavailableReason: unavailableReason ?? 'watcher_no_verdict' } : {}),
           readEvidenceCursor: readEvidence.throughSettlementIndex,
           readEvidence: readEvidence.results, artifactEvidence: artifacts.artifacts,
