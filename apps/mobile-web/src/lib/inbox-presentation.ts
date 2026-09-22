@@ -151,6 +151,13 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
   return rows;
 }
 
+/** A notification title as the card shows it: a leading emoji is a status
+ *  icon ("📅 Reply needed", "⚠️ Workflow …") and the card already says what
+ *  kind of row it is. */
+export function notificationTitle(title: string | null | undefined): string {
+  return (title ?? '').replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '').trim();
+}
+
 export function notificationLabel(row: Pick<InboxNotification, 'kind' | 'needsAttention' | 'read'>): string {
   if (row.needsAttention && !row.read) return 'Clem needs you';
   switch (row.kind) {

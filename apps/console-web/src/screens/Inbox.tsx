@@ -12,6 +12,7 @@ import { setWorkflowEnabled } from '@/lib/automate';
 import { usePoll } from '@/lib/poll';
 import { applyTidy, describeTidy } from '@/lib/tidy';
 import { cn } from '@/lib/cn';
+import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
@@ -687,7 +688,7 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
       className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
         selected ? 'border-primary bg-primary-tint' : 'border-border bg-surface hover:bg-hover', dim && 'opacity-60')}>
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
-      <span className="min-w-0 flex-1 truncate text-body text-fg">{title}</span>
+      <span className="min-w-0 flex-1 truncate text-body text-fg">{plainText(title, 200)}</span>
       {meta && <span className="shrink-0 text-caption text-faint">{meta}</span>}
     </button>
   );

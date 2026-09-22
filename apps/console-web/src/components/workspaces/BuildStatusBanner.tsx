@@ -55,7 +55,7 @@ export function BuildStatusBanner({
                   <li key={i} className="min-w-0 text-small text-fg">
                     <span className="inline-flex items-center gap-1.5">
                       <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />
-                      Couldn’t refresh <strong className="font-semibold">{source}</strong>.
+                      <span>Couldn’t refresh <strong className="font-semibold">{source}</strong>.</span>
                     </span>
                     {f.note && (
                       <details className="mt-0.5 pl-5 text-caption text-muted">

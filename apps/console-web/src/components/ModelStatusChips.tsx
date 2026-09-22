@@ -67,7 +67,9 @@ export function ModelStatusChips() {
   const shown = meters.filter((meter) => meter.windows.length > 0);
   if (shown.length === 0) return null;
   return (
-    <div className="hidden min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap lg:flex" data-testid="usage-chips">
+    // xl and up: at narrower windows the bar clipped a chip mid-word; the
+    // meters stay complete in Settings › Connected.
+    <div className="hidden min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap xl:flex" data-testid="usage-chips">
       {shown.map((meter) => <MeterChip key={meter.id} meter={meter} now={now} />)}
     </div>
   );

@@ -34,8 +34,7 @@ import {
   notificationLabel,
   notificationRunTarget,
   trustScopeSummary,
-  updatesClearScope,
-} from '../lib/inbox-presentation';
+  updatesClearScope, notificationTitle } from '../lib/inbox-presentation';
 import { inboxNeedsCountKnown, mergeInboxLastGood, type InboxLastGood } from '../lib/inbox-last-good';
 import { stoppableWorkflowRunIds } from '../lib/running-tasks';
 import { useScreenData } from '../lib/use-screen-data';
@@ -587,7 +586,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 tabIndex={-1}
               >
                 <CardMeta label="Update · needs you" at={row.createdAt} urgent />
-                <h2>{row.title || 'I need your attention'}</h2>
+                <h2>{notificationTitle(row.title) || 'I need your attention'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {earlier > 0 ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
                 <div class="inbox-card-actions">
@@ -731,7 +730,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 tabIndex={-1}
               >
                 <CardMeta label={notificationLabel(row)} at={row.createdAt} unread={!row.read} />
-                <h2>{row.title || 'Update from Clem'}</h2>
+                <h2>{notificationTitle(row.title) || 'Update from Clem'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
                 {!row.read || runTarget ? (

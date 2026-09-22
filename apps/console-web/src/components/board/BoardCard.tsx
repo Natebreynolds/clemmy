@@ -159,7 +159,10 @@ export function BoardCard({
         return (
           // line-clamp keeps a verbose failure reason from turning the card into a
           // wall of red — the FULL text lives one click away in the trace drawer.
-          <p className="mt-2 line-clamp-3 break-words rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
+          // Red is for items that actually failed; "needs review" asks for a
+          // look and wears the warning tone like every other ask.
+          <p className={cn('mt-2 line-clamp-3 break-words rounded-sm px-2 py-1 text-caption',
+            card.failureSummary.failedItems > 0 ? 'bg-danger-tint text-danger' : 'bg-warning-tint text-warning')}>
             {card.failureSummary.failedItems > 0
               ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
               : 'Needs review'}
