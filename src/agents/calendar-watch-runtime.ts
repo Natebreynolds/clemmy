@@ -20,6 +20,7 @@ import { BASE_DIR } from '../config.js';
 import {
   compileLiveCatalogWorkflowCallPlan,
   ensureLiveReadCapabilityForOperation,
+  isCapabilityNotRegisteredMessage,
   type WorkflowCapabilityAccountSelectionV1,
 } from '../execution/workflow-live-call-compiler.js';
 import { executeWorkflowNodeRead } from '../execution/workflow-node-invocation-executor.js';
@@ -387,7 +388,7 @@ export async function readCalendarAccountsAttested(
     }
     for (const read of perAccount) {
       if (!read.ok) {
-        const reason = /No current capability is registered/.test(read.reason)
+        const reason = isCapabilityNotRegisteredMessage(read.reason)
           ? `${read.reason} (catalog: ${explainMissingCandidates(connected)}${warmNote ? `; ${warmNote}` : ''})`
           : read.reason;
         failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason });

@@ -8144,7 +8144,8 @@ test('a capability pause says what actually happened instead of "go reconnect"',
     ...base, message: 'The saved GOOGLESHEETS connection is missing or belongs to a different Composio user.',
   } as never);
   assert.match(reallyDead.title, /connect googlesheets/);
-  assert.match(reallyDead.detail, /Open Settings/, 'a real disconnection keeps its real cure');
+  assert.match(reallyDead.detail, /Connect page/, 'a real disconnection keeps its real cure');
+  assert.match(reallyDead.detail, /different Composio user/, 'a diagnostic that says something new stays');
 });
 
 // The owner's rule, 2026-09-11: "if a workflow doesn't fire, any subsequent one

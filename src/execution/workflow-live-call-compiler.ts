@@ -23,6 +23,15 @@ const EXACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
 
 /** Normalize caller-owned labels into the exact identity alphabet accepted by
  * the durable workflow activation tables. */
+
+/** The engine's own "nothing can run this operation" diagnostic. It names an
+ *  operation id, so a person-facing report shows its own sentence instead;
+ *  readers recognise it here rather than re-spelling the text. */
+export const CAPABILITY_NOT_REGISTERED_PREFIX = 'No current capability is registered for';
+export function isCapabilityNotRegisteredMessage(message: string | undefined | null): boolean {
+  return typeof message === 'string' && message.startsWith(CAPABILITY_NOT_REGISTERED_PREFIX);
+}
+
 export function exactWorkflowCallIdOrDigest(value: string): string {
   const trimmed = value.trim();
   if (EXACT_ID_RE.test(trimmed)) return trimmed;
@@ -415,7 +424,7 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
       ok: false,
       recoverable: true,
       reason: 'not-connected',
-      message: `No current capability is registered for "${input.operationId}". Connect it, then retry.`
+      message: `${CAPABILITY_NOT_REGISTERED_PREFIX} "${input.operationId}". Connect it, then retry.`
         + (revalidation ? ` (${describeOperationCatalogRevalidation(revalidation)})` : ''),
     };
   }

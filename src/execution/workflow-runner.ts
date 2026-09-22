@@ -284,6 +284,7 @@ import {
 import {
   compileLiveCatalogWorkflowCallPlan,
   ensureLiveReadCapabilityForOperation, warmDurableProviderOperation,
+  isCapabilityNotRegisteredMessage,
   workflowCapabilityAccountChoiceSet,
   type WorkflowCapabilityAccountCandidateV1,
   type WorkflowCapabilityAccountChoiceSetV1,
@@ -13789,20 +13790,47 @@ export interface CreationTestResult {
   steps: CreationTestStepResult[];
 }
 
-/** One line per creation-test step, shared by the parked report and the terminal. */
+/** A step id as a person reads it in Clem's reply: `read_calendar` →
+ *  "Read calendar". The id itself stays on the definition. */
+export function creationTestStepName(stepId: string): string {
+  const words = stepId.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').trim().toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : stepId;
+}
+
+/** "in about 10 minutes" / "at 4:30 PM"; '' when there is no real time.
+ *  Live 2026-09-22 a missing retry time printed as 1970-01-01T00:00:00.000Z
+ *  in Clem's reply. */
+export function capabilityRetryPhrase(retryAt: string | null | undefined, nowMs = Date.now()): string {
+  const at = retryAt ? Date.parse(retryAt) : NaN;
+  if (!Number.isFinite(at) || at <= nowMs) return '';
+  const minutes = Math.round((at - nowMs) / 60_000);
+  if (minutes <= 1) return 'in a minute';
+  if (minutes <= 90) return `in about ${minutes} minutes`;
+  return `at ${new Date(at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+}
+
+function capabilityAppName(toolkit: string): string {
+  const name = toolkit.trim();
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : 'the app';
+}
+
+/** One line per creation-test step, shared by the parked report and the
+ *  terminal. Words, not emoji: this is read in Clem's own reply. */
 export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
   return steps.map((s) => {
-    if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
+    const name = creationTestStepName(s.stepId);
+    if (s.status === 'ok') return `- ${name} — returned data`;
     // The one answerable thing leads with the question itself, indented so
     // the enumerated choices stay readable inside the step list.
     if (s.status === 'needs_choice') {
-      return [`- ${s.stepId}: ❓ needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
+      return [`- ${name} — needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
     }
-    if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
+    if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it`;
     // Unverifiable is honest, not alarming: it names WHY the check could
     // not run so the report never implies a broken step.
-    if (s.status === 'unverifiable') return `- ${s.stepId}: 🔍 not checked — ${s.detail ?? 'verifies a previewed mutation'}`;
-    return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
+    if (s.status === 'unverifiable') return `- ${name} — not checked: ${s.detail ?? 'it verifies a change the test only previewed'}`;
+    const word = s.status === 'empty' ? 'returned nothing' : s.status === 'failed' ? 'failed' : 'hit an error';
+    return `- ${name} — ${word}${s.detail ? `: ${s.detail}` : ''}`;
   });
 }
 
@@ -14488,9 +14516,11 @@ export function workflowCapabilityNotificationPresentation(
           : '',
         creationTest
           ? 'Choose the account in Needs You. I will save it on that step, re-run the creation test with it (mutations stay previewed), and enable the workflow if it passes.'
-          : 'Choose the exact account ID in Needs You. I will save that choice and resume this same run.',
+          : 'Choose the account in Needs you. I will save that choice and resume this same run.',
       ].filter(Boolean).join('\n')
     : '';
+  const app = capabilityAppName(block.toolkit);
+  const retry = capabilityRetryPhrase(block.retryAt);
   const detail = [
     accountChoiceBlock
       ? creationTest
@@ -14502,21 +14532,24 @@ export function workflowCapabilityNotificationPresentation(
           ? `I paused "${workflowName}" at step "${block.stepId}" because I could not reach ${block.toolkit} to verify it before running. This is not a sign your connection is broken.`
           : needsAccountChoice
             ? `I paused "${workflowName}" at step "${block.stepId}" because the step did not say which ${block.toolkit} account to use. Your connection is fine.`
-            : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
-    block.message,
+            : `I paused "${workflowName}" at step "${creationTestStepName(block.stepId)}" because ${app} isn't connected right now.`,
+    // The engine's "nothing can run <operation id>" diagnostic only restates
+    // the sentence above with an operation id; it stays on the block for Clem
+    // and the logs. Every other message says something the person needs.
+    isCapabilityNotRegisteredMessage(block.message) ? '' : block.message,
     creationTest
-      ? `Nothing ran for real — a creation test previews every mutation. No ${block.tool} dispatch occurred.`
-      : `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
+      ? `Nothing ran for real — a creation test only previews changes. No ${app} call was made.`
+      : `Everything before this step is kept. No ${app} call was made, so this same run can pick up where it stopped.`,
     accountChoiceBlock
       ? choiceQuestion
       : exactSchemaBlock
-        ? `Open Needs You to retry this exact metadata gate now, or I will retry safely after ${block.retryAt}; recovery performs no broader discovery or business action.`
+        ? `Retry it from Needs you${retry ? `, or I'll try again ${retry}` : ''}. Retrying only re-checks this action; it doesn't run anything else.`
         : couldNotCheck
-          ? `Nothing to do — I retry this automatically after ${block.retryAt}. Reconnecting ${block.toolkit} would not change it; if this keeps repeating, the provider is having trouble, not your account.`
+          ? `Nothing to do — I'll try again ${retry || 'shortly'}. Reconnecting ${app} wouldn't change it; if this keeps happening, ${app} is having trouble, not your account.`
           : needsAccountChoice
-            ? `Pick the ${block.toolkit} account for this step in Needs You and I will resume this same run. Reconnecting ${block.toolkit} will not help — the connection is not the problem.`
-            : `Open Settings → Connections and connect ${block.toolkit}, then return to Needs You to retry this exact gate. It will also retry safely after ${block.retryAt}.`,
-  ].join('\n\n');
+            ? `Pick the ${app} account for this step in Needs you and I'll resume this same run. Reconnecting ${app} won't help — the connection is fine.`
+            : `Connect ${app} on the Connect page, then retry from Needs you${retry ? ` — I'll also try again ${retry}` : ''}.`,
+  ].filter(Boolean).join('\n\n');
   return {
     exactSchemaBlock,
     accountChoiceBlock,
@@ -14682,8 +14715,8 @@ function parkWorkflowCapabilityBlockedRun(input: {
         nextAction: accountChoiceBlock
           ? choiceQuestion
           : exactSchemaBlock
-            ? `Tell me to retry exact metadata for run ${run.id}; completed work stays preserved.`
-            : `Connect ${error.toolkit} in Settings → Connections, then tell me to retry run ${run.id}; completed work stays preserved.`,
+            ? 'Retry it from Needs you; everything before this step is kept.'
+            : `Connect ${capabilityAppName(error.toolkit)} on the Connect page, then retry it from Needs you; everything before this step is kept.`,
         resolution,
         retryAt,
         provenNoDispatch: true,
@@ -14994,18 +15027,18 @@ async function processOneRunFile(
       const lines = creationTestStepLines(result.steps);
       const body = creationReady
         ? activateAfterCreationTest
-          ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
-          : `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. It remains DISABLED as requested.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run).`
+          ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.`
+          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.`
         : result.pass
           ? autoRetestRunId
-            ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); ${activateAfterCreationTest ? "it'll auto-enable here on pass" : 'it will remain disabled'}.\n\n${lines.join('\n')}`
-            : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
+            ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
+            : `The creation test passed for the version I checked, but I left "${workflow.data.name}" as it was because ${activationBlockedReason}. Run a fresh creation test on the newer version before turning it on.\n\n${lines.join('\n')}`
         : result.steps.some((s) => s.status === 'needs_choice')
           // NOT a broken workflow — one unanswered question. Everything else
           // that stopped is downstream of it. Ask for the answer and say what
           // happens next, so answering is the whole of the owner's part.
-          ? `"${workflow.data.name}" is ready except for one thing I can't decide for you — left DISABLED until it's settled.\n\n${lines.join('\n')}\n\nAnswer that and I'll bind it to the step, re-run the creation test, and enable it if it passes.`
-          : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rebind them and re-test. If you'd rather run it as it stands, say so and I'll enable it.`;
+          ? `"${workflow.data.name}" is ready except for one thing I can't decide for you, so it stays off until you answer.\n\n${lines.join('\n')}\n\nAnswer that and I'll save it on the step, test again, and turn it on if it passes.`
+          : `The creation test for "${workflow.data.name}" found problems, so it stays off rather than run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rework and re-test them. If you'd rather run it as it is, say so and I'll turn it on.`;
       const report = {
         workflowName: workflow.data.name,
         outcome: creationReady ? 'done' as const : 'blocked' as const,
