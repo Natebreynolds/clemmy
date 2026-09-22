@@ -145,7 +145,11 @@ export interface ProvenStrategyCandidate {
 
 const PROVEN_STRATEGY_CONFIDENCE_MIN = 0.6;
 const PROVEN_STRATEGY_NOUL_MIN = 0.6;
-const PROVEN_STRATEGY_TIMEOUT_MS = 3_500;
+// This call sits on the critical path before the first model frame. Live
+// 2026-09-21/22: median 740 ms, p90 2,980 ms across ten calls. Past 2 s the
+// caller keeps the top lexical match (failedOpen), and a wrong pick is
+// recoverable in-turn now that tool_search stays on the proven-skip surface.
+const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
 
 export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
   strategy: T | null;
