@@ -193,3 +193,68 @@ test('a schedule whose runner script is missing creates one readiness-blocked oc
   );
 });
 
+test('a legacy hold is retired once its workflow has run successfully since, and a later boot stays quiet', async () => {
+  writeWorkflow(WORKFLOW_SLUG, {
+    name: WORKFLOW_SLUG,
+    description: 'Read-only daily refresh of the Friday dashboard.',
+    enabled: true,
+    trigger: { schedule: '0 7 * * *', timezone: 'America/Los_Angeles', manual: true },
+    steps: [{
+      id: 'pull',
+      prompt: '',
+      deterministic: { runner: 'refresh.mjs' },
+      sideEffect: 'read',
+      output: { type: 'object', required_keys: ['ok'] },
+    }],
+  });
+  registerWorkflowRunDrainKick(() => {});
+  const first = await processWorkflowSchedules(DUE);
+  assert.deepEqual(first.blocked, [WORKFLOW_SLUG]);
+  const hold = runRecords()[0]!;
+  assert.equal(hold.status, 'blocked_readiness');
+  // The 2026-09-01 shape: the same occurrence, refused for raw-subprocess authority.
+  const holdPath = path.join(WORKFLOW_RUNS_DIR, `${hold.id}.json`);
+  const legacy = {
+    ...hold,
+    readiness: {
+      ...(hold.readiness as Record<string, unknown>),
+      blockers: [{ kind: 'script', name: 'refresh.mjs', stepIds: ['pull'], reason: 'workflow_raw_subprocess_authority_unrepresented: deterministic.runner has no shared exact authority' }],
+    },
+    readinessMessage: 'required capability is missing: script "refresh.mjs" (step: pull) via deterministic runner - workflow_raw_subprocess',
+  };
+  writeFileSync(holdPath, JSON.stringify(legacy, null, 2), 'utf-8');
+
+  // Nothing has run since: the hold is live, inspected on every boot, never retired.
+  const before = reconcileLegacyScheduledReadinessHolds();
+  assert.equal(before.inspected, 1, JSON.stringify(before));
+  assert.equal(before.retired, 0, JSON.stringify(before));
+  const noticeId = `system-workflow-readiness-blocked-${hold.id}`;
+  assert.equal(loadNotifications().find((n) => n.id === noticeId)?.read, false, 'the occurrence notice is still unread');
+
+  // The workflow completed successfully after the block.
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'trigger-later-success.json'), JSON.stringify({
+    id: 'trigger-later-success',
+    workflow: WORKFLOW_SLUG,
+    workflowSlug: WORKFLOW_SLUG,
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+    source: 'schedule',
+    inputs: {},
+    createdAt: new Date(Date.now() + 60_000).toISOString(),
+    startedAt: new Date(Date.now() + 61_000).toISOString(),
+    finishedAt: new Date(Date.now() + 73_000).toISOString(), // after the hold's own createdAt
+  }, null, 2), 'utf-8');
+
+  const after = reconcileLegacyScheduledReadinessHolds();
+  assert.equal(after.retired, 1, 'the dead hold is retired');
+  assert.deepEqual(after.retiredRunIds, [hold.id]);
+  assert.equal(after.noticesEnsured, 0, 'no notice is ensured for a dead hold');
+  assert.equal(loadNotifications().find((n) => n.id === noticeId)?.read, true, 'its notice is read');
+  const stamped = JSON.parse(readFileSync(holdPath, 'utf-8')) as { scheduledReadinessBlock?: { retiredAt?: string; retiredBy?: { runId?: string } } };
+  assert.equal(typeof stamped.scheduledReadinessBlock?.retiredAt, 'string');
+  assert.equal(stamped.scheduledReadinessBlock?.retiredBy?.runId, 'trigger-later-success');
+
+  const nextBoot = reconcileLegacyScheduledReadinessHolds();
+  assert.equal(nextBoot.inspected, 0, 'a retired hold is never inspected again');
+  assert.equal(nextBoot.noticesEnsured, 0);
+});
