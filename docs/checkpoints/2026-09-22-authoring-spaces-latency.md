@@ -1,8 +1,9 @@
 # Workflow authoring, human-in-the-loop, Spaces, latency — 2026-09-22
 
-Continues `2026-09-22-calendar-watch.md`. Ten commits on shared `main`,
-`4276ea62` (first candidate) → the Space view fix, accepted step by step in
-the installed app against the live home. No release was published. Model
+Continues `2026-09-22-calendar-watch.md`. Eleven commits on shared `main`,
+`4276ea62` (first candidate) → `755d6f24` (Space view fix), installed as
+`eebd4239` and accepted step by step in the installed app against the live
+home. No release was published. Model
 roles during the tests: brain grok-4.6, judge grok-4.3, worker moved to
 glm-5.3 for the window and restored to claude-haiku-4-5 afterwards.
 
@@ -38,8 +39,11 @@ done, 2 live sources (calendar + inbox, 05:00 PT daily), health fresh, view
 **1,034 s, 33 calls (tool_search ×16), 694k prompt tokens**. The rendered
 board then showed "No meetings" and "Nothing needs a reply": the view's own
 `rows()` helper did not know the `{complete, result}` read envelope the
-sources are stored under. Fixed at the dataset boundary (see 7 below);
-render verification after the last hotpatch is recorded at the end.
+sources are stored under. Fixed at the dataset boundary (see 7 below) and
+verified on `eebd4239`: the same view now shows 8 meetings, 12 needing a
+look, 1 canceled, 2 overlaps, with the day's calendar listed
+(`output/calendar-watch/space-daily-brief-after.png`; before:
+`space-daily-brief.png`).
 
 **4. Latency.** Calendar turn ("whats on my calendar tomorrow"), same
 build family, same day:
