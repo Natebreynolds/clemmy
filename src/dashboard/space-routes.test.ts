@@ -989,3 +989,9 @@ test('every served view carries the framework design layer and helper kit ahead 
   assert.match(html, /:root\[data-theme=dark\]/, 'dark tokens travel with the view');
   assert.ok(html.indexOf('data-theme') > 0, 'the theme handoff is read from the query string by the kit');
 });
+
+test('starter recipes answer on their own route, not as a Space id', async () => {
+  const res = await j(await fetch(`${base}/api/console/spaces/starters`));
+  assert.equal(res.status, 200, 'registered after /spaces/:id, "starters" was looked up as a Space and 404ed');
+  assert.ok(Array.isArray(res.body.starters));
+});

@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { cn } from '@/lib/cn';
+import dogMark from '@/assets/dog-mark.png';
 
 /**
  * Friendly empty state: the dog mascot + a plain title + a teaching line
@@ -19,7 +20,7 @@ export function EmptyState({
   return (
     <div className={cn('flex flex-col items-center justify-center px-6 py-16 text-center', className)}>
       <img
-        src="/console/icon.png"
+        src={dogMark}
         alt=""
         width={56}
         height={56}

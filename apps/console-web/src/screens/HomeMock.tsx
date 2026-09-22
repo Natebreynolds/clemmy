@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
 import { Select } from '@/components/ui/Field';
 import { cn } from '@/lib/cn';
-import dogMark from '@/assets/home-mock/dog-mark.png';
+import dogMark from '@/assets/dog-mark.png';
 import { AGENDA, CATALOG, CAPTURE, MAIL, MOCK_NAME, NEEDS_YOU, TRENDS, type CatalogCard } from '@/components/home/mock/data';
 import {
   AgendaTile, CaptureTile, MailTile, MiniAsk, NeedsYouTile, ReportTile, WatchTile,

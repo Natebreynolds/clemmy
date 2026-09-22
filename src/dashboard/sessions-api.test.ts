@@ -34,6 +34,7 @@ const {
   appendEvent,
   beginRunAttempt,
   getSession,
+  listSessions,
   openEventLog,
   reapStaleSessions,
   recordRunAttemptUserInput,
@@ -798,9 +799,53 @@ test('the shared snapshot is taken exactly once per list build', () => {
     source.indexOf('function collectHarnessSummaries'),
     source.indexOf('function desktopSearchText'),
   );
-  assert.match(collect, /const allRows = listAllHarnessRows\(\);/);
+  assert.match(collect, /const allRows = listAllHarnessRowsForDisplay\(\);/);
   assert.match(collect, /userFacingHarnessRows\(allRows\)/,
     'the user-facing filter must reuse the same scan, not start a second one');
   assert.match(collect, /return \{ summaries: out, rawIds, allRows \}/,
     'the snapshot must be handed back so per-row fills can reuse it');
+});
+
+test('the list reads session rows without conversation state; every other key survives', () => {
+  const heavy = 'x'.repeat(200_000);
+  const chat = createSession({
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'State-heavy chat',
+    metadata: { source: 'desktop', pinned: true, tags: ['kept'], __conversation: { items: [heavy] }, __interrupt_state: { big: heavy } },
+  });
+  appendEvent({ sessionId: chat.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hello there' } });
+  appendEvent({ sessionId: chat.id, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'light reply' } });
+
+  const light = listSessions({ status: 'any', withoutConversationState: true, limit: 500 }).find((row) => row.id === chat.id);
+  assert.ok(light, 'the light listing returns the row');
+  assert.equal('__conversation' in light.metadata, false);
+  assert.equal('__interrupt_state' in light.metadata, false);
+  assert.equal(light.metadata.pinned, true);
+  assert.deepEqual(light.metadata.tags, ['kept']);
+
+  const full = listSessions({ status: 'any', limit: 500 }).find((row) => row.id === chat.id);
+  assert.equal((full?.metadata.__conversation as { items: string[] }).items[0].length, 200_000,
+    'the default listing still returns the whole row');
+
+  const summary = buildUnifiedSessionList({ q: 'State-heavy chat' }).find((row) => row.id === `harness:${chat.id}`);
+  assert.equal(summary?.pinned, true);
+  assert.equal(summary?.preview, 'light reply');
+  assert.equal(summary?.turnCount, 2);
+});
+
+test('pinning a workflow run after a list build keeps each step\'s conversation state', () => {
+  const state = { items: ['resume me'] };
+  const stepA = createSession({ kind: 'workflow', channel: 'workflow', title: 'State Flow::a', metadata: { source: 'workflow', workflowName: 'State Flow', workflowRunId: 'run-state-kept', stepId: 'a', __conversation: state } });
+  const stepB = createSession({ kind: 'workflow', channel: 'workflow', title: 'State Flow::b', metadata: { source: 'workflow', workflowName: 'State Flow', workflowRunId: 'run-state-kept', stepId: 'b', __conversation: state } });
+  appendEvent({ sessionId: stepB.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'state step b done' } });
+
+  assert.ok(buildUnifiedSessionList({ source: 'workflow' }).some((row) => row.title === 'State Flow'));
+  patchUnifiedSession(`harness:${stepB.id}`, { pinned: true });
+
+  for (const step of [stepA, stepB]) {
+    const row = getSession(step.id);
+    assert.equal(row?.metadata.pinned, true);
+    assert.deepEqual(row?.metadata.__conversation, state, 'a patch must never write back a display row');
+  }
 });

@@ -798,9 +798,29 @@ export interface ListSessionsOptions {
   /** `false` hides archived sessions (a list a person reads); undefined keeps
    *  every row (internal readers). */
   archived?: boolean;
+  /** Read-only lists: leave the model/recovery state out of `metadata`. It is
+   *  ~97% of the table's bytes (live 2026-09-22: 132 of 136 MB across 2,780
+   *  rows) and no list reads it. updateSession REPLACES metadata, so a row read
+   *  this way must never be written back. */
+  withoutConversationState?: boolean;
   limit?: number;
   offset?: number;
 }
+
+/** Per-session model and recovery state: megabytes on a long chat, and only
+ *  the runner that resumes the session reads it. */
+const SESSION_STATE_METADATA_PATHS = [
+  '$.__conversation',
+  '$.__host_recovery_state',
+  '$.__interrupt_state',
+  '$.__host_recovery_mcp_scope',
+] as const;
+
+const SESSION_COLUMNS_WITHOUT_STATE = `id, kind, channel, user_id, created_at, updated_at, status, title,
+  objective, token_budget, tokens_used, current_plan_id,
+  CASE WHEN json_valid(metadata_json)
+    THEN json_remove(metadata_json, ${SESSION_STATE_METADATA_PATHS.map((p) => `'${p}'`).join(', ')})
+    ELSE metadata_json END AS metadata_json`;
 
 let cached: Database.Database | null = null;
 
@@ -1210,6 +1230,14 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   sql += ' LIMIT ? OFFSET ?';
   params.push(limit);
   params.push(offset);
+  if (options.withoutConversationState) {
+    // Page on the narrow columns first, then project only that page: a sorter
+    // fed the projected metadata would strip every row in the table once per
+    // page.
+    sql = `SELECT ${SESSION_COLUMNS_WITHOUT_STATE} FROM sessions
+      WHERE rowid IN (${sql.replace('SELECT * FROM sessions', 'SELECT rowid FROM sessions')})
+      ORDER BY updated_at DESC, id DESC`;
+  }
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
   return rows.map(rowToSession);
 }

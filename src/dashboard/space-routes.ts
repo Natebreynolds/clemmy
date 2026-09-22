@@ -491,6 +491,19 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     res.status(201).json({ space: rec });
   });
 
+  // ---- Starter recipes: the "start from a recipe" activation list ---------
+  // Runtime-filtered against the user's actually-connected toolkits (never a
+  // hardcoded vendor list); connection-free recipes are always present.
+  // Registered before /spaces/:id — after it, "starters" was read as a Space
+  // id and every call answered 404 (the Spaces page said starters "couldn't
+  // be loaded just now").
+  app.get('/api/console/spaces/starters', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    let slugs: string[] = [];
+    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { /* offline → connection-free only */ }
+    res.json({ starters: availableStarterRecipes(slugs) });
+  });
+
   app.get('/api/console/spaces/:id', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
@@ -931,16 +944,6 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     writeFileSync(canonical, snapshot, 'utf-8');
     appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
     res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
-  });
-
-  // ---- Starter recipes: the "start from a recipe" activation list ---------
-  // Runtime-filtered against the user's actually-connected toolkits (never a
-  // hardcoded vendor list); connection-free recipes are always present.
-  app.get('/api/console/spaces/starters', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    let slugs: string[] = [];
-    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { /* offline → connection-free only */ }
-    res.json({ starters: availableStarterRecipes(slugs) });
   });
 
   // ---- Publish: export a static share-ready snapshot ----------------------

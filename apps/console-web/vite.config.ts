@@ -23,11 +23,12 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
-    // Never inline assets as data: URIs — the daemon CSP only allows
-    // fonts/scripts from 'self', so an inlined data: font is blocked.
-    // Keeping every font/asset as a real file under /console/assets/
-    // keeps everything CSP-clean.
-    assetsInlineLimit: 0,
+    // Fonts are never inlined: the daemon CSP allows fonts only from 'self',
+    // so a data: font is blocked. Small raster images (the dog mark) ARE
+    // inlined — img-src allows data:, and a mark fetched from the daemon
+    // vanishes whenever the daemon is busy.
+    assetsInlineLimit: (file: string, content: Buffer) =>
+      /\.(png|jpe?g|webp|gif)$/i.test(file) && content.length <= 16 * 1024,
     rollupOptions: {
       output: {
         // Coalesce the (lazy-loaded) 3D graph stack into one cacheable chunk

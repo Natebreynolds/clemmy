@@ -1,10 +1,12 @@
 import { cn } from '@/lib/cn';
+import dogMark from '@/assets/dog-mark.png';
 
-/** The pixel-art Clementine Frenchie, served by the daemon at /console/icon.png. */
+/** The pixel-art Clementine Frenchie, inlined into the bundle so it paints
+ *  even while the daemon is busy (vite.config.ts assetsInlineLimit). */
 export function DogMark({ size = 32, className }: { size?: number; className?: string }) {
   return (
     <img
-      src="/console/icon.png"
+      src={dogMark}
       alt="Clementine"
       width={size}
       height={size}
