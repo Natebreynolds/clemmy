@@ -284,3 +284,38 @@ in the baseline worktree) is recorded in
   daemon held the live home for a minute, ran the pre-fix boot cap and
   re-parked 12 already-parked runs (no schema change). Launch by path and
   confirm `gitSha` + `entry` from build-info before driving anything.
+
+## Release pass for 3.18.20 (`ee799093` → `dce76b81`)
+
+Owner instruction 2026-09-22 ~19:20Z: cut the tag. Bumped to 3.18.20
+(`ee799093`), then ran the gate doc's local procedure on that commit:
+typecheck, release-asset tests 56/56, release closure 137/137, public
+hygiene 4/4, fresh-install smoke, packaged upgrade 21/21 (in a clean
+worktree; the working tree carries the owner's uncommitted handoff doc,
+which the gate refuses by design), full isolated suite 11,000+ with the
+attributed pre-existing failures plus two new names: one a pin that
+asserted the exact old "not connected" text before the park message
+carried its reason (updated), one load-induced and green alone. Three
+live traces on the hotpatched release daemon: a calendar read (done; its
+first provider call hit a transient account refresh and the turn
+re-discovered and answered), a Space update from the dock (done, row
+changed), a workflow listing (done, 88 s).
+
+**Added before the tag, at the owner's request** (`dce76b81`): the model
+picker lists what a Codex subscription can run. The Codex backend lists a
+subscription's models filtered by the calling client's version; the
+catalog asks as the newest possible client (metadata only, no completion)
+and keeps the rows the backend marks visible, in its priority order.
+OpenAI choices are the union of the API-key list and the subscription
+list, each failing open on its own. A completed Claude or Codex sign-in
+refreshes its provider at once, and a daemon-lifetime heartbeat at the
+catalog's six-hour lease re-reads between picker visits. Claude
+subscriptions and API keys were already discovered. Open: the dispatch
+path still identifies as the shipped client version; if the backend
+refuses a newly listed model for that client, the client version constant
+in the codex model module is the fix.
+
+The stalls that shaped the afternoon's wall times were the machine's
+network path: the Slack websocket on this Mac lost its pong replies 52
+times between 18:00 and 19:51 UTC, across every silent model frame, and
+short judge calls completed between hiccups.
