@@ -65,7 +65,9 @@ export function AppShell() {
     () => apiGet<CommandCenter>('/api/console/home/command-center'),
     pollIntervalForStream(stream, 6_000),
   );
-  const needsYouCount = commandCenter.data?.needsYou?.length ?? 0;
+  // `waiting` counts a decision set aside with "Not now" too: it left Home,
+  // not Needs you.
+  const needsYouCount = commandCenter.data?.counts?.waiting ?? commandCenter.data?.needsYou?.length ?? 0;
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
   const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
   const workingView = presentWorkingNow(

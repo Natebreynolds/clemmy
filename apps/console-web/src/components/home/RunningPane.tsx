@@ -54,12 +54,15 @@ export function RunningPane({
   error,
   onRetry,
   headingId,
+  coveredByNeedsYou,
 }: {
   view: WorkingNowView<ActivityEntry>;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
   headingId: string;
+  /** A parked run the Needs-you pane already shows stays off this pane. */
+  coveredByNeedsYou?: (entry: ActivityEntry) => boolean;
 }) {
   const inFlight = view.entries.filter((presented) => presented.membership === 'running');
   const stalled = view.entries.filter((presented) => presented.membership === 'stalled');
@@ -70,7 +73,8 @@ export function RunningPane({
   // computed on this screen and rendered by nothing: work stopped, waiting on
   // a person, invisible on their Home. It leads the pane now, because it is
   // the only group here that is a demand rather than a status.
-  const parked = view.entries.filter((presented) => presented.membership === 'needs_you');
+  const parked = view.entries.filter((presented) => presented.membership === 'needs_you'
+    && !coveredByNeedsYou?.(presented.entry));
   // The cap is on the pane, not on each group: what needs you, then running
   // work, then what stopped and never finished.
   const rows = [...parked, ...inFlight, ...stalled];

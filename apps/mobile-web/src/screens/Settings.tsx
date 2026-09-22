@@ -273,7 +273,7 @@ function BrainCard({ currentLabel, provider, inactive, actualModelId, codexRescu
         </span>
         <span class="settings-row-action">Change</span>
       </button>
-      {inactive ? (
+      {inactive && inactive.modelId !== actualModelId ? (
         <p class="warning card-note">
           Saved {inactive.modelId} is unavailable — {actualModelId} answers instead.
         </p>

@@ -175,6 +175,33 @@ export function compactUsageText(meter: UsageMeter): string {
   return 'connected';
 }
 
+/** A reading older than this is shown with its age and without alarm: a
+ *  two-day-old "83%" in amber read as a live warning (2026-09-22). */
+export const USAGE_READING_STALE_MS = 6 * 3_600_000;
+
+const WINDOW_WORDS: Record<string, string> = {
+  '5h': '5-hour limit', week: 'week', requests: 'request limit', tokens: 'token limit',
+};
+
+function ageWords(ms: number): string {
+  const hours = Math.floor(ms / 3_600_000);
+  return hours < 48 ? `${hours}h old` : `${Math.floor(hours / 24)}d old`;
+}
+
+/** The chip in words, not "wk 83%": the window closest to its limit, and the
+ *  reading's age once it is no longer current. "Codex" · "83% of week · 2d old". */
+export function usageChipText(meter: UsageMeter, now: number): { text: string; stale: boolean } {
+  const stale = typeof meter.capturedAt === 'number' && now - meter.capturedAt > USAGE_READING_STALE_MS;
+  const age = stale && typeof meter.capturedAt === 'number' ? ` · ${ageWords(now - meter.capturedAt)}` : '';
+  const busiest = meter.windows.reduce<UsageMeterWindow | null>(
+    (best, w) => (!best || w.usedPercent > best.usedPercent ? w : best),
+    null,
+  );
+  if (busiest) return { text: `${busiest.usedPercent}% of ${WINDOW_WORDS[busiest.label] ?? busiest.label}${age}`, stale };
+  if (meter.spend) return { text: `${formatTokenCount(meter.spend.tokens)} tokens today`, stale: false };
+  return { text: 'connected', stale: false };
+}
+
 export function meterTone(meter: UsageMeter): UsageTone {
   return meter.windows.reduce<UsageTone>((tone, w) => (
     w.tone === 'danger' || tone === 'danger' ? 'danger' : w.tone === 'warning' || tone === 'warning' ? 'warning' : 'ok'

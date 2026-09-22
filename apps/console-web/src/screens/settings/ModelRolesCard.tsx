@@ -122,26 +122,33 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const onRemoveIntent = (whenIntent: string) => r.run(`intent-rm-${whenIntent}`, () => patchModelRole({ role: 'worker', whenIntent, clear: true }));
 
   const row = (label: string, hint: string, control: React.ReactNode, note?: React.ReactNode) => (
-    <div className="grid grid-cols-[1fr_auto] items-center gap-4 border-t border-border px-4 py-3 first:border-t-0">
+    // One control column for every role, so Brain, Workers and Judge line up
+    // (an `auto` column sized each row to its own select).
+    <div className="grid grid-cols-1 items-center gap-2 border-t border-border px-4 py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)] sm:gap-4">
       <div className="min-w-0">
         <div className="text-body font-semibold text-fg">{label}</div>
         <div className="text-small text-muted">{hint}</div>
         {note}
       </div>
-      <div className="flex min-w-0 max-w-[60%] items-center gap-2">{control}</div>
+      <div className="flex min-w-0 items-center gap-2 sm:justify-end [&>select]:w-full">{control}</div>
     </div>
   );
-  const inactive = (role: 'brain' | 'worker' | 'judge') => mr.roles[role].inactiveBinding && (
+  // Warn only when something else answers. The live brain binding is
+  // "inactive" whenever the active-brain switch owns the choice — even when
+  // both name the same model, which read "Saved grok-4.6 is unavailable" over
+  // a grok-4.6 brain.
+  const inactive = (role: 'brain' | 'worker' | 'judge') => mr.roles[role].inactiveBinding
+    && mr.roles[role].inactiveBinding?.modelId !== mr.roles[role].modelId && (
     <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={mr.roles[role].inactiveBinding?.reason}>
       <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-      <span className="truncate">Saved {mr.roles[role].inactiveBinding?.modelId} is unavailable; using the default.</span>
+      <span className="min-w-0">Saved {mr.roles[role].inactiveBinding?.modelId} isn’t available, so {mr.roles[role].modelId} answers instead.</span>
     </div>
   );
   const seg = (value: string, options: Array<[string, string]>, onPick: (v: string) => void, disabled: boolean) => (
     <div role="group" className="inline-flex rounded-full bg-subtle p-0.5">
       {options.map(([v, label]) => (
         <button key={v} type="button" disabled={disabled} aria-pressed={value === v} onClick={() => onPick(v)}
-          className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', value === v ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}>
+          className={cn('whitespace-nowrap rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', value === v ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}>
           {label}
         </button>
       ))}

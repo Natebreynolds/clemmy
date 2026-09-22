@@ -1,4 +1,4 @@
-import { compactUsageText, formatTokenCount, meterTone, presentUsageMeters, resetsInText, type UsageMeter, type UsageTone } from '@clem/chat-engine';
+import { formatTokenCount, meterTone, presentUsageMeters, resetsInText, usageChipText, type UsageMeter, type UsageTone } from '@clem/chat-engine';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { getModelStatus, type ModelStatus } from '@/lib/model-status';
@@ -41,27 +41,30 @@ export function useUsageMeters(): { meters: UsageMeter[]; now: number; ready: bo
 }
 
 function MeterChip({ meter, now }: { meter: UsageMeter; now: number }) {
-  const tone = meterTone(meter);
+  const chip = usageChipText(meter, now);
+  // An old reading is context, not a warning: it keeps its words and age but
+  // drops the amber/red it earned when it was current.
+  const tone = chip.stale ? 'ok' : meterTone(meter);
   return (
     <span
       title={meterTooltip(meter, now)}
       aria-label={`${meter.label} usage: ${meterTooltip(meter, now).replace(/\n/g, '; ')}`}
       className="app-no-drag inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-canvas px-2 py-1 text-caption text-muted"
     >
-      <span className={cn('h-1.5 w-1.5 rounded-full', TONE_BAR[tone])} aria-hidden />
+      <span className={cn('h-1.5 w-1.5 rounded-full', chip.stale ? 'bg-border-strong' : TONE_BAR[tone])} aria-hidden />
       <span className="font-medium text-fg">{meter.label}</span>
-      <span className={cn('tabular-nums', TONE_TEXT[tone])}>{compactUsageText(meter)}</span>
+      <span className={cn('tabular-nums', chip.stale ? 'text-faint' : TONE_TEXT[tone])}>{chip.text}</span>
     </span>
   );
 }
 
-/** Compact chips for the top bar. Only the accounts that publish a window
- *  (Codex, Claude, Grok) earn a chip here — a subscription is what can run
- *  out mid-day. API-key providers are metered in Settings › Connected. */
-const TOP_BAR_ACCOUNTS = new Set(['codex', 'claude', 'xai']);
+/** Compact chips for the top bar: accounts that publish a limit window — a
+ *  subscription is what can run out mid-day. Accounts without a window are
+ *  metered in Settings › Connected. Chosen by what the meter reports, never
+ *  by a list of provider names. */
 export function ModelStatusChips() {
   const { meters, now } = useUsageMeters();
-  const shown = meters.filter((meter) => TOP_BAR_ACCOUNTS.has(meter.id));
+  const shown = meters.filter((meter) => meter.windows.length > 0);
   if (shown.length === 0) return null;
   return (
     <div className="hidden min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap lg:flex" data-testid="usage-chips">

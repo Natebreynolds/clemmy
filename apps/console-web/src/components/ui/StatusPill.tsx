@@ -51,3 +51,17 @@ export function StatusPill({
     </span>
   );
 }
+
+/** A category, not a state: where a conversation came from, what kind of
+ *  thing a row is. Neutral and icon-free, so warning amber and the live
+ *  orange only ever mean something about the work itself. */
+export function Tag({ children, className, title }: { children: React.ReactNode; className?: string; title?: string }) {
+  return (
+    <span
+      title={title}
+      className={cn('inline-flex items-center rounded-sm bg-subtle px-2 py-0.5 text-caption font-semibold text-muted', className)}
+    >
+      {children}
+    </span>
+  );
+}

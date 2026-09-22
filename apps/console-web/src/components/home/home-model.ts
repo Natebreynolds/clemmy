@@ -26,6 +26,25 @@ export interface HomeFeedItem extends CommandCenterItem {
   runId?: string;
   taskId?: string;
   targetRunId?: string;
+  /** Set on grouped workflow cards ("11 paused runs of …"). */
+  workflowName?: string;
+}
+
+/**
+ * Whether a parked run is already on the Needs-you pane. The Running pane
+ * leads with parked runs because some never reach the command centre, but a
+ * run that does was drawn twice on one Home ("daily-standup-email" under both
+ * headings, live 2026-09-22).
+ */
+export function parkedRunCoveredByNeedsYou(
+  entry: { runId?: string; sessionId?: string; headline?: string },
+  needsYou: readonly HomeFeedItem[],
+): boolean {
+  return needsYou.some((item) => (
+    (entry.runId && (item.runId === entry.runId || item.targetRunId === entry.runId))
+    || (entry.sessionId && item.targetSessionId === entry.sessionId)
+    || (item.kind === 'workflow-paused' && item.workflowName && item.workflowName === entry.headline)
+  ));
 }
 
 // ─── The shape of the window ───────────────────────────────────────────────
@@ -368,6 +387,9 @@ export function projectSubtitle(space: SpaceRecord): string {
 export function plainText(input?: string | null, max = 400): string {
   if (!input) return '';
   return input
+    // A leading emoji is a status icon standing in for the pane's own ("📅
+    // Reply needed", "✅ …"); the row already draws one.
+    .replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '')
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]*)`/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')

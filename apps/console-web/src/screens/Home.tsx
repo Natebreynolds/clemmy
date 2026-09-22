@@ -37,7 +37,7 @@ import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
-import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
+import { awayCounts, parkedRunCoveredByNeedsYou, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 
 const OPEN_THREAD_TIMEOUT_MS = 30_000;
 
@@ -151,6 +151,7 @@ function LiveHome() {
             key={id}
             headingId="home-running"
             view={workingView}
+            coveredByNeedsYou={(entry) => parkedRunCoveredByNeedsYou(entry, needsYou)}
             loading={workingNow.isLoading}
             error={workingNow.isError && !workingNow.data}
             onRetry={() => { void workingNow.refetch(); }}
