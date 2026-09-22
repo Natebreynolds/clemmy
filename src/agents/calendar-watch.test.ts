@@ -220,6 +220,7 @@ test('high-signal changes never ask Jev; a low-signal change asks once and a con
   assert.equal(tick.produced, 1, 'the cancellation surfaces regardless of Jev');
   assert.match(h.notified[0]!.title, /Cancelled: Meeting/);
   assert.equal(h.notified[0]!.metadata?.needsAttention, true);
+  assert.equal(h.notified[0]!.metadata?.inboxOnly, true, 'visible in the Needs-you feeds, never queued for external delivery');
   assert.equal(h.notified[0]!.metadata?.source, 'calendar-watch');
   // The vetoed change is remembered so the next tick does not ask again.
   const again = await processCalendarWatchTick({ ...h.deps, tickId: 'tick-3' });
@@ -314,6 +315,11 @@ test('a failed read keeps the snapshot, records the error, and is not a quiet ti
   assert.match(tick.summary, /Read failed/);
 });
 
+test('a watch notification is never silent (silent hides it from every feed)', () => {
+  const source = readFileSync(new URL('./calendar-watch.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /silent: true/);
+});
+
 test('the same mailbox connected twice yields one item, and an existing duplicate retires as duplicate_account', async () => {
   const invite = ev({ id: 'inv', myResponse: 'notResponded', attendeeCount: 3 });
   const notified: Array<{ id: string }> = [];
@@ -351,6 +357,9 @@ test('the same mailbox connected twice yields one item, and an existing duplicat
   state = legacy;
   const second = await processCalendarWatchTick({ ...deps, tickId: 'tick-2' });
   assert.equal(second.produced, 0);
+  assert.equal(second.duplicatesSuppressed, 1, 'the healed duplicate is counted on the tick');
+  assert.equal(second.quiet, false);
+  assert.equal(second.acknowledged, 0, 'a duplicate the watch marked read is not an acknowledgement');
   const dup = state.items['ca_two|invite_unanswered|inv']!;
   assert.equal(dup.retiredReason, 'duplicate_account');
   assert.ok(read.has('dup-notif'), 'the duplicate notification is marked read');

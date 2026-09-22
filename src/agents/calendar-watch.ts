@@ -558,9 +558,11 @@ export function buildCalendarWatchNotification(
     body: lines.filter(Boolean).join('\n'),
     createdAt: new Date(nowMs).toISOString(),
     read: false,
-    silent: true,
+    // Visible on the desktop and mobile Needs-you feeds, never queued for
+    // external delivery (a silent record is hidden from those feeds too).
     metadata: {
       needsAttention: true,
+      inboxOnly: true,
       source: 'calendar-watch',
       watch: 'calendar',
       itemKey: change.itemKey,
@@ -670,12 +672,22 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     }));
   }
 
-  // 2. Retire items whose state resolved; count acknowledgements. Two open
-  //    items for the same event under different accounts (one mailbox
-  //    connected twice) collapse to the earliest; the other retires as a
-  //    duplicate and its notification is marked read.
+  // 2a. Acknowledgements: an OPEN item whose notification the owner read.
+  //     Counted before the watch itself marks anything read below.
   let retired = 0;
   let acknowledged = 0;
+  for (const item of Object.values(state.items)) {
+    if (item.retiredAt || !item.notificationId || item.acknowledgedAt) continue;
+    if (deps.isNotificationRead(item.notificationId)) {
+      item.acknowledgedAt = new Date(nowMs).toISOString();
+      state.metrics.itemsAcknowledged += 1;
+      acknowledged += 1;
+    }
+  }
+  // 2b. Two open items for the same event under different accounts (one
+  //     mailbox connected twice) collapse to the earliest; the other retires
+  //     as a duplicate and its notification is marked read.
+  let healedDuplicates = 0;
   const openByEventKey = new Map<string, CalendarWatchItem>();
   for (const item of Object.values(state.items).sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
     if (item.retiredAt) continue;
@@ -685,17 +697,14 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     if (!kept) { openByEventKey.set(eventKey, item); continue; }
     item.retiredAt = new Date(nowMs).toISOString();
     item.retiredReason = 'duplicate_account';
-    state.metrics.duplicatesSuppressed += 1;
+    healedDuplicates += 1;
     if (item.notificationId && !deps.isNotificationRead(item.notificationId)) {
       try { deps.markNotificationRead(item.notificationId); } catch { /* retired either way */ }
     }
   }
+  state.metrics.duplicatesSuppressed += healedDuplicates;
+  // 2c. Retire items whose state resolved.
   for (const item of Object.values(state.items)) {
-    if (item.notificationId && !item.acknowledgedAt && deps.isNotificationRead(item.notificationId)) {
-      item.acknowledgedAt = new Date(nowMs).toISOString();
-      state.metrics.itemsAcknowledged += 1;
-      acknowledged += 1;
-    }
     if (item.retiredAt) continue;
     const reason = retirementReason(item, currentByAccount[item.accountId], nowMs);
     if (!reason) continue;
@@ -711,7 +720,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
   // 3. One item per change. Duplicates are suppressed by exact key (same
   //    account) and by event key (same event under another account), within
   //    the tick and against open items.
-  let duplicatesSuppressed = 0;
+  let duplicatesSuppressed = healedDuplicates;
   const candidates: CalendarWatchChange[] = [];
   const seenEventKeys = new Set<string>();
   const vetoedEventKeys = new Set(
@@ -733,7 +742,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     seenEventKeys.add(change.eventKey);
     candidates.push(change);
   }
-  state.metrics.duplicatesSuppressed += duplicatesSuppressed;
+  state.metrics.duplicatesSuppressed += duplicatesSuppressed - healedDuplicates;
 
   // 4. Jev decides whether a LOW-signal change matters. High-signal never asks.
   let judged = 0;
