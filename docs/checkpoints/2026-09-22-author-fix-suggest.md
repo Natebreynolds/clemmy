@@ -132,3 +132,45 @@ through two launches.
   `Digest check 2`, `Invite digest`, the suggested `Whats on my calendar
   today` (if the approval completed), and the plan proposal
   `plan-a1f3b23e`. Delete when done. Updater `pending` folder still held.
+
+## Second wave, same day: the human-in-the-loop contracts (`b7f93fc6` → `5220d8d1`)
+
+Owner's north star, recorded: Clem must create interactive workflows and
+workspaces for any scenario with any tools, linked to human replies,
+changes and updates. Fixture: a three-prospect outreach campaign
+(fictional contacts, drafts only, never a send), authored from one request
+in 13 min / 23 calls / 635k tokens, exercised on the installed app.
+
+| Contract | Before | After (installed `5220d8d1`) |
+|---|---|---|
+| A gated step performs what the reviewer approved | 3 `write_file` calls refused `coverage_missing`; run blocked; diagnosis said "no tool was called" | 3 draft files written after approval; a refused write is now named as a refusal |
+| A change note revises instead of cancelling | occurrence cancelled with the note; "re-run in chat" | note → `step_invalidated` → drafting step re-ran (28 s) → Jev revision check `applied` (0.77, 1.3 s) → gate asked again: "Revised per your note; the check confirmed it was applied" → approved → completed |
+| The reviewer reads a draft | raw JSON | numbered items, labelled lines, long text as paragraphs |
+| Any approval reads as a person would | `{"requirement_id":"cap:resolved:…","args_json":…}` | "Send message via Slack · Slack · SLACK_SEND_MESSAGE · Channel · Markdown text", raw call behind "Technical details" (desktop and mobile) |
+| The Space follows the workflow | tiles stuck at "Drafts saved 0 / Not drafted 3" | "Prospects 3 · Drafts saved 3 · Not drafted 0" with the draft on each card; the stale authored phone summary is dropped on a later commit |
+| What Clem sends anywhere shows on desktop and mobile | Slack post → "Workflow completed" only | every irreversible send mirrored as one in-app item (pinned; live proof owed: the test send is waiting on the owner's approval) |
+
+Commits: `9e77e697` (gate coverage, revision path, readable draft, truthful
+diagnosis), `d0235ba1` (send mirror), `6be305a7` (revision judge,
+approval presentation, Space re-projection), `178e896d` and `5220d8d1`
+(the judge in the one attempt wrapper; invalidation under the durable slug).
+Three live-found traps on the way: the agent-lane hook never saw the graph
+lane; the invalidation was written under the display name while the resume
+reads the slug; the tsc at the root passed where the build's tsc did not.
+
+Shell access, answered from code and the week's log: `run_shell_command`
+is core in chat, workers and steps (51 runs this week, 0 approval cards);
+cwd must be inside an allowed root; destructive shapes ask first
+(rm/mv/chmod/kill/sudo/package installs/redirection); hard blocks never
+approve (`rm -rf /` or home, sudo, shutdown, reboot, disk erase, `dd of=`,
+fork bombs, mkfs, recursive chmod/chown on root or home, Clem's own stores).
+A shell command wrapped in `work_call` is refused as effect-unknown with
+the direct tool named as the recovery.
+
+Still owed: the send mirror's live proof; a second scenario end to end
+(content calendar synced to a Space); mobile not driven; the Space dock
+session for chat-created Spaces (console 404s). Worker restored to
+claude-haiku-4-5 at 17:08Z. Fixtures to delete: workflows `Prospect
+outreach review`, `Digest check`, `Digest check 2`, `Invite digest`,
+`Whats on my calendar today`; Space `Prospect campaign`; plan proposal
+`plan-a1f3b23e`; the pending "Send Slack message" approval.
