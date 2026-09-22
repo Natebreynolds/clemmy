@@ -23,7 +23,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
-import { listVerifiedRunStrategies, type RunStrategyRecord } from '../memory/run-strategy-store.js';
+import { listVerifiedRunStrategies, overlapScore, strategyKeywords, type RunStrategyRecord } from '../memory/run-strategy-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { composioSlugLooksWellFormed } from '../integrations/composio/toolkit-slug.js';
@@ -138,16 +138,40 @@ export function collectRepeatObservations(now = new Date()): RepeatObservation[]
   ));
 }
 
-/** Every tool a saved workflow already runs (call.tool and allowedTools), upper-cased. */
-export function existingWorkflowTools(): Set<string> {
-  const out = new Set<string>();
-  for (const entry of listWorkflows()) {
+/** What a saved workflow already covers: the tools it runs (call.tool and
+ *  allowedTools, upper-cased) and the words it is about. */
+export interface ExistingWorkflowCoverage {
+  name: string;
+  tools: Set<string>;
+  keywords: string[];
+}
+
+export function existingWorkflowCoverage(): ExistingWorkflowCoverage[] {
+  return listWorkflows().map((entry) => {
+    const tools = new Set<string>();
     for (const step of entry.data.steps ?? []) {
-      if (step.call?.tool) out.add(step.call.tool.trim().toUpperCase());
-      for (const tool of step.allowedTools ?? []) out.add(tool.trim().toUpperCase());
+      if (step.call?.tool) tools.add(step.call.tool.trim().toUpperCase());
+      for (const tool of step.allowedTools ?? []) tools.add(tool.trim().toUpperCase());
     }
-  }
-  return out;
+    return {
+      name: entry.data.name,
+      tools,
+      keywords: strategyKeywords(`${entry.data.name} ${entry.data.description ?? ''} ${entry.data.goal?.objective ?? ''}`),
+    };
+  });
+}
+
+/** Coverage floor: the same relevance floor the strategy store uses to
+ *  recall a proven shape for an objective. */
+export const SUGGESTION_COVERAGE_OVERLAP = 0.34;
+
+/** A saved workflow covers a routine when it runs every work tool the
+ *  routine uses AND is about the same thing. Sharing one tool is not
+ *  coverage: a morning briefing that reads the calendar does not make
+ *  "what's on my calendar tomorrow" automated. */
+export function workflowCovers(workflow: ExistingWorkflowCoverage, workTools: readonly string[], objectiveKeywords: readonly string[]): boolean {
+  if (!workTools.every((tool) => workflow.tools.has(tool.trim().toUpperCase()))) return false;
+  return overlapScore(objectiveKeywords, workflow.keywords) >= SUGGESTION_COVERAGE_OVERLAP;
 }
 
 /** A tool that does work worth saving: a connected-provider operation or a
@@ -167,7 +191,7 @@ export function isWorkTool(tool: string): boolean {
 export function deriveSuggestionCandidates(input: {
   strategies: readonly Pick<RunStrategyRecord, 'id' | 'objective' | 'toolsUsed'>[];
   observations: readonly RepeatObservation[];
-  existingTools: ReadonlySet<string>;
+  existingWorkflows: readonly ExistingWorkflowCoverage[];
   isWorkTool?: (tool: string) => boolean;
   now?: Date;
 }): { candidates: SuggestionCandidate[]; covered: number } {
@@ -195,7 +219,8 @@ export function deriveSuggestionCandidates(input: {
     if (Date.parse(last.at) < recencyStart) continue;
     const workTools = strategy.toolsUsed.filter(workTool);
     if (workTools.length === 0) continue;
-    if (workTools.some((tool) => input.existingTools.has(tool.trim().toUpperCase()))) { covered += 1; continue; }
+    const objectiveKeywords = strategyKeywords(strategy.objective);
+    if (input.existingWorkflows.some((workflow) => workflowCovers(workflow, workTools, objectiveKeywords))) { covered += 1; continue; }
     candidates.push({
       strategyId: strategy.id,
       objective: strategy.objective,
@@ -304,7 +329,7 @@ export interface WorkflowSuggestionsDeps {
   policy: () => WorkflowSuggestionsPolicyView;
   observations: (now: Date) => RepeatObservation[];
   strategies: () => Pick<RunStrategyRecord, 'id' | 'objective' | 'toolsUsed'>[];
-  existingTools: () => Set<string>;
+  existingWorkflows: () => ExistingWorkflowCoverage[];
   isWorkTool: (tool: string) => boolean;
   /** Surface the proposal card; returns the plan proposal id. */
   surface: (candidate: SuggestionCandidate, name: string) => string;
@@ -322,7 +347,7 @@ export function productionWorkflowSuggestionsDeps(): WorkflowSuggestionsDeps {
     // Only what the user asked for in chat; a strategy learned inside a
     // workflow step is the host repeating itself.
     strategies: () => listVerifiedRunStrategies().filter((strategy) => (strategy.scope ?? 'chat') === 'chat'),
-    existingTools: existingWorkflowTools,
+    existingWorkflows: existingWorkflowCoverage,
     isWorkTool,
     surface: (candidate, name) => surfacePlan({
       plan: buildSuggestionPlan(candidate, name),
@@ -389,7 +414,7 @@ export function processWorkflowSuggestionsTick(
   const { candidates, covered } = deriveSuggestionCandidates({
     strategies: deps.strategies(),
     observations,
-    existingTools: deps.existingTools(),
+    existingWorkflows: deps.existingWorkflows(),
     isWorkTool: deps.isWorkTool,
     now: started,
   });

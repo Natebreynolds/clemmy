@@ -18,7 +18,7 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 const {
   deriveSuggestionCandidates, processWorkflowSuggestionsTick, emptyWorkflowSuggestionsState,
-  suggestedWorkflowName, buildSuggestionPlan, isWorkTool, workflowSuggestionsStatus,
+  suggestedWorkflowName, buildSuggestionPlan, isWorkTool, workflowSuggestionsStatus, workflowCovers,
   SUGGESTION_MIN_TURNS, SUGGESTION_PENDING_EXPIRY_DAYS, SUGGESTION_DECLINE_COOLDOWN_DAYS,
 } = await import('./workflow-suggestions.js');
 import type { RepeatObservation, WorkflowSuggestionsDeps, WorkflowSuggestionsState, SuggestionCandidate } from './workflow-suggestions.js';
@@ -48,7 +48,12 @@ test('a request repeated on several days with a real work tool is a candidate; m
   ];
   const { candidates, covered } = deriveSuggestionCandidates({
     strategies, observations, now: NOW, isWorkTool: work,
-    existingTools: new Set(['SALESFORCE_SF_SOQL_QUERY']),
+    existingWorkflows: [
+      // Covers the salesforce routine: same tools, same subject.
+      { name: 'Tim in Salesforce check', tools: new Set(['SALESFORCE_SF_SOQL_QUERY', 'OUTLOOK_GET_CALENDAR_VIEW']), keywords: ['tim', 'salesforce', 'check'] },
+      // Shares the calendar read but is about something else: NOT coverage.
+      { name: 'Morning briefing', tools: new Set(['OUTLOOK_GET_CALENDAR_VIEW', 'GMAIL_FETCH_EMAILS']), keywords: ['morning', 'briefing', 'inbox', 'summary'] },
+    ],
   });
   assert.deepEqual(candidates.map((c) => c.strategyId), ['strat-cal'], 'only the calendar routine qualifies');
   assert.equal(covered, 1, 'the salesforce routine is already covered by a saved workflow');
@@ -60,6 +65,14 @@ test('a request repeated on several days with a real work tool is a candidate; m
   assert.equal(cal.latestSourceUserSeq, 200);
   assert.deepEqual(cal.workTools, ['outlook_get_calendar_view']);
   assert.ok(SUGGESTION_MIN_TURNS >= 3);
+});
+
+test('coverage needs every work tool AND the same subject; one shared tool is not coverage', () => {
+  const routine = ['outlook_get_calendar_view'];
+  const words = ['whats', 'calendar', 'tomorrow'];
+  assert.equal(workflowCovers({ name: 'Tomorrow calendar', tools: new Set(['OUTLOOK_GET_CALENDAR_VIEW']), keywords: ['tomorrow', 'calendar', 'read'] }, routine, words), true);
+  assert.equal(workflowCovers({ name: 'Morning briefing', tools: new Set(['OUTLOOK_GET_CALENDAR_VIEW']), keywords: ['morning', 'briefing', 'inbox'] }, routine, words), false, 'same tool, different subject');
+  assert.equal(workflowCovers({ name: 'Tomorrow plan', tools: new Set(['GOOGLECALENDAR_LIST_EVENTS']), keywords: ['tomorrow', 'calendar'] }, routine, words), false, 'same subject, different tool');
 });
 
 test('the suggested name is the user\'s own words as a title; the plan is one workflow_from_session step', () => {
@@ -95,7 +108,7 @@ function makeDeps(overrides: Partial<WorkflowSuggestionsDeps> = {}): { deps: Wor
     policy: () => ({ enabled: true, cadenceMinutes: 360, quietHoursActive: false }),
     observations: () => [obs('strat-cal', 0), obs('strat-cal', 0, 'sess-cal-b', 200), obs('strat-cal', 1), obs('strat-sf', 0), obs('strat-sf', 3), obs('strat-sf', 5)],
     strategies: () => strategies,
-    existingTools: () => new Set(),
+    existingWorkflows: () => [],
     isWorkTool: work,
     surface: (candidate, name) => { surfaced.push({ candidate, name }); const id = `plan-${surfaced.length}`; statuses.set(id, 'pending'); return id; },
     proposalStatus: (id) => statuses.get(id) ?? 'missing',

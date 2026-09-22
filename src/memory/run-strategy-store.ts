@@ -111,7 +111,7 @@ function writeStore(file: StrategyFile): void {
   renameSync(tmp, STORE_FILE);
 }
 
-function overlapScore(a: string[], b: string[]): number {
+export function overlapScore(a: readonly string[], b: readonly string[]): number {
   if (a.length === 0 || b.length === 0) return 0;
   const setB = new Set(b);
   const hits = a.filter((w) => setB.has(w)).length;
