@@ -202,7 +202,7 @@ test('a durable manifest without a current independent observer remains unavaila
     ok: false,
     recoverable: true,
     reason: 'not-connected',
-    message: `No current capability is registered for "${operationId}". Connect it, then retry.`,
+    message: `No current capability is registered for "${operationId}". Connect it, then retry. (1 durable manifest(s), 0 registered, refused: missing)`,
   });
   assert.equal(factory.snapshot().length, 0, 'durable bytes alone do not materialize authority');
   assert.equal(providerBodies, 0);

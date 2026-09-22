@@ -461,7 +461,7 @@ import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/to
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { modelRoleOptionCatalogSnapshot, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
 import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/harness/codex-rescue-settings.js';
-import { modelDiscoveryStatus } from '../runtime/harness/model-discovery.js';
+import { modelDiscoveryStatus, refreshModelDiscoveryNow } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
@@ -15317,6 +15317,8 @@ export function registerConsoleRoutes(
     try {
       const result = await loginWithNativeOAuth();
       if (result.ok) {
+        void refreshModelDiscoveryNow('openai'); // list what the subscription can run, now
+
         // Clear in-app confirmation (the button label flips for only ~2s and is
         // easy to miss). Also clears the 'codex-auth-revoked' alert's relevance.
         try {
@@ -15364,6 +15366,8 @@ export function registerConsoleRoutes(
     try {
       const result = await pollCodexDeviceLogin(loginId);
       if (result.status === 'complete') {
+        void refreshModelDiscoveryNow('openai');
+
         try {
           addNotification({
             id: `codex-reauth-success-${new Date().toISOString()}`,
@@ -15500,6 +15504,7 @@ export function registerConsoleRoutes(
       claudeLoginFlows.delete(flowId);
       resetHarnessRuntimeConfig(); // re-register the Claude provider on the next run
       resetClaudeModelCache(); // drop the cached (pre-login) token so the new grant takes effect immediately
+      void refreshModelDiscoveryNow('anthropic'); // the picker lists what this subscription can run, now
       res.json({ ok: true, snapshot: getClaudeAuthSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });

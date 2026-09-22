@@ -18,6 +18,7 @@
  */
 import { getRuntimeEnv, getOpenAiApiKey } from '../../config.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { getStoredCodexOAuthTokens } from '../auth-store.js';
 
 export interface DiscoveredModel { id: string; label: string }
 
@@ -194,7 +195,73 @@ async function discoverAnthropic(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/** The Codex backend lists the models a SUBSCRIPTION can run, filtered by the
+ *  calling client's version (an old client sees an empty list). The catalog
+ *  asks as the newest possible client so a model that has landed is listed;
+ *  dispatch still identifies as the real client and the provider decides at
+ *  call time. Listing is metadata: no completion is requested. */
+export const CODEX_MODEL_CATALOG_URL = 'https://chatgpt.com/backend-api/codex/models';
+export const CODEX_MODEL_CATALOG_CLIENT_VERSION = '9.9.9';
+
+export interface CodexCatalogModel { slug?: string; visibility?: string; priority?: number; display_name?: string }
+
+/** Pure: the backend's rows → picker choices. Hidden rows (review-only,
+ *  reserved) stay out; the backend's own priority orders the rest. */
+export function filterCodexCatalogModels(rows: readonly CodexCatalogModel[]): DiscoveredModel[] {
+  return rows
+    .filter((row): row is CodexCatalogModel & { slug: string } => typeof row?.slug === 'string' && row.slug.trim().length > 0)
+    .filter((row) => (row.visibility ?? 'list') === 'list')
+    .sort((a, b) => (a.priority ?? Number.MAX_SAFE_INTEGER) - (b.priority ?? Number.MAX_SAFE_INTEGER) || a.slug.localeCompare(b.slug))
+    .map((row) => ({ id: row.slug, label: labelForModelId(row.slug, row.display_name) }));
+}
+
+function codexAccountIdFromJwt(token: string): string {
+  try {
+    const payload = token.split('.')[1] ?? '';
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
+    const auth = claims['https://api.openai.com/auth'] as { chatgpt_account_id?: unknown } | undefined;
+    return typeof auth?.chatgpt_account_id === 'string' ? auth.chatgpt_account_id : '';
+  } catch { return ''; }
+}
+
+type CodexSubscription = { accessToken: string; accountId: string };
+let codexSubscription: () => CodexSubscription | null = () => {
+  const token = getStoredCodexOAuthTokens()?.accessToken?.trim();
+  if (!token) return null;
+  const accountId = codexAccountIdFromJwt(token);
+  return accountId ? { accessToken: token, accountId } : null;
+};
+
+async function discoverCodexSubscription(): Promise<DiscoveredModel[]> {
+  const subscription = codexSubscription();
+  if (!subscription) return [];
+  const body = await fetchJson(`${CODEX_MODEL_CATALOG_URL}?client_version=${CODEX_MODEL_CATALOG_CLIENT_VERSION}`, {
+    authorization: `Bearer ${subscription.accessToken}`,
+    'chatgpt-account-id': subscription.accountId,
+    originator: 'codex_cli_rs',
+    'user-agent': `Codex/${CODEX_MODEL_CATALOG_CLIENT_VERSION}`,
+    accept: 'application/json',
+  }) as { models?: CodexCatalogModel[] };
+  return filterCodexCatalogModels(body.models ?? []);
+}
+
+/** OpenAI choices are the union of what an API key can see and what a Codex
+ *  subscription can run; each source fails open on its own so one outage
+ *  never hides the other's models. */
 async function discoverOpenAi(): Promise<DiscoveredModel[]> {
+  const settled = await Promise.allSettled([discoverOpenAiViaApiKey(), discoverCodexSubscription()]);
+  const merged: DiscoveredModel[] = [];
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') continue;
+    for (const model of result.value) if (!merged.some((m) => m.id === model.id)) merged.push(model);
+  }
+  if (merged.length === 0 && settled.some((r) => r.status === 'rejected')) {
+    throw (settled.find((r) => r.status === 'rejected') as PromiseRejectedResult).reason;
+  }
+  return merged;
+}
+
+async function discoverOpenAiViaApiKey(): Promise<DiscoveredModel[]> {
   const key = getOpenAiApiKey().trim(); // env → file vault (the daemon's real key)
   if (!key) return [];
   const body = await fetchJson('https://api.openai.com/v1/models', { authorization: `Bearer ${key}` }) as { data?: Array<{ id?: string }> };
@@ -203,7 +270,7 @@ async function discoverOpenAi(): Promise<DiscoveredModel[]> {
 }
 
 function providerHasDiscoveryCredential(provider: ProviderName): boolean {
-  if (provider === 'openai') return Boolean(getOpenAiApiKey().trim());
+  if (provider === 'openai') return Boolean(getOpenAiApiKey().trim()) || codexSubscription() !== null;
   const apiKey = (getRuntimeEnv('ANTHROPIC_API_KEY', '') ?? '').trim();
   return Boolean(apiKey || getStoredClaudeTokens()?.accessToken);
 }
@@ -320,6 +387,45 @@ export function discoveredModels(): { anthropic: DiscoveredModel[]; openai: Disc
 export function modelDiscoveryStatus(): ModelDiscoveryStatus {
   ensureRefresh();
   return statusSnapshot();
+}
+
+/** A sign-in just landed (or a sign-out): drop the provider's lease so the
+ *  next read lists what the NEW credential can see, and start that read now
+ *  instead of at the next picker visit. Never throws. */
+export async function refreshModelDiscoveryNow(provider?: ProviderName): Promise<void> {
+  // ensureRefresh coalesces onto whatever is in flight and adds no targets to
+  // it; let that pass finish so this provider's read actually starts.
+  if (refreshInFlight) { try { await refreshInFlight; } catch { /* fail-open */ } }
+  const targets: ProviderName[] = provider ? [provider] : ['anthropic', 'openai'];
+  for (const name of targets) {
+    if (cache[name].phase === 'refreshing') continue;
+    cache[name] = { ...cache[name], phase: 'idle' };
+  }
+  const pending = ensureRefresh();
+  if (pending) await pending;
+}
+
+let heartbeat: ReturnType<typeof setInterval> | null = null;
+
+/** Models land between picker visits. A daemon-lifetime tick at the catalog's
+ *  own lease keeps the cache within one lease of the provider, so the next
+ *  picker paint lists a model that dropped while the app sat open. Idempotent;
+ *  the timer never holds the process open. */
+export function startModelDiscoveryHeartbeat(intervalMs = TTL_MS): () => void {
+  if (heartbeat) return () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null; } };
+  heartbeat = setInterval(() => { ensureRefresh(); }, Math.max(10, intervalMs));
+  heartbeat.unref?.();
+  return () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null; } };
+}
+
+/** Test-only: pretend a Codex subscription is (or is not) signed in. */
+export function _setCodexSubscriptionForTest(next: (() => CodexSubscription | null) | null): void {
+  codexSubscription = next ?? (() => {
+    const token = getStoredCodexOAuthTokens()?.accessToken?.trim();
+    if (!token) return null;
+    const accountId = codexAccountIdFromJwt(token);
+    return accountId ? { accessToken: token, accountId } : null;
+  });
 }
 
 /** Daemon-boot warmup. Waits only up to the caller's small startup budget; an

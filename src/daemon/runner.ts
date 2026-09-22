@@ -26,7 +26,7 @@ import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, ge
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
-import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
+import { startModelDiscoveryHeartbeat, warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks, listBackgroundTasks } from '../execution/background-tasks.js';
@@ -2160,6 +2160,7 @@ export async function startDaemon(
     },
     'Model catalog discovery initialized',
   );
+  startModelDiscoveryHeartbeat();
   // BYO catalog warm (fire-and-forget): providers that publish context_length
   // on /v1/models (Together, Moonshot) get their windows recorded as durable
   // observations at startup, so window budgeting runs on provider evidence
