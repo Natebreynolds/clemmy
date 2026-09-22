@@ -405,6 +405,10 @@ export interface ModelUsageAttributionContext {
   sessionId: string;
   sourceUserSeq: number;
   attemptId?: string;
+  /** Call-site lane for rows the SDK emits without one (a judge lane such as
+   * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
+   * `unknown / other` with no lane, so nothing about them could be ranked. */
+  channel?: string;
 }
 
 /**
@@ -506,7 +510,8 @@ export function recordModelUsage(args: {
   try {
     sessionRowKind = getSession(source)?.kind;
   } catch { /* classification falls back to channel/prefix evidence */ }
-  const resolution = resolveUsageKind(source, { channel: args.channel, sessionRowKind });
+  const channel = args.channel ?? attribution?.channel;
+  const resolution = resolveUsageKind(source, { channel, sessionRowKind });
   const canonical = canonicalCacheAccounting(args);
   const hasExactAcceptedSource = source !== 'unknown'
     && Number.isSafeInteger(sourceUserSeq)
@@ -548,7 +553,7 @@ export function recordModelUsage(args: {
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
-    channel: args.channel,
+    channel,
     ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,

@@ -1,4 +1,5 @@
 import { classifyModelError } from './resilient-model.js';
+import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
@@ -935,8 +936,15 @@ export async function runHedgedJudge<T>(
     const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
     routing = resolveBoundaryJudge(opts.boundaryJudgeSelection);
     const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
-    const attempt = (r: BoundaryJudgeRouting) => () => runRoutedJudgeAttempt(
-      r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
+    // Every attempt is attributed to its lane so the usage log can rank judge
+    // spend per lane; the turn's own session/source attribution is preserved.
+    const inherited = modelUsageAttributionStorage.getStore();
+    const attempt = (r: BoundaryJudgeRouting) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
+      { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
+        ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}` },
+      () => runRoutedJudgeAttempt<T>(
+        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
+      ),
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
