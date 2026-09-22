@@ -172,11 +172,13 @@ export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'tool_output_query',
   'recall_tool_result',
   // Live 282184: a proven calendar strategy matched "create a workflow…";
-  // the thinned surface had no door to ANY local tool — tool_search found
+  // the thinned surface had no door to authoring — tool_search found
   // workflow_create (carrier call_tool) and nothing could call it, so the
-  // turn ended on a placeholder question. A remembered operation is a
-  // shortcut, never the whole tool universe: the generic local door stays.
-  'call_tool',
+  // turn ended on a placeholder question. The native authoring tools stay
+  // first-class through a proven skip. call_tool does NOT: live 283712, with
+  // call_tool on the surface, the brain wrapped the proven read through it
+  // and spent a 26 s frame on a 7 ms refusal (98 s model time vs 48 s).
+  ...NATIVE_PRODUCT_AUTHORING_TOOLS,
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {

@@ -507,6 +507,26 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
   if (inFlight) return inFlight;
   const nowMs = Date.now();
   const tickId = newTickId(nowMs);
+  // A home with no calendar connected is quiet, not failing: no read to
+  // retry every five minutes, no error on the card. Live (blank home): the
+  // first tick reported "Read failed" and armed the failed-read retry.
+  if (connectedCalendarOperations().length === 0) {
+    const state = loadCalendarWatchState();
+    const finding: CalendarWatchState['lastFinding'] = {
+      tickId, at: new Date(nowMs).toISOString(), source: options.source, durationMs: 0,
+      accounts: 0, events: 0, changes: 0, produced: 0, vetoed: 0, retired: 0, quiet: true, readFailures: 0,
+      summary: 'No calendar connected yet (connect Outlook or Google Calendar to start watching).',
+    };
+    state.lastTickAt = finding.at;
+    state.lastFinding = finding;
+    state.metrics.ticks += 1;
+    state.metrics.quietTicks += 1;
+    saveCalendarWatchState(state);
+    return Promise.resolve({
+      ...finding,
+      items: [], changesByKind: {}, judged: 0, duplicatesSuppressed: 0, acknowledged: 0, failures: [], seenEvents: [],
+    } as CalendarWatchTickResult);
+  }
   const run = processCalendarWatchTick({
     now: () => Date.now(),
     tickId,

@@ -114,9 +114,16 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   assert.equal(thinned.has('recall_tool_result'), true);
   assert.equal(thinned.has('check_in'), false);
   // Live 282184: a proven calendar strategy matched an authoring request and
-  // the thinned surface had no door to any local tool; the turn ended on a
-  // placeholder question. The generic local door survives a proven skip.
-  assert.equal(applyProvenSkipToHotSet(new Set([...hot, 'call_tool'])).has('call_tool'), true, 'call_tool stays callable after a proven skip');
+  // the thinned surface had no door to authoring; the turn ended on a
+  // placeholder question. The native authoring tools survive a proven skip.
+  // call_tool does not (live 283712: the brain wrapped the proven read
+  // through it and lost a frame).
+  // (call_tool is not an always-loaded kernel tool; the orchestrator keeps it
+  // off the assembled surface on a proven turn — see applyProvenSkip callers.)
+  const withDoors = applyProvenSkipToHotSet(new Set([...hot, 'workflow_create', 'workflow_update', 'workflow_set_enabled', 'space_save']));
+  for (const name of ['workflow_create', 'workflow_update', 'workflow_set_enabled', 'space_save']) {
+    assert.equal(withDoors.has(name), true, `${name} stays callable after a proven skip`);
+  }
   for (const name of PROVEN_SKIP_KEEP_LOADED) {
     if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
   }

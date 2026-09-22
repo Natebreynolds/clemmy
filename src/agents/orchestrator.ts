@@ -4014,11 +4014,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // as a result handle) and the surface offered no door back to discovery,
     // so the turn burned 13 identical query frames and ended blocked. A
     // remembered operation is a shortcut, never the whole tool universe.
-    // Live 282184: without call_tool a proven turn could not reach any local
-    // tool a search disclosed (workflow_create, carrier call_tool) and ended
-    // on a placeholder question. The door stays; the proven note still says
-    // to call the remembered operation directly.
-    ...(callTool ? [callTool] : []),
+    // Live 283712: with call_tool on a proven turn the brain wrapped the
+    // remembered read through it and lost a frame; the authoring dead end
+    // (live 282184) is closed by keeping the native authoring tools first-class
+    // through the proven skip instead (tool-catalog PROVEN_SKIP_KEEP_LOADED).
+    ...((callTool && !skipDiscoverySearch) ? [callTool] : []),
     ...nonStructuralDiscovery,
   ]);
   searchFirstClassCount = assembledTools.length;
