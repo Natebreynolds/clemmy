@@ -113,17 +113,13 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   assert.equal(thinned.has('tool_output_query'), true);
   assert.equal(thinned.has('recall_tool_result'), true);
   assert.equal(thinned.has('check_in'), false);
-  // Live 282184: a proven calendar strategy matched an authoring request and
-  // the thinned surface had no door to authoring; the turn ended on a
-  // placeholder question. The native authoring tools survive a proven skip.
-  // call_tool does not (live 283712: the brain wrapped the proven read
-  // through it and lost a frame).
-  // (call_tool is not an always-loaded kernel tool; the orchestrator keeps it
-  // off the assembled surface on a proven turn — see applyProvenSkip callers.)
-  const withDoors = applyProvenSkipToHotSet(new Set([...hot, 'workflow_create', 'workflow_update', 'workflow_set_enabled', 'space_save']));
-  for (const name of ['workflow_create', 'workflow_update', 'workflow_set_enabled', 'space_save']) {
-    assert.equal(withDoors.has(name), true, `${name} stays callable after a proven skip`);
-  }
+  // Live 284195: with the authoring tools kept through a proven skip, a plain
+  // calendar question started with workflow_create. A proven surface carries
+  // no authoring door; a weak strategy match no longer thins the surface at
+  // all (proven-operation.ts).
+  const withDoors = applyProvenSkipToHotSet(new Set([...hot, 'workflow_create', 'space_save']));
+  assert.equal(withDoors.has('workflow_create'), false);
+  assert.equal(withDoors.has('space_save'), false);
   for (const name of PROVEN_SKIP_KEEP_LOADED) {
     if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
   }

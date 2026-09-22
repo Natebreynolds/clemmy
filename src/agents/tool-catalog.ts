@@ -14,8 +14,8 @@
  * orchestrator or the runtime tool registry.
  */
 import { getRuntimeEnv } from '../config.js';
-import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
+import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
@@ -171,14 +171,13 @@ export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'tool_search',
   'tool_output_query',
   'recall_tool_result',
-  // Live 282184: a proven calendar strategy matched "create a workflow…";
-  // the thinned surface had no door to authoring — tool_search found
-  // workflow_create (carrier call_tool) and nothing could call it, so the
-  // turn ended on a placeholder question. The native authoring tools stay
-  // first-class through a proven skip. call_tool does NOT: live 283712, with
-  // call_tool on the surface, the brain wrapped the proven read through it
-  // and spent a 26 s frame on a 7 ms refusal (98 s model time vs 48 s).
-  ...NATIVE_PRODUCT_AUTHORING_TOOLS,
+  // Live 282184: a proven calendar strategy matched "create a workflow…" and
+  // the thinned surface had no door to authoring. Neither call_tool (live
+  // 283712: the brain wrapped the proven read through it, 98 s vs 48 s) nor
+  // the authoring tools (live 284195: a plain calendar question started with
+  // workflow_create) belong on a proven surface. The fix is upstream: a
+  // strategy that covers only a sliver of the request no longer thins the
+  // surface at all (proven-operation.ts, strongMatch).
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {

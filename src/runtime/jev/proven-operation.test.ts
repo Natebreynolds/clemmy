@@ -273,3 +273,16 @@ test('the authoring line names only real operations: bound slugs first, else too
   const noSchema = renderProvenOperationGuidance(base, {}, [{ tool: 'work_call', args: {} }]);
   assert.doesNotMatch(noSchema, /If this becomes a saved workflow/);
 });
+
+test('a strategy thins the surface only when it covers the request, not when it merely touches it', async () => {
+  const { provenStrategyCoversRequest } = await import('./proven-operation.js');
+  const { strategyKeywords } = await import('../../memory/run-strategy-store.js');
+  const calendar = { keywords: strategyKeywords('whats on my calendar tomorrow') };
+  assert.equal(provenStrategyCoversRequest('whats on my calendar tomorrow', calendar), true, 'the same short request is covered');
+  assert.equal(provenStrategyCoversRequest('calendar tomorrow please', calendar), true);
+  // Live 282184: an authoring request mentioning the calendar once.
+  assert.equal(provenStrategyCoversRequest(
+    "Create a workflow named 'Invite digest'. Steps: read my Outlook calendar for the next 24 hours, draft a short digest of invites awaiting my reply, ask me to review the draft before saving it to a file. Manual trigger only.",
+    calendar,
+  ), false, 'a sliver of a long request is not coverage');
+});

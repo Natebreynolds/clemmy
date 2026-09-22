@@ -8,7 +8,7 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyKeywords, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { readActiveToolSurface } from '../../memory/active-tool-surface.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
@@ -388,6 +388,22 @@ function toolSignature(tools: readonly string[]): string {
  * Several matches that used the same tools are the same job (today vs
  * tomorrow calendar). Jev is only needed when proven tools disagree.
  */
+export const PROVEN_SKIP_MIN_REQUEST_COVERAGE = 0.34;
+
+/** Does the strategy cover the request, not merely touch it? The store's
+ *  recall score is containment of the SHORTER keyword list, so a two-word
+ *  strategy matches any longer request that mentions one of its words. The
+ *  skip (a thinned surface) needs the strategy to cover the request's own
+ *  words: all of a short request, a third of a long one. */
+export function provenStrategyCoversRequest(query: string, strategy: Pick<RunStrategyRecord, 'keywords'>): boolean {
+  const words = strategyKeywords(query);
+  if (words.length === 0) return true;
+  const known = new Set(strategy.keywords);
+  const covered = words.filter((word) => known.has(word)).length;
+  if (words.length <= 3) return covered >= words.length;
+  return covered / words.length >= PROVEN_SKIP_MIN_REQUEST_COVERAGE;
+}
+
 export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): RunStrategyRecord | null {
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0]!.strategy;
@@ -523,7 +539,11 @@ export async function prepareProvenOperationForRequest(input: {
         if (provisioned.ok) published = publishedProvenOperations(composioSlugs);
       }
       const bound = bindPublishedSkip(published);
-      skipDiscoverySearch = bound.skipDiscoverySearch;
+      // A strategy that covers only a sliver of the request may still be
+      // called directly, but it never thins the surface: live 282184 a
+      // two-word calendar strategy matched "create a workflow… calendar…"
+      // and the thinned surface had no door to authoring.
+      skipDiscoverySearch = bound.skipDiscoverySearch && provenStrategyCoversRequest(input.query, strategy);
       capabilityRefs = bound.capabilityRefs;
       descriptors = bound.descriptors;
       invocations = bound.invocations;
