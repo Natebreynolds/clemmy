@@ -341,7 +341,17 @@ ahead of `origin/main`, none behind, none pushed by this session):
   carry pre-existing failures (`host-turn-runner` 37, `loop` 8,
   `rubric-characterization` 6, planning-card recovery 5, …), and the
   handful that only failed under the suite's load (cross-process spawns,
-  watchdog file retirements) pass alone. Journeys: see the line below.
+  watchdog file retirements) pass alone.
+- **Journeys** (`npm run journeys`, alone on an idle machine, 10.8 min):
+  174 tests, 131 pass, 43 fail on the release runtime, against 166 / 130 /
+  36 at v3.18.19 in a worktree. Every name failing at HEAD either fails at
+  the tag by name or belongs to
+  `northstar-local-llm-content-workspace.host-e2e.test.ts`, which fails as
+  a whole file at the tag and per test at HEAD (`plan_incomplete_missing_write`,
+  a local-LLM + Firecrawl journey). One journey that failed at the tag
+  passes now. **No journey regression.** Under load the run dies on a
+  watchdog retirement of `balanced-user-stops-ordinary-channel`; run
+  journeys alone.
 - **Installed proof**: the sealed 3.18.19 bundle runs daemon `a7099a68`
   (hotpatched, launched by path). Live on it: calendar read, Space update
   from the dock, workflow listing — one accepted source and one terminal
