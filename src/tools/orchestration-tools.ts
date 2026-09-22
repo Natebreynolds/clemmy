@@ -1667,14 +1667,34 @@ export function registerOrchestrationTools(server: McpServer): void {
             + (specialist.maxTurns !== undefined ? ` maxTurns=${specialist.maxTurns}` : ''),
           `      prompt: ${JSON.stringify(specialist.prompt)}`,
         ]) ?? [];
+        // The AUTHORABLE shape of a non-prompt step, exactly as workflow_create
+        // takes it. Live 2026-09-22: the full view showed a call step as
+        // "allowed tools: … · side-effect: write" over an empty prompt, so a
+        // brain reading an example workflow re-read the same step five times
+        // (section=full, step=<id>, section=metadata) and still never saw the
+        // call args or the approval flag it wanted to copy.
+        const callLine = stp.call
+          ? `    call: ${JSON.stringify({ tool: stp.call.tool, ...(stp.call.args ? { args: stp.call.args } : {}) })}`
+          : '';
+        const approvalLine = stp.requiresApproval
+          ? `    requiresApproval: true${stp.approvalPreview ? ` approvalPreview: ${JSON.stringify(stp.approvalPreview)}` : ''}`
+          : '';
+        const inputsLine = stp.inputs && Object.keys(stp.inputs).length > 0 ? `    inputs: ${JSON.stringify(stp.inputs)}` : '';
+        const outputLine = stp.output ? `    output: ${JSON.stringify(stp.output)}` : '';
+        const loopLine = stp.loopSafe ? '    loopSafe: true' : '';
+        const hasPrompt = (stp.prompt ?? '').trim().length > 0;
         return [
           `  ${stp.id}${deps}${project}${model}${forEach}${subgraph}${det}`,
           sourcesLine,
           runnerLine,
+          callLine,
+          approvalLine,
+          inputsLine,
+          outputLine,
+          loopLine,
           transformLine,
           ...specialistLines,
-          '    prompt:',
-          numbered,
+          ...(hasPrompt ? ['    prompt:', numbered] : (stp.call || stp.transform || stp.deterministic ? [] : ['    prompt:', numbered])),
         ].filter(Boolean).join('\n');
       };
       // step=<id> targeting: when a workflow is large, read just one step in full.

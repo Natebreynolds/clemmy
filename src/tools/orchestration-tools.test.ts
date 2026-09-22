@@ -542,6 +542,35 @@ test('workflow_create accepts durable resources separately from run inputs and w
   assert.match(text, /Inputs:\n  \(none\)/);
 });
 
+test('workflow_get full view shows the authorable shape of a gated call step in one read', async () => {
+  // Live 2026-09-22: a brain authoring a review-gated workflow read the
+  // example fixture five times and never saw its call args or approval flag.
+  const result = await workflowCreate()({
+    name: 'gated-call-wf',
+    description: 'Draft then save after review.',
+    steps: [
+      { id: 'draft', prompt: 'Draft three lines.', sideEffect: 'read' },
+      {
+        id: 'save',
+        dependsOn: ['draft'],
+        call: { tool: 'write_file', args: { path: '/tmp/gated-call-wf.txt', content: '{{steps.draft.output}}', mode: 'overwrite' } },
+        requiresApproval: true,
+        approvalPreview: 'Review the draft before it is saved.',
+        sideEffect: 'write',
+      },
+    ],
+  });
+  assert.match(resultText(result), /Created workflow "gated-call-wf"/);
+  const text = resultText(await workflowGet()({ name: 'gated-call-wf' }));
+  assert.match(text, /save \(depends on: draft\)/);
+  assert.match(text, /call: \{"tool":"write_file","args":\{"path":"\/tmp\/gated-call-wf\.txt"/);
+  assert.match(text, /requiresApproval: true approvalPreview: "Review the draft before it is saved\."/);
+  // A call step has no prompt; the view no longer prints an empty numbered prompt for it.
+  assert.doesNotMatch(text, /call: \{"tool":"write_file"[^\n]*\n(?:[^\n]*\n){0,3}\s+prompt:\n\s+1\t\n/);
+  // The prompt step keeps its line-numbered prompt.
+  assert.match(text, /draft\n[\s\S]*prompt:\n\s+1\tDraft three lines\./);
+});
+
 test('workflow_get metadata section is structurally selectable and omits large step prompts', async () => {
   const promptSentinel = 'FULL-PROMPT-MUST-NOT-ENTER-METADATA';
   writeWorkflow('bounded-metadata-read', {
