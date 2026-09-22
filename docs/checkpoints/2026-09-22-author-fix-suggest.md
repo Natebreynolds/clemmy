@@ -379,3 +379,22 @@ ahead of `origin/main`, none behind, none pushed by this session):
   (`checkpoint-process` tests, `constraint-guard.test.ts`,
   `balanced-user-stops-ordinary-channel.acceptance.test.ts` in journeys);
   run them alone if a run dies there.
+
+## Addendum, 23:35Z: the "team Slack update failed" that was not one
+
+The owner reported a failed team Slack update while the other agent's
+build (`7eb11623`) was running. The 16:00 PT run had posted to Slack at
+23:01:19Z (goal judge 2/2, report-back with every number). What the owner
+saw was "Workflow update required: team-activity-slack-updates did not
+start", raised at 23:06:26Z, nine seconds after that daemon came up, for a
+catch-up occurrence blocked on **2026-09-01**. The boot reconcile of
+legacy readiness holds inspected six such records (four for this workflow,
+two for friday-dashboard-daily-refresh, all with dozens of later successful
+runs) on every launch and re-ensured their notices: 18 launches, 18
+re-announcements. Fixed in the commit after `e5782c75`: a hold whose
+workflow completed after the block is stamped retired, its notices are
+read, and it is never inspected again. Pinned. The six notices in the
+owner's home were marked read by hand; the retirement stamps land on the
+first launch of a build carrying the fix. Tag owner: this commit is on
+`main` and rides with the tag; it changes only the scheduler's boot
+reconcile and its pin.
