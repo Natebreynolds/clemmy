@@ -23,8 +23,7 @@ import {
   type SpaceRecord,
 } from '../spaces/store.js';
 import {
-  readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit,
-} from '../spaces/data-store.js';
+  readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
   bootstrapWorkspaceObservationHistory,
   commitWorkspaceObservationBatch,
@@ -304,7 +303,7 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
 const CLEM_VIEW_DATA_SEED = (slug: string): string => {
   let json: string | undefined;
   try {
-    json = JSON.stringify(readData(slug));
+    json = JSON.stringify(readViewData(slug));
   } catch { /* an unserializable dataset simply does not seed */ }
   if (typeof json !== 'string') return '';
   // Same rule as the static snapshot: HTML parses classic-script contents
@@ -633,7 +632,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
     if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
-    res.json({ data: readData(slug) });
+    res.json({ data: readViewData(slug) });
   });
 
   app.put('/api/console/spaces/:id/data', async (req, res) => {
