@@ -62,6 +62,8 @@ import {
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
 import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
 import { recordAuthoredWorkflowWriteAuthority } from '../runtime/harness/authored-workflow-write-authority.js';
 import { HOST_TOOL_DISPOSITION_PROTOCOL } from '../runtime/harness/host-model-result-receipt.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
@@ -279,6 +281,7 @@ import {
 import {
   compileLiveCatalogWorkflowCallPlan,
   ensureLiveReadCapabilityForOperation,
+  workflowCapabilityAccountChoiceSet,
   type WorkflowCapabilityAccountCandidateV1,
   type WorkflowCapabilityAccountChoiceSetV1,
   type WorkflowCapabilityAccountSelectionV1,
@@ -1412,6 +1415,25 @@ export function catalogPreparationRefusalToCapabilityBlock(
         + 'No provider dispatch occurred; the run is parked and retried when the exact definition refreshes.',
     });
   }
+  // Several current accounts for one operation is a CHOICE, not a missing
+  // connection (live 2026-09-22: three Outlook connections, "connect outlook"
+  // on Home while Outlook was connected the whole time). Park under the
+  // account-choice reason with the exact choice set, which the console
+  // renders as "choose the account" and the resolver answers durably.
+  if (refusal.reason === 'ambiguous_current_manifest' && tool) {
+    const accountChoiceSet = currentAccountChoiceSetForOperation(tool);
+    if (accountChoiceSet && accountChoiceSet.candidates.length > 1) {
+      return new WorkflowCapabilityBlockedError({
+        stepId: step.id,
+        tool,
+        toolkit: exactSchemaToolkitLabel(tool),
+        reason: 'ambiguous-account',
+        message: `Step "${step.id}" names ${tool}, and ${accountChoiceSet.total} connected accounts can run it. `
+          + 'Choose the exact account this workflow should operate as; no provider dispatch occurred and the run resumes with your answer.',
+        accountChoiceSet,
+      });
+    }
+  }
   return new WorkflowCapabilityBlockedError({
     stepId: step.id,
     tool: tool || `(${refusal.reason})`,
@@ -1421,6 +1443,23 @@ export function catalogPreparationRefusalToCapabilityBlock(
       + 'Either the toolkit is not connected or the operation name is wrong. No provider dispatch occurred; '
       + 'the run is parked and retried when the capability appears, or fix the step\'s operation name.',
   });
+}
+
+/** The current durable manifests for one operation, as an exact choice set. */
+function currentAccountChoiceSetForOperation(operationId: string): WorkflowCapabilityAccountChoiceSetV1 | null {
+  try {
+    const store = peekCapabilityManifestStore();
+    if (!store) return null;
+    const wanted = operationId.trim().toUpperCase();
+    const identities = store.list().flatMap((entry) => {
+      const manifest = currentCapabilityManifest(entry.manifest);
+      if (!manifest || manifest.operationId.toUpperCase() !== wanted || !manifest.accountId) return [];
+      return [{ capabilityId: manifest.manifestId, account: manifest.accountId }];
+    });
+    return identities.length > 0 ? workflowCapabilityAccountChoiceSet(identities) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
