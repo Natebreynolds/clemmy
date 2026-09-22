@@ -498,8 +498,12 @@ function short(subject: string, max = 80): string {
   return subject.length > max ? `${subject.slice(0, max - 3)}...` : subject;
 }
 
-export function calendarWatchNotificationId(itemKey: string, kind: CalendarWatchChangeKind): string {
-  return `calendar-watch:${kind}:${digest16(itemKey)}`;
+/** One notification per item OCCURRENCE. The item key alone would reuse a
+ * record from an earlier life of the same change (the store keeps ids
+ * at-most-once), so a fresh item would inherit an old read or silent row
+ * and never show; the creation instant makes each occurrence its own row. */
+export function calendarWatchNotificationId(itemKey: string, kind: CalendarWatchChangeKind, createdAtIso: string): string {
+  return `calendar-watch:${kind}:${digest16(`${itemKey}|${createdAtIso}`)}`;
 }
 
 export function buildCalendarWatchNotification(
@@ -552,7 +556,7 @@ export function buildCalendarWatchNotification(
   }
   lines.push(`Calendar: ${change.accountLabel}`);
   return {
-    id: calendarWatchNotificationId(change.itemKey, change.kind),
+    id: calendarWatchNotificationId(change.itemKey, change.kind, new Date(nowMs).toISOString()),
     kind: 'execution',
     title: `📅 ${title}`,
     body: lines.filter(Boolean).join('\n'),
