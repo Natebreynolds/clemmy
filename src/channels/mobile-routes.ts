@@ -1,3 +1,4 @@
+import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
@@ -475,11 +476,13 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
   subject: string;
   tool: string | null;
   args: Record<string, unknown> | null;
+  presentation: ApprovalPresentation;
   status: approvalRegistry.PendingApprovalStatus;
   resolution: approvalRegistry.ApprovalResolution | null;
 } {
   return {
     kind: 'harness',
+    presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject }),
     approvalId: row.approvalId,
     sessionId: row.sessionId,
     channel: row.channel,

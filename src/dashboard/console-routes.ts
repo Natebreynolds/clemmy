@@ -129,6 +129,7 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
+import { presentApprovalForHumans } from './approval-presentation.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -11464,6 +11465,8 @@ export function registerConsoleRoutes(
           sourceKind: undefined as string | undefined,
           tool: r.tool,
           args: r.args,
+          // What will happen, where, through which app — never the carrier envelope.
+          presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject }),
           status: r.status,
           resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {

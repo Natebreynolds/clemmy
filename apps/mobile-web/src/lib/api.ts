@@ -372,6 +372,7 @@ export interface ApprovalRow {
   subject: string;
   tool: string | null;
   args: unknown;
+  presentation?: { action: string; app?: string; operation?: string; details: Array<{ label: string; value: string; long: boolean }>; unwrapped: boolean };
   status: 'pending' | 'resolved' | 'expired' | 'cancelled';
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';

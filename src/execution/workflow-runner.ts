@@ -61,6 +61,7 @@ import {
 } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
+import { judgeRevisionApplied } from './revision-judge.js';
 import { noEffectStepReason, readPreDispatchRefusals } from './step-refusal-summary.js';
 import { renderReviewDraftForHumans, renderReviewValueForHumans } from './review-draft-render.js';
 import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
@@ -1154,6 +1155,15 @@ export interface WorkflowRunRevision {
   requestedAt: string;
   requestedBy: string;
   appliedAt: string;
+  /** The judge's verdict on the revised output, before the gate asks again. */
+  verification?: {
+    verdict: 'applied' | 'not_applied' | 'unverified';
+    reason: string;
+    judge: string;
+    confidence?: number;
+    attempts: number;
+    at: string;
+  };
 }
 
 /** The model steps a gated step consumes: the ones a reviewer's note can
@@ -1167,6 +1177,47 @@ export function revisableUpstreamStepIds(
   return (gated.dependsOn ?? []).filter((dep) => {
     const step = steps.find((candidate) => candidate.id === dep);
     return Boolean(step && (step.prompt ?? '').trim() && !step.call && !step.transform && !step.subgraph && !step.deterministic);
+  });
+}
+
+/** The latest revision naming this step whose verdict is still open (no
+ *  verification yet, or one failed attempt). */
+export function pendingRevisionFor(runId: string, stepId: string): WorkflowRunRevision | null {
+  const revisions = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`))?.revisions ?? [];
+  const mine = revisions.filter((revision) => revision.revisedStepIds.includes(stepId));
+  const latest = mine[mine.length - 1];
+  if (!latest) return null;
+  const attempts = latest.verification?.attempts ?? 0;
+  if (latest.verification?.verdict === 'applied') return null;
+  if (attempts >= REVISION_JUDGE_MAX_ATTEMPTS) return null;
+  return latest;
+}
+
+export const REVISION_JUDGE_MAX_ATTEMPTS = 2;
+
+/** Record the judge's verdict on the latest revision naming this step. */
+export function recordRevisionVerification(
+  runId: string,
+  approvalId: string,
+  verification: { verdict: 'applied' | 'not_applied' | 'unverified'; reason: string; judge: string; confidence?: number },
+): void {
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current?.revisions) return;
+    writeRunRecord(filePath, {
+      ...current,
+      revisions: current.revisions.map((revision) => (revision.approvalId === approvalId
+        ? {
+            ...revision,
+            verification: {
+              ...verification,
+              attempts: (revision.verification?.attempts ?? 0) + 1,
+              at: new Date().toISOString(),
+            },
+          }
+        : revision)),
+    });
   });
 }
 
@@ -6313,11 +6364,22 @@ async function awaitDeclarativeStepApproval(
     const renderedPreview = step.approvalPreview && step.approvalPreview.trim()
       ? renderTemplate(step.approvalPreview.trim(), ctx.inputs, ctx.stepOutputs).trim()
       : '';
-    const subject = renderedPreview
+    const baseSubject = renderedPreview
       // Legibility (#1): show WHAT the step will do, not just its id — so the
       // approver (gated) or the audit stream (unattended/yolo) sees the real
       // action. Flows to the dashboard card, the notification, and Discord/Slack.
       || `Approve "${ctx.workflow.name}" step "${step.id}": ${describeWorkflowStepAction(step)}`;
+    // Asking again after a change request: say whether the note was applied.
+    const latestRevision = (readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${ctx.runId}.json`))?.revisions ?? [])
+      .filter((revision) => revision.stepId === step.id).at(-1);
+    const revisionLine = latestRevision
+      ? (latestRevision.verification?.verdict === 'applied'
+        ? `Revised per your note ("${latestRevision.note}"); the check confirmed it was applied. `
+        : latestRevision.verification?.verdict === 'not_applied'
+          ? `Revised after your note ("${latestRevision.note}"), but the check says the note was NOT fully applied — read it closely. `
+          : `Revised after your note ("${latestRevision.note}"); the check could not confirm it was applied. `)
+      : '';
+    const subject = `${revisionLine}${baseSubject}`;
     // The reviewer inspects the DRAFT, not a step id: the outputs this step
     // consumes ride on the approval row (desktop content preview, mobile
     // "Review details", command-center sample) bounded and never re-fetched.
@@ -6570,9 +6632,12 @@ export function stepHasLoopProbe(step: WorkflowStepInput): boolean {
  */
 export const CONTRACT_REPAIR_MAX_ATTEMPTS = 2;
 
-export function stepContractRepairEnabled(step: WorkflowStepInput): boolean {
+export function stepContractRepairEnabled(step: WorkflowStepInput, runId?: string): boolean {
   if (step.loopUntil) return false;
-  if (!step.output) return false;
+  // A step re-running for a reviewer's change request gets the same one
+  // evidence-fed repair attempt when the revision judge says the note was
+  // not applied, contract or no contract.
+  if (!step.output && !(runId && pendingRevisionFor(runId, step.id))) return false;
   if (step.forEach || step.deterministic) return false;
   if (step.call?.tool) return false;
   return true;
@@ -7063,7 +7128,7 @@ async function runStepVerifiedAttempt(
   // Steps with neither loop nor contract run exactly once, byte-identical to
   // the pre-loopUntil behavior.
   if (!stepLoopUntilEnabled(step)) {
-    if (!stepContractRepairEnabled(step)) return runOnce(step);
+    if (!stepContractRepairEnabled(step, ctx.runId)) return runOnce(step);
     return runWithContractLoop(runOnce, step, {
       ...contractLoopOptions(step, ctx),
       maxAttempts: CONTRACT_REPAIR_MAX_ATTEMPTS,
@@ -8823,12 +8888,47 @@ export async function executeStep(
     }
   }
 
+  // A step re-running for a reviewer's change request: before the gate asks
+  // the human again, the host checks that the note was applied. Not applied
+  // → one evidence-fed re-run; still not applied → the card says so.
+  await verifyPendingRevisionOrRetry(ctx, step, output);
+
   const completionMeta = {
     modelRoute: workflowModelRouteMeta(stepRoute),
   };
   const finalized = finalizeOrDeferStepOutput(ctx, step, output, completionMeta);
   noteInferredOutputContractAdvisory(step, finalized, ctx);
   return finalized;
+}
+
+async function verifyPendingRevisionOrRetry(ctx: StepExecutionContext, step: WorkflowStepInput, output: unknown): Promise<void> {
+  const revision = pendingRevisionFor(ctx.runId, step.id);
+  if (!revision) return;
+  let previous: string | undefined;
+  try {
+    const body = approvalRegistry.get(revision.approvalId)?.args?.body;
+    previous = typeof body === 'string' ? body : undefined;
+  } catch { previous = undefined; }
+  const verdict = await judgeRevisionApplied({ note: revision.note, previous, revised: output, sessionId: `workflow:${ctx.runId}:${step.id}` });
+  recordRevisionVerification(ctx.runId, revision.approvalId, {
+    verdict: verdict.verdict, reason: verdict.reason, judge: verdict.judge, ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
+  });
+  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+    kind: 'step_advisory',
+    stepId: step.id,
+    meta: { reason: 'revision_check', verdict: verdict.verdict, judge: verdict.judge, confidence: verdict.confidence ?? null, durationMs: verdict.durationMs, approvalId: revision.approvalId },
+  });
+  const attemptsSoFar = (revision.verification?.attempts ?? 0) + 1;
+  if (verdict.verdict === 'not_applied' && attemptsSoFar < REVISION_JUDGE_MAX_ATTEMPTS) {
+    const problem = `The reviewer's change request was not applied: ${verdict.reason}. The reviewer asked: "${revision.note}". Apply exactly that, and leave everything the reviewer did not mention as it was.`;
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_failed',
+      stepId: step.id,
+      error: problem,
+      meta: { reason: 'output_contract', problems: [problem], revisionCheck: true },
+    });
+    throw new WorkflowContractViolationError(problem, step.id, [problem], 'output_contract');
+  }
 }
 
 /**

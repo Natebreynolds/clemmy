@@ -261,7 +261,8 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
   onReply?: DecisionsProps['onReply'];
 }) {
   const [open, setOpen] = useState(false);
-  const details = approvalDetails(row);
+  // The server already unwrapped the carrier into the provider's own fields.
+  const details = row.presentation && row.presentation.details.length > 0 ? row.presentation.details : approvalDetails(row);
   const isWorkflowGate = row.tool === 'workflow_approval_gate';
   const [changing, setChanging] = useState(false);
   const [changeNote, setChangeNote] = useState('');

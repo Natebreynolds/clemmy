@@ -16,6 +16,15 @@ export interface ApprovalRow {
   kind?: string;
   /** The draft or body the approval is about, when the server could name one. */
   contentPreview?: { body?: string; imageUrl?: string };
+  /** The call as a person reads it: action in words, app, and the provider's
+   * own fields — never the carrier envelope. */
+  presentation?: {
+    action: string;
+    app?: string;
+    operation?: string;
+    details: Array<{ label: string; value: string; long: boolean }>;
+    unwrapped: boolean;
+  };
   pendingAction?: PendingActionApprovalView;
   /** Unanswered 48h+ with nothing parked on it — sinks out of the urgent
    * header but stays fully approvable. */

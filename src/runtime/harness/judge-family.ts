@@ -205,7 +205,7 @@ export async function withJudgeHedge<T>(
   });
 }
 
-export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher' | 'calendar_watch';
+export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher' | 'calendar_watch' | 'revision';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';
 
 export interface JudgeMetricRecord {
@@ -252,7 +252,7 @@ interface JudgeMetricAggregate extends JudgeMetricLaneSnapshot {
   totalMs: number;
 }
 
-const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding', 'certify', 'watcher', 'calendar_watch'];
+const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding', 'certify', 'watcher', 'calendar_watch', 'revision'];
 const judgeMetrics = new Map<JudgeMetricLane, JudgeMetricAggregate>();
 
 function emptyJudgeMetricAggregate(lane: JudgeMetricLane): JudgeMetricAggregate {

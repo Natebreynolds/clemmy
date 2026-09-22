@@ -1425,11 +1425,18 @@ function buildWorkspaceProjection(
       if (event.projection_mode === 'document') {
         document = data;
       } else {
-        document = applySourceProjection(document, event.source_key, data, {
-          refreshedAt: event.observed_at,
-          ok: true,
-          provenance: event.cause,
-        });
+        document = applySourceProjection(
+          // A source committed after the authored document supersedes the
+          // summary that document authored from older records.
+          dropStaleAuthoredSummary(document, data),
+          event.source_key,
+          data,
+          {
+            refreshedAt: event.observed_at,
+            ok: true,
+            provenance: event.cause,
+          },
+        );
       }
       continue;
     }
@@ -1458,6 +1465,24 @@ function buildWorkspaceProjection(
     });
   }
   return { document, sources: sources.size };
+}
+
+/**
+ * A workspace may author its own phone summary (`_mobile`) in the document it
+ * saves; that summary describes the records of that moment. When a later
+ * source commit (a workflow's space_set_data, a refresh) lands without
+ * re-authoring the summary, the authored block is stale: it would keep
+ * showing yesterday's tiles over today's records. Drop it so the phone view
+ * is inferred from the current data; a source that carries its own nested
+ * `_mobile` keeps re-authoring it every refresh, as documented.
+ * Live 2026-09-22: "Drafts saved 0 / Not drafted 3" over three saved drafts.
+ */
+export function dropStaleAuthoredSummary(document: unknown, sourceData: unknown): unknown {
+  if (!isJsonObject(document) || !('_mobile' in document)) return document;
+  if (isJsonObject(sourceData) && isJsonObject(sourceData._mobile)) return document;
+  const root = { ...document };
+  Reflect.deleteProperty(root, '_mobile');
+  return root;
 }
 
 function pruneRetiredSourceProjections(

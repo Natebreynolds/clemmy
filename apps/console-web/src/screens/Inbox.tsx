@@ -1092,10 +1092,30 @@ function ApprovalDetail({
     <div>
       <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready for approval: ${queued.title}` : row.subject}</h3>
       {queued && <PendingActionDetail action={queued} />}
-      <Field label="Tool">{row.tool || '—'}</Field>
-      {row.sessionId && <Field label="From session">{row.sessionId}</Field>}
+      <Field label="Action">{row.presentation?.action || row.tool || '—'}</Field>
+      {row.presentation?.app && <Field label="App">{row.presentation.app}{row.presentation.operation ? ` · ${row.presentation.operation}` : ''}</Field>}
       <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>
-      <Field label="Details"><Mono value={row.args} /></Field>
+      {row.presentation && row.presentation.details.length > 0 ? (
+        <div className="mt-2 space-y-2" data-testid="approval-presentation">
+          {row.presentation.details.map((line) => (
+            line.long
+              ? (
+                <div key={line.label}>
+                  <div className="text-label text-fg">{line.label}</div>
+                  <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2 text-body text-fg">{line.value}</p>
+                </div>
+              )
+              : <Field key={line.label} label={line.label}>{line.value}</Field>
+          ))}
+        </div>
+      ) : (
+        <Field label="Details"><Mono value={row.args} /></Field>
+      )}
+      <details className="mt-2 text-caption text-muted">
+        <summary className="cursor-pointer">Technical details</summary>
+        <div className="mt-1 text-fg">Tool: {row.tool || '—'}{row.sessionId ? ` · session ${row.sessionId}` : ''}</div>
+        <Mono value={row.args} />
+      </details>
       <div className="mt-4 flex gap-2">
         <Button disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}

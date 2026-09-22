@@ -14,7 +14,9 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'clem-revision-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
-const { revisableUpstreamStepIds, reviewerChangeLeadIn } = await import('./workflow-runner.js');
+const { revisableUpstreamStepIds, reviewerChangeLeadIn, pendingRevisionFor, recordRevisionVerification, REVISION_JUDGE_MAX_ATTEMPTS } = await import('./workflow-runner.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { mkdirSync: mkdirp, writeFileSync } = await import('node:fs');
 const { appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 
 const steps = [
@@ -56,4 +58,26 @@ test('a step_invalidated event discards a completed step so the resume re-runs i
   state = computeResumeState('rev-wf', 'run-1');
   assert.equal(state.completedSteps.has('draft_emails'), false, 'the declined draft is no longer a completed output');
   assert.equal(state.terminal, false);
+});
+
+test('a revision is pending until the judge says applied, and at most two verdicts are taken', () => {
+  mkdirp(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'run-rev';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: 'wf', status: 'running',
+    revisions: [{ approvalId: 'apr-1', stepId: 'save_drafts', revisedStepIds: ['draft_emails'], note: 'more context', requestedAt: 't', requestedBy: 'user', appliedAt: 't' }],
+  }));
+  assert.equal(pendingRevisionFor(runId, 'draft_emails')?.approvalId, 'apr-1');
+  assert.equal(pendingRevisionFor(runId, 'read_prospects'), null);
+  recordRevisionVerification(runId, 'apr-1', { verdict: 'not_applied', reason: 'missing sentence', judge: 'jev', confidence: 0.8 });
+  const after = pendingRevisionFor(runId, 'draft_emails');
+  assert.equal(after?.verification?.attempts, 1, 'one failed check keeps the revision open for one re-run');
+  recordRevisionVerification(runId, 'apr-1', { verdict: 'not_applied', reason: 'still missing', judge: 'jev' });
+  assert.equal(pendingRevisionFor(runId, 'draft_emails'), null, `after ${REVISION_JUDGE_MAX_ATTEMPTS} verdicts the gate asks the human with an honest card`);
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: 'wf', status: 'running',
+    revisions: [{ approvalId: 'apr-2', stepId: 'save_drafts', revisedStepIds: ['draft_emails'], note: 'x', requestedAt: 't', requestedBy: 'user', appliedAt: 't' }],
+  }));
+  recordRevisionVerification(runId, 'apr-2', { verdict: 'applied', reason: 'ok', judge: 'jev', confidence: 0.9 });
+  assert.equal(pendingRevisionFor(runId, 'draft_emails'), null, 'an applied verdict closes the revision');
 });
