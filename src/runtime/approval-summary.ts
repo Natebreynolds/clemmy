@@ -360,10 +360,23 @@ function looksLikeImageUrl(s: string): boolean {
   return /^\/?[\w./-]+\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(t); // local path
 }
 
+/** A field is draft text when any word of its name is a body word:
+ *  `markdown_text`, `messageBody` and `text` all qualify. Matching words, not
+ *  whole keys, keeps this free of per-provider field lists. */
+function fieldWords(key: string): string[] {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** Identifier-shaped fields (`post_id`, `message_url`, `status_code`) are
+ *  never the draft, whatever else their name says. */
+const NOT_BODY_WORDS = new Set(['id', 'ids', 'url', 'urls', 'uri', 'urn', 'key', 'token', 'type', 'code', 'hash', 'ts']);
+
 function pickLongestString(record: Record<string, unknown>, keys: string[]): string {
+  const bodyWords = new Set(keys);
   let best = '';
-  for (const key of keys) {
-    const v = record[key];
+  for (const [key, v] of Object.entries(record)) {
+    const words = fieldWords(key);
+    if (!words.some((word) => bodyWords.has(word)) || words.some((word) => NOT_BODY_WORDS.has(word))) continue;
     if (typeof v === 'string' && v.trim().length > best.length) best = v;
   }
   return best.trim();
