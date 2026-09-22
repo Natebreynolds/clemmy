@@ -104,8 +104,11 @@ tick on the installed app raised that one card on Needs you
 (`needs-you-suggestion.png`: "Workflow suggestion: you asked for 'whats on
 my calendar today' 12 times over 2 days. Save it as a workflow you can run
 or schedule?" with Approve exact plan / Reject). Both watches on Autonomy
-(`autonomy-watches-2.png`). The approval's outcome is recorded in the
-memory note for this checkpoint.
+(`autonomy-watches-2.png`). Approving the card ran the plan as a
+background task: 6 min, 7 calls (workflow_get ×4, tool_search ×2,
+workflow_create — the brain chose `workflow_create` with an exact
+`OUTLOOK_GET_CALENDAR_VIEW` step over `workflow_from_session`), creation
+test passed, and "Whats on my calendar today" exists enabled, manual-only.
 
 **Boot.** The ten parked occurrences kept their counts and park times
 through two launches.
