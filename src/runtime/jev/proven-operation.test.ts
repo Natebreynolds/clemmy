@@ -99,7 +99,7 @@ test('proven operation guidance tells the brain to skip tool_search when an invo
   assert.match(bound, /no account_selection and no tool_search/);
   // The turn that holds exact operation ids is the turn that can author them
   // as exact call steps instead of prompt steps that re-describe the read.
-  assert.match(bound, /If this becomes a saved workflow, author these as exact call steps: call\.tool = the operation id \(outlook_get_calendar_view\)/);
+  assert.match(bound, /If this becomes a saved workflow, author these as exact call steps: call\.tool = the operation id \(OUTLOOK_GET_CALENDAR_VIEW\)/);
   assert.match(bound, /\{\{now\}\}, \{\{now\+24h\}\}/);
   assert.match(bound, /the host binds the account/);
   assert.match(bound, /OUTLOOK_GET_CALENDAR_VIEW: alex@corp\.example \(ca_one\)/);
@@ -257,4 +257,19 @@ test('skipDiscoverySearch remains gated on a currently callable disclosed ref', 
   } finally {
     installHostCapabilityCatalogFactory(prior);
   }
+});
+
+test('the authoring line names only real operations: bound slugs first, else tools with a schema, never a step-only control tool', () => {
+  // Live 281953: a workflow-step strategy (outlook_get_calendar_view +
+  // workflow_step_result) was matched to a chat authoring request; the line
+  // must not tell the brain to author workflow_step_result as a call step.
+  const base = {
+    id: 'strat-step', objective: 'Workflow: Invite digest Step: draft_digest', keywords: ['invite', 'digest'],
+    toolsUsed: ['outlook_get_calendar_view', 'workflow_step_result'], workerCount: 0, durationMs: 1_000, createdAt: new Date().toISOString(), uses: 2,
+  };
+  const withSchema = renderProvenOperationGuidance(base, { outlook_get_calendar_view: { start_datetime: 'string' } }, [{ tool: 'work_call', args: {} }]);
+  assert.match(withSchema, /author these as exact call steps: call\.tool = the operation id \(outlook_get_calendar_view\)/);
+  assert.doesNotMatch(withSchema, /operation id \([^)]*workflow_step_result/);
+  const noSchema = renderProvenOperationGuidance(base, {}, [{ tool: 'work_call', args: {} }]);
+  assert.doesNotMatch(noSchema, /If this becomes a saved workflow/);
 });

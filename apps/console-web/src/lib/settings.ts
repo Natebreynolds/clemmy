@@ -49,6 +49,8 @@ export interface Policy {
   /** Calendar watch: its own switch, independent of `enabled` (read-only watch). */
   calendarWatchEnabled?: boolean;
   calendarWatchMinutes?: number;
+  workflowSuggestionsEnabled?: boolean;
+  workflowSuggestionsMinutes?: number;
   mode?: 'watch' | 'balanced' | 'hands_on';
   autoApproveScope?: 'strict' | 'balanced' | 'workspace' | 'yolo';
   checkInMinutes?: number;
@@ -368,7 +370,7 @@ export const patchFusion = (p: { mode: FusionMode; judge?: 'claude' | 'codex'; s
 // ── Watches (background heartbeats on a contract) ───────────────────────────
 export interface WatchItem {
   key: string;
-  kind: 'cancelled' | 'removed' | 'conflict' | 'invite_unanswered' | 'moved' | 'starting_soon';
+  kind: 'cancelled' | 'removed' | 'conflict' | 'invite_unanswered' | 'moved' | 'starting_soon' | 'suggestion';
   signal: 'high' | 'low';
   subject: string;
   eventStartMs: number;
@@ -395,7 +397,7 @@ export interface WatchFinding {
   summary: string;
 }
 export interface WatchStatus {
-  id: 'calendar';
+  id: string;
   title: string;
   purpose: string;
   enabled: boolean;

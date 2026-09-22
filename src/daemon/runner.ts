@@ -3337,6 +3337,11 @@ export async function startDaemon(
     const { calendarWatchPolicy, startCalendarWatchHeartbeat } = await import('../agents/calendar-watch-runtime.js');
     const watchPolicy = calendarWatchPolicy();
     startCalendarWatchHeartbeat();
+    // Workflow suggestions ride the same contract: a cadence, a deterministic
+    // look at the host's own proven-strategy record, one plan-proposal card
+    // when a request keeps repeating, nothing on a quiet tick.
+    const { startWorkflowSuggestionsHeartbeat } = await import('../agents/workflow-suggestions.js');
+    startWorkflowSuggestionsHeartbeat();
     logger.info(
       { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
       watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',

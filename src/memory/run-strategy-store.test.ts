@@ -122,3 +122,58 @@ test('legacy strategy records stay on disk for audit but cannot steer a future r
   );
   assert.equal(getRunStrategyLearningStats().legacyExcluded, 1);
 });
+
+// ─── scope: a step strategy never answers a chat request ─────────────────────
+
+test('a strategy learned in a workflow-kind session is step-scoped; chat matching skips it, "any" keeps it', async () => {
+  const { createSession } = await import('../runtime/harness/eventlog.js');
+  createSession({ id: 'workflow:run-scope:draft', kind: 'workflow' });
+  createSession({ id: 'sess-desktop-scope', kind: 'chat' });
+  const stepReceipt = evaluateLearningCandidate({
+    target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'workflow:run-scope:draft', sourceId: 'workflow:run-scope:draft:1',
+    terminalSuccess: true, controllerValidation: true,
+  }).receipt!;
+  const chatReceipt = evaluateLearningCandidate({
+    target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'sess-desktop-scope', sourceId: 'sess-desktop-scope:1',
+    terminalSuccess: true, controllerValidation: true,
+  }).receipt!;
+  const step = recordRunStrategy({
+    objective: 'Workflow: Invite digest Step: draft_digest — draft the pending invite digest from the calendar',
+    toolsUsed: ['outlook_get_calendar_view', 'workflow_step_result'], workerCount: 0, durationMs: 1_000, learningReceipt: stepReceipt,
+  })!;
+  assert.equal(step.scope, 'workflow_step', 'the scope follows the session that learned it');
+  const chat = recordRunStrategy({
+    objective: 'draft the pending invite digest from the calendar for tomorrow',
+    toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 1_000, learningReceipt: chatReceipt,
+  })!;
+  assert.equal(chat.scope, 'chat');
+  assert.notEqual(chat.id, step.id, 'near-duplicate objectives do not merge across scopes');
+  assert.equal(chat.uses, 1);
+
+  const forChat = listMatchingRunStrategies('draft the invite digest from the calendar', 4);
+  assert.ok(forChat.some((m) => m.strategy.id === chat.id));
+  assert.ok(!forChat.some((m) => m.strategy.id === step.id), 'a chat request is never offered a step strategy');
+  const forStep = listMatchingRunStrategies('draft the invite digest from the calendar', 4, { scope: 'any' });
+  assert.ok(forStep.some((m) => m.strategy.id === step.id));
+});
+
+test('records learned before scopes resolve theirs from the receipt session on read and are written back', async () => {
+  const { createSession } = await import('../runtime/harness/eventlog.js');
+  createSession({ id: 'workflow:legacy:step', kind: 'workflow' });
+  const file = path.join(TMP_HOME, 'state', 'run-strategies.json');
+  const raw = JSON.parse(readFileSync(file, 'utf8')) as { strategies: Array<Record<string, unknown>> };
+  const legacyReceipt = evaluateLearningCandidate({
+    target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'workflow:legacy:step', sourceId: 'workflow:legacy:step:1',
+    terminalSuccess: true, controllerValidation: true,
+  }).receipt!;
+  raw.strategies.push({
+    id: 'strat-legacy-step', objective: 'legacy step strategy about quarterly numbers', keywords: ['legacy', 'step', 'strategy', 'quarterly', 'numbers'],
+    toolsUsed: ['googlesheets_batch_get', 'workflow_step_result'], workerCount: 0, durationMs: 5, createdAt: new Date().toISOString(), uses: 3,
+    learningReceipt: legacyReceipt,
+  });
+  writeFileSync(file, JSON.stringify(raw));
+  const forChat = listMatchingRunStrategies('legacy step strategy quarterly numbers', 4);
+  assert.ok(!forChat.some((m) => m.strategy.id === 'strat-legacy-step'), 'resolved to step scope on read');
+  const persisted = JSON.parse(readFileSync(file, 'utf8')) as { strategies: Array<{ id: string; scope?: string }> };
+  assert.equal(persisted.strategies.find((s) => s.id === 'strat-legacy-step')?.scope, 'workflow_step', 'the resolved scope is written back once');
+});

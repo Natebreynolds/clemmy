@@ -129,6 +129,7 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
+import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
@@ -5679,6 +5680,13 @@ export function registerConsoleRoutes(
         summary: describeWorkflowPlainEnglish(entry.data),
         proof,
         certification,
+        // The creation test as the page should show it: running for this
+        // exact definition, passed, or needs review with the daemon's report.
+        creationTest: workflowCreationTestState({
+          workflowName: entry.data.name,
+          pendingRunId: pendingWorkflowVerification(entry.data.name, entry.data) ?? null,
+          notifications: listNotifications(400),
+        }),
         // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
         // visual workflow view. Built server-side from the pure, unit-tested
         // buildWorkflowGraph so the browser just hands it to Cytoscape.
@@ -8716,8 +8724,11 @@ export function registerConsoleRoutes(
   app.get('/api/console/watches', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { calendarWatchStatus } = await import('../agents/calendar-watch-runtime.js');
-      res.json({ watches: [calendarWatchStatus()] });
+      const [{ calendarWatchStatus }, { workflowSuggestionsStatus }] = await Promise.all([
+        import('../agents/calendar-watch-runtime.js'),
+        import('../agents/workflow-suggestions.js'),
+      ]);
+      res.json({ watches: [calendarWatchStatus(), workflowSuggestionsStatus()] });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -8725,14 +8736,21 @@ export function registerConsoleRoutes(
 
   app.patch('/api/console/watches/:id', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    if (req.params.id !== 'calendar') { res.status(404).json({ error: 'unknown watch' }); return; }
+    if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
     try {
-      const { calendarWatchStatus, setCalendarWatchPolicy } = await import('../agents/calendar-watch-runtime.js');
       const body = (req.body ?? {}) as { enabled?: unknown; cadenceMinutes?: unknown };
-      setCalendarWatchPolicy({
+      const patch = {
         ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
         ...(typeof body.cadenceMinutes === 'number' && Number.isFinite(body.cadenceMinutes) ? { cadenceMinutes: body.cadenceMinutes } : {}),
-      });
+      };
+      if (req.params.id === 'workflow-suggestions') {
+        const { setWorkflowSuggestionsPolicy, workflowSuggestionsStatus } = await import('../agents/workflow-suggestions.js');
+        setWorkflowSuggestionsPolicy(patch);
+        res.json({ watch: workflowSuggestionsStatus() });
+        return;
+      }
+      const { calendarWatchStatus, setCalendarWatchPolicy } = await import('../agents/calendar-watch-runtime.js');
+      setCalendarWatchPolicy(patch);
       res.json({ watch: calendarWatchStatus() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -8741,8 +8759,14 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/watches/:id/tick', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    if (req.params.id !== 'calendar') { res.status(404).json({ error: 'unknown watch' }); return; }
+    if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
     try {
+      if (req.params.id === 'workflow-suggestions') {
+        const { runWorkflowSuggestionsTick, workflowSuggestionsStatus } = await import('../agents/workflow-suggestions.js');
+        const tick = await runWorkflowSuggestionsTick({ source: 'manual', force: true });
+        res.json({ tick, watch: workflowSuggestionsStatus() });
+        return;
+      }
       const { calendarWatchStatus, runCalendarWatchTick } = await import('../agents/calendar-watch-runtime.js');
       const tick = await runCalendarWatchTick({ source: 'manual', force: true });
       const { seenEvents, ...summary } = tick;

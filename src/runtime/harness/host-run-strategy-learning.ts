@@ -14,7 +14,7 @@ import {
   evaluateLearningCandidate,
   recordLearningDecision,
 } from '../../memory/learning-receipt.js';
-import { recordRunStrategy } from '../../memory/run-strategy-store.js';
+import { recordRunStrategy, runStrategyScopeForSession } from '../../memory/run-strategy-store.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
 
@@ -108,6 +108,7 @@ export function learnHostRunStrategyForAcceptedTask(input: {
   const recorded = recordRunStrategy({
     objective,
     toolsUsed,
+    scope: runStrategyScopeForSession(input.sessionId),
     workerCount: 0,
     durationMs: durationMsForSource(input),
     deliverable: deliverableForSource(input),

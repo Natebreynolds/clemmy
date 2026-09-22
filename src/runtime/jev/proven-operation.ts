@@ -8,7 +8,7 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { listMatchingRunStrategies, listVerifiedRunStrategies, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { readActiveToolSurface } from '../../memory/active-tool-surface.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
@@ -364,7 +364,17 @@ export function renderProvenOperationGuidance(
     // The moment the brain holds exact operation ids is the moment it can
     // author them: a saved workflow step for one of these is an exact `call`,
     // never a prompt step that re-describes the read.
-    `If this becomes a saved workflow, author these as exact call steps: call.tool = the operation id (${tools.join(', ')}), literal args with time tokens ({{now}}, {{now+24h}}, {{date}}); the host binds the account.`,
+    ...(() => {
+      // Only real operations are authorable: the ones the host bound an
+      // account for, else the ones it holds a schema for. A control tool
+      // that only exists inside a step session is never a call step.
+      const authorable = boundAccounts.length > 0
+        ? [...new Set(boundAccounts.map((row) => row.slug))]
+        : tools.filter((name) => schemas[name] !== undefined || schemas[name.toUpperCase()] !== undefined);
+      return authorable.length > 0
+        ? [`If this becomes a saved workflow, author these as exact call steps: call.tool = the operation id (${authorable.join(', ')}), literal args with time tokens ({{now}}, {{now+24h}}, {{date}}); the host binds the account.`]
+        : [];
+    })(),
     ...schemaLines,
   ].join('\n');
 }
@@ -442,7 +452,11 @@ export async function prepareProvenOperationForRequest(input: {
   void import('./active-surface-heartbeat.js')
     .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
     .catch(() => { /* heartbeat never blocks the live turn */ });
-  const matches = listMatchingRunStrategies(input.query, 4);
+  // A chat request is offered chat strategies only; a workflow step may reuse
+  // anything it or a chat proved.
+  const matches = listMatchingRunStrategies(input.query, 4, {
+    scope: runStrategyScopeForSession(input.sessionId) === 'workflow_step' ? 'any' : 'chat',
+  });
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical;
   if (!strategy && matches.length > 0) {

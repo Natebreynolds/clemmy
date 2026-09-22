@@ -1,3 +1,4 @@
+import { getSession } from '../runtime/harness/eventlog.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -38,7 +39,15 @@ export interface RunStrategyRecord {
   learningReceipt?: LearningReceipt;
   /** Pre-receipt observations retained for audit, never counted as proof. */
   legacyUses?: number;
+  /** Where the strategy was learned. A chat request and a workflow step both
+   *  record strategies; only a chat strategy may be offered to a chat request
+   *  (live 2026-09-22: a step strategy carrying workflow_step_result was
+   *  matched to an authoring request). Missing = learned before scopes and
+   *  resolved from the receipt's session on read. */
+  scope?: RunStrategyScope;
 }
+
+export type RunStrategyScope = 'chat' | 'workflow_step';
 
 interface StrategyFile {
   strategies: RunStrategyRecord[];
@@ -66,7 +75,7 @@ export function strategyKeywords(text: string): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([w]) => w);
 }
 
-function readStore(): StrategyFile {
+function readStoreRaw(): StrategyFile {
   if (!existsSync(STORE_FILE)) return { strategies: [], version: 'v1' };
   try {
     const parsed = JSON.parse(readFileSync(STORE_FILE, 'utf-8')) as StrategyFile;
@@ -75,6 +84,23 @@ function readStore(): StrategyFile {
   } catch {
     return { strategies: [], version: 'v1' };
   }
+}
+
+/** Records learned before scopes exist resolve their scope once from the
+ *  receipt's session and are written back, so a step strategy never
+ *  masquerades as a chat one on the next read. */
+function readStore(): StrategyFile {
+  const file = readStoreRaw();
+  let changed = false;
+  for (const record of file.strategies) {
+    if (record.scope !== undefined) continue;
+    record.scope = runStrategyScopeForSession(record.learningReceipt?.sessionId);
+    changed = true;
+  }
+  if (changed) {
+    try { writeStore(file); } catch { /* the in-memory view is already scoped */ }
+  }
+  return file;
 }
 
 function writeStore(file: StrategyFile): void {
@@ -99,6 +125,22 @@ export interface RecordRunStrategyInput {
   durationMs: number;
   deliverable?: string;
   learningReceipt: LearningReceipt;
+  scope?: RunStrategyScope;
+}
+
+/** The scope a receipt's session implies: a workflow-kind session learned a
+ *  step strategy; anything else is a chat strategy. */
+export function runStrategyScopeForSession(sessionId: string | undefined): RunStrategyScope {
+  if (!sessionId) return 'chat';
+  try {
+    return getSession(sessionId)?.kind === 'workflow' ? 'workflow_step' : 'chat';
+  } catch {
+    return 'chat';
+  }
+}
+
+function scopeOf(record: Pick<RunStrategyRecord, 'scope'>): RunStrategyScope {
+  return record.scope ?? 'chat';
 }
 
 /** Record a successful run's shape. Near-duplicate objectives (≥0.8 keyword
@@ -113,9 +155,13 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   if (keywords.length === 0) return null;
   const file = readStore();
   const now = new Date().toISOString();
-  const existing = file.strategies.find((s) => overlapScore(keywords, s.keywords) >= 0.8);
+  const scope: RunStrategyScope = input.scope ?? runStrategyScopeForSession(input.learningReceipt.sessionId);
+  // Evidence accumulates within a scope only: a step that restates a chat
+  // request must not inflate the chat strategy's proof, or the reverse.
+  const existing = file.strategies.find((s) => scopeOf(s) === scope && overlapScore(keywords, s.keywords) >= 0.8);
   if (existing) {
     const wasVerified = isValidLearningReceipt(existing.learningReceipt, { target: 'strategy' });
+    existing.scope = scope;
     existing.toolsUsed = toolsUsed;
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
@@ -138,6 +184,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     createdAt: now,
     uses: 1,
     learningReceipt: input.learningReceipt,
+    scope,
   };
   file.strategies.push(record);
   if (file.strategies.length > MAX_RECORDS) {
@@ -168,13 +215,19 @@ export function listVerifiedRunStrategies(): RunStrategyRecord[] {
 }
 
 /** Ranked proven strategies for this objective. Empty when nothing clears the floor. */
-export function listMatchingRunStrategies(objective: string | undefined, limit = 4): MatchedRunStrategy[] {
+export function listMatchingRunStrategies(
+  objective: string | undefined,
+  limit = 4,
+  options: { scope?: RunStrategyScope | 'any' } = {},
+): MatchedRunStrategy[] {
   if (!objective?.trim()) return [];
   const keywords = strategyKeywords(objective);
   if (keywords.length === 0) return [];
+  const scope = options.scope ?? 'chat';
   const file = readStore();
   return file.strategies
     .filter((s) => isValidLearningReceipt(s.learningReceipt, { target: 'strategy' }))
+    .filter((s) => scope === 'any' || scopeOf(s) === scope)
     .map((s) => ({ strategy: s, score: overlapScore(keywords, s.keywords) }))
     .filter((x) => x.score >= 0.34)
     .sort((a, b) => b.score - a.score)

@@ -108,6 +108,7 @@ const WATCH_KIND_LABEL: Record<string, string> = {
   invite_unanswered: 'Reply needed',
   moved: 'Moved',
   starting_soon: 'Starting soon',
+  suggestion: 'Workflow suggestion',
 };
 
 /**
@@ -151,7 +152,7 @@ function WatchesPanel() {
             <Switch checked={w.enabled} onChange={(v) => { void toggle(w, v); }} label={w.title} />
           </div>
           <div className="mt-2 grid gap-1 text-caption text-muted sm:grid-cols-2">
-            <div>Every {w.cadenceMinutes} min{w.quietHoursActive ? ' · quiet hours now' : ''}{w.connectedOperations.length === 0 ? ' · no calendar connected' : ''}</div>
+            <div>Every {w.cadenceMinutes} min{w.quietHoursActive ? ' · quiet hours now' : ''}{w.id === 'calendar' && w.connectedOperations.length === 0 ? ' · no calendar connected' : ''}</div>
             <div>Last check: {ago(w.lastTickAt)}{w.running ? ' · checking…' : ''}</div>
             <div className="sm:col-span-2">
               Last finding: {w.lastFinding ? w.lastFinding.summary : 'none yet'}
