@@ -170,7 +170,7 @@ export const WorkCallInputSchema = z.object({
     'Complete provider-neutral work topology. Null when the host already froze the contract, and null after the first successful freeze. Required only when no contract exists yet.',
   ),
   requirement_id: IdSchema.describe(
-    'Binding selector: fresh write uses tool_search capabilityRef; frozen graph uses its open operation id; read/compute uses its requirement label.',
+    'Binding selector: a cap:… capabilityRef disclosed by tool_search OR by the host\'s PROVEN OPERATION note for this turn (both are already disclosed; do not run tool_search to re-obtain one); frozen graph uses its open operation id; read/compute uses its requirement label.',
   ),
   universe_item_id: MemberSchema.nullable().describe(
     'Exact accepted universe member for cardinality=each; otherwise use JSON null (not the string "null").',
@@ -195,7 +195,7 @@ export const WorkCallInputSchema = z.object({
     .nullable().optional().describe(
       'When the frozen read refinement or structured deliverable has a typed source-evidence contract, name the exact source record identities selected from the nominated result. For recent-article evidence these are canonical source URLs. Otherwise use JSON null.',
     ),
-  name: z.string().min(1).describe('Exact reachable inner tool name returned by tool_search/catalog.'),
+  name: z.string().min(1).describe('Exact reachable inner tool name returned by tool_search/catalog, or named in the host\'s proven-operation disclosure for this turn.'),
   args_json: z.string().describe('JSON object string matching the inner tool schema.'),
 }).strict();
 
