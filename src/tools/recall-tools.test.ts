@@ -543,3 +543,27 @@ test('MCP record queries decode one owner and never select a conflicting or fail
     assert.match(text, /None of/); assert.doesNotMatch(text, /"path": "\/exact"/, 'do not promote failed, ambiguous or merely similar transport bytes');
   }
 });
+
+test('tool_output_query given a capability reference redirects to the carrier and lists real results — never a bare "not found" (live 277962)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'call-real-1', tool: 'work_call', output: JSON.stringify({ items: [{ subject: 'Standup' }] }) });
+  // A reader's own miss is retained too; it must not be listed back as data.
+  writeToolOutput({ sessionId: session.id, callId: 'call-miss-1', tool: 'tool_output_query', output: 'No tool output found for call_id "x" in this session.' });
+  const query = captureToolOutputQueryHandler();
+  const ref = 'cap:resolved:outlook_get_calendar_view:definition:890911f634558ec9c128fad4';
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => query({ call_id: ref, fields: [], limit: 1, offset: 0, filter_field: 'dummy', filter_contains: 'dummy', filter_equals: 'dummy' }));
+  const text = result.content[0].text;
+  assert.match(text, /CAPABILITY reference, not a result handle/);
+  // No live catalog in this test → the honest door is discovery.
+  assert.match(text, /tool_search/);
+  assert.match(text, /call-real-1 \(work_call/);
+  assert.doesNotMatch(text, /call-miss-1/);
+  assert.doesNotMatch(text, /^No tool output found/);
+
+  const recall = captureRecallHandler();
+  const recalled = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 60_000) },
+    () => recall({ call_id: ref }));
+  assert.match(recalled.content[0].text, /CAPABILITY reference, not a result handle/);
+});

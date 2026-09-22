@@ -151,13 +151,21 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
 
 /**
  * On a proven-operation skip the carrier already has the callable schema.
- * Keep ask/check-in. Recall/query tools stay off this surface until a
- * result has landed: first-class tool_output_query with nothing to query
- * became a dummy-query loop instead of the disclosed carrier
- * (live 2026-09-21 source 277962).
+ * Keep ask. Recall/query tools stay off this surface until a result has
+ * landed: first-class tool_output_query with nothing to query became a
+ * dummy-query loop instead of the disclosed carrier (live 2026-09-21 source
+ * 277962).
+ *
+ * tool_search STAYS. A remembered operation accelerates selection; it must
+ * not close the tool universe for the turn. The guidance says "search if
+ * these cannot fulfil the request" — that promise needs a reachable door,
+ * and the same live source showed what happens when the only doors left are
+ * ask and a query tool with nothing to query. The schema is small and stable,
+ * so the prompt-cache prefix does not churn.
  */
 export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'ask_user_question',
+  'tool_search',
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {

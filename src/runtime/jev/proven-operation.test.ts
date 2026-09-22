@@ -70,6 +70,10 @@ test('proven operation guidance tells the brain to skip tool_search when an invo
     },
   }]);
   assert.match(text, /skip tool_search/i);
+  // The door stays open, and the ref is named for what it is (live 277962:
+  // the cap:… ref was sent to tool_output_query as a call_id).
+  assert.match(text, /tool_search stays available/);
+  assert.match(text, /not a result/);
   assert.match(text, /outlook_get_calendar_view/);
   assert.match(text, /work_call/);
   assert.match(text, /cap:resolved:outlook_get_calendar_view/);

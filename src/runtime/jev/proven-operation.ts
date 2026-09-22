@@ -312,10 +312,13 @@ export function renderProvenOperationGuidance(
       : '[PROVEN OPERATION]',
     `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
     callable
-      ? 'Call them directly on this turn. Do not call tool_search unless these operations cannot fulfill the request.'
+      ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
     'Connected provider operations go through work_call: name composio_execute_tool, args_json a JSON string with tool_slug and arguments.',
     'Local operations use their exact callable name.',
+    // Live 277962: the cap:… ref below was sent to tool_output_query as a
+    // call_id. Say the one thing that prevents that at the source.
+    'A cap:… reference is an OPERATION to invoke, not a result: results only exist after the call returns, under the call_id it returns.',
     ...(callable
       ? [
           'Exact work_call already disclosed and callable now:',

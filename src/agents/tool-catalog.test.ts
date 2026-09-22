@@ -104,7 +104,10 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   assert.equal(thinned.has('workspace_roots'), false);
   assert.equal(thinned.has('list_files'), false);
   assert.equal(thinned.has('read_file'), false);
-  assert.equal(thinned.has('tool_search'), false);
+  // Discovery is the one door that must survive a remembered operation: if
+  // the proven op cannot fulfil the request, the model needs a way to widen
+  // in the same turn instead of looping on ask/query.
+  assert.equal(thinned.has('tool_search'), true);
   assert.equal(thinned.has('tool_output_query'), false);
   assert.equal(thinned.has('recall_tool_result'), false);
   assert.equal(thinned.has('check_in'), false);

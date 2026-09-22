@@ -2803,3 +2803,65 @@ test('repeated identical-args local reads with unchanged retained bytes project 
   }
   db.close();
 });
+
+test('repeated identical parked-output MISSES meter as an identical outcome — the live 277962 shape', () => {
+  // Live 2026-09-21 source 277962: thirteen tool_output_query calls with the
+  // same (dummy) args against a capability ref, every settlement succeeded,
+  // business_call 0, the same 126-byte miss retained each time — and every
+  // frame projected as unmetered task work. A parked-output reader repeating
+  // identical args cannot learn anything new; the second frame must meter.
+  const identity = accepted('identical-parked-miss');
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE logical_call_settlements (
+      logical_tool_call_id TEXT NOT NULL, observer_call_id TEXT, execution_kind TEXT NOT NULL,
+      outcome_kind TEXT NOT NULL, recovery_action TEXT NOT NULL, business_call INTEGER NOT NULL,
+      mutating INTEGER NOT NULL, requires_reconciliation INTEGER NOT NULL,
+      physical_crossing_count INTEGER NOT NULL, host_crossing_count INTEGER, outcome_detail TEXT,
+      session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL
+    );
+    CREATE TABLE logical_tool_calls (
+      session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL,
+      logical_tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, argument_digest TEXT NOT NULL
+    );
+    CREATE TABLE tool_outputs (session_id TEXT NOT NULL, call_id TEXT NOT NULL, output_full TEXT NOT NULL);
+  `);
+  const digest = 'c'.repeat(64);
+  const miss = 'No tool output found for call_id "cap:resolved:outlook_get_calendar_view:definition:890911f6" in this session.';
+  const args = { call_id: 'cap:resolved:outlook_get_calendar_view:definition:890911f6', filter_field: 'dummy' };
+  const insertSettlement = db.prepare(`
+    INSERT INTO logical_call_settlements
+      (logical_tool_call_id, observer_call_id, execution_kind, outcome_kind, recovery_action, business_call,
+       mutating, requires_reconciliation, physical_crossing_count, host_crossing_count, outcome_detail, session_id, source_user_seq)
+    VALUES (?, ?, 'local_execution', 'succeeded', 'continue', 0, 0, 0, 0, 0, NULL, ?, ?)
+  `);
+  const insertCall = db.prepare(`
+    INSERT INTO logical_tool_calls (session_id, source_user_seq, logical_tool_call_id, tool_name, argument_digest)
+    VALUES (?, ?, ?, 'tool_output_query', ?)
+  `);
+  const insertOutput = db.prepare(`INSERT INTO tool_outputs (session_id, call_id, output_full) VALUES (?, ?, ?)`);
+  insertSettlement.run('call-miss-1', 'call-miss-1', identity.sessionId, identity.sourceUserSeq);
+  insertCall.run(identity.sessionId, identity.sourceUserSeq, 'call-miss-1', digest);
+  insertOutput.run(identity.sessionId, 'call-miss-1', miss);
+  const first = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('call-miss-1', 'tool_output_query', args), result('call-miss-1', 'tool_output_query', miss)],
+  }, db);
+  assert.equal(first.status, 'ok');
+  if (first.status === 'ok') {
+    assert.equal(first.attemptClass, 'task_work');
+    assert.equal(first.identicalOutcome, undefined, 'the first miss is new information');
+  }
+  insertSettlement.run('call-miss-2', 'call-miss-2', identity.sessionId, identity.sourceUserSeq);
+  insertCall.run(identity.sessionId, identity.sourceUserSeq, 'call-miss-2', digest);
+  insertOutput.run(identity.sessionId, 'call-miss-2', miss);
+  const second = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('call-miss-2', 'tool_output_query', args), result('call-miss-2', 'tool_output_query', miss)],
+  }, db);
+  assert.equal(second.status, 'ok');
+  if (second.status === 'ok') {
+    assert.equal(second.attemptClass, 'task_work');
+    assert.equal(second.identicalOutcome, true, 'an identical parked-output miss is zero information and must meter');
+  }
+});

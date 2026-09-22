@@ -3967,10 +3967,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // fanned out run_worker onto the worker-lane model (requested glm-5.2)
     // for a single disclosed read. Proven skip keeps the disclosed carrier
     // and ask; fan-out and generic dispatch stay off this surface.
+    // tool_search stays on it: live 277962 the remembered op was withheld
+    // from the model's next move by its own confusion (a capability ref sent
+    // as a result handle) and the surface offered no door back to discovery,
+    // so the turn burned 13 identical query frames and ended blocked. A
+    // remembered operation is a shortcut, never the whole tool universe.
     ...((callTool && !skipDiscoverySearch) ? [callTool] : []),
-    ...nonStructuralDiscovery.filter((toolRef) => (
-      !skipDiscoverySearch || (toolRef as { name?: string }).name !== 'tool_search'
-    )),
+    ...nonStructuralDiscovery,
   ]);
   searchFirstClassCount = assembledTools.length;
   searchFirstClassTokens = Math.round(

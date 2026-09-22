@@ -6963,6 +6963,59 @@ export function listToolOutputCallIds(sessionId: string, limit = 60): string[] {
   return rows.map((row) => row.call_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
 }
 
+export interface RetainedToolOutputSummary {
+  callId: string;
+  tool: string | null;
+  contentBytes: number;
+  createdAt: string;
+}
+
+/**
+ * What this turn has ACTUALLY retained, newest first. When the model asks a
+ * parked-output reader for an id that was never a result, the honest answer
+ * names the results that do exist — scoped to the accepted source when the
+ * logical call ledger knows it — instead of a bare "not found" that reads as
+ * "empty data". Session-wide when the source is unknown; empty when nothing
+ * has been retrieved yet, which is itself the fact the model needs.
+ */
+export function listRetainedToolOutputs(
+  sessionId: string,
+  options: { sourceUserSeq?: number; limit?: number } = {},
+): RetainedToolOutputSummary[] {
+  const db = openEventLog();
+  const limit = Math.max(1, Math.min(60, Math.floor(options.limit ?? 12)));
+  const source = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq as number
+    : null;
+  const rows = (source !== null
+    ? db.prepare(
+      `SELECT o.call_id, o.tool, o.content_bytes, o.created_at
+         FROM tool_outputs o
+         INNER JOIN logical_tool_calls c
+           ON c.session_id = o.session_id AND c.logical_tool_call_id = o.call_id
+        WHERE o.session_id = ? AND c.source_user_seq = ?
+        ORDER BY o.created_at DESC, o.call_id ASC
+        LIMIT ?`,
+    ).all(sessionId, source, limit)
+    : db.prepare(
+      `SELECT call_id, tool, content_bytes, created_at
+         FROM tool_outputs
+        WHERE session_id = ?
+        ORDER BY created_at DESC, call_id ASC
+        LIMIT ?`,
+    ).all(sessionId, limit)) as Array<{
+      call_id: string; tool: string | null; content_bytes: number; created_at: string;
+    }>;
+  return rows
+    .filter((row) => typeof row.call_id === 'string' && row.call_id.length > 0)
+    .map((row) => ({
+      callId: row.call_id,
+      tool: typeof row.tool === 'string' && row.tool ? row.tool : null,
+      contentBytes: Number.isFinite(row.content_bytes) ? row.content_bytes : 0,
+      createdAt: row.created_at,
+    }));
+}
+
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
   return db.transaction(() => readCanonicalOutput(db, sessionId, callId))();
