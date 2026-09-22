@@ -1060,6 +1060,16 @@ test('an interruption bounded across RESTARTS: a spent frame stops being re-admi
   assert.match(text, /continue/i, 'the terminal carries the continue next edge');
   assert.doesNotMatch(text, /pick up where it left off/i,
     'it must not promise an exact resume of a frame that never advanced');
+
+  // ONCE, not once per restart. The per-process notice Set is why the owner got
+  // 59 copies of "Clem paused a task that kept stopping at the same point" —
+  // one per daemon lifetime. A later pass must find nothing left to recover.
+  const second = recoverInterruptedChatRuns(Date.now, async () => { dispatched += 1; });
+  assert.equal(dispatched, 0, 'no later pass dispatches it either');
+  assert.equal(second.records.some((row) => row.sessionId === fixture.sessionId), false,
+    'the interruption is reconciled, so it leaves the recovery surface entirely');
+  assert.equal(listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length, 1,
+    'and it is not terminalized again on every pass');
 });
 
 test('attempt count alone never bounds a recovery that is still advancing', async () => {
