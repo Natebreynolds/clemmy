@@ -174,3 +174,58 @@ claude-haiku-4-5 at 17:08Z. Fixtures to delete: workflows `Prospect
 outreach review`, `Digest check`, `Digest check 2`, `Invite digest`,
 `Whats on my calendar today`; Space `Prospect campaign`; plan proposal
 `plan-a1f3b23e`; the pending "Send Slack message" approval.
+
+## Third wave, same day: the proven surface and the live pre-tag pass (`930c755f` → `1776a5b1`)
+
+The morning's placeholder-question dead end had one root left: which
+requests a proven strategy is allowed to *thin the surface* for. The
+store's recall score is containment of the shorter keyword list, so a
+three-word calendar strategy "touched" any longer request that mentioned
+the calendar once. Two attempts kept a door open on the thinned surface
+(`call_tool`, then the authoring tools) and each cost something live: the
+brain wrapped the proven read through `call_tool` and lost a frame (98 s
+turn), then a plain calendar question started with `workflow_create`
+("tmp-cal-read", rejected by schema) with ~111k prompt tokens of authoring
+schemas. Both were reverted.
+
+The rule that held (`1a49645e`, `1776a5b1`): a strategy thins the surface
+only when its keywords and the request's mostly coincide — shared words
+over the union of both sets, at least half
+(`provenStrategyCoversRequest`, proven-operation.ts). A near rephrase
+("show me my calendar for tomorrow" against "what is on my calendar
+tomorrow") skips the search; an authoring request that mentions the
+calendar, short or long, does not; a request about something else that
+shares two filler words ("whats … today") does not. A weak match still
+offers the proven call — it just never removes the doors. The authoring
+tools no longer ride through the skip. Pins in proven-operation.test.ts and
+tool-catalog.test.ts.
+
+### Live, on the installed app
+
+Installed `1a49645e` by hotpatch (sealed 3.18.19), launched **by path**.
+
+| Sample (`whats on my calendar tomorrow`) | Wall | Model | Calls | Prompt tokens | Note |
+|---|---|---|---|---|---|
+| `930c755f` ×3 (before) | — | 86.6 s / 52.2 s / 53.0 s | 3 | ~111k | sample 1 called `workflow_create` first |
+| `1a49645e` sample 1 | 67.8 s | 54.4 s | 3 (tool_search, calendar read, tool_output_query) | 87k | skip applied (`skipDiscoverySearch: true`, 6.5k schema tokens); the brain still searched once before the read |
+| `1a49645e` sample 2 | 11 min 26 s | — | 0 | — | **provider outage**: first frame silent 10 min → stream-stall retry → xAI "Internal error during token generation" → "Something went wrong on that turn" |
+| `1a49645e` sample 3 | (see below) | | | | started while sample 2's retry was in flight; xAI still degraded |
+
+Sample 2 is the ceiling of a one-brain home: the stall wall is 600 s of
+no activity (model-stall-policy.ts), one same-brain retry follows, the
+provider's in-stream internal error is already classified retryable, and
+with `activeBrain: api_key` there is no second brain to fall over to. The
+turn ended truthfully rather than hanging. It cost the person 11 minutes
+of "Still working". Not changed before the tag; noted as the next
+latency item (a shorter silence wall when the request is small).
+
+### Two traps found on the way
+
+- `open -a Clementine` launches `/Applications/Clementine.app`, an old
+  3.18.6 bundle (`32269b1e`) still beside the sealed `~/Applications` one;
+  six bundles answer to the desktop bundle id on this machine. The old
+  daemon held the live home for a minute, ran the pre-fix boot cap and
+  re-parked 12 already-parked runs (no schema change). Launch by path and
+  confirm `gitSha` + `entry` from build-info before driving anything.
+- The tsc at the root passed while the file it checked had the import
+  pasted inside the header comment; the build's tsc caught it.
