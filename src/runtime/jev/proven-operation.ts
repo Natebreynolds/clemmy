@@ -426,7 +426,7 @@ function stagedCandidatesForJev(scope: 'chat' | 'any'): Array<{ id: string; obje
 }
 
 async function pickStagedSurfaceStrategy(query: string, sessionId?: string): Promise<RunStrategyRecord | null> {
-  const staged = stagedCandidatesForJev(strategyScope);
+  const staged = stagedCandidatesForJev(runStrategyScopeForSession(sessionId) === 'workflow_step' ? 'any' : 'chat');
   if (staged.length === 0) return null;
   const jev = await selectProvenRunStrategyWithJev(
     query,
