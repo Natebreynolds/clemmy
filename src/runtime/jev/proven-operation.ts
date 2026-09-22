@@ -31,6 +31,8 @@ export interface ProvenOperationPreparation {
   skipDiscoverySearch: boolean;
   capabilityRefs: string[];
   descriptors: HostCapabilityDescriptorV1[];
+  /** Operating accounts the host already bound for the published operations. */
+  boundAccounts: ProvenBoundAccount[];
 }
 
 function recordedProvenDescriptors(
@@ -431,6 +433,7 @@ export async function prepareProvenOperationForRequest(input: {
     skipDiscoverySearch: false,
     capabilityRefs: [],
     descriptors: [],
+    boundAccounts: [],
   };
   void import('./active-surface-heartbeat.js')
     .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
@@ -513,6 +516,7 @@ export async function prepareProvenOperationForRequest(input: {
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
     skipDiscoverySearch,
+    boundAccounts,
     capabilityRefs,
     descriptors,
   };

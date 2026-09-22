@@ -6220,6 +6220,7 @@ async function runConversationWithinRuntimeConfig(
                 skipDiscoverySearch: proven.skipDiscoverySearch,
                 capabilityRefs: proven.capabilityRefs,
                 descriptors: proven.descriptors,
+                boundAccounts: proven.boundAccounts,
               },
             });
           }

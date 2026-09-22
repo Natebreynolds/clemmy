@@ -1851,18 +1851,41 @@ export function recentConversationTextsForFanout(
   }
 }
 
+export interface ProvenTurnDisclosure {
+  skipDiscoverySearch: boolean;
+  descriptors: HostCapabilityDescriptorV1[];
+  /** Operation names the proven strategy used, for the instruction line. */
+  tools: string[];
+  /** Operating accounts the host already bound for those operations. */
+  boundAccounts: Array<{ slug: string; accountId: string; label?: string }>;
+}
+
+const NO_PROVEN_DISCLOSURE: ProvenTurnDisclosure = Object.freeze({
+  skipDiscoverySearch: false, descriptors: [], tools: [], boundAccounts: [],
+}) as ProvenTurnDisclosure;
+
 function provenOperationDisclosureForTurn(
   sessionId: string | null | undefined,
   sourceUserSeq: number | undefined,
-): { skipDiscoverySearch: boolean; descriptors: HostCapabilityDescriptorV1[] } {
+): ProvenTurnDisclosure {
   if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
-    return { skipDiscoverySearch: false, descriptors: [] };
+    return NO_PROVEN_DISCLOSURE;
   }
   try {
     const selected = listEvents(sessionId, { types: ['proven_operation_selected'] })
       .filter((event) => event.data.sourceUserSeq === sourceUserSeq)
       .at(-1);
-    if (!selected) return { skipDiscoverySearch: false, descriptors: [] };
+    if (!selected) return NO_PROVEN_DISCLOSURE;
+    const tools = Array.isArray(selected.data.tools)
+      ? selected.data.tools.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+      : [];
+    const boundAccounts = Array.isArray(selected.data.boundAccounts)
+      ? selected.data.boundAccounts.filter((entry: unknown): entry is { slug: string; accountId: string; label?: string } => (
+        Boolean(entry) && typeof entry === 'object'
+        && typeof (entry as { slug?: unknown }).slug === 'string'
+        && typeof (entry as { accountId?: unknown }).accountId === 'string'
+      ))
+      : [];
     const descriptors = Array.isArray(selected.data.descriptors)
       ? selected.data.descriptors.filter((entry: unknown): entry is HostCapabilityDescriptorV1 => (
         Boolean(entry)
@@ -1870,13 +1893,32 @@ function provenOperationDisclosureForTurn(
         && typeof (entry as { id?: unknown }).id === 'string'
       ))
       : [];
-    return resolveCallableProvenDiscoverySkip({
+    const callable = resolveCallableProvenDiscoverySkip({
       skipDiscoverySearch: selected.data.skipDiscoverySearch === true,
       descriptors,
     });
+    return { ...callable, tools, boundAccounts };
   } catch {
-    return { skipDiscoverySearch: false, descriptors: [] };
+    return NO_PROVEN_DISCLOSURE;
   }
+}
+
+/**
+ * The one line that stops a proven turn from re-running discovery. The proven
+ * guidance already sits as a trailing system item, and the brain still opened
+ * with tool_search account_selection on every calendar turn (live 279653 and
+ * 280037: a 31 s and a 10 s frame each), because the planning instruction
+ * above it says to resolve refs and nominate accounts with tool_search. The
+ * instruction itself now says when that work is already done.
+ */
+export function renderProvenDiscoveryCompleteLine(disclosure: ProvenTurnDisclosure): string | null {
+  if (!disclosure.skipDiscoverySearch || disclosure.descriptors.length === 0) return null;
+  const tools = disclosure.tools.length > 0 ? disclosure.tools.join(', ') : 'the proven operations below';
+  const accounts = disclosure.boundAccounts.length > 0
+    ? ` The operating account is already bound by the host (${disclosure.boundAccounts
+      .map((row) => `${row.slug}: ${row.label ? `${row.label} (${row.accountId})` : row.accountId}`).join('; ')}); no account_selection is needed.`
+    : '';
+  return `[discovery-complete] Discovery already ran for this turn's proven operations (${tools}): their exact work_call requirement_id is disclosed in the PROVEN OPERATION note.${accounts} Calling tool_search for them again only spends a model round; call them now, and use tool_search only for something they cannot do.`;
 }
 
 function mergeWorkCallDisclosures(
@@ -3900,7 +3942,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use `plan_task` for coordinated business dependencies or per-member work that needs a graph, unresolved business dependencies, an explicitly requested execution graph, ambiguity, admin, destructive, or unknown-effect work. Contextual reads followed by one authorized reversible write and ordinary readback do not require a graph merely because they happen in order. Conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) also need none.'
+          ? [renderProvenDiscoveryCompleteLine(provenDisclosure), '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use `plan_task` for coordinated business dependencies or per-member work that needs a graph, unresolved business dependencies, an explicitly requested execution graph, ambiguity, admin, destructive, or unknown-effect work. Contextual reads followed by one authorized reversible write and ordinary readback do not require a graph merely because they happen in order. Conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) also need none.'].filter(Boolean).join('\n')
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,
