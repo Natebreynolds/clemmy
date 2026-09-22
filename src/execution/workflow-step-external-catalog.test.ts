@@ -1036,6 +1036,40 @@ test('two current manifests for one operation are two accounts: the connection t
     acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
   }, dependencies);
   assert.deepEqual(unnamed, { status: 'refused', reason: 'ambiguous_current_manifest', operationId: 'OUTLOOK_LIST_EVENTS' });
+
+  // Live 2026-09-22 ("Invite digest"): the same unnamed step, authored from a
+  // chat whose source already routed Outlook to the work account, parked the
+  // creation test on "which account?". The origin's routing answers it.
+  const routedCalls: Array<{ toolkit: string; operation: string; sessionId: string; sourceUserSeq: number }> = [];
+  const routedByOrigin = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's events using OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+    originSource: { sessionId: 'sess-origin', sourceUserSeq: 41 },
+  }, {
+    ...dependencies,
+    routeOriginAccount: async (call) => { routedCalls.push(call); return work.accountId; },
+  });
+  assert.equal(routedByOrigin.status, 'ready', JSON.stringify(routedByOrigin));
+  if (routedByOrigin.status === 'ready') assert.deepEqual(routedByOrigin.manifestIds, [work.manifestId]);
+  assert.deepEqual(routedCalls, [{ sessionId: 'sess-origin', sourceUserSeq: 41, toolkit: 'outlook', operation: 'OUTLOOK_LIST_EVENTS' }]);
+
+  // An origin that established nothing leaves the honest ambiguity in place.
+  const originSilent = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's events using OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+    originSource: { sessionId: 'sess-origin', sourceUserSeq: 41 },
+  }, { ...dependencies, routeOriginAccount: async () => null });
+  assert.deepEqual(originSilent, { status: 'refused', reason: 'ambiguous_current_manifest', operationId: 'OUTLOOK_LIST_EVENTS' });
+  // A routed account that is not one of the current manifests never selects.
+  const originForeign = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's events using OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+    originSource: { sessionId: 'sess-origin', sourceUserSeq: 41 },
+  }, { ...dependencies, routeOriginAccount: async () => 'ca_elsewhere' });
+  assert.deepEqual(originForeign, { status: 'refused', reason: 'ambiguous_current_manifest', operationId: 'OUTLOOK_LIST_EVENTS' });
 });
 
 // Facebook trends, live 2026-09-02: APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS refused

@@ -1211,6 +1211,29 @@ function gateDraftExcerpt(step: WorkflowStepInput, ctx: StepExecutionContext, ma
   return joined.length > maxChars ? `${joined.slice(0, maxChars - 1)}…` : joined;
 }
 
+/**
+ * The chat source a run was authored or dispatched from: the creation test's
+ * recorded source, else the origin session's latest accepted input. Used to
+ * route a multi-account operation the step does not name (see
+ * prepareWorkflowStepExternalCatalog.originSource).
+ */
+function workflowRunOriginSource(runId: string): { sessionId: string; sourceUserSeq: number } | null {
+  try {
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    if (!record) return null;
+    const creation = record.creationTestSource;
+    if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {
+      return { sessionId: creation.sessionId, sourceUserSeq: creation.sourceUserSeq };
+    }
+    const origin = typeof record.originSessionId === 'string' ? record.originSessionId.trim() : '';
+    if (!origin) return null;
+    const latest = listHarnessEvents(origin, { types: ['user_input_received'], limit: 1, desc: true })[0];
+    return latest ? { sessionId: origin, sourceUserSeq: latest.seq } : null;
+  } catch {
+    return null;
+  }
+}
+
 function readRunRecord(filePath: string): QueuedRunRecord | null {
   try { return readWorkflowRunRecord<QueuedRunRecord>(filePath); }
   catch { return null; }
@@ -5259,6 +5282,7 @@ async function runStepViaHarness(
     const preparedExternalCatalog = await prepareWorkflowStepExternalCatalogImpl({
       immutablePrompt: step.prompt,
       allowedTools,
+      ...(workflowRunOriginSource(workflowRunId) ? { originSource: workflowRunOriginSource(workflowRunId)! } : {}),
       acceptedSource: {
         sessionId: realSessionId,
         sourceUserSeq: sourceUserEvent.seq,

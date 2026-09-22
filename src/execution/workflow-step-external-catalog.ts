@@ -66,6 +66,15 @@ export type WorkflowStepExternalCatalogPreparation =
 
 export interface WorkflowStepExternalCatalogDependencies {
   manifestStore?: CapabilityManifestStore | null;
+  /** Route an ambiguous operation to the account the run's ORIGIN source
+   * already established (the same host policy a chat turn uses). Returns the
+   * connection id, or null when the origin established nothing. */
+  routeOriginAccount?: (input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    toolkit: string;
+    operation: string;
+  }) => Promise<string | null>;
   catalogFactory?: HostCapabilityCatalogFactory | null;
   revalidate?: (
     selections: readonly SelectedComposioDefinition[],
@@ -318,6 +327,39 @@ function isSelectedDefinitionDriftCode(code: string): boolean {
     || code === 'selected_definition_semantic_contract_drift';
 }
 
+/**
+ * The account the run's origin source already routes to for this toolkit,
+ * by the host's own source-account policy (remembered read default,
+ * established route for the principal). Chat resolved the calendar read to
+ * one of three Outlook connections without asking; a workflow authored from
+ * that same conversation should not park on "which account?" for the same
+ * operation (live 2026-09-22, "Invite digest" creation test).
+ */
+async function routeOriginAccountByHostPolicy(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  toolkit: string;
+  operation: string;
+}): Promise<string | null> {
+  try {
+    const [{ resolveSourceAccountRouting }, { listUsableConnectedToolkits }] = await Promise.all([
+      import('../tools/source-account-routing.js'),
+      import('../integrations/composio/client.js'),
+    ]);
+    const routed = await resolveSourceAccountRouting({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      toolkit: input.toolkit,
+      operation: input.operation,
+      connections: await listUsableConnectedToolkits(),
+      effect: 'read',
+    });
+    return routed.kind === 'resolved' ? routed.connection.connectionId : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function prepareWorkflowStepExternalCatalog(input: {
   immutablePrompt: string;
   allowedTools: readonly string[];
@@ -325,6 +367,13 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     sessionId: string;
     sourceUserSeq: number;
     acceptedInput: string;
+  };
+  /** The chat source this run was authored or dispatched from, when there
+   * is one. Its established account routing disambiguates a multi-account
+   * operation the step does not name. */
+  originSource?: {
+    sessionId: string;
+    sourceUserSeq: number;
   };
   deadlineAt?: number;
 }, dependencies: WorkflowStepExternalCatalogDependencies = {}): Promise<WorkflowStepExternalCatalogPreparation> {
@@ -354,6 +403,27 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     ...(input.immutablePrompt.match(/[A-Za-z0-9_-]+/g) ?? []),
     ...((input.acceptedSource?.acceptedInput ?? '').match(/[A-Za-z0-9_-]+/g) ?? []),
   ]);
+  // An operation with several current accounts and no name in the step: ask
+  // the run's origin source which account it already routes to. One lookup
+  // per ambiguous operation, before either provisioning pass.
+  if (input.originSource) {
+    const routeOrigin = dependencies.routeOriginAccount ?? routeOriginAccountByHostPolicy;
+    const seenOperations = new Set<string>();
+    for (const entry of currentRows) {
+      const key = entry.manifest.operationId.toUpperCase();
+      if (!operationIds.includes(key) || seenOperations.has(key)) continue;
+      const siblings = currentRows.filter((row) => row.manifest.operationId.toUpperCase() === key);
+      if (siblings.length < 2 || siblings.some((row) => namedAccountTokens.has(row.manifest.accountId))) continue;
+      seenOperations.add(key);
+      const routed = await routeOrigin({
+        sessionId: input.originSource.sessionId,
+        sourceUserSeq: input.originSource.sourceUserSeq,
+        toolkit: registeredToolkitOfSlug(key).trim().toLowerCase(),
+        operation: key,
+      });
+      if (routed && siblings.some((row) => row.manifest.accountId === routed)) namedAccountTokens.add(routed);
+    }
+  }
   const rowsByOperation = (): Map<string, InstalledCapabilityManifest[]> => {
     const rows = new Map<string, InstalledCapabilityManifest[]>();
     for (const entry of currentRows) {
