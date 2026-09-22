@@ -388,20 +388,23 @@ function toolSignature(tools: readonly string[]): string {
  * Several matches that used the same tools are the same job (today vs
  * tomorrow calendar). Jev is only needed when proven tools disagree.
  */
-export const PROVEN_SKIP_MIN_REQUEST_COVERAGE = 0.34;
+export const PROVEN_SKIP_MIN_OVERLAP = 0.5;
 
 /** Does the strategy cover the request, not merely touch it? The store's
  *  recall score is containment of the SHORTER keyword list, so a two-word
- *  strategy matches any longer request that mentions one of its words. The
- *  skip (a thinned surface) needs the strategy to cover the request's own
- *  words: all of a short request, a third of a long one. */
+ *  strategy matches any longer request that mentions one of its words, and
+ *  a three-word strategy matches a four-word request about something else
+ *  that shares two of them. The skip (a thinned surface with no search) needs
+ *  the two keyword sets to mostly coincide: shared words over all words of
+ *  either side, at least half. */
 export function provenStrategyCoversRequest(query: string, strategy: Pick<RunStrategyRecord, 'keywords'>): boolean {
-  const words = strategyKeywords(query);
-  if (words.length === 0) return true;
+  const words = new Set(strategyKeywords(query));
   const known = new Set(strategy.keywords);
-  const covered = words.filter((word) => known.has(word)).length;
-  if (words.length <= 3) return covered >= words.length;
-  return covered / words.length >= PROVEN_SKIP_MIN_REQUEST_COVERAGE;
+  if (words.size === 0 || known.size === 0) return words.size === known.size;
+  let shared = 0;
+  for (const word of words) if (known.has(word)) shared += 1;
+  const union = words.size + known.size - shared;
+  return shared / union >= PROVEN_SKIP_MIN_OVERLAP;
 }
 
 export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): RunStrategyRecord | null {
