@@ -1014,3 +1014,40 @@ test('native stream asks for the usage chunk and records it once, on the ALS ses
   assert.equal(row.cachedInputTokens, 900);
   assert.equal(row.outputTokens, 25);
 });
+
+test('prefix cache: the per-turn instruction layers ride before the current user message, not inside the stable system prefix', async () => {
+  const { placeDynamicInstructionLayersBeforeCurrentMessage } = await import('./byo-model.js');
+  const { INSTRUCTION_CACHE_DELIM, CACHE_MEMORY_CONTEXT_DELIM } = await import('./model-wire-registry.js');
+  const stable = 'You are Clementine. Stable role instructions.';
+  const dynamic = `Today is 2026-09-22.${CACHE_MEMORY_CONTEXT_DELIM}Memory: the owner prefers short answers.`;
+  const messages = [
+    { role: 'system', content: `${stable}${INSTRUCTION_CACHE_DELIM}${dynamic}` },
+    { role: 'user', content: 'earlier question' },
+    { role: 'assistant', content: 'earlier answer' },
+    { role: 'user', content: 'whats on my calendar tomorrow' },
+  ];
+  const out = placeDynamicInstructionLayersBeforeCurrentMessage(messages);
+  // Byte 0 is the stable prefix, nothing per-turn in it.
+  assert.equal(out[0].role, 'system');
+  assert.equal(out[0].content, stable);
+  assert.doesNotMatch(String(out[0].content), /2026-09-22|Memory:|CLEM_/);
+  // Prior history is untouched and directly follows the stable prefix.
+  assert.deepEqual(out.slice(1, 3), messages.slice(1, 3));
+  // The dynamic layers sit right before the current user message, markers stripped.
+  assert.equal(out[3].role, 'system');
+  assert.match(String(out[3].content), /Today is 2026-09-22/);
+  assert.match(String(out[3].content), /Memory: the owner prefers short answers/);
+  assert.doesNotMatch(String(out[3].content), /CLEM_/);
+  assert.deepEqual(out[4], messages[3]);
+  assert.equal(out.length, 5);
+  // Frames within a turn append tool traffic after the current message; the
+  // prefix through the dynamic block is byte-identical frame to frame.
+  const frame2 = placeDynamicInstructionLayersBeforeCurrentMessage([
+    ...messages, { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'x', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'result' },
+  ]);
+  assert.deepEqual(frame2.slice(0, 5), out);
+  // A system message with no boundary is only stripped of markers.
+  const plain = placeDynamicInstructionLayersBeforeCurrentMessage([{ role: 'system', content: 'plain' }, { role: 'user', content: 'hi' }]);
+  assert.deepEqual(plain, [{ role: 'system', content: 'plain' }, { role: 'user', content: 'hi' }]);
+});
