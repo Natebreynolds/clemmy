@@ -18,7 +18,8 @@ import {
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from './shared.js';
-import { listWorkflows, type WorkflowDefinition } from '../memory/workflow-store.js';
+import { getNotification } from '../runtime/notifications.js';
+import { listWorkflows, readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -92,6 +93,7 @@ import {
   type WorkflowChatDispatchPreparedReceipt,
   type WorkflowRunOriginIdentity,
   type WorkflowRunOriginObserver,
+  workflowRunDrainKickRegistered,
 } from '../execution/workflow-origin-group.js';
 import {
   TURN_SCOPED_HOLD_STATUS,
@@ -122,6 +124,7 @@ export {
   reconcileActivatedWorkflowOriginGroups,
   recoverClosedWorkflowOriginGroups,
   registerWorkflowRunDrainKick,
+  workflowRunDrainKickRegistered,
   readActiveWorkflowOriginGroup,
   readActiveWorkflowOriginGroupForRun,
   readWorkflowOriginGroup,
@@ -2945,6 +2948,63 @@ export function queueWorkflowCreationTest(
         : `Tell the user it's being tested and that it will auto-enable here on pass (or report what to fix on fail). `)
       + `Do NOT wait, poll, or do the work yourself.`,
   };
+}
+
+export interface WorkflowCreationTestSettlement {
+  runId: string;
+  pass: boolean;
+  activationCompatible: boolean;
+  enabled: boolean;
+  /** The creation-test report the daemon wrote (step lines, what to fix). */
+  body: string;
+  waitedMs: number;
+}
+
+/** Longest a creation test is awaited inside the authoring tool. Below the
+ * tool's own externalApi budget so a slow test returns the queued message
+ * instead of a timeout. */
+export const CREATION_TEST_AWAIT_MS = 240_000;
+const CREATION_TEST_POLL_MS = 1_500;
+
+/**
+ * Wait for a queued creation test to settle, so the authoring receipt carries
+ * the test outcome and the enabled state instead of a promise the brain then
+ * polls for (live 2026-09-22: seven workflow_get/run_status frames, ~90 s and
+ * ~100k tokens, to learn what the daemon knew after 66 s). Only waits inside a
+ * daemon that drains runs; elsewhere it returns null at once. Null also means
+ * "not settled within the bound": the queued message stays truthful.
+ */
+export async function awaitWorkflowCreationTestSettlement(
+  runId: string,
+  workflowName: string,
+  options: { boundMs?: number; pollMs?: number; drainRegistered?: () => boolean } = {},
+): Promise<WorkflowCreationTestSettlement | null> {
+  const registered = options.drainRegistered ?? workflowRunDrainKickRegistered;
+  if (!registered()) return null;
+  const boundMs = options.boundMs ?? CREATION_TEST_AWAIT_MS;
+  const pollMs = options.pollMs ?? CREATION_TEST_POLL_MS;
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const started = Date.now();
+  while (Date.now() - started < boundMs) {
+    let record: { notifiedAt?: unknown; completedAt?: unknown } | null = null;
+    try {
+      record = JSON.parse(readFileSync(file, 'utf8')) as { notifiedAt?: unknown; completedAt?: unknown };
+    } catch { /* not written yet or being rewritten; poll again */ }
+    if (record && (typeof record.notifiedAt === 'string' || typeof record.completedAt === 'string')) {
+      const notification = getNotification(`workflow-${runId}-creationtest`);
+      const enabled = readWorkflow(workflowName)?.data.enabled === true;
+      return {
+        runId,
+        pass: notification?.metadata?.pass === true,
+        activationCompatible: notification?.metadata?.activationCompatible !== false,
+        enabled,
+        body: notification?.body ?? '',
+        waitedMs: Date.now() - started,
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return null;
 }
 
 /** Read-only lifecycle evidence; never grants execution authority. */

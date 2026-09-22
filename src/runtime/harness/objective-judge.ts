@@ -521,6 +521,12 @@ export interface SkillExecutionContext {
 export interface CompletionEvidenceRow {
   toolName: string;
   outcome: string;
+  /** A control-role write whose settled result is a proven host-local
+   * authoring commit (a workflow or Space definition on disk). Authoring IS
+   * the outcome of an authoring request; without this the whole class of
+   * "create a workflow" turns had no outcome evidence and Jev's INCOMPLETE
+   * was accepted against finished work (live 2026-09-22, "Invite digest"). */
+  authoringResult?: boolean;
   status?: string;
   contentComplete?: boolean;
   contentDisposition?: string;
@@ -554,6 +560,7 @@ function isCompleteRetainedProjection(row: CompletionEvidenceRow): boolean {
 function isNonOutcomeEvidence(row: CompletionEvidenceRow): boolean {
   if (row.contentDisposition === 'discovery_navigation') return true;
   if (isCompleteRetainedProjection(row)) return false;
+  if (row.authoringResult === true && isSucceededReceipt(row)) return false;
   return actionTopologyRoleFor(row.toolName) === 'control';
 }
 

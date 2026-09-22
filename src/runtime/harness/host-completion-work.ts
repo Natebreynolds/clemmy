@@ -456,6 +456,23 @@ export function sourceSettledReadEvidence(input: {
     const results: CompletionReadEvidence['results'] = [];
     const blocks: string[] = [];
     const incremental = input.afterSettlementIndex !== undefined;
+    // A control-role write that committed a durable definition (workflow or
+    // Space) is marked on its tool_returned row by the tool edge. That commit
+    // is the outcome of an authoring request, so the review sees it as one.
+    const authoringResultSettled = (callId: string): boolean => {
+      try {
+        const returned = openEventLog().prepare(`SELECT json_extract(data_json, '$.successfulAuthoringResult') AS marker FROM events
+          WHERE session_id = ? AND type = 'tool_returned'
+            AND json_extract(data_json, '$.sourceUserSeq') = ?
+            AND (json_extract(data_json, '$.canonicalCallId') = ?
+              OR json_extract(data_json, '$.callId') = ?
+              OR json_extract(data_json, '$.logicalToolCallId') = ?)
+          ORDER BY seq DESC LIMIT 1`).get(input.sessionId, input.sourceUserSeq, callId, callId, callId) as { marker: unknown } | undefined;
+        return returned?.marker === 1 || returned?.marker === true;
+      } catch {
+        return false;
+      }
+    };
     const seenContent = new Map<string, string>();
     const succeeded = (outcome: string): boolean => outcome === 'succeeded' || outcome === 'empty_result';
     // Discovery is scaffolding once a business read has answered; when nothing
@@ -466,8 +483,13 @@ export function sourceSettledReadEvidence(input: {
       if (!incremental && input.omitSuccessfulDiscovery && row.toolName === 'tool_search' && row.outcome === 'succeeded') continue;
       const evidenceKind = toolReadsRetainedOutput(row.toolName)
         ? 'retained_projection' as const : 'source_result' as const;
-      const base = { logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, evidenceKind };
-      const label = `${row.toolName} [logicalCall=${row.callId}, outcome=${row.outcome}${row.mutating ? ', write receipt' : ''}]`;
+      const authoringResult = Boolean(row.mutating) && succeeded(row.outcome) && authoringResultSettled(row.callId);
+      const base = {
+        logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, evidenceKind,
+        ...(authoringResult ? { authoringResult: true } : {}),
+      };
+      const label = `${row.toolName} [logicalCall=${row.callId}, outcome=${row.outcome}${row.mutating ? (authoringResult ? ', authoring receipt' : ', write receipt') : ''}]`;
+      if (authoringResult) blocks.push('Authoring receipt: a durable definition (workflow or Space) was committed to disk and reopened; its body below reports the creation test and enabled state as settled. This IS the outcome of an authoring request; it does not prove any later scheduled run.');
       if (row.mutating) blocks.push('Write receipt: verifies only the settled operation and its returned result. Saving a timer, workflow, or queued action does NOT prove later execution or delivery. Inspect its exact request/result; never repeat the write to obtain evidence.');
       if (row.outcome !== 'succeeded' && row.outcome !== 'empty_result') {
         results.push({ ...base, status: 'not_succeeded' });

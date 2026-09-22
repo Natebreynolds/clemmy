@@ -234,19 +234,39 @@ async function publishCachedProvenOperations(input: {
   return publishedProvenOperations(input.slugs);
 }
 
+export interface ProvenBoundAccount {
+  slug: string;
+  accountId: string;
+  label?: string;
+}
+
+/** The connected-account label the owner would recognise for a bound id. */
+function boundAccountLabel(accountId: string): string | undefined {
+  try {
+    const row = peekConnectedToolkits().find((entry) => entry.connectionId === accountId);
+    return row?.accountEmail || row?.accountLabel || row?.accountName || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function bindPublishedSkip(
-  published: Array<{ slug: string; capabilityId: string; descriptor: HostCapabilityDescriptorV1 }>,
+  published: Array<{ slug: string; capabilityId: string; descriptor: HostCapabilityDescriptorV1; accountId?: string }>,
 ): {
   skipDiscoverySearch: boolean;
   capabilityRefs: string[];
   descriptors: HostCapabilityDescriptorV1[];
   invocations: unknown[];
+  boundAccounts: ProvenBoundAccount[];
 } {
   const capabilityRefs = published.map((row) => row.capabilityId);
   return {
     skipDiscoverySearch: capabilityRefs.length > 0,
     capabilityRefs,
     descriptors: published.map((row) => row.descriptor),
+    boundAccounts: published.flatMap((row) => (row.accountId
+      ? [{ slug: row.slug, accountId: row.accountId, ...(boundAccountLabel(row.accountId) ? { label: boundAccountLabel(row.accountId) } : {}) }]
+      : [])),
     invocations: published.map((row) => renderCarrierInvocationExample(
       'work_call',
       {
@@ -263,6 +283,7 @@ function publishedProvenOperations(slugs: readonly string[]): Array<{
   slug: string;
   capabilityId: string;
   descriptor: HostCapabilityDescriptorV1;
+  accountId?: string;
 }> {
   try {
     const catalog = peekHostCapabilityCatalogFactory();
@@ -271,6 +292,7 @@ function publishedProvenOperations(slugs: readonly string[]): Array<{
       slug: string;
       capabilityId: string;
       descriptor: HostCapabilityDescriptorV1;
+      accountId?: string;
     }> = [];
     for (const slug of slugs) {
       const base = `cap:resolved:${slug.toLowerCase()}`;
@@ -280,10 +302,12 @@ function publishedProvenOperations(slugs: readonly string[]): Array<{
         && row.manifest.operationId.toUpperCase() === slug
       ));
       if (!entry) continue;
+      const accountId = (entry as { account?: unknown }).account ?? entry.manifest?.accountId;
       published.push({
         slug,
         capabilityId: entry.capabilityId,
         descriptor: descriptorFromCatalogEntry(entry),
+        ...(typeof accountId === 'string' && accountId ? { accountId } : {}),
       });
     }
     return published;
@@ -296,6 +320,7 @@ export function renderProvenOperationGuidance(
   strategy: RunStrategyRecord,
   schemas: Record<string, unknown>,
   invocations: readonly unknown[] = [],
+  boundAccounts: readonly ProvenBoundAccount[] = [],
 ): string {
   const tools = strategy.toolsUsed;
   const schemaLines = tools.map((name) => {
@@ -323,6 +348,15 @@ export function renderProvenOperationGuidance(
       ? [
           'Exact work_call already disclosed and callable now:',
           ...invocations.map((invocation) => JSON.stringify(invocation)),
+        ]
+      : []),
+    // Live 279653: with three Outlook accounts connected, the brain spent a
+    // 31 s frame on tool_search account_selection for an operation whose
+    // account the host had already routed. Say so, in the brain's own terms.
+    ...(callable && boundAccounts.length > 0
+      ? [
+          'Operating account already bound by the host for these operations; no account_selection and no tool_search is needed to choose or confirm it:',
+          ...boundAccounts.map((row) => `- ${row.slug}: ${row.label ? `${row.label} (${row.accountId})` : row.accountId}`),
         ]
       : []),
     ...schemaLines,
@@ -433,6 +467,7 @@ export async function prepareProvenOperationForRequest(input: {
   let capabilityRefs: string[] = [];
   let descriptors: HostCapabilityDescriptorV1[] = [];
   let invocations: unknown[] = [];
+  let boundAccounts: ProvenBoundAccount[] = [];
   const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
   if (
     composioSlugs.length > 0
@@ -469,11 +504,12 @@ export async function prepareProvenOperationForRequest(input: {
       capabilityRefs = bound.capabilityRefs;
       descriptors = bound.descriptors;
       invocations = bound.invocations;
+      boundAccounts = bound.boundAccounts;
     } catch { /* proven provision is fail-open: keep tool_search */ }
   }
 
   return {
-    text: renderProvenOperationGuidance(strategy, schemas, invocations),
+    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
     skipDiscoverySearch,

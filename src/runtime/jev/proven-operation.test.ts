@@ -78,6 +78,26 @@ test('proven operation guidance tells the brain to skip tool_search when an invo
   assert.match(text, /work_call/);
   assert.match(text, /cap:resolved:outlook_get_calendar_view/);
   assert.match(text, /start_datetime/);
+  // No bound account was disclosed: nothing is claimed about accounts.
+  assert.doesNotMatch(text, /Operating account already bound/);
+
+  // Live 279653: three Outlook accounts connected, the host had routed the
+  // account, and the brain still spent a 31 s frame on tool_search
+  // account_selection. The guidance names the bound account and says so.
+  const bound = renderProvenOperationGuidance({
+    id: 'strat-cal',
+    objective: 'whats on my calendar today',
+    keywords: ['calendar', 'today'],
+    toolsUsed: ['outlook_get_calendar_view'],
+    workerCount: 0,
+    durationMs: 40_000,
+    createdAt: new Date().toISOString(),
+    uses: 1,
+  }, {}, [{ tool: 'work_call', args: { requirement_id: 'cap:resolved:outlook_get_calendar_view', name: 'composio_execute_tool', args_json: '{}' } }],
+  [{ slug: 'OUTLOOK_GET_CALENDAR_VIEW', accountId: 'ca_one', label: 'alex@corp.example' }]);
+  assert.match(bound, /Operating account already bound by the host/);
+  assert.match(bound, /no account_selection and no tool_search/);
+  assert.match(bound, /OUTLOOK_GET_CALENDAR_VIEW: alex@corp\.example \(ca_one\)/);
 });
 
 test('paraphrases and same-tool strategies bind without exact wording', async () => {

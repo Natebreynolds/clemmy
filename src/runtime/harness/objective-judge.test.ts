@@ -334,6 +334,39 @@ test('judgeObjectiveComplete uses a confident Jev verdict and skips the chat-mod
   assert.equal(v.failedOpen, undefined);
 });
 
+test('evidence coverage: a proven authoring commit is the outcome of an authoring request', () => {
+  // Live 2026-09-22 ("Invite digest"): workflow_create is a control-role
+  // tool, so an authoring turn had NO outcome evidence and Jev's INCOMPLETE
+  // was accepted against a created, tested, enabled workflow.
+  const authored = assessCompletionEvidenceCoverage({
+    objective: 'create a workflow with a review step',
+    results: [
+      { toolName: 'workflow_list', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+      { toolName: 'workflow_create', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result', authoringResult: true },
+    ],
+  });
+  assert.equal(authored.missingCoverage, false);
+  assert.equal(authored.complete, true);
+  assert.deepEqual(authored.outcomeEvidence.map((row) => row.toolName), ['workflow_create']);
+
+  // The same control write WITHOUT a proven authoring commit is still control.
+  const unproven = assessCompletionEvidenceCoverage({
+    objective: 'create a workflow with a review step',
+    results: [
+      { toolName: 'workflow_create', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+    ],
+  });
+  assert.equal(unproven.missingCoverage, true);
+  // A failed authoring attempt never counts, marker or not.
+  const failed = assessCompletionEvidenceCoverage({
+    objective: 'create a workflow',
+    results: [
+      { toolName: 'workflow_create', outcome: 'failed', status: 'not_succeeded', evidenceKind: 'source_result', authoringResult: true },
+    ],
+  });
+  assert.equal(failed.complete, false);
+});
+
 test('evidence coverage uses registry role and completeness, not vendor names', () => {
   const empty = assessCompletionEvidenceCoverage({
     objective: 'look up the named record and its window',

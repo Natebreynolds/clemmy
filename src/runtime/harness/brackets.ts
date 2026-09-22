@@ -667,6 +667,13 @@ export function timeoutForTool(toolName: string): number {
   if (toolName === 'run_batch') {
     return DEFAULT_TIMEOUTS_MS.shell;
   }
+  // Workflow authoring waits for the creation test it starts (real read steps
+  // against the connected tools plus model steps: 66 s live, 2026-09-22),
+  // exactly the external-work shape this bucket exists for. The default 60 s
+  // budget would kill the tool while its own test is still running.
+  if (toolName === 'workflow_create' || toolName === 'workflow_update' || toolName === 'workflow_reshape') {
+    return DEFAULT_TIMEOUTS_MS.externalApi;
+  }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
     return DEFAULT_TIMEOUTS_MS.mcp;

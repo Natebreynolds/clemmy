@@ -2822,6 +2822,11 @@ export function registerWorkflowRunDrainKick(
  * callback failure is ignored, and the daemon's periodic drain remains the
  * recovery path. Keeping the request beside registration lets every queue
  * producer use the same hook without importing the daemon. */
+/** True inside a daemon that drains queued runs; false in tools run without one. */
+export function workflowRunDrainKickRegistered(): boolean {
+  return workflowRunDrainKick !== undefined;
+}
+
 export function requestWorkflowRunDrainKick(runIds: readonly string[]): void {
   const exact = [...new Set(runIds.map((runId) => runId.trim()).filter(Boolean))];
   if (exact.length === 0) return;

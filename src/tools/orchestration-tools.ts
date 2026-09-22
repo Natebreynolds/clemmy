@@ -77,6 +77,7 @@ import {
 import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
 import {
+  awaitWorkflowCreationTestSettlement,
   queueWorkflowCreationTest,
   requeueWorkflowFailedItemsFromRun,
 } from './workflow-run-queue.js';
@@ -1279,6 +1280,27 @@ export function registerOrchestrationTools(server: McpServer): void {
           originSessionId: getToolOutputContext()?.sessionId,
           activateAfterCreationTest: enabled !== false,
         });
+        // The creation test is part of authoring: wait for it (bounded) so this
+        // receipt reports the settled outcome and the enabled state, instead of
+        // a promise the brain then polls for frame after frame.
+        const settled = queued.id
+          ? await awaitWorkflowCreationTestSettlement(queued.id, name)
+          : null;
+        if (settled) {
+          const headline = settled.pass
+            ? (settled.enabled
+              ? `Created workflow "${name}" — creation test PASSED and it is ENABLED.`
+              : `Created workflow "${name}" — creation test PASSED; it stays DISABLED${enabled === false ? ' as requested' : ` (${settled.activationCompatible ? 'not enabled' : 'the saved definition changed during the test; re-test before enabling'})`}.`)
+            : `Created workflow "${name}" — creation test FOUND ISSUES, so it stays DISABLED.`;
+          return textResult(withWorkflowCommit(
+            dirName,
+            `${headline} Here's what it will do:\n\n${describeWorkflowPlainEnglish(readWorkflow(dirName)?.data ?? created.savedDef)}\n\n`
+            + `${appendDataSources(created.savedDef)}`
+            + `${appendVisualContract(created.executionPlan)}`
+            + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+            + `Creation test (run ${settled.runId}, settled after ${Math.round(settled.waitedMs / 1000)} s):\n${settled.body.trim()}${advisoryTail}`,
+          ));
+        }
         return textResult(withWorkflowCommit(
           dirName,
           `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
