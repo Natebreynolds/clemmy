@@ -28,8 +28,9 @@ import { nextWorkflowNodeAttempt } from '../runtime/harness/accepted-turn-call-a
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { refreshIndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
-import { listConnectedToolkits } from '../integrations/composio/client.js';
-import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
+import { listConnectedToolkits, peekConnectedToolkits } from '../integrations/composio/client.js';
+import { peekAttestedTransport } from '../runtime/harness/implementation-artifacts/attested-transport.js';
+import { ensureLiveComposioSchemaFingerprint, liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { tryJevWatchChangeVerdict } from '../runtime/jev/control-plane.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
@@ -216,9 +217,37 @@ async function warmProviderObservation(operation: ConnectedCalendarOperation): P
     }
   }
   if (observed === 0 && operation.manifests.length > 0) {
-    return `no account could be observed live (${outcomes.join('; ') || 'no account on the manifests'})`;
+    return `no account could be observed live (${outcomes.join('; ') || 'no account on the manifests'}; ${describeObservationInputs(operation)})`;
   }
   return undefined;
+}
+
+/** Name the inputs the attested observer needs, so a refusal is diagnosable
+ * from the status card instead of from a debugger. */
+function describeObservationInputs(operation: ConnectedCalendarOperation): string {
+  const parts: string[] = [];
+  try {
+    const toolkit = operation.operationId.split('_')[0]?.toLowerCase() ?? '';
+    const rows = peekConnectedToolkits();
+    const matching = rows.filter((row) => String(row.slug ?? '').toLowerCase().includes(toolkit));
+    parts.push(`connected toolkits ${rows.length}, ${toolkit}: ${matching.map((row) => `${row.connectionId}/${row.status}`).join(',') || 'none'}`);
+  } catch (error) {
+    parts.push(`connected toolkits unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  parts.push(`live schema ${liveComposioSchemaFingerprint(operation.operationId) ? 'present' : 'absent'}`);
+  try {
+    const transport = peekAttestedTransport();
+    if (!transport) parts.push('transport unbound');
+    else {
+      const seen = operation.manifests
+        .filter((m) => m.accountId && transport.observe({ operationId: operation.operationId, accountId: m.accountId }))
+        .map((m) => m.accountId);
+      parts.push(`transport observed: ${seen.join(',') || 'none'}`);
+    }
+  } catch (error) {
+    parts.push(`transport unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parts.join('; ');
 }
 
 /** When the compiler still finds no candidate, ask the adapter why the
