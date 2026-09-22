@@ -26,7 +26,9 @@ import { executeWorkflowNodeRead } from '../execution/workflow-node-invocation-e
 import type { WorkflowNodeCallExecutionIdentityV1 } from '../execution/workflow-node-invocation-executor.js';
 import { nextWorkflowNodeAttempt } from '../runtime/harness/accepted-turn-call-authority.js';
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import { refreshIndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
+import { listConnectedToolkits } from '../integrations/composio/client.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { tryJevWatchChangeVerdict } from '../runtime/jev/control-plane.js';
@@ -115,7 +117,14 @@ export interface ConnectedCalendarOperation {
    * exact string; the watch never re-spells it. */
   operationId: string;
   providerKind: string;
-  manifestIds: string[];
+  /** Every CURRENT durable manifest for the operation, one per account. */
+  manifests: Array<{
+    manifestId: string;
+    accountId: string;
+    definitionFingerprint: string;
+    providerVersion: string;
+    operationVersion: string;
+  }>;
   provider: CalendarReadOperation;
 }
 
@@ -127,22 +136,38 @@ export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
   if (!store) return [];
   const present = new Map<string, ConnectedCalendarOperation>();
   for (const entry of store.list()) {
-    const manifest = entry.manifest as { manifestId?: unknown; operationId?: unknown; providerKind?: unknown; lifecycle?: { state?: unknown } };
+    const manifest = entry.manifest as {
+      manifestId?: unknown;
+      operationId?: unknown;
+      providerKind?: unknown;
+      accountId?: unknown;
+      definitionFingerprint?: unknown;
+      providerVersion?: unknown;
+      operationVersion?: unknown;
+      lifecycle?: { state?: unknown };
+    };
     const state = manifest.lifecycle?.state;
     if (state !== undefined && state !== 'current') continue;
     if (typeof manifest.operationId !== 'string') continue;
     const provider = calendarReadOperation(manifest.operationId);
     if (!provider) continue;
+    const str = (value: unknown): string => (typeof value === 'string' ? value : '');
+    const row = {
+      manifestId: str(manifest.manifestId),
+      accountId: str(manifest.accountId),
+      definitionFingerprint: str(manifest.definitionFingerprint),
+      providerVersion: str(manifest.providerVersion),
+      operationVersion: str(manifest.operationVersion),
+    };
     const existing = present.get(manifest.operationId);
-    const manifestId = typeof manifest.manifestId === 'string' ? manifest.manifestId : undefined;
     if (existing) {
-      if (manifestId) existing.manifestIds.push(manifestId);
+      if (row.manifestId) existing.manifests.push(row);
       continue;
     }
     present.set(manifest.operationId, {
       operationId: manifest.operationId,
-      providerKind: typeof manifest.providerKind === 'string' ? manifest.providerKind : 'unknown',
-      manifestIds: manifestId ? [manifestId] : [],
+      providerKind: str(manifest.providerKind) || 'unknown',
+      manifests: row.manifestId ? [row] : [],
       provider,
     });
   }
@@ -160,10 +185,40 @@ async function warmProviderObservation(operation: ConnectedCalendarOperation): P
   if (operation.providerKind !== 'composio') return undefined;
   try {
     const fingerprint = await ensureLiveComposioSchemaFingerprint(operation.operationId);
-    return fingerprint ? undefined : 'live provider schema unavailable for this operation';
+    if (!fingerprint) return 'live provider schema unavailable for this operation';
   } catch (error) {
     return `live provider schema refresh failed: ${error instanceof Error ? error.message : String(error)}`;
   }
+  // The attested transport resolves an account against the connected
+  // toolkits it can see; a cold process has seen none yet.
+  try { await listConnectedToolkits(); } catch { /* the observation below reports it */ }
+  // A durable manifest becomes a live candidate only after the attested
+  // transport has observed the operation for its account in THIS process
+  // (independent observation, 60 s freshness). Chat does this through the
+  // materializer during discovery; the watch asks for the same observation
+  // for each account the manifests name.
+  const outcomes: string[] = [];
+  let observed = 0;
+  for (const manifest of operation.manifests) {
+    if (!manifest.accountId) continue;
+    try {
+      const result = await refreshIndependentCapabilityObservation({
+        operationId: operation.operationId,
+        accountId: manifest.accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+      });
+      if (result) observed += 1;
+      else outcomes.push(`${manifest.accountId}: not observed`);
+    } catch (error) {
+      outcomes.push(`${manifest.accountId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (observed === 0 && operation.manifests.length > 0) {
+    return `no account could be observed live (${outcomes.join('; ') || 'no account on the manifests'})`;
+  }
+  return undefined;
 }
 
 /** When the compiler still finds no candidate, ask the adapter why the
@@ -171,8 +226,8 @@ async function warmProviderObservation(operation: ConnectedCalendarOperation): P
 function explainMissingCandidates(operation: ConnectedCalendarOperation): string {
   try {
     const adapter = peekProductionCapabilityAdapter();
-    if (!adapter || operation.manifestIds.length === 0) return 'no durable manifest';
-    const result = adapter.refresh(new Set(operation.manifestIds));
+    if (!adapter || operation.manifests.length === 0) return 'no durable manifest';
+    const result = adapter.refresh(new Set(operation.manifests.map((m) => m.manifestId)));
     if (result.refused.length === 0) return `${result.registered} registered, none refused`;
     return result.refused.map((entry) => `${entry.manifestId.split(':definition:')[1] ?? entry.manifestId}: ${entry.reason}`).join('; ');
   } catch (error) {

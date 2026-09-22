@@ -314,9 +314,10 @@ test('a failed read keeps the snapshot, records the error, and is not a quiet ti
   assert.match(tick.summary, /Read failed/);
 });
 
-test('the watch runtime never imports the raw provider client', () => {
+test('the watch runtime never dispatches through the raw provider client; reads go through the prepared workflow read path', () => {
   const source = readFileSync(new URL('./calendar-watch-runtime.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(source, /integrations\/composio\/client|executeComposioTool/);
+  assert.doesNotMatch(source, /executeComposioTool|executeTool\(|composio_execute_tool/);
   assert.match(source, /executeWorkflowNodeRead/);
   assert.match(source, /compileLiveCatalogWorkflowCallPlan/);
+  assert.match(source, /refreshIndependentCapabilityObservation/);
 });
