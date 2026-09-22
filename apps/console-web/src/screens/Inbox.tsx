@@ -143,7 +143,7 @@ export function Inbox() {
       const result = await decideApproval(id, decision, { kind: row.kind, ...(note ? { note } : {}) });
       const notice: DecisionNotice = {
         tone: 'success',
-        text: approvalDecisionSuccessText(row, decision, result),
+        text: approvalDecisionSuccessText(row, decision, result, note),
       };
       setDecisionStates((prev) => ({ ...prev, [id]: { busy: false, notice } }));
       setDecisionNotice(notice);

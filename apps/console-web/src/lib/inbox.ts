@@ -201,7 +201,13 @@ export function approvalDecisionSuccessText(
   row: ApprovalRow,
   decision: 'approve' | 'reject',
   response?: ApprovalDecisionResponse,
+  note?: string,
 ): string {
+  // A rejection that carried a note is a change request: say what happens
+  // to the note, not just that nothing will be dispatched.
+  if (decision === 'reject' && note?.trim()) {
+    return 'Changes requested — this draft stops here and your note goes back to Clem to revise before anything is saved or sent.';
+  }
   if (decision === 'reject') return 'Rejected — this action will not be dispatched.';
   if (row.pendingAction) {
     const status = response?.status ?? '';
