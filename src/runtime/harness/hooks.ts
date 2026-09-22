@@ -12,6 +12,7 @@ import {
   unwrapRuntimeEffectiveToolIdentity,
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
+import { mirrorExternalSendToFirstPartySurfaces } from './external-send-mirror.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
@@ -647,6 +648,16 @@ export function attachEventLogHooks(
     } catch {
       // see onToolStart
     }
+    // What Clem sent anywhere shows up on the first-party surfaces: one
+    // in-app item per successful irreversible external send, chat or step.
+    mirrorExternalSendToFirstPartySurfaces({
+      sessionId,
+      callId,
+      toolName: tool?.name ?? '',
+      accounting,
+      rawArgs: details?.toolCall?.arguments,
+      ok: toolOutputLooksSuccessful(resultStr),
+    });
     if (
       returnedEvent
       && callId
