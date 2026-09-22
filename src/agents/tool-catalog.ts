@@ -171,6 +171,12 @@ export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'tool_search',
   'tool_output_query',
   'recall_tool_result',
+  // Live 282184: a proven calendar strategy matched "create a workflow…";
+  // the thinned surface had no door to ANY local tool — tool_search found
+  // workflow_create (carrier call_tool) and nothing could call it, so the
+  // turn ended on a placeholder question. A remembered operation is a
+  // shortcut, never the whole tool universe: the generic local door stays.
+  'call_tool',
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {

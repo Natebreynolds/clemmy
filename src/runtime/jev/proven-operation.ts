@@ -396,10 +396,13 @@ export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): R
   return null;
 }
 
-function stagedCandidatesForJev(): Array<{ id: string; objective: string; toolsUsed: string[]; record: RunStrategyRecord }> {
+function stagedCandidatesForJev(scope: 'chat' | 'any'): Array<{ id: string; objective: string; toolsUsed: string[]; record: RunStrategyRecord }> {
   const staged = readActiveToolSurface().tools.filter((row) => row.schemaReady).slice(0, 8);
   if (staged.length === 0) return [];
-  const proven = listVerifiedRunStrategies();
+  // Live 282184: this path handed a chat request a workflow-step strategy
+  // (outlook read + workflow_step_result) the keyword matcher had already
+  // filtered out. The scope rule applies to every way a strategy is chosen.
+  const proven = listVerifiedRunStrategies().filter((strategy) => scope === 'any' || (strategy.scope ?? 'chat') === 'chat');
   return staged.map((row) => {
     const record = proven.find((strategy) => (
       strategy.toolsUsed.some((name) => name.trim().toLowerCase() === row.name.toLowerCase())
@@ -423,7 +426,7 @@ function stagedCandidatesForJev(): Array<{ id: string; objective: string; toolsU
 }
 
 async function pickStagedSurfaceStrategy(query: string, sessionId?: string): Promise<RunStrategyRecord | null> {
-  const staged = stagedCandidatesForJev();
+  const staged = stagedCandidatesForJev(strategyScope);
   if (staged.length === 0) return null;
   const jev = await selectProvenRunStrategyWithJev(
     query,
@@ -454,9 +457,8 @@ export async function prepareProvenOperationForRequest(input: {
     .catch(() => { /* heartbeat never blocks the live turn */ });
   // A chat request is offered chat strategies only; a workflow step may reuse
   // anything it or a chat proved.
-  const matches = listMatchingRunStrategies(input.query, 4, {
-    scope: runStrategyScopeForSession(input.sessionId) === 'workflow_step' ? 'any' : 'chat',
-  });
+  const strategyScope = runStrategyScopeForSession(input.sessionId) === 'workflow_step' ? 'any' as const : 'chat' as const;
+  const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical;
   if (!strategy && matches.length > 0) {

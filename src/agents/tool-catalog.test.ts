@@ -113,6 +113,10 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   assert.equal(thinned.has('tool_output_query'), true);
   assert.equal(thinned.has('recall_tool_result'), true);
   assert.equal(thinned.has('check_in'), false);
+  // Live 282184: a proven calendar strategy matched an authoring request and
+  // the thinned surface had no door to any local tool; the turn ended on a
+  // placeholder question. The generic local door survives a proven skip.
+  assert.equal(applyProvenSkipToHotSet(new Set([...hot, 'call_tool'])).has('call_tool'), true, 'call_tool stays callable after a proven skip');
   for (const name of PROVEN_SKIP_KEEP_LOADED) {
     if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
   }

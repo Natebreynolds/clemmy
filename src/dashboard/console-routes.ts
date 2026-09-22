@@ -5684,7 +5684,8 @@ export function registerConsoleRoutes(
         // exact definition, passed, or needs review with the daemon's report.
         creationTest: workflowCreationTestState({
           workflowName: entry.data.name,
-          pendingRunId: pendingWorkflowVerification(entry.data.name, entry.data) ?? null,
+          // Run records carry the durable slug, never the display name.
+          pendingRunId: pendingWorkflowVerification(entry.name, entry.data) ?? null,
           notifications: listNotifications(400),
         }),
         // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
@@ -6374,7 +6375,7 @@ export function registerConsoleRoutes(
       return;
     }
     if (!dryRun && !targetStepId && entry.data.enabled === false) {
-      const verificationRunId = pendingWorkflowVerification(entry.data.name, entry.data);
+      const verificationRunId = pendingWorkflowVerification(entry.name, entry.data);
       if (!verificationRunId) {
         res.status(409).json({ status: 'disabled', error: 'workflow is disabled — approve it first' });
         return;
