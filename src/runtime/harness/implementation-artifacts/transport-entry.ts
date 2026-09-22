@@ -212,24 +212,30 @@ function observationKey(operationId: string, accountId: string): string {
  * connection, or that connection is not the sealed account, there is nothing
  * honest to observe.
  */
-function resolveConnectedAccount(client: ComposioClientSurface, input: {
+/**
+ * Confirm the sealed account is a connected account of the operation's
+ * toolkit. The caller names the exact account; the transport's only job is
+ * to see it among the toolkit's connections. It used to require the toolkit
+ * to have exactly ONE connection, which made every second account of a
+ * provider unobservable (three Outlook accounts, calendar watch,
+ * 2026-09-22) even though the caller had already named which one.
+ */
+export function resolveConnectedAccount(client: Pick<ComposioClientSurface, 'peekConnectedToolkits'>, input: {
   operationId: string;
   accountId: string;
 }): string | null {
   const toolkit = input.operationId.split('_')[0]?.toLowerCase() ?? '';
-  if (!toolkit) return null;
+  const expected = input.accountId.trim();
+  if (!toolkit || !expected) return null;
   const matched = client.peekConnectedToolkits().filter((row) => {
     const slug = String((row as { slug?: unknown }).slug ?? '').toLowerCase();
-    return slug.includes(toolkit);
+    if (!slug.includes(toolkit)) return false;
+    const connectionId = String((row as { connectionId?: unknown }).connectionId ?? '').trim();
+    const accountEmail = String((row as { accountEmail?: unknown }).accountEmail ?? '').trim();
+    return connectionId === expected || (!connectionId && accountEmail === expected);
   });
   if (matched.length !== 1) return null;
-  const accountId = String(
-    (matched[0] as { connectionId?: unknown }).connectionId
-    ?? (matched[0] as { accountEmail?: unknown }).accountEmail
-    ?? '',
-  ).trim();
-  if (!accountId || accountId !== input.accountId) return null;
-  return accountId;
+  return expected;
 }
 
 export function observeAttestedTransport(input: {
