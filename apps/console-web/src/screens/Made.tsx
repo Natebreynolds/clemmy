@@ -108,7 +108,6 @@ export function MadeArchive() {
   return (
     <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 py-6 animate-fade-in sm:px-10">
       <div>
-        <p className="text-caption font-semibold uppercase tracking-wide text-faint">Home</p>
         <h1 className="text-h1 text-fg">Made</h1>
         <p className="mt-1 text-body text-muted">Finished work, by when it was made. Open a folder to see the drafts and files.</p>
       </div>

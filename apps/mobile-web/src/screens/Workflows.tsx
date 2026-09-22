@@ -67,7 +67,7 @@ export function Workflows() {
           </div>
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
-            <span>{wf.stepCount} steps</span>
+            <span>{wf.stepCount} {wf.stepCount === 1 ? 'step' : 'steps'}</span>
             {wf.schedule ? <span>{whenLabel(wf.schedule)}</span> : null}
             {wf.requiresInput ? <span class="workflow-row-tag">needs input</span> : null}
             {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">needs binding</span> : null}

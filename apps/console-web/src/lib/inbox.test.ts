@@ -71,9 +71,9 @@ test('desktop Inbox makes workflow gates actionable and never approves a plan th
   assert.match(source, /I connected it — resume this run/);
   assert.match(source, /Retry exact metadata now/);
   assert.match(source, /!needsInput && \(/);
-  assert.match(source, /Answer in the exact conversation/);
+  assert.match(source, /Answer in the conversation/);
   assert.match(source, /to=\{`\/chat\/\$\{encodeURIComponent\(row\.sessionId\)\}`\}/);
-  assert.match(source, /Reject it and ask Clem to draft a new plan/);
+  assert.match(source, /Decline it and ask Clem to draft a new plan/);
   assert.match(automate, /Open exact Needs You gate/);
   assert.match(automate, /Choose an exact account/);
   assert.doesNotMatch(automate, /resumeWorkflowCapability/);

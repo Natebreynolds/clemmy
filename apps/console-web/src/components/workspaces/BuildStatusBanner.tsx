@@ -46,12 +46,26 @@ export function BuildStatusBanner({
             </p>
           )}
           {failures.length > 0 && (
-            <ul className="flex flex-col gap-1">
-              {failures.map((f, i) => (
-                <li key={i} className="text-caption text-danger">
-                  <span className="font-mono">{f.path.replace('/refresh/', '')}</span>: {f.note ?? 'failed to refresh'}
-                </li>
-              ))}
+            <ul className="flex flex-col gap-1.5">
+              {failures.map((f, i) => {
+                // One sentence a person reads; the engine's diagnostic (codes,
+                // operation ids) stays one click away for Clem-assisted fixes.
+                const source = f.path.replace('/refresh/', '').replace(/^\/+/, '') || 'a data source';
+                return (
+                  <li key={i} className="min-w-0 text-small text-fg">
+                    <span className="inline-flex items-center gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />
+                      Couldn’t refresh <strong className="font-semibold">{source}</strong>.
+                    </span>
+                    {f.note && (
+                      <details className="mt-0.5 pl-5 text-caption text-muted">
+                        <summary className="cursor-pointer select-none hover:text-fg">Details</summary>
+                        <p className="mt-1 whitespace-pre-wrap font-mono [overflow-wrap:anywhere]">{f.note}</p>
+                      </details>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
           {gaps.length > 0 && (

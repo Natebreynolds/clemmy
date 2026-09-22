@@ -2324,17 +2324,18 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .workflow-row-status.status-queued { background: var(--accent-soft) !important; color: var(--accent-deep); }
 .chat-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-row-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 3px; display: flex; gap: var(--sp-2); }
+/* "needs input" / "needs binding" are asks, not successes: warning tone, and
+   at the type floor rather than 10px. */
 .workflow-row-tag {
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.01em;
-  color: var(--accent-2);
-  background: rgba(77, 147, 55, 0.12);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--accent-warn);
+  background: color-mix(in srgb, var(--accent-warn) 12%, transparent);
   border-radius: 7px;
-  padding: 3px 9px;
+  padding: 2px 8px;
 }
 .workflow-row-desc, .workflow-desc { font-size: var(--t-sm); color: var(--fg-2); margin-top: 5px; }
-.workflow-row-meta { font-size: var(--t-xs); color: var(--fg-3); font-family: var(--font-mono); margin-top: 6px; }
+.workflow-row-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px var(--sp-2); }
 .workflow-actions { display: flex; gap: var(--sp-2); margin: var(--sp-3) 0; }
 .workflow-detail-body { font-size: var(--t-sm); }
 .workflow-event-head { display: flex; gap: var(--sp-2); align-items: baseline; }

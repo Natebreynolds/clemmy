@@ -11,7 +11,7 @@ import { detectedTimezone } from '@/lib/cron';
 import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
-import { certPrimaryAction, certificationActionLabel, certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
+import { certPrimaryAction, certificationActionLabel, certificationTone, workflowCertificationCounts, workflowPrimaryAction, sentenceCaseLabel } from '@/lib/workflowCertification';
 import { getWorkflow, patchWorkflow, deleteWorkflow, runWorkflow, setWorkflowEnabled, type WorkflowCertification, type WorkflowDetail, type WorkflowResourceBinding, type WorkflowResourceBindingReport, type WorkflowResourceProposalStatus } from '@/lib/automate';
 
 function engineToneClasses(tone: Tone) {
@@ -102,7 +102,7 @@ function WorkflowEnginePanel({
     <section className="mt-5">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-h3 text-fg">Readiness</h3>
-        <StatusPill tone={certificationTone(certification.state)}>{certification.label}</StatusPill>
+        <StatusPill tone={certificationTone(certification.state)}>{sentenceCaseLabel(certification.label)}</StatusPill>
       </div>
       <div className="rounded-md border border-border bg-subtle p-3">
         <p className="mb-3 text-small text-muted">{certification.summary}</p>

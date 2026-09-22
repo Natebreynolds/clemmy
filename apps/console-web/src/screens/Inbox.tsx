@@ -28,12 +28,12 @@ import {
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
 } from '@/lib/inbox';
 
-/** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
- *  — these are DECISIONS/blocks for the user, so they belong on the "Needs you"
- *  tab beside approvals, not buried under general notifications. */
+/** Decisions and blocks belong on "Needs you" beside approvals. The server
+ *  decides which those are (runtime/notifications.ts) and says so on every
+ *  row; a second rule here read titles and disagreed with it — "paused" and
+ *  "needs you" in a title counted on the desktop and nowhere else. */
 function needsAttentionNotif(n: NotificationRow): boolean {
-  return n.needsAttention === true
-    || /\bblocked\b|needs attention|needs input|needs you|paused|couldn['\u2019]t finish|action required/i.test(n.title || '');
+  return n.needsAttention === true;
 }
 
 type Tab = 'needs' | 'notifications';
@@ -556,7 +556,7 @@ export function Inbox() {
                             <Check className="h-4 w-4" aria-hidden /> Approve {checkedCount}
                           </Button>
                           <Button size="sm" variant="secondary" disabled={bulkBusy} onClick={() => onBulkDecide('reject')}>
-                            <X className="h-4 w-4" aria-hidden /> Reject {checkedCount}
+                            <X className="h-4 w-4" aria-hidden /> Decline {checkedCount}
                           </Button>
                         </div>
                       </>
@@ -632,7 +632,9 @@ export function Inbox() {
 
         {/* Reading pane — only rendered when the tab has selectable rows. */}
         {hasRows && (
-          <div className="rounded-lg border border-border-raised bg-raised p-5">
+          // Sized to what it shows and kept in view while the list scrolls —
+          // stretched to the list's height it was an empty white slab.
+          <div className="self-start rounded-lg border border-border-raised bg-raised p-5 lg:sticky lg:top-4 lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto">
             {selApproval && (
               <ApprovalDetail
                 row={selApproval}
@@ -664,8 +666,9 @@ export function Inbox() {
               <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />
             ) : null}
             {!selApproval && !selPlan && !selNotif && (
-              <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
-                Select an item to see the details
+              <div className="flex min-h-40 flex-col items-center justify-center gap-1 text-center">
+                <p className="text-body font-medium text-fg">Pick something on the left</p>
+                <p className="text-small text-muted">You’ll see the details and what happens when you decide.</p>
               </div>
             )}
           </div>
@@ -803,21 +806,21 @@ function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }
           <ul className="mt-1 list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
           {row.sessionId ? (
             <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the exact conversation
+              Answer in the conversation
             </Link>
           ) : (
-            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Reject it and ask Clem to draft a new plan with your answers.</p>
+            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Decline it and ask Clem to draft a new plan with your answers.</p>
           )}
         </div>
       )}
       <div className="mt-2.5 flex gap-2">
         {!needsInput && (
           <Button size="sm" disabled={busy} onClick={onApprove}>
-            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve exact plan'}
+            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve plan'}
           </Button>
         )}
         <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
-          <X className="h-4 w-4" aria-hidden /> Reject
+          <X className="h-4 w-4" aria-hidden /> Decline
         </Button>
       </div>
     </div>
@@ -832,29 +835,44 @@ function PlanProposalDetail({ row, busy, onApprove, onReject }: {
 }) {
   const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
   const needsInput = questions.length > 0;
+  const steps = (row.plan.steps ?? []).filter((step) => (step.action || step.description)?.trim());
   return (
     <div>
       <h3 className="mb-3 text-h3 text-fg">{row.plan.objective || 'Proposed plan'}</h3>
-      <Field label="Original request"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
+      <Field label="You asked"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
       {row.context && <Field label="Context"><span className="whitespace-pre-wrap">{row.context}</span></Field>}
-      {row.sessionId && <Field label="Exact conversation"><span className="font-mono">{row.sessionId}</span></Field>}
       <Field label="Proposed">{relativeTime(row.proposedAt) || row.proposedAt}</Field>
-      <Field label="Plan"><Mono value={row.plan} /></Field>
+      {steps.length > 0 && (
+        <Field label="What she’ll do">
+          <ol className="list-decimal space-y-1.5 pl-5">
+            {steps.map((step, index) => <li key={step.id ?? index}>{step.action || step.description}</li>)}
+          </ol>
+        </Field>
+      )}
+      {row.sessionId && (
+        <Link className="mt-1 inline-block text-small font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
+          Open the conversation
+        </Link>
+      )}
+      <details className="mt-3 text-caption text-muted">
+        <summary className="cursor-pointer select-none hover:text-fg">Technical details</summary>
+        <div className="mt-2"><Mono value={row.plan} /></div>
+      </details>
       {needsInput && (
         <Field label="Answers needed">
           <ul className="list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
           {row.sessionId ? (
             <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the exact conversation
+              Answer in the conversation
             </Link>
           ) : (
-            <p className="mt-2 text-warning">No linked conversation is available. Reject this proposal and ask Clem for a new plan after supplying the answers.</p>
+            <p className="mt-2 text-warning">No linked conversation is available. Decline this proposal and ask Clem for a new plan after supplying the answers.</p>
           )}
         </Field>
       )}
       <div className="mt-4 flex gap-2">
         {!needsInput && <Button disabled={busy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve & continue'}</Button>}
-        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Decline</Button>
       </div>
     </div>
   );
@@ -984,7 +1002,7 @@ function ApprovalCard({
         )}
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => onReject()}>
           <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : isWorkflowGate ? 'Decline' : 'Reject'}
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
         </Button>
       </div>
       {isWorkflowGate && changing && (
@@ -1125,7 +1143,7 @@ function ApprovalDetail({
         </Button>
         <Button variant="secondary" disabled={busy} onClick={onReject}>
           <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
         </Button>
       </div>
       {decisionState?.notice && (

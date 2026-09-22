@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import { AlertCircle, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { awayMeta, awayOutcome, awayTarget, clockLabel, type HomeFeedItem } from './home-model';
+import { awayMeta, awayOutcome, awayTarget, clockLabel, plainText, type HomeFeedItem } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
 const MAX_ROWS = 6;
@@ -51,7 +51,7 @@ export function WhileAwayPane({
             const body = (
               <>
                 <span
-                  className={cn('inline-flex shrink-0', outcome === 'update' ? 'text-muted' : 'text-warning')}
+                  className={cn('inline-flex shrink-0 self-start pt-1', outcome === 'update' ? 'text-muted' : 'text-warning')}
                   aria-label={outcome === 'update' ? 'Update' : 'Needs a look'}
                   role="img"
                 >
@@ -59,11 +59,15 @@ export function WhileAwayPane({
                     ? <Info className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden />
                     : <AlertCircle className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden />}
                 </span>
-                <span className="min-w-0 shrink-0 max-w-[55%] truncate text-body font-medium text-fg" title={item.title}>
-                  {item.title ?? 'Update from Clem'}
+                {/* Title over meta: side by side in a third of the window,
+                    the meta got two or three characters ("- cle…"). */}
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate text-body font-medium text-fg" title={item.title}>
+                    {plainText(item.title, 160) || 'Update from Clem'}
+                  </span>
+                  {meta && <span className="truncate text-small text-muted" title={meta}>{plainText(meta, 200)}</span>}
                 </span>
-                {meta && <span className="min-w-0 flex-1 truncate text-body text-muted" title={meta}>{meta}</span>}
-                {time && <span className="ml-auto shrink-0 text-caption text-faint">{time}</span>}
+                {time && <span className="shrink-0 self-start pt-0.5 text-caption text-faint">{time}</span>}
               </>
             );
             const key = item.notifId ?? item.taskId ?? item.targetRunId ?? `${index}:${item.title ?? ''}`;

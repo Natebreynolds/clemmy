@@ -606,11 +606,13 @@ export function buildCalendarWatchNotification(
       lines = [`${formatWhen(ev.startMs, nowMs, timezone)}${attendees ? ` · ${attendees}` : ''}${ev.location ? ` · ${ev.location}` : ''}.`];
       break;
   }
-  lines.push(`Calendar: ${change.accountLabel}`);
+  // Name the calendar only when there is a name to give: the fallback label
+  // is the connection id ("Calendar: ca_uDzrJqqniJFk" on the phone, 2026-09-22).
+  if (change.accountLabel && change.accountLabel !== change.accountId) lines.push(`Calendar: ${change.accountLabel}`);
   return {
     id: calendarWatchNotificationId(change.itemKey, change.kind, new Date(nowMs).toISOString()),
     kind: 'execution',
-    title: `📅 ${title}`,
+    title,
     body: lines.filter(Boolean).join('\n'),
     createdAt: new Date(nowMs).toISOString(),
     read: false,
