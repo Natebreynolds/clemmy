@@ -12466,11 +12466,14 @@ export function reapResolvedParkedRuns(): void {
           } catch { /* the record below still carries the revision */ }
         }
         clearWorkflowRunPausedForApproval(run.id);
+        // Merge onto the record as it is NOW: a step may have written its
+        // own facts (a judge's verdict) since this scan read `run`.
+        const currentRun = readRunRecord(filePath) ?? run;
         const revisedRecord = writeRunRecord(filePath, {
-          ...run,
+          ...currentRun,
           status: 'running',
           revisions: [
-            ...(run.revisions ?? []),
+            ...(currentRun.revisions ?? []),
             {
               approvalId: stopped.approvalId,
               stepId: changeRequest.stepId,
@@ -12578,7 +12581,9 @@ export function reapResolvedParkedRuns(): void {
     // stale flag that silences the resumed run's heartbeats. Covers every
     // park path (declarative gate throws before its own finally can clear).
     clearWorkflowRunPausedForApproval(run.id);
-    const resumedRecord = writeRunRecord(filePath, { ...run, status: 'running' }).record;
+    // Same merge: the record on disk may carry facts written after the scan
+    // (live: a revision verdict was overwritten by this stale spread).
+    const resumedRecord = writeRunRecord(filePath, { ...(readRunRecord(filePath) ?? run), status: 'running' }).record;
     if (isTerminalRunRecord(resumedRecord)) continue;
     try {
       addRunEvent(run.id, {
