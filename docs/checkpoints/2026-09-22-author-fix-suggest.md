@@ -398,3 +398,22 @@ owner's home were marked read by hand; the retirement stamps land on the
 first launch of a build carrying the fix. Tag owner: this commit is on
 `main` and rides with the tag; it changes only the scheduler's boot
 reconcile and its pin.
+
+## Addendum, 23:55Z: killing old occurrences that never ran
+
+Owner: "we should be able to kill old workflows that never ran." Twelve
+paused occurrences (eleven of daily-standup-email, one of
+platform-49-slack-channel-review) had sat as cards for up to eleven days,
+each parked before any provider dispatch ("Paused after 447 automatic
+restarts"), each with a newer occurrence behind it. `bf684668` adds the
+rule as a boot sweep and a console route
+(`POST /api/console/workflows/dead-occurrences/sweep`): a waiting
+occurrence that completed no step is cancelled through the ordinary
+cancellation boundary once a newer occurrence of its workflow exists, with
+a reason naming it, and its cards are read; the newest never-worked
+occurrence per workflow and anything that did work are kept for the
+person. Pinned in `workflow-dead-occurrences.test.ts`. Applied by hand
+in the owner's home through the existing cancel route: ten cancelled,
+two kept (the newest standup occurrence and the single review
+occurrence). UI note for the tag owner: the route exists; a "Clean up
+old occurrences" control on the Workflows page is the remaining surface.
