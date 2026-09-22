@@ -404,6 +404,38 @@ export async function refreshIndependentCapabilityObservation(input: {
  * the expected identity. A transport with nothing observed yields null, and the
  * capability stays unready.
  */
+/**
+ * A fresh independent observation for a manifest's (operation, account), or
+ * one refreshed live right now. Admission demands an independent observation
+ * no older than INDEPENDENT_OBSERVATION_FRESHNESS_MS at crossing time; a
+ * background run has none unless something refreshed it in this process
+ * (live 2026-09-22: a creation test failed live_observation_missing while a
+ * chat turn on the same operation succeeded, because chat's discovery had
+ * refreshed the observation seconds earlier). Best effort: a transport that
+ * cannot observe leaves admission to refuse with its own reason.
+ */
+export async function ensureFreshIndependentCapabilityObservation(expected: {
+  operationId: string;
+  accountId: string;
+  definitionFingerprint: string;
+  providerVersion: string;
+  operationVersion: string;
+}, now = Date.now()): Promise<IndependentCapabilityObservation | null> {
+  let current: IndependentCapabilityObservation | null = null;
+  try {
+    current = independentlyObserveCapability(expected.operationId, expected.accountId);
+  } catch { current = null; }
+  if (current && current.origin === 'independent' && observationIsFresh(current, now)
+    && current.definitionFingerprint === expected.definitionFingerprint) {
+    return current;
+  }
+  try {
+    return await refreshIndependentCapabilityObservation(expected);
+  } catch {
+    return null;
+  }
+}
+
 export function adoptObservedCapabilityIdentity(
   expected: {
     operationId: string;

@@ -8,7 +8,7 @@ import {
   isRegisteredToolkitSlug,
   registeredToolkitOfSlug,
 } from '../integrations/composio/toolkit-slug.js';
-import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
+import { currentCapabilityManifest, type CapabilityManifestV1 } from '../runtime/harness/capability-manifest.js';
 import pino from 'pino';
 import {
   peekCapabilityManifestStore,
@@ -66,6 +66,8 @@ export type WorkflowStepExternalCatalogPreparation =
 
 export interface WorkflowStepExternalCatalogDependencies {
   manifestStore?: CapabilityManifestStore | null;
+  /** Refresh the independent crossing-time observation of a selected manifest. */
+  refreshObservation?: (manifest: CapabilityManifestV1) => Promise<unknown>;
   /** Route an ambiguous operation to the account the run's ORIGIN source
    * already established (the same host policy a chat turn uses). Returns the
    * connection id, or null when the origin established nothing. */
@@ -335,6 +337,17 @@ function isSelectedDefinitionDriftCode(code: string): boolean {
  * that same conversation should not park on "which account?" for the same
  * operation (live 2026-09-22, "Invite digest" creation test).
  */
+async function defaultRefreshObservation(manifest: CapabilityManifestV1): Promise<unknown> {
+  const { ensureFreshIndependentCapabilityObservation } = await import('../runtime/harness/independent-capability-observation.js');
+  return ensureFreshIndependentCapabilityObservation({
+    operationId: manifest.operationId,
+    accountId: manifest.accountId,
+    definitionFingerprint: manifest.definitionFingerprint,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+  });
+}
+
 async function routeOriginAccountByHostPolicy(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -716,6 +729,14 @@ export async function prepareWorkflowStepExternalCatalog(input: {
 
   const manifestIds = selected.map((entry) => entry.manifest.manifestId).sort();
   if (manifestIds.length > 0) {
+    // The selected manifests must be observable at the step's crossings. A
+    // background run's process holds no fresh independent observation until
+    // something refreshes it (live 2026-09-22: creation test
+    // live_observation_missing on the same operation chat had just used).
+    const refreshObservation = dependencies.refreshObservation ?? defaultRefreshObservation;
+    for (const entry of selected) {
+      try { await refreshObservation(entry.manifest); } catch { /* readiness below reports */ }
+    }
     (dependencies.refresh ?? refreshTypedExecutionReadiness)(manifestIds);
     if (!(dependencies.ready ?? typedExecutionCatalogReady)(manifestIds)) {
       // The readiness evaluator records WHY each manifest was refused; this

@@ -94,7 +94,11 @@ import { requirePhysicalDispatchGrounding } from './physical-dispatch-grounding.
 import { buildGraphNodeInvocationEnvelope } from './graph-node-envelope.js';
 import { validateBoundCapabilityEdges } from '../graph/capability-edge-kinds.js';
 import { compileSealedProviderArgs } from './production-capability-adapters.js';
-import { registerIndependentCapabilityObservation, independentlyObserveCapability } from './independent-capability-observation.js';
+import {
+  registerIndependentCapabilityObservation,
+  independentlyObserveCapability,
+  ensureFreshIndependentCapabilityObservation,
+} from './independent-capability-observation.js';
 import {
   authorizeTypedReconciliation,
   beginTypedPhysicalDispatch,
@@ -1550,6 +1554,21 @@ export async function runAdmittedTurnGraph(input: {
       : { ok: false as const, reason: 'none' };
     if (startedForMint && !persistedForMint.ok) {
       throw new Error(`reconciliation_required: reserved crossing has no reconstructable authority (${persistedForMint.reason})`);
+    }
+    if (!persistedForMint.ok) {
+      // Crossing-time observation, refreshed live when this process holds
+      // none or a stale one (a background run's first crossing).
+      const manifestForObservation = binding.manifest
+        ?? (binding.manifestDigest ? peekCapabilityManifestStore()?.byDigest(binding.manifestDigest)?.manifest : undefined);
+      if (manifestForObservation) {
+        await ensureFreshIndependentCapabilityObservation({
+          operationId: manifestForObservation.operationId,
+          accountId: manifestForObservation.accountId,
+          definitionFingerprint: manifestForObservation.definitionFingerprint,
+          providerVersion: manifestForObservation.providerVersion,
+          operationVersion: manifestForObservation.operationVersion,
+        });
+      }
     }
     const mintedAuthority = persistedForMint.ok
       ? persistedForMint.authority
