@@ -7084,11 +7084,11 @@ async function runStepVerifiedAttempt(
   // Transient-retry wraps EXECUTION only. Verification is deterministic and
   // never transient-retried. Park/cancel signals propagate immediately (they
   // are not "retryable").
-  const runOnce = (
+  const runOnce = async (
     attemptStep: WorkflowStepInput,
     attemptContext: StepExecutionContext = ctx,
-  ): Promise<unknown> =>
-    runWithStepRetry(() => executeStep(attemptStep, attemptContext), {
+  ): Promise<unknown> => {
+    const output = await runWithStepRetry(() => executeStep(attemptStep, attemptContext), {
       budget,
       backoffBaseMs: RETRY_BACKOFF_BASE_MS,
       isRetryable: (err) =>
@@ -7114,6 +7114,14 @@ async function runStepVerifiedAttempt(
       },
       afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
     });
+    // A step re-running for a reviewer's change request, whichever lane ran
+    // it: before the gate asks the human again, the host checks that the
+    // note was applied. Not applied → the completion is invalidated and the
+    // contract loop re-runs this attempt with the judge's finding as
+    // evidence; still not applied → the card says so.
+    await verifyPendingRevisionOrRetry(attemptContext, attemptStep, output);
+    return output;
+  };
 
   // Goal-contract Phase 2: contract loop wraps the transient-retry wrapper —
   // each contract attempt gets its own transient budget.
@@ -8888,11 +8896,6 @@ export async function executeStep(
     }
   }
 
-  // A step re-running for a reviewer's change request: before the gate asks
-  // the human again, the host checks that the note was applied. Not applied
-  // → one evidence-fed re-run; still not applied → the card says so.
-  await verifyPendingRevisionOrRetry(ctx, step, output);
-
   const completionMeta = {
     modelRoute: workflowModelRouteMeta(stepRoute),
   };
@@ -8921,6 +8924,13 @@ async function verifyPendingRevisionOrRetry(ctx: StepExecutionContext, step: Wor
   const attemptsSoFar = (revision.verification?.attempts ?? 0) + 1;
   if (verdict.verdict === 'not_applied' && attemptsSoFar < REVISION_JUDGE_MAX_ATTEMPTS) {
     const problem = `The reviewer's change request was not applied: ${verdict.reason}. The reviewer asked: "${revision.note}". Apply exactly that, and leave everything the reviewer did not mention as it was.`;
+    // The lane may already have published this attempt's completion; the
+    // invalidation keeps the event history and the resume state truthful.
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_invalidated',
+      stepId: step.id,
+      meta: { reason: 'revision_not_applied', approvalId: revision.approvalId, judge: verdict.judge },
+    });
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_failed',
       stepId: step.id,
