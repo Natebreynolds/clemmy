@@ -202,25 +202,82 @@ tool-catalog.test.ts.
 
 ### Live, on the installed app
 
-Installed `1a49645e` by hotpatch (sealed 3.18.19), launched **by path**.
+Installed by hotpatch (sealed 3.18.19), launched **by path**, five cycles:
+`1a49645e` → `0430d118` → `c839caad` → `3c3bf2e9` (final). Brain grok-4.6,
+judge grok-4.3, worker glm-5.3 for the window (restored to claude-haiku-4-5
+at 19:14Z). xAI had an outage in the middle of the window: four turns hit
+the 600 s silent-frame wall; two recovered on the retry, one ended in the
+provider's "Internal error during token generation", one in "Connection
+error". Those walls, not the framework, set the wall times below.
 
-| Sample (`whats on my calendar tomorrow`) | Wall | Model | Calls | Prompt tokens | Note |
-|---|---|---|---|---|---|
-| `930c755f` ×3 (before) | — | 86.6 s / 52.2 s / 53.0 s | 3 | ~111k | sample 1 called `workflow_create` first |
-| `1a49645e` sample 1 | 67.8 s | 54.4 s | 3 (tool_search, calendar read, tool_output_query) | 87k | skip applied (`skipDiscoverySearch: true`, 6.5k schema tokens); the brain still searched once before the read |
-| `1a49645e` sample 2 | 11 min 26 s | — | 0 | — | **provider outage**: first frame silent 10 min → stream-stall retry → xAI "Internal error during token generation" → "Something went wrong on that turn" |
-| `1a49645e` sample 3 | (see below) | | | | started while sample 2's retry was in flight; xAI still degraded |
+| Turn | Build | Wall | Model | Calls | Prompt tokens | Ending |
+|---|---|---|---|---|---|---|
+| calendar ×3 (before) | `930c755f` | — | 86.6 / 52.2 / 53.0 s | 3 | ~111k | sample 1 called `workflow_create` first |
+| calendar sample 1 | `1a49645e` | 67.8 s | 54.4 s | 3 (tool_search, read, query) | 87k | skip applied, the brain still searched once |
+| calendar sample 2 | `1a49645e` | 11 min 26 s | — | 0 | — | xAI: 10-min silent frame → retry → provider internal error → truthful failure |
+| calendar sample 3 | `1a49645e` | 11 min 14 s | 56.8 s | 2 (read, query) | **49.6k** | xAI 10-min silent frame, then the target shape: no search, morning-best tokens |
+| author "Invite digest B" | `0430d118` | 488 s | 360 s | 11 (search ×3, get ×3, create) | 322k | weak match kept all 26 tools (`skipDiscoverySearch: false`); exact call step with `{{now}}`..`{{now+24h}}` and a gated save; turn then died in xAI "Connection error" |
+| content-calendar revision | `0430d118` | 3 min 40 s | — | — | — | gate 54 s → note → Jev `applied` 0.86 in 3.5 s → re-ask carried the verdict → completed; Space `posts` live |
+| Space dock: "Mark the LinkedIn post as Approved and update this space" | `0430d118` | 13 min | — | 16 (space_get ×4, space_diff ×2, space_set_data, …) | — | done: row status Approved, the other two untouched; 10 of the 13 min were one xAI stall |
+| Space dock: "Post the approved LinkedIn one now" | `c839caad` | 200 s | — | — | — | blocked, honestly: "no LinkedIn account/connection is present in the verified tool status"; no card, nothing sent |
 
-Sample 2 is the ceiling of a one-brain home: the stall wall is 600 s of
-no activity (model-stall-policy.ts), one same-brain retry follows, the
-provider's in-stream internal error is already classified retryable, and
-with `activeBrain: api_key` there is no second brain to fall over to. The
-turn ended truthfully rather than hanging. It cost the person 11 minutes
-of "Still working". Not changed before the tag; noted as the next
-latency item (a shorter silence wall when the request is small).
+### The cold-catalog defect, found by the authoring turn
 
-### A trap found on the way
+The created workflow's creation test parked its exact calendar step as
+"not connected" eight minutes after a launch, while two current manifests
+sat in the durable store and the same step had passed that morning. A
+durable manifest becomes a callable candidate only once the running
+process has observed the operation: a provider schema seen within its
+30-minute lease, the connected toolkits enumerated, one independent
+observation per account (60 s). Chat rebuilds all of that as a side effect
+of discovery and the calendar watch does it for itself; a workflow step
+never did. All 12 parked runs in the owner's home carried the same class
+(`selected_definition_observation_refused`,
+`selected_definition_revalidation_refused` — "connect outlook", "connect
+googlesheets", providers connected the whole time).
 
+- `516a0d17`: the compiler returns the refresh's refusal reasons in the
+  park message instead of discarding them.
+- `c839caad`: the call step warms the operation in-process before the
+  compile (`warmDurableProviderOperation`). **Cold proof:** on a daemon
+  launched 90 s earlier with no chat turn, the creation test's read step
+  returned data in 4 s and the workflow was enabled.
+- `3c3bf2e9`: the prompt-named (legacy) step path does the same before its
+  revalidator. Pinned by order; no live proof (the parked fixtures send
+  email and were not resumed).
+
+Also fixed on the way (`516a0d17`): a revision's judge verdict was written
+under the record lock and then erased by the next runner write that spread
+the stale in-memory run; the single writer now keeps the durable verdict.
+
+### Working in a Space with Clem, answered live
+
+Every Space has its own chat session (`space-<id>`, the dock on the Space
+page). Asked there to change a post's status and update the Space, Clem
+read the Space, committed the row with `space_set_data`, and the data the
+page renders changed. Asked to post the approved item, she checked the
+verified tool status, found no LinkedIn connection, and stopped without a
+card or a send. With a social toolkit connected, the send is an irreversible
+external write and takes the same one approval at the send boundary as
+any other, then mirrors to desktop and mobile. A Space can also declare
+its own action buttons (`actions` in the manifest, `POST /spaces/:id/action`)
+with one approval per runner version; this content-calendar Space declares
+none because it was authored as "nothing publishes".
+
+### Suite on `1776a5b1`
+
+11,024 tests ran before the isolated runner's watchdog retired a hung
+`constraint-guard.test.ts` (exit 143; the previous run had died at 8,355).
+87 `not ok`; 24 of the first 6,125 matched the list attributed to baseline
+`eebd4239` this morning. The full attribution (every failing file re-run
+in the baseline worktree) is recorded in
+`scratchpad/attribution-1776a5b1.txt` and summarised in the memory file.
+
+### Traps found on the way
+
+- The daemon's source fingerprint covers `docs/` and the git HEAD, so a
+  docs-only commit after a build makes the hotpatch refuse ("Source differs
+  from the built candidate"). Build after the last commit, whatever it touched.
 - `open -a Clementine` launches `/Applications/Clementine.app`, an old
   3.18.6 bundle (`32269b1e`) still beside the sealed `~/Applications` one;
   six bundles answer to the desktop bundle id on this machine. The old
