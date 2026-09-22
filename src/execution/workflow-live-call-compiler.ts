@@ -8,7 +8,7 @@ import {
   type WorkflowNodeInvocationPlanV1,
   type WorkflowNodeInvocationValueTypeV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
+import { currentCapabilityManifest, type CapabilityManifestV1 } from '../runtime/harness/capability-manifest.js';
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import {
   canonicalCatalogIdentityOf,
@@ -217,6 +217,88 @@ export function describeOperationCatalogRevalidation(revalidation: OperationCata
   const reasons = [...new Set(revalidation.refused.map((entry) => entry.reason))];
   return `${revalidation.durableManifests} durable manifest(s), ${revalidation.registered} registered`
     + (reasons.length > 0 ? `, refused: ${reasons.join(', ')}` : '');
+}
+
+/**
+ * Prove a saved provider operation in THIS process before the compiler asks
+ * for a current candidate.
+ *
+ * A durable manifest becomes a live candidate only once the attested
+ * transport has observed the operation for its account in the running
+ * daemon: a provider schema seen within its 30-minute lease, the connected
+ * toolkits enumerated, and one independent observation per account (60 s
+ * freshness). Chat does all of that as a side effect of discovery and the
+ * calendar watch does it for itself; a call step never did, so a freshly
+ * restarted daemon parked an exact calendar step as "not connected" while
+ * two current manifests sat in the store (live 2026-09-22, creation test of
+ * an authored workflow eight minutes after a launch). Supply, never
+ * authority: the compiler below still re-proves candidate, account and
+ * effect from the same refresh it always ran.
+ */
+export type DurableProviderOperationWarmDeps = {
+  listDurableManifests: (operationId: string) => Array<Pick<CapabilityManifestV1, 'accountId' | 'definitionFingerprint' | 'providerVersion' | 'operationVersion'>>;
+  ensureSchema: (operationId: string) => Promise<string | undefined>;
+  listToolkits: () => Promise<unknown>;
+  observe: (input: { operationId: string; accountId: string; definitionFingerprint: string; providerVersion: string; operationVersion: string }) => Promise<unknown>;
+};
+
+const defaultWarmDeps: DurableProviderOperationWarmDeps = {
+  listDurableManifests: (operationId) => (peekCapabilityManifestStore()?.list() ?? []).flatMap((entry) => {
+    const manifest = currentCapabilityManifest(entry.manifest);
+    return manifest && manifest.operationId === operationId && manifest.providerKind === 'composio' ? [manifest] : [];
+  }),
+  ensureSchema: async (operationId) => {
+    const { ensureLiveComposioSchemaFingerprint } = await import('../tools/composio-schema-cache.js');
+    return ensureLiveComposioSchemaFingerprint(operationId);
+  },
+  listToolkits: async () => {
+    const { listConnectedToolkits } = await import('../integrations/composio/client.js');
+    return listConnectedToolkits();
+  },
+  observe: async (input) => {
+    const { refreshIndependentCapabilityObservation } = await import('../runtime/harness/independent-capability-observation.js');
+    return refreshIndependentCapabilityObservation(input);
+  },
+};
+
+export async function warmDurableProviderOperation(
+  operationId: string,
+  deps: DurableProviderOperationWarmDeps = defaultWarmDeps,
+): Promise<{ status: 'present' | 'no_durable_manifest' | 'warmed'; manifests: number; observed: number; notes: string[] }> {
+  const factory = peekHostCapabilityCatalogFactory();
+  if (factory && currentOperationCandidates(factory, operationId).length > 0) {
+    return { status: 'present', manifests: 0, observed: 0, notes: [] };
+  }
+  const manifests = deps.listDurableManifests(operationId);
+  if (manifests.length === 0) return { status: 'no_durable_manifest', manifests: 0, observed: 0, notes: [] };
+  const notes: string[] = [];
+  try {
+    if (!(await deps.ensureSchema(operationId))) notes.push('live provider schema unavailable for this operation');
+  } catch (error) {
+    notes.push(`live provider schema refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try { await deps.listToolkits(); } catch (error) {
+    notes.push(`connected toolkits unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let observed = 0;
+  for (const manifest of manifests) {
+    const accountId = manifest.accountId?.trim();
+    if (!accountId) continue;
+    try {
+      const result = await deps.observe({
+        operationId,
+        accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+      });
+      if (result) observed += 1;
+      else notes.push(`${accountId}: not observed`);
+    } catch (error) {
+      notes.push(`${accountId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { status: 'warmed', manifests: manifests.length, observed, notes };
 }
 
 /**

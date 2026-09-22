@@ -283,7 +283,7 @@ import {
 } from '../memory/workflow-node-invocation-plan.js';
 import {
   compileLiveCatalogWorkflowCallPlan,
-  ensureLiveReadCapabilityForOperation,
+  ensureLiveReadCapabilityForOperation, warmDurableProviderOperation,
   workflowCapabilityAccountChoiceSet,
   type WorkflowCapabilityAccountCandidateV1,
   type WorkflowCapabilityAccountChoiceSetV1,
@@ -3680,6 +3680,17 @@ async function executeWorkflowCallNode(
     // foreground disclosure uses, so a scheduled call step is never reported
     // "not connected" for an operation the host can serve. Supply only; the
     // compiler below still re-proves candidate, account and effect.
+    // A durable provider manifest is only callable after this process has
+    // observed the operation (schema lease, connected toolkits, per-account
+    // observation). Chat gets that from discovery; a call step proves it
+    // for itself, so a cold daemon never parks a saved step as not connected.
+    const warmed = await warmDurableProviderOperation(call.tool);
+    if (warmed.status === 'warmed' && warmed.observed === 0) {
+      logger.info(
+        { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, warmed },
+        'workflow call step provider observation',
+      );
+    }
     const acquisition = await ensureLiveReadCapabilityForOperation({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,
