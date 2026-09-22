@@ -174,6 +174,7 @@ import {
 } from '../execution/workflow-capability-inbox.js';
 import {
   resolveWorkflowCapabilityAccountChoice,
+  recordWorkflowGateChangeRequest,
   resolveWorkflowCapabilityRetry,
 } from '../execution/workflow-runner.js';
 import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
@@ -3410,6 +3411,22 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/approvals/:id/reject', requireMobileSession, async (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    // "Request changes" from the phone: the note is recorded on the parked run
+    // before the row resolves, exactly as the desktop does.
+    const note = typeof req.body?.note === 'string' ? req.body.note : '';
+    if (note.trim()) {
+      const existing = approvalRegistry.get(id);
+      if (existing) {
+        try {
+          recordWorkflowGateChangeRequest({
+            approvalId: id,
+            sessionId: existing.sessionId,
+            note,
+            by: `mobile-inbox:${req.mobileSession!.record.deviceId}`,
+          });
+        } catch { /* the decision still lands */ }
+      }
+    }
     await resolveMobileApproval(res, id, 'reject');
   });
 

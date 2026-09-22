@@ -14,6 +14,8 @@ export interface ApprovalRow {
   requestedAt?: string;
   expiresAt?: string;
   kind?: string;
+  /** The draft or body the approval is about, when the server could name one. */
+  contentPreview?: { body?: string; imageUrl?: string };
   pendingAction?: PendingActionApprovalView;
   /** Unanswered 48h+ with nothing parked on it — sinks out of the urgent
    * header but stays fully approvable. */
@@ -182,15 +184,17 @@ export const resolveWorkspaceDestinationChooser = (
 export const decideApproval = (
   id: string,
   decision: 'approve' | 'reject',
-  opts?: { kind?: string; modifiedArgs?: string },
+  opts?: { kind?: string; modifiedArgs?: string; note?: string },
 ) => {
   const path = opts?.kind === 'runtime'
     ? `/api/approvals/${encodeURIComponent(id)}/${decision}`
     : `/api/console/harness-approvals/${encodeURIComponent(id)}/${decision}`;
-  return apiPost<ApprovalDecisionResponse>(
-    path,
-    opts?.modifiedArgs ? { modifiedArgs: opts.modifiedArgs } : undefined,
-  );
+  const body: Record<string, string> = {};
+  if (opts?.modifiedArgs) body.modifiedArgs = opts.modifiedArgs;
+  // A rejection with a note is "request changes": the server records the
+  // note on the parked run so the draft's owner gets it, not a bare stop.
+  if (decision === 'reject' && opts?.note?.trim()) body.note = opts.note.trim();
+  return apiPost<ApprovalDecisionResponse>(path, Object.keys(body).length > 0 ? body : undefined);
 };
 
 export function approvalDecisionSuccessText(

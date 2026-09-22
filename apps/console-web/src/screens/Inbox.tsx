@@ -134,13 +134,13 @@ export function Inbox() {
 
   const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
 
-  const onDecide = async (id: string, decision: 'approve' | 'reject') => {
+  const onDecide = async (id: string, decision: 'approve' | 'reject', note?: string) => {
     const row = approvalRows.find((a) => a.approvalId === id);
     if (!row || decisionStates[id]?.busy || bulkBusy) return;
     setDecisionStates((prev) => ({ ...prev, [id]: { busy: true, intent: decision } }));
     setDecisionNotice(null);
     try {
-      const result = await decideApproval(id, decision, { kind: row.kind });
+      const result = await decideApproval(id, decision, { kind: row.kind, ...(note ? { note } : {}) });
       const notice: DecisionNotice = {
         tone: 'success',
         text: approvalDecisionSuccessText(row, decision, result),
@@ -573,7 +573,7 @@ export function Inbox() {
                     onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
                 {agedApprovalRows.length > 0 && (
                   <div className="flex items-center gap-2 pt-2 text-caption text-muted">
@@ -590,7 +590,7 @@ export function Inbox() {
                     onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
                 {trustRows.map((p) => (
                   <TrustProposalCard key={p.id} row={p}
@@ -925,10 +925,21 @@ function ApprovalCard({
 }: {
   row: ApprovalRow; selected: boolean; checked: boolean; onToggleCheck: () => void;
   decisionState?: RowDecisionState; disabled?: boolean;
-  onSelect: () => void; onApprove: () => void; onReject: () => void;
+  onSelect: () => void; onApprove: () => void; onReject: (note?: string) => void;
 }) {
   const queued = row.pendingAction;
   const busy = disabled || decisionState?.busy === true;
+  // The draft the reviewer is deciding on. Long drafts fold; the first lines
+  // are always visible so "what am I approving?" is answered on the card.
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const [draftOpen, setDraftOpen] = useState(false);
+  const draftIsLong = draft.length > 420;
+  const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 419)}…` : draft;
+  // "Request changes": decline THIS draft and say what to change. The note
+  // rides with the rejection and reaches the conversation that owns the run.
+  const [changing, setChanging] = useState(false);
+  const [changeNote, setChangeNote] = useState('');
+  const isWorkflowGate = row.tool === 'workflow_approval_gate';
   return (
     <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
       selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
@@ -948,18 +959,60 @@ function ApprovalCard({
           {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}
         </div>
       )}
-      <div className="mt-2.5 flex gap-2">
+      {draft && (
+        <div className="mt-2 rounded border border-border bg-surface px-3 py-2" aria-label="What you are approving">
+          <p className="text-caption font-semibold uppercase tracking-wider text-faint">Draft</p>
+          <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-small text-fg">{shownDraft}</pre>
+          {draftIsLong && (
+            <button type="button" className="mt-1 text-caption font-medium text-primary hover:underline" onClick={() => setDraftOpen((open) => !open)}>
+              {draftOpen ? 'Show less' : 'Show the whole draft'}
+            </button>
+          )}
+        </div>
+      )}
+      <div className="mt-2.5 flex flex-wrap gap-2">
         <Button size="sm" disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
           {decisionState?.busy && decisionState.intent === 'approve'
             ? 'Approving…'
             : queued ? 'Approve & continue' : 'Approve'}
         </Button>
-        <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
+        {isWorkflowGate && (
+          <Button size="sm" variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
+            Request changes
+          </Button>
+        )}
+        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onReject()}>
           <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : isWorkflowGate ? 'Decline' : 'Reject'}
         </Button>
       </div>
+      {isWorkflowGate && changing && (
+        <form
+          className="mt-2 flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!changeNote.trim()) return;
+            onReject(changeNote.trim());
+            setChanging(false);
+          }}
+        >
+          <textarea
+            value={changeNote}
+            onChange={(event) => setChangeNote(event.target.value)}
+            disabled={busy}
+            rows={3}
+            aria-label="What should change"
+            placeholder="What should change in this draft?"
+            className="w-full rounded-md border border-border bg-surface px-2.5 py-2 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
+          />
+          <div className="flex items-center gap-2">
+            <Button type="submit" size="sm" disabled={busy || !changeNote.trim()}>Send changes</Button>
+            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setChanging(false)}>Cancel</Button>
+            <span className="text-caption text-faint">This stops the current draft and hands your note back to Clem to revise.</span>
+          </div>
+        </form>
+      )}
       {decisionState?.notice && (
         <p
           role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}

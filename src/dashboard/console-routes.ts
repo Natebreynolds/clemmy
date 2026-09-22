@@ -563,6 +563,7 @@ import {
   resumeCapabilityBlockedWorkflowRun,
   resumeMutationBlockedWorkflowRun,
   resolveWorkflowCapabilityAccountChoice,
+  recordWorkflowGateChangeRequest,
   resolveWorkflowCapabilityRetry,
 } from '../execution/workflow-runner.js';
 import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
@@ -13282,6 +13283,18 @@ export function registerConsoleRoutes(
     if (pendingActionPreflight.kind === 'error') {
       res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
       return;
+    }
+    // "Request changes" = reject + what to change. The note lands on the
+    // parked run BEFORE the row resolves, so the stop report carries it back
+    // to the conversation that owns the draft. Best-effort: a note that
+    // cannot be recorded never blocks the decision itself.
+    const changeNote = decision === 'reject' && typeof (req.body as { note?: unknown })?.note === 'string'
+      ? (req.body as { note: string }).note
+      : '';
+    if (changeNote.trim()) {
+      try {
+        recordWorkflowGateChangeRequest({ approvalId: id, sessionId: existing.sessionId, note: changeNote, by: 'desktop-command-center' });
+      } catch { /* the decision still lands */ }
     }
 
     // Map any approve-shaped decision to the audit-log "approved"

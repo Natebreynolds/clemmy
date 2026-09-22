@@ -395,9 +395,12 @@ export async function approveApproval(id: string, modifiedArgs?: string): Promis
     method: 'POST',
   });
 }
-export async function rejectApproval(id: string): Promise<unknown> {
+export async function rejectApproval(id: string, note?: string): Promise<unknown> {
   return api(`/m/api/approvals/${encodeURIComponent(id)}/reject`, {
     method: 'POST',
+    // A note turns a bare rejection into "request changes"; the Mac records
+    // it on the parked run before the row resolves.
+    ...(note?.trim() ? { body: JSON.stringify({ note: note.trim() }), headers: { 'content-type': 'application/json' } } : {}),
   });
 }
 
