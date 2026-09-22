@@ -23,6 +23,44 @@ export interface WorkflowTargetEvidence {
  * catalogs. Large results and artifacts stay whole behind read-only evidence
  * refs rather than being duplicated into every review prompt.
  */
+/**
+ * A person's decision on this run is evidence the reviewer must see.
+ *
+ * Live 2026-09-22, "Handoff review fixture": the owner approved the draft on
+ * the review card, the gated save ran four seconds later, and the goal review
+ * scored the run 4/5 — "saved without your review and approval" — because the
+ * approval lived in the approvals table and nowhere in what the judge read.
+ * A human decision recorded before a step ran is the strongest evidence a
+ * "review first" criterion can have; say it, exactly, with who and when.
+ */
+function humanDecisionBlocks(runId: string): string[] {
+  try {
+    const rows = openEventLog().prepare(`
+      SELECT approval_id, session_id, status, resolution, resolver, requested_at, resolved_at
+        FROM pending_approvals
+       WHERE session_id LIKE ?
+       ORDER BY requested_at ASC
+    `).all(`workflow-gate:${runId}:%`) as Array<{
+      approval_id: string; session_id: string; status: string; resolution: string | null;
+      resolver: string | null; requested_at: string; resolved_at: string | null;
+    }>;
+    return rows.map((row) => {
+      const stepId = row.session_id.slice(`workflow-gate:${runId}:`.length) || '(unknown step)';
+      if (row.status === 'pending') {
+        return `Human review gate on step "${stepId}": approval ${row.approval_id} still pending (requested ${row.requested_at}); the gated step has not run.`;
+      }
+      const who = row.resolver ? ` by ${row.resolver}` : '';
+      return `Human review gate on step "${stepId}": approval ${row.approval_id} ${row.resolution ?? row.status}${who} at ${row.resolved_at ?? 'unknown time'} (requested ${row.requested_at}). ${
+        row.resolution === 'approved'
+          ? 'The person reviewed and approved this step\'s material BEFORE the step ran; a "review first" criterion is satisfied by this record.'
+          : 'The gated step was not approved; it must not have run.'
+      }`;
+    });
+  } catch {
+    return [];
+  }
+}
+
 export function readWorkflowTargetEvidence(runId: string): WorkflowTargetEvidence {
   try {
     const db = openEventLog();
@@ -143,6 +181,7 @@ export function readWorkflowTargetEvidence(runId: string): WorkflowTargetEvidenc
       resolve: (ref: string) => retained.get(ref),
     } } : {}), summary: [
       `Exact workflow run ${runId}: ${rows.length} logical settlements. A call or successful write alone does not prove that its content meets the objective.`,
+      ...humanDecisionBlocks(runId),
       ...blocks,
       ...(rows.length ? [] : ['No retained logical-call evidence is available for this run. Step output is not proof of a tool execution.']),
     ].join('\n') };
