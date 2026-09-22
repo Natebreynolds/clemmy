@@ -217,7 +217,11 @@ async function warmProviderObservation(operation: ConnectedCalendarOperation): P
     }
   }
   if (observed === 0 && operation.manifests.length > 0) {
-    return `no account could be observed live (${outcomes.join('; ') || 'no account on the manifests'}; ${describeObservationInputs(operation)})`;
+    // Best effort only: the transport may already hold an observation for
+    // these accounts (a chat turn, or the boot reconstruction, registered
+    // it), and the compiler's own refresh adopts it. The note travels with a
+    // compile failure so the cause is named there.
+    return `no account could be refreshed live (${outcomes.join('; ') || 'no account on the manifests'}; ${describeObservationInputs(operation)})`;
   }
   return undefined;
 }
@@ -239,9 +243,15 @@ function describeObservationInputs(operation: ConnectedCalendarOperation): strin
     const transport = peekAttestedTransport();
     if (!transport) parts.push('transport unbound');
     else {
-      const seen = operation.manifests
-        .filter((m) => m.accountId && transport.observe({ operationId: operation.operationId, accountId: m.accountId }))
-        .map((m) => m.accountId);
+      const seen = operation.manifests.flatMap((m) => {
+        if (!m.accountId) return [];
+        const live = transport.observe({ operationId: operation.operationId, accountId: m.accountId });
+        if (!live) return [];
+        const same = live.definitionFingerprint === m.definitionFingerprint
+          && live.providerVersion === m.providerVersion
+          && live.operationVersion === m.operationVersion;
+        return [`${m.accountId}${same ? ' matches manifest' : ` differs (live ${live.definitionFingerprint.slice(0, 8)}/${live.operationVersion} vs manifest ${m.definitionFingerprint.slice(0, 8)}/${m.operationVersion})`}`];
+      });
       parts.push(`transport observed: ${seen.join(',') || 'none'}`);
     }
   } catch (error) {
@@ -355,11 +365,7 @@ export async function readCalendarAccountsAttested(
   for (const connected of operations) {
     const { operationId, provider: operation } = connected;
     const args = operation.args(window);
-    const warm = await warmProviderObservation(connected);
-    if (warm) {
-      failures.push({ operationId, reason: warm });
-      continue;
-    }
+    const warmNote = await warmProviderObservation(connected);
     const first = await readOneAccount({ operationId, args, tickId, sessionId });
     const perAccount: AccountRead[] = [];
     if (!first.ok && first.choiceSet) {
@@ -382,7 +388,7 @@ export async function readCalendarAccountsAttested(
     for (const read of perAccount) {
       if (!read.ok) {
         const reason = /No current capability is registered/.test(read.reason)
-          ? `${read.reason} (catalog: ${explainMissingCandidates(connected)})`
+          ? `${read.reason} (catalog: ${explainMissingCandidates(connected)}${warmNote ? `; ${warmNote}` : ''})`
           : read.reason;
         failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason });
         continue;
