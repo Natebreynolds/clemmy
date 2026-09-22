@@ -1221,6 +1221,25 @@ export function recordRevisionVerification(
   });
 }
 
+/** A revision's verification is written by the step lane under the record
+ *  lock; every later runner write spreads the in-memory run it loaded before
+ *  that. Keep the durable verification when the incoming revision has none
+ *  (live 2026-09-22: the gate subject carried the verdict while the record
+ *  said null). */
+export function mergeRevisionVerifications(
+  current: readonly WorkflowRunRevision[] | undefined,
+  next: readonly WorkflowRunRevision[] | undefined,
+): WorkflowRunRevision[] | undefined {
+  if (!next) return current ? [...current] : undefined;
+  if (!current || current.length === 0) return [...next];
+  const durable = new Map(current.map((revision) => [revision.approvalId, revision]));
+  return next.map((revision) => {
+    const prior = durable.get(revision.approvalId);
+    if (revision.verification || !prior?.verification) return revision;
+    return { ...revision, verification: prior.verification };
+  });
+}
+
 /** Lead-in for a step that is running again because a reviewer asked for
  *  changes at the gate it feeds. */
 export function reviewerChangeLeadIn(revisions: readonly WorkflowRunRevision[] | undefined, stepId: string): string {
@@ -1976,6 +1995,8 @@ function writeRunRecord(
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
+    nextRecord.revisions = mergeRevisionVerifications(current?.revisions, nextRecord.revisions);
+    if (nextRecord.revisions === undefined) delete nextRecord.revisions;
     // An answered clarification is retained only while the same run is being
     // resumed. A later approval/capability park or terminal publication must
     // never expose that stale question as the run's current dependency.

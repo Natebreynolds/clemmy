@@ -181,21 +181,42 @@ function currentOperationCandidates(
  * saved slug or arguments, and every matching account is refreshed so the
  * compiler's existing ambiguity refusal remains intact.
  */
-function revalidateCurrentOperationCatalog(operationId: string): void {
+export type OperationCatalogRevalidation = {
+  durableManifests: number;
+  registered: number;
+  refused: Array<{ manifestId: string; reason: string }>;
+  error?: string;
+};
+
+function revalidateCurrentOperationCatalog(operationId: string): OperationCatalogRevalidation {
   const store = peekCapabilityManifestStore();
   const adapter = peekProductionCapabilityAdapter();
-  if (!store || !adapter) return;
+  if (!store || !adapter) return { durableManifests: 0, registered: 0, refused: [], error: 'no manifest store or adapter installed' };
   const manifestIds = store.list().flatMap((entry) => {
     const manifest = currentCapabilityManifest(entry.manifest);
     return manifest?.operationId === operationId ? [manifest.manifestId] : [];
   });
-  if (manifestIds.length === 0) return;
+  if (manifestIds.length === 0) return { durableManifests: 0, registered: 0, refused: [] };
   try {
-    adapter.refresh(new Set(manifestIds));
-  } catch {
+    const result = adapter.refresh(new Set(manifestIds));
+    return { durableManifests: manifestIds.length, registered: result.registered, refused: result.refused };
+  } catch (error) {
     // Revalidation is supply, never authority. The ordinary zero-candidate
     // result below remains the fail-closed outcome when refresh is unavailable.
+    return { durableManifests: manifestIds.length, registered: 0, refused: [], error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Why a saved operation with durable manifests still has no current
+ *  candidate — the refresh's own refusal reasons, so a parked run names the
+ *  cause (live 2026-09-22: a cold daemon parked an exact calendar step as
+ *  "not connected" while two current manifests sat in the store). */
+export function describeOperationCatalogRevalidation(revalidation: OperationCatalogRevalidation): string {
+  if (revalidation.error) return `revalidation failed: ${revalidation.error}`;
+  if (revalidation.durableManifests === 0) return 'no durable manifest for this operation';
+  const reasons = [...new Set(revalidation.refused.map((entry) => entry.reason))];
+  return `${revalidation.durableManifests} durable manifest(s), ${revalidation.registered} registered`
+    + (reasons.length > 0 ? `, refused: ${reasons.join(', ')}` : '');
 }
 
 /**
@@ -302,8 +323,9 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
   }
 
   let candidates = currentOperationCandidates(factory, input.operationId);
+  let revalidation: OperationCatalogRevalidation | undefined;
   if (candidates.length === 0) {
-    revalidateCurrentOperationCatalog(input.operationId);
+    revalidation = revalidateCurrentOperationCatalog(input.operationId);
     candidates = currentOperationCandidates(factory, input.operationId);
   }
   if (candidates.length === 0) {
@@ -311,7 +333,8 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
       ok: false,
       recoverable: true,
       reason: 'not-connected',
-      message: `No current capability is registered for "${input.operationId}". Connect it, then retry.`,
+      message: `No current capability is registered for "${input.operationId}". Connect it, then retry.`
+        + (revalidation ? ` (${describeOperationCatalogRevalidation(revalidation)})` : ''),
     };
   }
 

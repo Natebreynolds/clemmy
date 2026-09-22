@@ -81,3 +81,16 @@ test('a revision is pending until the judge says applied, and at most two verdic
   recordRevisionVerification(runId, 'apr-2', { verdict: 'applied', reason: 'ok', judge: 'jev', confidence: 0.9 });
   assert.equal(pendingRevisionFor(runId, 'draft_emails'), null, 'an applied verdict closes the revision');
 });
+
+test('a later runner write keeps the durable revision verification the step lane recorded', async () => {
+  const { mergeRevisionVerifications } = await import('./workflow-runner.js');
+  const base = { approvalId: 'apr-1', stepId: 'save', revisedStepIds: ['draft'], note: 'shorter', requestedAt: 't0', requestedBy: 'owner', appliedAt: 't1' };
+  const durable = [{ ...base, verification: { verdict: 'applied' as const, reason: 'hook is a question', judge: 'jev', attempts: 1, at: 't2' } }];
+  const stale = [{ ...base }];
+  const merged = mergeRevisionVerifications(durable, stale);
+  assert.equal(merged?.[0]?.verification?.verdict, 'applied', 'the stale in-memory spread does not erase the durable verdict');
+  const fresh = [{ ...base, verification: { verdict: 'not_applied' as const, reason: 'unchanged', judge: 'model', attempts: 2, at: 't3' } }];
+  assert.equal(mergeRevisionVerifications(durable, fresh)?.[0]?.verification?.verdict, 'not_applied', 'a newer verdict wins');
+  assert.equal(mergeRevisionVerifications(undefined, stale)?.length, 1);
+  assert.equal(mergeRevisionVerifications(durable, undefined)?.[0]?.verification?.verdict, 'applied', 'a write without revisions keeps them');
+});
