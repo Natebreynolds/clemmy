@@ -314,6 +314,49 @@ test('a failed read keeps the snapshot, records the error, and is not a quiet ti
   assert.match(tick.summary, /Read failed/);
 });
 
+test('the same mailbox connected twice yields one item, and an existing duplicate retires as duplicate_account', async () => {
+  const invite = ev({ id: 'inv', myResponse: 'notResponded', attendeeCount: 3 });
+  const notified: Array<{ id: string }> = [];
+  const read = new Set<string>();
+  let state = emptyCalendarWatchState();
+  const deps: CalendarWatchDeps = {
+    now: () => NOW,
+    tickId: 'tick-1',
+    source: 'test',
+    timezone: 'UTC',
+    config: cfg,
+    readAccounts: async () => ({
+      reads: [
+        { operationId: 'outlook_get_calendar_view', accountId: 'ca_one', accountLabel: 'one', events: [invite] },
+        { operationId: 'outlook_get_calendar_view', accountId: 'ca_two', accountLabel: 'two', events: [invite] },
+      ],
+      failures: [],
+    }),
+    notify: (n) => { notified.push({ id: n.id }); },
+    isNotificationRead: (id) => read.has(id),
+    markNotificationRead: (id) => { read.add(id); },
+    loadState: () => JSON.parse(JSON.stringify(state)) as CalendarWatchState,
+    saveState: (s) => { state = s; },
+  };
+  const first = await processCalendarWatchTick(deps);
+  assert.equal(first.produced, 1, 'one item for one event, not one per connection');
+  assert.equal(first.duplicatesSuppressed, 1);
+  assert.equal(notified.length, 1);
+
+  // A state written before this rule: two open items for the same event.
+  const legacy = JSON.parse(JSON.stringify(state)) as CalendarWatchState;
+  const kept = Object.values(legacy.items)[0]!;
+  legacy.items['ca_two|invite_unanswered|inv'] = { ...kept, key: 'ca_two|invite_unanswered|inv', accountId: 'ca_two', notificationId: 'dup-notif', createdAt: '2026-09-22T15:00:01.000Z' };
+  delete legacy.items['ca_two|invite_unanswered|inv']!.eventKey;
+  state = legacy;
+  const second = await processCalendarWatchTick({ ...deps, tickId: 'tick-2' });
+  assert.equal(second.produced, 0);
+  const dup = state.items['ca_two|invite_unanswered|inv']!;
+  assert.equal(dup.retiredReason, 'duplicate_account');
+  assert.ok(read.has('dup-notif'), 'the duplicate notification is marked read');
+  assert.equal(state.items[kept.key]!.retiredAt, undefined, 'the earliest item stays open');
+});
+
 test('the watch runtime never dispatches through the raw provider client; reads go through the prepared workflow read path', () => {
   const source = readFileSync(new URL('./calendar-watch-runtime.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /executeComposioTool|executeTool\(|composio_execute_tool/);

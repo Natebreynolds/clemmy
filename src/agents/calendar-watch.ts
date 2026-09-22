@@ -76,6 +76,7 @@ export interface CalendarWatchChange {
   kind: CalendarWatchChangeKind;
   signal: CalendarWatchSignal;
   itemKey: string;
+  eventKey: string;
   operationId: string;
   accountId: string;
   accountLabel: string;
@@ -87,6 +88,9 @@ export interface CalendarWatchChange {
 
 export interface CalendarWatchItem {
   key: string;
+  /** Account-independent identity of the change: the same mailbox connected
+   * twice reports the same event ids, and must yield ONE item. */
+  eventKey?: string;
   kind: CalendarWatchChangeKind;
   signal: CalendarWatchSignal;
   accountId: string;
@@ -100,7 +104,7 @@ export interface CalendarWatchItem {
   tickId: string;
   acknowledgedAt?: string;
   retiredAt?: string;
-  retiredReason?: 'event_passed' | 'event_cancelled' | 'invite_answered' | 'overlap_gone' | 'event_started' | 'jev_veto' | 'superseded';
+  retiredReason?: 'event_passed' | 'event_cancelled' | 'invite_answered' | 'overlap_gone' | 'event_started' | 'jev_veto' | 'superseded' | 'duplicate_account';
 }
 
 export interface CalendarWatchMetrics {
@@ -354,14 +358,13 @@ function digest16(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16);
 }
 
-export function calendarWatchItemKey(input: {
-  accountId: string;
+export function calendarWatchEventKey(input: {
   kind: CalendarWatchChangeKind;
   eventId: string;
   otherEventId?: string;
   version?: string;
 }): string {
-  const parts = [input.accountId, input.kind];
+  const parts: string[] = [input.kind];
   if (input.kind === 'conflict' && input.otherEventId) {
     parts.push(...[input.eventId, input.otherEventId].sort());
   } else {
@@ -369,6 +372,16 @@ export function calendarWatchItemKey(input: {
   }
   if (input.version) parts.push(input.version);
   return parts.join('|');
+}
+
+export function calendarWatchItemKey(input: {
+  accountId: string;
+  kind: CalendarWatchChangeKind;
+  eventId: string;
+  otherEventId?: string;
+  version?: string;
+}): string {
+  return `${input.accountId}|${calendarWatchEventKey(input)}`;
 }
 
 /**
@@ -398,16 +411,17 @@ export function detectCalendarChanges(input: {
     reasons: string[],
     extra: { other?: CalEvent; previous?: { startMs: number; endMs: number }; version?: string } = {},
   ): void => {
+    const keyInput = {
+      kind,
+      eventId: event.id,
+      ...(extra.other ? { otherEventId: extra.other.id } : {}),
+      ...(extra.version ? { version: extra.version } : {}),
+    };
     out.push({
       kind,
       signal,
-      itemKey: calendarWatchItemKey({
-        accountId,
-        kind,
-        eventId: event.id,
-        ...(extra.other ? { otherEventId: extra.other.id } : {}),
-        ...(extra.version ? { version: extra.version } : {}),
-      }),
+      itemKey: calendarWatchItemKey({ accountId, ...keyInput }),
+      eventKey: calendarWatchEventKey(keyInput),
       operationId,
       accountId,
       accountLabel,
@@ -656,9 +670,26 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     }));
   }
 
-  // 2. Retire items whose state resolved; count acknowledgements.
+  // 2. Retire items whose state resolved; count acknowledgements. Two open
+  //    items for the same event under different accounts (one mailbox
+  //    connected twice) collapse to the earliest; the other retires as a
+  //    duplicate and its notification is marked read.
   let retired = 0;
   let acknowledged = 0;
+  const openByEventKey = new Map<string, CalendarWatchItem>();
+  for (const item of Object.values(state.items).sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+    if (item.retiredAt) continue;
+    const eventKey = item.eventKey ?? item.key.slice(item.accountId.length + 1);
+    item.eventKey = eventKey;
+    const kept = openByEventKey.get(eventKey);
+    if (!kept) { openByEventKey.set(eventKey, item); continue; }
+    item.retiredAt = new Date(nowMs).toISOString();
+    item.retiredReason = 'duplicate_account';
+    state.metrics.duplicatesSuppressed += 1;
+    if (item.notificationId && !deps.isNotificationRead(item.notificationId)) {
+      try { deps.markNotificationRead(item.notificationId); } catch { /* retired either way */ }
+    }
+  }
   for (const item of Object.values(state.items)) {
     if (item.notificationId && !item.acknowledgedAt && deps.isNotificationRead(item.notificationId)) {
       item.acknowledgedAt = new Date(nowMs).toISOString();
@@ -677,19 +708,29 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     }
   }
 
-  // 3. One item per change; duplicates (open items with the same key) are suppressed.
+  // 3. One item per change. Duplicates are suppressed by exact key (same
+  //    account) and by event key (same event under another account), within
+  //    the tick and against open items.
   let duplicatesSuppressed = 0;
   const candidates: CalendarWatchChange[] = [];
+  const seenEventKeys = new Set<string>();
+  const vetoedEventKeys = new Set(
+    Object.values(state.items)
+      .filter((item) => item.retiredReason === 'jev_veto')
+      .map((item) => item.eventKey ?? item.key.slice(item.accountId.length + 1)),
+  );
   for (const change of changes) {
     const existing = state.items[change.itemKey];
-    if (existing && !existing.retiredAt) {
+    const openElsewhere = openByEventKey.get(change.eventKey);
+    if ((existing && !existing.retiredAt) || (openElsewhere && !openElsewhere.retiredAt) || seenEventKeys.has(change.eventKey)) {
       duplicatesSuppressed += 1;
       continue;
     }
-    if (existing?.retiredReason === 'jev_veto') {
+    if (existing?.retiredReason === 'jev_veto' || vetoedEventKeys.has(change.eventKey)) {
       duplicatesSuppressed += 1;
       continue;
     }
+    seenEventKeys.add(change.eventKey);
     candidates.push(change);
   }
   state.metrics.duplicatesSuppressed += duplicatesSuppressed;
@@ -724,6 +765,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
       state.metrics.modelVetoes += 1;
       state.items[change.itemKey] = {
         key: change.itemKey,
+        eventKey: change.eventKey,
         kind: change.kind,
         signal: change.signal,
         accountId: change.accountId,
@@ -755,6 +797,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     }
     const item: CalendarWatchItem = {
       key: change.itemKey,
+      eventKey: change.eventKey,
       kind: change.kind,
       signal: change.signal,
       accountId: change.accountId,
@@ -780,7 +823,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
     if (item.retiredAt && Date.parse(item.retiredAt) < keepAfter) delete state.items[key];
   }
 
-  const quiet = changes.length === 0 && retired === 0 && failures.length === 0;
+  const quiet = changes.length === 0 && retired === 0 && failures.length === 0 && duplicatesSuppressed === 0;
   if (quiet) state.metrics.quietTicks += 1; else if (changes.length > 0) state.metrics.changedTicks += 1;
 
   const changesByKind: Partial<Record<CalendarWatchChangeKind, number>> = {};
