@@ -26,6 +26,8 @@ import { executeWorkflowNodeRead } from '../execution/workflow-node-invocation-e
 import type { WorkflowNodeCallExecutionIdentityV1 } from '../execution/workflow-node-invocation-executor.js';
 import { nextWorkflowNodeAttempt } from '../runtime/harness/accepted-turn-call-authority.js';
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
+import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { tryJevWatchChangeVerdict } from '../runtime/jev/control-plane.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
@@ -112,6 +114,8 @@ export interface ConnectedCalendarOperation {
    * identity, the acquisition registry and the compiler all match on that
    * exact string; the watch never re-spells it. */
   operationId: string;
+  providerKind: string;
+  manifestIds: string[];
   provider: CalendarReadOperation;
 }
 
@@ -123,15 +127,57 @@ export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
   if (!store) return [];
   const present = new Map<string, ConnectedCalendarOperation>();
   for (const entry of store.list()) {
-    const manifest = entry.manifest as { operationId?: unknown; lifecycle?: { state?: unknown } };
+    const manifest = entry.manifest as { manifestId?: unknown; operationId?: unknown; providerKind?: unknown; lifecycle?: { state?: unknown } };
     const state = manifest.lifecycle?.state;
     if (state !== undefined && state !== 'current') continue;
     if (typeof manifest.operationId !== 'string') continue;
     const provider = calendarReadOperation(manifest.operationId);
     if (!provider) continue;
-    if (!present.has(manifest.operationId)) present.set(manifest.operationId, { operationId: manifest.operationId, provider });
+    const existing = present.get(manifest.operationId);
+    const manifestId = typeof manifest.manifestId === 'string' ? manifest.manifestId : undefined;
+    if (existing) {
+      if (manifestId) existing.manifestIds.push(manifestId);
+      continue;
+    }
+    present.set(manifest.operationId, {
+      operationId: manifest.operationId,
+      providerKind: typeof manifest.providerKind === 'string' ? manifest.providerKind : 'unknown',
+      manifestIds: manifestId ? [manifestId] : [],
+      provider,
+    });
   }
   return [...present.values()];
+}
+
+/**
+ * A Composio manifest is only observable once this process holds the live
+ * schema fingerprint for its operation; a cold daemon holds none, so the
+ * catalog refresh reports the durable manifest "missing" and the compiler
+ * says not-connected. The workflow runner warms the same fingerprint before a
+ * Composio call step; the watch does the identical thing.
+ */
+async function warmProviderObservation(operation: ConnectedCalendarOperation): Promise<string | undefined> {
+  if (operation.providerKind !== 'composio') return undefined;
+  try {
+    const fingerprint = await ensureLiveComposioSchemaFingerprint(operation.operationId);
+    return fingerprint ? undefined : 'live provider schema unavailable for this operation';
+  } catch (error) {
+    return `live provider schema refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/** When the compiler still finds no candidate, ask the adapter why the
+ * durable manifests did not register, so the failure names its cause. */
+function explainMissingCandidates(operation: ConnectedCalendarOperation): string {
+  try {
+    const adapter = peekProductionCapabilityAdapter();
+    if (!adapter || operation.manifestIds.length === 0) return 'no durable manifest';
+    const result = adapter.refresh(new Set(operation.manifestIds));
+    if (result.refused.length === 0) return `${result.registered} registered, none refused`;
+    return result.refused.map((entry) => `${entry.manifestId.split(':definition:')[1] ?? entry.manifestId}: ${entry.reason}`).join('; ');
+  } catch (error) {
+    return `adapter refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 type AccountRead =
@@ -222,8 +268,14 @@ export async function readCalendarAccountsAttested(
   }
   const sessionId = ensureWatchSession().id;
   const accountLabels = accountLabelsByConnectionId();
-  for (const { operationId, provider: operation } of operations) {
+  for (const connected of operations) {
+    const { operationId, provider: operation } = connected;
     const args = operation.args(window);
+    const warm = await warmProviderObservation(connected);
+    if (warm) {
+      failures.push({ operationId, reason: warm });
+      continue;
+    }
     const first = await readOneAccount({ operationId, args, tickId, sessionId });
     const perAccount: AccountRead[] = [];
     if (!first.ok && first.choiceSet) {
@@ -245,7 +297,10 @@ export async function readCalendarAccountsAttested(
     }
     for (const read of perAccount) {
       if (!read.ok) {
-        failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason: read.reason });
+        const reason = /No current capability is registered/.test(read.reason)
+          ? `${read.reason} (catalog: ${explainMissingCandidates(connected)})`
+          : read.reason;
+        failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason });
         continue;
       }
       reads.push({
