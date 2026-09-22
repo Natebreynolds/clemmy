@@ -219,7 +219,7 @@ turn ended truthfully rather than hanging. It cost the person 11 minutes
 of "Still working". Not changed before the tag; noted as the next
 latency item (a shorter silence wall when the request is small).
 
-### Two traps found on the way
+### A trap found on the way
 
 - `open -a Clementine` launches `/Applications/Clementine.app`, an old
   3.18.6 bundle (`32269b1e`) still beside the sealed `~/Applications` one;
@@ -227,5 +227,3 @@ latency item (a shorter silence wall when the request is small).
   daemon held the live home for a minute, ran the pre-fix boot cap and
   re-parked 12 already-parked runs (no schema change). Launch by path and
   confirm `gitSha` + `entry` from build-info before driving anything.
-- The tsc at the root passed while the file it checked had the import
-  pasted inside the header comment; the build's tsc caught it.
