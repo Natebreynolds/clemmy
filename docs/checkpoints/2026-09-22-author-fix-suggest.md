@@ -319,3 +319,53 @@ The stalls that shaped the afternoon's wall times were the machine's
 network path: the Slack websocket on this Mac lost its pong replies 52
 times between 18:00 and 19:51 UTC, across every silent model frame, and
 short judge calls completed between hiccups.
+
+## Readiness handoff for the tag owner (3.18.20, not tagged, nothing pushed)
+
+The owner moved the tag to the other agent, after their design changes.
+State at 2026-09-22 22:35Z, HEAD `a7099a68` on shared `main` (69 commits
+ahead of `origin/main`, none behind, none pushed by this session):
+
+- **Version** already bumped to 3.18.20 in `package.json`,
+  `apps/desktop/package.json` and both lockfiles (`ee799093`, message
+  carries `[mac-only]` like the last two tags). Do not bump again.
+- **Gates run on `dce76b81`** (runtime source identical to `a7099a68`,
+  which adds only this doc): typecheck; release-asset tests 56/56; release
+  closure 137/137; public hygiene 4/4; fresh-install smoke; packaged
+  upgrade 21/21 in a **clean worktree** (in the working tree it refuses on
+  the owner's uncommitted `docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md`, by
+  design); full isolated suite **16,654 tests, 16,517 pass, 127 fail,
+  47 min** — the first full completion today, earlier runs died at the
+  constraint-guard hang. Every failing name was run alone at HEAD and, when
+  still failing, at baseline `eebd4239`: **zero regressions**; 54 files
+  carry pre-existing failures (`host-turn-runner` 37, `loop` 8,
+  `rubric-characterization` 6, planning-card recovery 5, …), and the
+  handful that only failed under the suite's load (cross-process spawns,
+  watchdog file retirements) pass alone. Journeys: see the line below.
+- **Installed proof**: the sealed 3.18.19 bundle runs daemon `a7099a68`
+  (hotpatched, launched by path). Live on it: calendar read, Space update
+  from the dock, workflow listing — one accepted source and one terminal
+  each — and the picker listing the Codex subscription's models.
+- **Before cutting the tag after design changes**: rebuild
+  (`npm run build`; the fingerprint covers `src/`, `docs/`, `scripts/`
+  and HEAD), typecheck, run the test files the changes touch plus
+  `test:release-assets`, `test:release-closure`, `test:public-hygiene`;
+  the full suite and journeys already ran on this runtime. Then
+  `git tag -a v3.18.20 <sha> -m "<message>"`, push `main` and the tag;
+  `release-desktop.yml` (Release Desktop App) builds, signs, notarizes and
+  publishes from the tag. Package and desktop versions must equal the tag.
+- **After the release publishes**: delete
+  `~/Library/Caches/@clemmydesktop-updater/pending.held-20260921-215159`
+  and the stale `update.zip` beside it so the updater fetches 3.18.20
+  cleanly, then quit the app once to let ShipIt install the signed bundle.
+  Never hotpatch a freshly re-sealed bundle before its first launch.
+- **Fixtures to delete from the owner's home when convenient**: workflows
+  Invite digest B, Invite digest, Digest check, Digest check 2, Whats on my
+  calendar today, Prospect outreach review, Content calendar review;
+  Spaces Prospect campaign and Content calendar; plan proposal
+  `plan-a1f3b23e`; the pending "Send Slack message" approval (the
+  send-mirror live proof still waits on it).
+- **Two hung files** end a full run early under load
+  (`checkpoint-process` tests, `constraint-guard.test.ts`,
+  `balanced-user-stops-ordinary-channel.acceptance.test.ts` in journeys);
+  run them alone if a run dies there.
