@@ -1,3 +1,4 @@
+import { gateApprovedStepWriteCoverage } from './workflow-gate-write-coverage.js';
 import { reviewedFileCorrectionReservation, retainedFileCorrectionReservation } from './reviewed-file-correction.js';
 import path from 'node:path';
 import os from 'node:os';
@@ -1462,7 +1463,16 @@ export async function evaluateUncoveredHostMutationConsent(input: {
         }),
       }
     : { posture: 'not_applicable', digest: digest({ version: 1, source, unknown: true }) };
-  const { call, coverage } = buildHostConsentEvidence({ call: {
+  // A workflow step a human approved at its own review gate: the step's
+  // declared local writes ARE the accepted work (never a surprise write).
+  const gateScope = attestation.effect === 'local_write'
+    ? gateApprovedStepWriteCoverage({
+        sessionId: attestation.sessionId,
+        toolName: definition?.name ?? attestation.operationId,
+        logicalToolCallId: attestation.logicalToolCallId,
+      })
+    : null;
+  const uncoveredCall: Parameters<typeof buildHostConsentEvidence>[0]['call'] = {
     source,
     acceptedTaskId: attestation.acceptedTaskId,
     bindingDigest: digest({
@@ -1487,7 +1497,10 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       digest: definition?.envelopeFingerprint ?? attestation.bindingDigest,
     },
     safety: 'admissible',
-  }, coverage: null });
+  };
+  const { call, coverage } = gateScope
+    ? buildHostConsentEvidence({ call: uncoveredCall, coverage: () => gateScope })
+    : buildHostConsentEvidence({ call: uncoveredCall, coverage: null });
   const crossing = crossingFor({
     sessionId: attestation.sessionId,
     sourceUserSeq: attestation.sourceUserSeq,

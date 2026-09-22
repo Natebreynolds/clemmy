@@ -61,6 +61,8 @@ import {
 } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
+import { noEffectStepReason, readPreDispatchRefusals } from './step-refusal-summary.js';
+import { renderReviewDraftForHumans, renderReviewValueForHumans } from './review-draft-render.js';
 import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
@@ -864,6 +866,9 @@ export interface QueuedRunRecord {
    *  dead weight for the schedule, not a person's pending approval, so the
    *  scheduler must not hold the next occurrence for it. */
   bootResumeParkedAt?: string;
+  /** Reviewer change requests this occurrence has absorbed: each re-ran the
+   *  drafting step(s) behind the gated step with the note and re-parked. */
+  revisions?: WorkflowRunRevision[];
   /** Optional review only; captured before execution and immutable on resume. */
   targetReviewPolicy?: WorkflowTargetReviewPolicy;
   inputs?: Record<string, string>;
@@ -1139,6 +1144,48 @@ export interface ParkedStepRef {
   sessionId?: string;
 }
 
+export interface WorkflowRunRevision {
+  approvalId: string;
+  /** The gated step whose draft was declined. */
+  stepId: string;
+  /** The steps re-run with the note (the gated step's model-authored inputs). */
+  revisedStepIds: string[];
+  note: string;
+  requestedAt: string;
+  requestedBy: string;
+  appliedAt: string;
+}
+
+/** The model steps a gated step consumes: the ones a reviewer's note can
+ *  change. A call, transform or subgraph step has nothing to revise. */
+export function revisableUpstreamStepIds(
+  steps: ReadonlyArray<{ id: string; dependsOn?: string[]; prompt?: string; call?: unknown; transform?: unknown; subgraph?: unknown; deterministic?: unknown }>,
+  gatedStepId: string,
+): string[] {
+  const gated = steps.find((step) => step.id === gatedStepId);
+  if (!gated) return [];
+  return (gated.dependsOn ?? []).filter((dep) => {
+    const step = steps.find((candidate) => candidate.id === dep);
+    return Boolean(step && (step.prompt ?? '').trim() && !step.call && !step.transform && !step.subgraph && !step.deterministic);
+  });
+}
+
+/** Lead-in for a step that is running again because a reviewer asked for
+ *  changes at the gate it feeds. */
+export function reviewerChangeLeadIn(revisions: readonly WorkflowRunRevision[] | undefined, stepId: string): string {
+  const mine = (revisions ?? []).filter((revision) => revision.revisedStepIds.includes(stepId));
+  if (mine.length === 0) return '';
+  const latest = mine[mine.length - 1];
+  return [
+    '',
+    '',
+    '=== REVIEWER REQUESTED CHANGES ===',
+    `The reviewer declined the previous output of this step at the approval gate and asked: "${latest.note}"`,
+    'Produce a revised output that applies this request exactly. Keep everything the reviewer did not mention as it was. Output the complete revised result, not only the changed part.',
+    '=== END REVIEWER REQUESTED CHANGES ===',
+  ].join('\n');
+}
+
 interface ParkedRunState {
   parkedSteps: ParkedStepRef[];
   parkedAt: string;
@@ -1203,9 +1250,11 @@ function gateDraftExcerpt(step: WorkflowStepInput, ctx: StepExecutionContext, ma
   for (const dep of step.dependsOn ?? []) {
     const value = ctx.stepOutputs[dep];
     if (value === undefined || value === null) continue;
+    // The reviewer reads a draft, not JSON: structured output from the
+    // drafting step is rendered as numbered items with labelled lines.
     const text = typeof value === 'string'
-      ? value
-      : (() => { try { return JSON.stringify(value, null, 2); } catch { return String(value); } })();
+      ? renderReviewDraftForHumans(value)
+      : renderReviewValueForHumans(value);
     const clean = text.replace(/\r\n/g, '\n').trim();
     if (!clean) continue;
     parts.push((step.dependsOn ?? []).length > 1 ? `[${dep}]\n${clean}` : clean);
@@ -5363,7 +5412,8 @@ async function runStepViaHarness(
     // time-sensitive step can judge in its own words; the run itself is never
     // parked for a human (workflow-scheduled-lateness.ts).
     const latenessSpec = scheduledLatenessLeadInForRun(workflowRunId);
-    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}${latenessSpec}`;
+    const revisionSpec = reviewerChangeLeadIn(readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${workflowRunId}.json`))?.revisions, step.id);
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}${latenessSpec}${revisionSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
     // as a structured block AFTER the prose (never replacing it). This is
@@ -6191,10 +6241,17 @@ async function awaitDeclarativeStepApproval(
   const gateSessionId = `workflow-gate:${ctx.runId}:${step.id}`;
   const startedAt = Date.now();
 
+  // A rejection that carried a change request was consumed by a revision:
+  // the step is asking again with a new draft, so that old answer is not
+  // this gate's verdict.
+  const consumedApprovalIds = new Set(
+    (readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${ctx.runId}.json`))?.revisions ?? []).map((revision) => revision.approvalId),
+  );
   const settledResolution = (): string | undefined =>
     approvalRegistry
       .listPending({ sessionId: gateSessionId, status: 'any' })
-      .find((r) => r.resolution)?.resolution ?? undefined;
+      .filter((r) => r.resolution && !consumedApprovalIds.has(r.approvalId))
+      .sort((a, b) => (b.resolvedAt ?? b.requestedAt).localeCompare(a.resolvedAt ?? a.requestedAt))[0]?.resolution ?? undefined;
 
   // Already resolved on a prior pass (resume) — honor it without re-prompting.
   const prior = settledResolution();
@@ -9510,7 +9567,13 @@ export function settlementGuardedStepOutput(input: {
   output: unknown;
 }): unknown {
   if (isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
-    return phantomBlockedOutput(input.step);
+    // The true reason: a refused write is not "no tool was called".
+    const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
+    const cls = stepSideEffectClass(input.step);
+    return {
+      blocked: true,
+      reason: noEffectStepReason({ stepId: input.step.id, effectClass: cls === 'send' ? 'send' : 'write', refusals }),
+    };
   }
   const businessTools = (input.toolUses ?? [])
     .map((tool) => (typeof tool === 'string' ? (tool.split('__').at(-1) ?? tool) : ''))
@@ -12267,6 +12330,71 @@ export function reapResolvedParkedRuns(): void {
     // that may cross the side-effect boundary; every other decision stops the
     // occurrence without disabling its recurring schedule.
     const stopped = rows.find((row) => row?.resolution !== 'approved');
+    // "Request changes" with a note is a revision, not a stop: the drafting
+    // step(s) behind the gated step run again with the note and the gate
+    // asks again with the new draft. Live 2026-09-22: the note cancelled the
+    // whole occurrence and told the user to re-run in chat.
+    if (stopped && stopped.resolution === 'rejected'
+      && run.parked.changeRequest?.approvalId === stopped.approvalId
+      && !(run.revisions ?? []).some((revision) => revision.approvalId === stopped.approvalId)) {
+      const changeRequest = run.parked.changeRequest;
+      const snapshotSteps = ((run.workflowDefinitionSnapshot as { definition?: { steps?: unknown } } | undefined)?.definition?.steps ?? []) as Array<{ id: string; dependsOn?: string[]; prompt?: string; call?: unknown; transform?: unknown; subgraph?: unknown; deterministic?: unknown }>;
+      const revisedStepIds = revisableUpstreamStepIds(snapshotSteps, changeRequest.stepId);
+      if (revisedStepIds.length > 0 && (run.revisions?.length ?? 0) < 5) {
+        const appliedAt = new Date().toISOString();
+        for (const stepId of revisedStepIds) {
+          try {
+            appendWorkflowEvent(run.workflow, run.id, {
+              kind: 'step_invalidated',
+              stepId,
+              meta: { approvalId: stopped.approvalId, gatedStepId: changeRequest.stepId, note: changeRequest.note },
+            });
+          } catch { /* the record below still carries the revision */ }
+        }
+        clearWorkflowRunPausedForApproval(run.id);
+        const revisedRecord = writeRunRecord(filePath, {
+          ...run,
+          status: 'running',
+          revisions: [
+            ...(run.revisions ?? []),
+            {
+              approvalId: stopped.approvalId,
+              stepId: changeRequest.stepId,
+              revisedStepIds,
+              note: changeRequest.note,
+              requestedAt: changeRequest.requestedAt,
+              requestedBy: changeRequest.requestedBy,
+              appliedAt,
+            },
+          ],
+        }).record;
+        if (isTerminalRunRecord(revisedRecord)) continue;
+        try {
+          addRunEvent(run.id, {
+            type: 'run_resumed',
+            status: 'running',
+            message: `Revising "${revisedStepIds.join('", "')}" with your note; the review will ask again with the new draft.`,
+            data: { workflow: run.workflow, gatedStepId: changeRequest.stepId, revisedStepIds, approvalId: stopped.approvalId },
+          });
+        } catch { /* run-events is best-effort */ }
+        try {
+          addNotification({
+            id: `workflow-revision-${run.id}-${stopped.approvalId}`,
+            kind: 'workflow',
+            title: `Revising the draft: ${run.workflow}`,
+            body: `Got your note on "${changeRequest.stepId}": "${changeRequest.note}". I'm redoing ${revisedStepIds.join(', ')} with it and will ask you to review the new draft.`,
+            createdAt: appliedAt,
+            read: false,
+            metadata: { workflow: run.workflow, runId: run.id, stepId: changeRequest.stepId, inboxOnly: true, source: 'workflow-revision' },
+          });
+        } catch { /* best-effort */ }
+        logger.info(
+          { workflow: run.workflow, runId: run.id, approvalId: stopped.approvalId, revisedStepIds },
+          'Parked workflow occurrence revising after a change request',
+        );
+        continue;
+      }
+    }
     if (stopped) {
       const decision = stopped.resolution === 'rejected'
         ? 'declined by the user'
