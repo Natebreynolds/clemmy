@@ -12,7 +12,10 @@ const GATE_TIMEOUT_MS = 1_500;
 const PRIMER_DROP_BELOW = 0.25;
 const GROUNDING_CONFIDENCE_MIN = 0.55;
 const COMPLETION_CONFIDENCE_MIN = 0.6;
-const COMPLETION_TIMEOUT_MS = 1_500;
+// Live 2026-09-22: a completion verdict timed out at 1,525 ms while the two
+// hits landed at 270 and 988 ms. With the reviewer hedged rather than raced,
+// a later Jev answer still returns before the reviewer would; give it room.
+const COMPLETION_TIMEOUT_MS = 2_500;
 
 export interface NamedCandidate {
   name: string;

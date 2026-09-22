@@ -7,7 +7,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict, assessCompletionEvidenceCoverage, _setCompletionJudgeForTests } = await import('./objective-judge.js');
+const { resolveJudgeResponder, honestFailureReportSettles, boundedAttemptResultIsTerminal, buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, JUDGE_SYSTEM_PROMPT, parseCompletionVerdict, parseProgressVerdict, assessCompletionEvidenceCoverage, _setCompletionJudgeForTests, JEV_HEDGE_DELAY_MS } = await import('./objective-judge.js');
 const { _setSystemOneFetchForTests, _setTypesafeKeyForTests } = await import('../jev/client.js');
 
 function unavailableSettingsJudge() {
@@ -600,8 +600,9 @@ test('Jev incomplete with complete receipts falls through; reply similarity does
   assert.notEqual(v.reason, 'Jev found the response reports the verified receipts.');
 });
 
-test('the Settings judge starts before Jev returns so a miss does not serialize', async () => {
+test('a Jev miss does not serialize: the reviewer starts at the hedge delay, before Jev returns', async () => {
   _setTypesafeKeyForTests('ts_test');
+  const t0 = Date.now();
   let judgeStartedAt = 0;
   _setCompletionJudgeForTests(async () => {
     judgeStartedAt = Date.now();
@@ -610,7 +611,8 @@ test('the Settings judge starts before Jev returns so a miss does not serialize'
   });
   let jevEndedAt = 0;
   _setSystemOneFetchForTests(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    // Slower than the hedge: the reviewer must already be running by then.
+    await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 300));
     jevEndedAt = Date.now();
     return {
       status: 200,
@@ -618,13 +620,8 @@ test('the Settings judge starts before Jev returns so a miss does not serialize'
       text: async () => JSON.stringify({
         model: 'jev-1.13.0',
         answers: {
-          verdict: {
-            type: 'choice',
-            choice: 'done',
-            probabilities: { done: 0.91, incomplete: 0.09 },
-            confidence: 0.88,
-          },
-          matches: { type: 'noul', noul: 0.9 },
+          verdict: { type: 'choice', choice: 'incomplete', probabilities: { done: 0.2, incomplete: 0.8 }, confidence: 0.7 },
+          matches: { type: 'noul', noul: 0.2 },
         },
         usage: { input_tokens: 36, output_tokens: 4 },
       }),
@@ -641,10 +638,13 @@ test('the Settings judge starts before Jev returns so a miss does not serialize'
       ],
     },
   );
-  assert.equal(v.fast, true);
-  assert.equal(v.judgeModelId, 'jev-1.13.0');
   assert.ok(judgeStartedAt > 0, 'Settings judge must start');
-  assert.ok(judgeStartedAt < jevEndedAt, 'Settings judge must overlap Jev, not wait for it');
+  assert.ok(judgeStartedAt < jevEndedAt, 'the reviewer must not wait for a slow Jev');
+  assert.ok(judgeStartedAt - t0 >= JEV_HEDGE_DELAY_MS - 20 && judgeStartedAt - t0 < JEV_HEDGE_DELAY_MS + 250,
+    `the reviewer starts at the hedge delay, not immediately (started after ${judgeStartedAt - t0}ms)`);
+  assert.equal(v.done, false);
+  assert.equal(v.jevAttempt?.reviewerStarted, true);
+  _setCompletionJudgeForTests(null);
 });
 
 test('judgeObjectiveComplete still uses Jev when a captured judge selection is present', async () => {
@@ -981,4 +981,62 @@ test('a verdict records the model that answered after a mid-call fallover, keepi
   assert.deepEqual(resolveJudgeResponder({ requested: { judgeModelId: 'grok-4.6', judgeProvider: 'byo' }, judgeStartedAt: Date.parse('2026-09-15T08:05:00.000Z'), routedRows: rows }), { judgeModelId: 'grok-4.6', judgeProvider: 'byo' });
   // A fallover of a different model is not this judge's.
   assert.deepEqual(resolveJudgeResponder({ requested: { judgeModelId: 'claude-haiku-4-5' }, judgeStartedAt: startedAt, routedRows: rows }), { judgeModelId: 'claude-haiku-4-5' });
+});
+
+test('an accepted Jev verdict inside the hedge delay never starts the configured reviewer', async () => {
+  const { _setCompletionJudgeForTests } = await import('./objective-judge.js');
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer ran' }, failure: null }; });
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200, ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: { verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
+      usage: { input_tokens: 30, output_tokens: 4 },
+    }),
+  }));
+  try {
+    const v = await judgeObjectiveComplete(
+      'Create /tmp/jev-hedge.txt containing HEDGE_OK',
+      'Created /tmp/jev-hedge.txt with exactly HEDGE_OK.',
+      { sessionId: 'probe-jev-hedge', skills: [], toolCallSummary: 'write_file succeeded',
+        verifiedReadResults: [{ toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' }] },
+    );
+    assert.equal(v.done, true);
+    assert.equal(v.judgeModelId, 'jev-1.13.0');
+    assert.equal(v.jevAttempt?.reviewerStarted, false, 'the hedge must have saved the reviewer call');
+    // Give any stray hedge timer a chance to fire; it must have been cleared.
+    await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 100));
+    assert.equal(reviewerCalls, 0, 'the configured reviewer must not run for a verdict Jev already settled');
+  } finally {
+    _setCompletionJudgeForTests(null);
+  }
+});
+
+test('a Jev verdict slower than the hedge delay lets the configured reviewer start, and its verdict still wins when Jev is rejected', async () => {
+  const { _setCompletionJudgeForTests } = await import('./objective-judge.js');
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: false, reason: 'reviewer: not done' }, failure: null }; });
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => {
+    await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 200));
+    return {
+      status: 200, ok: true,
+      text: async () => JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: { verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
+        usage: { input_tokens: 30, output_tokens: 4 },
+      }),
+    };
+  });
+  try {
+    // No verified reads → coverage incomplete → Jev DONE is not accepted.
+    const v = await judgeObjectiveComplete('look up the record', 'I looked it up.', { sessionId: 'probe-jev-slow', skills: [], toolCallSummary: '' });
+    assert.equal(reviewerCalls, 1, 'a slow Jev must not delay the reviewer past the hedge');
+    assert.equal(v.done, false);
+    assert.equal(v.jevAttempt?.reviewerStarted, true);
+  } finally {
+    _setCompletionJudgeForTests(null);
+  }
 });

@@ -27,6 +27,10 @@ import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
  * owned this prompt was deleted in Phase 3 — the goal-contract store +
  * harness validation (goal-validate.ts) replaced it.
  */
+/** How long Jev may take before the configured reviewer is started alongside
+ * it. Below Jev's measured miss latency on this machine, above its hit median. */
+export const JEV_HEDGE_DELAY_MS = 1_000;
+
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
@@ -133,7 +137,9 @@ export interface ObjectiveJudgeVerdict {
     replyMatchesReceipts?: number;
     accepted: boolean;
     coverageComplete: boolean;
-  };
+      /** Whether the configured reviewer was started (false = the hedge saved it). */
+    reviewerStarted?: boolean;
+};
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -1179,10 +1185,16 @@ export async function judgeObjectiveComplete(
   // skips the 3–25s hedged chat-model judge. The configured judge remains the
   // backstop when confidence is low, Jev times out, or the key is absent.
   //
-  // Start both immediately. A serialized Jev await made every rejected fast
-  // path pay Jev's full latency before grok even started (live ~30ms gap after
-  // Jev returned). Overlap makes a Jev miss free on the wall clock; a Jev hit
-  // still returns without waiting for the Settings judge.
+  // Start Jev now; start the configured reviewer only if Jev has not answered
+  // within a short hedge delay. Fully serial made every rejected fast path pay
+  // Jev's whole latency before grok started; fully parallel (the previous
+  // shape) started grok on every turn and let it run to completion after Jev
+  // had already been accepted — a whole reviewer call and its tokens spent
+  // for a verdict nobody read (live 2026-09-22: Jev accepted at 988 ms while
+  // grok-4.3 ran on for seconds). The reviewer cannot be aborted mid-flight,
+  // so the only cost that can be avoided is the one not started. Measured
+  // Jev latency on this machine: 270–988 ms on hits, so a 1 s delay lets most
+  // hits settle without a reviewer and costs a miss at most 1 s of wall time.
   const coverage = assessCompletionEvidenceCoverage({
     objective,
     results: skillContext?.verifiedReadResults,
@@ -1207,7 +1219,13 @@ export async function judgeObjectiveComplete(
       return null;
     }
   })();
-  const judgePromise = startCompletionJudge(objective, assistantResponse, skillContext);
+  let judgePromise: Promise<CompletionJudgeRun> | null = null;
+  const startJudge = (): Promise<CompletionJudgeRun> => {
+    judgePromise ??= startCompletionJudge(objective, assistantResponse, skillContext);
+    return judgePromise;
+  };
+  const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
+  hedge.unref?.();
   let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
   /** Jev's own reading of THIS reply, kept past the try so the unreachable
    *  path below can still use it. Without this it was computed, recorded as
@@ -1215,6 +1233,7 @@ export async function judgeObjectiveComplete(
    *  left. */
   let jevSaid: { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null = null;
   const fast = await jevPromise;
+  clearTimeout(hedge);
   const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
   // Accept a Jev verdict only when coverage supports it. DONE without
   // receipts is not completion; BLOCKED without a failed attempt is not a
@@ -1236,6 +1255,8 @@ export async function judgeObjectiveComplete(
     ? {
         accepted: acceptJev,
         coverageComplete: coverage.complete,
+        // Whether the hedge saved the reviewer call, so the saving is countable.
+        reviewerStarted: judgePromise !== null,
         ...(fast.choice ? { choice: fast.choice } : {}),
         ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
         ...(typeof fast.replyMatchesReceipts === 'number'
@@ -1255,7 +1276,7 @@ export async function judgeObjectiveComplete(
       ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
     };
   }
-  const run = await judgePromise;
+  const run = await startJudge();
   if (!run.verdict) {
     // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
     //
