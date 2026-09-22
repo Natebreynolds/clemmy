@@ -6704,6 +6704,18 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Kill old occurrences that never ran: the same rule the daemon applies on
+  // boot, on demand from the desktop or phone.
+  app.post('/api/console/workflows/dead-occurrences/sweep', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { sweepDeadOccurrences } = await import('../execution/workflow-dead-occurrences.js');
+      res.json(sweepDeadOccurrences({ source: 'desktop-dashboard' }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/workflows/:name/runs/:runId/cancel', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
@@ -12181,8 +12193,11 @@ export function registerConsoleRoutes(
           title: run.title,
           column,
           status: needsAttention ? 'needs_attention' : run.status,
-          progressHint: run.outputPreview?.slice(0, 600)
-            || run.events[run.events.length - 1]?.message || '',
+          // Raw structured output (`[{"team":"A",…}]`) is data for the run
+          // drawer, not a sentence for the card.
+          progressHint: (run.outputPreview && !/^\s*[[{]/.test(run.outputPreview) ? run.outputPreview.slice(0, 600) : '')
+            || run.events[run.events.length - 1]?.message
+            || (run.outputPreview ? 'Finished with data — open it to see the results.' : ''),
           sessionId: run.sessionId,
           ageMs: ageMs((run as { startedAt?: string; createdAt?: string }).startedAt
             || (run as { createdAt?: string }).createdAt

@@ -2715,6 +2715,15 @@ export async function startDaemon(
       'Legacy scheduled readiness hold boot reconciliation failed closed',
     );
   }
+  try {
+    const { sweepDeadOccurrences } = await import('../execution/workflow-dead-occurrences.js');
+    const dead = sweepDeadOccurrences({ source: 'boot' });
+    if (dead.cancelled > 0 || dead.failed > 0) {
+      logger.warn(dead, 'Cancelled dead occurrences on boot — never worked, superseded by a newer occurrence');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Dead occurrence sweep failed closed');
+  }
   // Notification hygiene on boot: stale unread approval/execution cards
   // (dead runs) flip to read; >30d records purge. Clears the "Needs you"
   // ghosts that bury real items (observed live: 873 unread from weeks back).
