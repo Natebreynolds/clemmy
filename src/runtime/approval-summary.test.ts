@@ -177,3 +177,14 @@ test('presentApproval handles alternate Outlook recipient shapes and strips HTML
   assert.doesNotMatch(presentation.detail, /<p>|<li>/);
   assert.equal(presentation.canPauseWorkflow, false);
 });
+
+test('extractApprovalContentPreview: finds the draft inside a work_call carrier around a composio call', () => {
+  const p = extractApprovalContentPreview('work_call', {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({
+      tool_slug: 'SLACK_SEND_MESSAGE',
+      arguments: { channel: 'D0TEST', text: 'Morning — the pipeline review moved to 3pm.' },
+    }),
+  });
+  assert.equal(p?.body, 'Morning — the pipeline review moved to 3pm.');
+});

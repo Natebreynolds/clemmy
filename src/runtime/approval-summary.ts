@@ -387,13 +387,23 @@ export function extractApprovalContentPreview(
 ): ApprovalContentPreview | undefined {
   try {
     if (!args || typeof args !== 'object') return undefined;
-    // composio_execute_tool nests the real fields under `arguments` (string|object).
+    // Carriers nest the real fields: composio_execute_tool under `arguments`,
+    // work_call under `args_json` (which may itself be a composio call). Peel
+    // until the provider's own fields — live 2026-09-22 a Slack send wrapped
+    // in work_call showed no draft on either surface.
+    const asRecord = (value: unknown): Record<string, unknown> | null => {
+      if (typeof value === 'string') {
+        try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null; } catch { return null; }
+      }
+      return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+    };
     let inner: Record<string, unknown> = args;
-    const nested = (args as Record<string, unknown>).arguments;
-    if (typeof nested === 'string') {
-      try { const p = JSON.parse(nested); if (p && typeof p === 'object') inner = p as Record<string, unknown>; } catch { /* keep args */ }
-    } else if (nested && typeof nested === 'object') {
-      inner = nested as Record<string, unknown>;
+    for (let depth = 0; depth < 4; depth++) {
+      const next = asRecord(inner.args_json)
+        ?? (typeof inner.name === 'string' ? asRecord(inner.args) : null)
+        ?? asRecord(inner.arguments);
+      if (!next) break;
+      inner = next;
     }
     const rawBody = pickLongestString(inner, CONTENT_BODY_KEYS);
     const imageUrl = pickImageUrl(inner, CONTENT_IMAGE_KEYS);

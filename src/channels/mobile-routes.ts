@@ -3653,10 +3653,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // (token budget, plan IDs, raw metadata) to keep payloads small.
 
   router.get('/api/chat/sessions', requireMobileSession, (_req, res) => {
-    const sessions = harnessListSessions({ limit: 80, archived: false })
-      // Only chat-like sessions land on the phone — workflow / execution
-      // sessions belong on the dashboard, not in the mobile chat list.
-      .filter((session) => session.kind === 'chat')
+    // Only chat sessions land on the phone — workflow / execution sessions
+    // belong on the dashboard. The list reads titles and times, never the
+    // conversation state (megabytes per long chat; it held the phone's chat
+    // list on skeletons for 7+ s on 2026-09-22).
+    const sessions = harnessListSessions({ limit: 80, archived: false, kind: 'chat', withoutConversationState: true })
       .map(serializeSessionForMobile);
     res.json({ sessions });
   });
