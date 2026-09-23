@@ -608,6 +608,10 @@ function reservationKey(input: {
 }
 
 function priorReservationExists(prepared: PreparedHostWorkCallV1): boolean {
+  // Expected-work admission already bounded this corrected attempt. A typed
+  // invalid-argument settlement explicitly authorizes argument repair and is
+  // not a spent effect. Keep successful, unresolved and uncertain reservations;
+  // only the same capability with changed effective arguments can use repair.
   const binding = prepared.binding;
   try {
     const rows = openEventLog().prepare(`
@@ -625,12 +629,23 @@ function priorReservationExists(prepared: PreparedHostWorkCallV1): boolean {
            settlement.logical_tool_call_id IS NULL
            OR settlement.execution_kind <> 'refused_pre_dispatch'
          )
+         AND NOT COALESCE((
+           settlement.outcome_kind = 'invalid_arguments'
+           AND settlement.outcome_evidence = 'structured'
+           AND settlement.recovery_action = 'repair_arguments'
+           AND settlement.retry_same_candidate = 1
+           AND settlement.requires_reconciliation = 0
+           AND binding.tool_name = ?
+           AND binding.argument_digest <> ?
+         ), 0)
     `).all(
       prepared.sessionId,
       prepared.sourceUserSeq,
       binding.contractId,
       binding.requirementId,
       prepared.logicalToolCallId,
+      prepared.targetName,
+      prepared.hostCapabilityBinding.effectiveArgumentDigest,
     ) as Array<{
       logical_tool_call_id: string;
       cardinality_kind: string;

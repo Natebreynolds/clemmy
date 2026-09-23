@@ -317,3 +317,78 @@ Six adjacent production-host advisory checks also pass, including corrected-work
 discovery-preserves-current-advice and incremental evidence windows:
 /tmp/clem-watcher-plan-host.log. Full suite remains unqualified on this loaded
 machine. This is not a claim of fresh installed acceptance.
+
+## Installed fc59240fb — watcher pass, Sol lifecycle failure
+
+Installed clean fc59240fb0796f80ab1b120f3d34db1d158dae62 via the Terminal recipe;
+served fingerprint2c2c7dfb28083148ad6185f692c54b3beffc493e0f3213b81e5681fbaee0b552.
+Retained Opus/Sol/e949 terminal proofs passed after restart. Fresh source289100,
+session sess-desktop-917068040221787d721e1e90, used actual gpt-6-sol. Its first plan
+failed lineage admission, the repaired plan was saved at289187, and the pending
+watcher review was discarded at289188 with accepted_plan_changed. No stale-plan
+steer was delivered. This supplies installed/live proof of that narrow fix.
+
+Full lifecycle FAILED. workflow_create289193 returned typed invalid_arguments
+because the authored aggregate had an empty groupBy. The retained settlement
+explicitly authorized repair_arguments, retry_same_candidate=true, no required
+reconciliation. A corrected invocation then passed expected-work admission but
+consent refused cardinality_spent: priorReservationExists counted the rejected
+local invocation as a spent effect. Sol searched for plan_task and attempted a
+replacement graph; that was correctly refused because an accepted plan already
+existed. Do not loosen graph replacement to hide the inconsistent repair rule.
+
+Cancelled the exact run to cap repair spend; canonical terminal289246 cancelled.
+API workflow and runs readback both404 for harness-plan-author-0923-fc592-sol:
+no fixture persisted, no child run, no operator workflow cleanup needed. Restored
+claude_oauth/claude-opus-5-5 after cancellation. Global worker/judge unchanged.
+Canonical measurement:178423ms,11 top-level calls (including6 searches),331347
+prompt/16768 cached/314579 uncached input/6190 output;22 usage records:12Sol6,
+5Grok4.3,5Jev1.13. Exact attribution and token accounting certified, zero
+uncertified rows. Failed task, not a matched performance win. Learned native
+selection occurred289104; redundant discovery remains an unresolved cost.
+
+Evidence: output/harness-acceptance/2026-09-23-fc59240fb/sol-{accepted,cancel,
+workflow,runs,events,measurement}.json. Private traces omit model-memory context.
+
+## Typed definition repair candidate — consent and artifact lineage
+
+A durable, structured invalid-arguments result with repair_arguments,
+retry_same_candidate=true and requires_reconciliation=false no longer spends
+consent cardinality for the SAME tool with CHANGED effective arguments. The
+existing expected-work repair budget still owns admission. Successful, open,
+uncertain and unrelated reservations remain protected; no new provider/tool
+exception, graph replacement, reset or generic success fallback.
+
+The production regression first reproduced cardinality_spent on unchangedfc592
+(/tmp/clem-definition-repair-red.log). After that correction it exposed a second
+boundary: artifact revision lineage counted the rejected definition as another
+possible artifact generation. The proof now omits only typed no-effect refusals
+and structured argument failures authorizing repair, keeping open/uncertain
+candidates ambiguous. Transactional native selection uses the exact requested
+logical invocation instead of requiring all historic bindings to have one row.
+The shared core still verifies artifact identity and current revision chain.
+
+The pin executes actual invalid workflow_create, corrected work_call on the same
+saved requirement, enable/readback/disable, database reopen and final transaction
+proof. All three variants (ordinary lifecycle, plan repair, definition repair)
+pass; mutating successes remain exactly3. An injected uncertain predecessor
+makes terminal proof fail, and rollback restores proof without replay. The
+partial consent-only candidate was rejected; do not hotpatch only that change.
+Fresh installed acceptance of this definition-repair candidate remains owed.
+
+## Jev trajectory evidence toward the release decision
+
+Read-only window from2026-09-16 to this September23 observation:612 completed
+trajectory reviews,540 without Jev shadow;72 paired shadows,13 already marked
+stale. Of59 current pairs:36 both on_track,2 both drift,21 watcher drift/Jev
+on_track. Agreement is NOT ground truth, workloads/builds differ, and Jev shadow
+was not present for the full window. The completed week evidence is not proof
+that Jev can replace the watcher or enforce stops. Preserve the owner's explicit
+release decision; investigate concrete disagreements against actual receipts.
+Private summary without prompt bodies: trajectory-week.json in the fc592 folder.
+
+Definition-repair validation:63/63 targeted native lifecycle, local execution
+repair/evidence, consent grants/binding projection, and terminal publication
+checks pass (/tmp/clem-definition-repair-adjacent.log); typecheck passes
+(/tmp/clem-definition-repair-types.log). Full suite was not run on this loaded
+machine. No speed/token improvement is claimed until fresh installed completion.

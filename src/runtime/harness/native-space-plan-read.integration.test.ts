@@ -609,7 +609,9 @@ test('a real Space read → write → read plan keeps both reads selected and ex
 // Live source287511: enabling an authored workflow changed its revision and
 // erased the create step's completion; enable then failed its own data lineage
 // proof. This uses production discovery, planning, writes and dependency proof.
-for (const repairedPlan of [false, true]) test(`a created workflow remains completed after its planned enable revision and database reopen (repaired=${repairedPlan})`, async t => {
+for (const repair of ['none', 'plan', 'definition'] as const) test(`a created workflow remains completed after its planned enable revision and database reopen (repair=${repair})`, async t => {
+  const repairedPlan = repair === 'plan';
+  const repairedDefinition = repair === 'definition';
   const watcher = await import('./watcher-judge.js');
   const oldWatcher = process.env.CLEMMY_WATCHER_JUDGE;
   const oldInterval = process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
@@ -622,7 +624,7 @@ for (const repairedPlan of [false, true]) test(`a created workflow remains compl
   });
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
-  const name = repairedPlan ? 'native-planned-lifecycle-repaired' : 'native-planned-lifecycle';
+  const name = `native-planned-lifecycle-${repair}`;
   const session = eventlog.createSession({ kind: 'chat' });
   const objective = `Create manual-only workflow ${name}, enable it, verify, then disable and verify again. Do not run it.`;
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
@@ -657,6 +659,7 @@ for (const repairedPlan of [false, true]) test(`a created workflow remains compl
     [toolCall('lifecycle-discover-read', 'tool_search', { query: 'workflow_get', limit: 5 })],
     ...(repairedPlan ? [[toolCall('lifecycle-rejected-plan', 'plan_task', { ...plan, draft: { ...plan.draft, topology: { ...plan.draft.topology, operations: plan.draft.topology.operations.map(op => ({ ...op, dataFrom: [] })) } } })]] : []),
     [toolCall('lifecycle-plan', 'plan_task', plan)],
+    ...(repairedDefinition ? [[selected('lifecycle-invalid-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false, steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'aggregate', value: { op: 'literal', value: [{ n: 323 }] }, groupBy: [], metrics: [{ fn: 'sum', column: 'n' }] } }), sideEffect: 'read' }] })]] : []),
     [selected('lifecycle-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false,
       steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'literal', value: { product: 323 } } }), sideEffect: 'read' }] })],
     [selected('lifecycle-enable', 'enable', 'workflow_set_enabled', { name, enabled: true })],
@@ -680,6 +683,7 @@ for (const repairedPlan of [false, true]) test(`a created workflow remains compl
     assert.ok(model.requests().every(request => !request.inputTail.includes('STALE_PLAN_REPAIR_SENTINEL')),
       'the repaired plan cannot receive advice about its failed predecessor');
   }
+  if (repairedDefinition) assert.match(historyResult(history, 'lifecycle-invalid-create'), /Invalid workflow transform/);
   assert.match(historyResult(history, 'lifecycle-create'), /Created workflow/);
   assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
   const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
@@ -710,6 +714,19 @@ for (const repairedPlan of [false, true]) test(`a created workflow remains compl
   const verifyTerminal = () => terminalProof.verifyAcceptedTaskTerminalProofInTransaction({ db, ...identity,
     acceptedTaskId: workContract.contract.acceptedTaskId, manifest: state.manifest });
   assert.deepEqual(verifyTerminal(), { ok: true });
+  if (repairedDefinition) {
+    // A failed attempt may disappear from lineage only when its no-effect
+    // classification is exact. Uncertainty must not be hidden by later success.
+    db.exec('SAVEPOINT uncertain_definition_predecessor');
+    try {
+      const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='logical_call_settlements'").all() as Array<{name:string}>;
+      for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      db.prepare(`UPDATE logical_call_settlements SET outcome_kind='uncertain_write',requires_reconciliation=1
+        WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id='lifecycle-invalid-create'`).run(session.id,source.seq);
+      assert.equal(verifyTerminal().ok, false, 'an uncertain predecessor cannot be erased by a later successful definition');
+    } finally { db.exec('ROLLBACK TO uncertain_definition_predecessor'); db.exec('RELEASE uncertain_definition_predecessor'); }
+    assert.deepEqual(verifyTerminal(), { ok: true });
+  }
   for (const id of ['enable', 'disable']) {
     assert.ok(state.manifest.nodes.find(node => node.operationId === id)?.obligations.includes('derivation_from_current_source'),
       'identity proof satisfies the existing obligation; the obligation is not removed');
@@ -744,9 +761,9 @@ for (const repairedPlan of [false, true]) test(`a created workflow remains compl
   const committed = delivery.commitTurnOutcome({ version: 2, id: turnOutcomes.turnOutcomeId(identity), identity,
     status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Created, enabled, then disabled and verified.' } });
   assert.equal(committed.presentation.status, 'done');
-  assert.equal(model.calls(), repairedPlan ? 11 : 10, 'terminal proof adds no model round');
+  assert.equal(model.calls(), repair !== 'none' ? 11 : 10, 'terminal proof adds no model round');
   assert.equal((db.prepare(`SELECT count(*) AS n FROM logical_call_settlements
-    WHERE session_id=? AND source_user_seq=? AND mutating=1`).get(session.id, source.seq) as { n: number }).n, 3,
+    WHERE session_id=? AND source_user_seq=? AND mutating=1 AND outcome_kind='succeeded'`).get(session.id, source.seq) as { n: number }).n, 3,
     'receipt verification and publication must not replay any mutation');
 
   const strategies = await import('../../memory/run-strategy-store.js');

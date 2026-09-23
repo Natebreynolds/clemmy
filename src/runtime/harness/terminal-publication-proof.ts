@@ -1072,6 +1072,7 @@ function exactSealedNodeAuthority(input: {
   nodeId: string;
   expectedEffect: string;
   expectedBindingDigest?: string;
+  logicalToolCallId?: string;
 }): { ok: true; binding: SealedNodeBinding; logicalToolCallId: string }
   | { ok: false; reason: string } {
   const rows = input.db.prepare(`
@@ -1085,11 +1086,14 @@ function exactSealedNodeAuthority(input: {
        AND b.requirement_id = n.node_id
      WHERE n.session_id = ? AND n.source_user_seq = ?
        AND n.node_id = ? AND b.contract_id = ?
+       AND (? IS NULL OR b.logical_tool_call_id = ?)
   `).all(
     input.sessionId,
     input.sourceUserSeq,
     input.nodeId,
     input.contractId,
+    input.logicalToolCallId ?? null,
+    input.logicalToolCallId ?? null,
   ) as Array<{
     binding_json: string;
     binding_digest: string;

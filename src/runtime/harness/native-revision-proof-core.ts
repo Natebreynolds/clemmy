@@ -76,8 +76,16 @@ function proveRevision(input: RevisionProofInput, ports: NativeRevisionProofPort
     const outputKind = declarations[0]!.localPlanning!.outputKind;
     const verified = { status: 'verified' as const, handle: facts.handle, contentDigest: facts.contentDigest,
       createdId: facts.createdId, boundAt: work.bound_at, settledAt: work.settled_at, outputKind, identityLineageVerified: false };
-    const sourceCalls = (requirementId: string) => db.prepare(`SELECT logical_tool_call_id FROM expected_work_call_bindings
-      WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND contract_id=? AND requirement_id=?`)
+    // A rejected definition is not an alternative artifact generation. Keep
+    // every successful, open or ambiguous candidate; omit only durable no-effect
+    // refusals and structured argument failures that explicitly permit repair.
+    const sourceCalls = (requirementId: string) => db.prepare(`SELECT b.logical_tool_call_id FROM expected_work_call_bindings b
+      LEFT JOIN logical_call_settlements s USING(session_id,source_user_seq,logical_tool_call_id)
+      WHERE b.session_id=? AND b.source_user_seq=? AND b.accepted_task_id=? AND b.contract_id=? AND b.requirement_id=?
+        AND NOT COALESCE((s.execution_kind='refused_pre_dispatch' AND s.requires_reconciliation=0
+          AND s.physical_crossing_count=0 AND s.host_crossing_count=0),0)
+        AND NOT COALESCE((s.outcome_kind='invalid_arguments' AND s.outcome_evidence='structured'
+          AND s.recovery_action='repair_arguments' AND s.retry_same_candidate=1 AND s.requires_reconciliation=0),0)`)
       .all(input.sessionId, input.sourceUserSeq, input.acceptedTaskId, input.contractId, requirementId) as Array<{ logical_tool_call_id: string }>;
     // A commit proves the authored bytes landed, not that they descend from a
     // promised source. Retain the existing stronger proof whenever the graph
