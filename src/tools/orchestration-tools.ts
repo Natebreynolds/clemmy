@@ -1,3 +1,4 @@
+import { withWorkflowDispatchCommit } from '../runtime/harness/workflow-dispatch-commit.js';
 import { workflowProjectCreationErrors } from '../execution/workflow-project-preflight.js';
 import { requestsToolkitUse } from './workflow-toolkit-intent.js';
 import { randomBytes } from 'node:crypto';
@@ -1508,7 +1509,8 @@ export function registerOrchestrationTools(server: McpServer): void {
             : admitted.message,
         );
       }
-      return textResult(admitted.message);
+      return textResult(admitted.ok && admitted.chatDispatchPreparation
+        ? withWorkflowDispatchCommit(admitted.message, admitted.chatDispatchPreparation) : admitted.message);
     },
   );
 

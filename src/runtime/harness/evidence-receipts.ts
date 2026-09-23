@@ -1,4 +1,4 @@
-import { verifiedNativeIdentityDerivation } from './native-revision-commit-proof.js';
+import { verifiedNativeIdentityDerivation, proveWorkflowDispatchCommit } from './native-revision-commit-proof.js';
 import { deriveResultHandleFactsFromRaw, recordsAtRecordPath } from './result-facts.js';
 /**
  * Typed, host-issued evidence receipts.
@@ -1406,6 +1406,22 @@ function redeemHostWriteReceiptFacts(input: {
   const node = manifestState.ok
     ? manifestState.manifest.nodes.find((entry) => entry.nodeId === input.nodeId)
     : undefined;
+  if (manifestState.ok && node?.writeEvidenceMode === 'host_workflow_dispatch_v1') {
+    const bound = db.prepare(`SELECT contract_id,requirement_id FROM expected_work_call_bindings
+      WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+      .get(input.sessionId,input.sourceUserSeq,input.acceptedTaskId,input.logicalToolCallId) as
+      { contract_id: string; requirement_id: string } | undefined;
+    const proof = bound ? proveWorkflowDispatchCommit({ ...input,
+      contractId: bound.contract_id, requirementId: bound.requirement_id }) : null;
+    return proof?.status === 'verified' && node.effectKind === 'local_write'
+      && node.resolvedTool === created.value.toolName && input.kind === 'commit'
+      && input.obligation === 'commit_effect' && node.obligations.length === 2
+      && node.obligations.includes('execution_terminal')
+      && input.createdId === proof.runId && input.handle === `workflow-run:${proof.runId}`
+      && input.providerReceipt === proof.receiptDigest && input.intendedDigest === proof.preparationDigest
+      && input.observedDigest === null && input.physicalDispatchId === created.value.physicalDispatchId
+      ? { ok: true } : { ok: false, reason: 'workflow dispatch receipt no longer matches its host preparation' };
+  }
   const frozenVerification = proveFrozenMutationVerification({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -1813,6 +1829,19 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         mirrors.push(mirror);
         return { status: 'issued', receipts: [proved.receipt] };
       }
+      const dispatchBinding = node.writeEvidenceMode === 'host_workflow_dispatch_v1'
+        ? db.prepare(`SELECT contract_id,requirement_id FROM expected_work_call_bindings
+          WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+          .get(input.sessionId,input.sourceUserSeq,manifestState.authority.accepted_task_id,logicalToolCallId) as
+          { contract_id: string; requirement_id: string } | undefined : undefined;
+      const dispatchProof = dispatchBinding ? proveWorkflowDispatchCommit({
+        sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: manifestState.authority.accepted_task_id, logicalToolCallId,
+        contractId: dispatchBinding.contract_id, requirementId: dispatchBinding.requirement_id,
+      }) : null;
+      if (node.writeEvidenceMode === 'host_workflow_dispatch_v1' && dispatchProof?.status !== 'verified') {
+        return { status: 'refused', reason: 'workflow dispatch has no exact host preparation receipt' };
+      }
       const frozenVerification = proveFrozenMutationVerification({
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
@@ -1883,7 +1912,10 @@ export function issueHostWriteEvidenceForManifestNode(input: {
       const exactReceiptDigest = frozenVerification.status === 'verified'
         ? exactContentDigest ?? frozenVerification.targetDigest
         : null;
-      const payload = frozenVerification.status === 'verified'
+      const payload = dispatchProof?.status === 'verified'
+        ? { id: dispatchProof.runId, handle: `workflow-run:${dispatchProof.runId}`,
+            receipt: dispatchProof.receiptDigest, writtenDigest: dispatchProof.preparationDigest }
+        : frozenVerification.status === 'verified'
         ? {
             id: frozenVerification.resourceId,
             handle: frozenVerification.resourceId,
@@ -1910,12 +1942,13 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         frozenVerification.status !== 'verified'
         && !atomic?.ok
         && !localCommit
+        && dispatchProof?.status !== 'verified'
         && !independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)
       ) {
         return { status: 'refused', reason: 'write settlement did not return an independent provider receipt' };
       }
       let intendedDigest = payload.writtenDigest;
-      const readback = frozenVerification.status === 'verified'
+      const readback = dispatchProof?.status === 'verified' ? null : frozenVerification.status === 'verified'
         ? {
             digest: exactContentDigest ?? frozenVerification.targetDigest,
             handle: frozenVerification.resourceId,

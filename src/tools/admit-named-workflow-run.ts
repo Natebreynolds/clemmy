@@ -7,6 +7,7 @@
  * the host uniquely named platform-49-slack-channel-review, then the model
  * asked a check-in instead of dispatching.
  */
+import type { WorkflowChatDispatchPreparedReceipt } from '../execution/workflow-origin-group.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import {
   certifyWorkflow,
@@ -47,6 +48,7 @@ export interface AdmitNamedWorkflowRunResult {
   message: string;
   workflowName: string;
   runId?: string;
+  chatDispatchPreparation?: WorkflowChatDispatchPreparedReceipt;
 }
 
 export function admitNamedWorkflowRunFromAcceptedSource(
@@ -189,5 +191,6 @@ export function admitNamedWorkflowRunFromAcceptedSource(
       ? `Requested execution ${queued.id ?? "(not admitted)"} depends on verification ${verificationRunId}. It will execute only after that exact verification passes and this saved definition is enabled. Do not queue another run or do the work independently. ${queued.message}`
       : queued.message,
     ...(queued.id ? { runId: queued.id } : {}),
+    ...(queued.chatDispatchPreparation ? { chatDispatchPreparation: queued.chatDispatchPreparation } : {}),
   };
 }

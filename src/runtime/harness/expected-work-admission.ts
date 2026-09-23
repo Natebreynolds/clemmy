@@ -92,7 +92,7 @@ import {
 } from './host-capability-catalog-factory.js';
 import { proveFrozenMutationVerification } from './mutation-verification-proof.js';
 import { expectsHostLocalWorkspaceCompoundCommit } from './host-local-write-commit.js';
-import { proveNativeRevisionCommit } from './native-revision-commit-proof.js';
+import { proveNativeRevisionCommit, proveWorkflowDispatchCommit } from './native-revision-commit-proof.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
@@ -1041,6 +1041,10 @@ export function dischargedRequirementSettlements(
     // artifact write discharges only after a downstream exact-ID read, bound
     // to this same contract, proves the frozen content contract.
     if (row.effect_kind !== 'read') {
+      if (row.effect_kind === 'local_write' && proveWorkflowDispatchCommit({
+        ...contract.identity, acceptedTaskId: contract.acceptedTaskId, contractId: contract.contractId,
+        requirementId, logicalToolCallId: row.logical_tool_call_id,
+      }).status === 'verified') return true;
       if (row.effect_kind === 'local_write' && proveNativeRevisionCommit({
         sessionId: contract.identity.sessionId,
         sourceUserSeq: contract.identity.sourceUserSeq,

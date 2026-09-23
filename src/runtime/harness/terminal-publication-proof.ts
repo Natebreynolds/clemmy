@@ -1,3 +1,4 @@
+import { proveWorkflowDispatchCommitWithPorts } from './workflow-dispatch-commit.js';
 /**
  * Cycle-free final proof verifier for accepted-task terminal publication.
  *
@@ -1129,8 +1130,8 @@ function exactSealedNodeAuthority(input: {
 }
 
 /** Verify native artifact identity lineage using only this publication transaction. */
-function nativeIdentityDerivationInTransaction(db: Database.Database, input: RevisionProofInput): boolean {
-  const proof = proveNativeRevisionCommitWithPorts(input, {
+function nativeProofPortsInTransaction(db: Database.Database): import('./native-revision-proof-core.js').NativeRevisionProofPorts {
+  return {
     db,
     loadContract(identity) {
       const row = db.prepare(`SELECT * FROM accepted_task_work_contracts WHERE session_id=? AND source_user_seq=?`)
@@ -1162,7 +1163,10 @@ function nativeIdentityDerivationInTransaction(db: Database.Database, input: Rev
         outcomeKind: result.row.outcome_kind, toolName: result.row.logical_tool_name, rawPayload: result.raw } }
         : { status: 'unavailable', reason: result.reason };
     },
-  });
+  };
+}
+function nativeIdentityDerivationInTransaction(db: Database.Database, input: RevisionProofInput): boolean {
+  const proof = proveNativeRevisionCommitWithPorts(input, nativeProofPortsInTransaction(db));
   return proof.status === 'verified' && proof.identityLineageVerified;
 }
 
@@ -1537,6 +1541,7 @@ function verifyHostSealedWriteReceipt(input: {
       && input.transition.physical_dispatch_id !== receipt.physical_dispatch_id)
     || !digest64(receipt.intended_digest)
     || (input.node.contentCommitMode === 'documented_atomic_input'
+      || input.node.writeEvidenceMode === 'host_workflow_dispatch_v1'
       ? receipt.observed_digest !== null
       : receipt.observed_digest !== receipt.intended_digest)
   ) return { ok: false, status: 'conflict', reason: 'write transition and receipt identity disagree' };
@@ -1601,6 +1606,25 @@ function verifyHostSealedWriteReceipt(input: {
     logicalToolCallId: receipt.logical_tool_call_id,
   });
   if (!createResult.ok) return { ok: false, status: 'conflict', reason: createResult.reason };
+  if (input.node.writeEvidenceMode === 'host_workflow_dispatch_v1') {
+    const bound = input.db.prepare(`SELECT contract_id,requirement_id FROM expected_work_call_bindings
+      WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+      .get(input.sessionId,input.sourceUserSeq,input.acceptedTaskId,receipt.logical_tool_call_id) as
+      { contract_id: string; requirement_id: string } | undefined;
+    if (!bound || input.obligation !== 'commit_effect' || receipt.kind !== 'commit'
+      || input.node.effectKind !== 'local_write' || input.node.obligations.length !== 2
+      || !input.node.obligations.includes('execution_terminal')) {
+      return { ok: false, status: 'conflict', reason: 'workflow dispatch obligation is not exact' };
+    }
+    const proof = proveWorkflowDispatchCommitWithPorts({ ...input,
+      contractId: bound.contract_id, requirementId: bound.requirement_id,
+      logicalToolCallId: receipt.logical_tool_call_id,
+    }, nativeProofPortsInTransaction(input.db));
+    return proof.status === 'verified' && receipt.created_id === proof.runId
+      && receipt.handle === `workflow-run:${proof.runId}` && receipt.provider_receipt === proof.receiptDigest
+      && receipt.intended_digest === proof.preparationDigest && receipt.observed_digest === null
+      ? { ok: true } : { ok: false, status: 'conflict', reason: 'workflow dispatch preparation no longer redeems' };
+  }
   const frozenMutation = verifyFrozenMutationWriteReceipt({
     db: input.db,
     sessionId: input.sessionId,

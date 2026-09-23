@@ -1,11 +1,12 @@
+import { proveWorkflowDispatchCommitWithPorts } from './workflow-dispatch-commit.js';
 /** Runtime store adapters for the shared native revision verifier. */
 import { openEventLog } from './eventlog.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { loadSealedNodeBinding } from './host-capability-catalog-factory.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { proveNativeRevisionCommitWithPorts, type RevisionProofInput } from './native-revision-proof-core.js';
-export function proveNativeRevisionCommit(input: RevisionProofInput) {
-  return proveNativeRevisionCommitWithPorts(input, {
+function runtimePorts() {
+  return {
     db: openEventLog(),
     loadContract(identity) {
       const result = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
@@ -16,7 +17,13 @@ export function proveNativeRevisionCommit(input: RevisionProofInput) {
       const result = redeemSuccessfulSettlementResultForHost(identity);
       return result.status === 'ok' ? result : { status: 'unavailable', reason: result.reason };
     },
-  });
+  } satisfies import('./native-revision-proof-core.js').NativeRevisionProofPorts;
+}
+export function proveNativeRevisionCommit(input: RevisionProofInput) {
+  return proveNativeRevisionCommitWithPorts(input, runtimePorts());
+}
+export function proveWorkflowDispatchCommit(input: RevisionProofInput) {
+  return proveWorkflowDispatchCommitWithPorts(input, runtimePorts());
 }
 
 /** Reuse the execution proof for artifact identity dependencies. Content

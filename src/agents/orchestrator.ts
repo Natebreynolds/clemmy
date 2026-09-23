@@ -1,3 +1,4 @@
+import { declaresWorkflowDispatchReceipt } from '../runtime/harness/workflow-dispatch-commit.js';
 import { buildPlanStepResultTool } from '../tools/plan-step-result.js';
 import { markTurnClock } from '../runtime/harness/turn-clock.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
@@ -2152,7 +2153,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // effect boundary correctly prevents its direct invocation.
   const routesPlanBoundLocalCapabilityForTurn = (name: string): boolean => (
     routesPlanBoundLocalCapability(name)
-    && (name !== 'workflow_run' || planMode || taskMode?.kind === 'execute')
+    && (!declaresWorkflowDispatchReceipt(name) || planMode || taskMode?.kind === 'execute'
+      || durableSelectedLocalPlanningNames.has(name))
   );
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
@@ -3628,6 +3630,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const workCallBuiltinNames = new Set([
         ...actionBusinessNames,
         ...localPlanningCapabilityNames,
+        // A plan can select a currently configured coordinator later in this
+        // same model surface. Keep its carrier reachable before selection;
+        // the current graph binding still owns admission and once-cardinality.
+        ...[...policyAllowed].filter(name => isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)),
         // Keep context call_tool reads available; the second carrier is only a
         // potential Plan execution surface. Exact frozen read admission still
         // owns every selected invocation, including plans frozen later this turn.
@@ -3686,7 +3692,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             ? buildScopedLocalToolSearch(
                 searchableNames,
                 'work_call',
-                (name) => localPlanningCapabilityNames.has(name)
+                (name) => (localPlanningCapabilityNames.has(name)
+                  || (options.sessionId && Number.isSafeInteger(options.sourceUserSeq)
+                    && isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)
+                    && durableSelectedLocalPlanningCapabilityNames({ sessionId: options.sessionId,
+                      sourceUserSeq: options.sourceUserSeq as number,
+                      workCallConfiguredNames: workCallLocalSchemaNames }).has(name)))
                   ? 'work_call'
                   : actionTopologyRoleFor(name) === 'control' || isRegistryDeclaredRead(name)
                     ? 'call_tool'
@@ -3893,7 +3904,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ...actionScopedDiscoveryTools.map((toolRef) => (toolRef as { name?: string }).name ?? '')
         .filter((name) => name && !excludes.has(name)
           && (!explicitAllowed || explicitAllowed.has(name))
-          && isRegistryDeclaredNativePlanningRead(name) && workCallLocalSchemaNames.has(name)),
+          && isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)),
     ]);
     workCallOptions = {
       reachableBuiltinNames: workCallBuiltinNames,

@@ -151,3 +151,86 @@ change fingerprints. Prior production code fails both (15 pass/2 fail):
 /tmp/clem-native-resume-red.log. Candidate17/17 pass:
 /tmp/clem-native-resume-green.log. Typecheck passed in
 /tmp/clem-native-resume-types.log. Live acceptance of this correction remains owed.
+
+## Installed e5a continuation works; planned dispatch credit remains broken
+
+Clean e5a5db249 installed via Terminal recipe; fingerprint
+8932d887696e8178a72e128031daec54387d27375dc1a79a775361b82d45248a, dist
+5645aae2b6d9440af26f8f8db654711ea75dc6704e3927aa6dc07562f1de768b.
+Source288694 / sess-desktop-4e75067b604eb557067306b5 saved a tracked plan before
+workflow writes (first plan rejected for missing artifact lineage; second accepted
+at288733). Created, read back, enabled and dispatched fixture
+harness-plan-author-0923-e5a-plan once. Child1790166034397-885535 succeeded323.
+Parent resumed and read the actual result; no repeated surface-readmission failure.
+This supplies live evidence for the hint/fingerprint fix, NOT full acceptance.
+
+New class-level gap: saved graph includes run_once, but normal-mode discovery
+returns workflow_run as dispatch_now/call_tool (carrier_mismatch), and direct
+workflow_run288783 never binds that selected requirement. After child success,
+verify_run work_call refuses work_dependency_pending: run_once remains open with
+zero observed/settled instances. An unbound supplemental status read succeeds but
+cannot discharge the selected graph chain. Later direct disable was refused
+native_authoring_definition_unavailable. Request cancelled to cap repair spend;
+operator disabled exact named fixture. Neither cancellation nor cleanup is Clem
+completion. No speed/token win. Evidence output/harness-acceptance/2026-09-23-e5a5db249/.
+
+Next fix must join saved plan-selected workflow dispatch to the exact source,
+requirement and child-run receipt with once-only execution. Inspect normal-mode
+routesPlanBoundLocalCapabilityForTurn in src/agents/orchestrator.ts, direct
+coordinator dispatch in host-turn-runner, and workflow origin-group settlement.
+Do not generically mark success from prose, rerun the completed child to gain
+credit, remove dependency checks, or mutate the cancelled live graph. Pin a
+production plan→dispatch→parent-resume→verify→disable journey, including replay
+and wrong-source refusal, then fresh installed acceptance. Additional speed debt:
+trajectory steer about failed first plan arrived after corrected plan admission;
+retain as an investigation, not an established regression attribution.
+
+## Planned dispatch receipt candidate — source-level proof
+
+The next recording-model fixture reproduces the live failure: accepted plan
+run_once → verify_run → disable, actual queue preparation, durable handoff,
+parent rebuild/reopen and final publication. Before the routing correction,
+work_call refuses workflow_run as not_reachable. Once reachable it dispatches
+with an exact requirement binding, but run_once remains open: the old textual
+acknowledgement is not an invocation receipt. This is not a reason to weaken
+local-write artifact proof or mark child completion from a queue acknowledgement.
+
+Candidate changes: currently configured native planning capabilities remain
+reachable through work_call when a plan selects them during the same model
+surface; exact discovery rechecks durable selection after planning instead of
+returning an obsolete dispatch_now carrier. Policy exclusions remain in force.
+The native dispatcher returns the existing host queue-preparation receipt with
+its acknowledgement. A shared, cycle-free verifier binds that receipt to the
+exact accepted source, selected requirement, local host attestation, successful
+logical settlement and parented preparation event. The receipt's content address
+and event mirror must agree. This proves preparation only; it grants no child
+effect authority and does not prove completion of the workflow.
+
+Plan dependencies, issued write evidence, receipt redemption and transactional
+terminal publication all consume that same proof. The dispatch node owes a
+commit receipt and terminal invocation evidence; it is not treated as an authored
+document requiring content readback. Existing artifact/readback obligations for
+all other writes remain. Queue deduplication and group-seal ownership are reused;
+no alternative queue, manual success annotation, replay of a child or reset of
+live state.
+
+Production-path fixtures with JIT on/off reach a single terminal after reopening,
+verify the child result, disable the workflow and satisfy every saved plan step.
+They reject wrong source/step/call/contract and a changed preparation event, and
+terminal replay performs no model work and adds no dispatch. The child terminal
+record is controlled fixture data, NOT a claim that the installed runner executed
+it. Fresh installed lifecycle acceptance remains required.
+
+Validation: 31/31 adjacent checks (native plan integration, named workflow host
+dispatch, local carrier settlement, provider acknowledgement) in
+/tmp/clem-planned-dispatch-adjacent.log. Final added after-plan discovery assertions
+pass9/9 in /tmp/clem-dispatch-discovery-green.log. Replacing the two production
+surface files with unchanged e5a5db249 makes both new cases fail (7 pass/2 fail):
+/tmp/clem-dispatch-final-red.log. No live model task has been submitted for this
+candidate yet. Keep both failed live sources288556/288694 cancelled and do not
+rewrite their graphs or count operator fixture cleanup as acceptance.
+
+Trap: delegationPrimitive also marks native authoring tools; it is not a dispatch
+receipt class. A broad routing candidate using that flag broke Space/workflow
+authoring pins and was rejected before installation. The final predicate uses
+the explicit registered workflow-run output contract, shared with receipt proof.
