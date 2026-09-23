@@ -161,6 +161,11 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   // request must not inflate the chat strategy's proof, or the reverse.
   const existing = file.strategies.find((s) => scopeOf(s) === scope && overlapScore(keywords, s.keywords) >= 0.8);
   if (existing) {
+    // Close the write-before-learning-event crash window as well. Replaying
+    // the same proof does not turn one successful run into two observations.
+    if (isValidLearningReceipt(existing.learningReceipt, { target: 'strategy' })
+      && existing.learningReceipt.sessionId === input.learningReceipt.sessionId
+      && existing.learningReceipt.sourceId === input.learningReceipt.sourceId) return existing;
     const wasVerified = isValidLearningReceipt(existing.learningReceipt, { target: 'strategy' });
     existing.scope = scope;
     existing.objective = objective;

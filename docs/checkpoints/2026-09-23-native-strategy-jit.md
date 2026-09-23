@@ -57,3 +57,40 @@ checks29/29 pass in /tmp/clem-full-objective-green.log. These are distinct from
 the earlier47 set, not47+29 independent tests. No net-token win claimed before
 installed cold/warm measurement. The first candidate586cd1dfa was built but NOT
 hotpatched; installed app remainsa82108e5f until the combined candidate is built.
+
+## Installed635 cold trace: useful evidence, NOT full acceptance
+
+Clean63588620c installed via Terminal recipe; fingerprint
+faf696b89e0619e7db416c9ecfa39476687c22a1d464858c23abdaa499b5fa48,
+dist05cb2e879fc2546939714a8946abcdc15cffea4c8c577ae23a378f2e68a18c7b.
+Cold source288371 / sess-desktop-77c54913e4ce561ce06936f3 completed all workflow
+actions, run1790164326149-f6054a succeeded323, independent savedstate disabled,
+manualonly, sendsfalse, exactlyone run. Canonical terminal288539 is done, but
+its reply admits it never saved a formal tracked plan. No plan_task call exists.
+Thus this trace cannot prove the requested tracked-plan retention; do not count
+it as complete planned-task acceptance or use it as a clean speed comparison.
+Jev completion288535 chose done at confidence0.6 and replyMatchesReceipts0.61
+with coverageComplete=true. The completion path still needs analysis against
+process requirements as well as delivered effects. Do not invent phrase gates
+or silently force every ordinary task into a graph to address this.
+
+It DID exercise native learning: events288541 learned and288543 updated contain
+workflow_get/create/set_enabled/run/run_status. Stored keywords match full
+request with compact200-char preview. However those two events belong to ONE
+accepted source; uses2 is inflated. The cold trace independently demonstrates
+terminal replay invoking learning twice. No manual memory-counter correction.
+
+Candidate replay fix: host learning checks durable prior source-scoped learning
+before recording again (not a capped recent-events scan). Store also refuses to
+increment for the same latest session/source receipt, covering the write-before-
+event crash window. Original code fails both new replay pins in
+/tmp/clem-learning-replay-red.log; candidate22/22 checks pass in
+/tmp/clem-learning-replay-final.log. This prevents future replay inflation; it is
+not a retroactive reconstruction of old counts or global all-authority dedup.
+
+Live artifacts: output/harness-acceptance/2026-09-23-63588620c-cold/.
+79.951s,12calls,3searches,168677uncachedinput; exact attribution,1uncertifiedusage.
+These are measurements of the observed run, NOT an accepted warm-efficiency win.
+Warm request has NOT been submitted. App remains635 until next reviewed combined
+candidate; this replay correction is not installed acceptance yet. Resolve the
+tracked-plan proof gap and verify cold/warm source identity before claiming reuse.

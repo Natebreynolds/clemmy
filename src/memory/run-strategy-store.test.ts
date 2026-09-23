@@ -194,3 +194,13 @@ test('compact objective previews do not truncate the recall index or leave refre
   assert.equal(refreshed.id, record.id);
   assert.deepEqual(refreshed.keywords, strategyKeywords(refreshedObjective), 'new proof refreshes its exact recall index');
 });
+
+
+test('replaying the same learning receipt does not inflate successful uses', () => {
+  const input = { objective: 'observe nebula spectrum', toolsUsed: ['fixture_spectrum_read'],
+    workerCount: 0, durationMs: 1, learningReceipt: receipt('same-source-replay') };
+  const first = recordRunStrategy(input)!;
+  const replay = recordRunStrategy(input)!;
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.uses, first.uses);
+});

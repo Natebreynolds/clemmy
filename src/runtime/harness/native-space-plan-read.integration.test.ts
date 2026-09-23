@@ -735,6 +735,13 @@ test('a created workflow remains completed after its planned enable revision and
     row.learningReceipt?.sourceId === `${session.id}:${source.seq}`);
   assert.ok(learned, 'a verified native lifecycle must teach a reusable strategy');
   assert.deepEqual(learned.toolsUsed, ['workflow_create', 'workflow_set_enabled', 'workflow_get']);
+  const beforeReplay = learned.uses;
+  const replay = (await import('./host-run-strategy-learning.js')).learnHostRunStrategyForAcceptedTask(identity);
+  assert.equal(replay.status, 'replayed');
+  assert.equal(strategies.listVerifiedRunStrategies().find(row => row.id === learned.id)?.uses, beforeReplay);
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_strategy_learned'] })
+    .filter(row => row.data.sourceUserSeq === source.seq).length, 1);
+
   const warm = eventlog.createSession({ kind: 'chat' });
   const warmSource = eventlog.appendEvent({ sessionId: warm.id, turn: 1, role: 'user',
     type: 'user_input_received', data: { text: objective } });

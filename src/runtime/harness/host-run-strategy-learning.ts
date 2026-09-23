@@ -80,7 +80,13 @@ function deliverableForSource(input: { sessionId: string; sourceUserSeq: number 
 export function learnHostRunStrategyForAcceptedTask(input: {
   sessionId: string;
   sourceUserSeq: number;
-}): { status: 'learned' | 'updated' | 'not_proven'; reason?: string } {
+}): { status: 'learned' | 'updated' | 'replayed' | 'not_proven'; reason?: string } {
+  // Terminal delivery can be replayed after background handoff or restart.
+  // One accepted source is one learning observation, not another success.
+  const prior = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id=?
+    AND type='run_strategy_learned' AND json_extract(data_json, '$.sourceUserSeq')=? LIMIT 1`)
+    .get(input.sessionId, input.sourceUserSeq);
+  if (prior) return { status: 'replayed' };
   const objective = acceptedObjectiveForSource(input);
   if (!objective?.trim()) return { status: 'not_proven', reason: 'no accepted objective' };
   const toolsUsed = toolsUsedForSource(input);
