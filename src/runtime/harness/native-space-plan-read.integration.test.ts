@@ -679,4 +679,54 @@ test('a created workflow remains completed after its planned enable revision and
   } finally { writeFileSync(receiptPath, bytes); }
   eventlog.closeEventLog();
   assert.ok(lines().every(row => row.state === 'satisfied'), 'completion proof survives durable reopen without replay');
+  const terminal = terminalPreparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: 'The workflow was created, enabled, read back, disabled and verified disabled. It was not run.' });
+  assert.equal(terminal.status, 'ready', `completed lifecycle must also pass terminal proof: ${JSON.stringify(terminal)}`);
+  const state = obligationStore.loadManifestState(session.id, source.seq);
+  const expected = resolutionLedger.expectedTaskFor(session.id, source.seq);
+  assert.equal(state.status, 'ok'); assert.equal(expected.status, 'ok');
+  if (state.status !== 'ok' || expected.status !== 'ok') throw new Error('missing lifecycle terminal authority');
+  const db = eventlog.openEventLog();
+  const workContract = (await import('./expected-work-contract.js')).loadExpectedWorkContract(session.id, source.seq);
+  if (workContract.status !== 'ok') throw new Error('missing exact lifecycle work contract');
+  const verifyTerminal = () => terminalProof.verifyAcceptedTaskTerminalProofInTransaction({ db, ...identity,
+    acceptedTaskId: workContract.contract.acceptedTaskId, manifest: state.manifest });
+  assert.deepEqual(verifyTerminal(), { ok: true });
+  for (const id of ['enable', 'disable']) {
+    assert.ok(state.manifest.nodes.find(node => node.operationId === id)?.obligations.includes('derivation_from_current_source'),
+      'identity proof satisfies the existing obligation; the obligation is not removed');
+  }
+  try {
+    writeFileSync(receiptPath, Buffer.concat([bytes, Buffer.from('\n# Drift after evidence issuance\n')]));
+    assert.equal(verifyTerminal().ok, false, 'issued identity evidence must recheck current successor bytes');
+  } finally { writeFileSync(receiptPath, bytes); }
+  assert.deepEqual(verifyTerminal(), { ok: true });
+  // Counterexamples after receipt issuance must be caught by the transaction's
+  // own verifier, not merely by the earlier runtime preparation.
+  const corruptions = [
+    { table: 'accepted_task_work_contracts', set: "operation_count=operation_count+1" },
+    { table: 'accepted_task_authority', set: "work_contract_id='unrelated-contract'" },
+    { table: 'expected_work_call_bindings', set: "argument_digest='" + '0'.repeat(64) + "'", extra: " AND requirement_id='enable'" },
+  ];
+  for (const corruption of corruptions) {
+    db.exec('SAVEPOINT native_identity_terminal_counterexample');
+    try {
+      const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?")
+        .all(corruption.table) as Array<{ name: string }>;
+      for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      db.prepare(`UPDATE ${corruption.table} SET ${corruption.set} WHERE session_id=? AND source_user_seq=?${corruption.extra ?? ''}`)
+        .run(session.id, source.seq);
+      assert.equal(verifyTerminal().ok, false, `terminal must reject changed ${corruption.table}`);
+    } finally {
+      db.exec('ROLLBACK TO native_identity_terminal_counterexample');
+      db.exec('RELEASE native_identity_terminal_counterexample');
+    }
+    assert.deepEqual(verifyTerminal(), { ok: true }, 'restoring authority recovers without replay');
+  }
+  const committed = delivery.commitTurnOutcome({ version: 2, id: turnOutcomes.turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Created, enabled, then disabled and verified.' } });
+  assert.equal(committed.presentation.status, 'done');
+  assert.equal(model.calls(), 10, 'terminal proof adds no model round');
+  assert.equal((db.prepare(`SELECT count(*) AS n FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? AND mutating=1`).get(session.id, source.seq) as { n: number }).n, 3,
+    'receipt verification and publication must not replay any mutation');
 });

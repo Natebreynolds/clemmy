@@ -12,6 +12,9 @@
  * fails closed until its own normalized host receipt reaches this boundary.
  */
 import { createHash } from 'node:crypto';
+import { proveNativeRevisionCommitWithPorts, type RevisionProofInput } from './native-revision-proof-core.js';
+import { validateContractValue } from './expected-work-contract-value.js';
+import { canonicalWorkTopologyJson } from '../graph/work-topology.js';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
 import {
@@ -1125,6 +1128,44 @@ function exactSealedNodeAuthority(input: {
   };
 }
 
+/** Verify native artifact identity lineage using only this publication transaction. */
+function nativeIdentityDerivationInTransaction(db: Database.Database, input: RevisionProofInput): boolean {
+  const proof = proveNativeRevisionCommitWithPorts(input, {
+    db,
+    loadContract(identity) {
+      const row = db.prepare(`SELECT * FROM accepted_task_work_contracts WHERE session_id=? AND source_user_seq=?`)
+        .get(identity.sessionId, identity.sourceUserSeq) as Record<string, unknown> | undefined;
+      const authority = db.prepare(`SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?`)
+        .get(identity.sessionId, identity.sourceUserSeq) as Record<string, unknown> | undefined;
+      if (!row || !authority || authority.state === 'conflict') return null;
+      let parsed: unknown;
+      try { parsed = JSON.parse(String(row.contract_json)); } catch { return null; }
+      const contract = validateContractValue(parsed);
+      if (!contract || row.contract_json !== canonicalWorkTopologyJson(contract)
+        || row.contract_version !== contract.version || row.contract_id !== contract.contractId
+        || row.session_id !== contract.identity.sessionId || row.source_user_seq !== contract.identity.sourceUserSeq
+        || row.planner_source !== contract.plannerSource || row.operation_count !== contract.operations.length
+        || row.universe_count !== contract.universes.length || authority.work_contract_id !== contract.contractId) return null;
+      for (const [column, value] of Object.entries({ accepted_task_id: contract.acceptedTaskId,
+        graph_event_id: contract.graphEventId, graph_id: contract.graphId, graph_hash: contract.graphHash })) {
+        if (row[column] !== value || authority[column] !== value) return null;
+      }
+      return contract;
+    },
+    loadSelection(identity) {
+      const result = exactSealedNodeAuthority({ db, ...identity, nodeId: identity.requirementId, expectedEffect: 'local_write' });
+      return result.ok && result.logicalToolCallId === identity.logicalToolCallId ? result.binding : null;
+    },
+    redeem(identity) {
+      const result = exactSuccessfulResult({ db, ...identity });
+      return result.ok ? { status: 'ok', value: { executionSite: result.row.dispatch_execution_site ?? '',
+        outcomeKind: result.row.outcome_kind, toolName: result.row.logical_tool_name, rawPayload: result.raw } }
+        : { status: 'unavailable', reason: result.reason };
+    },
+  });
+  return proof.status === 'verified' && proof.identityLineageVerified;
+}
+
 function createdPayload(raw: unknown): {
   id?: string;
   handle?: string;
@@ -1597,6 +1638,14 @@ function verifyHostSealedWriteReceipt(input: {
       };
     }
     if (receipt.kind === 'derivation') {
+      const workBinding = input.db.prepare(`SELECT contract_id, requirement_id FROM expected_work_call_bindings
+        WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+        .get(input.sessionId, input.sourceUserSeq, input.acceptedTaskId, receipt.logical_tool_call_id) as
+        { contract_id: string; requirement_id: string } | undefined;
+      if (input.node.cardinality === undefined && !input.node.structuredCollectionLocator
+        && workBinding?.requirement_id === input.node.operationId
+        && nativeIdentityDerivationInTransaction(input.db, { ...input, contractId: workBinding.contract_id,
+          requirementId: workBinding.requirement_id, logicalToolCallId: receipt.logical_tool_call_id })) return { ok: true };
       const derivation = proveHostLocalWriteDerivation({
         db: input.db,
         sessionId: input.sessionId,

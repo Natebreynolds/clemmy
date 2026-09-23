@@ -1,3 +1,4 @@
+import { verifiedNativeIdentityDerivation } from './native-revision-commit-proof.js';
 import { deriveResultHandleFactsFromRaw, recordsAtRecordPath } from './result-facts.js';
 /**
  * Typed, host-issued evidence receipts.
@@ -1517,6 +1518,8 @@ function redeemHostWriteReceiptFacts(input: {
       return { ok: false, reason: 'local authoring commit receipt no longer matches its durable proof facts' };
     }
     if (input.kind === 'derivation') {
+      if (node && node.cardinality === undefined && !node.structuredCollectionLocator
+        && verifiedNativeIdentityDerivation({ ...input, operationId: node.operationId })) return { ok: true };
       const sources = verifyManifestDerivationSources({
         sessionId: input.sessionId,
         sourceUserSeq: input.sourceUserSeq,
@@ -1939,7 +1942,10 @@ export function issueHostWriteEvidenceForManifestNode(input: {
       ) {
         return { status: 'refused', reason: 'write has no exact documented atomic content acknowledgement' };
       }
-      if (node.obligations.includes('derivation_from_current_source')) {
+      const nativeIdentityDerivation = localCommit && node.cardinality === undefined && !node.structuredCollectionLocator
+        && verifiedNativeIdentityDerivation({ ...input, acceptedTaskId: manifestState.authority.accepted_task_id,
+          logicalToolCallId, operationId: node.operationId });
+      if (node.obligations.includes('derivation_from_current_source') && !nativeIdentityDerivation) {
         const sources = verifyManifestDerivationSources(input);
         if (!sources.ok) {
           return { status: 'refused', reason: `write derivation source proof failed: ${sources.reason}` };

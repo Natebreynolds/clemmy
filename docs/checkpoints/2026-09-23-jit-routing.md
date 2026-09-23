@@ -320,3 +320,72 @@ Final native regression rerun7/7 and backend typecheck passed. Candidate now
 proceeds to commit/build. Live installed source remains9ec240523; the proof fix
 has not yet been hotpatched or accepted. Full suite/journeys were not run on the
 loaded machine, and isolation sentinel was not performed with the live daemon.
+
+### Installed0bc follow-up: terminal gate still fails
+
+Source287735 completes all workflow actions and keeps create/enable/disable
+satisfied, including background continuation. Independent saved disabled state
+and exactly one completed run verified. Canonical terminal287939 is nevertheless
+blocked by content-derivation evidence required for artifact identity lineage.
+Evidence: output/harness-acceptance/2026-09-23-0bcbb8b7c/README.md.
+The production regression now extends through prepareAcceptedTaskTerminal;
+it fails with the exact live reason (manifest derivation names no upstream
+source evidence), /tmp/clem-lifecycle-terminal-red.log. This additional assertion
+is uncommitted and must pass before the next candidate. No new runtime change
+this acceptance turn; current installed0bc is NOT fully accepted. Do not weaken
+the terminal gate or count the brain's done reply as completion.
+
+### Terminal proof work in progress (do not hotpatch)
+
+Candidate now exposes identityLineageVerified from the exact native revision
+proof. Receipt issuance and ordinary redemption share verifiedNativeIdentityDerivation,
+which rechecks exact source/task/contract/operation and proof, and does not bypass
+structured content/count requirements. This makes prepareAcceptedTaskTerminal
+ready in the regression. The test now additionally verifies final publication,
+post-issuance file drift, actual commitTurnOutcome(done), and no extra model call
+or mutation. This final boundary still fails with Workspace-only derivation:
+/tmp/clem-terminal-publication2.log. The earlier publication log included a test
+setup mistake (wrong acceptedTaskId source); fixed by loading exact work contract.
+
+IMPORTANT architecture trap: terminal-publication-proof.ts is deliberately
+cycle-free and takes the existing database transaction. Importing native-revision-
+commit-proof there causes an eventlog/external-write-admission module cycle
+(/tmp/clem-terminal-publication3.log). That import was REMOVED, not papered over
+with a runtime callback or dynamic authority hook. Terminal source is unchanged.
+Next extract a cycle-free shared proof core accepting db and validated adapters;
+reuse terminal's exactSuccessfulResult/exactSealedNodeAuthority and preserve
+exact expected-work contract/address validation. Do not bypass the transaction
+boundary or duplicate a weaker identity check just to make publication green.
+
+18 affected content-derivation/created-payload/explicit-plan integration tests
+passed (/tmp/clem-terminal-affected.log), but final publication assertion remains
+RED. Current source changes are uncommitted and must not be built/hotpatched as
+an accepted fix. Installed app remains0bcbb8b7c, controlled fixture disabled.
+
+### Native lifecycle terminal proof: candidate regression green
+
+The previously red terminal boundary now shares a cycle-free native revision
+proof core with execution and receipt issuance/redemption. Publication supplies
+its existing transaction, exact sealed selection, exact successful result, and
+canonical contract/address/authority validation. No runtime store imports were
+added to the publication verifier. Pure contract value validation was extracted
+unchanged so the transaction checks the same normalized topology and address.
+Native identity lineage satisfies the existing derivation obligation; content
+and structured collection obligations retain their existing proof path.
+
+Production lifecycle fixture passes preparation, final proof, actual done
+publication, durable reopen, and post-issuance artifact drift rejection. Added
+negative cases corrupt contract metadata, authority contract identity, and the
+selected call argument binding; each refuses completion and recovers on rollback
+without another write or model turn. All7 native integration checks and59
+adjacent contract/publication/content-derivation/receipt/explicit-plan checks pass.
+Logs: /tmp/clem-cyclefree-native-negative.log, /tmp/clem-cyclefree-affected.log;
+backend typecheck /tmp/clem-cyclefree-types2.log passed; diff check passed.
+The isolation sentinel was NOT performed with the live daemon running. Full
+suite/journeys remain unqualified on the loaded machine. The previously attributed
+second DECLARED effect regression remains open, not silently counted as passing.
+
+Next: clean commit/build, Terminal hotpatch on idle installed app, exact build
+identity verification, and one controlled matched workflow lifecycle acceptance.
+Live installed0bc is still the failed terminal baseline until that rerun proves
+otherwise. Do not treat these isolated regressions as live acceptance or tag-ready.
