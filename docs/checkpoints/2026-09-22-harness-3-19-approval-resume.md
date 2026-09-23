@@ -89,3 +89,42 @@ and complete physical-settlement accounting remain owed as above.
 Memory trap: an SDK end callback need not repeat arguments, and callback success
 alone is not evidence of an admitted send. Use the paired start's original input;
 never reconstruct its message from a clipped event preview or unrelated end.
+
+## Continuation: fresh-process approval race
+
+Candidate `795ece4f7` built successfully at fingerprint
+`c855d16a879200afecc6cc853397d2bb552776cba36026fd7d5369b93dd3c53b`.
+It remains uninstalled. The remote tag is still absent and the shared UI routes
+are still being edited; the installed build remains `fcaa8754`.
+
+The existing duplicate-resolution pin calls resolve twice sequentially. The
+existing restart pin closes and reopens the database in the same process.
+Added a separate credential-free fixture that shuts the parent connection,
+starts two fresh processes, waits until both are ready, then releases both to
+resolve the same approval. A second pair of fresh processes claims that exact
+grant. All workers have deadlines and are reaped before fixture cleanup.
+
+Before correction, the exact grant claim failed twice with `database is locked`
+at approval-registry.ts's consumption UPDATE. Both deferred transactions can
+read an unconsumed approval, and one cannot upgrade its stale read snapshot to
+a writer after the other commits. The one-shot UPDATE prevents a duplicate
+winner, but the loser throws rather than returning the settled consumed state.
+
+All three registry read/consume transactions now use BEGIN IMMEDIATE through
+the existing transaction API. The writer reservation precedes the read, so a
+competing claimant reads the committed result. Exact card, lifetime, payload,
+and pending-action-owned checks remain intact. No generic retries, changed
+approval policy, provider conditions, or model calls were added.
+
+Verified after correction: 41/41 in approval-restart-race, approval-registry,
+approval-resume-source, approval-resume-continuation, and
+approval-replay-retirement.red. This includes both exact-card and session-claim
+fresh-process races. Typecheck passed. Evidence: `race-before.log`,
+`race-after.log`, `race-typecheck.log` in the candidate output directory.
+This is a grant-concurrency pin, not a real provider dispatch or mobile proof.
+Live canary and matched task usage remain owed.
+
+Memory trap: sequential duplicate calls and closing/reopening one connection do
+not exercise concurrent-process WAL read-to-write upgrades. Approval-consuming
+read/modify/write transactions need the writer reservation before the read; a
+conditional UPDATE alone prevents double consumption but not SQLITE_BUSY.
