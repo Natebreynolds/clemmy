@@ -453,3 +453,92 @@ Follow-up final combined checks85passed,0failed:
 also completed on the same runtime changes. Current main stille77215d00; installed
 still52ca6d67a. Next build combines removal of invented runtime shape requirements,
 mutation metric visibility, and precise native argument repair before consent.
+
+
+## Installed c2f9c45a8 — live preservation acceptance, remaining defects
+
+Hotpatched through the Terminal recipe after idle preflight and quitting the
+exact installed app. Build-info confirmed clean c2f9c45a88e4f7a1f8d9e571b8f0d2e0c1559503,
+fingerprint b8308e43f3a8f43366adc67fcc4c8ea2000d9d86d3bd6dd719692c712ce1b435.
+
+One accepted request source290761, session sess-desktop-6c454351ee3bdac42ac199ad;
+child1790177794627-5a42ec, source290824, step update_alpha. Canonical parent
+terminal290934 done; child290889 done; workflow terminalOutcome succeeded,
+needsAttention false. Independently read exact bytes Name,Value\nAlpha,2\nBeta,9\n.
+Exactly one child run, fixture workflow disabled, manual trigger, allowSends false.
+Evidence: output/harness-acceptance/2026-09-23-c2f9c45a8/ (accepted, build,
+workflow, child-run, runs, events, measurement, independent-verification).
+No business workflow or external send was exercised.
+
+Canonical certified source attribution:
+- Parent wall126588ms,7 top-level calls,0 discovery,330064 prompt,128800 cached,
+  3656 output. Opus5.5 x7; Grok4.3 x6; Jev1.13.0 x4; jev-latest x1.
+- Child wall38202ms,5 top-level calls,0 discovery,122739 prompt,60272 cached,
+  981 output. Haiku4.5 x7; Jev1.13.0 x2; Grok4.3 x2.
+Prior52 candidate: parent142603ms/11calls/3discovery/416407prompt;
+child64219ms/6calls/1discovery/199141prompt. Same prompt shape, fresh fixture,
+different trajectories and cache: descriptive single pair, not causal benchmark.
+Child wall nests inside parent; do not add walls. Worker did not test GPT6Sol.
+
+Remaining framework defects, do not claim clean release:
+1. Authoring first refused allowSends:false (290793), misreading the negative
+   instruction "do not use external tools or send messages" as a sending step.
+   Retry omitted that field; saved definition still resolves allowSends:false.
+   Advisory also incorrectly labels this local write as SEND and asks for output
+   details already in the saved instructions. UI proof reports needs_info despite
+   the independently verified successful execution. Pin at class boundary; do
+   not rewrite the user's fixture instructions to work around it.
+2. Native structural repair fired (290845) with current schema, but subsequent
+   valid write was refused as sibling_frame_replanned_before_dispatch (290848),
+   surfaced as coverage_missing (290850), then worker called workspace_roots.
+   No broad search or shell call, eventual one correct write and verified readback.
+   Single-call recording tests did not prove this actual frame-recovery path.
+3. Desktop Facebook toast route remains unresolved in UI-owned files. Current
+   focusDesktopNotificationRoute pushes /inbox while BrowserRouter uses /console;
+   rebuild packaged shell and test real native click after ownership clearance.
+   Daemon hotpatch cannot repair app.asar. No desktop source was modified.
+
+This receipt is a docs-only working-tree update after the built commit. Installed
+runtime remains exact c2f9c45a8. Build again after any future commit before patching.
+Full-suite, physical mobile, notification-click and broader release gates remain
+owed; no tag, main merge, or provider-wide acceptance claimed.
+
+
+## Follow-up: typed send gate and explicit omitted native defaults
+
+Three red tests reproduced send-gate defects: a declared local write was refused
+for prohibition prose; an unrelated step's approval exempted an actual send;
+and a structured send with quiet prose escaped this authoring gate. The check
+now uses the shared step effect classifier and the sending step's own gate.
+Exact operation effect remains stronger than stale read metadata. Legacy
+unspecified-step inference remains; no new keyword or provider rule was added.
+59 enforcement tests passed. This does NOT remove the separate prose coherence
+advisory or fix the workflow proof card's inferred-output demands.
+
+Corrected diagnosis of the live write retry: sibling_frame_replanned_before_dispatch
+is a generic release label, not evidence of multiple sibling writes. Reproducing
+the live omitted mode/append shape with a recording production host failed:
+the local mode matcher recognized explicit create/null but not omitted mode.
+The existing nullable materializer did not solve it (mode is optional in the
+current native schema); that attempted change was removed. The registry now
+explicitly declares omittedEquivalentToRequired for the actual create default.
+Generic validation requires the field to be optional in the current schema,
+normalization/fingerprints retain the declaration, and matching never infers
+omission equivalence from null. No argument bytes or accepted digests are changed.
+A future-tool matrix rejects missing required fields, undeclared defaults, null
+and overwrite; production host default recovery writes exactly once without
+search or shell, alongside the original direct and call_tool repair cases.
+Live updating an existing file still requires the correct overwrite mode; this
+fix must not silently convert the safe create default into overwrite.
+
+Logs: /tmp/clem-typed-send-gate-red.log (3fail),
+/tmp/clem-native-defaults-red.log (1fail),
+/tmp/clem-send-native-declared-default-green.log (86pass).
+Installed app remains c2f9c45a8; these changes still require build and live acceptance.
+No paid generative provider was used for these recording-model tests. Live-home
+isolation sentinel was NOT PERFORMED because the running daemon owns that home;
+unit checks are not installed-app acceptance. Main and desktop/UI files untouched.
+
+Final adjacent checks29passed (catalog/send authority and future-default matrix),
+/tmp/clem-send-native-adjacent.log. Typecheck passed:
+/tmp/clem-send-native-final-typecheck.log. No full-suite claim.

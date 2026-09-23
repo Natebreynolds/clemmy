@@ -754,7 +754,7 @@ test('an authored native write gets its current schema before consent when requi
   assert.equal(reviews, 0, 'structural repair does not pay for semantic review');
 });
 
-for (const repairedCarrier of ['direct', 'call_tool'] as const) {
+for (const repairedCarrier of ['direct', 'call_tool', 'direct-defaults'] as const) {
 test(`real workflow host repairs an off-surface native call through ${repairedCarrier} without discovery`, async () => {
   const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
   const target = path.join(TEST_HOME, 'workspace', `schema-repaired-report-${repairedCarrier}.md`);
@@ -768,7 +768,9 @@ test(`real workflow host repairs an off-surface native call through ${repairedCa
   });
   const model = stubModel([
     [toolCall('wrong-native-fields', 'write_file', { path: target, data: 'Prepared.\n' })],
-    [repairedCarrier === 'direct'
+    [repairedCarrier === 'direct-defaults'
+      ? toolCall('repaired-native-fields', 'write_file', { path: target, content: 'Prepared.\n' })
+      : repairedCarrier === 'direct'
       ? toolCall('repaired-native-fields', 'write_file', { path: target, content: 'Prepared.\n', mode: 'create', append: null })
       : toolCall('repaired-native-fields', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ path: target, content: 'Prepared.\n', mode: 'create', append: null }) })],
     [textMsg('Prepared.')],

@@ -313,18 +313,15 @@ export function workflowNeedsCreationTest(def: WorkflowDefinition): boolean {
   return (def.steps ?? []).some((s) => stepIsTestableRead(s));
 }
 
-function hasEnforcedApprovalGate(def: WorkflowDefinition): boolean {
-  return def.steps.some(
-    (s) => s.requiresApproval === true || (s as { requires_approval?: boolean }).requires_approval === true,
-  );
-}
-
 /**
  * Author/enable-time send-gate check. AUTONOMOUS-BY-DEFAULT (CHANGE 3,
  * 2026-06): approval gates are OPT-IN via `requiresApproval: true` on a step;
  * an enabled workflow with send steps and no gate saves cleanly. Strict mode
- * is `allowSends: false` at the workflow root — then any send-looking step
- * without a gate REFUSES the save. (Runtime safety is independent of this
+ * is `allowSends: false` at the workflow root — then any classified send step
+ * without its own gate REFUSES the save. Classification shares the execution
+ * contract: exact operation identity, authored effect, then legacy inference
+ * for unspecified steps. Prose cannot override an authored local write merely
+ * because it mentions prohibited sends. (Runtime safety is independent of this
  * authoring check: the verified-sender constraint gate and the grounding gate
  * still run on every actual send, and a declarative gate on a send-class step
  * is never auto-approved on unattended scheduled runs.)
@@ -336,11 +333,12 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
   const allowSends = def.allowSends !== false; // default: true (allow autonomous sends)
 
   if (!def.enabled) return [];
-  if (hasEnforcedApprovalGate(def)) return [];
   if (allowSends) return []; // Approval gates are now optional
 
   // Only block if user explicitly set allowSends: false
-  const offending = def.steps.find((s) => stepLooksLikeIrreversibleSend(s.prompt ?? ''));
+  const offending = def.steps.find((s) => classifyStepSideEffect(s) === 'send'
+    && s.requiresApproval !== true
+    && (s as { requires_approval?: boolean }).requires_approval !== true);
   if (!offending) return [];
 
   const snippet = (offending.prompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 100);
