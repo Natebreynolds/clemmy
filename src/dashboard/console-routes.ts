@@ -15711,7 +15711,7 @@ export function registerConsoleRoutes(
           //      otherwise the "Codex" brain resolves to (and the router sends it to)
           //      the BYO endpoint, or codexSafePrimary pins it to the gpt-5.4 fallback
           //      forever. A valid gpt-5.x slot is left exactly as-is.
-          const wantedPrimary = /^gpt-5/i.test(brainModelId) ? brainModelId : '';
+          const wantedPrimary = brainModelId && resolveProvider(brainModelId) === 'codex' ? brainModelId : '';
           for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
             const cur = (getRuntimeEnv(key, '') || '').trim();
             const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
