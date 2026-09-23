@@ -13712,6 +13712,58 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Today on Home: the calendar watch's last read of the next day, projected
+  // (dashboard/home-today.ts). No provider call and no model call.
+  app.get('/api/console/home/today', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { calendarWatchStatus, loadCalendarWatchState } = await import('../agents/calendar-watch-runtime.js');
+      const { projectHomeToday } = await import('./home-today.js');
+      const status = calendarWatchStatus();
+      res.json(projectHomeToday({
+        state: loadCalendarWatchState(),
+        connectedOperations: status.connectedOperations,
+        ...(status.nextTickAt ? { nextTickAt: status.nextTickAt } : {}),
+        nowMs: Date.now(),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Summaries of the Spaces on Home, from the same projection the phone uses
+  // (dashboard/home-space-summary.ts). Read-only; nothing is refreshed.
+  app.get('/api/console/home/space-summaries', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const raw = typeof req.query.ids === 'string' ? req.query.ids : '';
+      const ids = [...new Set(raw.split(',').map((id) => id.trim()).filter(Boolean))].slice(0, 32);
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      const { readData } = await import('../spaces/data-store.js');
+      const { summarizeSpaceForHome } = await import('./home-space-summary.js');
+      const summaries = ids.flatMap((id) => {
+        if (!isValidSpaceSlug(id)) return [];
+        const record = spaceStore.get(id);
+        if (!record || record.status === 'archived') return [];
+        const health = spaceStore.health(id);
+        let data: unknown = null;
+        try { data = readData(id); } catch { data = null; }
+        return [summarizeSpaceForHome({
+          id,
+          title: record.title,
+          objective: record.contract?.objective ?? null,
+          lastRefreshedAt: record.lastRefreshedAt ?? null,
+          freshness: health?.freshness.state ?? 'unknown',
+          issues: health?.issues ?? [],
+          data,
+        })];
+      });
+      res.json({ summaries });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/home/command-center', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

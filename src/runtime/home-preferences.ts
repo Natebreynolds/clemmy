@@ -22,6 +22,7 @@ export type HomeLanding = 'home' | 'last_conversation' | 'current_project';
 export const HOME_PANE_IDS = [
   'quick_actions',
   'needs_you',
+  'today',
   'running',
   'while_away',
   'made',
@@ -37,8 +38,19 @@ export interface QuickAction {
   value: string;
 }
 
+/** How Home is arranged: decisions first (briefing) or a tile grid (dashboard). */
+export type HomeStyle = 'briefing' | 'dashboard';
+/** The header that shows Clem at work: moving, still, or not shown. */
+export type HomeLiveStatus = 'animated' | 'still' | 'off';
+/** How one Space shows on Home: its summary, or its full page. */
+export type HomeSpaceView = 'summary' | 'full';
+
 export interface HomePreferences {
   landing: HomeLanding;
+  style: HomeStyle;
+  liveStatus: HomeLiveStatus;
+  /** Space id → how it shows on Home. A Space not named here shows its summary. */
+  spaceViews: Record<string, HomeSpaceView>;
   panes: { order: HomePaneId[]; hidden: HomePaneId[] };
   nav: { pinned: string[]; shown: string[]; more: string[] };
   quickActions: QuickAction[];
@@ -50,7 +62,10 @@ const PREFS_FILE = path.join(BASE_DIR, 'state', 'home-preferences.json');
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',
-  panes: { order: ['needs_you', 'running', 'while_away', 'made', 'projects', 'quick_actions'], hidden: ['workstate'] },
+  style: 'dashboard',
+  liveStatus: 'animated',
+  spaceViews: {},
+  panes: { order: ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions'], hidden: ['workstate'] },
   nav: {
     // Chat is the main feature; it is pinned, not folded. Spaces (/workspaces)
     // keep the product name the phone already uses.
@@ -64,6 +79,20 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
 };
 
 const LANDINGS = new Set<HomeLanding>(['home', 'last_conversation', 'current_project']);
+const STYLES = new Set<HomeStyle>(['briefing', 'dashboard']);
+const LIVE_STATUSES = new Set<HomeLiveStatus>(['animated', 'still', 'off']);
+const MAX_SPACE_VIEWS = 128;
+
+function spaceViewMap(input: unknown): Record<string, HomeSpaceView> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out: Record<string, HomeSpaceView> = {};
+  for (const [id, view] of Object.entries(input as Record<string, unknown>)) {
+    if (Object.keys(out).length >= MAX_SPACE_VIEWS) break;
+    const key = id.trim().slice(0, 120);
+    if (key && (view === 'summary' || view === 'full')) out[key] = view;
+  }
+  return out;
+}
 const PANE_SET = new Set<string>(HOME_PANE_IDS);
 const MAX_LIST = 64;
 const MAX_QUICK_ACTIONS = 24;
@@ -133,6 +162,11 @@ export function normalizeHomePreferences(input: RawPrefs = {}): HomePreferences 
   const hidden = 'hidden' in panes ? paneList(panes.hidden) : d.panes.hidden;
   return {
     landing,
+    style: typeof input.style === 'string' && STYLES.has(input.style as HomeStyle) ? (input.style as HomeStyle) : d.style,
+    liveStatus: typeof input.liveStatus === 'string' && LIVE_STATUSES.has(input.liveStatus as HomeLiveStatus)
+      ? (input.liveStatus as HomeLiveStatus)
+      : d.liveStatus,
+    spaceViews: 'spaceViews' in input ? spaceViewMap(input.spaceViews) : d.spaceViews,
     panes: { order, hidden },
     nav: {
       pinned: navUnchangedFromLegacyDefault(nav) ? d.nav.pinned : 'pinned' in nav ? stringList(nav.pinned) : d.nav.pinned,

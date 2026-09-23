@@ -103,7 +103,7 @@ test('the shipped default puts work first and the two "talk to Clem" blocks last
   // sheet displays, rather than by the renderer overruling that order.
   assert.deepEqual(
     homeBlocks(visiblePanes(DEFAULT_HOME_PREFERENCES)),
-    ['needs_you', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
 });
 
@@ -149,7 +149,7 @@ test('the daemon\'s chips-first default is re-expressed as the chips-last defaul
   assert.deepEqual(migrated.panes.order, DEFAULT_HOME_PANE_ORDER);
   assert.deepEqual(
     homeBlocks(visiblePanes(migrated)),
-    ['needs_you', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
   const withMade = migrateHomePreferences(prefs(['quick_actions', 'needs_you', 'running', 'while_away', 'made', 'projects']));
   assert.deepEqual(withMade.panes.order, DEFAULT_HOME_PANE_ORDER);
@@ -174,7 +174,8 @@ test('a saved order that still names the retired Running pane keeps every other 
     ...DEFAULT_HOME_PREFERENCES,
     panes: { order: ['projects', 'running', 'quick_actions', 'needs_you', 'while_away', 'made', 'workstate'], hidden: ['made'] },
   };
-  assert.deepEqual(visiblePanes(saved), ['projects', 'quick_actions', 'needs_you', 'while_away', 'workstate']);
+  // Today is new: a saved order that predates it gets it at the end.
+  assert.deepEqual(visiblePanes(saved), ['projects', 'quick_actions', 'needs_you', 'while_away', 'workstate', 'today']);
   assert.equal(saved.panes.order.includes('running'), true, 'the stored order itself is untouched');
 });
 
