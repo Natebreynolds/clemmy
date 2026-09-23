@@ -466,3 +466,50 @@ native integration15/15 passes (/tmp/clem-direct-planned-dispatch-final.log).
 Full suite remains unqualified on the loaded machine. Live home is never reset;
 fixture tests use explicit mkdtemp homes, with the live-daemon sentinel reporting
 NOT PERFORMED rather than certifying isolation while that daemon is active.
+
+
+## Installed51333: retained plan and recovery accepted
+
+Installed clean51333b27c, fingerprint90e7441cd7f3d9afee76570e6d5ffc6a24f6b23594cfead5ba2f67917560e57e.
+Source289432/session sess-desktop-c73f16f4511ee796ad807db4 completed at289616.
+Actual Opus5.5 repaired its first plan submission, then retained the accepted
+seven-operation graph through deliberately invalid aggregate creation, corrected
+creation, readback, enable, DIRECT native workflow_run, parent handoff/resume,
+result verification, disable and final readback. Child1790170425477-e214b5 is the
+only run and returned [{multiplicand:17,multiplier:19,product:323}]. Independent
+installed API confirms enabled=false, manual-only, allowSends=false. No operator
+cancellation or cleanup. Installed terminal proof independently returns ok and
+all7 plan lines satisfied; retained74e Opus/Sol proofs still pass without model
+or business calls. One learned strategy event289618 contains all5 native tools.
+
+Canonical measurement:111961ms,10 top-level calls,zero discovery/search.538607
+prompt/301109 cached/237498 uncached input/8485 output tokens.26 usage records:
+12Opus5.5,7Grok4.3,6Jev1.13,1Jevlatest; exact attribution certified, ONE usage
+record has uncertified tokens. This deliberate recovery case is not a matched
+speed benchmark. Evidence: output/harness-acceptance/2026-09-23-51333b27c/
+{build,workflow,runs,run-detail,events,measurement,installed-proof}.json.
+
+Accounting trap found live: the direct invocation was executed correctly but a
+hook received tool=work_call paired with the authored native args {name:fixture}.
+Carrier unwrapping therefore labeled the effective tool with the WORKFLOW name.
+Do not rewrite historical events; the saved measurement retains this defect.
+The candidate pairs the effective carrier with its actual carrier arguments for
+lifecycle notifications only, preserving authored history, invocation and proof.
+Production recording-model dispatch tests now attach real event-log hooks and
+assert both lifecycle identities plus unchanged authored call history. On
+unchanged51333,4 pass/2 direct variants fail (/tmp/clem-carrier-accounting-red.log).
+With the correction6/6 pass (/tmp/clem-carrier-accounting-green.log). No provider
+quota spent. Live acceptance of this accounting correction remains owed.
+
+Skipped: full suite on loaded machine, physical mobile, release installer parity,
+and matched successful Sol recovery repetition. These remain release work; this
+successful native lifecycle is not blanket tag readiness. Next efficiency work
+must preserve the accepted graph and proof while shrinking repeated schemas;
+it must not delete objective, constraints or unfinished work to lower tokens.
+
+Completion review289586 used actual Grok4.3 and fulfills=true with named
+receipts; Jev rejected completion at the partial handoff. This was not a
+failed-open reviewer success. Typecheck passes for the accounting correction
+(/tmp/clem-carrier-accounting-types.log).
+Adjacent native integration, lifecycle hooks and tool-effect checks77/77 pass
+(/tmp/clem-carrier-accounting-adjacent.log). Full suite is still unqualified.

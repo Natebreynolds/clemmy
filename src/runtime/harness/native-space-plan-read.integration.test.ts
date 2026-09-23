@@ -891,11 +891,23 @@ for (const toolJit of [true, false]) for (const directCall of ['work_call', 'dir
   const agent = await buildOrchestratorAgent({ ...identity, userInput: objective, hostFreshPlanning: primed.planning,
     allowedToolNames: ['workflow_run', 'workflow_run_status', 'workflow_set_enabled', 'tool_search'], allowToolJit: toolJit,
     mcpToolScope: { authority: 'none', reason: 'Local planned dispatch fixture', allowedServerSlugs: [], maxTools: 0 }, model: model as never });
+  const lifecycleRunner = throwingRunner();
+  const { attachEventLogHooks } = await import('./hooks.js');
+  const detachLifecycle = attachEventLogHooks(lifecycleRunner, { getSessionId: () => session.id });
   const outcome = await brackets.withHarnessRunContext({ ...identity, runAttemptId: attempt.attemptId,
     counter: new brackets.ToolCallsCounter(9), behaviorScopeId: `${session.id}::source:${source.seq}` },
-    () => hostRunRunner(throwingRunner() as never, agent as never,
+    () => hostRunRunner(lifecycleRunner as never, agent as never,
       [{ type: 'message', role: 'user', content: objective }] as never,
       { maxTurns: toolJit ? 4 : 7, hostTurnEngine: 'host_v1', context: identity } as never));
+  detachLifecycle();
+  const dispatchEvents = eventlog.listEvents(session.id, { types: ['tool_called', 'tool_returned'] })
+    .filter(row => row.data.accounting === 'top_level' && row.data.callId === 'dispatch-selected-run');
+  assert.equal(dispatchEvents.length, 2);
+  for (const row of dispatchEvents) assert.equal(row.data.effectiveTool, 'workflow_run', 'carrier accounting must describe the operation, never a workflow name');
+  const authoredCall = (outcome.history as Array<{type?: string; callId?: string; name?: string; arguments?: string}>)
+    .find(row => row.type === 'function_call' && row.callId === 'dispatch-selected-run');
+  assert.equal(authoredCall?.name, directCall === 'direct' ? 'workflow_run' : directCall);
+  if (directCall === 'direct') assert.deepEqual(JSON.parse(authoredCall!.arguments!), {name, inputs:'{}'});
   assert.equal(JSON.parse(historyResult(outcome.history as unknown[], 'dispatch-plan')).ok, true, historyResult(outcome.history as unknown[], 'dispatch-plan'));
   const discovered = JSON.parse(historyResult(outcome.history as unknown[], 'dispatch-resolve-selected'));
   assert.equal(discovered.results.find((row: { name: string }) => row.name === 'workflow_run')?.carrier, 'work_call', JSON.stringify(discovered));

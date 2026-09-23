@@ -5917,6 +5917,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       arguments: argumentsJson,
     };
     const details = { toolCall: toolCallItem };
+    // Lifecycle hooks receive the effective carrier and its payload together.
+    // Keep authored history/identity unchanged: pairing work_call with native
+    // arguments would mistake a resource's `name` for the executed tool name.
+    const lifecycleDetails = offSurfaceCarry
+      ? { toolCall: { ...toolCallItem, name: offSurfaceCarry.carrierName, arguments: invokeArgumentsJson } }
+      : details;
     const inputGuardrail = !canaryRefusal && tool && parsedArguments
       ? await runToolInputGuardrails({
           guardrails: tool.inputGuardrails as never,
@@ -5925,7 +5931,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           toolCall: toolCallItem as never,
         })
       : { type: 'allow' as const };
-    emit('agent_tool_start', runContext, agent, tool ?? { name: call.name }, details);
+    emit('agent_tool_start', runContext, agent, tool ?? { name: call.name }, lifecycleDetails);
     let output: unknown;
     let hostRefusal: string | undefined;
     let returnedPreDispatchRefusal = false;
@@ -6346,7 +6352,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     const text = resultText(output);
     if (!hostRefusal && returnedPreDispatchRefusal) hostRefusal = text;
-    emit('agent_tool_end', runContext, agent, tool ?? { name: call.name }, text, details);
+    emit('agent_tool_end', runContext, agent, tool ?? { name: call.name }, text, lifecycleDetails);
     // THE STEER CHANNEL. Host-computed from the ledger the harness already
     // keeps; carries no authority; fires at most once per accepted source.
     // Never allowed to fail a turn — a steer that throws would trade a slow
