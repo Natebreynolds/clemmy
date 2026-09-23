@@ -146,3 +146,61 @@ recording-model variants, scoped/local discovery and action-control contracts.
 Typecheck passed. Isolation sentinel was not performed while daemon82711 owned
 the live home. The candidate now proceeds to its required post-commit build;
 no live or token-efficiency acceptance is inferred from these unit results.
+
+## Learned-tool and long-horizon follow-up
+
+Owner priority: preserve the existing framework, use learned bindings before
+first brain inference, and control per-call growth without losing the goal,
+constraints, approved plan, unresolved work, or retrievable evidence. Plan to
+execution and workflow author/enable/run/readback/disable remain live gates.
+
+The existing host path already prepares proven operations before capability
+construction. It bypasses Jev for a single lexical strategy or equivalent tool
+sets and invokes Jev for ambiguous or staged candidates. Do not re-enable the
+obsolete host capability hunt. Open concern: guidance clips cached schemas at
+1,800 characters; the clipping can omit contract fields. No schema policy was
+changed in this increment, and no efficiency improvement is claimed.
+
+Fixed exact discovery of an already loaded first-class tool: the scoped search
+set now includes visible first-class names, independently of deferred catalog
+and execution authority. The production worker-schema test failed with an
+explicit run_worker request before the fix and passes with it. Learned guidance
+also now contributes its own provenOperation prompt-component estimate. A
+production runTurn filter test verifies measurement and retained guidance after
+compaction. This is attribution, not token reduction.
+
+Compaction tests initially returned 34 pass / 4 fail. Reproduced all four named
+failures at unchanged d8807b834 in /tmp/clem-context-head-0923 and last tag
+8c11aa3c0 in /private/tmp/clem-last-tag-0922:
+- inFlightCompactionThresholds — a caching wire scales, a non-caching wire does not
+- summarizeOlderMessages — preserves compaction summaries instead of re-summarizing recall maps
+- pressure collapse keeps parallel and sequential identical-result frames valid and retains the newest pair
+- Layer 2 preserves complete tool arguments and results outside its prose summarization
+
+These were fixture drift: automatic caching uses stable checkpoints without
+larger thresholds; three small inputs produced token-expanding replacements
+which production correctly rejected. Fixtures now exercise actual savings while
+retaining exact evidence, recall-map, parallel-protocol and newest-result
+assertions. Added an explicit regression requiring both tool compaction and
+prose summarization to reject larger replacements. No compaction policy changed.
+
+Validation: 61/61 combined compaction, proven-operation and production discovery
+checks; 1/1 added nonexpansion regression; 1/1 runTurn measurement/compaction pin;
+backend typecheck and diff whitespace check passed. Logs:
+/tmp/clem-{context-final,context-nonexpansion,proven-meter,context-types}-0923.log.
+Historical attribution logs: /tmp/clem-compaction-{head,tag}-0923.log.
+Live-home isolation sentinel was not performed because daemon6402 owns the home.
+These are isolated fixture checks, not installed-app acceptance.
+
+Current main e77215d00 is an ancestor of our candidate. Owner/UI changes remain
+untouched. Installed source remains d8807b834 until the next coordinated build
+and hotpatch; do not attribute these new checks to installed bytes. The broader
+release gates, live matched performance and long-horizon acceptance remain owed.
+
+Plan follow-up: explicit-plan-execute integration and plan-continuity suites
+passed 33/33 using recording/stub models. These cover prepared reads, approved
+execution, repeated member read/write results across reopen, terminal proof,
+source identity, and pending input continuity. Log:
+/tmp/clem-plan-continuity-0923.log. Live build-info rechecked d8807b834,
+fingerprint3123a52f5d0ae6593d35ee7b99f9891a0842386f6b76850cebe1bf16c185c8fc,
+daemon6402. No new live acceptance or model-cost claim.

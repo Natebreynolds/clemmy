@@ -2795,6 +2795,7 @@ test('runTurn compacts oversized same-turn tool results only in model-facing inp
       agent: makeAgentStub(),
       sessionId: sess.id,
       input: 'research these ten targets',
+      provenOperationText: '[PROVEN OPERATION] Use the validated research.target contract.',
       makeRunner: makeRunnerStub,
       runRunner,
     });
@@ -2817,6 +2818,10 @@ test('runTurn compacts oversized same-turn tool results only in model-facing inp
   assert.ok((observedPromptComponents?.history ?? 0) > 0);
   assert.ok((observedPromptComponents?.instructions ?? 0) > 0);
   assert.ok((observedPromptComponents?.contextPacket ?? 0) > 0);
+  assert.ok((observedPromptComponents?.provenOperation ?? 0) > 0,
+    'learned-tool guidance must be included in the per-call prompt breakdown');
+  assert.match(modelJson, /Use the validated research\.target contract/,
+    'measurement must preserve learned-tool guidance through compaction');
   const event = listEvents(sess.id, { types: ['condenser_applied'] })
     .find((row) => row.data.inFlight === true);
   assert.ok(event, 'same-turn compaction should be visible in harness telemetry');

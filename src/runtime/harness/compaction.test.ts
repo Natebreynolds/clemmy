@@ -319,7 +319,7 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
   // registry did, which is how a test keeps a measurable error alive. The
   // genuinely non-caching wires stay, and the 2026-09-01 first-byte timeout
   // they protect is untouched.
-  for (const id of ['glm-5.2', 'gpt-5.6', 'kimi-k3']) {
+  for (const id of ['glm-5.2', 'kimi-k3']) {
     assert.equal(inFlightPromptCacheScale(id), 1, `${id} caches nothing — stay absolute`);
     assert.deepEqual(inFlightCompactionThresholds(() => undefined, id), {
       resultTriggerTokens: 32_000,
@@ -329,6 +329,17 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
       checkpointed: false,
     }, `${id} must keep the absolute thresholds byte-identically`);
   }
+
+  // Automatic caching keeps the absolute budget but freezes checkpoint
+  // prefixes. It does not need explicit provider cache markers to benefit.
+  assert.equal(inFlightPromptCacheScale('gpt-5.6'), 1);
+  assert.deepEqual(inFlightCompactionThresholds(() => undefined, 'gpt-5.6'), {
+    resultTriggerTokens: 32_000,
+    retainedResultBudgetTokens: 20_000,
+    minRetainPairs: 3,
+    maxRetainPairs: 8,
+    checkpointed: true,
+  });
 
   // Sonnet 5 caches from 2048 tokens on a 1M window. Collapsing its prefix
   // rewrites what the provider already cached: live 2026-09-03 the collapse
@@ -694,7 +705,7 @@ test('summarizeOlderMessages — preserves compaction summaries instead of re-su
     const items = [
       userMessage('original request'),
       collapsedToolSummary,
-      assistantMessage('The draft still needs final review.'),
+      assistantMessage('The draft still needs final review. ' + 'The review remains pending and no final delivery has occurred. '.repeat(20)),
       priorLayer2Summary,
       userMessage('also check latency before shipping'),
       assistantMessage('recent answer kept in tail'),
@@ -1094,7 +1105,9 @@ test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its 
 test('pressure collapse keeps parallel and sequential identical-result frames valid and retains the newest pair', async () => {
   const { inspectConversationProtocol } = await import('./conversation-protocol.js');
   const session = createSession({ id: 'dedup-parallel-frame', kind: 'chat' });
-  const payload = `IDENTICAL::${'p'.repeat(400)}`;
+  // The archived-pair ledger must actually be smaller than the raw result;
+  // pressure alone must never force a token-expanding replacement.
+  const payload = `IDENTICAL::${'p'.repeat(4000)}`;
   for (const callId of ['par-a', 'par-b']) {
     writeToolOutput({ sessionId: session.id, callId, tool: 'tool_search', output: payload });
   }
@@ -1143,6 +1156,33 @@ test('pressure collapse keeps parallel and sequential identical-result frames va
   assert.equal(inspectConversationProtocol(seqCollapsed.nextItems).status, 'valid');
 });
 
+test('compaction refuses replacements that expand the prompt even under pressure', async () => {
+  const session = createSession({ kind: 'chat' });
+  const items = [userMessage('Read twice.')];
+  for (const id of ['small-a', 'small-b']) {
+    writeToolOutput({ sessionId: session.id, callId: id, tool: 'test.read', output: 'ok' });
+    items.push(toolCall(id, 'test.read', '{}'), toolResult(id, 'ok'));
+  }
+  const result = compactInFlightToolContext(items, session.id, {
+    resultTriggerTokens: 1, retainedResultBudgetTokens: 1, minRetainPairs: 1, maxRetainPairs: 1,
+  });
+  assert.equal(result.applied, false);
+  assert.deepEqual(result.nextItems, items);
+
+  _setCompactionSummarizerForTests(async () => ({
+    summary: 'A verbose replacement that adds unnecessary words. '.repeat(30), modelUsed: 'test-summarizer',
+  }));
+  try {
+    const summary = await summarizeOlderMessages([
+      userMessage('Keep the constraint.'), assistantMessage('Noted.'), assistantMessage('Still pending.'),
+      userMessage('Continue.'), assistantMessage('Ready.'),
+    ], session.id, 2);
+    assert.equal(summary.applied, false);
+    assert.equal(summary.error, 'summary_not_smaller');
+    assert.equal(summary.mutatedItems, undefined);
+  } finally { _setCompactionSummarizerForTests(null); }
+});
+
 test('Layer 2 preserves complete tool arguments and results outside its prose summarization', async () => {
   resetEventLog();
   const session = HarnessSession.create({ kind: 'chat', title: 'complete summarizer context' });
@@ -1157,7 +1197,7 @@ test('Layer 2 preserves complete tool arguments and results outside its prose su
     const result = await summarizeOlderMessages([
       userMessage('Review the full result before continuing.'), assistantMessage('I will inspect it.'),
       toolCall('call_complete_input', 'test.read', argumentsJson), toolResult('call_complete_input', resultText),
-      assistantMessage('The review is pending.'), userMessage('Continue later.'), assistantMessage('Ready.'),
+      assistantMessage('The review is pending. ' + 'The complete returned record still requires review before delivery. '.repeat(20)), userMessage('Continue later.'), assistantMessage('Ready.'),
     ], session.id, 2);
     assert.equal(result.applied, true);
     const keptCall = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call') as { arguments?: string };

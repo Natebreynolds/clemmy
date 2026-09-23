@@ -3659,6 +3659,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             ...[...actionControlNames].filter((name) => isRegistryDeclaredNativePlanningRead(name)),
           ])
         : deferredNames;
+      // Loading a schema must not revoke exact lookup of that same contract.
+      // The dispatcher already supports these first-class names; include them
+      // in search without adding them to the deferred catalog or widening the
+      // execution carrier's allowed sets.
+      const searchableNames = new Set([...discoverableNames, ...visibleFirstClassNames]);
       firstClassDiscovery = actionScopedDiscoveryTools
         .filter((t) => visibleFirstClassNames.has((t as { name?: string }).name ?? ''))
         // The static tool_search instance searches the entire registry. On the
@@ -3668,7 +3673,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           if ((t as { name?: string }).name !== 'tool_search') return t;
           return carrierWork
             ? buildScopedLocalToolSearch(
-                discoverableNames,
+                searchableNames,
                 'work_call',
                 (name) => localPlanningCapabilityNames.has(name)
                   ? 'work_call'
@@ -3679,7 +3684,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 planningDisclosure,
                 () => structuralDiscoveryMetadata,
               )
-            : buildScopedLocalToolSearch(discoverableNames, 'call_tool', undefined,
+            : buildScopedLocalToolSearch(searchableNames, 'call_tool', undefined,
                 actionToolSearchCandidateSources, planningDisclosure, () => structuralDiscoveryMetadata);
         });
       // Suppress the generic dispatcher ONLY on the local-memory-scoped turn

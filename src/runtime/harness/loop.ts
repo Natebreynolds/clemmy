@@ -11496,6 +11496,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         };
       }
       if (options.provenOperationText) {
+        promptComponents.provenOperation = estimateTokens(options.provenOperationText);
         modelData = {
           input: [
             ...modelData.input,

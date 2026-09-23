@@ -61,9 +61,11 @@ test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-test('production orchestrator discovery returns its own worker packet schema', async () => {
+for (const explicitlyNamed of [false, true]) test(`production orchestrator discovery returns its own worker packet schema (named=${explicitlyNamed})`, async () => {
   const session = createSession({ kind: 'chat' });
-  const prompt = 'Inspect the packet contract for delegating independent work; do not start any workers.';
+  const prompt = explicitlyNamed
+    ? 'Inspect the exact run_worker packet schema; do not start any workers.'
+    : 'Inspect the packet contract for delegating independent work; do not start any workers.';
   const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
   const { EventEmitter } = await import('node:events');
   const { hostRunRunner } = await import('../runtime/harness/host-turn-runner.js');
