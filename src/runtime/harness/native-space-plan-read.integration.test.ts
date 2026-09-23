@@ -609,10 +609,20 @@ test('a real Space read → write → read plan keeps both reads selected and ex
 // Live source287511: enabling an authored workflow changed its revision and
 // erased the create step's completion; enable then failed its own data lineage
 // proof. This uses production discovery, planning, writes and dependency proof.
-test('a created workflow remains completed after its planned enable revision and database reopen', async () => {
+for (const repairedPlan of [false, true]) test(`a created workflow remains completed after its planned enable revision and database reopen (repaired=${repairedPlan})`, async t => {
+  const watcher = await import('./watcher-judge.js');
+  const oldWatcher = process.env.CLEMMY_WATCHER_JUDGE;
+  const oldInterval = process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
+  process.env.CLEMMY_WATCHER_JUDGE = repairedPlan ? 'on' : 'off';
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '12';
+  watcher._setWatcherJudgeForTests(async () => ({ onTrack: false, miss: 'No tracked plan saved.', steer: 'STALE_PLAN_REPAIR_SENTINEL' }));
+  t.after(() => { watcher._setWatcherJudgeForTests(null);
+    if (oldWatcher === undefined) delete process.env.CLEMMY_WATCHER_JUDGE; else process.env.CLEMMY_WATCHER_JUDGE = oldWatcher;
+    if (oldInterval === undefined) delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS; else process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = oldInterval;
+  });
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
-  const name = 'native-planned-lifecycle';
+  const name = repairedPlan ? 'native-planned-lifecycle-repaired' : 'native-planned-lifecycle';
   const session = eventlog.createSession({ kind: 'chat' });
   const objective = `Create manual-only workflow ${name}, enable it, verify, then disable and verify again. Do not run it.`;
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
@@ -645,6 +655,7 @@ test('a created workflow remains completed after its planned enable revision and
     [toolCall('lifecycle-discover-create', 'tool_search', { query: 'workflow_create', limit: 5 })],
     [toolCall('lifecycle-discover-enable', 'tool_search', { query: 'workflow_set_enabled', limit: 5 })],
     [toolCall('lifecycle-discover-read', 'tool_search', { query: 'workflow_get', limit: 5 })],
+    ...(repairedPlan ? [[toolCall('lifecycle-rejected-plan', 'plan_task', { ...plan, draft: { ...plan.draft, topology: { ...plan.draft.topology, operations: plan.draft.topology.operations.map(op => ({ ...op, dataFrom: [] })) } } })]] : []),
     [toolCall('lifecycle-plan', 'plan_task', plan)],
     [selected('lifecycle-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false,
       steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'literal', value: { product: 323 } } }), sideEffect: 'read' }] })],
@@ -661,6 +672,14 @@ test('a created workflow remains completed after its planned enable revision and
     () => hostRunRunner(throwingRunner() as never, agent as never,
       [{ type: 'message', role: 'user', content: objective }] as never, { maxTurns: 12, hostTurnEngine: 'host_v1', context: identity } as never));
   const history = (result as { history: unknown[] }).history;
+  if (repairedPlan) {
+    assert.match(historyResult(history, 'lifecycle-rejected-plan'), /plan_not_admitted/);
+    const reviews = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'trajectory_review');
+    assert.ok(reviews.some(e => e.data.phase === 'discarded' && e.data.reason === 'accepted_plan_changed'), JSON.stringify(reviews));
+    assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, 0);
+    assert.ok(model.requests().every(request => !request.inputTail.includes('STALE_PLAN_REPAIR_SENTINEL')),
+      'the repaired plan cannot receive advice about its failed predecessor');
+  }
   assert.match(historyResult(history, 'lifecycle-create'), /Created workflow/);
   assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
   const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
@@ -725,7 +744,7 @@ test('a created workflow remains completed after its planned enable revision and
   const committed = delivery.commitTurnOutcome({ version: 2, id: turnOutcomes.turnOutcomeId(identity), identity,
     status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Created, enabled, then disabled and verified.' } });
   assert.equal(committed.presentation.status, 'done');
-  assert.equal(model.calls(), 10, 'terminal proof adds no model round');
+  assert.equal(model.calls(), repairedPlan ? 11 : 10, 'terminal proof adds no model round');
   assert.equal((db.prepare(`SELECT count(*) AS n FROM logical_call_settlements
     WHERE session_id=? AND source_user_seq=? AND mutating=1`).get(session.id, source.seq) as { n: number }).n, 3,
     'receipt verification and publication must not replay any mutation');

@@ -234,3 +234,86 @@ Trap: delegationPrimitive also marks native authoring tools; it is not a dispatc
 receipt class. A broad routing candidate using that flag broke Space/workflow
 authoring pins and was rejected before installation. The final predicate uses
 the explicit registered workflow-run output contract, shared with receipt proof.
+
+## Installed e94951829 — retained plan and lifecycle acceptance
+
+Fresh source288872/session sess-desktop-aca92ce569f49a982700f032 passed on
+installed clean e94951829e5f508d67f5d1e5d7141254a7b60f33, fingerprint
+8c965e87547cb0b046645a6a49361d7452b7dd13b31e258fe5142b8f3a22794d.
+This supersedes the candidate's pending-live statement above, not the failed
+f5b/e5a results. The task explicitly required a tracked plan before writes,
+creation, definition readback, enable, exactly one run, result verification,
+disable and disabled-state verification. The first plan needed repair; the
+second was accepted before workflow_create. The retained seven-step contract
+survived asynchronous child execution and parent resume. All seven lines have
+one settled/observed instance and state satisfied. No operator cleanup.
+
+Independent installed-module verification re-read the contract, manifest and
+transactional terminal proof: all seven plan lines satisfied and proof ok.
+The same current installed verifier also accepts the retained 74e Opus/Sol
+terminal proofs; these are replay checks, not fresh Sol execution. No business
+or model calls were made by this proof helper. API readback confirms fixture
+harness-plan-author-0923-e949-plan disabled, manual-only and allowSends false,
+with exactly one child1790167628320-0c527b succeeded, actual product323.
+Canonical terminal289073 is done; Grok4.3 completion review289043 fulfills true,
+not an unavailable-review pass. Jev had correctly withheld completion at the
+earlier handoff while work remained. One strategy update observed at289075.
+
+Canonical measureAcceptedTurn:108442ms,12 top-level tools,zero discovery/search,
+597793 prompt tokens,350440 cached,247353 uncached input,8393 output.28 usage
+records:13 Opus5.5,8 Grok4.3,5 Jev1.13,2 Jevlatest. Exact source attribution is
+certified, but two usage records have uncertified token accounting. These are
+different claims. Do not present the total as fully certified or compare unlike
+failed/no-plan predecessors as a causal efficiency win. Runtime success is
+bounded to this controlled local workflow; external writes are not qualified.
+
+Next overhead to investigate: first-plan lineage repair, a stale watcher result
+arriving after the repaired plan was saved, unnecessary workflow_list plus
+output query, and repeated prompt/schema/review payloads. Preserve the saved
+objective, dependencies, exact child identity and completion receipts when
+reducing context. Zero discovery is useful evidence for learned JIT admission,
+not proof of overall latency/token efficiency. No full-suite, physical mobile,
+fresh Sol lifecycle or installer release qualification on this candidate.
+
+Evidence: output/harness-acceptance/2026-09-23-e94951829/ (ignored/private):
+accepted.json, build-info.json, installed-proof.json, workflow.json, runs.json,
+run-detail.json, measurement.json, events.json. Raw event evidence is private;
+do not publish it wholesale. This checkpoint was written after the installed
+build; any new commit including it requires another build before hotpatch.
+
+## Watcher plan freshness — follow-up candidate
+
+Source288872 exposed a stale correction after successful plan repair: watcher
+review288904/288908 considered the rejected plan; accepted plan288918 did not
+move the business-call cadence, so advice was injected288920/delivered288922.
+The watcher told the brain no tracked plan existed after one was already saved.
+This does not invalidate the eventual successful workflow, but it is avoidable
+contradictory context and a possible source of extra repairs.
+
+The host now captures the exact validated expected-work contract identity with
+advisory evidence, rechecks it when review finishes, when pending advice is
+selected, and immediately before model injection. Changed plan identity drops
+that advisory with accepted_plan_changed. Planning remains excluded from review
+cadence, discovery does not retire otherwise-current advice, and final completion
+proof remains independent. No extra judge call or larger model prompt is added.
+
+Production-path pin uses actual plan_task rejection, corrected plan admission,
+work_call authoring/enable/readback/disable, durable reopen and final publication.
+The stale sentinel never reaches a model request; every lifecycle step still
+settles. Unchanged e949 production runner fails the repaired case while the
+ordinary lifecycle passes (1 pass/1 fail, /tmp/clem-watcher-plan-red.log). Candidate
+passes both (/tmp/clem-watcher-plan-green.log); native integration plus watcher
+unit checks23/23 pass (/tmp/clem-watcher-plan-adjacent.log), typecheck passes
+(/tmp/clem-watcher-plan-types.log). Recording models only, no provider quota.
+
+Trap: do not simulate plan repair by inserting a legacy graph inside a fake
+plan_task body. That changes authority outside the real plan admission transaction
+and tests an execution-owner conflict instead of the watcher. The retained pin
+uses production admission. Test homes are mkdtemp fixtures; the live-daemon
+sentinel is explicitly NOT PERFORMED while the installed daemon owns its home.
+Fresh installed acceptance and measured efficiency benefit are still owed for
+this watcher change; the successful source288872 precedes this fix.
+Six adjacent production-host advisory checks also pass, including corrected-work,
+discovery-preserves-current-advice and incremental evidence windows:
+/tmp/clem-watcher-plan-host.log. Full suite remains unqualified on this loaded
+machine. This is not a claim of fresh installed acceptance.

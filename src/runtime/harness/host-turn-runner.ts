@@ -3355,7 +3355,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const hostWatcherEnabled = watcherJudgeEnabled() && !conversationalCheckInSurface();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
   const hostWatcherHistoryStart = history.length;
-  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string; toolCallCount: number }) | null } = { pending: null };
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string; toolCallCount: number; planIdentity: string }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
   /** A drift verdict is outstanding. Keeps the watcher WATCHING after it has
@@ -3397,6 +3397,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       return rows.filter((row) => !HOST_JUDGE_CONTROL_TOOL_NAMES.has(row.name)).length;
     } catch { return 0; }
   };
+  // Planning is control work: it deliberately does not advance business-call
+  // review cadence. It DOES invalidate advice about the old accepted plan.
+  const hostWatcherPlanIdentity = (): string => {
+    const identity = exactHostIdentity();
+    const loaded = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
+    return loaded.status === 'ok' ? loaded.contract.contractId : loaded.status;
+  };
   const hostWatcherGate = (watcherToolCalls: number): WatcherGateInput => ({
     enabled: true,
     totalToolCalls: watcherToolCalls,
@@ -3425,6 +3432,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     hostWatcherLastCheckedAt = watcherToolCalls;
     const watcherObjective = judgedObjective();
     const watcherIdentity = exactHostIdentity();
+    const planIdentity = hostWatcherPlanIdentity();
     const reviewId = `${watcherIdentity.sourceUserSeq}:${randomUUID()}`;
     const objectiveDigest = createHash('sha256').update(watcherObjective).digest('hex');
     const watcherJudge = currentWatcherJudge();
@@ -3463,6 +3471,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           toolCallCount: watcherToolCalls,
         });
         const staleReason = judgedObjective() !== watcherObjective ? 'objective_changed'
+          : hostWatcherPlanIdentity() !== planIdentity ? 'accepted_plan_changed'
           : summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity) !== workerProgress
             ? 'worker_progress_changed'
             : hostWatcherToolCalls() !== watcherToolCalls ? 'settled_work_changed' : undefined;
@@ -3502,7 +3511,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           evidenceBytes: Buffer.byteLength(sourceEvidence), latestAssistantNote,
         });
         if (verdict && !verdict.onTrack && !stale) {
-          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId, workerProgress, toolCallCount: watcherToolCalls };
+          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId, workerProgress, toolCallCount: watcherToolCalls, planIdentity };
         }
       } catch (error) {
         recordWatcherReview('completed', { reviewId, objectiveDigest, verdict: 'unavailable',
@@ -8429,10 +8438,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let watcherReviewForStep: string | undefined;
     let watcherDirectiveForStep: string | undefined;
     let watcherObjectiveForStep: string | undefined;
-    let watcherDriftForStep: (WatcherVerdict & { objective: string; toolCallCount: number }) | undefined;
+    let watcherDriftForStep: (WatcherVerdict & { objective: string; toolCallCount: number; planIdentity: string }) | undefined;
     if (hostProduction && hostWatcherEnabled) {
       const pending = hostWatcherSteer.pending;
       const staleReason = pending && pending.objective !== judgedObjective() ? 'objective_changed'
+        : pending && pending.planIdentity !== hostWatcherPlanIdentity() ? 'accepted_plan_changed'
         : pending && pending.workerProgress !== summarizeWorkerProgressForWatcher(exactHostIdentity().sessionId, exactHostIdentity())
           ? 'worker_progress_changed'
           : pending && pending.toolCallCount !== hostWatcherToolCalls() ? 'settled_work_changed' : undefined;
@@ -8824,6 +8834,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // selected it. Check again AFTER adopting them, immediately before the
         // model request; an old review cannot redirect the revised objective.
         const staleReason = watcherObjectiveForStep !== judgedObjective() ? 'objective_changed'
+          : watcherDriftForStep?.planIdentity !== hostWatcherPlanIdentity() ? 'accepted_plan_changed'
           : watcherDriftForStep?.toolCallCount !== hostWatcherToolCalls() ? 'settled_work_changed' : undefined;
         if (!staleReason) {
           modelInput.push({ role: 'user', content: watcherDirectiveForStep });
