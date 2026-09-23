@@ -1345,3 +1345,46 @@ build the clean candidate, hotpatch via the Terminal recipe, and qualify the
 original proposal on the installed app. These controlled fixtures do not prove
 that provider-specific acceptance or the broader release gates. Installed app
 remains the earlier d2 candidate until reverified through build-info.
+
+
+## Actual installed documentation source: text, no declared schema
+
+Read-only inspection of installed `dataforseo-mcp-server` 3.1.1 found
+`docs_list_sections` has an empty input schema, no outputSchema in server
+registration, and returns `textResult(listSections())`. `listSections` is a pure
+local function over bundled section names, producing 13 hyphen-prefixed lines.
+No network, MCP dispatch, credential access, provider mutation or paid call was
+performed. Captured the exact locally produced payload and digest under
+`output/harness-acceptance/2026-09-23-doc-inventory-shape/provider-result.json`.
+This is source-level output evidence, not a live workflow receipt.
+
+On current HEAD 6baa93767, running the actual pure result projector against
+those bytes returns `{kind: "no_evidence", owner: "mcp", reason:
+"mcp_payload_missing"}`; receipt in `current-projection.json` beside the sample.
+The raw payload SHA256 is
+2af2930dc0c8fa979121c47c581bb01d0cd296dedfdb5c7f63e22bcb0b2e48d2.
+
+The next live attempt would still fail at multiple independent boundaries:
+1. Automatic authoring refuses absent declared/reviewed output schema.
+2. Result facts currently accept MCP structuredContent or JSON-text payloads,
+   not a text-list interpretation.
+3. Canonical production requires an array of object records, equality with
+   retained itemCount and all-record coverage. The approved original asks for
+   up to five of thirteen sections, not exhaustive provider inventory.
+
+Do not bypass these by inventing a provider schema, changing the original
+proposal, silently slicing while claiming full-source coverage, or rerunning
+the model to rediscover the same mismatch. The next implementation needs an
+explicit reviewed deterministic text interpretation and bounded selection,
+bound to the retained raw receipt. Keep source count, selected count and
+selection scope distinct. Preserve old structured contracts and their digests.
+Use generic source-format operations, never a provider/tool-name exception.
+The authoring path must expose and validate this supported interpretation
+without an unauthorized business sample; execution must validate actual bytes
+and retain honest uncertainty on shape mismatch. Contract, count/coverage,
+lineage, Workspace publication and replay need one integrated fixture using
+this actual format before the paid original-pilot retry. These are framework
+representation defects; the free CLI/MCP tool itself is not broken.
+
+No hotpatch or tag performed. This new evidence changes the next action from
+build-and-retry to implementing the missing generic text/selection contract.
