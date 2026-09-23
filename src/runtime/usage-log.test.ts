@@ -382,3 +382,13 @@ test('usageEfficiencyForEvents: a brain frame that fails to reuse the previous p
   assert.equal(efficiency.appendedTokens, 10_000);
   assert.equal(efficiency.prefixReuse, Math.round(((20_000 + 18_000) / (20_000 + 25_000)) * 1000) / 1000);
 });
+
+test('a failed request without provider usage is counted as uncertified, never proven zero cost', () => {
+  const failed = ev({ cacheDialect: 'none', ok: false, failReason: 'timeout', inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+  assert.equal(canonicalCacheAccounting(failed).certified, false);
+  assert.equal(canonicalCacheAccounting(failed).invalid, false, 'a missing usage receipt is not malformed token arithmetic');
+  assert.equal(rollupUsage([failed]).uncertifiedCalls, 1);
+  assert.equal(rollupUsage([failed]).totalCalls, 1, 'failed attempts remain visible');
+  assert.equal(canonicalCacheAccounting({ ...failed, ok: true }).certified, true, 'a successful reported zero remains representable');
+  assert.equal(canonicalCacheAccounting({ ...failed, inputTokens: 10, totalTokens: 10 }).uncachedWorkTokens, 10, 'known failed-call usage is still charged');
+});

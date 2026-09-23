@@ -1071,21 +1071,38 @@ test('workflow_create persists step intent for intent-routed worker models', asy
 });
 
 test('workflow_create persists workflow and step local project bindings', async () => {
-  const result = await workflowCreate()({
-    name: 'project-bound-wf',
-    description: 'Work across local repos.',
-    project: 'clementine-next',
-    steps: [
-      { id: 'inspect', prompt: 'Inspect {{project.path}}.' },
-      { id: 'patch_other', prompt: 'Patch the sibling repo.', project: 'sibling-app', dependsOn: ['inspect'] },
-    ],
-  });
+  const { updateEnvKey, removeEnvKey, listWorkspaceProjects } = await import('./shared.js');
+  const previousRoots = process.env.WORKSPACE_DIRS;
+  const roots = path.join(TMP_HOME, 'workspace-fixture');
+  for (const name of ['clementine-next', 'sibling-app']) {
+    const dir = path.join(roots, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+  }
+  updateEnvKey('WORKSPACE_DIRS', roots);
+  try {
+    assert.deepEqual(listWorkspaceProjects().map(project => project.name), ['clementine-next', 'sibling-app']);
+    const result = await workflowCreate()({
+      name: 'project-bound-wf',
+      description: 'Work across local repos.',
+      project: 'clementine-next',
+      steps: [
+        { id: 'inspect', prompt: 'Inspect {{project.path}}.' },
+        { id: 'patch_other', prompt: 'Patch the sibling repo.', project: 'sibling-app', dependsOn: ['inspect'] },
+      ],
+    });
 
-  assert.match(resultText(result), /Created workflow "project-bound-wf"/);
-  const saved = readWorkflow('project-bound-wf')!.data;
-  assert.equal(saved.project, 'clementine-next');
-  assert.equal(saved.steps[0].project, undefined);
-  assert.equal(saved.steps[1].project, 'sibling-app');
+    assert.match(resultText(result), /Created workflow "project-bound-wf"/);
+    const saved = readWorkflow('project-bound-wf')!.data;
+    assert.equal(saved.project, 'clementine-next');
+    assert.equal(saved.steps[0].project, undefined);
+    assert.equal(saved.steps[1].project, 'sibling-app');
+  } finally {
+    if (previousRoots === undefined) removeEnvKey('WORKSPACE_DIRS');
+    else updateEnvKey('WORKSPACE_DIRS', previousRoots);
+    const { clearWorkspaceProjectCache } = await import('./shared.js');
+    clearWorkspaceProjectCache();
+  }
 });
 
 test('workflow_create portable_models strips exact model pins and keeps intents', async () => {

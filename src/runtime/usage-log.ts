@@ -36,6 +36,9 @@ export type UsageKind =
   | 'embedding' | 'controller' | 'warmup' | 'other';
 
 export interface UsageEvent {
+  /** Failed requests with no reported usage have unknown cost, not certified zero. */
+  ok?: boolean;
+  failReason?: string;
   /** ISO-8601 timestamp when the model response finished. */
   at: string;
   /** Where the call came from: session ID, cron name, "embedding-backfill", etc. */
@@ -297,6 +300,7 @@ export interface CanonicalUsage {
  * Pure.
  */
 export function canonicalCacheAccounting(event: {
+  ok?: boolean;
   cacheDialect?: CacheDialectProvenance;
   inputTokens?: number;
   cachedInputTokens?: number;
@@ -327,6 +331,13 @@ export function canonicalCacheAccounting(event: {
   });
   for (const value of [input, cached, output, reasoning, total]) {
     if (!Number.isFinite(value) || value < 0) return invalid();
+  }
+  // Timeout/error adapters retain a zero placeholder when the provider never
+  // reports usage. Keep the call visible, but never certify that placeholder
+  // as free work or include it in certified cache-efficiency denominators.
+  if (event.ok === false && input === 0 && cached === 0 && output === 0 && reasoning === 0 && total === 0) {
+    return { dialect, certified: false, invalid: false, promptTokens: 0,
+      cachedReadTokens: 0, uncachedInputTokens: 0, uncachedWorkTokens: 0, hitRate: 0 };
   }
   if (dialect === 'inclusive') {
     if (cached > input) return invalid(); // contradicts the declared dialect
