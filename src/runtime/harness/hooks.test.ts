@@ -36,6 +36,11 @@ const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabi
   operationId: 'PROOF_LIST_TASKS',
   providerKind: 'composio',
   effect: 'read',
+}, {
+  operationId: 'PROOF_SEND_NOTE',
+  providerKind: 'composio',
+  effect: 'external_write',
+  operationSemantics: { version: 1, reversibility: 'irreversible' },
 }]);
 const { _withHostLocalWriteCommitFactsForTest } = await import('./host-local-write-commit.js');
 const withLocalWriteCommitFixture = (_tool: string, result: string) =>
@@ -1010,4 +1015,36 @@ test('a rejected plan remains negative on the public stream even when its diagno
   const visible = projectHarnessEventForPublic(returned)!;
   assert.equal(visible.data.ok, false);
   assert.equal(visible.data.result, undefined, 'internal diagnostics stay private');
+});
+
+
+test('send mirror uses admitted start arguments when the end omits them', async () => {
+  resetEventLog();
+  const { listNotifications } = await import('../notifications.js');
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  const detach = attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  const callId = 'send-start-args';
+  const args = JSON.stringify({ tool_slug: 'PROOF_SEND_NOTE', arguments: { destination: 'fixture', body: 'The exact reviewed canary message.' } });
+  try {
+    stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, { toolCall: { callId, arguments: args } });
+    stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, '{"ok":true}', { toolCall: { callId } });
+    const mirrors = listNotifications(100).filter((row) => row.metadata?.source === 'external-send' && row.metadata.sessionId === sess.id);
+    assert.equal(mirrors.length, 1);
+    assert.match(mirrors[0].body, /The exact reviewed canary message/);
+  } finally { detach(); }
+});
+
+test('an unpaired successful-looking callback cannot claim an external send', async () => {
+  resetEventLog();
+  const { listNotifications } = await import('../notifications.js');
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  const detach = attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  try {
+    stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, '{"ok":true}', {
+      toolCall: { callId: 'unpaired-send', arguments: JSON.stringify({ tool_slug: 'PROOF_SEND_NOTE', arguments: { body: 'Unpaired result must not assert a send.' } }) },
+    });
+    assert.equal(listNotifications(100).filter((row) => row.metadata?.source === 'external-send' && row.metadata.sessionId === sess.id).length, 0);
+  } finally { detach(); }
 });

@@ -258,6 +258,9 @@ export function attachEventLogHooks(
   const callIdToCalledEventId = new Map<string, string>();
   const callIdToAccounting = new Map<string, ReturnType<typeof runtimeToolAccountingMetadata>>();
   const callIdToTopologyRole = new Map<string, ReturnType<typeof actionTopologyRoleForRuntimeCall>>();
+  // The SDK may omit arguments at end. Retain only send arguments from the
+  // admitted start, scoped by the same physical lifecycle as its accounting.
+  const callIdToSendArguments = new Map<string, string>();
   const activeToolCallKeys = new Set<string>();
   const closedToolCallKeys = new Set<string>();
   // The SDK can replay the exact same lifecycle notification. Object identity
@@ -411,6 +414,10 @@ export function attachEventLogHooks(
       callIdToCalledEventId.set(key, event.id);
       callIdToAccounting.set(key, accounting);
       callIdToTopologyRole.set(key, topologyRole);
+      if (accounting.effect === 'external_write' && accounting.reversibility === 'irreversible'
+        && typeof details?.toolCall?.arguments === 'string') {
+        callIdToSendArguments.set(key, details.toolCall.arguments);
+      }
       if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
         callIdToWorkerItem.set(key, workerItemFromDetails(details));
       }
@@ -462,6 +469,8 @@ export function attachEventLogHooks(
       && callIdToAccounting.has(key)
       && callIdToTopologyRole.has(key),
     );
+    const admittedSendArguments = key ? callIdToSendArguments.get(key) : undefined;
+    if (key) callIdToSendArguments.delete(key);
     if (key) callIdToCalledEventId.delete(key);
     const accounting = (key ? callIdToAccounting.get(key) : undefined)
       ?? runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
@@ -650,14 +659,16 @@ export function attachEventLogHooks(
     }
     // What Clem sent anywhere shows up on the first-party surfaces: one
     // in-app item per successful irreversible external send, chat or step.
-    mirrorExternalSendToFirstPartySurfaces({
-      sessionId,
-      callId,
-      toolName: tool?.name ?? '',
-      accounting,
-      rawArgs: details?.toolCall?.arguments,
-      ok: toolOutputLooksSuccessful(resultStr),
-    });
+    if (pairedAdmittedStart) {
+      mirrorExternalSendToFirstPartySurfaces({
+        sessionId,
+        callId,
+        toolName: tool?.name ?? '',
+        accounting,
+        rawArgs: admittedSendArguments,
+        ok: toolOutputLooksSuccessful(resultStr),
+      });
+    }
     if (
       returnedEvent
       && callId

@@ -62,3 +62,30 @@ do not describe the test result as sentinel certification.
   afterward. A successful build does not authorize interrupting a UI patch cycle.
 - Fixture generators and registry tests do not prove physical phone interaction,
   one provider effect, or delivery. Keep those acceptance claims separate.
+
+## Continuation: mirror lifecycle evidence
+
+The initial candidate `aa71887d7` built successfully with source fingerprint
+`1a9d3589c200d172f9df1bb5093e2b6dbca701b3342c0618a63b565106feb71a`.
+It was not installed. Main still had no remote v3.18.20 tag on recheck; the UI
+agent was actively editing its shared feed routes. No installed-app changes made.
+
+Further focused approval-path checks passed 53/53: source ownership,
+checkpoint continuation, chat approval resume, replay retirement, and hooks.
+Inspecting those hooks exposed two more first-item mirror defects:
+
+- A successful return that omitted arguments lost its mirror even though the
+  admitted start carried them.
+- A successful-looking end with no admitted start could create a send mirror.
+
+Two provider-neutral fixture tests failed before the correction (32 pass,
+2 fail). Hooks now retain send arguments only for their admitted lifecycle,
+release them on its end, and publish the mirror only for the paired current
+start. This does not grant or modify dispatch authority. Afterward the hooks
+and mirror suites passed 41/41. Logs: `hooks-before.log`, `hooks-after.log`,
+`approval-path.log` alongside the earlier evidence. Live phone/restart proof
+and complete physical-settlement accounting remain owed as above.
+
+Memory trap: an SDK end callback need not repeat arguments, and callback success
+alone is not evidence of an admitted send. Use the paired start's original input;
+never reconstruct its message from a clipped event preview or unrelated end.
