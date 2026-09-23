@@ -1388,3 +1388,41 @@ representation defects; the free CLI/MCP tool itself is not broken.
 
 No hotpatch or tag performed. This new evidence changes the next action from
 build-and-retry to implementing the missing generic text/selection contract.
+
+
+## Explicit text interpretation primitive — not yet live-enabled
+
+Implemented a pure closed text-lines interpretation contract and optional
+result-evidence projection. Rules explicitly specify target field, literal
+prefix, whitespace/blank-line handling, source byte/record bounds and first-N
+selection. No arbitrary expressions, inferred provider schemas or tool-name
+exceptions. The whole source is validated before publishing selected records;
+a bad suffix cannot hide after the selected prefix. Original bytes are never
+mutated. Source/selected/omitted counts and `reviewed_selection` scope are
+explicit in the interpreted payload.
+
+The actual locally observed 13-entry MCP inventory is a regression fixture.
+With explicit rules it returns five selected records and eight omitted; with
+no interpretation it keeps the prior no-evidence result. Error envelopes,
+structuredContent ownership, multiple text blocks, foreign envelope fields and
+malformed sealed wrappers cannot be overridden by text parsing. Plain strings
+can also be interpreted without any provider-specific path.
+
+Validation: 38 focused checks passed across the new primitive, existing result
+handles and workflow invocation executor
+(`/tmp/clem-text-interpretation-regressions.log`, session 78728 exit 0).
+Typecheck passed (`/tmp/clem-text-interpretation-typecheck.log`, session 68758
+exit 0); diff check passed. The same actual fixture failed against HEAD's prior
+projector (`/tmp/clem-text-interpretation-red.log`, expected provider_payload,
+actual no_evidence). Temporary comparison module removed. No paid calls.
+Live-home sentinel NOT PERFORMED while daemon owns home; no isolated acceptance
+claim.
+
+This is the parsing layer only, deliberately not enabled by callers yet. Owed
+before installation: digest-bound projection/tool authoring fields; honest
+conditional interpretation when declared output schema is absent; invocation
+evidence wiring; retained source/selection lineage and Workspace scope; original
+13-to-5 pilot integration and replay tests. Do not merely skip old recordCount
+equality or mark a selected dataset as full provider inventory. Structured
+contracts must keep their old digests and behavior. Then build, hotpatch and
+qualify the unchanged approved original proposal through the installed app.
