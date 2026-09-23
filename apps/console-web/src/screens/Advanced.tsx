@@ -148,7 +148,6 @@ function AdvancedRail({ current, developerMode }: { current: string; developerMo
   };
   return (
     <nav aria-label="Advanced sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
-      <h1 className="mb-3 px-2 text-h2 text-fg">Advanced</h1>
       {everyday.map(row)}
       {instruments.length > 0 && (
         <div className="mt-4 border-t border-border pt-3">

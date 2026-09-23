@@ -35,7 +35,7 @@ test('every place that asks for a key links to where the key is made', () => {
   const jevUrl = /JEV_KEY_URL = '([^']+)'/.exec(FORM)?.[1];
   assert.ok(jevUrl);
   assert.match(REGISTRY, new RegExp(`name: 'typesafe_api_key'[\\s\\S]*?keyUrl: '${jevUrl.replace(/[.]/g, '\\.')}'`));
-  assert.match(SECTION, /!jev\?\.configured[\s\S]*href=\{JEV_KEY_URL\}/);
+  assert.match(SECTION, /!jev\?\.configured && !open[\s\S]*href=\{JEV_KEY_URL\}/);
   // Keys & accounts rows and the add-a-model form render the descriptor's
   // and the preset's key page.
   assert.match(CONNECT, /descriptor\?\.keyUrl/);

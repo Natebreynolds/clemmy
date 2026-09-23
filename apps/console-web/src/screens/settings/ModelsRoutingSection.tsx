@@ -67,13 +67,13 @@ export function ConnectedSection() {
           {open ? 'Hide sign-ins and keys' : 'Sign in, add a key, or manage'}
         </button>
       </div>
-      {!jev?.configured && (
+      {!jev?.configured && !open && (
         <p className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-small text-muted">
           <span><span className="font-semibold text-fg">New: Jev</span> makes Clem’s quick yes/no checks near-instant.</span>
           <a href={JEV_KEY_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
             Get a key at console.typesafe.ai <ExternalLink className="h-3.5 w-3.5" aria-hidden />
           </a>
-          {!open && <button type="button" onClick={() => setOpen(true)} className="text-primary hover:underline">Add it</button>}
+          <button type="button" onClick={() => setOpen(true)} className="text-primary hover:underline">Add it</button>
         </p>
       )}
       {open && (
