@@ -1233,14 +1233,13 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   sql += ' LIMIT ? OFFSET ?';
   params.push(limit);
   params.push(offset);
-  if (options.withoutConversationState) {
-    // Page on the narrow columns first, then project only that page: a sorter
-    // fed the projected metadata would strip every row in the table once per
-    // page.
-    sql = `SELECT ${SESSION_COLUMNS_WITHOUT_STATE} FROM sessions
-      WHERE rowid IN (${sql.replace('SELECT * FROM sessions', 'SELECT rowid FROM sessions')})
-      ORDER BY updated_at DESC, id DESC`;
-  }
+  // Select row identities before carrying conversation payloads into a sorter.
+  // Full-state callers need the selected metadata, not every off-page blob.
+  // Keep filters and pagination in the inner query and reapply the stable
+  // ordering outside; the returned rows and metadata contract are unchanged.
+  sql = `SELECT ${options.withoutConversationState ? SESSION_COLUMNS_WITHOUT_STATE : '*'} FROM sessions
+    WHERE rowid IN (${sql.replace('SELECT * FROM sessions', 'SELECT rowid FROM sessions')})
+    ORDER BY updated_at DESC, id DESC`;
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
   return rows.map(rowToSession);
 }

@@ -696,3 +696,86 @@ coordination. This edit removes the observed false gap, not that entire mismatch
 Scope/gap follow-up typecheck completed exit0, /tmp/clem-scope-gap-typecheck.log.
 The prolonged typecheck remained a live CPU-active process; observed its original
 session14910 through completion rather than restarting it.
+
+
+## dda40b821 installed; acceptance in progress
+
+Clean build completed exit0 (session52634), sha dda40b821e4a41ef5bfc451bdb25cb69c9e6bfa8,
+fingerprint594095535f2e184424b7c45053554e9c4f711bcae95950c9c2bb5a64fe79ea93.
+Preflight active0/runningRuns0/backgroundActive0; three pending runs parked,
+no started physical dispatches or other builds. Exact app quit, daemon80396 exited,
+Terminal hotpatch completed, new daemon96681. Initial build-info connection was
+refused during startup before fixture/receipt/request creation; waited for that
+same app launch and then submitted once after exact SHA verification.
+
+Acceptance receipt /tmp/clem-dda40b821-acceptance/accepted.json,
+session sess-desktop-42a121925a7f50a47888da82,
+request56842808-06e3-4c26-a253-0a66292b8aa6. Observe this accepted source/child;
+do not resubmit. At this checkpoint test is in progress, not yet acceptance.
+Fixture workflow harness-preservation-0923-dda40b821, fresh CSV under live
+workspace/harness-acceptance-dda40b821. Standard explicit no-sends preservation
+request; verify one child, exact bytes, disabled fixture, no false SEND/missing
+output question or out-of-scope remembered suggestion, canonical source metrics.
+
+
+## dda40b821 acceptance completed; broader-gate preflight
+
+Parent source291277/session sess-desktop-42a121925a7f50a47888da82;
+child1790179767735-6424e4/source291335/step update_alpha.
+Parent terminal291437 done, child291380 done. Independent exact CSV bytes verified,
+one child succeeded, fixture disabled, allowSends false. Evidence saved under
+output/harness-acceptance/2026-09-23-dda40b821/. Creation291310 contains none of the
+false SEND, missing-output/destination or out-of-scope remembered suggestions.
+It does retain a deterministic-renderer advisory because this authored pass added
+a local path output verification contract. Parent read the prior named fixture
+as reference before creating the fresh one; prior fixture was not changed.
+
+Canonical certified parent145367ms/8calls/0discovery/343907prompt/131343cached/
+3069output (Opus5.5 x7,Grok4.3 x7,Jev1.13.0 x4,jev-latest x2).
+Child38964ms/4calls/0discovery/33478prompt/128cached/668output
+(Haiku4.5 x4,Jev1.13.0 x1,Grok4.3 x1). Parent tokens decreased versus5707,
+wall increased. Different authored output contracts/routes/cache/host load:
+no causal speed claim; child wall nested in parent. No GPT6Sol acceptance yet.
+
+Broader full-suite preflight deferred for actual machine load, not a failed test:
+09:12PT snapshot had Zoom39.7% CPU, system indexer75.8%, WindowServer32.8%,
+other system services active. Clem daemon96681 showed77.3% while command-center
+active0/runningRuns0/backgroundActive0. Do not launch full suite/journeys under
+that load or interrupt the user's applications. No full-suite process started.
+A 3s read-only sample completed: /tmp/clem-dda40b821-idle-cpu.sample.txt;
+903.5MB physical footprint, samples include better-sqlite3 Statement::JS_all,
+sqlite3_step and overflow-page reads, plus event-loop waits. This is a latency
+lead, NOT proof of the owning JS query or causal wall contribution. Trace the
+actual query owner before changing caching, removing checks or adding indexes.
+Framework fixes and broader release gates remain active, no tag/main merge.
+
+
+## Follow-up: page session identities before loading conversation payloads
+
+Traced one concrete query reachable from command-center polling: listSessions
+(with full state) selected all columns before ORDER BY updated_at DESC,id DESC
+LIMIT/OFFSET. Read-only EXPLAIN on live DB showed a full sessions scan and temp
+sort; no general updated_at index. The existing withoutConversationState path
+already pages rowids first, but full-state callers did not. Kept API/state semantics
+and generalized that narrow-page-first query to both paths, no index/migration.
+Filters/params/limit/offset remain inner; deterministic order reapplied outer.
+
+Read-only live DB transaction compared complete rows for the two SQL forms three
+times at limit60: current218.70/46.85/54.50ms, page-first3.19/3.43/2.87ms;
+all rows equal. /tmp/clem-session-query-baseline.json. This proves this query
+cost, not total daemon CPU attribution or end-to-end app latency. Native sample
+cannot resolve owning JS frames; other work remains possible. CPU later11%.
+
+A transparent isolated SQLite view counts metadata materialization independent
+of SQL spelling or wall timing. For 20 sessions/2-row page/offset3/tied timestamps,
+old query materialized20 payloads; expected2. Red /tmp/clem-session-page-red.log.
+This is not a fake production path: the view instruments the real listSessions
+SQL and preserves row identities; normal execution still reads the real table.
+Metadata predicates can legitimately inspect non-page rows; the pin covers
+ordinary unfiltered listing. Installed app stilldda40b821, candidate uninstalled.
+
+Session paging follow-up: full eventlog file80passed,0failed, exit0
+(/tmp/clem-session-page-green.log), including exact page order/metadata and
+dispatch/receipt contracts. Typecheck exit0 (/tmp/clem-session-page-typecheck.log).
+Machine load extended duration; existing process handles observed to completion.
+No full-suite or installed-app latency acceptance yet.

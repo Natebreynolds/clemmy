@@ -1645,6 +1645,34 @@ test('listSessions has deterministic tie ordering for offset pagination', () => 
   );
 });
 
+test('session listing materializes metadata only for the requested page', () => {
+  resetEventLog();
+  const db = openEventLog();
+  for (let i = 0; i < 20; i++) {
+    createSession({ id: `materialize-${String(i).padStart(3, '0')}`, kind: 'chat',
+      metadata: { marker: i, state: 'x'.repeat(4096) } });
+  }
+  db.prepare('UPDATE sessions SET updated_at = ?').run('2026-09-23T00:00:00.000Z');
+  let materializations = 0;
+  db.function('count_metadata_materialization', (value: unknown) => {
+    materializations++;
+    return value as string;
+  });
+  const columns = (db.prepare('PRAGMA main.table_info(sessions)').all() as Array<{ name: string }>).map(column =>
+    column.name === 'metadata_json' ? 'count_metadata_materialization(metadata_json) AS metadata_json' : `"${column.name}"`);
+  // A transparent test view measures payload evaluation, not elapsed time or
+  // SQL spelling. Production reads the real table with the same row identity.
+  db.exec(`CREATE TEMP VIEW sessions AS SELECT rowid AS rowid, ${columns.join(', ')} FROM main.sessions`);
+  try {
+    const page = listSessions({ limit: 2, offset: 3 });
+    assert.deepEqual(page.map(row => row.id), ['materialize-016', 'materialize-015']);
+    assert.deepEqual(page.map(row => row.metadata.marker), [16, 15]);
+    assert.equal(materializations, 2, 'off-page conversation payloads must not enter the sort');
+  } finally {
+    db.exec('DROP VIEW temp.sessions');
+  }
+});
+
 test('kill switch is sticky until cleared', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
