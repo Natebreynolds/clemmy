@@ -1619,6 +1619,20 @@ test('original approved inventory contract executes 13 text records into five sc
   assert.equal(created.ok, true, JSON.stringify(created));
   if (!created.ok || !created.projection.selection) return;
   fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  // A live model supplied raw MCP evidence paths and omitted the approved
+  // prefer-newer fields. Return both repairs in one refusal, before dispatch.
+  const invalidContract = chatPilotRequest(fixture, surface.acquisitionRef);
+  const invalidWire = invalidContract.contract as any;
+  invalidWire.evidence.required_paths = ['/content'];
+  invalidWire.completeness.evidence_paths = ['/content'];
+  delete invalidWire.result_projection.resolution_policy.prefer_newer_after_exact_identity;
+  const invalidPreview = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalidContract));
+  assert.equal(invalidPreview.ok, false);
+  assert.equal(invalidPreview.code, 'preview_blocked');
+  assert.match(invalidPreview.reason, /evidence.required_paths must include/);
+  assert.match(invalidPreview.reason, /completeness.evidence_paths must include/);
+  assert.match(invalidPreview.reason, /prefer_newer_after_exact_identity must match/);
+  assert.equal(fixture.bodies(), 0, 'invalid authoring never dispatches');
   const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
   assert.equal(requested.ok, true, JSON.stringify(requested));
   assert.equal(approvals.resolve(requested.approval.approvalId, 'approved', 'operator.original-text-pilot').ok, true);

@@ -918,17 +918,43 @@ function exactSingleReadPlan(input: {
       && dataset.merge.preserveSourceRecords === true
       && dataset.provenance.required === true
       && dataset.provenance.retainSourceSnapshots === true;
-    if (
-      stableJson(expectedFields) !== stableJson(projectedFields)
-      || stableJson(expectedRules) !== stableJson(projectedRules)
-      || stableJson(expectedOutcomeAuthority ?? null) !== stableJson(projectedOutcomeAuthority ?? null)
-      || !supportedMerge
-      || !contract.evidence.requiredPaths.includes(exactProjection.recordsPath)
-      || !contract.completeness.evidencePaths.includes(exactProjection.recordsPath)
-      || exactProjection.bounds.maxPages !== (continuation.kind === 'cursor' ? continuation.maxPages : 1)
-      || exactProjection.bounds.maxRecords > input.opportunity.pilot.maxRecords
-      || exactProjection.bounds.maxRecords > input.opportunity.budgets.maxRecordsPerRun
-    ) throw new Error('workflow_dataset_contract_unrepresented: result mapping, merge/provenance semantics, evidence, or reviewed bounds are incomplete');
+    // Explain each mismatch against the approved contract. A generic refusal
+    // forces the caller to guess and repeat discovery without changing the
+    // failing input. These diagnostics do not relax any admission predicate.
+    const mismatches: string[] = [];
+    if (stableJson(expectedFields) !== stableJson(projectedFields)) {
+      mismatches.push(`result_projection.fields must match approved fields ${stableJson(expectedFields)}`);
+    }
+    if (stableJson(expectedRules) !== stableJson(projectedRules)) {
+      mismatches.push(`result_projection.identity_rules must match approved identity ${stableJson(expectedRules)}`);
+    }
+    if (stableJson(expectedOutcomeAuthority ?? null) !== stableJson(projectedOutcomeAuthority ?? null)) {
+      mismatches.push(`result_projection.partition.outcome_authority must match approved authority ${stableJson(expectedOutcomeAuthority ?? null)}`);
+    }
+    if (!supportedMerge) {
+      if (stableJson(preferredFields) !== stableJson(projectedPreferred)) {
+        mismatches.push(`result_projection.resolution_policy.prefer_newer_after_exact_identity must match approved fields ${stableJson(preferredFields)}`);
+      } else {
+        mismatches.push('approved dataset merge/provenance policy is not representable by this projection; preserve the proposal and report the unsupported policy');
+      }
+    }
+    if (!contract.evidence.requiredPaths.includes(exactProjection.recordsPath)) {
+      mismatches.push(`contract.evidence.required_paths must include result_projection.records_path ${JSON.stringify(exactProjection.recordsPath)}`);
+    }
+    if (!contract.completeness.evidencePaths.includes(exactProjection.recordsPath)) {
+      mismatches.push(`contract.completeness.evidence_paths must include result_projection.records_path ${JSON.stringify(exactProjection.recordsPath)}`);
+    }
+    const expectedMaxPages = continuation.kind === 'cursor' ? continuation.maxPages : 1;
+    if (exactProjection.bounds.maxPages !== expectedMaxPages) {
+      mismatches.push(`result_projection.bounds.max_pages must equal continuation page bound ${expectedMaxPages}`);
+    }
+    if (exactProjection.bounds.maxRecords > input.opportunity.pilot.maxRecords
+      || exactProjection.bounds.maxRecords > input.opportunity.budgets.maxRecordsPerRun) {
+      mismatches.push(`result_projection.bounds.max_records must not exceed approved pilot/run bound ${Math.min(input.opportunity.pilot.maxRecords, input.opportunity.budgets.maxRecordsPerRun)}`);
+    }
+    if (mismatches.length > 0) {
+      throw new Error(`workflow_dataset_contract_unrepresented: ${mismatches.join('; ')}`);
+    }
   }
   return createWorkflowNodeInvocationPlan({
     requirementId: requirement.id,
