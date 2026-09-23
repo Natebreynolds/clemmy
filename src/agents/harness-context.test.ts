@@ -638,3 +638,17 @@ test('engaged offer context stays in the volatile first-reply context and out of
   assert.match(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'volatile' }), /OFFER_CONTEXT_FIXTURE/);
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'stable' }), /OFFER_CONTEXT_FIXTURE/);
 });
+
+test('explicit selection supplies only the selected offer to the volatile harness context', async () => {
+  const offers = await import('../runtime/proactive-offers.js');
+  const first = offers.publishProactiveOffer({ id: 'explicit-render-a', userId: 'owner', kind: 'goal', title: 'A goal', summary: 'UNSELECTED_OFFER_FIXTURE', whyNow: 'Related work', evidenceRefs: ['fact:a'] });
+  const { sessionId } = offers.discussProactiveOffer(first.id, 1, 'owner');
+  offers.publishProactiveOffer({ id: 'explicit-render-b', userId: 'owner', kind: 'skill', title: 'A skill', summary: 'SELECTED_SKILL_FIXTURE', whyNow: 'Learning receipt', evidenceRefs: ['receipt:b'], originSessionId: sessionId });
+  offers.discussProactiveOffer('explicit-render-b', 1, 'owner');
+  const event = appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Yes' } });
+  offers.bindProactiveOfferReply({ sessionId, sourceUserSeq: event.seq, userId: 'owner', offerId: 'explicit-render-b', revision: 1 });
+  const context = renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'volatile' });
+  assert.match(context, /SELECTED_SKILL_FIXTURE/);
+  assert.doesNotMatch(context, /UNSELECTED_OFFER_FIXTURE/);
+  assert.doesNotMatch(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'stable' }), /SELECTED_SKILL_FIXTURE/);
+});

@@ -51,6 +51,11 @@ function db() {
         offer_id TEXT NOT NULL, revision INTEGER NOT NULL, input_json TEXT NOT NULL,
         recorded_at TEXT NOT NULL, PRIMARY KEY (offer_id, revision)
       )`);
+      database.exec(`CREATE TABLE IF NOT EXISTS proactive_offer_replies (
+        session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL,
+        offer_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq)
+      )`);
       database.exec('CREATE INDEX IF NOT EXISTS proactive_offer_conversation ON proactive_offers (conversation_id, user_id, status)');
       database.exec(`INSERT OR IGNORE INTO proactive_offer_revisions
         SELECT id, revision, input_json, updated_at FROM proactive_offers`);
@@ -228,14 +233,64 @@ function armOfferContext(id: string, revision: number, sessionId: string): void 
     .run(revision, sessionId, id, revision);
 }
 
+/** Called by authenticated ingress before dispatch, inside its acceptance
+ * transaction when creating a new source. The audience comes from auth, never
+ * the offer payload. An accepted reply cannot be rebound on retry. */
+export function bindProactiveOfferReply(input: {
+  sessionId: string; sourceUserSeq: number; userId: string;
+  offerId: string; revision: number;
+}, now = new Date()): void {
+  const database = db();
+  database.transaction(() => {
+    const session = getSession(input.sessionId);
+    if (!session || session.kind !== 'chat' || session.userId !== input.userId) {
+      throw new Error('offer reply requires an owned chat');
+    }
+    const source = database.prepare(`SELECT seq FROM events WHERE seq = ? AND session_id = ?
+      AND type = 'user_input_received' AND role = 'user'
+      AND COALESCE(json_extract(data_json, '$.synthetic'), 0) != 1`)
+      .get(input.sourceUserSeq, input.sessionId);
+    if (!source) throw new Error('offer reply requires an accepted user source');
+    const old = database.prepare(`SELECT offer_id, revision FROM proactive_offer_replies
+      WHERE session_id = ? AND source_user_seq = ?`).get(input.sessionId, input.sourceUserSeq) as
+      { offer_id: string; revision: number } | undefined;
+    if (old) {
+      if (old.offer_id !== input.offerId || old.revision !== input.revision) throw new Error('offer reply binding conflict');
+      return; // Replay preserves identity even if the offer has since resolved.
+    }
+    const offer = getProactiveOffer(input.offerId, input.userId);
+    if (!offer || offer.conversationId !== input.sessionId) throw new Error('offer reply conversation mismatch');
+    if (offer.revision !== input.revision) throw new Error('offer revision conflict');
+    if (offer.status !== 'discussing') throw new Error('offer is not being discussed');
+    if (offer.expiresAt && Date.parse(offer.expiresAt) <= now.getTime()) throw new Error('offer expired');
+    const armed = database.prepare(`SELECT context_revision, context_after_seq FROM proactive_offers WHERE id = ?`)
+      .get(input.offerId) as { context_revision: number | null; context_after_seq: number | null };
+    if (armed.context_revision !== input.revision || input.sourceUserSeq <= (armed.context_after_seq ?? Infinity)) {
+      throw new Error('offer reply predates reviewed context');
+    }
+    database.prepare('INSERT INTO proactive_offer_replies VALUES (?, ?, ?, ?)')
+      .run(input.sessionId, input.sourceUserSeq, input.offerId, input.revision);
+  }).immediate();
+}
+
 /** Resolve data only for the exact first accepted user reply after engagement.
  * No new messages, no task authority, no repeated full context on later turns.
- * Ambiguous multiple offers in one chat require explicit UI selection later. */
+ * Explicit ingress bindings take precedence; ambiguity is never guessed. */
 export function proactiveOfferContextForTurn(sessionId: string, sourceUserSeq: number, now = new Date()): string {
   if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return '';
   const session = getSession(sessionId);
   if (!session?.userId || session.kind !== 'chat') return '';
-  const rows = db().prepare(`SELECT o.* FROM proactive_offers o
+  const database = db();
+  const binding = database.prepare(`SELECT offer_id, revision FROM proactive_offer_replies
+    WHERE session_id = ? AND source_user_seq = ?`).get(sessionId, sourceUserSeq) as
+    { offer_id: string; revision: number } | undefined;
+  if (binding) {
+    const offer = getProactiveOffer(binding.offer_id, session.userId);
+    if (!offer || offer.conversationId !== sessionId || offer.revision !== binding.revision
+      || offer.status !== 'discussing' || (offer.expiresAt && Date.parse(offer.expiresAt) <= now.getTime())) return '';
+    return renderOfferContext(offer);
+  }
+  const rows = database.prepare(`SELECT o.* FROM proactive_offers o
     WHERE o.conversation_id = ? AND o.user_id = ? AND o.status = 'discussing'
       AND o.context_revision = o.revision
       AND (json_extract(o.input_json, '$.expiresAt') IS NULL OR julianday(json_extract(o.input_json, '$.expiresAt')) > julianday(?))
@@ -244,7 +299,10 @@ export function proactiveOfferContextForTurn(sessionId: string, sourceUserSeq: n
         AND COALESCE(json_extract(e.data_json, '$.synthetic'), 0) != 1)
     LIMIT 2`).all(sessionId, session.userId, now.toISOString(), sourceUserSeq) as Row[];
   if (rows.length !== 1) return '';
-  const offer = decode(rows[0]);
+  return renderOfferContext(decode(rows[0]));
+}
+
+function renderOfferContext(offer: ProactiveOffer): string {
   return JSON.stringify({
     kind: 'proactive_offer_context', authority: 'context_only',
     offerId: offer.id, revision: offer.revision, proposedKind: offer.kind,

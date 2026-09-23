@@ -202,3 +202,43 @@ test('a changed offer waits for renewed engagement before contributing context',
   const next = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the revised context' } });
   assert.equal(JSON.parse(offers.proactiveOfferContextForTurn(sessionId, next.seq)).summary, 'Corrected context');
 });
+
+test('explicit reply selects one of two offers and survives restart without rebinding', () => {
+  const sessionId = log.createSession({ kind: 'chat', userId: 'owner' }).id;
+  for (const id of ['choice-a', 'choice-b']) {
+    offers.publishProactiveOffer({ ...input(id), originSessionId: sessionId });
+    offers.discussProactiveOffer(id, 1, 'owner');
+  }
+  const source = log.appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Yes' } });
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, source.seq), '');
+  const binding = { sessionId, sourceUserSeq: source.seq, userId: 'owner', offerId: 'choice-b', revision: 1 };
+  offers.bindProactiveOfferReply(binding);
+  log.closeEventLog();
+  offers.bindProactiveOfferReply(binding);
+  assert.equal(JSON.parse(offers.proactiveOfferContextForTurn(sessionId, source.seq)).offerId, 'choice-b');
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, offerId: 'choice-a' }), /binding conflict/);
+  offers.withdrawProactiveOffer('choice-b', 1, 'owner', 'Already resolved');
+  offers.bindProactiveOfferReply(binding);
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, source.seq), '', 'withdrawal must not fall back to the other offer');
+  assert.equal(log.listEvents(sessionId).length, 1, 'binding must not manufacture user input');
+});
+
+test('explicit reply rejects foreign, synthetic, stale and pre-engagement sources', () => {
+  const sessionId = log.createSession({ kind: 'chat', userId: 'owner' }).id;
+  const append = (synthetic = false) => log.appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Yes', synthetic } });
+  const before = append();
+  offers.publishProactiveOffer({ ...input('binding-guards'), originSessionId: sessionId });
+  offers.discussProactiveOffer('binding-guards', 1, 'owner');
+  const source = append();
+  const binding = { sessionId, sourceUserSeq: source.seq, userId: 'owner', offerId: 'binding-guards', revision: 1 };
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, userId: 'other' }), /owned chat/);
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, sourceUserSeq: append(true).seq }), /accepted user source/);
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, sourceUserSeq: before.seq }), /predates/);
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, revision: 2 }), /revision/);
+  offers.reviseProactiveOffer({ ...input('binding-guards'), originSessionId: sessionId, summary: 'Corrected' }, 1);
+  assert.throws(() => offers.bindProactiveOfferReply({ ...binding, revision: 2 }), /predates/);
+  offers.discussProactiveOffer('binding-guards', 2, 'owner');
+  const current = { ...binding, revision: 2, sourceUserSeq: append().seq };
+  offers.bindProactiveOfferReply(current);
+  assert.equal(JSON.parse(offers.proactiveOfferContextForTurn(sessionId, current.sourceUserSeq)).summary, 'Corrected');
+});
