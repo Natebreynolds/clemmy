@@ -1,37 +1,51 @@
 # Handoff: 3.18.20 readiness and the road to the next major tag
 
 Written 2026-09-22, end of day, by the session that ran the day's pre-tag pass.
-Read this with `docs/checkpoints/2026-09-22-author-fix-suggest.md` (the
-measurements) and `docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md` (the mandate).
-Nothing here is pushed or tagged. The tag belongs to the agent finishing the
-design changes.
+**For the harness agent** who refines the framework on top of this work. A
+separate UI agent owns the console/mobile design changes and will cut the
+3.18.20 tag; this document is not for them. Read this with
+`docs/checkpoints/2026-09-22-author-fix-suggest.md` (the measurements) and
+`docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md` (the mandate). Nothing here is
+pushed or tagged.
 
-## 1. Paste-ready prompt for the receiving agent
+## 1. Paste-ready prompt for the harness agent
 
 ```text
-You are taking over Clementine on the shared `main` worktree at /Users/nathan.reynolds/clementine-next.
-Read, in this order: docs/NEXT-TAG-HANDOFF-2026-09-22.md, docs/checkpoints/2026-09-22-author-fix-suggest.md,
-docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md, docs/NEXT-TAG-RELEASE-GATE.md ("Candidate and tag procedure").
+You are the harness agent for Clementine. You refine the framework on top of the 2026-09-22 work and finish what
+it left open. A separate UI agent owns the console/mobile design changes and will cut the v3.18.20 tag; you do not
+tag, you do not touch their files, and you do not put unreviewed runtime changes under their tag.
+
+Repo: /Users/nathan.reynolds/clementine-next (shared `main` worktree). Read, in this order:
+docs/NEXT-TAG-HANDOFF-2026-09-22.md (this), docs/checkpoints/2026-09-22-author-fix-suggest.md (measurements),
+docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md (the mandate), docs/NEXT-TAG-RELEASE-GATE.md ("Candidate and tag procedure").
+
+Coordination, until the v3.18.20 tag is pushed:
+- Work in your own worktree on a branch from main: `git worktree add ../clementine-next-harness-3-19 -b harness/3.19 main`.
+  The release runtime was gated at dce76b81; a runtime commit on main before the tag would ship ungated. After the
+  tag lands, rebase onto main and land your commits one reviewed series at a time.
+- The UI agent owns apps/console-web, apps/mobile-web, apps/desktop and .impeccable/. You own src/execution,
+  src/runtime, src/agents, src/tools, src/spaces, src/memory, scripts/ and docs/checkpoints/. Ask before crossing.
+- Never `git add -A`. Commit only the paths you changed. The owner's own docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md
+  is uncommitted on purpose; leave it.
 
 Binding rules (owner's, not negotiable):
 - Implement, do not audit. Every failure you see live is a framework defect to fix at the class level, pinned by a
-  test that fails without the fix. No band-aids, no rollout flags, no model or provider names in kernel decisions.
+  test that fails without the fix. No band-aids, no rollout flags, no model or provider names in kernel decisions,
+  no new chat verbs; behaviour lives in code, not prompts.
 - Test with Grok/GLM for generative work and Jev for decisions. Do not spend Claude or Codex quota on tests.
-  Never aim a destructive reset at the live home (~/.clementine-next). Isolated tests use their own CLEMENTINE_HOME.
-- Never `git add -A` here; another agent shares this worktree. Commit only the paths you changed.
-- No release without the owner's explicit instruction. When told to tag: version is ALREADY 3.18.20 in all four
-  package files; do not bump again. Cut `v3.18.20` at your final commit, push main and the tag; release-desktop.yml
-  builds, signs and publishes. Then delete ~/Library/Caches/@clemmydesktop-updater/pending.held-20260921-215159
-  and the stale update.zip beside it so the app fetches 3.18.20, and quit the app once so the signed bundle installs.
-- Launch the app BY PATH: `open ~/Applications/Clementine.app`. `open -a Clementine` starts a stale 3.18.6 copy
-  in /Applications. Confirm gitSha and entry from GET /api/console/build-info before driving anything.
-- Hotpatch only through the Terminal .command recipe (memory: hotpatch-terminal-and-held-updater-0922). A build
-  is required after ANY commit (the fingerprint covers src/, docs/, scripts/ and HEAD).
+  Never aim a destructive reset at the live home (~/.clementine-next); isolated tests use their own CLEMENTINE_HOME.
+- Measure on the installed app against the live home before calling anything done: one accepted source, one
+  terminal, exact settlements, before/after wall, calls and tokens on matched work.
+- Launch the app BY PATH (`open ~/Applications/Clementine.app`; `open -a Clementine` starts a stale 3.18.6 copy) and
+  confirm gitSha from GET /api/console/build-info before driving anything. Hotpatch only through the Terminal
+  .command recipe (memory: hotpatch-terminal-and-held-updater-0922), and only when the UI agent is not mid-cycle;
+  a build is required after ANY commit (the fingerprint covers src/, docs/, scripts/ and HEAD).
 - Run the full suite and journeys only on an otherwise idle machine; two hung files retire a loaded run early.
+  Attribute every failure by name at HEAD alone and at the last tag before calling it pre-existing.
 
-Your first job: finish the UI work you own, rebuild, typecheck, run the test files you touched plus
-test:release-assets, test:release-closure and test:public-hygiene, then wait for the owner's tag instruction.
-Your second job: section 6 of the handoff, in order, one accepted candidate per item, measured on the installed app.
+Your work is section 6, in order. One accepted candidate per item: the pin, the live trace on the installed app,
+the numbers in a checkpoint doc under docs/checkpoints/, and a memory note of every trap. Report what you
+verified, what you skipped, and what is still owed, in that order, in your own words.
 ```
 
 ## 2. Where things stand
@@ -122,6 +136,22 @@ a newer one exists, on boot and on demand (`bf684668`); surfaces never advertise
   Whats on my calendar today, Prospect outreach review, Content calendar review; Spaces Prospect campaign, Content
   calendar; plan proposal `plan-a1f3b23e`; the pending "Send Slack message" approval (send-mirror live proof waits
   on it). Two kept occurrences await a decision: today's daily-standup-email, the platform-49 review from 09-15.
+
+## 5b. The Jev handoff's definition of done, row by row
+
+| Row | Status on this candidate | Evidence or gap |
+|---|---|---|
+| Simple task with a known tool | Done | calendar read on the installed release daemon, 2 calls, 49.6k tokens on the target shape |
+| Mixed task discovering an unfamiliar tool | Not re-driven | earlier waves proved discovery; not repeated on this candidate |
+| Native workflow creation with a human review step | Done | prospecting and content-calendar journeys, gate → note → re-draft → approve |
+| Find and respond to the review item on desktop | Done | approval card with a person-readable draft, approve and request-changes |
+| … on mobile | Not driven | pairing token must stay out of transcripts; mobile renders through the same presentation code |
+| Request for changes preserves draft identity, invalidates stale approval | Done | `step_invalidated` under the run slug, consumed approval ids ignored, Jev `applied` 0.86 |
+| Account choice during creation testing, preview preserved | Done earlier (`1f045ec6`, `a11d7ca7`) | not re-driven today |
+| Approval/response continuation after restart, repeated taps, no duplicates | Pinned, not live | the v3.16 "approval/resume write" canary is still deferred; item 1 of section 6 |
+| Correct cancellation and truthful partial failure | Done | refused writes named as refusals; dead occurrences cancelled with reasons |
+| Retained-memory correction affecting a later task | Not re-driven | |
+| Before/after correctness, time, tokens, interventions on matched work | Done | tables in the checkpoint doc |
 
 ## 6. Direction for the next major tag (candidate name: 3.19 "trust to walk away")
 
