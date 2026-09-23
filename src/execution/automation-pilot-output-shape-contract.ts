@@ -1,3 +1,4 @@
+import { parseWorkflowCanonicalEntityResultProjection } from '../memory/workflow-result-projection-contract.js';
 /**
  * Provider-neutral admission for an automatic pilot's interpretation of live
  * read output bytes. The model may propose paths, but only exact paths proven
@@ -309,6 +310,8 @@ function resultShapeIssue(input: {
   }
   const projection = result.contract.resultProjection;
   if (!projection) return null;
+  const parsedProjection = parseWorkflowCanonicalEntityResultProjection(projection);
+  if (!parsedProjection.ok) return `Invalid result projection: ${parsedProjection.errors.join(' ')}`;
   if (
     !evidence.requiredPaths.includes(projection.recordsPath)
     || !evidence.nonEmptyPaths.includes(projection.recordsPath)
@@ -328,6 +331,7 @@ function resultShapeIssue(input: {
   }
   const fieldByName = new Map(projection.fields.map((field) => [field.field, field]));
   for (const field of projection.fields) {
+    if (field.hostSource !== undefined) continue; // Validated host evidence is not provider schema.
     const issue = requireTypes({
       root: item,
       path: field.recordPath,

@@ -418,7 +418,7 @@ function exactApprovedProposal(input: {
 function keyProjection(input: {
   proposal: AutomationOpportunityProposalRecordV1;
   plan: WorkflowNodeInvocationPlanV1;
-}): { ok: true; projection: WorkflowCanonicalEntityResultProjection; fields: WorkflowCanonicalEntityFieldProjectionV1[]; digest: string }
+}): { ok: true; projection: WorkflowCanonicalEntityResultProjection; fields: Extract<WorkflowCanonicalEntityFieldProjectionV1, { recordPath: string }>[]; digest: string }
   | { ok: false; code: string; reason: string } {
   const parsed = parseWorkflowCanonicalEntityResultProjection(input.plan.resultProjection);
   if (!parsed.ok) {
@@ -427,10 +427,10 @@ function keyProjection(input: {
   const keyFields = input.proposal.opportunity.partition.mode === 'finite'
     ? input.proposal.opportunity.partition.keyFields
     : [];
-  const mappings: WorkflowCanonicalEntityFieldProjectionV1[] = [];
+  const mappings: Extract<WorkflowCanonicalEntityFieldProjectionV1, { recordPath: string }>[] = [];
   for (const key of keyFields) {
     const field = parsed.contract.fields.find((candidate) => candidate.field === key);
-    if (!field || !field.required || !['string', 'timestamp', 'number', 'boolean'].includes(field.type)) {
+    if (!field || field.hostSource !== undefined || !field.required || !['string', 'timestamp', 'number', 'boolean'].includes(field.type)) {
       return {
         ok: false,
         code: 'partition_key_unrepresented',
@@ -510,7 +510,7 @@ interface PreparedPartition {
 function preparePartitions(input: {
   redeemed: VerifiedClosedWorkflowReadResultV1;
   projection: WorkflowCanonicalEntityResultProjection;
-  keyFields: WorkflowCanonicalEntityFieldProjectionV1[];
+  keyFields: Extract<WorkflowCanonicalEntityFieldProjectionV1, { recordPath: string }>[];
 }): { ok: true; partitions: PreparedPartition[] }
   | { ok: false; code: string; reason: string } {
   const partitions: PreparedPartition[] = [];

@@ -185,6 +185,11 @@ function approvedProposal(
     authored.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
     authored.pilot.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
     authored.budgets.maxOperationsPerRun = maxOperations + 1;
+    authored.dataset!.schema.fields.push(
+      { name: 'run_ref', type: 'string', required: true, sensitivity: 'internal' },
+      { name: 'observed_at', type: 'timestamp', required: true, sensitivity: 'public' },
+      { name: 'source_ref', type: 'string', required: true, sensitivity: 'public' },
+    );
     authored.dataset!.merge.mode = 'field_policy_after_exact_identity';
     authored.dataset!.merge.fieldPolicies = [{ field: 'scope', onConflict: 'prefer_newer' }];
   }
@@ -424,6 +429,11 @@ function blankStateFixture(label: string, options: {
             fields: [
               { field: 'key', recordPath: 'key', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
               { field: 'scope', recordPath: 'scope', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+              ...(options.localOutput ? [
+                { field: 'run_ref', hostSource: 'workflow_run_id' as const, type: 'string' as const, required: true, sensitivity: 'internal' as const, confidence: 1 },
+                { field: 'observed_at', hostSource: 'page_settled_at' as const, type: 'timestamp' as const, required: true, sensitivity: 'public' as const, confidence: 1 },
+                { field: 'source_ref', hostSource: 'page_receipt_id' as const, type: 'string' as const, required: true, sensitivity: 'public' as const, confidence: 1 },
+              ] : []),
             ],
             sourceRecord: { idPath: 'key', observedAt: { kind: 'page_settled_at' } },
             entityKind: 'generic-record',
@@ -597,7 +607,7 @@ function chatPilotRequest(
           records_path: projection.recordsPath,
           fields: projection.fields.map((field) => ({
             field: field.field,
-            record_path: field.recordPath,
+            ...(field.hostSource ? { host_source: field.hostSource } : { record_path: field.recordPath }),
             type: field.type,
             required: field.required,
             sensitivity: field.sensitivity,
@@ -1155,6 +1165,26 @@ test('reviewed read plus local output crosses three pages and publishes canonica
   assert.equal(head?.records.canonicalRecordsCreated, 2);
   assert.equal(head?.records.mergedObservations, 1);
   assert.equal(head?.quarantine.observationCount, 0);
+  const retainedPages = eventlog.openEventLog().prepare(`
+    SELECT page_receipt_id, settled_at FROM workflow_paginated_read_pages
+    WHERE activation_id IN (SELECT activation_id FROM workflow_paginated_read_activations WHERE run_id = ?)
+  `).all(queued.projection.runId) as Array<{ page_receipt_id: string; settled_at: string }>;
+  assert.equal(retainedPages.length, 3);
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId }).items;
+  assert.equal(recordIds.length, 2);
+  for (const id of recordIds) {
+    const canonical = entityStore.getCanonicalRecord(datasetId, id)!;
+    for (const evidence of canonical.fields.run_ref!.evidence) {
+      assert.equal(evidence.value, queued.projection.runId);
+      assert.equal(evidence.provenance.path, 'host:workflow_run_id');
+    }
+    for (const evidence of canonical.fields.observed_at!.evidence) {
+      assert.equal(evidence.value, evidence.observedAt);
+      assert.equal(evidence.provenance.path, 'host:page_settled_at');
+      assert.ok(retainedPages.some(page => page.settled_at === evidence.value));
+    }
+    assert.ok(canonical.fields.source_ref!.evidence.every(e => retainedPages.some(page => page.page_receipt_id === e.value && page.settled_at === e.observedAt) && e.provenance.path === 'host:page_receipt_id'));
+  }
   const firstHeadDigest = head?.headDigest;
 
   assert.deepEqual(

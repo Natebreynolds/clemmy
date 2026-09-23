@@ -96,17 +96,21 @@ const currentIdentityRuleSchema = z.discriminatedUnion('kind', [
   }).strict(),
 ]);
 
+const projectionFieldBase = z.object({
+  field: z.string().regex(EXACT_KEY_RE),
+  type: z.enum(['string', 'number', 'boolean', 'timestamp', 'object', 'array']),
+  required: z.boolean(),
+  sensitivity: z.enum(['public', 'internal', 'confidential', 'restricted']),
+  confidence: z.number().min(0).max(1),
+});
 const resultProjectionSchema = z.object({
   version: z.union([z.literal(1), z.literal(2)]),
   records_path: z.string().trim().min(1).max(512),
-  fields: z.array(z.object({
-    field: z.string().regex(EXACT_KEY_RE),
-    record_path: z.string().trim().min(1).max(512),
-    type: z.enum(['string', 'number', 'boolean', 'timestamp', 'object', 'array']),
-    required: z.boolean(),
-    sensitivity: z.enum(['public', 'internal', 'confidential', 'restricted']),
-    confidence: z.number().min(0).max(1),
-  }).strict()).min(1).max(512),
+  fields: z.array(z.union([
+    projectionFieldBase.extend({ record_path: z.string().trim().min(1).max(512) }).strict(),
+    projectionFieldBase.extend({ host_source: z.enum(['workflow_run_id', 'page_settled_at', 'page_receipt_id'])
+      .describe('Verified execution provenance; never read from provider data.') }).strict(),
+  ])).min(1).max(512),
   source_record: z.object({
     id_path: z.string().trim().min(1).max(512),
     revision_path: z.string().trim().min(1).max(512).optional(),
@@ -319,7 +323,7 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
     recordsPath: projection.records_path,
     fields: projection.fields.map((field) => ({
       field: field.field,
-      recordPath: field.record_path,
+      ...('host_source' in field ? { hostSource: field.host_source } : { recordPath: field.record_path }),
       type: field.type,
       required: field.required,
       sensitivity: field.sensitivity,

@@ -1302,3 +1302,46 @@ time and redeemed workflow lineage available, but does not expose explicit
 field mappings from that host evidence. Do not fabricate provider fields, infer
 a mapping from field names, or weaken the approved proposal to pass. Preserve
 the full original schema and success criteria in offline and installed checks.
+
+
+## Explicit host provenance field mappings — candidate follow-up
+
+Added mutually exclusive field mappings: existing `recordPath` or explicit
+`hostSource` (`workflow_run_id`, `page_settled_at`, `page_receipt_id`). Tool
+authoring exposes the snake-case equivalents. No field-name inference or
+provider-specific rule is involved. Each mapping remains digest-bound and
+reviewed. The parser rejects dual sources, unknown sources and incompatible
+types. Old record-path contracts keep their existing serialized bytes.
+
+The producer obtains run identity only after exact workflow lineage redemption;
+page time and receipt identity come from verified retained page settlements.
+Host fields are excluded from provider record-shape matching, while provider
+fields still require exact paths/types and the closed record shape. Output
+schema attestation validates the projection before excluding host fields from
+provider schema requirements. Finite partition keys continue to require source
+record scalar fields; a host receipt cannot masquerade as a discovered key.
+
+The controlled three-page pilot now projects run/time/receipt fields through
+chat tool schema, approval, compilation, execution, canonical storage and
+Workspace publication. Assertions compare stored references and times with
+actual retained page rows and the exact queued run; replay preserves the head
+and makes no extra dispatch. Existing provider fields remain checked.
+
+Validation: 28 focused checks passed across pilot control plane, output-shape
+contract, partition authority and authoring dispatcher
+(`/tmp/clem-host-provenance-final.log`, session 66197 exit 0). Final typecheck
+passed (`/tmp/clem-host-provenance-typecheck-complete.log`, session 10075 exit 0).
+`git diff --check` passed. A direct regression against the previous committed
+parser failed with `fields[1] must be closed` for the same valid host mapping
+(`/tmp/clem-host-provenance-red.log`); temporary comparison module was removed.
+Two intermediate typechecks found a widened partition-key type; its validated
+record-only type now flows through key preparation. No model calls, business
+writes, live-home resets, UI edits, install or tag performed. The independent
+live-home sentinel remained NOT PERFORMED while the daemon owned that home.
+
+Still owed: test the full original documentation-inventory proposal against
+the provider's actual declared output shape and bounded-selection semantics,
+build the clean candidate, hotpatch via the Terminal recipe, and qualify the
+original proposal on the installed app. These controlled fixtures do not prove
+that provider-specific acceptance or the broader release gates. Installed app
+remains the earlier d2 candidate until reverified through build-info.

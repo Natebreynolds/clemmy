@@ -261,3 +261,34 @@ test('unsupported schema composition is never treated as path proof', () => {
   assert.equal(checked.ok, false);
   if (!checked.ok) assert.match(checked.reason, /unsupported schema composition/);
 });
+
+
+test('explicit host provenance maps without inventing provider output fields', () => {
+  const attested = attestAutomationPilotOutputShape({ request: request(), requestDigest: DIGEST });
+  assert.equal(attested.ok, true);
+  if (!attested.ok) return;
+  const candidate = result();
+  const previous = candidate.contract.resultProjection!;
+  const { projectionDigest: _digest, ...base } = previous;
+  candidate.contract.resultProjection = createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    fields: [...base.fields,
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+  });
+  assert.notEqual(candidate.contract.resultProjection.projectionDigest, previous.projectionDigest);
+  assert.deepEqual(validateAutomationPilotAuthoringOutputShape({ receipt: attested.receipt, result: candidate }), { ok: true });
+  const host = candidate.contract.resultProjection.fields.at(-1)!;
+  for (const invalid of [
+    { ...host, recordPath: 'spoofed' },
+    { ...host, hostSource: 'invented_source' },
+    { ...host, type: 'number' },
+    { ...host, hostSource: undefined },
+  ]) {
+    assert.throws(() => createWorkflowCanonicalEntityResultProjection({
+      ...base, fields: [invalid as typeof host],
+    }));
+  }
+});

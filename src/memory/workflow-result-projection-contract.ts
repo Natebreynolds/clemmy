@@ -24,14 +24,15 @@ export type WorkflowCanonicalEntityNormalizerV1 =
   | 'unicode_nfkc'
   | 'numeric';
 
-export interface WorkflowCanonicalEntityFieldProjectionV1 {
+export type WorkflowCanonicalEntityHostFieldSource = 'workflow_run_id' | 'page_settled_at' | 'page_receipt_id';
+
+export type WorkflowCanonicalEntityFieldProjectionV1 = {
   field: string;
-  recordPath: string;
   type: WorkflowCanonicalEntityFieldTypeV1;
   required: boolean;
   sensitivity: 'public' | 'internal' | 'confidential' | 'restricted';
   confidence: number;
-}
+} & ({ recordPath: string; hostSource?: never } | { hostSource: WorkflowCanonicalEntityHostFieldSource; recordPath?: never });
 
 export interface WorkflowCanonicalEntityIdentityRuleProjectionV1 {
   ruleId: string;
@@ -276,14 +277,21 @@ export function parseWorkflowCanonicalEntityResultProjection(
     for (const [index, mapping] of canonical.fields.entries()) {
       const item = record(mapping);
       if (!item || !exactKeys(item, [
-        'field', 'recordPath', 'type', 'required', 'sensitivity', 'confidence',
-      ])) {
+        'field', 'type', 'required', 'sensitivity', 'confidence',
+      ], ['recordPath', 'hostSource'])) {
         errors.push(`fields[${index}] must be closed.`);
         continue;
       }
       if (!field(mapping.field) || names.has(mapping.field)) errors.push(`fields[${index}].field is invalid or duplicated.`);
       else names.add(mapping.field);
-      if (!path(mapping.recordPath)) errors.push(`fields[${index}].recordPath is invalid.`);
+      const hasRecord = Object.hasOwn(item, 'recordPath');
+      const hasHost = Object.hasOwn(item, 'hostSource');
+      if (hasRecord === hasHost) errors.push(`fields[${index}] requires exactly one recordPath or hostSource.`);
+      if (hasRecord && !path(mapping.recordPath)) errors.push(`fields[${index}].recordPath is invalid.`);
+      if (hasHost && (!['workflow_run_id', 'page_settled_at', 'page_receipt_id'].includes(String(mapping.hostSource))
+        || mapping.type !== (mapping.hostSource === 'page_settled_at' ? 'timestamp' : 'string'))) {
+        errors.push(`fields[${index}].hostSource or its type is invalid.`);
+      }
       if (!FIELD_TYPES.has(mapping.type)) errors.push(`fields[${index}].type is invalid.`);
       if (typeof mapping.required !== 'boolean') errors.push(`fields[${index}].required must be boolean.`);
       if (!SENSITIVITIES.has(mapping.sensitivity)) errors.push(`fields[${index}].sensitivity is invalid.`);
