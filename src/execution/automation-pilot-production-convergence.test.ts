@@ -79,7 +79,7 @@ function opportunity(label: string) {
       description: `retrieve exact ${label} records`,
       minimumEffect: 'read',
       constraints: ['Return a bounded records collection.'],
-    }],
+    }, { id: 'local-output', description: 'Save the reviewed dataset into the selected Workspace.', minimumEffect: 'local_write', constraints: ['Exact Workspace projection only.'] }],
     phases: [{
       id: 'read-result',
       objective: 'Retrieve the exact bounded records.',
@@ -88,8 +88,8 @@ function opportunity(label: string) {
       effect: { class: 'read', approval: 'not_required', maxOperationsPerRun: 1 },
       partitioned: false,
       outputEvidence: ['The records collection is non-empty.'],
-    }],
-    effectCeiling: { class: 'read', maxOperationsPerRun: 1 },
+    }, { id: 'save-result', objective: 'Save the dataset with provenance.', dependsOn: ['read-result'], capabilityRequirementIds: ['local-output'], effect: { class: 'local_write', approval: 'not_required', maxOperationsPerRun: 1 }, partitioned: false, outputEvidence: ['Exact Workspace projection head.'] }],
+    effectCeiling: { class: 'local_write', maxOperationsPerRun: 2 },
     dataset: {
       schema: {
         fields: [
@@ -132,7 +132,7 @@ function opportunity(label: string) {
       required: true,
       maxPartitions: 1,
       maxRecords: 10,
-      effectCeiling: { class: 'read', maxOperationsPerRun: 1 },
+      effectCeiling: { class: 'local_write', maxOperationsPerRun: 2 },
       successCriterionIds: ['complete'],
       haltOnFailure: true,
     },
@@ -142,7 +142,7 @@ function opportunity(label: string) {
       maxAttemptsPerPartition: 1,
       maxPartitionsPerRun: 1,
       maxRecordsPerRun: 10,
-      maxOperationsPerRun: 1,
+      maxOperationsPerRun: 2,
       reserveOperations: 0,
     },
   });
@@ -152,6 +152,7 @@ function exactCandidate(prompt: string) {
   const projected = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2)) as {
     request: {
       requestId: string;
+      workspaceOutputPhaseId?: string;
       requirement: { phaseId: string; requirementId: string };
       workspaceSelection: Parameters<typeof projections.createWorkflowCanonicalEntityResultProjection>[0] extends never
         ? never
@@ -164,6 +165,7 @@ function exactCandidate(prompt: string) {
     requestId: projected.request.requestId,
     requestDigest: projected.requestDigest,
     contract: {
+      workspaceOutputPhaseId: projected.request.workspaceOutputPhaseId,
       phaseId: projected.request.requirement.phaseId,
       requirementId: projected.request.requirement.requirementId,
       workflowInputs: { scope: { type: 'string', required: true } },

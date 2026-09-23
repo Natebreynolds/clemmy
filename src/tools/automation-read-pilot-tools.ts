@@ -1,3 +1,4 @@
+import { selectAutomaticReadPilotTarget } from '../execution/automation-pilot-target.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
@@ -199,6 +200,7 @@ const resultProjectionSchema = z.object({
 });
 
 const typedContractSchema = z.object({
+  workspace_output_phase_id: z.string().regex(EXACT_REF_RE).optional().describe('Exact local dataset-output phase represented by the separately approved Workspace projection; required when the proposal includes that phase.'),
   phase_id: z.string().regex(EXACT_REF_RE),
   requirement_id: z.string().regex(EXACT_REF_RE),
   workflow_inputs: z.record(z.string().regex(EXACT_KEY_RE), stringWorkflowInputSchema),
@@ -289,24 +291,12 @@ function acquisitionScope(input: {
   if (proposal.status !== 'approved') {
     return { ok: false, code: 'proposal_not_approved', reason: 'The proposal has not completed its separate user-owned review decision.' };
   }
-  const phase = proposal.opportunity.phases[0];
-  const requirement = proposal.opportunity.capabilityRequirements[0];
-  if (
-    proposal.opportunity.phases.length !== 1
-    || proposal.opportunity.capabilityRequirements.length !== 1
-    || !phase
-    || !requirement
-    || phase.id !== input.phaseId
-    || requirement.id !== input.requirementId
-    || phase.capabilityRequirementIds.length !== 1
-    || phase.capabilityRequirementIds[0] !== requirement.id
-    || phase.effect.class !== 'read'
-    || requirement.minimumEffect !== 'read'
-    || proposal.opportunity.effectCeiling.class !== 'read'
-  ) return {
-    ok: false,
-    code: 'pilot_requirement_unsupported',
-    reason: 'Acquisition-reference issuance requires the exact single read phase and requirement.',
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) return { ok: false, code: 'pilot_requirement_unsupported', reason: target.reason };
+  const { phase, requirement } = target;
+  if (phase.id !== input.phaseId || requirement.id !== input.requirementId) return {
+    ok: false, code: 'pilot_requirement_unsupported',
+    reason: 'Acquisition references bind the selected read phase and requirement; Workspace output is bound separately in the pilot contract.',
   };
   return {
     ok: true,
@@ -447,6 +437,7 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
         })
     : undefined;
   return {
+    ...(input.workspace_output_phase_id ? { workspaceOutputPhaseId: input.workspace_output_phase_id } : {}),
     phaseId: input.phase_id,
     requirementId: input.requirement_id,
     workflowInputs: structuredClone(input.workflow_inputs),

@@ -201,6 +201,7 @@ export interface AutomationSingleReadPilotContractV1 {
   continuation?: WorkflowNodeContinuationContractV1;
   resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
+  workspaceOutputPhaseId?: string;
 }
 
 export type AutomationWorkflowBridgeIssueCode =
@@ -813,6 +814,15 @@ function exactSingleReadPlan(input: {
   const target = selectAutomaticReadPilotTarget(input.opportunity);
   if (!target.ok) throw new Error(target.reason);
   const { phase, requirement } = target;
+  if (target.workspaceOutputPhase) {
+    if (contract.workspaceOutputPhaseId !== target.workspaceOutputPhase.id
+      || !contract.resultProjection || !contract.workspaceBindingSelection) {
+      throw new Error('workspace_binding_contract_unrepresented: the local output phase needs its exact explicit Workspace projection binding');
+    }
+  } else if (contract.workspaceOutputPhaseId !== undefined) {
+    throw new Error('workspace_binding_contract_unrepresented: the proposal has no matching local output phase');
+  }
+
   const binding = input.bindings.find((candidate) => candidate.requirementId === contract.requirementId);
   if (
     contract.phaseId !== phase.id
@@ -1067,6 +1077,7 @@ function buildPreview(input: {
     partition: input.opportunity.partition,
     dataset: input.opportunity.dataset ?? null,
     recurrence: input.target === 'recurrence' ? input.opportunity.recurrence : { mode: 'none' },
+    ...(input.readPilotContract?.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.readPilotContract.workspaceOutputPhaseId } : {}),
     phaseEffects: input.opportunity.phases.map((phase) => ({
       phaseId: phase.id,
       effect: phase.effect,
@@ -1144,7 +1155,10 @@ function representationIssues(
       });
     }
   }
-  if (opportunity.phases.some((phase) => phase.effect.class !== 'read')) {
+  const representedLocalOutput = pilotTarget.ok && pilotTarget.workspaceOutputPhase
+    && exactReadPlan?.resultProjection && preview.canonicalEntityWorkspaceBinding;
+  if (opportunity.phases.some((phase) => phase.effect.class !== 'read'
+    && !(representedLocalOutput && phase.id === pilotTarget.workspaceOutputPhase?.id))) {
     issues.push({
       code: 'workflow_effect_authority_unrepresented',
       message: 'WorkflowDefinition collapses local/external effects and cannot persist exact prior approval plus readback authority.',

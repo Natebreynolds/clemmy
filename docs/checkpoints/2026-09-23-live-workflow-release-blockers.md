@@ -1153,3 +1153,112 @@ final rerun passed 14/14 (/tmp/clem-review-preview-final.log); typecheck passed 
 (/tmp/clem-review-preview-typecheck.log). Live-home sentinel is
 NOT PERFORMED while daemon owns stores, not an isolation proof. No paid model
 calls. Candidate still requires build and installed API/rendered acceptance.
+
+### d2aad1c41 live preview acceptance
+
+Build session93447 exit0 (roughly five minutes under load; compiler remained
+CPU-active). Clean d2aad1c41c9c187d764799b96f543bd2d8d68031 patched through
+Terminal recipe after active/runningRuns/backgroundActive=0 and started physical
+dispatches=0. Running API verifies fingerprint
+ff589a5c2b12685fbc0e5f0e158fa8415530fafa64b8a06128a4714cccdebccf,
+daemon10852, schema81. Rollback dist.backup-rTYHlZ. Main e77215d00 unchanged.
+
+Exact pending apr-e9ap survived restart: args and requestedAt match prepatch;
+contentPreview expanded from "proposed" to a 6,057-character exact proposal
+preview. API evidence saved under output/harness-acceptance/2026-09-23-preview-d2/.
+Native desktop inspection independently confirmed objective visible under What
+you are approving, Show the whole draft expands it, and screenshot showed the
+scope statement and proposal-only boundary. No approval clicked; no model calls,
+no pilot or recurrence started. Desktop rendering passes this bounded content
+check; physical mobile still unverified. Existing detail pane remains technical
+IDs, and expanded preview uses JSON for structured limits. Do not call this
+premium UI completion. UI ownership was not crossed.
+
+Operational trap: querying native AX after quitting may relaunch the app.
+First quit ended old process but AX inspection relaunched it; quit again and
+waited for zero exact-path app processes before patching. Do not repeat the AX
+query during shutdown. After startup, Needs you additionally surfaced Platform49
+"Paused after repeated restarts". Do not infer the preview patch caused it or
+resume the personal workflow. Inspect durable restart counters/recovery records
+before further hotpatch cycles; repeated acceptance restarts may expose a
+framework recovery/circuit-breaker interaction. No business workflow state was
+manually repaired or changed.
+
+### Restart-pause audit and next durable-pilot failure
+
+Platform49's sole boot-cap parked occurrence is
+trigger-e90fa09ed6e577f118d26db2c76e4fab, started2026-09-15T23:00:17.062Z,
+parkedAt2026-09-22T10:02:00.571Z, count350, mark2026-09-15T23:01:31.221Z.
+Its notification was created September15 and is read. No evidence that d2's
+hotpatch newly parked it. Existing parked-skip logic already protects it;
+9/9 workflow-boot-resume-cap checks pass (/tmp/clem-preview-boot-cap.log).
+No personal workflow mutation or resume performed.
+
+Automated operator acceptance then approved only exact fixture apr-e9ap through
+POST harness-approvals/apr-e9ap/approve. API reports resolved approved (legacy
+route status resolved-stale); independent readonly opportunity DB confirms
+approved revision3, unchanged digest9574eff2...f207. This is NOT physical-human
+or phone acceptance. No pilot/schedule permission was supplied.
+
+Follow-up source291720 asked Clem to prepare the separately reviewed disabled
+pilot from that approved proposal. Terminal291777 needs_input;4 top-levelcalls,
+1 discovery,27,960ms,153,041 input/95,451cached/57,590uncached/1,590output.
+Actual Opus5.5 x3,Grok4.3 x2,Jevlatest x1,Jev1.13.0 x1;one uncertified usagecall.
+Both acquisition_list and workspace_list refused pilot_requirement_unsupported.
+No pilot, Space or schedule created. Evidence: output/harness-acceptance/
+2026-09-23-pilot-d2/ (secrets/prompt and memory-context fragments excluded).
+
+Root is not stale approval or provider auth. acquisitionScope in
+src/tools/automation-read-pilot-tools.ts requires phases.length==1,
+capabilityRequirements.length==1 and global effectCeiling read. Approved proposal
+has a root inventory read and dependent local Space write, dataset/provenance
+schema, local_write global AND pilot ceiling. Its success criteria require the
+bounded snapshot to be written to the new Space. selectAutomaticReadPilotTarget,
+read-pilot-control-plane proposalIssue, and workflow-bridge representationIssues
+also reject that shape. Removing just the first guard is not a fix. Do not ask
+Clem to rewrite this into an easier read-only task and call the lifecycle passed.
+
+Next implementation must represent the original read + local dataset output
+through the existing exact Workspace projection/consent contract, retain all
+success criteria and provenance, and prove selected read dispatch plus exact
+local projection without executing arbitrary downstream work. Generic unrelated
+writes, ambiguous read roots, missing Workspace consent, stale CAS and non-read
+provider calls must remain excluded. Current model's suggested rewrite was NOT
+authorized or performed. No candidate loosening these guards has been written.
+
+### Read + exact local output candidate — checked, not installed
+
+Reproduced the unchanged approved live proposal in
+src/execution/fixtures/read-local-dataset-opportunity.json. Selector pin failed
+before change (/tmp/clem-local-pilot-target-red.log);7 target checks now pass.
+Selector admits a root read plus dependent local dataset-output phase only when
+both reviewed overall/pilot ceilings include local output. This does not execute
+that phase as a tool: the typed contract must explicitly name
+workspaceOutputPhaseId and supply exact resultProjection + separately approved
+workspaceBindingSelection. Missing/wrong output binding refuses compilation.
+The binding enters the control digest; model authoring cannot change it. Read
+carrier effects remain read. Existing single-read and finite source shapes stay
+on their prior path. Tool acquisition now uses the shared selector rather than
+a contradictory phases.length==1 check. Workspace tools still take the selected
+read phase/requirement; the refusal explains that output binds separately.
+
+30 control-plane/workflow-bridge checks pass (/tmp/clem-local-pilot-control.log).
+The strengthened dataset path executes three exact pages, projects canonical
+truth into the approved Workspace, retains provenance and rejects missing/wrong
+output-phase binding before dispatch. Replay does not redispatch reads. The
+production convergence fixture now carries the explicit local output through
+constrained authoring, full pilot approval, exact execution and recurrence;
+16 production/shape/advancement checks pass (/tmp/clem-local-pilot-production.log).
+Final typecheck exit0 (/tmp/clem-local-pilot-typecheck-final.log). These are
+recording/injected fixtures, not live provider or installed acceptance. No paid
+calls. Sentinel remains NOT PERFORMED while daemon owns live stores.
+
+No hotpatch yet: proactively found another representation gap in the ORIGINAL
+live proposal. Its dataset.merge uses field_policy_after_exact_identity with
+prefer_newer for observed_at/run_ref/source_ref. workflow-bridge supportedMerge
+accepts only review_required mode/default/per-field rules. The new integration
+fixtures prove local-output representation with supported merge semantics, not
+that original field-merge policy. Preserve the approved live contract; implement
+and pin its exact merge semantics before another paid live attempt. Do not simply
+relax supportedMerge, replace the proposal, or claim this candidate alone passes
+the original lifecycle. Current installed build remains d2aad1c41.

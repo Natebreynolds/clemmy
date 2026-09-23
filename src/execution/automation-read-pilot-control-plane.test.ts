@@ -176,11 +176,20 @@ function approvedProposal(
   recurring = false,
   dataset = false,
   maxOperations = 1,
+  localOutput = false,
 ): AutomationOpportunityProposalRecordV1 {
+  const authored = opportunity(label, effect, recurring, dataset, maxOperations);
+  if (localOutput) {
+    authored.capabilityRequirements.push({ id: 'workspace-output', description: 'Persist the reviewed dataset in the chosen Workspace.', minimumEffect: 'local_write', constraints: ['Only the exact consented Workspace projection.'] });
+    authored.phases.push({ id: 'persist-result', objective: 'Persist the dataset with its provenance.', dependsOn: ['read-result'], capabilityRequirementIds: ['workspace-output'], effect: { class: 'local_write', approval: 'not_required', maxOperationsPerRun: 1 }, partitioned: false, outputEvidence: ['Exact Workspace projection head.'] });
+    authored.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
+    authored.pilot.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
+    authored.budgets.maxOperationsPerRun = maxOperations + 1;
+  }
   const proposalId = unique(`proposal_${label}`);
   const created = opportunityStore.createAutomationOpportunityProposal({
     proposalId,
-    opportunity: opportunity(label, effect, recurring, dataset, maxOperations),
+    opportunity: authored,
     actorRef: `accepted-source:chat.${label}#1`,
   });
   assert.equal(created.ok, true, JSON.stringify(created));
@@ -221,6 +230,7 @@ interface BlankStateFixture {
 function blankStateFixture(label: string, options: {
   recurring?: boolean;
   dataset?: boolean;
+  localOutput?: boolean;
   pages?: number;
   paginationMode?: 'complete' | 'cycle' | 'budget';
 } = {}): BlankStateFixture {
@@ -232,6 +242,7 @@ function blankStateFixture(label: string, options: {
     options.recurring === true,
     options.dataset === true,
     pageCount,
+    options.localOutput === true,
   );
   const chatId = unique(`chat.${label}`);
   eventlog.createSession({ id: chatId, kind: 'chat' });
@@ -544,6 +555,7 @@ function chatPilotRequest(
     expected_proposal_digest: fixture.input.expectedProposalDigest,
     acquisition_ref: acquisitionRef,
     contract: {
+      ...(fixture.input.contract.workspaceOutputPhaseId ? { workspace_output_phase_id: fixture.input.contract.workspaceOutputPhaseId } : {}),
       phase_id: fixture.input.contract.phaseId,
       requirement_id: fixture.input.contract.requirementId,
       workflow_inputs: fixture.input.contract.workflowInputs,
@@ -981,9 +993,9 @@ test('Workspace creation approval converges across crash, rejection, expiry, can
   });
 });
 
-test('blank-home reviewed dataset chat pilot crosses three pages and publishes canonical truth before success', async () => {
+test('reviewed read plus local output crosses three pages and publishes canonical truth before success', async () => {
   const baselineRunFiles = runFiles().length;
-  const fixture = blankStateFixture('dataset', { dataset: true, pages: 3 });
+  const fixture = blankStateFixture('dataset', { dataset: true, pages: 3, localOutput: true });
   const surface = chatPilotSurface(fixture);
   assert.ok(fixture.workspaceCreation);
   assert.equal(spaces.spaceStore.get(fixture.workspaceCreation!.workspaceId), undefined);
@@ -1021,6 +1033,7 @@ test('blank-home reviewed dataset chat pilot crosses three pages and publishes c
   assert.equal(created.state, 'created');
   const workspaceSelection = created.projection.selection;
   fixture.input.contract.workspaceBindingSelection = workspaceSelection;
+  fixture.input.contract.workspaceOutputPhaseId = 'persist-result';
   assert.ok(spaces.spaceStore.get(workspaceSelection.workspaceId));
   const inventory = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_list')!(
     chatPilotAcquisitionListRequest(fixture),
@@ -1036,6 +1049,13 @@ test('blank-home reviewed dataset chat pilot crosses three pages and publishes c
   }]);
   assert.equal(inventory.selectionAuthority, 'none');
 
+  for (const phaseBinding of [undefined, 'read-result', 'unrelated-output']) {
+    const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+    (invalid.contract as Record<string, unknown>).workspace_output_phase_id = phaseBinding;
+    const denied = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalid));
+    assert.equal(denied.ok, false, JSON.stringify(denied));
+    assert.equal(fixture.bodies(), 0);
+  }
   const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(
     chatPilotRequest(fixture, surface.acquisitionRef),
   ));

@@ -405,6 +405,7 @@ export function automationPilotAuthoringPrompt(input: {
         proposal: input.request.proposal,
         acceptedSource: input.request.acceptedSource,
         requirement: input.request.requirement,
+        ...(input.request.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.request.workspaceOutputPhaseId } : {}),
         ...(input.request.workspaceSelection
           ? { workspaceSelection: input.request.workspaceSelection }
           : {}),

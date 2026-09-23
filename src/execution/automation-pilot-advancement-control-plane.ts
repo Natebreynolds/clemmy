@@ -157,6 +157,7 @@ export interface AutomationPilotAuthoringRequestV1 {
     effect: 'read';
   };
   workspaceSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
+  workspaceOutputPhaseId?: string;
   acquisition: AutomationPilotAcquisitionSnapshotV1;
   authority: {
     workspaceMutation: 'none';
@@ -1002,6 +1003,7 @@ function buildAuthoringRequest(input: {
       digest: input.proposal.digest,
       opportunity: structuredClone(input.proposal.opportunity),
     },
+    ...(target.workspaceOutputPhase ? { workspaceOutputPhaseId: target.workspaceOutputPhase.id } : {}),
     acceptedSource: {
       sessionId: input.current.ownerSessionId,
       sourceUserSeq: input.current.sourceUserSeq,
@@ -1586,6 +1588,9 @@ function authoringResultIssue(input: {
   const target = selectAutomaticReadPilotTarget(proposal.opportunity);
   if (!target.ok) return target.reason;
   const { phase, requirement } = target;
+  if (result.contract.workspaceOutputPhaseId !== target.workspaceOutputPhase?.id) {
+    return 'The authoring result does not bind the exact local output phase to its Workspace projection.';
+  }
   if (result.contract.phaseId !== phase.id || result.contract.requirementId !== requirement.id) {
     return 'The authoring result names a different phase or requirement.';
   }

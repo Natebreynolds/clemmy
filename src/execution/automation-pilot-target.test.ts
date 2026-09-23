@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -118,5 +119,27 @@ test('the closed finite selector rejects arbitrary, ambiguous, and partitioned s
       const selected = selectAutomaticReadPilotTarget(candidate);
       assert.equal(selected.ok, false, JSON.stringify(selected));
     });
+  }
+});
+
+
+test('the live read plus local dataset proposal retains its exact output phase', () => {
+  const proposal = parseAutomationOpportunity(JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')));
+  const target = selectAutomaticReadPilotTarget(proposal);
+  assert.equal(target.ok, true, JSON.stringify(target));
+  if (!target.ok) return;
+  assert.equal(target.phase.id, 'read-inventory');
+  assert.equal(target.requirement.id, 'doc-section-inventory-read');
+  assert.equal(target.workspaceOutputPhase?.id, 'write-space');
+  for (const mutate of [
+    (p: AutomationOpportunityV1) => { p.phases[1]!.effect.class = 'external_write'; },
+    (p: AutomationOpportunityV1) => { p.phases[1]!.dependsOn = []; },
+    (p: AutomationOpportunityV1) => { p.phases[1]!.partitioned = true; },
+    (p: AutomationOpportunityV1) => { delete p.dataset; },
+    (p: AutomationOpportunityV1) => { p.capabilityRequirements[1]!.minimumEffect = 'external_write'; },
+    (p: AutomationOpportunityV1) => { p.phases[0]!.dependsOn = ['write-space']; },
+  ]) {
+    const changed = structuredClone(proposal); mutate(changed);
+    assert.equal(selectAutomaticReadPilotTarget(changed).ok, false, JSON.stringify(changed.phases));
   }
 });

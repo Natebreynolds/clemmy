@@ -95,6 +95,7 @@ export interface AutomationReadPilotTypedContractV1 {
   continuation?: WorkflowNodeContinuationContractV1;
   resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
+  workspaceOutputPhaseId?: string;
 }
 
 export interface RegisterAutomationReadPilotProjectionInputV1 {
@@ -626,7 +627,7 @@ function proposalIssue(input: {
   if (
     phase.effect.class !== 'read'
     || requirement.minimumEffect !== 'read'
-    || opportunity.effectCeiling.class !== 'read'
+    || (!target.workspaceOutputPhase && opportunity.effectCeiling.class !== 'read')
   ) return { code: 'capability_effect_unsafe', reason: 'Compute or write work cannot enter the one-read pilot.' };
   return null;
 }
@@ -693,6 +694,7 @@ function prepareProjection(
     }],
   };
   const readPilotContract: AutomationSingleReadPilotContractV1 = {
+    ...(input.contract.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.contract.workspaceOutputPhaseId } : {}),
     phaseId: input.contract.phaseId,
     requirementId: input.contract.requirementId,
     workflowInputs: structuredClone(input.contract.workflowInputs),
