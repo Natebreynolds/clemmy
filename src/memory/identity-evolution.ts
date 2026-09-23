@@ -30,7 +30,7 @@ import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
 import { BASE_DIR, getRuntimeEnv, MODELS } from '../config.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, markNotificationRead } from '../runtime/notifications.js';
 import { IDENTITY_FILE, SOUL_FILE, composeCuratedMemory, sanitizeCuratedMemory, splitCuratedMemory } from './vault.js';
 import { listActiveFacts, type ConsolidatedFact } from './facts.js';
 import { isDurableUserFact } from './identity-md-builder.js';
@@ -307,6 +307,13 @@ export interface ApplyProposalResult {
   proposal?: IdentityProposal;
 }
 
+function retireProposalNotification(id: string): void {
+  // The durable proposal is authority. A presentation-store failure must not
+  // make an already-applied personality change appear to have failed.
+  try { markNotificationRead(`identity-proposal-${id}`); }
+  catch { logger.warn({ proposalId: id }, 'could not retire identity proposal notification'); }
+}
+
 /**
  * Apply an approved proposal to the curated half of its target file.
  * Fails closed on staleness: if the user edited the curated text after
@@ -317,7 +324,10 @@ export function approveIdentityProposal(id: string, now = new Date()): ApplyProp
   const store = loadStore();
   const proposal = store.proposals.find((p) => p.id === id);
   if (!proposal) return { applied: false, reason: 'not-found' };
-  if (proposal.status !== 'pending') return { applied: false, reason: 'not-pending', proposal };
+  if (proposal.status !== 'pending') {
+    retireProposalNotification(id);
+    return { applied: false, reason: 'not-pending', proposal };
+  }
 
   const nowIso = now.toISOString();
   const liveCurated = readCuratedTarget(proposal.target);
@@ -326,6 +336,7 @@ export function approveIdentityProposal(id: string, now = new Date()): ApplyProp
     proposal.resolvedAt = nowIso;
     proposal.resolvedReason = 'curated text changed after drafting';
     saveStore(store);
+    retireProposalNotification(id);
     return { applied: false, reason: 'stale', proposal };
   }
 
@@ -338,6 +349,7 @@ export function approveIdentityProposal(id: string, now = new Date()): ApplyProp
   proposal.resolvedAt = nowIso;
   proposal.resolvedReason = 'owner approved';
   saveStore(store);
+  retireProposalNotification(id);
   logger.info({ proposalId: id, target: proposal.target }, 'identity proposal approved and applied');
   return { applied: true, reason: 'applied', proposal };
 }
@@ -345,10 +357,15 @@ export function approveIdentityProposal(id: string, now = new Date()): ApplyProp
 export function rejectIdentityProposal(id: string, now = new Date()): boolean {
   const store = loadStore();
   const proposal = store.proposals.find((p) => p.id === id);
-  if (!proposal || proposal.status !== 'pending') return false;
+  if (!proposal) return false;
+  if (proposal.status !== 'pending') {
+    retireProposalNotification(id);
+    return false;
+  }
   proposal.status = 'rejected';
   proposal.resolvedAt = now.toISOString();
   proposal.resolvedReason = 'owner rejected';
   saveStore(store);
+  retireProposalNotification(id);
   return true;
 }
