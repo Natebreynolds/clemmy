@@ -250,6 +250,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
       text: async () => JSON.stringify({
         model: 'jev-1.13.0',
         answers: {
+          requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
           verdict: {
             type: 'choice',
             choice: 'done',
@@ -284,6 +285,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
       answers: {
+        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
         verdict: {
           type: 'choice',
           choice: 'incomplete',
@@ -314,6 +316,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
       answers: {
+        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
         verdict: {
           type: 'choice',
           choice: 'done',
@@ -399,4 +402,32 @@ test('completion review preserves the complete source objective, final receipt a
   assert.equal(posted.state.verifiedReads, verifiedReads);
   assert.equal(posted.state.evidence, evidence);
   assert.deepEqual(posted.state.coverage.outcomeEvidence, outcomes);
+});
+
+test('valid receipts and a done vote do not certify missing or uncertain requested work', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  for (const choice of ['missing', 'uncertain', 'satisfied']) {
+    _setSystemOneFetchForTests(async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      assert.equal(payload.questions.requirements.type, 'choice');
+      assert.match(payload.questions.requirements.instructions, /does not prove all requested work/);
+      return { status: 200, ok: true, text: async () => JSON.stringify({
+        model: 'jev-1.13.0', answers: {
+          verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.9 },
+          requirements: { type: 'choice', choice, probabilities: { satisfied: choice === 'satisfied' ? 0.9 : 0.05,
+            missing: choice === 'missing' ? 0.9 : 0.05, uncertain: choice === 'uncertain' ? 0.9 : 0.05 }, confidence: 0.9 },
+          matches: { type: 'noul', noul: 0.95 },
+        }, usage: { input_tokens: 40, output_tokens: 6 },
+      }) };
+    });
+    const result = await tryJevCompletionVerdict(
+      'Save a tracked plan before writing, then create, run and disable the fixture.',
+      choice === 'satisfied' ? 'The saved plan and all requested steps are verified.'
+        : 'The workflow returned 323 and is disabled. I never saved the requested plan.',
+      { coverage: { complete: true, outcomeEvidence: [{ toolName: 'workflow_set_enabled', outcome: 'succeeded' }] } },
+    );
+    if (choice === 'satisfied') assert.equal(result?.done, true);
+    else if (choice === 'missing') assert.equal(result?.done, false, 'preserve the negative finding for reviewer fallback');
+    else assert.equal(result, null, 'uncertain coverage must defer to the reviewer');
+  }
 });

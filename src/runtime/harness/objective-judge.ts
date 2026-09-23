@@ -136,6 +136,7 @@ export interface ObjectiveJudgeVerdict {
     choice?: string;
     confidence?: number;
     replyMatchesReceipts?: number;
+    requirementCoverage?: 'satisfied' | 'missing' | 'uncertain';
     accepted: boolean;
     coverageComplete: boolean;
       /** Whether the configured reviewer was started (false = the hedge saved it). */
@@ -1273,6 +1274,7 @@ export async function judgeObjectiveComplete(
         // Whether the hedge saved the reviewer call, so the saving is countable.
         reviewerStarted: judgePromise !== null,
         ...(fast.choice ? { choice: fast.choice } : {}),
+        ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
         ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
         ...(typeof fast.replyMatchesReceipts === 'number'
           ? { replyMatchesReceipts: fast.replyMatchesReceipts }

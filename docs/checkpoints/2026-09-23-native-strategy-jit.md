@@ -94,3 +94,28 @@ These are measurements of the observed run, NOT an accepted warm-efficiency win.
 Warm request has NOT been submitted. App remains635 until next reviewed combined
 candidate; this replay correction is not installed acceptance yet. Resolve the
 tracked-plan proof gap and verify cold/warm source identity before claiming reuse.
+
+## Whole-request completion coverage candidate
+
+The supplied-receipt coverage predicate establishes receipt integrity, not
+coverage of every requested deliverable or process constraint. Jev now answers
+an independent requirements choice in its existing completion request. Fast
+DONE needs satisfied coverage at the existing confidence floor. Missing work
+is preserved as a negative verdict for configured review, including when that
+review is unavailable; uncertain or absent coverage defers to that reviewer.
+The decision is recorded as requirementCoverage separately from coverageComplete.
+No extra model round trip, provider/tool-name rule, keyword gate or mandatory
+plan for ordinary tasks was added. This does not make Jev infallible or establish
+that a plan was retained: live traces must still prove that separately.
+
+The two new pins fail against unchanged fcc6e71b7 production control-plane code:
+/tmp/clem-requirement-coverage-red.log (76 passed, 2 failed). With the candidate,
+78/78 pass in /tmp/clem-requirement-coverage-verified.log; typecheck passed in
+/tmp/clem-requirement-coverage-types2.log. These are controlled framework tests,
+not installed-app acceptance. The regression arose from observed source288371;
+no last-tag regression attribution or broad completion claim is made.
+
+Next acceptance must prove a saved plan before writes, retained identities and
+ordered settlement through create/enable/run/result/disable, and exact terminal
+proof. Never repair a missed pre-write ordering requirement by retrospectively
+claiming a later plan satisfies it. Keep paid pilot/50-firm work paused.

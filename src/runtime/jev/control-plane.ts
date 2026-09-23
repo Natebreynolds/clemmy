@@ -345,6 +345,7 @@ export interface JevCompletionVerdict {
   choice?: string;
   confidence?: number;
   replyMatchesReceipts?: number;
+  requirementCoverage?: 'satisfied' | 'missing' | 'uncertain';
 }
 
 const COMPLETION_REASONS = {
@@ -408,6 +409,15 @@ export async function tryJevCompletionVerdict(
     },
   };
   if (opts?.coverage?.complete) {
+    questions.requirements = {
+      type: 'choice',
+      instructions: 'Compare the entire objective with the evidence and response. coverage.complete only means the supplied receipts are inspectable; it does not prove all requested work was supplied. Audit every explicit deliverable, process requirement, ordering constraint and verification. A response that admits an unmet requested requirement is not fully satisfied, even when the main artifact exists. Do not invent requirements the user did not ask for.',
+      criteria: {
+        satisfied: 'Evidence covers every explicit requirement, including any requested process or ordering; none is left undone.',
+        missing: 'At least one explicit requirement is unmet or admitted missing.',
+        uncertain: 'The evidence is insufficient to determine whether all explicit requirements were met.',
+      },
+    };
     questions.matches = {
       type: 'noul',
       instructions: 'Does the assistant response report the verified receipts without inventing extra load-bearing facts?',
@@ -453,8 +463,21 @@ export async function tryJevCompletionVerdict(
   if (!result.ok) return null;
   const answer = result.answers.verdict as ChoiceAnswer | undefined;
   if (!answer || answer.confidence < COMPLETION_CONFIDENCE_MIN) return null;
-  const mapped = mapCompletionChoice(answer.choice);
+  let mapped = mapCompletionChoice(answer.choice);
   if (!mapped) return null;
+  let choice = answer.choice;
+  let confidence = answer.confidence;
+  const requirements = result.answers.requirements as ChoiceAnswer | undefined;
+  if (mapped.done && !mapped.awaitingUser && !mapped.blocked && opts?.coverage?.complete) {
+    if (!requirements || requirements.confidence < COMPLETION_CONFIDENCE_MIN) return null;
+    if (requirements.choice === 'missing') {
+      // Preserve this negative finding for the reviewer-unavailable path;
+      // an abstention must not erase known missing work into failed-open done.
+      mapped = { done: false, reason: 'Jev found an explicit requirement unsupported by the evidence.' };
+      choice = 'incomplete';
+      confidence = requirements.confidence;
+    } else if (requirements.choice !== 'satisfied') return null;
+  }
   const matches = result.answers.matches as NoulAnswer | undefined;
   const durationMs = Date.now() - started;
   const passed = mapped.done;
@@ -462,9 +485,11 @@ export async function tryJevCompletionVerdict(
   return {
     ...mapped,
     judgeModelId: result.model,
-    choice: answer.choice,
-    confidence: answer.confidence,
+    choice,
+    confidence,
     ...(typeof matches?.noul === 'number' ? { replyMatchesReceipts: matches.noul } : {}),
+    ...(requirements?.choice === 'satisfied' || requirements?.choice === 'missing' || requirements?.choice === 'uncertain'
+      ? { requirementCoverage: requirements.choice } : {}),
   };
 }
 
