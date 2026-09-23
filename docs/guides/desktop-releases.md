@@ -34,6 +34,15 @@ before packaging unless both inputs are present. After packaging, the workflow
 also verifies valid Authenticode signatures and signer certificates on both the
 installer and packaged application before accepting or uploading the artifacts.
 
+Every Windows build then runs `scripts/platform-runtime-probe.mjs` against the
+packaged app: it boots the daemon the way the desktop supervisor does and runs
+the storage and child-process paths a turn, a workflow code step, and a
+Composio transfer take, under `Clementine.exe` in a throwaway home. A candidate
+keeps its uploaded installer when the probe fails, but the job fails, so a
+production tag cannot publish Windows assets past it. The probe runs on any
+platform, for example `node scripts/platform-runtime-probe.mjs --dist dist`
+after `npm run build`.
+
 The only production exception is an explicit `[mac-only]` marker in the tagged
 commit message. That marker skips the entire Windows job, so the published
 release contains only the macOS assets. Use it deliberately for a release that

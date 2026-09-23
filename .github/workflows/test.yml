@@ -288,6 +288,7 @@ jobs:
         run: node scripts/run-tests-isolated.mjs src/tools/inner-dispatch.test.ts src/tools/composio-carrier.test.ts src/runtime/harness/logical-call-contract-refinement.test.ts
 
       - name: Daemon boot smoke
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -310,3 +311,23 @@ jobs:
           Get-Content (Join-Path $env:RUNNER_TEMP 'daemon-smoke.err.log') -Tail 40 -ErrorAction SilentlyContinue
           if (-not $booted) { throw 'Daemon did not reach "Daemon loop started" on Windows.' }
           Write-Host 'Windows daemon boot smoke: OK'
+
+      # The steps below run even when an earlier one failed, so one run
+      # reports every Windows break instead of only the first.
+      - name: Build daemon
+        if: ${{ !cancelled() }}
+        run: npm run build
+
+      - name: Platform runtime probe (turn, storage and code-step paths)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: node scripts/platform-runtime-probe.mjs --dist dist --report "$RUNNER_TEMP/platform-runtime-probe.json"
+
+      - name: Upload platform runtime probe report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-platform-runtime-probe
+          path: ${{ runner.temp }}/platform-runtime-probe.json
+          if-no-files-found: warn
+          retention-days: 14

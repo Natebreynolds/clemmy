@@ -382,6 +382,7 @@ jobs:
         run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Build Windows installer
+        id: build-windows
         working-directory: apps/desktop
         env:
           CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
@@ -433,6 +434,29 @@ jobs:
             apps/desktop/release/*.exe.blockmap
             apps/desktop/release/latest.yml
           if-no-files-found: error
+          retention-days: 14
+
+      # After the upload on purpose: a candidate keeps its installer for
+      # hands-on testing, while a failed probe still fails this job and so
+      # blocks the production publish that needs it. It runs whenever the
+      # installer built, so a flaky upload cannot hide the probe result.
+      - name: Probe the packaged runtime (daemon boot, turn and storage paths)
+        if: ${{ !cancelled() && steps.build-windows.outcome == 'success' }}
+        shell: bash
+        run: >-
+          node scripts/platform-runtime-probe.mjs
+          --dist apps/desktop/release/win-unpacked/resources/daemon/dist
+          --exec apps/desktop/release/win-unpacked/Clementine.exe
+          --resources apps/desktop/release/win-unpacked/resources
+          --report "$RUNNER_TEMP/platform-runtime-probe.json"
+
+      - name: Upload packaged runtime probe report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clementine-windows-runtime-probe-${{ needs.preflight.outputs.version }}
+          path: ${{ runner.temp }}/platform-runtime-probe.json
+          if-no-files-found: warn
           retention-days: 14
 
   publish-release:

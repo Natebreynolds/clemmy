@@ -1,0 +1,5 @@
+# Every platform checks out the same bytes. The runtime content-addresses
+# committed files: the emitted implementation artifacts are verified against
+# manifest.json by SHA-256 at boot, and a Windows checkout with core.autocrlf
+# would rewrite them to CRLF and refuse to start the daemon.
+* text=auto eol=lf
