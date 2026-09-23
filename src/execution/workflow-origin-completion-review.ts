@@ -69,11 +69,15 @@ export function readWorkflowParentContinuationTrigger(
   reply: string,
   trigger: { verdictEventId: string; evidenceDigest: string },
 ) {
-  if (input.outcome !== 'done' || terminalExists(input)) return null;
+  if ((input.outcome !== 'done' && input.outcome !== 'blocked') || terminalExists(input)) return null;
   const policy = readCapturedCompletionPolicy(identityFor(input));
   if (policy.status !== 'captured' || !policy.policy.enabled) return null;
   const current = snapshot(input, reply);
   if (!current) return null;
+  // A completed child's quality advisory is work for the original parent to
+  // resolve, not a loss of parent ownership. Do not resume through an actual
+  // paused, failed, or cancelled child: those require their own recovery.
+  if (input.outcome === 'blocked' && !current.child.allExecutionsCompleted) return null;
   const verdict = listEvents(current.identity.sessionId, { types: ['goal_alignment_judged'] })
     .find(event => event.id === trigger.verdictEventId && event.role === 'system'
       && event.data.sourceUserSeq === current.identity.sourceUserSeq

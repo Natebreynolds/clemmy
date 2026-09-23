@@ -701,3 +701,19 @@ Candidate is ready for a local source checkpoint/build and controlled installed
 acceptance of the original parent-continuation failure. This is not a declaration
 of tag readiness: the live acceptance matrix, full exact-commit suites/journeys,
 packaging/upgrade gates, and measured latency/token comparison remain owed.
+
+## 2026-09-23: installed parent canary exposed quality-blocked handoff
+
+Installed candidate `45254ff2b5ff8eff1605935972f5176e6b7e9400` was confirmed through build-info, fingerprint `878eda32bbb66ed8135c999468dd5e5092e0d56642ddbd63233e7b963afa5b2c`. Source 286553 in session `sess-desktop-940f8d9a4aeffae71b799832` requested enabling the controlled manual fixture `harness-jit-native-0923-0616`, running once, verifying product 323, then disabling it. Served Opus 5.5. Child `1790154327508-39b0b1` completed and returned product 323, but parent terminal 286614 was blocked and no disable occurred. NOT acceptance.
+
+Canonical child status was `completed`; its report-back outcome was `blocked` because the legacy target quality review was negative. Parent completion Jev review was also negative. The continuation reader excluded any report outcome other than `done`, discarding an otherwise valid original-parent checkpoint. This is a framework ownership defect, not proof of exhausted quota or tool unavailability.
+
+Correction: retain completed-child execution truth separately from report quality. A blocked report may resume the original parent only when every sealed child's canonical execution is completed with a finish timestamp. Exact source/group/review/checkpoint/lease checks remain. Failed, blocked, completed-with-errors and cancelled executions do not gain this path. The parent still receives the quality concern and must earn its final completion verdict.
+
+Regression extended the production-builder parent test with a quality-blocked completed child and remaining disable work. It failed before the fix at the original-owner continuation assertion. After the fix, 10/10 tests pass, including exact-once child dispatch, original-parent continuation, disable/readback, foreground ownership isolation and replay settlement. Negative cases review fresh blocked/failed/completed-with-errors execution evidence and refuse continuation. Distinct test variant run IDs avoid cross-session fixture collisions.
+
+Evidence: `/tmp/clem-quality-parent-red.log`, `/tmp/clem-quality-parent-green2.log`, `/tmp/clem-quality-parent-types.log`. Typecheck and diff check pass. Isolated runner live-home sentinel NOT PERFORMED because installed daemon owns home; do not call these live acceptance or isolation certification. Installed source remains the failed candidate until the next committed build/hotpatch.
+
+Cleanup: disabled only the named manual fixture using its console set-enabled endpoint, and read back `enabled:false`. This was operator cleanup, NOT autonomous parent success. No personal workflows modified. Next owed: neighboring report-back tests, exact clean candidate rebuild/hotpatch and a fresh matched installed-app source that proves the whole enable/run/verify/disable task. Investigate the legacy target review's negative result separately; do not erase the warning to get a passing run. Broader release gates and JIT latency/token qualification remain owed.
+
+Neighbor verification completed: 48/48 across workflow-origin-terminal, workflow-run-report-back, and workflow-run-report-back.human (`/tmp/clem-quality-parent-neighbors.log`). No generative-provider calls in these regression tests. Next step is the clean candidate build and installed acceptance, not more identical isolated runs.

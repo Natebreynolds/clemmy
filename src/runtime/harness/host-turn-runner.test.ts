@@ -10103,13 +10103,15 @@ test('named workflow dispatch seals before review and final child evidence owns 
     return { done: false, reason: 'the child has not returned its actual summary' };
   });
   try {
-    for (const variant of ['positive', 'off', 'negative', 'cancel-before-claim', 'remaining-local-work', 'unavailable', 'drift', 'wrong-source'] as const) {
+    for (const variant of ['positive', 'off', 'negative', 'cancel-before-claim', 'remaining-local-work', 'quality-blocked-local-work', 'unavailable', 'drift', 'wrong-source'] as const) {
       await t.test(variant, async () => {
+        const remainingLocalWork = variant === 'remaining-local-work' || variant === 'quality-blocked-local-work';
+        const childOutcome = variant === 'quality-blocked-local-work' ? 'blocked' as const : 'done' as const;
         const name = `final-child-review-${variant}`;
         writeWorkflow(name, { name, description: 'Summarize supplied text.', enabled: true,
           trigger: { manual: true }, steps: [{ id: 'summary', prompt: 'Summarize {{input.text}}.', sideEffect: 'read' }] });
         const replyTarget = { type: 'origin_chat' } as const;
-        const fixture = acceptHostCanarySource(name, variant === 'remaining-local-work'
+        const fixture = acceptHostCanarySource(name, remainingLocalWork
           ? `Run ${name}, then disable this saved workflow and give the summary here.`
           : `Run ${name} and give the summary here.`, {
           originReplyTarget: replyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget),
@@ -10132,12 +10134,12 @@ test('named workflow dispatch seals before review and final child evidence owns 
         assert.ok(disableDefinition.ok);
         if (!disableDefinition.ok) throw new Error(disableDefinition.reason);
         const model = stubModel([
-          [variant === 'remaining-local-work'
+          [remainingLocalWork
             ? toolCall(`joined-${variant}`, 'workflow_run', { name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) })
             : toolCall(`joined-${variant}`, 'call_tool', { name: 'workflow_run',
               args_json: JSON.stringify({ name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) }) })],
           [textMsg('CONTINUE: waiting for the dispatched child summary')],
-          [variant === 'remaining-local-work'
+          [remainingLocalWork
             ? toolCall(`parent-read-${variant}`, 'workflow_get', { name })
             : toolCall(`parent-read-${variant}`, 'call_tool', { name: 'workflow_get', args_json: JSON.stringify({ name }) })],
           [toolCall(`parent-disable-${variant}`, 'work_call', { name: 'workflow_set_enabled',
@@ -10145,7 +10147,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
           [textMsg('Southgate is ready. The workflow is disabled.')],
         ]);
         let agent = { model, tools: [carrier] };
-        if (variant === 'remaining-local-work') {
+        if (remainingLocalWork) {
           const planning = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
           assert.ok(planning.ok);
           if (!planning.ok) throw new Error('fixture planning context unavailable');
@@ -10175,7 +10177,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
         assert.doesNotMatch(JSON.stringify(parentCheckpoint.history), /CONTINUE: waiting for the dispatched child summary/,
           'the acknowledgment is not part of the committed tool-batch replay history');
         assert.ok(parentCheckpoint.envelope.capabilities.some(capability => capability.name ===
-          (variant === 'remaining-local-work' ? 'workflow_run' : 'call_tool')));
+          (remainingLocalWork ? 'workflow_run' : 'call_tool')));
         assert.deepEqual(parentCheckpoint.bindingRevision,
           capabilityEnvelopes.boundAgentCapabilityRevision(agent),
           'recovery retains the selected tool surface, not just the whole catalog universe');
@@ -10211,7 +10213,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
               replyDigest: createHash('sha256').update('Queued.').digest('hex'), judgedArtifacts: [] } });
           eventlog.closeEventLog(); // older pre-child verdict survives actual SQLite reopen
         }
-        const input = { observer, runId, evidenceRunIds: [runId], outcome: 'done' as const, detail };
+        const input = { observer, runId, evidenceRunIds: [runId], outcome: childOutcome, detail };
         assert.equal(report.readWorkflowOriginCompletionEvidence(input), null,
           'queued work cannot satisfy all-member terminal evidence');
         records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, {
@@ -10220,7 +10222,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
           stepOutputs: { summary: { summary: detail, retainedNested: { nonce: `actual-child-${variant}` } } },
           output: detail,
         }));
-        assert.equal(report.checkpointWorkflowRunReportBack(file, { workflowName: name, outcome: 'done', detail }), true);
+        assert.equal(report.checkpointWorkflowRunReportBack(file, { workflowName: name, outcome: childOutcome, detail }), true);
         const evidence = report.readWorkflowOriginCompletionEvidence(input);
         assert.ok(evidence);
         assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, detail: 'invented result' }), null);
@@ -10240,8 +10242,8 @@ test('named workflow dispatch seals before review and final child evidence owns 
               records.writeWorkflowRunRecordDurablyUnlocked(file, { ...current, stepOutputs: { summary: 'changed after review began' } });
             });
           }
-          return { done: variant !== 'negative' && variant !== 'cancel-before-claim' && variant !== 'remaining-local-work',
-            reason: variant === 'remaining-local-work' ? 'The workflow finished, but the authorized post-run disable is still missing.'
+          return { done: variant !== 'negative' && variant !== 'cancel-before-claim' && !remainingLocalWork,
+            reason: remainingLocalWork ? 'The workflow finished, but the authorized post-run disable is still missing.'
               : variant === 'negative' ? 'a required fact is missing' : 'actual child checked',
             ...(variant === 'unavailable' ? { failedOpen: true } : {}),
             selfJudge: true, ownerSelectedJudge: true, judgeModelId: 'test-selected-model', judgeProvider: 'byo' as const };
@@ -10274,7 +10276,20 @@ test('named workflow dispatch seals before review and final child evidence owns 
           assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
           return;
         }
-        if (variant === 'negative' || variant === 'remaining-local-work' || variant === 'unavailable') {
+        if (variant === 'negative' || remainingLocalWork || variant === 'unavailable') {
+          if (variant === 'quality-blocked-local-work') {
+            const completedRecord = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
+            for (const status of ['blocked', 'failed', 'completed_with_errors']) {
+              records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, {
+                ...completedRecord, status,
+              }));
+              await completion.reviewWorkflowOriginCompletion(input, detail);
+              assert.equal(completion.readWorkflowParentContinuation(input, detail), null,
+                `a ${status} execution cannot be treated as a completed child with a quality advisory`);
+            }
+            records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, completedRecord));
+            finalJudges = 0;
+          }
           await completion.reviewWorkflowOriginCompletion(input, detail);
           const continuation = completion.readWorkflowParentContinuation(input, detail);
           if (variant === 'unavailable') {
@@ -10298,7 +10313,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
               'late foreground cleanup cannot clear the new parent activation owner');
             assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs }), null,
               'duplicate wake-ups cannot both own the unfinished parent');
-            if (variant === 'remaining-local-work') {
+            if (remainingLocalWork) {
               // A real additional host read changes the parent's evidence
               // inventory. Use a single recording-model step; no provider is
               // called and the model-limit result is not published here.
@@ -10355,7 +10370,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
             assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs: nowMs + 2000 }), null,
               'pending cancellation prevents a recovery claim before terminal publication');
             eventlog.clearKill(fixture.session.id, { attemptId: attempt.attemptId });
-            if (variant === 'remaining-local-work') {
+            if (remainingLocalWork) {
               const { readWorkflow } = await import('../../memory/workflow-store.js');
               host._setHostObjectiveJudgeForTests(async () => ({
                 done: readWorkflow(name)?.data.enabled === false,
@@ -10365,11 +10380,11 @@ test('named workflow dispatch seals before review and final child evidence owns 
                 runId: attempt.runId!, ownerId: 'old-http-retry', leaseMs: 30_000 });
               assert.equal(sameRun.claimed, false, 'a replay cannot reclaim the workflow-owned original run');
               assert.equal(sameRun.attempt?.attemptId, attempt.attemptId);
-              const later = eventlog.beginRunAttempt(fixture.session.id, { runId: 'later-foreground-during-workflow' });
+              const later = eventlog.beginRunAttempt(fixture.session.id, { runId: `later-foreground-during-workflow-${variant}` });
               eventlog.recordRunAttemptUserInput(later, { turn: 2, role: 'user', data: { text: 'An independent newer request.' } });
               assert.equal(attemptState()?.finishedAt, null, 'a new foreground request must not supersede transferred workflow ownership');
               const newest = eventlog.claimRunAttemptLease({ sessionId: fixture.session.id,
-                runId: 'newest-leased-foreground', ownerId: 'test-foreground-owner', leaseMs: 30_000 });
+                runId: `newest-leased-foreground-${variant}`, ownerId: 'test-foreground-owner', leaseMs: 30_000 });
               assert.equal(newest.claimed, true);
               const newestSource = eventlog.recordRunAttemptUserInput(newest.attempt,
                 { turn: 3, role: 'user', data: { text: 'A fresh foreground request with its own lease.' } });
@@ -10469,7 +10484,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
           assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
           return;
         }
-        if (variant === 'remaining-local-work') {
+        if (remainingLocalWork) {
           assert.equal(committed?.presentation.status, 'done');
           assert.ok(attemptState()?.finishedAt, 'the original attempt finishes only after its remaining action');
           assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);

@@ -691,6 +691,7 @@ function resolveWorkflowOriginGroupReport(
 export function readWorkflowOriginCompletionEvidence(input: WorkflowOriginTerminalInput): {
   digest: string;
   summary: string;
+  allExecutionsCompleted: boolean;
   sourceGroupId: string;
   sourceGroupDigest: string;
 } | null {
@@ -722,6 +723,8 @@ export function readWorkflowOriginCompletionEvidence(input: WorkflowOriginTermin
     const summary = JSON.stringify({ sourceGroupId: projection.sourceGroupId,
       sourceGroupDigest: projection.sourceGroupDigest, members });
     return { digest: createHash('sha256').update(summary).digest('hex'), summary,
+      allExecutionsCompleted: members.every(member => member.status === 'completed'
+        && typeof member.finishedAt === 'string'),
       sourceGroupId: projection.sourceGroupId, sourceGroupDigest: projection.sourceGroupDigest };
   } catch { return null; }
 }
