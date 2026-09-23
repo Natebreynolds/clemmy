@@ -555,7 +555,22 @@ test('deferred opportunity creation decodes transport-only nested null without g
     propose.invoke(new RunContext({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }), JSON.stringify({
       proposal_key: 'invalid-recurrence', opportunity,
     })));
-  assert.ok(invalid instanceof HostLocalExecutionFailureResult);
+  assert.ok(invalid instanceof InvalidArgumentsPreDispatchResult, "proposal validation must allow argument repair before any write");
   assert.match(String(invalid), /recurrence proposal requires the recurrence trigger/);
 
+});
+
+
+test('promoted native opportunity schema is valid on the actual Claude wire', async () => {
+  const { applyClaudeEnvelope } = await import('../runtime/harness/claude-model.js');
+  const { Ajv2020 } = await import('ajv/dist/2020.js');
+  const tool = getLocalRuntimeTools().find(candidate => candidate.name === 'automation_opportunity_propose');
+  assert.ok(tool && tool.type === 'function');
+  const envelope = applyClaudeEnvelope({ body: JSON.stringify({
+    model: 'fixture-model', messages: [{ role: 'user', content: 'fixture' }],
+    tools: [{ name: tool.name, input_schema: tool.parameters }],
+  }) }, 'fixture-token');
+  const schema = JSON.parse(String(envelope.body)).tools[0].input_schema;
+  const ajv = new Ajv2020({ strict: false });
+  assert.equal(ajv.validateSchema(schema), true, JSON.stringify(ajv.errors));
 });

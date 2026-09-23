@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { isInvalidArgumentsTextResult } from './shared.js';
 import Database from 'better-sqlite3';
 
 import {
@@ -244,7 +245,13 @@ test('invalid structured proposal produces no durable row', async () => {
       opportunity: { version: 1, title: 'Incomplete' },
     });
     assert.equal(invalid.isError, true);
+    assert.ok(isInvalidArgumentsTextResult(invalid));
     assert.equal(body(invalid).code, 'invalid_opportunity');
+    const revision = await tools.get('automation_opportunity_revise')!({
+      proposal_id: 'missing-proposal', expected_revision: 1, expected_digest: 'a'.repeat(64),
+      opportunity: { version: 1, title: 'Incomplete' },
+    });
+    assert.ok(isInvalidArgumentsTextResult(revision));
     assert.equal(listAutomationOpportunityProposals({ database }).length, 0);
   } finally {
     database.close();

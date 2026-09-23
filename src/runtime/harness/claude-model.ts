@@ -1,3 +1,4 @@
+import { projectTupleSchemasFor202012 } from '../schema-normalizer.js';
 import { installedClaudeClientVersion } from './claude-client-version.js';
 /**
  * ClaudeModelProvider — runs Claude (Anthropic) as a flagship brain on the
@@ -124,6 +125,16 @@ export function applyClaudeEnvelope(
   if (typeof body === 'string') {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
+      if (Array.isArray(parsed.tools)) {
+        for (const item of parsed.tools) {
+          if (!item || typeof item !== 'object') continue;
+          const row = item as Record<string, unknown>;
+          const custom = row.custom && typeof row.custom === 'object' && !Array.isArray(row.custom)
+            ? row.custom as Record<string, unknown> : row;
+          if ('input_schema' in custom) custom.input_schema = projectTupleSchemasFor202012(custom.input_schema);
+        }
+      }
+
       // Correctness (all models, independent of parity): Anthropic accepts a
       // system prompt ONLY via the top-level `system` field — a role:'system'
       // message inside `messages` is rejected by every Claude model EXCEPT Opus

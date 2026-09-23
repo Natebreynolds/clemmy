@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 import {
   compactAdvertisedJsonSchema,
+  projectTupleSchemasFor202012,
   decodeProjectedOptionalNulls,
   materializeStrictNullableFields,
   normalizeZodForCodexStrict,
@@ -282,4 +283,25 @@ test('projected optional nulls decode against original semantics, including nest
 test('ambiguous optional/null unions keep the explicit value', () => {
   const schema = z.union([z.object({ item: z.string().optional() }), z.object({ item: z.string().nullable() })]);
   assert.deepEqual(decodeProjectedOptionalNulls({ item: null }, schema), { item: null });
+});
+
+
+test('tuple dialect projection preserves closed, open and typed tails without rewriting instance data', async () => {
+  const { Ajv2020 } = await import('ajv/dist/2020.js');
+  const { Ajv } = await import('ajv');
+  for (const tail of [undefined, false, { type: 'number' }]) {
+    const legacy = { type: 'object', properties: {
+      items: { type: 'array', items: [{ type: 'string' }], minItems: 1,
+        ...(tail === undefined ? {} : { additionalItems: tail }) },
+    }, required: ['items'], additionalProperties: false,
+    default: { items: ['do not rewrite this data'] } };
+    const modern = projectTupleSchemasFor202012(legacy);
+    const before = new Ajv({ strict: false }).compile(legacy);
+    const after = new Ajv2020({ strict: false }).compile(modern as object);
+    for (const items of [[], ['first'], [1], ['first', 2], ['first', 'second'], ['first', 2, 3]]) {
+      assert.equal(after({ items }), before({ items }), JSON.stringify({ tail, items }));
+    }
+    assert.deepEqual((modern as typeof legacy).default, legacy.default);
+    assert.deepEqual(projectTupleSchemasFor202012(modern), modern);
+  }
 });

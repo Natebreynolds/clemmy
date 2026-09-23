@@ -936,3 +936,82 @@ Live DataForSEO metadata listing reports enabled and connected, exposing four
 tools: api_request, docs_index, docs_list_sections, docs_search. Next controlled
 pilot can use the documentation-section inventory, without paid API data queries,
 provider changes or business dataset mutation. Installed acceptance remains owed.
+
+### Installed12e140d6f pilot attempt — failed, not accepted
+
+Build completed. Idle preflight: active0/runningRuns0/backgroundActive0, no started
+physical dispatches; waiting8/approvals0/runningWorkflows2. UI paths match main;
+no competing packaging/hotpatch process. Quit exact installed app, confirmed old
+PID15094 gone, ran Terminal apply-hotpatch.command once. Rollback dist.backup-pkZhoa.
+Restart took about a minute under load; connection-refused observations were startup,
+not a reason to relaunch/repatch. New daemon54082, instance
+2b47d8db-ae87-4845-ab9d-16902ef05a35, started2026-09-23T16:51:09.479Z.
+Verified build-info gitSha12e140d6f269f7856a4a0f71181f6fd58dab2554/fingerprint
+5ee01d51fab88857470741322476b883ff26da0d52a43e805fef36c1c63be259/schema81.
+
+One request source291524/session sess-desktop-bdb6ca59f648a3cd62d20d8a asked for a
+reviewable documentation-section inventory opportunity using enabled DataForSEO.
+No paid data query, external send, provider setting change, pilot or recurrence
+authorized before review. Exact receipt files and exported events are under
+output/harness-acceptance/2026-09-23-durable-pilot/ (docs-* and patched-build).
+
+Scope fix observed live: event291528 retains dataforseo access despite the exact
+"not a business integration repair" phrase, with remembered requested-server
+routing. Native null decoding observed: creation reached domain validation and
+returned only the two genuine authoring errors (recurrence trigger mismatch and
+approval on local-only phase), not injected outcomeAuthority:null. This is bounded
+acceptance of those fixes, NOT durable-pilot acceptance.
+
+Two release-blocking failures now isolated:
+1. automation_opportunity_propose/revise domain input validation returns ordinary
+   isError, becoming HostLocalExecutionFailureResult. Recovery classifies it as
+   execution:unknown_read and permits only retained-result readers. The model's
+   attempted corrected proposal was refused pre-dispatch (291584). Existing
+   shared invalidArgumentsTextResult/resultToText nominal carrier should preserve
+   repairable validation truth before any proposal write, rather than broadening
+   unknown-effect retry policy or recognizing tool prose by keywords.
+2. Promotion of automation_opportunity_propose into first-class tools exposes an
+   invalid provider schema. Terminal291589 failed with tools.4.custom.input_schema
+   invalid against JSON Schema2020-12. Captured actual local runtime schema in
+   /tmp/clem-opportunity-schema.json: acceptedTerminalStates tuples use draft07
+   array-valued items inside anyOf. Ajv2020 validateSchema after removing draft07
+   $schema rejects that exact path (items must be object/boolean). Need protocol
+   dialect conversion retaining tuple positional/length semantics, plus real
+   emitted-schema/provider-boundary pins. Do not delete the field or loosen tuples.
+
+Canonical exact-source measure: wall184876ms, 3 top-level calls, 1 discovery,
+115216 input tokens (68991 cached,46225 uncached),5023 output. Models:
+Opus5.5×4,Jev-latest×5,Grok4.3×2. One terminal, statusfailed. The trajectory reviewer
+also reported a connection error; no successful review or quota-exhaustion claim.
+No comparative speed/token win is claimed from a failed turn. No proposal card,
+pilot execution, bound Space or schedule was completed. All remain owed.
+
+### Proposal repair and promoted-schema candidate — September 23
+
+Both failures from source291524 have offline red/green pins. Original pins failed
+in /tmp/clem-pilot-recovery-wire-red.log (2/2); corrected pins pass in
+/tmp/clem-pilot-recovery-wire-green.log. Full focused schema-normalizer,
+claude-model, local-runtime-tools, and opportunity-tools suite: 62/62 pass
+(/tmp/clem-pilot-recovery-wire-suite.log). Typecheck exit0
+(/tmp/clem-pilot-recovery-wire-typecheck.log). No provider calls or quota used.
+
+Proposal create and revise now return the existing nominal
+invalidArgumentsTextResult when domain input validation fails before persistence.
+The local adapter preserves InvalidArgumentsPreDispatchResult so the governor
+can allow argument repair. Authorization failures, durable conflicts, and actual
+execution failures retain their prior semantics; no global retry policy changed.
+Pins verify invalid proposals/revisions leave no durable row and that the actual
+deferred tool emits the typed refusal for a recurrence mismatch.
+
+Provider wire envelope now projects legacy tuple items[] to prefixItems and
+additionalItems to items for the endpoint's 2020-12 dialect. This is protocol
+serialization, not model-name policy in the kernel. Both standard and custom tool
+containers are handled. Tuple ordering, minimum length, closed tails and typed
+open tails are preserved; defaults/examples and property names are not treated
+as schemas. Pins compare draft07/draft2020 accepted/rejected values, validate the
+actual promoted native opportunity schema, and check projection idempotence.
+No schema fields or authority contracts were removed to get past the API.
+
+Installed app remains12e140d6f until this candidate is built and patched. Must
+repeat the docs inventory request on the exact new fingerprint and prove repair
+can produce a review card before claiming the durable pilot gate is accepted.

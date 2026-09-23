@@ -562,3 +562,39 @@ export function decodeProjectedOptionalNulls(value: unknown, schema: z.ZodTypeAn
   }
   return out;
 }
+
+/** Project legacy tuple keywords for a wire that requires draft 2020-12.
+ * Walk schema positions only: instance defaults/examples and property names
+ * such as `items` are data. Omitted additionalItems continues to allow a tail. */
+export function projectTupleSchemasFor202012(schemaValue: unknown): unknown {
+  function visit(value: unknown): unknown {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    const source = value as Record<string, unknown>;
+    const out = { ...source };
+    for (const key of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']) {
+      const map = source[key];
+      if (map && typeof map === 'object' && !Array.isArray(map)) {
+        out[key] = Object.fromEntries(Object.entries(map).map(([name, child]) => [name, visit(child)]));
+      }
+    }
+    for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+      if (Array.isArray(source[key])) out[key] = source[key].map(visit);
+    }
+    for (const key of ['items', 'additionalItems', 'additionalProperties', 'unevaluatedProperties',
+      'unevaluatedItems', 'contains', 'propertyNames', 'not', 'if', 'then', 'else']) {
+      if (key in source) out[key] = visit(source[key]);
+    }
+    if (Array.isArray(source.items)) {
+      out.prefixItems = source.items.map(visit);
+      if ('additionalItems' in source) out.items = visit(source.additionalItems);
+      else delete out.items;
+      delete out.additionalItems;
+    }
+    return out;
+  }
+  const projected = visit(schemaValue);
+  if (!projected || typeof projected !== 'object' || Array.isArray(projected)) return projected;
+  // The endpoint selects the dialect; do not carry an obsolete root declaration.
+  const { $schema: _dialect, ...schema } = projected as Record<string, unknown>;
+  return schema;
+}
