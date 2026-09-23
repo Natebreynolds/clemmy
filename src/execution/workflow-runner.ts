@@ -248,7 +248,6 @@ import {
   type WatcherJudgeFn,
   type WatcherVerdict,
 } from '../runtime/harness/watcher-judge.js';
-import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import {
   launchIndependentAdvisoryJudges,
@@ -7655,139 +7654,6 @@ function finalizeOrDeferStepOutput(
   return finalized;
 }
 
-function collectStringLeaves(value: unknown, into: string[] = [], depth = 0): string[] {
-  if (into.length >= 64 || depth > 6) return into;
-  if (typeof value === 'string') {
-    into.push(value);
-    return into;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectStringLeaves(item, into, depth + 1);
-    return into;
-  }
-  if (value && typeof value === 'object') {
-    for (const item of Object.values(value as Record<string, unknown>)) collectStringLeaves(item, into, depth + 1);
-  }
-  return into;
-}
-
-function hasHttpUrl(value: unknown): boolean {
-  const urls = new Set<string>();
-  collectHttpUrls(value, urls, 0);
-  return urls.size > 0;
-}
-
-function normalizePathCandidate(candidate: string): string {
-  return candidate
-    .trim()
-    .replace(/^["'`([{<]+/, '')
-    .replace(/["'`.,;:)\]}>]+$/, '');
-}
-
-function pathCandidateExists(candidate: string): boolean {
-  const cleaned = normalizePathCandidate(candidate);
-  if (!cleaned || /^https?:\/\//i.test(cleaned)) return false;
-  const candidates = path.isAbsolute(cleaned)
-    ? [cleaned]
-    : [cleaned, path.resolve(process.cwd(), cleaned)];
-  return candidates.some((p) => existsSync(p));
-}
-
-function hasExistingPath(value: unknown): boolean {
-  const pathLike =
-    /(?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[^\s"'<>]+|[A-Za-z0-9_.-]+\.(?:html?|md|pdf|csv|tsx?|jsx?|json|txt|docx?|xlsx?|pptx?|png|jpe?g|webp|gif|zip)/gi;
-  for (const text of collectStringLeaves(value)) {
-    if (pathCandidateExists(text)) return true;
-    for (const match of text.matchAll(pathLike)) {
-      if (pathCandidateExists(match[0])) return true;
-    }
-  }
-  return false;
-}
-
-function hasNonEmptyArrayDeep(value: unknown, depth = 0): boolean {
-  if (depth > 6) return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (value && typeof value === 'object') {
-    return Object.values(value as Record<string, unknown>).some((item) => hasNonEmptyArrayDeep(item, depth + 1));
-  }
-  return false;
-}
-
-function hasTextList(value: unknown): boolean {
-  if (typeof value !== 'string') return false;
-  const text = value.trim();
-  if (!text) return false;
-  if (/^\s*(?:[-*]|\d+[.)])\s+\S+/m.test(text)) return true;
-  if (/^\s*\|.+\|\s*$/m.test(text)) return true;
-  return false;
-}
-
-function hasNonEmptyListEvidence(value: unknown): boolean {
-  return hasNonEmptyArrayDeep(value) || collectStringLeaves(value).some(hasTextList);
-}
-
-/**
- * Legacy deliverable guard: workflows authored before explicit `output`
- * contracts can still promise "produce a URL/file/list" in prose. Infer that
- * concrete shape and surface a needs-attention advisory when the completed step
- * output has no matching evidence. This is intentionally softer than declared
- * contracts: it accepts legacy prose that contains a real URL, existing file
- * path, or text list instead of requiring an object shape the prompt never saw.
- */
-export function inferredOutputContractAdvisory(step: WorkflowStepInput, output: unknown): string | null {
-  if (step.output || step.transform || step.deterministic || step.forEach) return null;
-  const contract = inferOutputContractFromPrompt(step.prompt ?? '');
-  if (!contract) return null;
-  const bound = coerceOutputForContract(output, contract);
-  if (isBlockedStepOutput(bound)) return null;
-  if (verifyStepOutput(contract, bound).ok) return null;
-
-  const problems: string[] = [];
-  const expectedUrl = (contract.verify?.url_present?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('url');
-  const expectedPath = (contract.verify?.path_exists?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('path');
-  const expectedItems =
-    Object.keys(contract.min_items ?? {}).length > 0 ||
-    (contract.non_empty ?? []).includes('items') ||
-    (contract.required_keys ?? []).includes('items');
-  const expectedResult = (contract.required_keys ?? []).includes('result');
-
-  if (expectedUrl && !hasHttpUrl(bound)) {
-    problems.push('expected a URL deliverable, but no http(s) URL was found');
-  }
-  if (expectedPath && !hasExistingPath(bound)) {
-    problems.push('expected a file deliverable, but no existing file path was found');
-  }
-  if (expectedItems && !hasNonEmptyListEvidence(bound)) {
-    problems.push('expected a non-empty list/rows deliverable, but no non-empty list was found');
-  }
-  if (expectedResult && isEmptyValue(bound)) {
-    problems.push('expected a non-empty deliverable result, but output was empty');
-  }
-  if (problems.length === 0) return null;
-
-  return `step "${step.id}" looked like it should produce a concrete deliverable, but output did not satisfy inferred checks: ${problems.join('; ')} — produced ${describeOutputShape(bound)}. Add an explicit output contract to make this hard-enforced, or adjust the step/output.`;
-}
-
-function noteInferredOutputContractAdvisory(
-  step: WorkflowStepInput,
-  output: unknown,
-  ctx: StepExecutionContext,
-): void {
-  const note = inferredOutputContractAdvisory(step, output);
-  if (!note) return;
-  ctx.qualityAdvisories.push({
-    stepId: step.id,
-    kind: 'inferred_output_contract',
-    note,
-  });
-  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-    kind: 'step_advisory',
-    stepId: step.id,
-    meta: { reason: 'inferred_output_contract', note },
-  });
-}
-
 /**
  * Find the step that FAILED its declared output contract from a run's events
  * (most recent first). Contract violations THROW (vs the {blocked:true}
@@ -8937,7 +8803,6 @@ export async function executeStep(
     modelRoute: workflowModelRouteMeta(stepRoute),
   };
   const finalized = finalizeOrDeferStepOutput(ctx, step, output, completionMeta);
-  noteInferredOutputContractAdvisory(step, finalized, ctx);
   return finalized;
 }
 

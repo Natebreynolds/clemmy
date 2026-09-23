@@ -720,3 +720,70 @@ test('native workflow write constraints reject before execution and allow correc
     assert.equal(pendingApprovalCount(fixture), 0);
   } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
+
+
+test('an authored native write gets its current schema before consent when required arguments are missing', async () => {
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write', prompt: 'Write a prepared local report.' });
+  const { tools } = fixtureTools(['write_file']);
+  const agent = { tools };
+  const envelope = bindSurface(fixture, agent, tools);
+  const armed = callAuthority.armHostCallAuthority({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+    catalogRevisionDigest: sha256('schema-repair-catalog'), bindingRevisionDigest: sha256('schema-repair-binding'),
+    maxLogicalCalls: 8, maxParallelCalls: 1 });
+  assert.equal(armed.status, 'armed');
+  const args = { path: 'notes/fixture.md', data: 'Prepared' };
+  const admitted = checkpoints.admitAcceptedModelBatch({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+    preHistory: [{ role: 'user', content: fixture.source.data.text } as AgentInputItem],
+    frameHistory: [toolCall('native-schema-bad', 'write_file', args) as unknown as AgentInputItem],
+    providerResponseId: 'response:native-schema-bad' });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') return;
+  let reviews = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviews++; return { verdict: 'compatible', reason: 'unused', proposalDigest: 'fixture-review' };
+  });
+  const result = await authorityAdapter.evaluateAuthoredWorkflowMutationConsent({
+    attestation: localAttestation(fixture, envelope, 'native-schema-bad', 'write_file', args), args,
+    acceptedBatch: admitted.admission, callIndex: 0,
+  });
+  assert.equal(result?.status, 'repair', JSON.stringify(result));
+  if (result?.status !== 'repair') return;
+  assert.match(result.reason, /content/);
+  assert.match(result.reason, /schema/);
+  assert.doesNotMatch(result.reason, /coverage_missing/);
+  assert.equal(reviews, 0, 'structural repair does not pay for semantic review');
+});
+
+for (const repairedCarrier of ['direct', 'call_tool'] as const) {
+test(`real workflow host repairs an off-surface native call through ${repairedCarrier} without discovery`, async () => {
+  const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
+  const target = path.join(TEST_HOME, 'workspace', `schema-repaired-report-${repairedCarrier}.md`);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write', prompt: `Write ${target} with the text Prepared.` });
+  let reviews = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
+    reviews++;
+    assert.equal(input.args.content, 'Prepared.\n');
+    return { verdict: 'compatible', reason: 'Correct fixture content.', proposalDigest: 'fixture-review' };
+  });
+  const model = stubModel([
+    [toolCall('wrong-native-fields', 'write_file', { path: target, data: 'Prepared.\n' })],
+    [repairedCarrier === 'direct'
+      ? toolCall('repaired-native-fields', 'write_file', { path: target, content: 'Prepared.\n', mode: 'create', append: null })
+      : toolCall('repaired-native-fields', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ path: target, content: 'Prepared.\n', mode: 'create', append: null }) })],
+    [textMsg('Prepared.')],
+  ]);
+  const agent = await buildWorkflowStepAgent({ sessionId: fixture.session.id, userInput: fixture.source.data.text as string });
+  agent.model = model as never;
+  const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
+  assert.equal(readFileSync(target, 'utf8'), 'Prepared.\n');
+  assert.equal(reviews, 1, 'only the structurally valid proposal invokes semantic review');
+  assert.match(JSON.stringify(outcome.history), /Current schema for write_file/);
+  assert.match(JSON.stringify(outcome.history), /Missing required field.*content/);
+  assert.equal(pendingApprovalCount(fixture), 0);
+  const writes = nonRefusedSettlements(fixture).filter(row => row.logical_tool_call_id === 'repaired-native-fields');
+  assert.equal(writes.length, 1);
+  assert.equal(model.calls(), 3, 'repair, exact write, final response; no discovery or shell turn');
+});
+
+}

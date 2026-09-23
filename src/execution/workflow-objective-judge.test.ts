@@ -160,7 +160,7 @@ test('deriveLegacyWorkflowRunGoal: derives provisional goal from intent, inputs,
   assert.ok(goal!.successCriteria.some((c) => /at least 1 item/.test(c)));
 });
 
-test('deriveLegacyWorkflowRunGoal: infers provisional criteria from deliverable prompts when contracts are missing', () => {
+test('deriveLegacyWorkflowRunGoal: prose deliverables do not invent output schemas', () => {
   const goal = deriveLegacyWorkflowRunGoal(
     wf({
       description_body: 'Create an audit artifact.',
@@ -178,11 +178,7 @@ test('deriveLegacyWorkflowRunGoal: infers provisional criteria from deliverable 
     {},
   );
   assert.ok(goal);
-  assert.ok(goal!.successCriteria.some((c) => /required keys: url, path/.test(c)));
-  assert.ok(goal!.successCriteria.some((c) => /http\(s\) URL at "url"/.test(c)));
-  assert.ok(goal!.successCriteria.some((c) => /existing local file path at "path"/.test(c)));
-  assert.ok(goal!.successCriteria.some((c) => /required keys: items/.test(c)));
-  assert.ok(goal!.successCriteria.some((c) => /at least 1 item/.test(c)));
+  assert.deepEqual(goal!.successCriteria, [], 'prose requirements remain in the semantic review, not invented JSON key checks');
 });
 
 test('deriveLegacyWorkflowRunGoal: null when a legacy workflow has no objective source', () => {
@@ -251,7 +247,7 @@ test('judgeWorkflowTarget: includes provisional legacy success criteria in the j
   });
   assert.equal(v.reached, true);
   assert.match(seenObjective, /Produce a live audit page/);
-  assert.match(seenObjective, /Success criteria inferred from the workflow contract and deliverable hints/);
+  assert.match(seenObjective, /Success criteria from authored workflow contracts/);
   assert.match(seenObjective, /A real URL is present/);
 });
 
@@ -398,4 +394,29 @@ test('judgeWorkflowTarget: a truncation-shaped reason on a SHORT (un-windowed) d
   const j = judgeReturning({ done: false, reason: 'the output appears to be cut off / incomplete' });
   const v = await judgeWorkflowTarget({ workflow: wf(), inputs: {}, finalOutput: 'short deliverable', judgeFn: j.fn });
   assert.equal(v.reached, false, 'guard only applies when WE windowed the deliverable, not to genuinely short output');
+});
+
+test('legacy file updates retain their instructions without inventing path or items output keys', async () => {
+  const prompt = 'Read preservation.csv. Change only Alpha from 1 to 2. Preserve the existing header and Beta row. Read the file back after deciding what to write.';
+  const workflow = wf({ description: 'Update one value while preserving all other data.',
+    steps: [{ id: 'update_alpha', prompt }] });
+  const goal = deriveLegacyWorkflowRunGoal(workflow, {});
+  assert.ok(goal);
+  assert.deepEqual(goal.successCriteria, [], 'only authored schemas may define required output keys');
+  for (const valid of [true, false]) {
+    const verdict = await judgeWorkflowTarget({ workflow, inputs: {}, goal,
+      finalOutput: { file: '/fixture/preservation.csv', verification: 'read back' },
+      executionEvidence: () => ({ available: true, summary: valid
+        ? 'Verified current content: Name,Value\nAlpha,2\nBeta,9\n'
+        : 'Verified current content: Wrong,Header\nAlpha,2\nBeta,9\n' }),
+      judgeFn: async (objective, _reply, context) => {
+        assert.ok(objective.includes(prompt), 'the complete saved instructions still govern review');
+        assert.doesNotMatch(objective, /required keys: path|at least 1 item/);
+        return { done: context?.toolCallSummary.includes('Name,Value') === true,
+          reason: valid ? 'The exact update and preservation are verified.' : 'The protected header changed.' };
+      },
+    });
+    assert.equal(verdict.judged, true);
+    assert.equal(verdict.reached, valid, 'removing invented keys does not bypass semantic preservation review');
+  }
 });

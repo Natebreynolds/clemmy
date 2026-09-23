@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { getJudgeMetricsSnapshot, resetJudgeMetricsForTests } from './judge-family.js';
 import { parseWorkflowMutationReview, reviewWorkflowMutation, type WorkflowMutationReviewInput } from './workflow-mutation-review.js';
 
 const input: WorkflowMutationReviewInput = {
@@ -14,11 +15,13 @@ const choice = (confidence: number, verdict = 'compatible') => async () => ({
 });
 
 test('complete confident compatibility avoids a second model call but remains only a review', async () => {
+  resetJudgeMetricsForTests();
   const result = await reviewWorkflowMutation(input, { evaluate: choice(0.95),
     judge: async () => { throw new Error('unexpected full review'); } });
   assert.equal(result.verdict, 'compatible');
   assert.match(result.proposalDigest, /^[a-f0-9]{64}$/);
   assert.equal('consent' in result, false);
+  assert.equal(getJudgeMetricsSnapshot().lanes.find(lane => lane.lane === 'mutation_constraints')?.fastDecisions, 1);
 });
 
 for (const variant of ['low-confidence', 'conflict', 'missing-key', 'incomplete-observations'] as const) {

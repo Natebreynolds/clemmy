@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge } from './objective-judge.js';
+import { recordJudgeMetric } from './judge-family.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
 
 export type WorkflowMutationReview = {
@@ -73,6 +74,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // and return an actionable repair reason. No classifier result grants consent.
   if (!large && input.observations.complete && !(sourceEvidence?.refs().length)) {
     try {
+      const started = Date.now();
       const result = await (deps.evaluate ?? evaluateSystemOne)({ sessionId: input.sessionId,
         channel: 'workflow-mutation-review', state: { ...proposal, proposalDigest }, questions: {
           compatibility: { type: 'choice', instructions: SYSTEM, criteria: {
@@ -84,6 +86,8 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
       const answer = result.ok ? result.answers.compatibility : undefined;
       if (answer?.type === 'choice' && answer.choice === 'compatible' && answer.confidence >= 0.85
         && (answer.probabilities.compatible ?? 0) >= 0.85) {
+        recordJudgeMetric({ lane: 'mutation_constraints', outcome: 'passed',
+          durationMs: Date.now() - started, modelId: result.ok ? result.model : undefined, fast: true });
         return { verdict: 'compatible', reason: 'The proposed write is compatible with the saved constraints and supplied observations.', proposalDigest };
       }
     } catch { /* The configured reviewer remains the fallback. */ }

@@ -252,7 +252,7 @@ interface JudgeMetricAggregate extends JudgeMetricLaneSnapshot {
   totalMs: number;
 }
 
-const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding', 'certify', 'watcher', 'calendar_watch', 'revision'];
+const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding', 'certify', 'watcher', 'calendar_watch', 'revision', 'mutation_constraints'];
 const judgeMetrics = new Map<JudgeMetricLane, JudgeMetricAggregate>();
 
 function emptyJudgeMetricAggregate(lane: JudgeMetricLane): JudgeMetricAggregate {

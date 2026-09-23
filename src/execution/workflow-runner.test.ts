@@ -78,7 +78,6 @@ const {
   forEachItemOutputContract,
   forEachAggregateOutputContract,
   verifyForEachItemOutput,
-  inferredOutputContractAdvisory,
   sendAlreadyClaimed,
   stepExternalWriteAlreadyClaimed,
   stepSendAlreadyFired,
@@ -2515,58 +2514,9 @@ test('describeOutputShape: names the actual produced shape (so a contract failur
   assert.equal(describeOutputShape(null), 'null');
 });
 
-test('inferredOutputContractAdvisory: accepts legacy prose with concrete URL evidence', () => {
-  const note = inferredOutputContractAdvisory(
-    { id: 'publish', prompt: 'Build and publish the website page URL.' } as never,
-    'Published at https://example.com/landing',
-  );
-  assert.equal(note, null);
-});
-
-test('inferredOutputContractAdvisory: accepts legacy prose with an existing file path', () => {
-  const filePath = path.join(tmp, 'legacy-report.md');
-  writeFileSync(filePath, '# Report\n', 'utf-8');
-  const note = inferredOutputContractAdvisory(
-    { id: 'report', prompt: 'Create an HTML file and output the file path.' } as never,
-    `Saved to ${filePath}.`,
-  );
-  assert.equal(note, null);
-});
-
-test('inferredOutputContractAdvisory: flags a legacy deliverable step with no list evidence', () => {
-  const note = inferredOutputContractAdvisory(
-    { id: 'leads', prompt: 'Generate a list of weekly leads.' } as never,
-    'No leads found.',
-  );
-  assert.match(note ?? '', /non-empty list/);
-  assert.match(note ?? '', /produced string/);
-});
-
-test('a verified file briefing is not blocked by source-record vocabulary in a legacy prompt', () => {
-  const filePath = path.join(tmp, 'record-briefing.md');
-  writeFileSync(filePath, '# Briefing\nBudget: 237\n', 'utf-8');
-  const note = inferredOutputContractAdvisory(
-    { id: 'brief', prompt: 'Read the project record and follow its referenced sources. Create one Markdown briefing file and read the saved file back.' } as never,
-    { path: filePath, read_back_verified: true, budget: 237 },
-  );
-  assert.match(note ?? '', /non-empty list/); // The legacy heuristic confuses an input with an output.
-  const advisory = { kind: 'inferred_output_contract' as const };
-  assert.equal(workflowAdvisoryRequiresAttention(advisory), false);
-  assert.equal(workflowReportLaneForOutcome({ needsAttention: false, advisories: [advisory] }), 'done');
-  assert.equal(workflowReportLaneForOutcome({ needsAttention: true, advisories: [advisory] }), 'blocked');
-});
-
-test('inferredOutputContractAdvisory: explicit output contracts own their own enforcement path', () => {
-  const note = inferredOutputContractAdvisory(
-    {
-      id: 'leads',
-      prompt: 'Generate a list of weekly leads.',
-      output: { type: 'object', required_keys: ['items'], non_empty: ['items'] },
-    } as never,
-    { items: [] },
-  );
-  assert.equal(note, null);
-});
+// Legacy prose requirements are reviewed against actual run evidence in
+// workflow-objective-judge.test.ts. Word-derived shape advisories were removed
+// after they falsely rejected a verified file update in live acceptance.
 
 test('workflowAdvisoryRequiresAttention: confident quality misses are not clean success', () => {
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'target_missed' }), true);
@@ -5438,7 +5388,7 @@ test('workflow conversion: a plain step routes through the GATED harness loop wh
   }
 });
 
-test('executeStep: legacy plain deliverable step records inferred output-contract advisory', async () => {
+test('executeStep: legacy prose does not manufacture a non-empty output contract', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   process.env.WORKFLOW_USE_HARNESS = 'on';
   try {
@@ -5463,10 +5413,10 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
     const out = await executeStep(step, ctx);
     assert.equal(out, 'No leads found.');
     const advisory = qualityAdvisories.find((a) => a.kind === 'inferred_output_contract');
-    assert.match(advisory?.note ?? '', /non-empty list/);
+    assert.equal(advisory, undefined, 'semantic target review decides whether the reported empty result is supported');
     const event = readWorkflowEvents('legacy-deliverable-advisory', 'legacy-deliverable-1')
       .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'inferred_output_contract');
-    assert.equal(event?.stepId, 'lead_list');
+    assert.equal(event, undefined, 'no guessed shape is persisted as a factual quality failure');
   } finally {
     _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);

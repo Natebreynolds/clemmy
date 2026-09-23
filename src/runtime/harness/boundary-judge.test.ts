@@ -280,3 +280,15 @@ test('withJudgeHedge: kill-switch CLEMMY_JUDGE_HEDGE=off runs unhedged', async (
     else process.env.CLEMMY_JUDGE_HEDGE = prev;
   }
 });
+
+
+test('mutation constraint review appears in metric lanes and total latency', () => {
+  resetJudgeMetricsForTests();
+  try {
+    recordJudgeMetric({ lane: 'mutation_constraints', outcome: 'passed', durationMs: 450, fast: true });
+    const snapshot = getJudgeMetricsSnapshot();
+    assert.equal(snapshot.total.calls, 1);
+    assert.equal(snapshot.total.avgMs, 450);
+    assert.equal(snapshot.lanes.find(lane => lane.lane === 'mutation_constraints')?.fastDecisions, 1);
+  } finally { resetJudgeMetricsForTests(); }
+});

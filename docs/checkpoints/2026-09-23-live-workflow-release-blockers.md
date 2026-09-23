@@ -338,3 +338,118 @@ remain owed; no tag or push authorized here.
 Exact named-workflow parent continuation regression also passed10 checks on this
 candidate: /tmp/clem-workflow-candidate-parent.log. Child settled-write facts reach
 the resumed parent's review without another discovery turn.
+
+## Installed52ca6d67a acceptance — partial function, not clean acceptance
+
+Committed52ca6d67ae347ed6b08e9d085173db2f101627b3 and built clean. Installed via
+Terminal .command recipe after proving no open physical dispatch and no active
+chat. Command-center runningWorkflows=3 was misleading: all were awaiting input
+or parked, not executing. Old daemon13973 exited. New daemon18172 reports exact
+fingerprinta736c95edab62d4702d43414fc6cf977d64ca392fe7f740e17ccd24210dd52d8.
+Prior dist retained at dist.backup-Fh3cJN. Shell notification fix is NOT included.
+
+Controlled accepted source290510/session sess-desktop-b08eeea1aea5646d7adf98d2
+created manual harness-preservation-0923-52ca6d67a and ran child1790176371660-1b5dd0
+once, then disabled it. Child source290582/session
+workflow:1790176371660-1b5dd0:update_alpha. Independent exact-byte check passed:
+Name,Value newline Alpha,2 newline Beta,9 newline. Original header and neighbor
+were preserved. Native write_file executed once with readback. No business
+workflow or external send was invoked by this acceptance request.
+
+The live mutation reviewer DID run: Jev1.13.0 took1729ms/2666input/44output, followed
+by Grok4.3 fallback3979ms/2658input/74output on judge:mutation_constraints. This is
+~5.7s added review latency for this proposal, not a demonstrated efficiency win.
+Usage records use source, not sessionId; channel identifies the review lane.
+
+NOT ACCEPTED: child terminalOutcome blocked/needsAttention. Legacy contract
+inference promoted words file/row/write into invented required output keys path
+and items, although no output schema was authored. The file was correct and the
+model returned file plus verification. Source is appendContractCriteria in
+workflow-objective-judge.ts using inferOutputContractFromPrompt; the same guessed
+list shape also adds an inferredOutputContractAdvisory in workflow-runner.ts.
+Fix class: actual authored output schemas remain binding; guessed output-key
+conventions must not become acceptance requirements. Semantic review must still
+check actual intent, constraints and receipts. Do not patch the fixture definition
+or remove real completion validation to disguise this failure.
+
+Latency debt: initial worker hallucinated write_file {path,data}, refused as
+coverage_missing290605; then tried shell and incurred another refusal290621,
+workspace_roots, discovery, finally the correct native write through call_tool.
+The advertised/learned schema and repair path need inspection; do not attribute
+this to the new constraint checker (which ran on the later valid proposal).
+Parent also used3 discovery operations. Canonical measureAcceptedTurn:
+parent142603ms,11 top-level calls,416407prompt/239435cached/3548output;
+child64219ms,6 top-level calls,199141prompt/110360cached/1912output.
+Both exact attribution certified. Parent actualOpus5.5; workerHaiku4.5; reviewers
+Grok4.3/Jev1.13.0. Child wall is nested inside parent wall; do not add walls.
+No matched baseline or broad token-efficiency claim.
+
+Evidence copied to output/harness-acceptance/2026-09-23-52ca6d67a/ including
+accepted source, exact run record, definition, filtered events, canonical
+measurements and independent-verification.json. Parent final290746 honestly
+reported the status issue; fixture is disabled. Original release gates remain.
+
+## Follow-up candidate: authored contracts, not guessed runtime schemas
+
+The live preservation case failed a new regression on52ca6d67a: legacy goal
+inference invented path/items plus non-empty/minimum-item requirements from words
+in the step prompt. Removed that promotion in appendContractCriteria. Actual
+explicit output contracts remain exact; full saved step instructions and actual
+execution evidence still reach semantic target review. The new test accepts
+verified preserved data and rejects a changed protected header without invented
+keys. Existing explicit url/path/items contract tests remain.
+
+Removed the duplicate inferred-output advisory producer and its unused shape-
+scanning helpers from workflow-runner. Five tests of that deleted heuristic were
+removed; its real executeStep regression now asserts that a reported empty result
+is not automatically converted into an unauthored non-empty output requirement.
+Semantic correctness is still reviewed; declared contracts, missing required keys,
+empty required data and wrong shapes retain their tests and enforcement. This is
+an intentional removal of guessed requirements, not weakening an authored one.
+Authoring suggestions remain suggestions in workflow-deliverable-hints.
+
+Also fixed observability for the new mutation_constraints lane: the lane was in
+the type union but absent from the snapshot's enumeration, hiding its metrics.
+Red pin reproduced total0 after recording one call. The lane is now visible and
+Jev fast-compatible decisions record their latency as well. No usage history is
+rewritten. Source/call attribution already preserved the live fallback usage.
+
+Checks:57 objective/reviewer/metric tests passed;19 scoped runner contract and
+finalization checks passed; typecheck passed. Logs:
+/tmp/clem-legacy-output-keys-red.log, /tmp/clem-mutation-metrics-red.log,
+/tmp/clem-legacy-criteria-metrics-green.log,
+/tmp/clem-legacy-authored-contract-checks.log,
+/tmp/clem-legacy-criteria-typecheck.log. Still uncommitted and uninstalled.
+
+The first invalid write had NO write_file schema on the worker's initial model
+surface (prompt_composition290594); it invented the call and data field. Framework
+repair/disclosure must provide the exact current schema, not require a wasteful
+shell attempt and broad search. Do not implement a write_file/data keyword alias.
+This remains a separate measured latency defect, not yet fixed by this candidate.
+
+## Follow-up candidate: structural native repair before consent
+
+Pinned the live missing-content defect in the authored native boundary: a call
+with {path,data} returned no authored decision and fell into coverage_missing.
+Now a currently bound authored local call with a valid accepted occurrence opens
+the current native input schema and performs existing schema validation before
+argument-dependent planning/consent. Missing required fields return a non-null
+repair containing the exact current schema. No field alias, tool-name rule or
+provider-specific policy was introduced; semantic review is skipped for invalid
+arguments. Approval-required steps retain their existing gate.
+
+Red /tmp/clem-local-schema-repair-red.log. Adjacent native/catalog/send authority
+checks26passed: /tmp/clem-local-schema-repair-green.log. A production
+buildWorkflowStepAgent with a recording model reproduced the off-surface guessed
+write and then repaired it through call_tool: one physical write, one semantic
+review on the valid proposal, zero approval cards, no search or shell frame.
+/tmp/clem-local-schema-repair-host.log. Both direct and call_tool variants passed: /tmp/clem-local-schema-repair-host-final.log (2passed).
+Typecheck passed: /tmp/clem-local-schema-repair-typecheck.log. No live generative
+acceptance of this follow-up yet; installed52ca6d67a remains unchanged.
+
+Follow-up final combined checks85passed,0failed:
+/tmp/clem-followup-final-tests.log. Final typecheck passed:
+/tmp/clem-followup-final-typecheck.log. Scoped runner contract checks19passed were
+also completed on the same runtime changes. Current main stille77215d00; installed
+still52ca6d67a. Next build combines removal of invented runtime shape requirements,
+mutation metric visibility, and precise native argument repair before consent.
