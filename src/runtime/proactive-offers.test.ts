@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtempSync, mkdirSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-offer-routing-'));
@@ -99,4 +99,79 @@ test('two processes engaging the same offer resolve one durable thread', async (
     children.forEach(child => { if (child.exitCode === null) child.kill('SIGKILL'); });
     await Promise.allSettled(done);
   }
+});
+
+test('not now persists, stays quiet until the requested time, and reuses the discussion', () => {
+  offers.publishProactiveOffer(input('later'));
+  const first = offers.discussProactiveOffer('later', 1, 'owner');
+  const until = new Date(Date.now() + 60_000).toISOString();
+  offers.snoozeProactiveOffer('later', 1, 'owner', until);
+  log.closeEventLog();
+  assert.equal(offers.getProactiveOffer('later', 'owner')!.snoozedUntil, until);
+  assert.equal(offers.listProactiveOffers('owner').some(o => o.id === 'later'), false);
+  assert.throws(() => offers.discussProactiveOffer('later', 1, 'owner'), /snoozed/);
+  const after = new Date(Date.parse(until) + 1);
+  assert.equal(offers.listProactiveOffers('owner', after).some(o => o.id === 'later'), true);
+  assert.equal(offers.discussProactiveOffer('later', 1, 'owner', after).sessionId, first.sessionId);
+});
+
+test('revised evidence invalidates stale cards without losing the original conversation or dismissal', () => {
+  offers.publishProactiveOffer(input('amended'));
+  const first = offers.discussProactiveOffer('amended', 1, 'owner');
+  const changed = { ...input('amended'), summary: 'Updated research context', evidenceRefs: ['fact:13'] };
+  assert.equal(offers.reviseProactiveOffer(changed, 1).revision, 2);
+  assert.throws(() => offers.discussProactiveOffer('amended', 1, 'owner'), /revision/);
+  assert.throws(() => offers.dismissProactiveOffer('amended', 1, 'owner'), /revision/);
+  assert.equal(offers.discussProactiveOffer('amended', 2, 'owner').sessionId, first.sessionId);
+  offers.dismissProactiveOffer('amended', 2, 'owner');
+  assert.equal(offers.reviseProactiveOffer({ ...changed, summary: 'Additional detail' }, 2).status, 'dismissed');
+  assert.equal(offers.getProactiveOffer('amended', 'owner')!.revision, 3);
+});
+
+test('expired and withdrawn offers cannot be discussed or quietly resurrected', () => {
+  offers.publishProactiveOffer({ ...input('expired'), expiresAt: '2020-01-01T00:00:00.000Z' });
+  assert.equal(offers.listProactiveOffers('owner').some(o => o.id === 'expired'), false);
+  assert.throws(() => offers.discussProactiveOffer('expired', 1, 'owner'), /expired/);
+  offers.publishProactiveOffer(input('withdrawn'));
+  offers.withdrawProactiveOffer('withdrawn', 1, 'owner', 'Supporting fact was corrected');
+  log.closeEventLog();
+  assert.equal(offers.publishProactiveOffer(input('withdrawn')).status, 'withdrawn');
+  assert.throws(() => offers.discussProactiveOffer('withdrawn', 1, 'owner'), /withdrawn/);
+});
+
+
+test('upgrading the original schema retains its conversation and backs up the original revision', () => {
+  const oldHome = mkdtempSync(path.join(os.tmpdir(), 'clem-offer-upgrade-'));
+  const eventlogUrl = new URL('./harness/eventlog.ts', import.meta.url).href;
+  const moduleUrl = new URL('./proactive-offers.ts', import.meta.url).href;
+  const script = `
+    const assert = (await import('node:assert/strict')).default;
+    const log = await import(${JSON.stringify(eventlogUrl)});
+    const db = log.openEventLog();
+    log.createSession({ id: 'old-chat', kind: 'chat', userId: 'owner' });
+    db.exec('CREATE TABLE proactive_offers (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL, conversation_id TEXT, input_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    db.prepare('INSERT INTO proactive_offers VALUES (?, ?, 1, ?, ?, ?, ?, ?)').run(
+      'old-offer', 'owner', 'discussing', 'old-chat', ${JSON.stringify(JSON.stringify(input('old-offer')))}, '2026-09-22', '2026-09-22');
+    const offers = await import(${JSON.stringify(moduleUrl)});
+    assert.equal(offers.discussProactiveOffer('old-offer', 1, 'owner').sessionId, 'old-chat');
+    assert.equal(db.prepare('SELECT count(*) AS n FROM proactive_offer_revisions').get().n, 1);
+    assert.equal(offers.getProactiveOffer('old-offer', 'owner').snoozedUntil, null);
+    log.closeEventLog();
+  `;
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    env: { ...process.env, CLEMENTINE_HOME: oldHome }, encoding: 'utf8', timeout: 20_000,
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+});
+
+test('invalid snoozes and attempted scope changes leave the offer untouched', () => {
+  offers.publishProactiveOffer({ ...input('bounded'), expiresAt: '2030-01-02T00:00:00.000Z' });
+  const now = new Date('2030-01-01T00:00:00.000Z');
+  assert.throws(() => offers.snoozeProactiveOffer('bounded', 1, 'owner', 'not a date', now));
+  assert.throws(() => offers.snoozeProactiveOffer('bounded', 1, 'owner', now.toISOString(), now), /future/);
+  assert.throws(() => offers.snoozeProactiveOffer('bounded', 1, 'owner', '2030-01-03T00:00:00.000Z', now), /expires/);
+  assert.throws(() => offers.reviseProactiveOffer({ ...input('bounded'), kind: 'skill' }, 1), /scope/);
+  assert.equal(offers.getProactiveOffer('bounded', 'owner')!.status, 'offered');
+  assert.equal(offers.getProactiveOffer('bounded', 'owner')!.revision, 1);
 });
