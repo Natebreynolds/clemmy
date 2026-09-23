@@ -1426,3 +1426,39 @@ evidence wiring; retained source/selection lineage and Workspace scope; original
 equality or mark a selected dataset as full provider inventory. Structured
 contracts must keep their old digests and behavior. Then build, hotpatch and
 qualify the unchanged approved original proposal through the installed app.
+
+
+## Reviewed text projection and native approval wiring
+
+Added optional digest-bound `textInterpretation` to the canonical result
+projection and `text_interpretation` to the native pilot authoring schema.
+Existing projections omit it and retain their bytes. Parsing requires exact
+selected-record bounds, a single result, the declared text field as the source
+record identity, and verified page settlement time. Unknown record paths,
+pagination, larger source-byte limits and changed selection limits are rejected.
+The actual original four-field documentation schema is covered by a contract
+test including its reviewed prefer-newer rules and host provenance fields.
+
+The chat-tool acceptance test now creates a controlled Workspace, requests the
+separate pilot review, verifies the full exact interpretation in approval args
+and proves zero source bodies ran. It does not approve/run the pilot. Its
+negative case exposed an uncaught internal-contract validation exception in
+`automation_read_pilot_request`. Conversion now returns branded repairable
+invalid arguments, with an explicit nominal-brand assertion, instead of an
+unknown failure that could force another reasoning/discovery loop. The original
+red test and stack are `/tmp/clem-text-contract-approval.log`.
+
+Checks: earlier combined contract/parser/pilot/compiler suite passed 37 tests
+(`/tmp/clem-text-contract-regressions.log`). Final approval/contract pins passed
+18 tests (`/tmp/clem-text-contract-approval-pinned.log`); these overlap, do not
+sum them. Isolated runner sentinel not performed while the live daemon owns
+its home. No provider/model calls, business changes, hotpatch or tag.
+
+Runtime enablement remains intentionally incomplete: execution evidence,
+selection lineage/Workspace scope, and conditional authoring for absent
+provider schemas still need integration. A reviewable parser contract is not
+proof that the original live pilot can execute. Do not hotpatch this staged
+series until the full source-to-selected-output path and replay are qualified.
+
+Final typecheck exited 0 (`/tmp/clem-text-contract-typecheck-pinned.log`, session
+62560); approval suite session34526 exited 0. Diff check passed.

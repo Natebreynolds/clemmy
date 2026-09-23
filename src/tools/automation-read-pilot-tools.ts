@@ -23,7 +23,7 @@ import {
   type ResolveConfiguredReadPilotAcquisitionResult,
 } from '../execution/automation-read-pilot-production-acquisition.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 
 const DIGEST_RE = /^[a-f0-9]{64}$/;
 const EXACT_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
@@ -106,6 +106,13 @@ const projectionFieldBase = z.object({
 const resultProjectionSchema = z.object({
   version: z.union([z.literal(1), z.literal(2)]),
   records_path: z.string().trim().min(1).max(512),
+  text_interpretation: z.object({
+    version: z.literal(1), kind: z.literal('text_lines'),
+    field: z.string().regex(EXACT_KEY_RE), prefix: z.string(),
+    whitespace: z.enum(['trim', 'preserve']), blank_lines: z.enum(['skip', 'reject']),
+    max_source_bytes: z.number().int().positive(), max_source_records: z.number().int().positive(),
+    selection: z.object({ kind: z.literal('first'), max_records: z.number().int().positive() }).strict(),
+  }).strict().optional(),
   fields: z.array(z.union([
     projectionFieldBase.extend({ record_path: z.string().trim().min(1).max(512) }).strict(),
     projectionFieldBase.extend({ host_source: z.enum(['workflow_run_id', 'page_settled_at', 'page_receipt_id'])
@@ -321,6 +328,13 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
   const projection = input.result_projection;
   const projectionBase = projection ? {
     recordsPath: projection.records_path,
+    ...(projection.text_interpretation ? { textInterpretation: {
+      version: projection.text_interpretation.version, kind: projection.text_interpretation.kind,
+      field: projection.text_interpretation.field, prefix: projection.text_interpretation.prefix,
+      whitespace: projection.text_interpretation.whitespace, blankLines: projection.text_interpretation.blank_lines,
+      maxSourceBytes: projection.text_interpretation.max_source_bytes, maxSourceRecords: projection.text_interpretation.max_source_records,
+      selection: { kind: projection.text_interpretation.selection.kind, maxRecords: projection.text_interpretation.selection.max_records },
+    } } : {}),
     fields: projection.fields.map((field) => ({
       field: field.field,
       ...('host_source' in field ? { hostSource: field.host_source } : { recordPath: field.record_path }),
@@ -746,6 +760,15 @@ export function registerAutomationReadPilotTools(
       }
       if (!resolved.ok) return errorResult(resolved.code, resolved.reason);
 
+      let typedContract: AutomationReadPilotTypedContractV1;
+      try {
+        typedContract = internalContract(contract);
+      } catch (error) {
+        return invalidArgumentsTextResult(JSON.stringify({
+          ok: false, code: 'pilot_contract_invalid',
+          reason: error instanceof Error ? error.message : String(error),
+        }));
+      }
       const requested = await acquireAndRegisterAutomationReadPilotProjection({
         proposalId: proposal_id,
         expectedProposalRevision: expected_proposal_revision,
@@ -753,7 +776,7 @@ export function registerAutomationReadPilotTools(
         approvalSessionId: source.sessionId,
         originSessionId: source.sessionId,
         acquisition: resolved.acquisition,
-        contract: internalContract(contract),
+        contract: typedContract,
         workflowInputs: structuredClone(workflow_inputs),
       });
       if (!requested.ok) return errorResult(requested.code, requested.reason);

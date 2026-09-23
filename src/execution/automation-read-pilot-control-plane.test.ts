@@ -605,6 +605,13 @@ function chatPilotRequest(
         result_projection: {
           version: 1,
           records_path: projection.recordsPath,
+          ...(projection.textInterpretation ? { text_interpretation: {
+            version: projection.textInterpretation.version, kind: projection.textInterpretation.kind,
+            field: projection.textInterpretation.field, prefix: projection.textInterpretation.prefix,
+            whitespace: projection.textInterpretation.whitespace, blank_lines: projection.textInterpretation.blankLines,
+            max_source_bytes: projection.textInterpretation.maxSourceBytes, max_source_records: projection.textInterpretation.maxSourceRecords,
+            selection: { kind: projection.textInterpretation.selection.kind, max_records: projection.textInterpretation.selection.maxRecords },
+          } } : {}),
           fields: projection.fields.map((field) => ({
             field: field.field,
             ...(field.hostSource ? { host_source: field.hostSource } : { record_path: field.recordPath }),
@@ -1536,4 +1543,36 @@ test('projection storage is versioned, idempotent, and contains no prose-derived
     assert.deepEqual(workflows.readWorkflow(workflowId)?.data.trigger, { manual: true });
     assert.equal(workflows.readWorkflow(workflowId)?.data.enabled, false);
   }
+});
+
+
+test('explicit text selection survives the chat tool into the exact separate pilot review without dispatch', async () => {
+  const fixture = blankStateFixture('text_review', { dataset: true });
+  const surface = chatPilotSurface(fixture);
+  const previous = fixture.input.contract.resultProjection!;
+  const { projectionDigest: _digest, ...base } = previous;
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'key', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [base.fields[0]!, { field: 'scope', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 }],
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.text-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+  (invalid.contract as any).result_projection.text_interpretation.selection.max_records = 6;
+  const invalidResult = await surface.handlers.get('automation_read_pilot_request')!(invalid);
+  assert.equal(shared.isInvalidArgumentsTextResult(invalidResult), true, 'invalid contract remains repairable by the caller');
+  const denied = pilotToolJson(invalidResult);
+  assert.equal(denied.ok, false, 'selection drift is refused before review');
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  const approval = approvals.get(requested.approval.approvalId);
+  assert.deepEqual(approval?.args.resultProjection, fixture.input.contract.resultProjection);
+  assert.equal(fixture.bodies(), 0, 'authoring and requesting review cannot execute a text source');
 });

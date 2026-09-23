@@ -1,3 +1,4 @@
+import { validWorkflowTextResultInterpretation, type WorkflowTextResultInterpretationV1 } from './workflow-text-result-interpretation.js';
 import { createHash } from 'node:crypto';
 
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
@@ -80,6 +81,8 @@ export interface WorkflowCanonicalEntityResolutionPolicyV1 {
 export interface WorkflowCanonicalEntityResultProjectionV1 {
   version: typeof WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION;
   recordsPath: string;
+  /** Reviewed interpretation of retained text; absent preserves structured behavior. */
+  textInterpretation?: WorkflowTextResultInterpretationV1;
   fields: WorkflowCanonicalEntityFieldProjectionV1[];
   sourceRecord: {
     idPath: string;
@@ -262,7 +265,7 @@ export function parseWorkflowCanonicalEntityResultProjection(
     'version', 'recordsPath', 'fields', 'sourceRecord', 'entityKind',
     'identityRules', 'resolutionPolicy', 'fieldResolution', 'provenance',
     'partition', 'bounds', 'projectionDigest',
-  ])) return { ok: false, errors: ['Result projection must be a closed versioned object.'] };
+  ], ['textInterpretation'])) return { ok: false, errors: ['Result projection must be a closed versioned object.'] };
   if (canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION
     && canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION) {
     errors.push('Result projection version must be 1 or 2.');
@@ -478,6 +481,24 @@ export function parseWorkflowCanonicalEntityResultProjection(
     if (positiveBound(bounds.maxPageBytes, MAX_PAGE_BYTES)
       && positiveBound(bounds.maxTotalBytes, MAX_TOTAL_BYTES)
       && bounds.maxPageBytes > bounds.maxTotalBytes) errors.push('maxPageBytes exceeds maxTotalBytes.');
+  }
+
+  if (canonical.textInterpretation !== undefined) {
+    const text = canonical.textInterpretation;
+    if (!validWorkflowTextResultInterpretation(text)) errors.push('textInterpretation must be a closed explicit bounded interpretation.');
+    else if (canonical.recordsPath !== 'records'
+      || canonical.bounds?.maxPages !== 1
+      || text.maxSourceBytes > canonical.bounds.maxPageBytes
+      || text.selection.maxRecords !== canonical.bounds.maxRecords
+      || text.selection.maxRecords !== canonical.bounds.maxRecordsPerPage
+      || canonical.sourceRecord?.idPath !== text.field
+      || canonical.sourceRecord?.revisionPath !== undefined
+      || canonical.sourceRecord?.observedAt?.kind !== 'page_settled_at'
+      || !Array.isArray(canonical.fields)
+      || !canonical.fields.some(mapping => mapping.recordPath === text.field && mapping.required && mapping.type === 'string')
+      || canonical.fields.some(mapping => mapping.hostSource === undefined && (mapping.recordPath !== text.field || mapping.type !== 'string'))) {
+      errors.push('textInterpretation must match its single-result record mapping, host timestamp and exact selected-record bounds.');
+    }
   }
 
   if (!DIGEST_RE.test(canonical.projectionDigest)) errors.push('projectionDigest must be sha256 hex.');
