@@ -498,11 +498,13 @@ test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
   assert.equal(repaired.steps[0].sideEffect, 'read'); // declared value preserved
 });
 
-test('checkWorkflowForWrite: validator sees declared sideEffect from typed definitions', () => {
+test('checkWorkflowForWrite: validator compares declared effect with structured operation', () => {
   const result = checkWorkflowForWrite(wf({
-    steps: [{ id: 'send', prompt: 'Send the email summary to Alex.', sideEffect: 'read' }],
+    enabled: false,
+    steps: [{ id: 'send', prompt: 'Perform the operation.', sideEffect: 'read', call: { tool: 'OUTLOOK_SEND_EMAIL', args: {} } }],
   }));
-  assert.equal(result.ok, true);
+  // This intentionally incomplete direct call also faces the independent
+  // exact-call validator. Here we pin propagation of its typed-effect warning.
   assert.ok(
     result.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)),
     result.warnings.join('\n'),

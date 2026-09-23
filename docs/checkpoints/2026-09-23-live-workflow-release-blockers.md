@@ -542,3 +542,82 @@ unit checks are not installed-app acceptance. Main and desktop/UI files untouche
 Final adjacent checks29passed (catalog/send authority and future-default matrix),
 /tmp/clem-send-native-adjacent.log. Typecheck passed:
 /tmp/clem-send-native-final-typecheck.log. No full-suite claim.
+
+
+## Installed 3b5232604 — explicit no-sends preservation acceptance
+
+Build completed exit0, clean3b52326045d57fbbb36893a771ad86cf1b12d77d,
+fingerprint2df8af390d54b78075a272d486601c83aa024f7c8a182094ab97f4944b129ae1.
+Idle preflight: active0/runningRuns0/backgroundActive0; same three blocked/parked
+workflows, no started physical dispatch; no other build process. Quit exact app,
+confirmed daemon50688 exited, then Terminal hotpatch recipe and exact app relaunch.
+The acceptance script verified build-info SHA before submitting once.
+
+Source290943, session sess-desktop-dc37adb6008d9981ed183c8f;
+child1790178516933-8b2e15, source291001, step edit_preservation.
+Parent terminal291106 done; child291047 done. Workflow succeeded, needsAttention
+false. Independent read confirmed exact Name,Value\nAlpha,2\nBeta,9\n;
+one run, disabled fixture, allowSends false, manual trigger/no schedule.
+Creation succeeded first attempt retaining explicit no-sends and sideEffect write.
+One write (291023), mode overwrite/append false, successful readback; no refused
+write, no discovery. The authored saved step additionally supplied allowedTools
+read_file/write_file and output final_contents/verified. Those are valid authored
+contracts, not invented runtime constraints. Thus this live run does NOT exercise
+the omitted-default repair/off-surface path: that remains recording-host tested.
+Evidence output/harness-acceptance/2026-09-23-3b5232604/.
+
+Canonical certified measurements:
+parent111536ms,8 top-level calls,0discovery,384034prompt,158456cached,3314output;
+Opus5.5 x8/Grok4.3 x7/Jev1.13.0 x6.
+child38631ms,4 top-level calls,0discovery,32046prompt,0cached,552output;
+Haiku4.5 x4/Jev1.13.0 x1.
+Compared with c2 parent126588ms/330064prompt and child38202ms/122739prompt:
+child tokens decreased greatly, wall was effectively flat, parent tokens rose.
+Explicit tools/output and revised parent instruction make this non-matched
+observational data, not a causal performance claim. Do not sum nested walls.
+Initial measurement attempt correctly refused while parent had no terminal;
+observed same accepted source until settlement, never resubmitted.
+
+Remaining: false SEND coherence advisory still appeared on save and was reported
+honestly. Legacy dashboard/workflow-proof.ts independently turns analyzeWorkflowGaps
+questions into needs_info/canRun:false/canEnable:false, contradicting the canonical
+workflow-certification.ts advisory policy. Needs a shared authority projection,
+not a keyword negation patch or removing true missing-input/resource blocks.
+Parent prompt/review overhead, notification shell click, broader journeys/mobile/
+full suite and GPT6Sol comparison remain owed. No tag/main merge, no business writes.
+This checkpoint update postdates the built commit; rebuild after the next commit.
+
+
+## Follow-up: remove prose-only side-effect coherence warnings
+
+Red test reproduced false SEND warning for live prohibition text and quoted
+instructions. Removed the validator's independent prompt effect regex classifier
+and configured-owner alias inference. Side-effect coherence warnings now compare
+an authored declaration against the shared structured-call effect only. No regex
+negation expansion, provider switch, new prompt or extra paid judge was added.
+Generative steps still retain their authored effect and dispatch-time consent /
+mutation review; legacy unspecified classification in enforce was not changed.
+Old tests asserting prose-derived SEND warnings were replaced with structural
+send evidence, snake-case metadata and positive/negative/quoted prose cases.
+A checkWorkflowForWrite fixture intentionally has incomplete exact-call args;
+its assertion now pins warning propagation rather than incorrectly claiming
+that incomplete direct call should pass all independent structural validation.
+
+156checks passed,0failed: /tmp/clem-coherence-final.log. Typecheck passed:
+/tmp/clem-coherence-typecheck.log. Red /tmp/clem-coherence-red.log. Unit isolation
+sentinel NOT PERFORMED because live daemon68401 was running. Not installed yet.
+The dashboard proof/certification disagreement remains separate and unresolved.
+
+Measured parent overhead, accepted source290943 (no new generative run):
+first prompt_composition290960 total25352 estimated tokens; tool schemas16339,
+memory2868, history1923, instructions1566, contextPacket1221, turnContext1203,
+currentMessage232. Largest schemas workflow_create5272, plan_task2840,
+run_worker1329, work_call1280. Eight parent compositions increased25352→29924,
+not exponential growth in this short trace. Actual attributed provider input:
+Opus305007 over8calls; Jev completion30432 over3; Grok completion23971 over3;
+Grok watcher21496 over3; Jev trajectory2083 over3; other Grok1045 over1.
+These components sum to canonical384034 prompt tokens. Watcher/review durations
+can overlap other work; do not add them to derive wall latency. Tool schema size
+is the next evidence-backed JIT optimization target, not indiscriminate memory
+truncation. Preserve discovery reachability and the accepted plan/context when
+retiring irrelevant schema exposure; no such optimization shipped in this edit.

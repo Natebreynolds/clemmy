@@ -39,7 +39,6 @@ import {
   argsHaveStaticSendTarget,
   isSendTargetArgumentKey,
 } from '../runtime/harness/grounding-gate.js';
-import { textTargetsConfiguredUserRecipient } from '../runtime/user-profile.js';
 import {
   parseWorkflowNodeInvocationPlan,
   type WorkflowNodeArgumentSourceV1,
@@ -267,55 +266,9 @@ function checkApprovalCoherence(
   return { errors, warnings };
 }
 
-const SIDE_EFFECT_SEND_RE =
-  /\b(?:send|sends|sending|deliver|delivers|delivering|dispatch|dispatches|dispatching)\b[\s\S]{0,80}\b(?:e-?mails?|messages?|sms|texts?|invites?|dms?|notifications?|newsletters?|owner|me|myself|user|client|customer|prospect|recipient|inbox|mailbox)\b|\bnotify(?:ing|ies)?\b[\s\S]{0,80}\b(?:owner|me|myself|user|client|customer|prospect|recipient|inbox|mailbox|about|with|that)\b|\b(?:email|e-mail|message|dm)\s+(?:me|myself|owner|the\s+user|a\s+user|users?|clients?|customers?|prospects?|recipients?)\b/i;
-/**
- * Clear command-shaped sends to a named recipient. This is deliberately
- * separate from configured-user routing: an external "Email Riley ..." is a
- * SEND side effect, but it must not make notify_user a required local tool.
- * Requiring a command boundary keeps noun phrases such as "analyze email
- * trends" read-only; sideEffectSignalText strips explicit negations first.
- */
-const IMPERATIVE_DIRECT_RECIPIENT_SEND_RE =
-  /(?:^[ \t]*(?:[-*]\s+|\d+[.)]\s+)?|[.!?]\s+|\bthen\s+)(?:please\s+)?(?:send|deliver|dispatch|e-?mail|message|dm|notify)\s+[\p{L}][\p{L}\p{M}'’.-]*(?:\s+[\p{L}][\p{L}\p{M}'’.-]*){0,2}?(?=\s+(?:the|a|an|this|that|these|those|with|about)\b|[,.!?]|$)/imu;
-const IMPERATIVE_OBJECT_TO_RECIPIENT_SEND_RE =
-  /(?:^[ \t]*(?:[-*]\s+|\d+[.)]\s+)?|[.!?]\s+|\bthen\s+)(?:please\s+)?(?:send|deliver|dispatch|e-?mail|message|dm|notify)\b[^\n.!?]{0,80}\bto\s+[\p{L}][\p{L}\p{M}'’.-]*(?=\s|[,.!?]|$)/imu;
-const SIDE_EFFECT_PUBLISH_RE =
-  /\b(?:publish|publishes|publishing)\b[\s\S]{0,60}\b(?:tweet|tweets|linkedin|slack|twitter|\bx\b|facebook|instagram|blog\s*post|social\s+post|post)\b|\b(?:post|posts|posting)\b[\s\S]{0,30}\b(?:to|on|onto)\s+(?:linkedin|slack|twitter|\bx\b|facebook|instagram|the\s+blog|a\s+blog)\b/i;
-const SIDE_EFFECT_WRITE_RE =
-  /\b(?:create|creates|creating|add|adds|adding|insert|inserts|upsert|upserts|update|updates|updating|write|writes|writing|save|saves|saving|delete|deletes|remove|removes|append|appends|draft|drafts|upload|uploads)\b[\s\S]{0,60}\b(?:record|records|row|rows|sheet|spreadsheet|table|crm|airtable|salesforce|hubspot|database|file|files|document|docs?|event|calendar|invite|message|ticket|issue|page|notion|post|url)\b/i;
-
-function sideEffectSignalText(prompt: string): string {
-  return prompt
-    // "do NOT send/post/email" is a safety boundary, not an instruction to act.
-    .replace(/\b(?:do\s+not|don't|never)\s+(?:send|post|publish|email|e-mail|notify|message|dm|call|execute|create|update|write|save|delete|upload)\b[^\n.!?]*/gi, ' ')
-    // "nothing to send" / "no email was sent" / "downstream send steps" are
-    // status or planning language, not an instruction for this step to send.
-    .replace(/\b(?:nothing|no\s+(?:email|message|notification|dm|post|content))\s+(?:is\s+|was\s+|to\s+)?(?:send|sent|post|posted|publish|published|email|e-mail|notify|message|dm)\b[^\n.!?]*/gi, ' ')
-    .replace(/\bdownstream\s+[a-z0-9_/ -]{0,50}\bsteps?\b/gi, ' ')
-    // Planning prompts often describe risk classes named read/write/send; those
-    // labels are not themselves side effects for the current step.
-    .replace(/\brisk[_ -]?class\s*["']?(?:read|write|send)["']?\s+for\b[^\n]*/gi, ' ')
-    .replace(/\brisk[_ -]?class\s*[:=]\s*["']?(?:read|write|send)["']?/gi, ' ')
-    .replace(/\bread\|write\|send\b/gi, ' ');
-}
-
 function declaredSideEffect(step: WorkflowStepShape): 'read' | 'write' | 'send' | null {
   const raw = step.sideEffect ?? step.side_effect;
   return raw === 'read' || raw === 'write' || raw === 'send' ? raw : null;
-}
-
-function promptSideEffectClass(prompt: string): 'read' | 'write' | 'send' {
-  const signal = sideEffectSignalText(prompt);
-  if (
-    SIDE_EFFECT_SEND_RE.test(signal)
-    || SIDE_EFFECT_PUBLISH_RE.test(signal)
-    || IMPERATIVE_DIRECT_RECIPIENT_SEND_RE.test(signal)
-    || IMPERATIVE_OBJECT_TO_RECIPIENT_SEND_RE.test(signal)
-    || textTargetsConfiguredUserRecipient(signal)
-  ) return 'send';
-  if (SIDE_EFFECT_WRITE_RE.test(signal)) return 'write';
-  return 'read';
 }
 
 function sideEffectRank(cls: 'read' | 'write' | 'send'): number {
@@ -324,12 +277,15 @@ function sideEffectRank(cls: 'read' | 'write' | 'send'): number {
 
 function checkSideEffectCoherence(step: WorkflowStepShape): string | null {
   const declared = declaredSideEffect(step);
-  if (!declared) return null;
-  const inferred = promptSideEffectClass(step.prompt ?? '');
+  // Prose is neither operation identity nor evidence of an executed effect.
+  // Negations, examples and quoted instructions must not fabricate a stronger
+  // class. Generative proposals are checked at the actual dispatch boundary.
+  if (!declared || !step.call?.tool) return null;
+  const inferred = structuredCallSideEffectClass({ call: step.call, sideEffect: declared });
   if (sideEffectRank(declared) >= sideEffectRank(inferred)) return null;
   return (
-    `Step "${step.id}" declares sideEffect: ${declared}, but its prompt looks like a ${inferred.toUpperCase()} step. `
-    + 'Set the stronger sideEffect or rewrite the prompt; otherwise crash-resume, retry, and phantom-completion guards can treat the step as safer than it is.'
+    `Step "${step.id}" declares sideEffect: ${declared}, but its structured call is classified as ${inferred.toUpperCase()}. `
+    + 'Align the declared effect with the structured operation. Execution and recovery use the operation classification.'
   );
 }
 
