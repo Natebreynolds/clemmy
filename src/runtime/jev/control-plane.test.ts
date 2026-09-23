@@ -357,3 +357,27 @@ test('tryJevTrajectoryVerdict returns a typed on_track/drift reading and fails o
     objective: 'x', toolCallSummary: '', latestAssistantNote: '', toolCallCount: 1,
   }), null, 'a Jev miss changes nothing');
 });
+
+test('completion review preserves the complete source objective, final receipt and reply bytes', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 503, ok: false, text: async () => 'unavailable' };
+  });
+  const objective = 'Retained requirement. '.repeat(90) + '\nThen disable the workflow.';
+  const response = 'Verified result. '.repeat(450) + '\nWorkflow disabled: false is the saved enabled value.';
+  const verifiedReads = 'Earlier successful receipt. '.repeat(180) + '\nFINAL READ: enabled=false';
+  const evidence = 'Earlier settled work. '.repeat(150) + '\nLAST WRITE: enabled=false';
+  const outcomes = Array.from({ length: 16 }, (_, index) => ({
+    toolName: `operation_${index}`, outcome: 'succeeded', contentComplete: true,
+  }));
+  assert.equal(await tryJevCompletionVerdict(objective, response, {
+    verifiedReads, toolCallSummary: evidence, coverage: { complete: true, outcomeEvidence: outcomes },
+  }), null, 'transport unavailability still falls back to the existing reviewer');
+  assert.equal(posted.state.objective, objective);
+  assert.equal(posted.state.response, response);
+  assert.equal(posted.state.verifiedReads, verifiedReads);
+  assert.equal(posted.state.evidence, evidence);
+  assert.deepEqual(posted.state.coverage.outcomeEvidence, outcomes);
+});

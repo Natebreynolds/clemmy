@@ -416,13 +416,19 @@ export async function tryJevCompletionVerdict(
   const started = Date.now();
   const result = await evaluateSystemOne({
     state: {
-      objective: objective.replace(/\s+/g, ' ').trim().slice(0, 1_200),
-      response: assistantResponse.replace(/\s+/g, ' ').trim().slice(0, 6_000),
+      // Completion is a verdict over this exact source, not a relevance
+      // ranking over excerpts. Prefix clipping hid late receipts (including
+      // a completed disable) while coverage still advertised complete work.
+      // Retain the supplied source-scoped evidence; transport/context failure
+      // must abstain through the existing reviewer fallback, never judge an
+      // undisclosed partial view as the whole task.
+      objective,
+      response: assistantResponse,
       ...(opts?.coverage
         ? {
             coverage: {
               complete: opts.coverage.complete,
-              outcomeEvidence: opts.coverage.outcomeEvidence.slice(0, 12).map((row) => ({
+              outcomeEvidence: opts.coverage.outcomeEvidence.map((row) => ({
                 toolName: row.toolName,
                 outcome: row.outcome,
                 contentComplete: row.contentComplete !== false,
@@ -431,9 +437,9 @@ export async function tryJevCompletionVerdict(
           }
         : {}),
       ...(opts?.verifiedReads
-        ? { verifiedReads: opts.verifiedReads.replace(/\s+/g, ' ').trim().slice(0, 4_000) }
+        ? { verifiedReads: opts.verifiedReads }
         : {}),
-      ...(opts?.toolCallSummary ? { evidence: opts.toolCallSummary.replace(/\s+/g, ' ').trim().slice(0, 2_500) } : {}),
+      ...(opts?.toolCallSummary ? { evidence: opts.toolCallSummary } : {}),
     },
     questions,
     timeoutMs: COMPLETION_TIMEOUT_MS,
