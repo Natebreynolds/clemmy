@@ -109,3 +109,42 @@ Native click and installed acceptance are still owed at this checkpoint.
 Additional recorded native plan/Space regression suite:15/15 pass, including
 read/write/read, retained plan requirements, workflow enable/reopen and one
 mutation. No paid providers. /tmp/clem-workspace-plan-regressions.log.
+
+## Installed 5dba1dd41 follow-up — partial qualification
+
+Daemon source5dba1dd41c46b2204809b7ac3ab41055a84858ea is installed, fingerprint
+b5324eab3cfc02a5a753efdb9658774ea4220272ca90c13bb31b806673bcf843,
+instance15d1e10f-2f88-4332-a790-cbb0dbbc2738, pid81419. The desktop notification
+fix is NOT installed. Signing the new archive with the existing Developer ID
+failed errSecInternalComponent. A read-only login-keychain query also failed
+with the OS passphrase error. No security controls changed; owner asked to
+unlock login keychain. Do not infer exhausted model quota or bad OAuth from it.
+Original app.asar, executable, Info.plist and CodeResources were restored and
+matched byte-for-byte; native Home rendered again. New daemon remains installed.
+Never infer shell bytes from daemon build-info. Native click acceptance remains
+owed. All pending rollback artifacts are under /tmp/clem-notification-shell;
+do not overwrite them by rerunning apply.command. Signing traverses13GB including
+old retained backups; elapsed minutes were not proof of a hung credential dialog.
+
+Qualification on installed modules, using Clementine's own Electron runtime
+(ELECTRON_RUN_AS_NODE=1) against the existing controlled live-home Space:
+- Manifest-only native space_get succeeds, explicitly reports missing view,
+  leaves the snapshot unchanged and does not invent a view:194ms.
+- Exact inventory with approved proposal revision3/digest9574eff… succeeds for
+  both declared read and output pairs:9ms/7ms. Each returns exactly the named
+  fixture, revision1/digestfb7ef4…; no binding/execution authority granted.
+- Missing exact Workspace returns[], never broad inventory fallback.
+- Inventory uses a HISTORICAL CONTEXT REPLAY of source292077; readonly SQLite
+  verified its user_input_received event/session. This is not a new accepted
+  chat turn, pilot creation, or full lifecycle acceptance. Zero model calls.
+
+Initial system-Node replay hit native SQLite ABI127 versus packaged148. Do not
+rebuild installed native dependencies to accommodate a test runner. Rerun using
+the app's own runtime. The initial49ms native-read result is superseded by the
+194ms correct-runtime measurement, not a before/after latency comparison.
+
+Release-asset suite56/56 passes on5dba1dd41. This covers asset contracts, not a
+new signed installer or native click. Full suite held while load was12/12/12;
+no full-suite pass claimed. Evidence under output/harness-acceptance/
+2026-09-23-notification-click/ and2026-09-23-workspace-installed-read/.
+No business workflow rerun, no external message, no paid model, no tag/push.
