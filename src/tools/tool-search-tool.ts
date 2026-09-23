@@ -1088,9 +1088,12 @@ export function registerToolSearchTool(
             ...Object.keys(properties ?? {})].join('\n'),
         };
       });
-      const exactEntry = deferredPage ? undefined : scopedCatalog
-        .find((entry) => queryExplicitlyNamesTool(query, entry.name));
-      const exactKnownButDenied = !deferredPage && !exactEntry && catalogEntries()
+      const exactEntries = deferredPage ? [] : scopedCatalog
+        .filter((entry) => queryExplicitlyNamesTool(query, entry.name));
+      // Only a singleton may collapse the result to one schema. Multiple
+      // explicit native identities must all survive the ordinary result path.
+      const exactEntry = exactEntries.length === 1 ? exactEntries[0] : undefined;
+      const exactKnownButDenied = !deferredPage && exactEntries.length === 0 && catalogEntries()
         .some((entry) => queryExplicitlyNamesTool(query, entry.name));
       // Only a structured tool-name selection receives the exact-hit shortcut.
       // Workflow-name similarity remains advisory ranking, never a substitute
@@ -1119,6 +1122,8 @@ export function registerToolSearchTool(
       // source fails, that failure is the headline, never a local tool that
       // happened to rank.
       const requestedOperationInQuery = operationNamedInQuery(query);
+      const requestedOperationOutsideCatalog = Boolean(requestedOperationInQuery
+        && !catalogEntries().some((entry) => sameOperationName(entry.name, requestedOperationInQuery)));
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -1127,7 +1132,7 @@ export function registerToolSearchTool(
         ? deferredPage.rows.filter((row) => row.sourceKind && row.carrier).map((row) => ({
             name: row.name, summary: row.summary, sourceKind: row.sourceKind!, carrier: row.carrier!,
           } as ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind }))
-        : exactNamedHit || exactKnownButDenied
+        : (exactEntries.length > 0 || exactKnownButDenied) && !requestedOperationOutsideCatalog
         ? []
         : await (async () => {
           const discoverFromSource = async (source: NonNullable<typeof opts.candidateSources>[number]) => {
@@ -1296,7 +1301,9 @@ export function registerToolSearchTool(
       const exactSourceHit = exactSourceMatches.length === 1
         ? exactSourceMatches[0]
         : undefined;
-      const selectedExactly = exactSourceHit ?? exactNamedHit;
+      const selectedExactly = exactSourceMatches.length + exactEntries.length === 1
+        ? exactSourceHit ?? (requestedOperationOutsideCatalog ? undefined : exactNamedHit)
+        : undefined;
       const requestedEffect = requestedCapabilityEffectScope(query);
       // Merge all scoped metadata onto one query-relevance scale. A source's
       // ordinal score is useful only as a tie-break, never as proof that its
@@ -1818,8 +1825,7 @@ export function registerToolSearchTool(
         if (
           unavailable.length > 0
           && (sourceCandidates.length === 0 || namedOperationMissing)
-          && !exactNamedHit
-          && !exactKnownButDenied
+          && (requestedOperationOutsideCatalog || (!exactNamedHit && !exactKnownButDenied))
         ) {
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
           if (namedOperationMissing) {
