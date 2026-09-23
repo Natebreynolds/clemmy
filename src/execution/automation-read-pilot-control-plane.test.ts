@@ -241,6 +241,7 @@ function blankStateFixture(label: string, options: {
   localOutput?: boolean;
   opportunityOverride?: AutomationOpportunityV1;
   resultOverride?: unknown;
+  inputSchemaOverride?: Record<string, unknown>;
   pages?: number;
   paginationMode?: 'complete' | 'cycle' | 'budget';
 } = {}): BlankStateFixture {
@@ -291,7 +292,7 @@ function blankStateFixture(label: string, options: {
         accountId,
         effect: 'read',
         effectAttestation: 'carrier_declared',
-        inputSchema: {
+        inputSchema: options.inputSchemaOverride ?? {
           type: 'object',
           additionalProperties: false,
           properties: {
@@ -1587,7 +1588,12 @@ test('original approved inventory contract executes 13 text records into five sc
   const recoveryBefore = runner.reconcileCanonicalEntityWorkspaceProjectionClaims();
   const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
   const raw = JSON.parse(readFileSync(new URL('./fixtures/documentation-inventory-mcp-result.json', import.meta.url), 'utf8'));
-  const fixture = blankStateFixture('original_text_inventory', { dataset: true, opportunityOverride: original, resultOverride: raw });
+  const fixture = blankStateFixture('original_text_inventory', { dataset: true, opportunityOverride: original, resultOverride: raw,
+    inputSchemaOverride: { type: 'object', properties: {}, $schema: 'http://json-schema.org/draft-07/schema#' },
+  });
+  fixture.input.contract.arguments = {};
+  fixture.input.contract.workflowInputs = {};
+  fixture.input.workflowInputs = {};
   assert.deepEqual(fixture.proposal.opportunity, opportunities.parseAutomationOpportunity(original));
   const surface = chatPilotSurface(fixture);
   const { projectionDigest: _digest, ...base } = fixture.input.contract.resultProjection!;

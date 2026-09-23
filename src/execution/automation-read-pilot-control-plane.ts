@@ -512,13 +512,17 @@ function typedContractIssue(input: {
   schema: ToolContract;
 }): string | null {
   const schema = input.schema.schema;
+  // JSON Schema permits omitted properties/required and does not require the
+  // provider to forbid extra keys. The pilot remains narrower: every bound
+  // argument below must have an explicit property and preserve its type.
+  const properties = schema.properties === undefined ? {} : schema.properties;
+  const required = schema.required === undefined ? [] : schema.required;
   if (
     schema.type !== 'object'
-    || schema.additionalProperties !== false
-    || !safeRecord(schema.properties)
-    || !Array.isArray(schema.required)
-    || !schema.required.every((key) => typeof key === 'string' && key.trim() === key)
-  ) return 'The live input schema is not a closed typed object contract.';
+    || !safeRecord(properties)
+    || !Array.isArray(required)
+    || !required.every((key) => typeof key === 'string' && key.trim() === key)
+  ) return 'The live input schema is not a typed object contract.';
 
   const continuation = input.contract.continuation ?? { kind: 'none' as const };
   if (
@@ -526,10 +530,9 @@ function typedContractIssue(input: {
     || (input.contract.completeness.kind === 'terminal_result' && continuation.kind !== 'none')
     || (input.contract.completeness.kind === 'finite_exhaustive' && continuation.kind !== 'cursor')
   ) return 'The typed pilot completeness and continuation contracts contradict one another.';
-  const propertyNames = new Set(Object.keys(schema.properties));
-  const requiredNames = new Set(schema.required as string[]);
+  const propertyNames = new Set(Object.keys(properties));
+  const requiredNames = new Set(required as string[]);
   const argumentNames = Object.keys(input.contract.arguments);
-  if (argumentNames.length === 0) return 'The typed pilot has no provider arguments.';
   if (argumentNames.some((key) => !propertyNames.has(key))) {
     return 'The typed pilot contains an argument absent from the exact live schema.';
   }
@@ -545,7 +548,7 @@ function typedContractIssue(input: {
     )) {
       return 'The control-plane pilot accepts only workflow-input and host-owned continuation-cursor argument sources.';
     }
-    const property = schema.properties[argumentName];
+    const property = properties[argumentName];
     const propertyType = schemaType(property);
     if (!propertyType || propertyType !== binding.type || binding.type !== 'string') {
       return `Argument "${argumentName}" does not preserve the exact live schema type.`;

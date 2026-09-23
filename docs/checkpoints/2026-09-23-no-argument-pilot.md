@@ -1,0 +1,14 @@
+# No-argument pilot compatibility — candidate repair
+
+095702fb8 installed via Terminal, same Developer ID, strict signature verification passed, desktop asar unchanged44cf6d91…. Live build fingerprintc1cc82afda28e65b026ad198f6f5bf7122bfafbd433016d30a867a4eb943fb12; daemon29926. Rollback dist.backup-Fn9Ifk and builtin-skills.backup-2SqYUj retained; patch/signing artifacts under output/harness-acceptance/2026-09-23-semantic-nomination/installed-patch/.
+
+Original proposal continuation source292593→292644 needs_input, one attempt, no unfinished attempt.3top-levelcalls,0discovery,42124ms;190140input/111062cached/79078uncached/2812output;10usage rows (Opus3,Grok3,Jev1.13 three,Jev-latest one), exact attribution certified but1uncertified call. Not a successful or matched speed comparison. Exact Workspace lookup returned one correct record and refreshed acquisition was used first time. Pilot capability matching progressed to schema validation, which refused the valid provider-observed no-argument object schema. No pilot projection/execution or schedule. Model suggested updating personal connector; do not do that, fix framework.
+
+Two class defects reproduced by changing the existing ORIGINAL13-to-five execution/replay fixture to the actual provider schema {type:object,properties:{},$schema:…}, with empty arguments/workflow inputs. Previous fixture artificially required a scope string and hid both defects.
+
+1. Typed pilot validator incorrectly required explicit additionalProperties:false, required:[], and at least one argument. It now applies JSON Schema defaults for omitted properties/required and accepts zero arguments when none required. Every bound argument still needs an explicit declared property and exact type, every required name must be supplied, continuation contracts and workflow-input correspondence still validated. Provider schema/fingerprint untouched; null declarations remain invalid.
+2. No-input compiled preview emitted inputs:{}, while workflow store omits that field. Approval digest then refused the persisted workflow. Bridge now omits empty inputs BEFORE digest/approval, preserving exact round-trip enforcement rather than weakening equality.
+
+Negative test failed before fix with typed_contract_invalid. Intermediate run20/21 exposed pilot_queue_failed round-trip mismatch. Final two-file run21/21 passes, including original approved13textrecords→five scoped records with provenance and replay once, plus other refusal/recovery paths. No paid models in fixtures; isolated runner sentinel NOT PERFORMED while daemon owns live home. Source candidate not installed; final types and live pilot continuation still owed. Evidence under output/harness-acceptance/2026-09-23-pilot-095/.
+
+Final TypeScript check passed (exit0); whitespace check clean. Candidate awaits build and installed acceptance.

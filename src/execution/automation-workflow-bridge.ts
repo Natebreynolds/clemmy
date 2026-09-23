@@ -1003,7 +1003,10 @@ function buildPreview(input: {
     enabled: false,
     trigger: workflowTriggerFor(input.opportunity, input.target),
     ...(!invocationPlan ? { allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS] } : {}),
-    ...(invocationPlan ? { inputs: structuredClone(input.readPilotContract!.workflowInputs) } : {}),
+    // The durable store omits an empty inputs map. Review the same canonical
+    // representation so a no-argument read survives approval and persistence.
+    ...(invocationPlan && Object.keys(input.readPilotContract!.workflowInputs).length > 0
+      ? { inputs: structuredClone(input.readPilotContract!.workflowInputs) } : {}),
     steps: workflowPhases.map((phase) => ({
       id: phase.id,
       prompt: invocationPlan ? '' : phase.objective,
