@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { recordOperationalEventOnce } from '../runtime/operational-telemetry.js';
 import { getMemoryHealthSummary } from './facts.js';
 import { readHygieneAudit } from './hygiene-audit.js';
 import { readFactRecallTrace } from './recall-trace.js';
@@ -204,5 +205,23 @@ export function writeCuratorReport(report: CuratorReport): string {
 
 export function runReportOnlyCurator(now = new Date()): { report: CuratorReport; path: string } {
   const report = buildReportOnlyCuratorReport(now);
-  return { report, path: writeCuratorReport(report) };
+  const reportPath = writeCuratorReport(report);
+  // Publish only after the report exists. A review is not an applied repair.
+  // Aggregate evidence is safe for activity surfaces; names, facts and full
+  // recommendations remain in Memory's detailed report, not a global feed.
+  recordOperationalEventOnce({
+    source: 'memory',
+    type: 'memory_review_completed',
+    actor: 'memory-curator',
+    now,
+    payload: {
+      reportId: report.id,
+      mode: report.mode,
+      mutationApplied: false,
+      modelCalls: 0,
+      counts: report.counts,
+      findings: report.findings.map(({ area, severity, count }) => ({ area, severity, ...(count === undefined ? {} : { count }) })),
+    },
+  });
+  return { report, path: reportPath };
 }

@@ -100,3 +100,19 @@ test('buildReportOnlyCuratorReport previews current self-heal candidates without
   assert.equal(listProposedMemoryFixes().length, 0, 'curator current-candidate preview must not persist proposals');
   assert.ok(report.findings.some((finding) => /current reversible candidates/.test(finding.message)));
 });
+
+
+test('persisted memory review emits one privacy-safe receipt without claiming a mutation', async () => {
+  const { runReportOnlyCurator } = await import('./curator.js');
+  const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
+  rememberFact({ kind: 'project', content: 'PRIVATE_CONTEXT_MUST_STAY_IN_MEMORY', importance: 5 });
+  const at = new Date('2026-09-22T16:00:00.000Z');
+  const { report } = runReportOnlyCurator(at);
+  runReportOnlyCurator(at);
+  const receipts = listOperationalEvents({ source: 'memory', limit: 100 }).filter(row => row.payload.reportId === report.id);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].payload.mutationApplied, false);
+  assert.equal(receipts[0].payload.modelCalls, 0);
+  assert.deepEqual(receipts[0].payload.counts, report.counts);
+  assert.equal(JSON.stringify(receipts).includes('PRIVATE_CONTEXT_MUST_STAY_IN_MEMORY'), false);
+});
