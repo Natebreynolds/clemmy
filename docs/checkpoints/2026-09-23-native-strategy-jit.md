@@ -40,3 +40,20 @@ and controlled cold/warm lifecycle tasks on the same brain. Verify actual learne
 event, first request's schemas/refs, searches, calls, uncached tokens and canonical
 completion. Larger initial schema payload may offset fewer turns; do not claim
 net efficiency from reduced discovery alone. No tag or push yet.
+
+## Follow-up before installation: full-request recall index
+
+The real lifecycle prompt scores0.20 against keywords extracted from its first200
+characters, below the existing0.50 coverage condition. recordRunStrategy truncated
+the display objective before extracting keywords, so even exact repeated long
+requests could fail warm reuse. Candidate now derives its bounded12-keyword index
+from the full accepted objective while retaining the200-character display preview.
+A new verified near-duplicate refreshes both preview and index with its new proof.
+No old records are rewritten without new successful learning evidence.
+
+New pin fails on prior code and verifies late-request recall plus index refresh:
+/tmp/clem-full-objective-red.log. Combined store/learning/proven/native production
+checks29/29 pass in /tmp/clem-full-objective-green.log. These are distinct from
+the earlier47 set, not47+29 independent tests. No net-token win claimed before
+installed cold/warm measurement. The first candidate586cd1dfa was built but NOT
+hotpatched; installed app remainsa82108e5f until the combined candidate is built.

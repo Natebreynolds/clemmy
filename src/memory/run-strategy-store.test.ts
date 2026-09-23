@@ -177,3 +177,20 @@ test('records learned before scopes resolve theirs from the receipt session on r
   const persisted = JSON.parse(readFileSync(file, 'utf8')) as { strategies: Array<{ id: string; scope?: string }> };
   assert.equal(persisted.strategies.find((s) => s.id === 'strat-legacy-step')?.scope, 'workflow_step', 'the resolved scope is written back once');
 });
+
+test('compact objective previews do not truncate the recall index or leave refreshed evidence stale', () => {
+  const prefix = 'Proceed with the requested review using existing context. '.repeat(5);
+  const tail = 'inventory quarantine provenance reconciliation';
+  const objective = `${prefix} ${Array(8).fill(tail).join(' ')}`;
+  const input = { objective, toolsUsed: ['fixture_catalog_inspect'], workerCount: 0, durationMs: 1,
+    learningReceipt: receipt('full-objective') };
+  const record = recordRunStrategy(input)!;
+  assert.ok(record.objective.length <= 200, 'visible memory stays compact');
+  assert.deepEqual(record.keywords, strategyKeywords(objective), 'index the full accepted request');
+  assert.equal(listMatchingRunStrategies(tail)[0]?.strategy.id, record.id);
+  const refreshedObjective = `${prefix} ${Array(9).fill(tail).join(' ')} retention`;
+  const refreshed = recordRunStrategy({ ...input, objective: refreshedObjective,
+    learningReceipt: receipt('full-objective-refreshed') })!;
+  assert.equal(refreshed.id, record.id);
+  assert.deepEqual(refreshed.keywords, strategyKeywords(refreshedObjective), 'new proof refreshes its exact recall index');
+});

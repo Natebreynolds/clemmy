@@ -148,10 +148,11 @@ function scopeOf(record: Pick<RunStrategyRecord, 'scope'>): RunStrategyScope {
  *  not fill with restatements of the same job. */
 export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRecord | null {
   if (!isValidLearningReceipt(input.learningReceipt, { target: 'strategy' })) return null;
-  const objective = (input.objective ?? '').trim().slice(0, MAX_OBJECTIVE_CHARS);
+  const acceptedObjective = (input.objective ?? '').trim();
+  const objective = acceptedObjective.slice(0, MAX_OBJECTIVE_CHARS);
   const toolsUsed = [...new Set(input.toolsUsed.map((t) => t.trim()).filter(Boolean))].slice(0, 8);
   if (!objective || toolsUsed.length === 0) return null; // a run that used no real tools teaches nothing
-  const keywords = strategyKeywords(objective);
+  const keywords = strategyKeywords(acceptedObjective);
   if (keywords.length === 0) return null;
   const file = readStore();
   const now = new Date().toISOString();
@@ -162,6 +163,8 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   if (existing) {
     const wasVerified = isValidLearningReceipt(existing.learningReceipt, { target: 'strategy' });
     existing.scope = scope;
+    existing.objective = objective;
+    existing.keywords = keywords;
     existing.toolsUsed = toolsUsed;
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
