@@ -1,3 +1,4 @@
+import { validWorkflowTextSelectionReceipt, type WorkflowTextSelectionReceiptV1 } from '../memory/workflow-text-result-interpretation.js';
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
@@ -90,6 +91,7 @@ export interface CanonicalCoverageProjectionPositionV1 {
 }
 
 export interface CanonicalEntityWorkspaceProjectionHeadV1 {
+  selection?: WorkflowTextSelectionReceiptV1;
   version: 1;
   identity: CanonicalWorkspaceProjectionIdentityV1;
   bindingDigest: string;
@@ -136,6 +138,7 @@ export interface CanonicalEntityWorkspaceProjectionHeadV1 {
 }
 
 export interface ProjectCanonicalEntityStoreToWorkspaceInputV1 {
+  selection?: WorkflowTextSelectionReceiptV1;
   version: 1;
   identity: CanonicalWorkspaceProjectionIdentityV1;
   expectedBindingDigest: string;
@@ -697,6 +700,7 @@ function sortedRefs(values: Iterable<string>): string[] {
 }
 
 function buildHead(input: {
+  selection?: WorkflowTextSelectionReceiptV1;
   identity: CanonicalWorkspaceProjectionIdentityV1;
   bindingDigest: string;
   authority: CanonicalDatasetProjectionAuthorityV1;
@@ -713,6 +717,7 @@ function buildHead(input: {
   );
   const head: CanonicalEntityWorkspaceProjectionHeadV1 = {
     version: 1,
+    ...(input.selection ? { selection: { ...input.selection } } : {}),
     identity: { ...input.identity },
     bindingDigest: input.bindingDigest,
     datasetAuthority: { ...input.authority },
@@ -833,11 +838,12 @@ function validateCoverageReasons(value: unknown): asserts value is readonly stri
 }
 
 function validateHeadShape(value: unknown): asserts value is CanonicalEntityWorkspaceProjectionHeadV1 {
-  exactKeys(value, [
+  exactKeysWithOptional(value, [
     'version', 'identity', 'bindingDigest', 'datasetAuthority',
     'canonicalSourceDigest', 'workspaceProjectionDigest', 'source', 'records',
     'provenance', 'quarantine', 'coverage', 'projectedAt',
-  ], 'canonical entity Workspace projection head');
+  ], ['selection'], 'canonical entity Workspace projection head');
+  if (value.selection !== undefined && !validWorkflowTextSelectionReceipt(value.selection)) fail('corrupt_source', 'Invalid selected source coverage.');
   if (value.version !== 1) fail('corrupt_source', 'Projection head version must be 1.');
   exactKeys(value.identity, ['version', 'bindingId', 'workflowId', 'workspaceId', 'runId', 'datasetId'], 'projection identity');
   if (value.identity.version !== 1) fail('corrupt_source', 'Projection identity version must be 1.');
@@ -934,6 +940,7 @@ function validateHeadShape(value: unknown): asserts value is CanonicalEntityWork
   }
   const observedPartitions = exactCount(value.coverage.observedPartitions, 'coverage observedPartitions');
   const observed = exactCount(value.coverage.observed, 'coverage observed');
+  if (value.selection !== undefined && (value.selection as WorkflowTextSelectionReceiptV1).selectedRecords !== observed) fail('corrupt_source', 'Selected count contradicts stored coverage.');
   validateDenominator(value.coverage.denominator);
   if (value.coverage.partitionUniverse === 'closed') {
     const declared = exactCount(value.coverage.declaredPartitions, 'coverage declaredPartitions');
@@ -1101,6 +1108,7 @@ function insertOrUpdateHead(input: {
 function validateInput(input: ProjectCanonicalEntityStoreToWorkspaceInputV1): void {
   if (!input || typeof input !== 'object') fail('invalid', 'Projection input must be an object.');
   if (input.version !== 1) fail('invalid', 'Projection input version must be 1.');
+  if (input.selection !== undefined && !validWorkflowTextSelectionReceipt(input.selection)) fail('invalid', 'Invalid selected source coverage.');
   exactDigest(input.expectedBindingDigest, 'expectedBindingDigest');
   validateDatasetAuthority(input.expectedDatasetAuthority);
   if (input.expectedHeadDigest !== undefined) exactDigest(input.expectedHeadDigest, 'expectedHeadDigest');
@@ -1224,8 +1232,9 @@ export function projectCanonicalEntityStoreToWorkspace(
         ...adapted.value.facts,
         ...(input.scheduleFacts ?? []),
       ]);
+      if (input.selection && input.selection.selectedRecords !== adapted.value.coverage.observed) fail('corrupt_source', 'Selected count does not match canonical coverage.');
       const head = buildHead({
-        identity: input.identity,
+        ...(input.selection ? { selection: input.selection } : {}),        identity: input.identity,
         bindingDigest,
         authority: authorityFromDataset(truth.dataset),
         canonicalSourceDigest: adapted.value.sourceDigest,

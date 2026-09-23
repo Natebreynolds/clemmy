@@ -75,3 +75,21 @@ export function interpretWorkflowTextResult(value: unknown, rules: unknown): Int
     omittedRecords: sourceRecords - records.length, scope: 'reviewed_selection',
   } } };
 }
+
+/** Retained selection evidence binds counts to the reviewed projection and raw receipt. */
+export interface WorkflowTextSelectionReceiptV1 extends WorkflowTextSelectionEvidenceV1 {
+  version: 1;
+  sourceReceiptId: string;
+  sourceResultDigest: string;
+  projectionDigest: string;
+}
+export function validWorkflowTextSelectionReceipt(value: unknown): value is WorkflowTextSelectionReceiptV1 {
+  if (!object(value) || !keys(value, ['version', 'kind', 'sourceRecords', 'selectedRecords', 'omittedRecords', 'scope', 'sourceReceiptId', 'sourceResultDigest', 'projectionDigest'])) return false;
+  const count = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+  return value.version === 1 && value.kind === 'reviewed_first_records' && value.scope === 'reviewed_selection'
+    && count(value.sourceRecords) && count(value.selectedRecords) && count(value.omittedRecords)
+    && value.selectedRecords <= value.sourceRecords && value.sourceRecords - value.selectedRecords === value.omittedRecords
+    && typeof value.sourceReceiptId === 'string' && value.sourceReceiptId.length > 0 && value.sourceReceiptId === value.sourceReceiptId.trim()
+    && typeof value.sourceResultDigest === 'string' && /^[a-f0-9]{64}$/.test(value.sourceResultDigest)
+    && typeof value.projectionDigest === 'string' && /^[a-f0-9]{64}$/.test(value.projectionDigest);
+}

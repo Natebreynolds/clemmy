@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/execution/automation-read-pilot-control-plane.test.ts */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -177,8 +177,9 @@ function approvedProposal(
   dataset = false,
   maxOperations = 1,
   localOutput = false,
+  opportunityOverride?: AutomationOpportunityV1,
 ): AutomationOpportunityProposalRecordV1 {
-  const authored = opportunity(label, effect, recurring, dataset, maxOperations);
+  const authored = opportunityOverride ? structuredClone(opportunityOverride) : opportunity(label, effect, recurring, dataset, maxOperations);
   if (localOutput) {
     authored.capabilityRequirements.push({ id: 'workspace-output', description: 'Persist the reviewed dataset in the chosen Workspace.', minimumEffect: 'local_write', constraints: ['Only the exact consented Workspace projection.'] });
     authored.phases.push({ id: 'persist-result', objective: 'Persist the dataset with its provenance.', dependsOn: ['read-result'], capabilityRequirementIds: ['workspace-output'], effect: { class: 'local_write', approval: 'not_required', maxOperationsPerRun: 1 }, partitioned: false, outputEvidence: ['Exact Workspace projection head.'] });
@@ -238,6 +239,8 @@ function blankStateFixture(label: string, options: {
   recurring?: boolean;
   dataset?: boolean;
   localOutput?: boolean;
+  opportunityOverride?: AutomationOpportunityV1;
+  resultOverride?: unknown;
   pages?: number;
   paginationMode?: 'complete' | 'cycle' | 'budget';
 } = {}): BlankStateFixture {
@@ -250,6 +253,7 @@ function blankStateFixture(label: string, options: {
     options.dataset === true,
     pageCount,
     options.localOutput === true,
+    options.opportunityOverride,
   );
   const chatId = unique(`chat.${label}`);
   eventlog.createSession({ id: chatId, kind: 'chat' });
@@ -333,6 +337,7 @@ function blankStateFixture(label: string, options: {
                 bodies += 1;
                 payloads.push(structuredClone(payload));
                 const inputPayload = payload as { scope?: unknown; cursor?: unknown };
+                if (options.resultOverride !== undefined) return structuredClone(options.resultOverride);
                 if (pageCount === 1) {
                   return { records: [{ key: `record.${label}`, scope: inputPayload.scope }] };
                 }
@@ -372,8 +377,8 @@ function blankStateFixture(label: string, options: {
     approvalSessionId: chatId,
     originSessionId: chatId,
     contract: {
-      phaseId: 'read-result',
-      requirementId: 'bounded-read',
+      phaseId: options.opportunityOverride?.phases.find(phase => phase.effect.class === 'read')?.id ?? 'read-result',
+      requirementId: options.opportunityOverride?.capabilityRequirements.find(requirement => requirement.minimumEffect === 'read')?.id ?? 'bounded-read',
       workflowInputs: {
         scope: { type: 'string', required: true },
       },
@@ -1575,4 +1580,82 @@ test('explicit text selection survives the chat tool into the exact separate pil
   const approval = approvals.get(requested.approval.approvalId);
   assert.deepEqual(approval?.args.resultProjection, fixture.input.contract.resultProjection);
   assert.equal(fixture.bodies(), 0, 'authoring and requesting review cannot execute a text source');
+});
+
+
+test('original approved inventory contract executes 13 text records into five scoped records and replays once', async () => {
+  const recoveryBefore = runner.reconcileCanonicalEntityWorkspaceProjectionClaims();
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const raw = JSON.parse(readFileSync(new URL('./fixtures/documentation-inventory-mcp-result.json', import.meta.url), 'utf8'));
+  const fixture = blankStateFixture('original_text_inventory', { dataset: true, opportunityOverride: original, resultOverride: raw });
+  assert.deepEqual(fixture.proposal.opportunity, opportunities.parseAutomationOpportunity(original));
+  const surface = chatPilotSurface(fixture);
+  const { projectionDigest: _digest, ...base } = fixture.input.contract.resultProjection!;
+  fixture.input.contract.workspaceOutputPhaseId = 'write-space';
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'section_name', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [
+      { field: 'section_name', recordPath: 'section_name', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+    sourceRecord: { idPath: 'section_name', observedAt: { kind: 'page_settled_at' } },
+    identityRules: [{ ruleId: 'section-name', fields: ['section_name'], normalizers: ['case_fold', 'trim'], exactIdentifierNamespace: 'section-name' }],
+    resolutionPolicy: { ...base.resolutionPolicy, preferNewerAfterExactIdentity: ['observed_at', 'run_ref', 'source_ref'] },
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.original-text-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  assert.equal(approvals.resolve(requested.approval.approvalId, 'approved', 'operator.original-text-pilot').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  const run = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${queued.projection.runId}.json`), 'utf8'));
+  assert.equal(run.terminalOutcome, 'succeeded', JSON.stringify(run));
+  assert.equal(fixture.bodies(), 1);
+  const head = workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(created.projection.selection.bindingId);
+  assert.ok(head);
+  assert.equal(head.records.canonicalRecordsCreated, 5);
+  assert.equal(head.coverage.observed, 5);
+  assert.deepEqual(head.selection && {
+    sourceRecords: head.selection.sourceRecords, selectedRecords: head.selection.selectedRecords,
+    omittedRecords: head.selection.omittedRecords, scope: head.selection.scope,
+  }, { sourceRecords: 13, selectedRecords: 5, omittedRecords: 8, scope: 'reviewed_selection' });
+  assert.equal(head.selection?.projectionDigest, fixture.input.contract.resultProjection.projectionDigest);
+  const retained = eventlog.openEventLog().prepare(`
+    SELECT h.raw_payload_json, h.raw_payload_sha256 FROM logical_call_settlements s
+    JOIN durable_result_handles h ON h.handle_id = s.result_handle_id
+    WHERE s.settlement_event_id = ?
+  `).get(head.selection!.sourceReceiptId) as { raw_payload_json: string; raw_payload_sha256: string };
+  assert.ok(retained);
+  assert.equal(head.selection!.sourceResultDigest, retained.raw_payload_sha256);
+  const retainedView = (await import('../runtime/harness/result-facts.js')).projectProviderResultEvidenceView(
+    JSON.parse(retained.raw_payload_json), fixture.input.contract.resultProjection.textInterpretation,
+  );
+  assert.equal(retainedView.kind, 'provider_payload');
+  if (retainedView.kind !== 'provider_payload') return;
+  assert.equal((retainedView.payload as { selection: { sourceRecords: number } }).selection.sourceRecords, 13);
+
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId: head.identity.datasetId }).items;
+  assert.equal(recordIds.length, 5);
+  for (const id of recordIds) {
+    const record = entityStore.getCanonicalRecord(head.identity.datasetId, id)!;
+    assert.deepEqual(Object.keys(record.fields).sort(), ['observed_at', 'run_ref', 'section_name', 'source_ref']);
+    assert.equal(record.fields.run_ref!.evidence[0]!.value, queued.projection.runId);
+    assert.equal(record.fields.source_ref!.evidence[0]!.value, head.selection!.sourceReceiptId);
+  }
+  assert.deepEqual(runner.reconcileCanonicalEntityWorkspaceProjectionClaims(), { eligible: recoveryBefore.eligible + 1, projected: 0, replayed: recoveryBefore.replayed + 1, blocked: 0, failed: 0 });
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  assert.equal(fixture.bodies(), 1);
+  assert.deepEqual(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(created.projection.selection.bindingId), head);
 });

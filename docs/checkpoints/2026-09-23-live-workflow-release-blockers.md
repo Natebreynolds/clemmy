@@ -1462,3 +1462,54 @@ series until the full source-to-selected-output path and replay are qualified.
 
 Final typecheck exited 0 (`/tmp/clem-text-contract-typecheck-pinned.log`, session
 62560); approval suite session34526 exited 0. Diff check passed.
+
+
+## Original text pilot execution and retained selection coverage
+
+Wired the reviewed interpretation into single-read invocation evidence and the
+canonical lineage producer. Structured results retain their original itemCount
+equality check. Text is interpreted again from verified raw settlement bytes;
+its selected count is validated independently, with the original raw result
+untouched. Selection receipts bind source/selected/omitted counts and scope to
+the raw-result digest, exact page receipt and reviewed projection digest.
+
+Selection receipts persist through durable lineage and finalizer recovery into
+the Workspace head. Both input and stored-head validators reject malformed
+counts or a selected count inconsistent with canonical coverage. Finalization
+returns selection scope alongside dataset coverage. Old heads/requests omit
+this optional field and keep their prior serialized shape.
+
+The integration fixture uses the exact original approved proposal
+(digest9574eff2192f943e63a3ae49e3f4d7122082f04d8ab8f716e623bf444ff8f207),
+not an easier replacement, with the actual 13-entry provider text format. A
+controlled injected read carrier returns the retained public fixture: this is
+not a real provider dispatch. After separate Workspace and pilot approval, the
+runner publishes five records with all four required fields, exact run/source
+references, and source13/selected5/omitted8 scope. Stored selection SHA matches
+the durable result handle, and reinterpreting its retained raw bytes yields13.
+Recovery/replay keeps the same head and one physical fixture read.
+
+Checks: 35 combined pilot/parser/finalizer/Workspace-store tests passed
+(`/tmp/clem-text-execution-final.log`). Strengthened exact-receipt pilot suite
+then passed17 (`/tmp/clem-text-execution-receipt-pin.log`, session67138 exit0).
+Final typecheck passed (`/tmp/clem-text-execution-typecheck-final.log`,
+session16193 exit0). The first integration failure counted an earlier fixture
+in its global recovery count; fixed to assert the exact +1 delta and unchanged
+head/dispatch count, not a hard-coded total.
+
+A negative run temporarily removed only executor interpretation wiring. The
+original contract stopped with workflow_evidence_incomplete and missing records
+(`/tmp/clem-text-execution-red.log`, child exit1). The Node test error output
+included malformed TAP serialization after that expected block; do not count
+that output as a normal passing test. Source was restored byte-for-byte in a
+finally block; no test or typecheck was running during the temporary edit.
+Diff check passed. Tests remain isolated diagnostics; the sentinel was NOT
+PERFORMED while the live daemon owned the home and observed memory-file changes
+during one run. No live reset, paid call, business workflow, hotpatch or tag.
+
+Still owed before installed acceptance: automatic authoring must handle absent
+provider outputSchema honestly as a conditional reviewed interpretation. Its
+current prompt also still assumes only declared record-item fields and needs
+to expose the supported host provenance/text schema; behavior must remain
+validated by code. Then build clean HEAD, hotpatch with the Terminal recipe,
+and continue the unchanged real proposal through installed acceptance.

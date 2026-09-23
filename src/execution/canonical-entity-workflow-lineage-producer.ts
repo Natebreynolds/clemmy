@@ -1,3 +1,4 @@
+import { validWorkflowTextSelectionReceipt, type WorkflowTextSelectionReceiptV1 } from '../memory/workflow-text-result-interpretation.js';
 import {
   canonicalEntityJson,
   canonicalEntitySha256,
@@ -99,6 +100,7 @@ export type ProduceCanonicalEntityWorkflowLineageResultV1 =
     };
 
 interface PreparedPage {
+  selection?: WorkflowTextSelectionReceiptV1;
   page: VerifiedWorkflowReadPageV1;
   observations: EntityObservationInput[];
   observationIds: string[];
@@ -349,12 +351,20 @@ function preparePages(input: {
     totalBytes += page.rawByteCount;
     if (page.rawByteCount > input.projection.bounds.maxPageBytes
       || totalBytes > input.projection.bounds.maxTotalBytes) return null;
-    const evidenceView = projectProviderResultEvidenceView(page.rawPayload);
+    const evidenceView = projectProviderResultEvidenceView(page.rawPayload, input.projection.textInterpretation);
     if (evidenceView.kind !== 'provider_payload') return null;
     const records = valueAtPath(evidenceView.payload, input.projection.recordsPath);
     if (!Array.isArray(records)
-      || records.length !== page.itemCount
+      || (!input.projection.textInterpretation && records.length !== page.itemCount)
       || records.length > input.projection.bounds.maxRecordsPerPage) return null;
+    let selection: WorkflowTextSelectionReceiptV1 | undefined;
+    if (input.projection.textInterpretation) {
+      const selected = valueAtPath(evidenceView.payload, 'selection');
+      const receipt = { ...(selected as object), version: 1, sourceReceiptId: page.pageReceiptId,
+        sourceResultDigest: page.settledResultDigest, projectionDigest: input.projection.projectionDigest };
+      if (!validWorkflowTextSelectionReceipt(receipt) || receipt.selectedRecords !== records.length) return null;
+      selection = receipt;
+    }
     totalRecords += records.length;
     if (totalRecords > input.projection.bounds.maxRecords) return null;
     const observations: EntityObservationInput[] = [];
@@ -382,7 +392,7 @@ function preparePages(input: {
         recordOrdinal,
       })}`);
     }
-    pages.push({ page, observations, observationIds, coverageItemIds });
+    pages.push({ page, observations, observationIds, coverageItemIds, ...(selection ? { selection } : {}) });
   }
   return pages;
 }
@@ -491,6 +501,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   ) return block('result_projection_bounds_exceeded', 'closed read page count or exhaustion contradicts the reviewed projection');
   const pages = preparePages({ redeemed, projection, runId: input.root.lineage.runId });
   if (!pages) return block('result_records_invalid', 'retained page records violate the reviewed path, closed shape, type, identity, or byte bounds');
+  const selection = pages[0]?.selection;
   const observationCount = pages.reduce((total, page) => total + page.observations.length, 0);
   const datasetId = `canonical-dataset:${canonicalEntitySha256({
     version: 1,
@@ -611,6 +622,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
     activationDigest: redeemed.activationDigest,
     aggregateReceiptDigest: redeemed.aggregateReceiptDigest ?? null,
     terminalOutcome: failedOutcome ? 'failed' : 'completed',
+    ...(selection ? { selection } : {}),
     datasetAuthority: {
       contractDigest: dataset.contractDigest,
       resolutionRevision: dataset.resolutionRevision,
@@ -623,6 +635,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   if (retained) {
     const retainedFinishedAt = terminalAt(retained.request);
     if (!retainedFinishedAt
+      || canonicalEntityJson(retained.request.selection ?? null) !== canonicalEntityJson(selection ?? null)
       || retained.request.expectedBindingDigest !== binding.digest
       || canonicalEntityJson(retained.request.terminalOutcomeAuthority ?? null)
         !== canonicalEntityJson(terminalOutcomeAuthority ?? null)
@@ -669,6 +682,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   const terminalPartitionState = failedOutcome ? 'failed' as const : 'completed' as const;
   const request: CanonicalEntityWorkflowProjectionRequestV1 = {
     version: 1,
+    ...(selection ? { selection } : {}),
     identity,
     expectedBindingDigest: binding.digest,
     expectedDatasetAuthority: {

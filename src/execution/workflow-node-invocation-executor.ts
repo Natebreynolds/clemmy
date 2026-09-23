@@ -1124,7 +1124,7 @@ async function executePreparedWorkflowNodeCall(
     };
   }
 
-  const evidenceView = projectProviderResultEvidenceView(kernel.result);
+  const evidenceView = projectProviderResultEvidenceView(kernel.result, prepared.resolved.plan.resultProjection?.textInterpretation);
   const evidence = verifyWorkflowNodeInvocationEvidence(
     evidenceView.kind === 'provider_payload' ? evidenceView.payload : undefined,
     prepared.resolved.plan,

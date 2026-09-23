@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { interpretWorkflowTextResult, validWorkflowTextResultInterpretation, type WorkflowTextResultInterpretationV1 } from './workflow-text-result-interpretation.js';
+import { interpretWorkflowTextResult, validWorkflowTextResultInterpretation, validWorkflowTextSelectionReceipt, type WorkflowTextResultInterpretationV1 } from './workflow-text-result-interpretation.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 
 const rules: WorkflowTextResultInterpretationV1 = {
@@ -69,4 +69,15 @@ test('closed interpretation rejects implicit, unbounded or unsafe rules', () => 
     assert.equal(validWorkflowTextResultInterpretation(bad), false);
     assert.equal(interpretWorkflowTextResult('- A', bad).ok, false);
   }
+});
+
+
+test('retained selection receipts require exact counts and source bindings', () => {
+  const receipt = { version: 1, kind: 'reviewed_first_records', sourceRecords: 13, selectedRecords: 5, omittedRecords: 8, scope: 'reviewed_selection', sourceReceiptId: 'receipt:1', sourceResultDigest: 'a'.repeat(64), projectionDigest: 'b'.repeat(64) };
+  assert.equal(validWorkflowTextSelectionReceipt(receipt), true);
+  for (const changed of [
+    { omittedRecords: 0 }, { selectedRecords: 14 }, { sourceRecords: -1 },
+    { sourceResultDigest: 'unknown' }, { projectionDigest: '' },
+    { sourceReceiptId: ' ' }, { scope: 'complete_source' }, { extra: true },
+  ]) assert.equal(validWorkflowTextSelectionReceipt({ ...receipt, ...changed }), false);
 });
