@@ -3603,3 +3603,30 @@ test('worker failures claim zero dispatch only when the batch proves no body sta
     assert.doesNotMatch(String(result), /NOT started|No item was dispatched/);
   }
 });
+
+test('fresh-host account warmup respects resolved external authority and preserves cold external readiness', async () => {
+  const client = await import('../integrations/composio/client.js');
+  client.__test__.setComposioApiKeyOverride('controlled-fixture-key');
+  try {
+    for (const authority of ['none', 'catalog'] as const) {
+      let refreshes = 0;
+      client.__test__.setConnectedAccountsLoader(async () => { refreshes += 1; return []; });
+      resetEventLog();
+      const session = createSession({ kind: 'chat' });
+      const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+        data: { text: 'Inspect the configured capability.' } });
+      await buildOrchestratorAgent({
+        sessionId: session.id, sourceUserSeq: source.seq, userInput: 'Inspect the configured capability.',
+        acceptedRoute: 'act', hostFreshPlanning: freshPlanningFixture(session.id, source.seq),
+        mcpToolScope: { authority, reason: 'Controlled resolved authority', allowedServerSlugs: [],
+          maxTools: authority === 'none' ? 0 : 10, allowAll: authority === 'catalog' },
+      });
+      assert.equal(refreshes, authority === 'none' ? 0 : 1,
+        'only a turn allowed external capability may await connected-account inventory');
+      if (authority === 'catalog') assert.notEqual(client.peekCurrentConnectedToolkits(), null);
+    }
+  } finally {
+    client.__test__.setConnectedAccountsLoader(null);
+    client.__test__.setComposioApiKeyOverride(null);
+  }
+});

@@ -549,3 +549,36 @@ recovery, so do not repeat it as an unmeasured optimization.
 
 Readback correction:143/143 orchestration and accepted-task terminal-preparation
 checks pass; typecheck passes (/tmp/clem-enabled-readback-{green,types}.log).
+
+
+## Installed2d1e readback accepted; eliminate irrelevant account warmup
+
+Clean installed2d1e94f2c/faa330a1d5302461a1513384f97eb49badae656768e3d919518e6cb7eca473c8.
+Read-only source289818/session sess-desktop-4d238ab08255c0544fcb101e completed289846.
+Exactly one native workflow_get(section=full), no discovery/metadata second read,
+returned Enabled:false and the calculation. Actual Opus5.5, reviewerGrok4.3
+fulfills=true. Retained02e2b seven-step lifecycle and74e proofs pass on installed
+bytes. Evidence output/harness-acceptance/2026-09-23-2d1e94f2c/.
+20735ms,1tool,51625prompt/12479cached/39146uncached/317output.6 usage records,
+exact attribution certified,1uncertified token record. No efficiency win claimed.
+
+Timeline: accepted13:50:27.533; route32.128; planning snapshot33.293; MCP-scope
+38.296; memory primer40.637; first model prompt40.668; tool43.361→43.490;
+review48.183; terminal48.268. About13.1s elapsed BEFORE first model prompt.
+Do not assign the whole20.7s to the brain or completion review.
+
+Production agent construction awaited connected-account inventory for every
+host-fresh carrier BEFORE resolving tool scope, even when external connectors
+were explicitly denied. Candidate resolves scope first, skips that network
+warmup for authority=none, and preserves the same freshness check/await for
+external authority. No tool availability, execution admission or current-account
+validation is relaxed. No new classifier, model/provider routing, or flag.
+Real builder test with cold controlled account loader fails unchanged2d1e
+(1refresh vs expected0), then passes with the fix; also asserts catalog-authority
+turn refreshes once and leaves a current snapshot. No live account reset or
+fixture model calls. Logs /tmp/clem-account-warmup-{red,green}.log. Live latency
+comparison remains owed; the5s interval is a lead, not proof of causality.
+
+Account warmup correction:147/147 orchestrator, MCP scope and Composio
+single-owner contract checks pass; typecheck passes. Logs
+/tmp/clem-account-warmup-{adjacent,types}.log. Full suite remains unqualified.
