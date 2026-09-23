@@ -729,4 +729,50 @@ test('a created workflow remains completed after its planned enable revision and
   assert.equal((db.prepare(`SELECT count(*) AS n FROM logical_call_settlements
     WHERE session_id=? AND source_user_seq=? AND mutating=1`).get(session.id, source.seq) as { n: number }).n, 3,
     'receipt verification and publication must not replay any mutation');
+
+  const strategies = await import('../../memory/run-strategy-store.js');
+  const learned = strategies.listVerifiedRunStrategies().find(row =>
+    row.learningReceipt?.sourceId === `${session.id}:${source.seq}`);
+  assert.ok(learned, 'a verified native lifecycle must teach a reusable strategy');
+  assert.deepEqual(learned.toolsUsed, ['workflow_create', 'workflow_set_enabled', 'workflow_get']);
+  const warm = eventlog.createSession({ kind: 'chat' });
+  const warmSource = eventlog.appendEvent({ sessionId: warm.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: objective } });
+  const warmIdentity = { sessionId: warm.id, sourceUserSeq: warmSource.seq, turn: 1 };
+  const prepared = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
+    query: objective, ...warmIdentity,
+  });
+  assert.equal(prepared.strategyId, learned.id);
+  assert.deepEqual(prepared.nativeTools, learned.toolsUsed);
+  assert.equal(prepared.skipDiscoverySearch, false, 'native recall must preserve fallback discovery');
+  assert.doesNotMatch(prepared.text ?? '', /workflow_create schema:/,
+    'registry descriptions must not masquerade as complete argument schemas');
+  eventlog.appendEvent({ sessionId: warm.id, turn: 0, role: 'system', type: 'proven_operation_selected',
+    data: { ...prepared, sourceUserSeq: warmSource.seq } });
+  const warmPlanning = await semantic.primePrimaryModelPlanningCatalog(warmIdentity);
+  assert.ok(warmPlanning.ok);
+  if (!warmPlanning.ok) throw new Error(warmPlanning.reason);
+  const warmAgent = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    mcpToolScope: { authority: 'none', reason: 'Native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: stubModel([[textMessage('Surface check only')]]) as never });
+  for (const name of learned.toolsUsed) {
+    const tool = warmAgent.tools.find(row => row.name === name);
+    assert.ok(tool, `${name} must be present before the first model request`);
+    assert.match(tool.description ?? '', /capabilityRef=cap:local:/,
+      `${name} must carry its current validated planning ref without another search`);
+    assert.ok('parameters' in tool && JSON.stringify(tool.parameters).includes('name'), 'complete configured schema');
+  }
+  assert.ok(warmAgent.tools.some(row => row.name === 'tool_search'));
+  const restricted = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    excludeToolNames: ['workflow_set_enabled'],
+    mcpToolScope: { authority: 'none', reason: 'Restricted native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: stubModel([[textMessage('Surface check only')]]) as never });
+  assert.ok(!restricted.tools.some(row => row.name === 'workflow_set_enabled'),
+    'learned hints cannot restore a policy-excluded tool');
+  assert.equal((db.prepare('SELECT count(*) AS n FROM logical_call_settlements WHERE session_id=?')
+    .get(warm.id) as { n: number }).n, 0, 'learning/disclosure must not execute work');
 });

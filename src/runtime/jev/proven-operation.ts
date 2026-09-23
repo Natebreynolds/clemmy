@@ -28,6 +28,7 @@ export interface ProvenOperationPreparation {
   text?: string;
   strategyId?: string;
   tools: string[];
+  nativeTools: string[];
   skipDiscoverySearch: boolean;
   capabilityRefs: string[];
   descriptors: HostCapabilityDescriptorV1[];
@@ -88,10 +89,8 @@ function schemaForTool(name: string): unknown {
     const cached = getCachedToolSchema(slug) ?? getCachedToolSchema(slug.toUpperCase());
     if (cached) return cached;
   } catch { /* cache miss is fine */ }
-  try {
-    const local = TOOL_REGISTRY.find((entry) => entry.name === slug || entry.name === slug.toLowerCase());
-    if (local?.description) return { name: local.name, description: local.description };
-  } catch { /* registry miss is fine */ }
+  // Local schemas come from configured runtime tools on the model surface.
+  // A registry description is not an input schema.
   return null;
 }
 
@@ -466,6 +465,7 @@ export async function prepareProvenOperationForRequest(input: {
 }): Promise<ProvenOperationPreparation> {
   const empty: ProvenOperationPreparation = {
     tools: [],
+    nativeTools: [],
     skipDiscoverySearch: false,
     capabilityRefs: [],
     descriptors: [],
@@ -558,6 +558,9 @@ export async function prepareProvenOperationForRequest(input: {
     text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
+    nativeTools: provenStrategyCoversRequest(input.query, strategy)
+      ? strategy.toolsUsed.filter(name => TOOL_REGISTRY.some(row => row.name === name
+        && (row.localPlanning !== undefined || row.localPlanningRead === true))) : [],
     skipDiscoverySearch,
     boundAccounts,
     capabilityRefs,

@@ -6200,6 +6200,7 @@ async function runConversationWithinRuntimeConfig(
                 sourceUserSeq,
                 strategyId: proven.strategyId,
                 tools: proven.tools,
+                nativeTools: proven.nativeTools,
                 skipDiscoverySearch: proven.skipDiscoverySearch,
                 capabilityRefs: proven.capabilityRefs,
                 descriptors: proven.descriptors,

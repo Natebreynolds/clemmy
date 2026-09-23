@@ -15,7 +15,7 @@ import {
   recordLearningDecision,
 } from '../../memory/learning-receipt.js';
 import { recordRunStrategy, runStrategyScopeForSession } from '../../memory/run-strategy-store.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { actionTopologyRoleFor, TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
 
 /** Prefer the settled business tools. Kernel inspection tools only count when
@@ -24,7 +24,12 @@ export function selectLearnedStrategyTools(toolNames: readonly string[]): string
   const business = [...new Set(
     toolNames
       .map((name) => name.trim())
-      .filter((name) => name && actionTopologyRoleFor(name) !== 'control'),
+      .filter((name) => {
+        if (!name) return false;
+        const declaration = TOOL_REGISTRY.find(row => row.name === name);
+        return actionTopologyRoleFor(name) !== 'control'
+          || declaration?.localPlanning !== undefined || declaration?.localPlanningRead === true;
+      }),
   )];
   const proven = business.filter((name) => !TOOL_SEARCH_ALWAYS_LOADED.has(name));
   return (proven.length > 0 ? proven : business).slice(0, 8);

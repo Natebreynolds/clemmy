@@ -72,3 +72,11 @@ test('fail-open host review is not eligible to teach a strategy', () => {
   });
   assert.equal(decision.eligible, false);
 });
+
+test('native product lifecycle tools teach a strategy while kernel controls do not', () => {
+  assert.deepEqual(selectLearnedStrategyTools(['tool_search', 'plan_task', 'workflow_create',
+    'workflow_get', 'workflow_set_enabled', 'workflow_run', 'workflow_run_status', 'workflow_get']),
+  ['workflow_create', 'workflow_get', 'workflow_set_enabled', 'workflow_run', 'workflow_run_status']);
+  assert.deepEqual(selectLearnedStrategyTools(['space_save', 'space_get', 'tool_search']), ['space_save', 'space_get']);
+  assert.deepEqual(selectLearnedStrategyTools(['tool_search', 'plan_task', 'request_approval']), []);
+});

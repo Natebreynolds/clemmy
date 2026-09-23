@@ -1857,6 +1857,8 @@ export interface ProvenTurnDisclosure {
   descriptors: HostCapabilityDescriptorV1[];
   /** Operation names the proven strategy used, for the instruction line. */
   tools: string[];
+  /** Relevant native hints; revalidated against current scope/schema below. */
+  nativeTools?: string[];
   /** Operating accounts the host already bound for those operations. */
   boundAccounts: Array<{ slug: string; accountId: string; label?: string }>;
 }
@@ -1898,7 +1900,10 @@ function provenOperationDisclosureForTurn(
       skipDiscoverySearch: selected.data.skipDiscoverySearch === true,
       descriptors,
     });
-    return { ...callable, tools, boundAccounts };
+    const nativeTools = Array.isArray(selected.data.nativeTools)
+      ? selected.data.nativeTools.filter((name: unknown): name is string =>
+          typeof name === 'string' && tools.includes(name)) : [];
+    return { ...callable, tools, nativeTools, boundAccounts };
   } catch {
     return NO_PROVEN_DISCLOSURE;
   }
@@ -3577,6 +3582,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         .join('\n');
       const hot = resolveHotSet(options.sessionId, searchQuery, { allowedNames: policyAllowed });
       pinCompositionHotTools(hot, sessionMount, policyAllowed);
+      // A proven strategy ranks currently configured native capabilities; it
+      // does not grant scope or execution authority. Their complete runtime
+      // schemas and current-source refs are disclosed below after policy.
+      for (const name of provenDisclosure.nativeTools ?? []) {
+        if (policyAllowed.has(name) && isRegistryDeclaredLocalPlanningCapability(name)) hot.add(name);
+      }
       // Exact caller/candidate resolution is already the answer to discovery.
       // Promote those registry names directly instead of charging another
       // tool_search/model beat. This is bounded by the caller/candidate set and
@@ -4115,12 +4126,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // validation as discovery, after policy filtering; this adds no callable
   // tools and does not change the reader's direct invocation or execution gates.
   const nativePlanRefs: Record<string, string> = {};
-  if (planMode && hostFreshPlanning) {
+  if (hostFreshPlanning && (planMode || (provenDisclosure.nativeTools?.length ?? 0) > 0)) {
     const configuredNames = new Set(toolPolicy.tools.map(t => t.name));
     const candidates = (await Promise.all(toolPolicy.tools
-      .filter(t => isRegistryDeclaredNativePlanningRead(t.name))
+      .filter(t => (planMode && isRegistryDeclaredNativePlanningRead(t.name))
+        || (provenDisclosure.nativeTools?.includes(t.name) && isRegistryDeclaredLocalPlanningCapability(t.name)))
       .map(t => issueAuthorizedLocalPlanningDisclosureCandidate({
-        name: t.name, carrier: 'call_tool', configuredNames,
+        name: t.name, carrier: isRegistryDeclaredNativePlanningRead(t.name) ? 'call_tool' : 'work_call', configuredNames,
       })))).flatMap(candidate => candidate && !('refused' in candidate) ? [candidate] : []);
     for (let i = 0; i < candidates.length; i += 20) {
       Object.assign(nativePlanRefs, await disclosePrimaryModelPlanningCapabilities({
