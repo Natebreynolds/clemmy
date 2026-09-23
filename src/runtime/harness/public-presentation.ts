@@ -61,6 +61,8 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'primary_model_planning_card_snapshot',
   'async_work_dispatch_prepared',
   'async_work_dispatch_batch_closed',
+  'workflow_parent_checkpoint',
+  'workflow_parent_continuation_requested',
   'turn_memory_primer',
   'guardrail_tripped',
   'stuck_detected',

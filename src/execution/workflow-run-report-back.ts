@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isWorkflowParentTerminalIdentity } from './workflow-parent-terminal-proof.js';
 import { humanizeStepOutput } from './workflow-diagnosis.js';
 import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -927,16 +928,20 @@ function deliverToOrigins(
         continue;
       }
       const committedStatus = workflowOriginTerminalStatus(committed.presentation.status);
+      const parentTerminal = isWorkflowParentTerminalIdentity({ sourceGroupId: projection.sourceGroupId,
+        sourceGroupDigest: projection.sourceGroupDigest, terminal: { ...committed.presentation.identity,
+          eventId: committed.event.id, outcomeId: committed.presentation.outcomeId,
+          runId: committed.presentation.identity.runId ?? '' } });
       if (
         expectedText === null
-        || committed.presentation.identity.runId !== projection.identityRunId
+        || (!parentTerminal && committed.presentation.identity.runId !== projection.identityRunId)
         || committed.presentation.identity.sourceUserSeq !== observer.sourceUserSeq
         || committedStatus === null
-        || !workflowOriginTerminalCommitMatches({
+        || (!parentTerminal && !workflowOriginTerminalCommitMatches({
           committed,
           outcome: projection.outcome,
           expectedText,
-        })
+        }))
       ) {
         exactEvidenceComplete = false;
         corruptEvidence = true;

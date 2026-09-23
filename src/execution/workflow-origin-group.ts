@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isWorkflowParentTerminalIdentity } from './workflow-parent-terminal-proof.js';
 import {
   closeSync,
   existsSync,
@@ -2237,7 +2238,8 @@ function decodeWorkflowOriginGroupSettlementReceipt(
       sourceUserSeq: terminalIdentity.sourceUserSeq,
     })
     || terminalIdentity.outcomeId !== `turn:${terminalIdentity.sourceUserSeq}`
-    || terminalIdentity.runId !== (memberRunIds.length === 1 ? memberRunIds[0] : sourceGroupId)
+    || (terminalIdentity.runId !== (memberRunIds.length === 1 ? memberRunIds[0] : sourceGroupId)
+      && !isWorkflowParentTerminalIdentity({ sourceGroupId, sourceGroupDigest: String(raw.sourceGroupDigest), terminal: terminalIdentity }))
   ) {
     throw new Error('workflow origin group settlement terminal identity does not match its source');
   }
@@ -2318,7 +2320,9 @@ export function createWorkflowOriginGroupSettlementReceipt(input: {
     terminalIdentity.sessionId !== active.sealed.originSessionId
     || terminalIdentity.sourceUserSeq !== active.sealed.sourceUserSeq
     || terminalIdentity.outcomeId !== `turn:${active.sealed.sourceUserSeq}`
-    || terminalIdentity.runId !== (memberRunIds.length === 1 ? memberRunIds[0] : active.sealed.sourceGroupId)
+    || (terminalIdentity.runId !== (memberRunIds.length === 1 ? memberRunIds[0] : active.sealed.sourceGroupId)
+      && !isWorkflowParentTerminalIdentity({ sourceGroupId: active.sealed.sourceGroupId,
+        sourceGroupDigest: active.sealed.sourceGroupDigest, terminal: terminalIdentity }))
     || memberReportBackDigests.length !== memberRunIds.length
     || memberReportBackDigests.some(
       (member, index) => member.runId !== memberRunIds[index] || !isDigest(member.reportBackDigest),

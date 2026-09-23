@@ -30,6 +30,7 @@ import {
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
+import { bindAgentRebuildContext } from './agent-rebuild-context.js';
 import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
@@ -328,7 +329,7 @@ export interface BuildOrchestratorAgentOptions {
 export async function buildOrchestratorAgentForApprovalResume(
   options: Omit<BuildOrchestratorAgentOptions, 'mcpToolScope'> & { sessionId: string },
 ): Promise<Agent<RuntimeContextValue, any>> {
-  const pausedScope = HarnessSession.load(options.sessionId)?.loadInterruptMcpToolScope() ?? undefined;
+  const pausedScope = HarnessSession.load(options.sessionId)?.loadInterruptMcpToolScope(options.sourceUserSeq) ?? undefined;
   return buildOrchestratorAgent({
     ...options,
     ...(pausedScope ? { mcpToolScope: pausedScope } : {}),
@@ -3742,7 +3743,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               requireHostPlan: true,
               hostPlanningReady: () => {
                 const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
-                return Boolean(planning && planning.capabilities.length > 0);
+                // An empty discovery catalog must not hide the carrier that can
+                // prepare an exact configured call. Dispatch still proves authority.
+                return Boolean(planning);
               },
               hostPlanningReadCapabilityResolver: (request) => (
                 inspectPrimaryModelPlanningReadCapability({
@@ -3880,7 +3883,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         requireHostPlan: true,
         hostPlanningReady: () => {
           const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
-          return Boolean(planning && planning.capabilities.length > 0);
+          // An empty discovery catalog must not hide the carrier that can
+          // prepare an exact configured call. Dispatch still proves authority.
+          return Boolean(planning);
         },
         hostPlanningReadCapabilityResolver: (request) => (
           inspectPrimaryModelPlanningReadCapability({
@@ -4201,6 +4206,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
+  bindAgentRebuildContext(agent, options);
   if (hostFreshPlanning && workCallOptions?.reachableBuiltinNames) {
     bindHostLocalCallPreparation(agent, {
       planning: hostFreshPlanning,

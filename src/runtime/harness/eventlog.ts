@@ -172,6 +172,8 @@ export const EVENT_TYPES = [
   // This freezes the complete ordered set of prepared members before any run
   // can become executable. Prepared-only groups remain held across restarts.
   'async_work_dispatch_batch_closed',
+  'workflow_parent_checkpoint',
+  'workflow_parent_continuation_requested',
   // Typed nonterminal boundary: an exact workflow_run tool receipt handed
   // continuing ownership to the background workflow daemon. The foreground
   // model/transport may release, but this accepted logical intent remains
@@ -813,6 +815,7 @@ const SESSION_STATE_METADATA_PATHS = [
   '$.__conversation',
   '$.__host_recovery_state',
   '$.__interrupt_state',
+  '$.__source_approval_checkpoints',
   '$.__host_recovery_mcp_scope',
 ] as const;
 
@@ -4741,7 +4744,37 @@ export function getRunAttemptSourceUserEvent(
   return row ? rowToEvent(row) : null;
 }
 
-/** Register the one live attempt that a reusable session is currently serving. */
+/** A durable workflow handoff is no longer an abandoned foreground marker.
+ * Preserve its original attempt when another foreground request starts. This
+ * is only a retirement fence: resumption still verifies the cross-store group,
+ * checkpoint, current definitions and effect ledger before any execution. */
+function hasWorkflowHandoff(db: Database.Database, sessionId: string, sourceUserSeq: number | null): boolean {
+  if (!sourceUserSeq) return false;
+  const rows = db.prepare(`SELECT dispatch.* FROM events AS dispatch
+    JOIN events AS source ON source.seq = ? AND source.session_id = dispatch.session_id
+    WHERE dispatch.session_id = ? AND dispatch.type = 'async_work_dispatched'
+      AND dispatch.role = 'system' AND dispatch.parent_event_id = source.id
+      AND dispatch.turn = source.turn AND source.type = 'user_input_received' AND source.role = 'user'
+      AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+      AND json_extract(dispatch.data_json, '$.sourceUserSeq') = ?
+    ORDER BY dispatch.seq LIMIT 2`).all(sourceUserSeq, sessionId, sourceUserSeq) as RawEventRow[];
+  if (rows.length !== 1) return false;
+  try { return publicAsyncWorkDispatchedData(JSON.parse(rows[0]!.data_json))?.sourceUserSeq === sourceUserSeq; }
+  catch { return false; }
+}
+
+function supersedeForegroundAttempts(db: Database.Database, sessionId: string, now: string, exceptAttemptId?: string): void {
+  const rows = db.prepare(`SELECT attempt_id, source_user_seq FROM run_attempts
+    WHERE session_id = ? AND finished_at IS NULL`).all(sessionId) as Array<{ attempt_id: string; source_user_seq: number | null }>;
+  const retire = db.prepare(`UPDATE run_attempts SET finished_at = ?, status = 'superseded', lease_expires_at = NULL
+    WHERE session_id = ? AND attempt_id = ? AND finished_at IS NULL`);
+  for (const row of rows) {
+    if (row.attempt_id === exceptAttemptId || hasWorkflowHandoff(db, sessionId, row.source_user_seq)) continue;
+    retire.run(now, sessionId, row.attempt_id);
+  }
+}
+
+/** Register the foreground attempt without retiring transferred workflow owners. */
 export function beginRunAttempt(
   sessionId: string,
   input: { runId?: string | null; attemptId?: string } = {},
@@ -4800,14 +4833,9 @@ export function beginRunAttempt(
     if (current?.run_id !== null && current?.run_id !== undefined && runId !== null && current.run_id !== runId) {
       throw new Error(`run attempt ${attemptId} is already bound to run ${current.run_id}`);
     }
-    // A single chat session is serialized. If a caller starts a new attempt
-    // after a process-level error left the previous row active, retire the old
-    // marker so a stale stop can never target the fresh work.
-    db.prepare(
-      `UPDATE run_attempts
-          SET finished_at = COALESCE(finished_at, ?), status = 'superseded'
-        WHERE session_id = ? AND finished_at IS NULL AND attempt_id != ?`,
-    ).run(startedAt, sessionId, attemptId);
+    // Foreground requests supersede stale foreground markers. A source
+    // handed to a durable workflow keeps its own attempt and stop scope.
+    supersedeForegroundAttempts(db, sessionId, startedAt, attemptId);
     db.prepare(
       `INSERT INTO run_attempts
          (attempt_id, session_id, run_id, started_at, finished_at, status)
@@ -5376,6 +5404,11 @@ export function claimRunAttemptLease(input: {
       }
     }
 
+    if (latest && !latest.finished_at && hasWorkflowHandoff(db, sessionId, latest.source_user_seq)) {
+      return { attempt: { sessionId, attemptId: latest.attempt_id, runId: latest.run_id, startedAt: latest.started_at },
+        claimed: false, reason: 'active', interruptedAttemptId: null };
+    }
+
     let interruptedAttemptId: string | null = null;
     if (latest && !latest.finished_at) {
       const leaseExpiry = latest.lease_expires_at ? Date.parse(latest.lease_expires_at) : Number.NaN;
@@ -5399,13 +5432,9 @@ export function claimRunAttemptLease(input: {
     const baseExists = Boolean(db.prepare('SELECT 1 FROM run_attempts WHERE attempt_id = ?').get(baseAttemptId));
     const attemptId = baseExists ? `${baseAttemptId}:${randomUUID().slice(0, 8)}` : baseAttemptId;
 
-    // Keep the session serialization contract from beginRunAttempt: a newer
-    // request retires any unrelated unfinished marker before it becomes live.
-    db.prepare(
-      `UPDATE run_attempts
-          SET finished_at = COALESCE(finished_at, ?), status = 'superseded', lease_expires_at = NULL
-        WHERE session_id = ? AND finished_at IS NULL`,
-    ).run(now, sessionId);
+    // Match beginRunAttempt: retire stale foreground markers while keeping
+    // each workflow handoff under its original source and attempt.
+    supersedeForegroundAttempts(db, sessionId, now);
     db.prepare(
       `INSERT INTO run_attempts
          (attempt_id, session_id, run_id, started_at, finished_at, status,

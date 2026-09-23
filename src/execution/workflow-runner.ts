@@ -5195,6 +5195,7 @@ function graphContextForInvocation(
 
 function exactWorkflowApprovalResume(input: {
   sessionId: string;
+  sourceUserSeq: number;
   observedApprovalIds: readonly string[];
 }): {
   approvalId: string;
@@ -5204,7 +5205,7 @@ function exactWorkflowApprovalResume(input: {
   // The conversation loop persists the pause through its own HarnessSession
   // instance. Reload here: the step owner's instance predates that write and
   // intentionally does not mutate itself behind the caller's back.
-  const blob = HarnessSession.load(input.sessionId)?.loadInterruptState() ?? null;
+  const blob = HarnessSession.load(input.sessionId)?.loadInterruptState(input.sourceUserSeq) ?? null;
   const allRows = approvalRegistry.listPending({ sessionId: input.sessionId, status: 'any' });
   let exactRows: approvalRegistry.PendingApprovalRow[];
   if (blob && HostInterruptState.isHostState(blob)) {
@@ -5975,6 +5976,7 @@ async function runStepViaHarness(
       // and a bare approval id can be copied; both are authority widening.
       const approvalResume = exactWorkflowApprovalResume({
         sessionId: realSessionId,
+        sourceUserSeq: sourceUserEvent.seq,
         observedApprovalIds: approvalIds,
       });
       const approvalResumeWallClockMs = remainingStepWallClockMs();

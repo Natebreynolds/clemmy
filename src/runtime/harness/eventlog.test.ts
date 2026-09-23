@@ -1204,6 +1204,29 @@ test('latest run attempt follows a reusable session across terminal turns', () =
   assert.equal(latest?.sourceUserSeq, null);
 });
 
+test('malformed or unrelated workflow notices do not preserve stale foreground attempts', () => {
+  for (const variant of ['malformed', 'wrong-parent', 'wrong-turn', 'wrong-source', 'assistant-role', 'ambiguous'] as const) {
+    resetEventLog();
+    const session = createSession({ kind: 'chat', channel: 'desktop' });
+    const first = beginRunAttempt(session.id, { runId: `old-${variant}` });
+    const source = recordRunAttemptUserInput(first, { turn: 1, role: 'user', data: { text: 'Original work.' } });
+    const sourceGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+    const sourceGroupDigest = 'b'.repeat(64);
+    const data = { version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: source.seq,
+      sourceGroupId, sourceGroupDigest, runIds: ['child-one'], replyTargetDigest: 'c'.repeat(64),
+      dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}` };
+    for (let i = 0; i < (variant === 'ambiguous' ? 2 : 1); i++) appendEvent({
+      sessionId: session.id, turn: variant === 'wrong-turn' ? 2 : 1,
+      role: variant === 'assistant-role' ? 'assistant' : 'system', type: 'async_work_dispatched',
+      parentEventId: variant === 'wrong-parent' ? 'unrelated-source' : source.id,
+      data: variant === 'malformed' ? { sourceUserSeq: source.seq }
+        : variant === 'wrong-source' ? { ...data, sourceUserSeq: source.seq + 1 } : data,
+    });
+    claimRunAttemptLease({ sessionId: session.id, runId: `new-${variant}`, ownerId: 'new-owner', leaseMs: 1000 });
+    assert.equal(getLatestRunAttemptByRunId(session.id, `old-${variant}`)?.status, 'superseded', variant);
+  }
+});
+
 test('latest run attempts are projected for many sessions in one deterministic batch', () => {
   resetEventLog();
   const firstSession = createSession({ kind: 'chat' });

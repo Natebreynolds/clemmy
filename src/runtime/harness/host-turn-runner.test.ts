@@ -663,6 +663,7 @@ function runProductionHost(
     role: 'user',
     content: fixture.source.data.text,
   }],
+  options: Record<string, unknown> = {},
 ) {
   return brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never,
@@ -670,6 +671,7 @@ function runProductionHost(
     itemsOrState as never,
     {
       maxTurns: 4,
+      ...options,
       hostTurnEngine: 'host_v1',
       context: fixture.context,
     } as never,
@@ -3970,6 +3972,7 @@ test('a corrupt stop_and_explain settlement cannot manufacture a host terminal',
 });
 
 test('host stepping materializes omitted strict-nullable fields before approval and invocation', async () => {
+  const fixture = acceptHostCanarySource('nullable-read', 'read metadata');
   const seenApprovalArgs: unknown[] = [];
   const seenInvokeArgs: unknown[] = [];
   const model = stubModel([
@@ -4007,12 +4010,9 @@ test('host stepping materializes omitted strict-nullable fields before approval 
     }],
   };
 
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'read metadata' }] as never,
-    { maxTurns: 4 },
-  );
+  agent.tools = agent.tools.map(tool => brackets.wrapToolForHarness(tool));
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent);
 
   const expected = {
     name: 'platform-49-slack-channel-review',
@@ -4025,25 +4025,28 @@ test('host stepping materializes omitted strict-nullable fields before approval 
 });
 
 test('literal string controls are decoded before tool approval, without bypassing the SDK schema', async () => {
+  const fixture = acceptHostCanarySource('literal-read', 'inspect text');
   const approval: unknown[] = [];
   const invoked: unknown[] = [];
   const raw = '{"text":"| Claim | Source |\n| observed | fixture |","count":1}';
   const wrongType = '{"text":"line\nend","count":"wrong"}';
   const unexpectedKey = '{"text":"line\nend","count":1,"invented":true}';
   const model = stubModel([
-    [{ ...toolCall('literal-json-good', 'inspect_fixture_text', {}), arguments: raw }],
-    [{ ...toolCall('literal-json-wrong-type', 'inspect_fixture_text', {}), arguments: wrongType }],
-    [{ ...toolCall('literal-json-extra', 'inspect_fixture_text', {}), arguments: unexpectedKey }],
+    [{ ...toolCall('literal-json-good', 'workspace_roots', {}), arguments: raw }],
+    [{ ...toolCall('literal-json-wrong-type', 'workspace_roots', {}), arguments: wrongType }],
+    [{ ...toolCall('literal-json-extra', 'workspace_roots', {}), arguments: unexpectedKey }],
     [textMsg('finished')],
   ]);
   const inspect = tool({
-    name: 'inspect_fixture_text', description: 'Inspect text for a local test.',
+    name: 'workspace_roots', description: 'Inspect text for a local test.',
     parameters: z.object({ text: z.string(), count: z.number() }).strict(),
     needsApproval: async (_context, args) => { approval.push(args); return false; },
     execute: async args => { invoked.push(args); return 'inspected'; },
   });
-  const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [inspect] } as never,
-    [{ type: 'message', role: 'user', content: 'inspect text' }] as never, { maxTurns: 5 });
+  const wrapped = brackets.wrapToolForHarness(inspect);
+  const agent = { model, tools: [wrapped] };
+  bindHostCanarySurface(fixture, agent, [wrapped]);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
   const expected = { text: '| Claim | Source |\n| observed | fixture |', count: 1 };
   assert.deepEqual(invoked, [expected], 'wrong types and unknown fields never enter the tool body');
   assert.deepEqual(approval[0], expected, 'approval sees the actual invocation values');
@@ -4993,41 +4996,40 @@ test('a kill arriving during a host model step aborts and propagates to the shar
 });
 
 test('one host invocation owns an exact dispatch lease and revokes it before returning', async () => {
-  const session = eventlog.createSession({ id: 'host-exact-dispatch-lease', kind: 'chat' });
-  let observedLease: dispatchLeases.DispatchLeaseRef | undefined;
-  const model = stubModel([
-    [toolCall('leased-call', 'leased_read', {})],
-    [textMsg('leased complete')],
-  ]);
-  const parent = {
-    sessionId: session.id,
-    counter: new brackets.ToolCallsCounter(8),
-    behaviorScopeId: `${session.id}::turn:1`,
-  };
-  const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [{
-        type: 'function', name: 'leased_read', description: 'read', parameters: { type: 'object', properties: {} },
-        invoke: async () => {
-          observedLease = brackets.harnessRunContextStorage.getStore()?.dispatchLease;
-          assert.ok(observedLease, 'the tool must run under a physical lease');
-          assert.equal(dispatchLeases.isDispatchLeaseCurrent(observedLease), true);
-          return 'leased';
-        },
-        needsApproval: async () => false,
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 4 },
-  ));
-  assert.equal(outcome.finalOutput, 'leased complete');
-  assert.ok(observedLease);
-  assert.equal(dispatchLeases.isDispatchLeaseCurrent(observedLease), false, 'return waits for exact revocation');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('exact-dispatch-lease', 'Read the workspace roots.');
+    let observedLease: dispatchLeases.DispatchLeaseRef | undefined;
+    const model = stubModel([
+      [toolCall('leased-call', 'workspace_roots', {})],
+      [textMsg('leased complete')],
+    ]);
+    // Instrument a declared local read through the actual source-bound host.
+    const read = brackets.wrapToolForHarness({
+      type: 'function', name: 'workspace_roots', description: 'read', parameters: { type: 'object', properties: {} },
+      invoke: async () => {
+        observedLease = brackets.harnessRunContextStorage.getStore()?.dispatchLease;
+        assert.ok(observedLease, 'the tool must run under a physical lease');
+        assert.equal(dispatchLeases.isDispatchLeaseCurrent(observedLease), true);
+        return 'leased';
+      },
+      needsApproval: async () => false,
+    } as never);
+    const agent = { model, tools: [read] };
+    bindHostCanarySurface(fixture, agent, [read]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.finalOutput, 'leased complete');
+    assert.ok(observedLease);
+    assert.equal(dispatchLeases.isDispatchLeaseCurrent(observedLease), false, 'return waits for exact revocation');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });
 
 test('independent nonapproval calls execute concurrently while result history stays in call order', async () => {
+  const fixture = acceptHostCanarySource('concurrent-read', 'read both');
   let markSecondStarted!: () => void;
   const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
   let firstObservedSecond = false;
@@ -5058,12 +5060,9 @@ test('independent nonapproval calls execute concurrently while result history st
     }],
   };
 
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'read both' }] as never,
-    { maxTurns: 4, toolExecution: { maxFunctionToolConcurrency: 2 } },
-  );
+  agent.tools = agent.tools.map(tool => brackets.wrapToolForHarness(tool));
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { toolExecution: { maxFunctionToolConcurrency: 2 } });
 
   assert.equal(firstObservedSecond, true, 'the second invocation began before the first completed');
   const resultIds = outcome.history
@@ -5339,224 +5338,200 @@ test('effect uncertainty wins when a sibling also reaches the tool ceiling', asy
 });
 
 test('malformed tool arguments become a correlated result without approval or execution', async () => {
+  const fixture = acceptHostCanarySource('malformed-write', 'Write the local fixture.');
   let approvalChecks = 0;
   let bodyRuns = 0;
   const model = stubModel([
-    [{ type: 'function_call', callId: 'bad-json', name: 'guarded_write', arguments: '{not-json' }],
+    [{ type: 'function_call', callId: 'bad-json', name: 'write_file', arguments: '{not-json' }],
     [textMsg('corrected after parse error')],
   ]);
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [{
-        type: 'function', name: 'guarded_write', description: 'write',
+  const bounded = brackets.wrapToolForHarness({
+        type: 'function', name: 'write_file', description: 'write',
         parameters: { type: 'object', properties: { value: { type: 'string' } } },
         needsApproval: async () => { approvalChecks += 1; return true; },
         invoke: async () => { bodyRuns += 1; return 'must-not-run'; },
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 3 },
-  );
+  });
+  const agent = { model, tools: [bounded] };
+  bindHostCanarySurface(fixture, agent, [bounded]);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 3 });
   assert.equal(approvalChecks, 0, 'approval policy never receives malformed/raw text');
   assert.equal(bodyRuns, 0, 'the tool body never receives malformed arguments');
   assert.match(JSON.stringify(outcome.history), /bad-json.*invalid arguments/i);
   assert.equal(outcome.finalOutput, 'corrected after parse error');
 });
 
-test('user-edited approval arguments traverse the same parse gate on resume', async () => {
-  let approvalChecks = 0;
-  let bodyRuns = 0;
-  const model = stubModel([
-    [toolCall('edited-approval', 'edited_write', { value: 'valid-before-pause' })],
-    [textMsg('invalid edit was not executed')],
-  ]);
-  const agent = {
-    model,
-    tools: [{
-      type: 'function', name: 'edited_write', description: 'write',
-      parameters: { type: 'object', properties: { value: { type: 'string' } } },
-      needsApproval: async () => { approvalChecks += 1; return true; },
-      invoke: async () => { bodyRuns += 1; return 'must-not-run'; },
-    }],
+async function exerciseProductionWriteApproval(mode: 'approved' | 'invalid_edit' | 'missing_durable' | 'mixed'): Promise<void> {
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  const serverName = `approval_host_${++acceptedSerial}`;
+  const operationId = `${serverName}__send_message`;
+  const inputSchema = {
+    type: 'object', additionalProperties: false,
+    properties: { recipient: { type: 'string' }, message: { type: 'string' } },
+    required: ['recipient', 'message'],
   };
-  const paused = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [] as never,
-    { maxTurns: 3 },
-  );
-  assert.equal(paused.hasInterruptions, true);
-  assert.equal(approvalChecks, 1);
-  const state = HostInterruptState.fromString(paused.serializedState!);
-  const interruption = state.getInterruptions()[0] as {
-    rawItem: { arguments: string };
-  };
-  interruption.rawItem.arguments = '[]';
-  state.approve(interruption);
-  const resumed = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    state as never,
-    { maxTurns: 3 },
-  );
-  assert.equal(approvalChecks, 1, 'resume does not re-authorize the edited payload implicitly');
-  assert.equal(bodyRuns, 0);
-  assert.match(JSON.stringify(resumed.history), /edited-approval.*invalid arguments/i);
-  assert.equal(resumed.finalOutput, 'invalid edit was not executed');
-});
-
-test('approval pauses BEFORE execution; resume executes the approved tool exactly once', async () => {
+  const argumentsValue = { recipient: 'fixture@example.invalid', message: 'controlled approval fixture' };
   let sendRuns = 0;
-  const model = stubModel([
-    [toolCall('c-send', 'send_email', { to: 'x@y.com' })],
-    [textMsg('sent and finished')],
-  ]);
-  const agent = {
-    model,
-    tools: [{
-      type: 'function', name: 'send_email', description: 'send', parameters: { type: 'object', properties: {} },
-      invoke: async () => { sendRuns += 1; return 'sent'; },
-      needsApproval: async () => true,
-    }],
+  const fakeServer = {
+    async invalidateToolsCache() {},
+    async listTools() {
+      return [{ name: operationId, description: 'Send a message to the specified recipient.',
+        inputSchema, annotations: {
+          readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false,
+        } }];
+    },
+    async callTool(name: string, args: Record<string, unknown> | null) {
+      assert.equal(name, operationId);
+      assert.deepEqual(args, argumentsValue);
+      sendRuns += 1;
+      return [{ type: 'text', text: JSON.stringify({ sent: true, id: 'fixture-message' }) }];
+    },
   };
-  const paused = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'email it' }] as never,
-    { maxTurns: 6 },
-  );
-  assert.equal(paused.hasInterruptions, true);
-  assert.equal(sendRuns, 0, 'the paused tool body never ran');
-  assert.equal(paused.interruptions?.[0]?.toolName, 'send_email');
-  assert.ok(paused.serializedState);
+  const runtime: productionMcp.ProductionMcpRuntime = {
+    configuredServers: () => [{ name: serverName, type: 'stdio',
+      command: '/fixture/approval-mcp', args: [], enabled: true, source: 'user' }] as never,
+    serverForEnumeration: () => fakeServer as never,
+    serverForOperation: () => fakeServer as never,
+  };
+  try {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+    capabilityManifestStores.installCapabilityManifestStore(
+      capabilityManifestStores.createCapabilityManifestStore([], { durable: true }),
+    );
+    productionPorts.clearProductionCapabilityPorts();
+    const materialized = await productionMcp.createProductionMcpReadCarrier({ serverName, runtime })
+      .materializeExact({ operationId, inputSchema });
+    if (materialized.status !== 'installed') throw new Error(JSON.stringify(materialized));
+    assert.equal(materialized.manifest.effect, 'external_write');
+    const exactScope = { reason: 'controlled external approval fixture', authority: 'exact' as const,
+      allowedServerSlugs: [serverName], allowedToolNames: [operationId] };
+    const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+      reachableBuiltinNames: new Set<string>(), firstClassNames: new Set<string>(), mcpToolScope: exactScope,
+    }) as never);
+    const fixture = acceptHostCanarySource('external-write-approval', 'Prepare the message for my review.');
+    let readRuns = 0;
+    const read = brackets.wrapToolForHarness({
+      type: 'function', name: 'workspace_roots', description: 'List allowed workspace roots.',
+      parameters: { type: 'object', properties: {} },
+      needsApproval: async () => false,
+      invoke: async () => { readRuns += 1; return 'fixture roots'; },
+    });
+    const succeeds = mode === 'approved' || mode === 'mixed';
+    const finalReply = succeeds ? 'sent and finished' : 'write was not executed';
+    const model = stubModel([
+      [
+        ...(mode === 'mixed' ? [toolCall('c-read-before', 'workspace_roots', {})] : []),
+        toolCall('c-send', 'call_tool', { name: operationId, args_json: JSON.stringify(argumentsValue) }),
+        ...(mode === 'mixed' ? [toolCall('c-read-after', 'workspace_roots', {})] : []),
+      ],
+      [textMsg(finalReply)],
+    ]);
+    const surface = mode === 'mixed' ? [read, carrier] : [carrier];
+    const agent = { model, tools: surface };
+    mcpToolAuthority.bindAgentMcpToolScope(agent as never, exactScope);
+    bindHostCanarySurface(fixture, agent, surface);
+    const paused = await runProductionHost(fixture, agent);
+    if (!paused.hasInterruptions) throw new Error(`Expected write approval: ${JSON.stringify(paused.history)}`);
+    assert.equal(sendRuns, 0, 'the provider write never runs before approval');
+    assert.equal(readRuns, 0, 'mixed siblings remain parked before approval');
+    const state = HostInterruptState.fromString(paused.serializedState!);
+    assert.equal(state.getInterruptions().length, 1);
+    const writePending = state.pending.find((pending) => pending.callId === 'c-send')!;
+    const subject = writePending?.consentSubject;
+    if (!subject) throw new Error('Missing production consent subject');
+    const approvals = await import('./approval-registry.js');
+    const consent = await import('./host-interactive-consent.js');
+    const approval = approvals.registerResumable({
+      sessionId: fixture.session.id, subject: 'Approve the controlled fixture message.',
+      tool: 'call_tool', args: JSON.parse(writePending.rawItem.arguments),
+      resumeKey: consent.hostInteractiveConsentApprovalResumeKey(subject)!,
+    }).row;
+    assert.equal(approvals.resolve(approval.approvalId, 'approved', 'controlled-fixture').ok, true);
+    if (mode === 'invalid_edit') writePending.rawItem.arguments = '[]';
+    state.approve(state.getInterruptions()[0]);
+    const resumeOptions = mode === 'missing_durable' ? {} : { hostApprovalId: approval.approvalId };
+    const resumed = await runProductionHost(fixture, agent, state, resumeOptions);
+    assert.equal(sendRuns, succeeds ? 1 : 0,
+      'only an unchanged payload with its exact durable grant may reach the provider');
+    assert.equal(resumed.finalOutput, finalReply);
+    assert.equal(resumed.hasInterruptions ?? false, false);
+    if (mode === 'invalid_edit') {
+      const settlements = resumed.history.filter((item) =>
+        (item as { type?: string }).type === 'function_call_result'
+        && (item as { callId?: string }).callId === 'c-send');
+      assert.equal(settlements.length, 1, 'the malformed edit settles its original call exactly once');
+      const result = settlements[0] as { output: { text: string } };
+      const refusal = JSON.parse(result.output.text);
+      assert.equal(refusal.disposition, 'refused_pre_dispatch');
+      assert.equal(refusal.effect, 'none');
+      assert.equal(refusal.nextEdge.change, 'repair_arguments');
+    }
+    if (mode === 'mixed') {
+      assert.equal(readRuns, 2, 'each read sibling executes once');
+      assert.deepEqual(resumed.history.filter((item) =>
+        (item as { type?: string }).type === 'function_call_result'
+      ).map((item) => (item as { callId?: string }).callId),
+      ['c-read-before', 'c-send', 'c-read-after'], 'all siblings settle in model order');
+    }
+    if (succeeds) {
+      const replayState = HostInterruptState.fromString(paused.serializedState!);
+      replayState.approve(replayState.getInterruptions()[0]);
+      await runProductionHost(fixture, agent, replayState, resumeOptions);
+      assert.equal(sendRuns, 1, 'replaying the original approved pause cannot duplicate the provider write');
+      assert.equal(readRuns, mode === 'mixed' ? 2 : 0, 'replay does not repeat read siblings');
+    }
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    capabilityManifestStores.installCapabilityManifestStore(priorManifestStore);
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+  }
+}
 
-  // The resume owner's exact duck-typed flow: deserialize, list, approve.
-  const state = HostInterruptState.fromString(paused.serializedState!);
-  const pending = state.getInterruptions();
-  assert.equal(pending.length, 1);
-  state.approve(pending[0]);
-
-  const resumed = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    state as never,
-    { maxTurns: 6 },
-  );
-  assert.equal(sendRuns, 1, 'the approved tool executed exactly ONCE');
-  assert.equal(resumed.finalOutput, 'sent and finished');
-  assert.equal(resumed.hasInterruptions ?? false, false);
-});
+test('approval pauses BEFORE execution; resume executes the approved tool exactly once',
+  () => exerciseProductionWriteApproval('approved'));
+test('user-edited approval arguments traverse the same parse gate on resume',
+  () => exerciseProductionWriteApproval('invalid_edit'));
+test('serialized approval without its exact durable grant cannot execute an external write',
+  () => exerciseProductionWriteApproval('missing_durable'));
 
 test('needsApproval exceptions fail closed as an explicit approval pause', async () => {
-  let writeRuns = 0;
-  const model = stubModel([
-    [toolCall('c-guard-error', 'dangerous_write', { value: 1 })],
-    [textMsg('write completed after confirmation')],
-  ]);
-  const agent = {
-    model,
-    tools: [{
-      type: 'function', name: 'dangerous_write', description: 'write', parameters: { type: 'object', properties: {} },
-      invoke: async () => { writeRuns += 1; return 'written'; },
-      needsApproval: async () => { throw new Error('approval policy unavailable'); },
-    }],
-  };
-
-  const paused = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'change it' }] as never,
-    { maxTurns: 4 },
-  );
-  assert.equal(paused.hasInterruptions, true);
-  assert.equal(paused.interruptions?.[0]?.toolName, 'dangerous_write');
-  assert.equal(writeRuns, 0, 'a failed predicate cannot authorize the write');
-
-  const state = HostInterruptState.fromString(paused.serializedState!);
-  state.approve(state.getInterruptions()[0]);
-  const resumed = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    state as never,
-    { maxTurns: 4 },
-  );
-  assert.equal(writeRuns, 1, 'the write runs only after the explicit approval');
-  assert.equal(resumed.finalOutput, 'write completed after confirmation');
-});
-
-test('mixed approval batches preserve and settle every sibling exactly once across resume', async () => {
-  const runs = new Map<string, number>();
-  const countRun = (name: string): string => {
-    runs.set(name, (runs.get(name) ?? 0) + 1);
-    return `${name}-result`;
-  };
-  const model = stubModel([
-    [
-      toolCall('c-read-before', 'read_before', {}),
-      toolCall('c-write', 'confirmed_write', { value: 'x' }),
-      toolCall('c-read-after', 'read_after', {}),
-    ],
-    [textMsg('entire batch complete')],
-  ]);
-  const agent = {
-    model,
-    tools: [
-      {
-        type: 'function', name: 'read_before', description: 'read', parameters: { type: 'object', properties: {} },
-        invoke: async () => countRun('read_before'), needsApproval: async () => false,
-      },
-      {
-        type: 'function', name: 'confirmed_write', description: 'write', parameters: { type: 'object', properties: {} },
-        invoke: async () => countRun('confirmed_write'), needsApproval: async () => true,
-      },
-      {
-        type: 'function', name: 'read_after', description: 'read', parameters: { type: 'object', properties: {} },
-        invoke: async () => countRun('read_after'), needsApproval: async () => false,
-      },
-    ],
-  };
-
-  const paused = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'do the batch' }] as never,
-    { maxTurns: 5, toolExecution: { maxFunctionToolConcurrency: 3 } },
-  );
-  assert.equal(paused.hasInterruptions, true);
-  assert.equal(paused.interruptions?.length, 1, 'only the write asks for approval');
-  assert.deepEqual(Object.fromEntries(runs), {}, 'nothing in the mixed batch executes before the pause');
-
-  const state = HostInterruptState.fromString(paused.serializedState!);
-  assert.deepEqual(
-    state.pending.map((pending) => [pending.callId, pending.decision ?? 'awaiting']),
-    [
-      ['c-read-before', 'approved'],
-      ['c-write', 'awaiting'],
-      ['c-read-after', 'approved'],
-    ],
-    'the pause serialized both nonapproval siblings with the write',
-  );
-  state.approve(state.getInterruptions()[0]);
-
-  const resumed = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    state as never,
-    { maxTurns: 5, toolExecution: { maxFunctionToolConcurrency: 3 } },
-  );
-  assert.deepEqual(Object.fromEntries(runs), {
-    read_before: 1,
-    confirmed_write: 1,
-    read_after: 1,
+  // This pin exercises the wrapper predicate failure, not external-write consent.
+  // Real external writes use the production MCP/durable-grant fixtures above.
+  const fixture = acceptHostCanarySource('approval-policy-exception', 'List the workspace roots.');
+  let bodyRuns = 0;
+  let approvalChecks = 0;
+  const bounded = brackets.wrapToolForHarness({
+    type: 'function', name: 'workspace_roots', description: 'List allowed workspace roots.',
+    parameters: { type: 'object', properties: {} },
+    invoke: async () => { bodyRuns += 1; return 'fixture roots'; },
+    needsApproval: async () => {
+      approvalChecks += 1;
+      throw new Error('approval policy unavailable');
+    },
   });
-  const resultIds = resumed.history
-    .filter((item) => (item as { type?: string }).type === 'function_call_result')
-    .map((item) => (item as { callId?: string }).callId);
-  assert.deepEqual(resultIds, ['c-read-before', 'c-write', 'c-read-after']);
-  assert.equal(resumed.finalOutput, 'entire batch complete');
+  const model = stubModel([
+    [toolCall('c-guard-error', 'workspace_roots', {})],
+    [textMsg('read completed after confirmation')],
+  ]);
+  const agent = { model, tools: [bounded] };
+  bindHostCanarySurface(fixture, agent, [bounded]);
+  const paused = await runProductionHost(fixture, agent);
+  assert.equal(paused.hasInterruptions, true);
+  assert.equal(paused.interruptions?.[0]?.toolName, 'workspace_roots');
+  assert.equal(approvalChecks, 1);
+  assert.equal(bodyRuns, 0, 'a failed predicate cannot authorize the body');
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  state.approve(state.getInterruptions()[0]);
+  const resumed = await runProductionHost(fixture, agent, state);
+  assert.equal(bodyRuns, 1, 'the body runs only after explicit approval');
+  assert.equal(approvalChecks, 1, 'resume consumes the approval without repeating the failed predicate');
+  assert.equal(resumed.finalOutput, 'read completed after confirmation');
 });
+
+test('mixed approval batches preserve and settle every sibling exactly once across resume',
+  () => exerciseProductionWriteApproval('mixed'));
 
 test('a rejected approval becomes a visible tool result, never an execution', async () => {
   let sendRuns = 0;
@@ -8041,6 +8016,50 @@ test('read-only canary admits only attested read effects and refuses mutating/un
   }
 });
 
+for (const oldCard of [false, true]) test(`native approval public resume retains exact task identity after reopen (oldCard=${oldCard})`, async () => {
+  const fixture = acceptHostCanarySource(`native-public-resume-${oldCard}`);
+  let bodies = 0;
+  const read = brackets.wrapToolForHarness({ type: 'function', name: 'workspace_roots',
+    description: 'List allowed workspace roots.', parameters: { type: 'object', properties: {} },
+    needsApproval: async () => true,
+    invoke: async () => { bodies += 1; return 'controlled fixture roots'; },
+  });
+  const agent = { model: stubModel([[toolCall('native-public-call', 'workspace_roots', {})],
+    [textMsg('native approval resumed')]]), tools: [read] };
+  bindHostCanarySurface(fixture, agent, [read]);
+  const paused = await runProductionHost(fixture, agent);
+  assert.equal(paused.hasInterruptions, true);
+  const persisted = JSON.parse(paused.serializedState!);
+  if (oldCard) { persisted.__clemHostInterrupt = 6; delete persisted.nativeApprovalKeys; }
+  HarnessSession.load(fixture.session.id)!.saveInterruptState(JSON.stringify(persisted));
+  const registry = await import('./approval-registry.js');
+  const loop = await import('./loop.js');
+  const legacyCard = oldCard ? registry.register({ sessionId: fixture.session.id,
+    subject: 'Pre-upgrade native approval.', tool: 'workspace_roots', args: {} }) : undefined;
+  eventlog.closeEventLog();
+  loop.recoverParkedApprovalSurfaces();
+  const cards = registry.listPending({ sessionId: fixture.session.id, status: 'pending' });
+  assert.equal(cards.length, 1, 'upgrade recovery must not duplicate or replace an existing native card');
+  const card = cards[0]!;
+  if (legacyCard) {
+    assert.equal(card.approvalId, legacyCard.approvalId, 'the original card remains usable');
+    assert.equal(card.resumeKey, null);
+    const restored = HostInterruptState.fromString(HarnessSession.load(fixture.session.id)!.loadInterruptState()!);
+    assert.equal(HostInterruptState.fromString(restored.toString()).nativeApprovalKeys, false,
+      'reserializing old state must not silently upgrade its approval contract');
+  } else assert.match(card.resumeKey ?? '', /^host-approval:v1:/);
+  const resumed = await loop.resumePendingApproval({ sessionId: fixture.session.id,
+    approvalId: card!.approvalId, decision: 'approve', agent: agent as never,
+    makeRunner: throwingRunner as never });
+  assert.equal(resumed.status, 'completed');
+  assert.equal(bodies, 1);
+  assert.equal(HarnessSession.load(fixture.session.id)!.loadInterruptState(), null);
+  await loop.resumePendingApproval({ sessionId: fixture.session.id,
+    approvalId: card!.approvalId, decision: 'approve', agent: agent as never,
+    makeRunner: throwingRunner as never });
+  assert.equal(bodies, 1, 'a repeated click cannot rerun the native body');
+});
+
 test('host approval resume re-enters with an exact durable call lease before the body', async () => {
   const fixture = acceptHostCanarySource('approval-resume-owner');
   let bodies = 0;
@@ -8064,6 +8083,14 @@ test('host approval resume re-enters with an exact durable call lease before the
   const state = HostInterruptState.fromString(paused.serializedState!);
   assert.ok(state.acceptedModelBatchRef, 'V5 approval state owns the exact pre-admitted batch');
   const pausedRef = state.acceptedModelBatchRef!;
+  const resumeKey = state.getInterruptions()[0]!.approvalResumeKey;
+  assert.match(resumeKey ?? '', /^host-approval:v1:[a-f0-9]{64}$/);
+  assert.equal(HostInterruptState.fromString(state.toString()).getInterruptions()[0]!.approvalResumeKey, resumeKey);
+  const differentSource = HostInterruptState.fromString(state.toString());
+  differentSource.acceptedModelBatchRef!.sourceUserSeq += 1;
+  assert.notEqual(differentSource.getInterruptions()[0]!.approvalResumeKey, resumeKey,
+    'identical native arguments in another task never reuse this approval identity');
+
   const db = eventlog.openEventLog();
   assert.deepEqual(db.prepare(`
     SELECT admission.batch_id,
@@ -10076,13 +10103,15 @@ test('named workflow dispatch seals before review and final child evidence owns 
     return { done: false, reason: 'the child has not returned its actual summary' };
   });
   try {
-    for (const variant of ['positive', 'off', 'negative', 'unavailable', 'drift', 'wrong-source'] as const) {
+    for (const variant of ['positive', 'off', 'negative', 'cancel-before-claim', 'remaining-local-work', 'unavailable', 'drift', 'wrong-source'] as const) {
       await t.test(variant, async () => {
         const name = `final-child-review-${variant}`;
         writeWorkflow(name, { name, description: 'Summarize supplied text.', enabled: true,
           trigger: { manual: true }, steps: [{ id: 'summary', prompt: 'Summarize {{input.text}}.', sideEffect: 'read' }] });
         const replyTarget = { type: 'origin_chat' } as const;
-        const fixture = acceptHostCanarySource(name, `Run ${name} and give the summary here.`, {
+        const fixture = acceptHostCanarySource(name, variant === 'remaining-local-work'
+          ? `Run ${name}, then disable this saved workflow and give the summary here.`
+          : `Run ${name} and give the summary here.`, {
           originReplyTarget: replyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget),
         });
         const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `parent-${variant}` });
@@ -10093,18 +10122,39 @@ test('named workflow dispatch seals before review and final child evidence owns 
         host.captureEffectiveCompletionPolicyOnce({ sessionId: fixture.session.id,
           sourceUserSeq: fixture.source.seq, enabled: variant !== 'off' });
         const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
-          reachableBuiltinNames: new Set(['workflow_run']), firstClassNames: new Set(['call_tool']),
+          reachableBuiltinNames: new Set(['workflow_run', 'workflow_get', 'workflow_set_enabled']), firstClassNames: new Set(['call_tool']),
           deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
-          admitBuiltinAcquisition: async (target) => target === 'workflow_run'
+          admitBuiltinAcquisition: async (target) => ['workflow_run', 'workflow_get', 'workflow_set_enabled'].includes(target)
             ? { ok: true } : { ok: false, kind: 'requires_readmission', outside: [target] },
         }));
+        const { observeCurrentLocalPlanningDefinition } = await import('./local-planning-capability.js');
+        const disableDefinition = await observeCurrentLocalPlanningDefinition({ name: 'workflow_set_enabled', carrier: 'work_call' });
+        assert.ok(disableDefinition.ok);
+        if (!disableDefinition.ok) throw new Error(disableDefinition.reason);
         const model = stubModel([
-          [toolCall(`joined-${variant}`, 'call_tool', { name: 'workflow_run',
-            args_json: JSON.stringify({ name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) }) })],
+          [variant === 'remaining-local-work'
+            ? toolCall(`joined-${variant}`, 'workflow_run', { name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) })
+            : toolCall(`joined-${variant}`, 'call_tool', { name: 'workflow_run',
+              args_json: JSON.stringify({ name, inputs: JSON.stringify({ text: 'Southgate is Ready.' }) }) })],
           [textMsg('CONTINUE: waiting for the dispatched child summary')],
+          [variant === 'remaining-local-work'
+            ? toolCall(`parent-read-${variant}`, 'workflow_get', { name })
+            : toolCall(`parent-read-${variant}`, 'call_tool', { name: 'workflow_get', args_json: JSON.stringify({ name }) })],
+          [toolCall(`parent-disable-${variant}`, 'work_call', { name: 'workflow_set_enabled',
+            requirement_id: disableDefinition.definition.capabilityRef, args_json: JSON.stringify({ name, enabled: false }) })],
+          [textMsg('Southgate is ready. The workflow is disabled.')],
         ]);
-        const agent = { model, tools: [carrier] };
-        bindHostCanarySurface(fixture, agent, [carrier]);
+        let agent = { model, tools: [carrier] };
+        if (variant === 'remaining-local-work') {
+          const planning = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
+          assert.ok(planning.ok);
+          if (!planning.ok) throw new Error('fixture planning context unavailable');
+          const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+          agent = await buildOrchestratorAgent({ ...fixture.context, userInput: String(fixture.source.data.text),
+            hostFreshPlanning: planning.planning, model: model as never, allowToolJit: false,
+            allowedToolNames: ['call_tool', 'tool_search', 'plan_task', 'work_call', 'workflow_run', 'workflow_get', 'workflow_set_enabled'],
+          }) as unknown as typeof agent;
+        } else bindHostCanarySurface(fixture, agent, [carrier]);
         const outcome = await runProductionHost(fixture, agent);
         assert.equal(model.calls(), 2, 'queued work must transfer before a CONTINUE or reviewer loop');
         assert.equal(prematureJudges, 0, 'queue acknowledgement is not completion-review input');
@@ -10115,6 +10165,36 @@ test('named workflow dispatch seals before review and final child evidence owns 
         const dispatches = eventlog.listEvents(fixture.session.id, { types: ['async_work_dispatched'] });
         assert.equal(dispatches.length, 1);
         assert.equal(dispatches[0].data.sourceUserSeq, fixture.source.seq);
+        const parentCheckpoints = await import('../../execution/workflow-parent-checkpoint.js');
+        const checkpointIdentity = { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+          sourceGroupId: String(dispatches[0].data.sourceGroupId),
+          sourceGroupDigest: String(dispatches[0].data.sourceGroupDigest) };
+        const parentCheckpoint = parentCheckpoints.readWorkflowParentCheckpoint(checkpointIdentity);
+        assert.ok(parentCheckpoint, 'the group cannot become executable without its immutable parent replay context');
+        assert.match(JSON.stringify(parentCheckpoint.history), /Southgate is Ready/);
+        assert.doesNotMatch(JSON.stringify(parentCheckpoint.history), /CONTINUE: waiting for the dispatched child summary/,
+          'the acknowledgment is not part of the committed tool-batch replay history');
+        assert.ok(parentCheckpoint.envelope.capabilities.some(capability => capability.name ===
+          (variant === 'remaining-local-work' ? 'workflow_run' : 'call_tool')));
+        assert.deepEqual(parentCheckpoint.bindingRevision,
+          capabilityEnvelopes.boundAgentCapabilityRevision(agent),
+          'recovery retains the selected tool surface, not just the whole catalog universe');
+        assert.equal(parentCheckpoints.readWorkflowParentCheckpoint({ ...checkpointIdentity,
+          sourceGroupDigest: 'wrong-digest' }), null, 'a checkpoint does not transfer to different child evidence');
+        const { version: _checkpointVersion, ...checkpointInput } = parentCheckpoint;
+        parentCheckpoints.checkpointWorkflowParent(checkpointInput);
+        const checkpointRows = eventlog.listEvents(fixture.session.id, { types: ['workflow_parent_checkpoint'] });
+        assert.equal(checkpointRows.length, 1);
+        const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+        assert.equal(projectHarnessEventForPublic(checkpointRows[0]!), null, 'private replay state must never become a chat event');
+        assert.throws(() => parentCheckpoints.checkpointWorkflowParent({ ...checkpointInput, history: [] }), /conflicts/);
+        const sessionBeforeLaterHistory = eventlog.getSession(fixture.session.id)!;
+        eventlog.updateSession(fixture.session.id, { metadata: { ...sessionBeforeLaterHistory.metadata,
+          __conversation: { items: [{ type: 'message', role: 'user', content: 'A later independent task.' }] } } });
+        eventlog.closeEventLog();
+        assert.deepEqual(parentCheckpoints.readWorkflowParentCheckpoint(checkpointIdentity), parentCheckpoint,
+          'reopen restores original source context even after a later chat replaces the mutable snapshot');
+        eventlog.updateSession(fixture.session.id, { metadata: sessionBeforeLaterHistory.metadata });
         const runId = (dispatches[0].data.runIds as string[])[0];
         const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
         const queued = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
@@ -10160,7 +10240,9 @@ test('named workflow dispatch seals before review and final child evidence owns 
               records.writeWorkflowRunRecordDurablyUnlocked(file, { ...current, stepOutputs: { summary: 'changed after review began' } });
             });
           }
-          return { done: variant !== 'negative', reason: variant === 'negative' ? 'a required fact is missing' : 'actual child checked',
+          return { done: variant !== 'negative' && variant !== 'cancel-before-claim' && variant !== 'remaining-local-work',
+            reason: variant === 'remaining-local-work' ? 'The workflow finished, but the authorized post-run disable is still missing.'
+              : variant === 'negative' ? 'a required fact is missing' : 'actual child checked',
             ...(variant === 'unavailable' ? { failedOpen: true } : {}),
             selfJudge: true, ownerSelectedJudge: true, judgeModelId: 'test-selected-model', judgeProvider: 'byo' as const };
         });
@@ -10173,6 +10255,164 @@ test('named workflow dispatch seals before review and final child evidence owns 
         }
         if (variant !== 'off') assert.equal(terminal.commitWorkflowOriginTerminal(input), null,
           'sync report-back must not publish an unreviewed captured-ON result');
+        if (variant === 'cancel-before-claim') {
+          await completion.reviewWorkflowOriginCompletion(input, detail);
+          assert.ok(completion.readWorkflowParentContinuation(input, detail));
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['workflow_parent_continuation_requested'] }).length, 0);
+          eventlog.requestKill(fixture.session.id, 'Stop before the parent wakes', { attemptId: attempt.attemptId });
+          const cancelled = await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
+            activateWorkflowParent: async () => { throw new Error('cancelled parent must never activate'); },
+          });
+          assert.equal(cancelled?.presentation.status, 'cancelled');
+          assert.ok(attemptState()?.finishedAt);
+          assert.equal(model.calls(), 2);
+          assert.equal(finalJudges, 1, 'cancellation must not run another completion review');
+          assert.equal(report.attemptWorkflowRunReportBack(file), true);
+          eventlog.closeEventLog();
+          assert.equal((await terminal.reviewAndCommitWorkflowOriginTerminal(input))?.event.id, cancelled.event.id);
+          assert.equal(report.attemptWorkflowRunReportBack(file), false);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+          return;
+        }
+        if (variant === 'negative' || variant === 'remaining-local-work' || variant === 'unavailable') {
+          await completion.reviewWorkflowOriginCompletion(input, detail);
+          const continuation = completion.readWorkflowParentContinuation(input, detail);
+          if (variant === 'unavailable') {
+            assert.equal(continuation, null, 'an unfired review cannot authorize a recovery decision');
+          } else {
+            assert.ok(continuation, 'a current negative verdict can identify its original unfinished owner');
+            assert.equal(continuation.attemptId, attempt.attemptId);
+            assert.deepEqual(continuation.checkpoint, parentCheckpoint);
+            assert.equal(completion.readWorkflowParentContinuation(input, 'different report'), null,
+              'a verdict for different reply bytes cannot drive recovery');
+            assert.equal(completion.readWorkflowParentContinuation({ ...input, outcome: 'cancelled' }, detail), null);
+            assert.equal(completion.readWorkflowParentContinuation({ ...input, outcome: 'failed' }, detail), null);
+            const ownership = await import('../../execution/workflow-parent-continuation.js');
+            const nowMs = Date.now();
+            const first = ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs });
+            assert.ok(first);
+            assert.equal(first.lease.attemptId, attempt.attemptId, 'recovery must not mint another attempt');
+            const { releaseRunInFlightAfterWorkflowTransfer } = await import('./restart-recovery.js');
+            releaseRunInFlightAfterWorkflowTransfer(fixture.session.id, attempt.attemptId, fixture.source.seq);
+            assert.ok(ownership.readOwnedWorkflowParentContinuation(first.lease, input, detail, nowMs),
+              'late foreground cleanup cannot clear the new parent activation owner');
+            assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs }), null,
+              'duplicate wake-ups cannot both own the unfinished parent');
+            if (variant === 'remaining-local-work') {
+              // A real additional host read changes the parent's evidence
+              // inventory. Use a single recording-model step; no provider is
+              // called and the model-limit result is not published here.
+              await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+                throwingRunner() as never, agent as never, parentCheckpoint.history,
+                { maxTurns: 1, hostTurnEngine: 'host_v1', context: fixture.context,
+                  hostPreviousResponseId: parentCheckpoint.lastResponseId } as never));
+              assert.equal(model.calls(), 3);
+              const followupSettlements = eventlog.openEventLog().prepare(`
+                SELECT l.tool_name AS tool, s.outcome_kind AS outcome
+                FROM logical_call_settlements s JOIN logical_tool_calls l
+                  ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
+                  AND l.logical_tool_call_id = s.logical_tool_call_id
+                WHERE s.session_id = ? AND s.source_user_seq = ?`)
+                .all(fixture.session.id, fixture.source.seq) as Array<{ tool: string; outcome: string }>;
+              assert.ok(followupSettlements.some(row => row.tool === 'workflow_get' && row.outcome === 'succeeded'),
+                `the follow-up read must actually execute: ${JSON.stringify(followupSettlements)}`);
+              assert.equal(completion.readWorkflowParentContinuation(input, detail), null,
+                'the old negative review no longer matches the changed parent evidence');
+              assert.ok(ownership.readOwnedWorkflowParentContinuation(first.lease, input, detail, nowMs + 500),
+                'the original claimed trigger remains valid while its parent makes progress');
+            }
+            eventlog.closeEventLog();
+            assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs: nowMs + 500 }), null,
+              'ownership survives SQLite reopen');
+            assert.ok(ownership.readOwnedWorkflowParentContinuation(first.lease, input, detail, nowMs + 500));
+            assert.equal(ownership.readOwnedWorkflowParentContinuation({ ...first.lease, evidenceDigest: 'different-evidence' },
+              input, detail, nowMs + 500), null, 'lease ownership is bound to the original reviewed evidence');
+            const ownedChild = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
+            records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file,
+              { ...ownedChild, stepOutputs: { summary: 'changed after the parent claimed recovery' } }));
+            assert.equal(ownership.readOwnedWorkflowParentContinuation(first.lease, input, detail, nowMs + 500), null,
+              'a live lease cannot authorize recovery from changed child evidence');
+            records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, ownedChild));
+            assert.equal(ownership.renewWorkflowParentContinuation(first.lease, input, 'changed report',
+              { leaseMs: 1000, nowMs: nowMs + 500 }), false);
+            assert.equal(ownership.renewWorkflowParentContinuation(first.lease, input, detail,
+              { leaseMs: 1000, nowMs: nowMs + 500 }), true);
+            assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs: nowMs + 1000 }), null);
+            assert.equal(ownership.readOwnedWorkflowParentContinuation(first.lease, input, detail, nowMs + 1500), null);
+            assert.equal(ownership.renewWorkflowParentContinuation(first.lease, input, detail,
+              { leaseMs: 1000, nowMs: nowMs + 1500 }), false, 'expiry cannot be silently renewed into ownership');
+            const successor = ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs: nowMs + 1500 });
+            assert.ok(successor, 'an expired crashed activation is recoverable');
+            assert.equal(successor.lease.attemptId, attempt.attemptId);
+            assert.notEqual(successor.lease.ownerId, first.lease.ownerId);
+            const requests = eventlog.listEvents(fixture.session.id, { types: ['workflow_parent_continuation_requested'] });
+            assert.equal(requests.length, 1, 'reclaiming after progress does not create another recovery request');
+            assert.equal(projectHarnessEventForPublic(requests[0]!), null);
+            assert.equal(ownership.releaseWorkflowParentContinuation(first.lease), false,
+              'late completion from the former owner cannot release the successor');
+            assert.equal(ownership.releaseWorkflowParentContinuation(successor.lease), true);
+            eventlog.requestKill(fixture.session.id, 'controlled recovery cancellation', { attemptId: attempt.attemptId });
+            assert.equal(ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 1000, nowMs: nowMs + 2000 }), null,
+              'pending cancellation prevents a recovery claim before terminal publication');
+            eventlog.clearKill(fixture.session.id, { attemptId: attempt.attemptId });
+            if (variant === 'remaining-local-work') {
+              const { readWorkflow } = await import('../../memory/workflow-store.js');
+              host._setHostObjectiveJudgeForTests(async () => ({
+                done: readWorkflow(name)?.data.enabled === false,
+                reason: 'The exact saved workflow must be disabled after its settled run.',
+              }));
+              const sameRun = eventlog.claimRunAttemptLease({ sessionId: fixture.session.id,
+                runId: attempt.runId!, ownerId: 'old-http-retry', leaseMs: 30_000 });
+              assert.equal(sameRun.claimed, false, 'a replay cannot reclaim the workflow-owned original run');
+              assert.equal(sameRun.attempt?.attemptId, attempt.attemptId);
+              const later = eventlog.beginRunAttempt(fixture.session.id, { runId: 'later-foreground-during-workflow' });
+              eventlog.recordRunAttemptUserInput(later, { turn: 2, role: 'user', data: { text: 'An independent newer request.' } });
+              assert.equal(attemptState()?.finishedAt, null, 'a new foreground request must not supersede transferred workflow ownership');
+              const newest = eventlog.claimRunAttemptLease({ sessionId: fixture.session.id,
+                runId: 'newest-leased-foreground', ownerId: 'test-foreground-owner', leaseMs: 30_000 });
+              assert.equal(newest.claimed, true);
+              const newestSource = eventlog.recordRunAttemptUserInput(newest.attempt,
+                { turn: 3, role: 'user', data: { text: 'A fresh foreground request with its own lease.' } });
+              assert.equal(attemptState()?.finishedAt, null, 'leased foreground admission must also preserve the workflow parent');
+              assert.ok(eventlog.getRunAttemptBySourceUserSeq(fixture.session.id,
+                eventlog.getRunAttemptSourceUserEvent(later)!.seq)?.finishedAt,
+                'ordinary foreground supersession remains intact');
+              const currentSession = eventlog.getSession(fixture.session.id)!;
+              eventlog.updateSession(fixture.session.id, { metadata: { ...currentSession.metadata,
+                __run_in_flight: '2026-09-23T03:00:00.000Z',
+                __conversation: { items: [{ type: 'message', role: 'user', content: 'New foreground history stays here.' }] } } });
+              const foregroundSnapshot = eventlog.getSession(fixture.session.id)?.metadata.__conversation;
+              const driven = await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
+                activateWorkflowParent: options => runConversation({ ...options, buildAgent: async identity => {
+                  const rebuilt = await options.buildAgent!(identity);
+                  const { isHostPlanRequiredWorkCall } = await import('../../tools/work-call-mode.js');
+                  assert.ok(rebuilt.tools.some(tool => (tool as { name?: string }).name === 'work_call'
+                    && isHostPlanRequiredWorkCall(tool)), 'rebuilt production carrier retains host preparation');
+                  rebuilt.model = model as never;
+                  return rebuilt;
+                } }),
+              });
+              assert.equal(driven?.presentation.status, 'done', JSON.stringify(eventlog.listEvents(fixture.session.id,
+                { types: ['restart_recovery_decision', 'tool_returned', 'conversation_completed'] }).map(row => row.data)));
+              assert.deepEqual(eventlog.listEvents(fixture.session.id, { types: ['restart_recovery_decision'] })
+                .filter(row => row.data.decision === 'workflow_parent_retry_pending'), [],
+                'successful parent completion must not leave a spurious recovery retry');
+              assert.equal(readWorkflow(name)?.data.enabled, false, JSON.stringify(eventlog.listEvents(fixture.session.id,
+                { types: ['tool_returned'] }).map(row => row.data)));
+              assert.equal(model.calls(), 5, 'recovery replays settled history without repeating the read or child execution');
+              assert.deepEqual(eventlog.getSession(fixture.session.id)?.metadata.__conversation, foregroundSnapshot,
+                'resuming the older source does not overwrite the session conversation snapshot');
+              assert.equal(eventlog.getSession(fixture.session.id)?.metadata.__run_in_flight, '2026-09-23T03:00:00.000Z',
+                'the background parent must not replace or clear the newer foreground marker');
+              assert.equal(eventlog.getRunAttemptBySourceUserSeq(fixture.session.id, newestSource.seq)?.finishedAt, null,
+                'finishing the older parent does not finish the newer foreground request');
+              host._setHostObjectiveJudgeForTests(async () => {
+                prematureJudges += 1;
+                return { done: false, reason: 'the child has not returned its actual summary' };
+              });
+            }
+          }
+        }
         let committed: Awaited<ReturnType<typeof terminal.reviewAndCommitWorkflowOriginTerminal>>;
         if (variant === 'positive') {
           const { workflowOwnedUnfinishedAttemptIds } = await import('./accepted-source-outcome.js');
@@ -10195,7 +10435,33 @@ test('named workflow dispatch seals before review and final child evidence owns 
           }
           committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input);
         } else {
-          committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input);
+          committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input, variant === 'negative' ? {
+            activateWorkflowParent: async () => ({ sessionId: fixture.session.id, status: 'held', steps: 0,
+              lastTurn: fixture.source.turn, hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' } }),
+          } : {});
+        }
+        if (variant === 'negative') {
+          assert.equal(committed, null, 'unfinished recovery cannot fall through to child-report publication');
+          assert.equal(attemptState()?.finishedAt, null);
+          const ownership = await import('../../execution/workflow-parent-continuation.js');
+          const activeOwner = ownership.claimWorkflowParentContinuation(input, detail, { leaseMs: 30_000 });
+          assert.ok(activeOwner);
+          eventlog.requestKill(fixture.session.id, 'Stop the remaining parent work', { attemptId: attempt.attemptId });
+          assert.equal(terminal.commitWorkflowOriginTerminal(input), null,
+            'report-back cannot finish cancellation while another executor still owns the task');
+          assert.equal(ownership.releaseWorkflowParentContinuation(activeOwner.lease), true);
+          const cancelled = await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
+            activateWorkflowParent: async () => { throw new Error('cancelled parent must not activate'); },
+          });
+          assert.equal(cancelled?.presentation.status, 'cancelled');
+          assert.ok(attemptState()?.finishedAt);
+          assert.equal(model.calls(), 2, 'cancellation spends no more model calls');
+          assert.equal(report.attemptWorkflowRunReportBack(file), true);
+          eventlog.closeEventLog();
+          assert.equal((await terminal.reviewAndCommitWorkflowOriginTerminal(input))?.event.id, cancelled.event.id);
+          assert.equal(report.attemptWorkflowRunReportBack(file), false);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+          return;
         }
         if (variant === 'drift') {
           assert.equal(committed, null);
@@ -10203,7 +10469,40 @@ test('named workflow dispatch seals before review and final child evidence owns 
           assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 0);
           return;
         }
+        if (variant === 'remaining-local-work') {
+          assert.equal(committed?.presentation.status, 'done');
+          assert.ok(attemptState()?.finishedAt, 'the original attempt finishes only after its remaining action');
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['async_work_dispatched'] }).length, 1);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).length, 3, 'recovery must not add to the three actual user requests');
+          const { isWorkflowParentTerminalIdentity } = await import('../../execution/workflow-parent-terminal-proof.js');
+          assert.ok(committed);
+          const parentProof = { sourceGroupId: checkpointIdentity.sourceGroupId,
+            sourceGroupDigest: checkpointIdentity.sourceGroupDigest,
+            terminal: { ...committed.presentation.identity, eventId: committed.event.id,
+              outcomeId: committed.presentation.outcomeId, runId: committed.presentation.identity.runId ?? '' } };
+          assert.equal(isWorkflowParentTerminalIdentity(parentProof), true, JSON.stringify({ parentProof,
+            attempt: attemptState(), terminalAttempt: committed.event.data.attemptId,
+            requests: eventlog.listEvents(fixture.session.id, { types: ['workflow_parent_continuation_requested'] }) }));
+          assert.equal(isWorkflowParentTerminalIdentity({ ...parentProof, sourceGroupDigest: 'wrong-group' }), false);
+          assert.equal(isWorkflowParentTerminalIdentity({ ...parentProof,
+            terminal: { ...parentProof.terminal, runId: runId } }), false, 'a child identity cannot impersonate its resumed parent');
+          assert.equal(report.attemptWorkflowRunReportBack(file), true,
+            'the actual report-back reducer acknowledges the exact parent terminal');
+          eventlog.closeEventLog();
+          assert.equal(report.attemptWorkflowRunReportBack(file), false, 'already acknowledged work is no longer due for delivery');
+          const acknowledged = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
+          assert.equal(typeof acknowledged.reportBackAcknowledgedAt, 'string');
+          const { readWorkflowOriginGroupSettlement } = await import('../../execution/workflow-origin-group.js');
+          assert.equal(readWorkflowOriginGroupSettlement(checkpointIdentity.sourceGroupId)?.terminalIdentity.eventId,
+            committed.event.id, 'the durable group acknowledgment reopens against the exact parent terminal');
+          assert.equal(model.calls(), 5);
+          assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).length, 1);
+          return;
+        }
         assert.ok(committed);
+        assert.equal(completion.readWorkflowParentContinuation(input, detail), null,
+          'a terminal winner fences recovery even if its earlier review was negative');
         assert.ok(attemptState()?.finishedAt, 'the exact final terminal closes the parent attempt');
         const finishedAt = attemptState()?.finishedAt;
         assert.equal(finalJudges, variant === 'off' ? 0 : 1);
@@ -10211,7 +10510,7 @@ test('named workflow dispatch seals before review and final child evidence owns 
         // that CANNOT FIRE follows the brain, so 'unavailable' publishes done
         // while still disclosing that the result is unreviewed and recording
         // verified:false. A review that RAN and came back NEGATIVE still blocks.
-        assert.equal(committed.presentation.status, variant === 'negative' ? 'blocked' : 'done');
+        assert.equal(committed.presentation.status, 'done');
         if (variant === 'unavailable') {
           assert.match(committed.presentation.text, /unreviewed/i, 'an unfired review is still disclosed');
           assert.equal((committed.event.data.completionVerdictRef as Record<string, unknown> | undefined)?.verified, false);

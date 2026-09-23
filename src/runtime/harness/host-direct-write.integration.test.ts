@@ -70,7 +70,7 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown }) {
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; deferredAcrossSources?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown }) {
   const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
   const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
     ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
@@ -110,7 +110,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   let preparationCalls = 0;
   const invoke = async (request: any) => {
     providerCalls += 1;
-    assert.equal(modelCalls, providerFixture?.singleFrame ? 1 : providerCalls, 'each call dispatches in the model step that nominated it');
+    if (!providerFixture?.deferredAcrossSources) assert.equal(modelCalls, providerFixture?.singleFrame ? 1 : providerCalls, 'each call dispatches in the model step that nominated it');
     assert.deepEqual(request.payload, payloadForWrite(providerCalls));
     assert.equal(request.binding.account, accountId);
     assert.ok(request.authority, 'the existing adapter receives the exact consent grant');
@@ -204,26 +204,101 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   if (!sealed.ok) return;
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
-  const useProductionAgent = async () => {
+  const useProductionAgent = async (acceptedSource = source) => {
     const { primePrimaryModelPlanningCatalog } = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
     const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
     factory.register(entry);
-    const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+    const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: acceptedSource.seq });
     assert.ok(primed.ok, JSON.stringify(primed));
     if (!primed.ok) throw new Error(primed.reason);
-    agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq,
+    agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: acceptedSource.seq,
       userInput: prompt, hostFreshPlanning: primed.planning, allowToolJit: true, model: model as never });
     return agent;
   };
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('legacy Runner must remain unreachable'); } });
-  const run = (input: any = [{ type: 'message', role: 'user', content: prompt }], extra: Record<string, unknown> = {}) => brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
+  const run = (input: any = [{ type: 'message', role: 'user', content: prompt }], extra: Record<string, unknown> = {}, acceptedSource = source) => brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: acceptedSource.seq,
     counter: new brackets.ToolCallsCounter(writeCount + 2), behaviorScopeId: `${session.id}::turn:1` },
   () => hostRunRunner(runner as never, agent as never, input,
-    { maxTurns: writeCount + 2, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
+    { maxTurns: writeCount + 2, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: acceptedSource.seq }, ...extra } as never));
   return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt, model, useProductionAgent, modelInputs,
     counts: () => ({ providerCalls, modelCalls, preparationCalls, carrierBodies }) };
 }
+
+for (const cancelTarget of ['newer', 'parked'] as const) test(`approval preflight uses the parked source (cancel=${cancelTarget})`, async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', `resume-exact-kill-owner-${cancelTarget}`, false, 'args_json', 1, {
+    operationId: `PREFLIGHT_APPROVAL_${cancelTarget.toUpperCase()}`, schema: INPUT_SCHEMA, payloads: [ARGS],
+  });
+  assert.ok(fixture);
+  const paused = await fixture.run();
+  assert.equal(paused.hasInterruptions, true);
+  const { HarnessSession } = await import('./session.js');
+  HarnessSession.load(fixture.session.id)!.saveInterruptState(paused.serializedState!);
+  const newerSource = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 2,
+    role: 'user', type: 'user_input_received', data: { text: 'Another independent request.' } });
+  const cancelledAttempt = eventlog.beginRunAttempt(fixture.session.id, {
+    runId: `exact-task-cancellation-fixture-${cancelTarget}`,
+  });
+  eventlog.bindRunAttemptSourceUserEvent(cancelledAttempt,
+    cancelTarget === 'newer' ? newerSource.seq : fixture.source.seq);
+  eventlog.requestKill(fixture.session.id, 'Stop only the selected request.', cancelledAttempt);
+  eventlog.closeEventLog();
+  const { resumePendingApproval } = await import('./loop.js');
+  const outcome = await resumePendingApproval({
+    sessionId: fixture.session.id, agent: fixture.agent, decision: 'approve',
+    sourceUserSeq: newerSource.seq, makeRunner: () => fixture.runner as never,
+  });
+  assert.equal(outcome.status, cancelTarget === 'newer' ? 'awaiting_approval' : 'killed',
+    'the original parked write recovers its approval card instead of consuming another task stop');
+  assert.equal(eventlog.isKillRequested(fixture.session.id, cancelledAttempt), cancelTarget === 'newer',
+    'only the parked task cancellation may be consumed by this resume');
+  assert.equal(fixture.counts().providerCalls, 0, 'recovering a card grants no write authority');
+  assert.equal(fixture.counts().modelCalls, 1, 'preflight recovery needs no additional model call');
+});
+
+for (const entry of ['conversation', 'pending'] as const) test(`approval from another source is refused before ${entry} resume work`, async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', `wrong-source-${entry}`, false, 'args_json', 1, {
+    operationId: `WRONG_SOURCE_${entry.toUpperCase()}`, schema: INPUT_SCHEMA, payloads: [ARGS],
+  });
+  assert.ok(fixture);
+  const paused = await fixture.run();
+  assert.equal(paused.hasInterruptions, true);
+  const { HarnessSession } = await import('./session.js');
+  HarnessSession.load(fixture.session.id)!.saveInterruptState(paused.serializedState!);
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  const pending = state.pending[0]!;
+  const newerSource = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 2,
+    role: 'user', type: 'user_input_received', data: { text: 'A separate task with the same payload.' } });
+  const { hostInteractiveConsentApprovalResumeKey } = await import('./host-interactive-consent.js');
+  const wrongSubject = { ...pending.consentSubject!, sourceUserSeq: newerSource.seq };
+  const wrongCard = approvals.registerResumable({ sessionId: fixture.session.id,
+    subject: 'Another task with the same arguments.', tool: pending.name,
+    args: JSON.parse(pending.rawItem.arguments),
+    resumeKey: hostInteractiveConsentApprovalResumeKey(wrongSubject)!,
+  }).row;
+  let builds = 0;
+  const loop = await import('./loop.js');
+  const options = { sessionId: fixture.session.id, approvalId: wrongCard.approvalId,
+    decision: 'approve' as const, makeRunner: () => fixture.runner as never };
+  if (entry === 'conversation') {
+    const refused = await loop.runConversationFromResume({ ...options, turnEngine: 'host_v1',
+      buildAgent: async () => { builds += 1; throw new Error('wrong task must not build an agent'); },
+    });
+    assert.equal(refused.status, 'awaiting_approval');
+    assert.match(refused.error ?? '', /different paused action/);
+    assert.equal(builds, 0, 'an unrelated card is rejected before planning or agent construction');
+  } else {
+    const refused = await loop.resumePendingApproval({ ...options, agent: fixture.agent });
+    assert.equal(refused.status, 'awaiting_approval');
+    assert.match(refused.error ?? '', /different paused action/);
+  }
+  assert.equal(approvals.get(wrongCard.approvalId)?.status, 'pending', 'another task card is never resolved');
+  assert.equal(approvals.listPending({ sessionId: fixture.session.id, status: 'pending' }).length, 1,
+    'an unrelated decision must not trigger registration of a different task card');
+  assert.equal(HarnessSession.load(fixture.session.id)!.loadInterruptState(), paused.serializedState);
+  assert.equal(fixture.counts().providerCalls, 0);
+  assert.equal(fixture.counts().modelCalls, 1);
+});
 
 test('the production approval wrapper rebuilds the original host source and continues after SQLite reopen', async () => {
   const fixture = await directWriteFixture('work_call', 'opaque', 'production-resume', false, 'args_json', 1, {
@@ -259,6 +334,69 @@ test('the production approval wrapper rebuilds the original host source and cont
   assert.match(JSON.stringify(terminal?.data), /The draft was created/);
   const settlements = eventlog.openEventLog().prepare('SELECT source_user_seq, outcome_kind FROM logical_call_settlements WHERE session_id = ? AND mutating = 1').all(fixture.session.id) as any[];
   assert.deepEqual(settlements.map(row => [row.source_user_seq, row.outcome_kind]), [[fixture.source.seq, 'succeeded']]);
+});
+
+test('two production task approvals in one session resume independently after reopen', async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', 'two-paused-sources', false, 'args_json', 2, {
+    operationId: 'TWO_SOURCE_APPROVAL_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS, ARGS], deferredAcrossSources: true,
+  });
+  assert.ok(fixture);
+  const loop = await import('./loop.js');
+  const { HarnessSession } = await import('./session.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const pause = async (source: typeof fixture.source) => {
+    await fixture.useProductionAgent(source);
+    // Independently owned host work may park alongside another task (e.g. a
+    // background workflow parent). Ordinary fresh-chat ingress still branches
+    // or holds on an existing approval; do not bypass that policy in runTurn.
+    const result = await fixture.run(undefined, {}, source);
+    if (!result.hasInterruptions || !result.serializedState) throw new Error(`Expected pause: ${JSON.stringify(result.terminal)}`);
+    HarnessSession.load(fixture.session.id)!.saveInterruptState(result.serializedState);
+    // The source store is authoritative even if an old reader cleared only
+    // the compatibility projection before restart/card recovery.
+    eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_remove(metadata_json,
+      '$.__interrupt_state', '$.__interrupt_mcp_scope') WHERE id = ?`).run(fixture.session.id);
+    assert.ok(HarnessSession.load(fixture.session.id)!.loadInterruptState());
+    const recovered = loop.recoverParkedApprovalSurfaces();
+    assert.equal(recovered.failed, 0);
+  };
+  await pause(fixture.source);
+  const first = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  const secondSource = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 2, role: 'user',
+    type: 'user_input_received', data: { text: fixture.prompt } });
+  await pause(secondSource);
+  const second = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })
+    .find(row => row.approvalId !== first.approvalId)!;
+  assert.ok(second, 'each task has its own addressable card, despite identical business arguments');
+  assert.equal(fixture.counts().providerCalls, 0);
+  eventlog.closeEventLog();
+  const resume = (approvalId: string) => loop.runConversationFromResume({ sessionId: fixture.session.id,
+    approvalId, decision: 'approve', resolver: 'two-task-fixture', turnEngine: 'host_v1',
+    makeRunner: () => fixture.runner as never, maxTurns: 3,
+    judgeFn: async () => ({ done: true, reason: 'fixture operation completed' }),
+    buildAgent: identity => buildOrchestratorAgentForApprovalResume({ sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+      hostFreshPlanning: identity.hostFreshPlanning, model: fixture.model as never, allowToolJit: true }),
+  });
+  const firstResult = await resume(first.approvalId);
+  if (firstResult.status !== 'completed') throw new Error(`First resume failed: ${JSON.stringify(firstResult)}`);
+  assert.equal(fixture.counts().providerCalls, 1);
+  assert.equal(approvals.get(second.approvalId)?.status, 'pending');
+  assert.ok(HarnessSession.load(fixture.session.id)!.loadInterruptState(secondSource.seq));
+  eventlog.closeEventLog();
+  const secondResult = await resume(second.approvalId);
+  if (secondResult.status !== 'completed') throw new Error(`Second resume failed: ${JSON.stringify(secondResult)}`);
+  assert.equal(fixture.counts().providerCalls, 2);
+  const settlements = eventlog.openEventLog().prepare(`SELECT source_user_seq FROM logical_call_settlements
+    WHERE session_id = ? AND mutating = 1 AND outcome_kind = 'succeeded' ORDER BY source_user_seq`)
+    .all(fixture.session.id) as Array<{ source_user_seq: number }>;
+  assert.deepEqual(settlements.map(row => row.source_user_seq), [fixture.source.seq, secondSource.seq]);
+  const modelsBeforeReplay = fixture.counts().modelCalls;
+  await resume(first.approvalId);
+  await resume(second.approvalId);
+  assert.equal(fixture.counts().modelCalls, modelsBeforeReplay, 'repeat decisions need no model work');
+  assert.equal(fixture.counts().providerCalls, 2, 'repeat decisions do not duplicate either task write');
+  assert.equal(HarnessSession.load(fixture.session.id)!.loadInterruptState(), null);
 });
 
 for (const carrierName of ['call_tool', 'work_call'] as const) test(`one exact ${carrierName} reversible write crosses in its model step without plan_task`, async () => {

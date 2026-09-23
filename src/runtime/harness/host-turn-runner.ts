@@ -70,6 +70,7 @@ import { toSmartString } from '@openai/agents-core/utils';
 import { isToolMediaContent, toolMediaText } from './tool-media-content.js';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { BoundaryError } from '../boundary-error.js';
+import { workflowParentActivation } from './workflow-parent-activation.js';
 import { classifyModelError } from './resilient-model.js';
 import { compactAdvertisedJsonSchema, materializeStrictNullableFields } from '../schema-normalizer.js';
 import { getBuildInfo } from '../build-info.js';
@@ -758,7 +759,7 @@ import {
   projectHostNoProgressAuthority,
 } from './host-no-progress-projection.js';
 import { inspectConversationProtocol } from './conversation-protocol.js';
-const HOST_STATE_VERSION = 6;
+const HOST_STATE_VERSION = 7;
 const HOST_STATE_KEY = '__clemHostInterrupt';
 const HOST_RECOVERY_STATE_VERSION = 1;
 const HOST_RECOVERY_STATE_KEY = '__clemHostRecovery';
@@ -1953,6 +1954,8 @@ export class HostInterruptState {
     /** The completion-judge budget belongs to the accepted source, not a re-entry. */
     public readonly objectiveJudgeContinuations: number = 0,
     public readonly completionReviewFeedback?: HostCompletionReviewFeedback,
+    /** V7 preserves old unkeyed native cards while keying newly created pauses. */
+    public readonly nativeApprovalKeys: boolean = true,
   ) {
     // At construction a pending call's bytes ARE the bytes the pause admitted:
     // the pause loop builds rawItem from its admitted arguments, and a pre-V6
@@ -1976,11 +1979,12 @@ export class HostInterruptState {
       acceptedModelBatchRef?: unknown;
       objectiveJudgeContinuations?: unknown;
       completionReviewFeedback?: unknown;
+      nativeApprovalKeys?: unknown;
     };
     const version = parsed[HOST_STATE_KEY];
     if (
       version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5
-      && version !== HOST_STATE_VERSION
+      && version !== 6 && version !== HOST_STATE_VERSION
     ) {
       throw new Error('paused state is not a host-owned interrupt state');
     }
@@ -2039,12 +2043,16 @@ export class HostInterruptState {
         : undefined,
       parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
       parseHostCompletionReviewFeedback(parsed.completionReviewFeedback),
+      version < 7 ? false : typeof parsed.nativeApprovalKeys === 'boolean'
+        ? parsed.nativeApprovalKeys
+        : (() => { throw new Error('paused host state has no native approval identity mode'); })(),
     );
   }
 
   toString(): string {
     return JSON.stringify({
       [HOST_STATE_KEY]: HOST_STATE_VERSION,
+      nativeApprovalKeys: this.nativeApprovalKeys,
       history: this.history,
       pending: this.pending,
       turnEngine: this.turnEngine,
@@ -2060,6 +2068,17 @@ export class HostInterruptState {
     });
   }
 
+  approvalResumeKey(call: PendingHostCall): string | undefined {
+    if (call.consentSubject) return hostInteractiveConsentApprovalResumeKey(call.consentSubject) ?? undefined;
+    if (!this.nativeApprovalKeys || !this.acceptedModelBatchRef) return undefined; // legacy pauses retain their existing compatibility path
+    return `host-approval:v1:${createHash('sha256').update(JSON.stringify({
+      batch: this.acceptedModelBatchRef,
+      callId: call.callId,
+      tool: call.name,
+      arguments: call.admittedArgumentsJson ?? call.rawItem.arguments,
+    })).digest('hex')}`;
+  }
+
   getInterruptions(): Array<{
     rawItem: PendingHostCall['rawItem'];
     toolName: string;
@@ -2072,12 +2091,7 @@ export class HostInterruptState {
         rawItem: call.rawItem,
         toolName: call.name,
         ...(call.consentCall ? { consentCall: call.consentCall } : {}),
-        ...(call.consentSubject
-          ? {
-              approvalResumeKey: hostInteractiveConsentApprovalResumeKey(call.consentSubject)
-                ?? undefined,
-            }
-          : {}),
+        ...(this.approvalResumeKey(call) ? { approvalResumeKey: this.approvalResumeKey(call) } : {}),
       }));
   }
 
@@ -5812,6 +5826,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     committedVerificationHolds?: readonly CommittedMutationVerificationHold[];
   }> => {
     const executionContext = harnessRunContextStorage.getStore();
+    if (executionContext) workflowParentActivation(executionContext.sessionId, executionContext.sourceUserSeq);
     if (executionContext?.hostOwnsToolAccounting) {
       // One charge for every model-emitted execution intent, independent of
       // whether the selected carrier is a wrapped built-in, native MCP, CLI,
@@ -8294,6 +8309,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let remainingModelStallRetries = modelStreamStallRetries();
   let committedVerificationRecoveryChecked = false;
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
+    const activationContext = harnessRunContextStorage.getStore();
+    if (activationContext) workflowParentActivation(activationContext.sessionId, activationContext.sourceUserSeq);
     currentHostStepIndex = stepIndex;
     const recoveryFrameThisStep = recoveredToolFrame;
     const consumingRecoveredFrame = recoveryFrameThisStep !== undefined;
@@ -9006,8 +9023,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // reopens every exact prepared receipt and source/target binding.
         const prepared = listEvents(identity.sessionId, { types: ['async_work_dispatch_prepared'] })
           .some((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
-        if (prepared) {
+        if (prepared && !workflowParentActivation(identity.sessionId, identity.sourceUserSeq)) {
           const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+          const { checkpointWorkflowParent } = await import('../../execution/workflow-parent-checkpoint.js');
+          const { workflowOriginSourceGroupId } = await import('../../execution/workflow-origin-group.js');
+          const { boundAgentMcpToolScope } = await import('../mcp-tool-authority.js');
+          const { boundAgentRebuildContext } = await import('../../agents/agent-rebuild-context.js');
+          const envelope = boundAgentCapabilityEnvelope(agent as object);
+          if (!envelope) throw new Error('workflow transfer lost its admitted parent capability envelope');
+          const mcp = boundAgentMcpToolScope(agent as object);
+          const bindingRevision = boundAgentCapabilityRevision(agent as object);
+          const rebuildContext = boundAgentRebuildContext(agent as object);
+          // Persist before closing/releasing the child group: even a child that
+          // finishes immediately cannot outrun its parent's immutable context.
+          // Merely recording this checkpoint grants no execution authority.
+          checkpointWorkflowParent({
+            sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+            sourceGroupId: workflowOriginSourceGroupId(identity),
+            // The completed frame is only a queue acknowledgment. It is not
+            // an accepted call-bearing batch checkpoint. Recovery must resume
+            // the exact balanced history already committed by the last tool
+            // frame or the next batch's pre-history digest will be rejected.
+            history: [...history], envelope,
+            ...(bindingRevision ? { bindingRevision } : {}),
+            ...(rebuildContext ? { rebuildContext } : {}),
+            ...(lastResponseId ? { lastResponseId } : {}),
+            ...(modelId ? { modelId } : {}),
+            ...(mcp.bound ? { mcpToolScope: mcp.scope } : {}),
+          });
           const dispatched = finalizePreparedWorkflowDispatchForSource(identity.sessionId, identity.sourceUserSeq);
           if (dispatched) {
             history.push(...admission.frame.history);

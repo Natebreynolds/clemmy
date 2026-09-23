@@ -298,3 +298,20 @@ test('unmatched history without durable evidence is held and never guessed', () 
   assert.equal(prepared.providerHistory, null);
   assert.equal(rawMetadataJson(fixture.session.id), before);
 });
+
+test('a stored source approval holds provider replay even without its legacy projection', () => {
+  eventlog.resetEventLog();
+  const fixture = acceptedSession('Keep this task parked.');
+  fixture.session.saveInterruptState(JSON.stringify({ __clemHostInterrupt: 6,
+    acceptedModelBatchRef: { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, batchId: 'fixture', batchOrdinal: 1 },
+    pending: [{ callId: 'source-pause', name: 'send_message',
+      rawItem: { callId: 'source-pause', name: 'send_message', arguments: '{}' } }],
+  }));
+  eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_remove(metadata_json,
+    '$.__interrupt_state', '$.__interrupt_mcp_scope') WHERE id = ?`).run(fixture.session.id);
+  const before = rawMetadataJson(fixture.session.id);
+  const prepared = fixture.session.prepareProviderHistory();
+  assert.equal(prepared.status, 'held');
+  assert.equal(prepared.disposition, 'pending_approval');
+  assert.equal(rawMetadataJson(fixture.session.id), before);
+});

@@ -248,6 +248,74 @@ test('saveInterruptState round-trips across reopen (approval resume)', () => {
   assert.equal(resumed.length, 1);
 });
 
+test('approval pause and clear preserve metadata written by a newer session instance', () => {
+  resetEventLog();
+  const stale = HarnessSession.create({ kind: 'chat' });
+  const current = HarnessSession.load(stale.id)!;
+  current.recordTurnResult({ history: [{ role: 'user', content: 'newer conversation' }], lastResponseId: 'new-response', turn: 2 });
+  const before = getSession(stale.id)!.metadata.__conversation;
+  stale.saveInterruptState('older-task-pause');
+  assert.deepEqual(getSession(stale.id)!.metadata.__conversation, before,
+    'saving an approval may change only approval fields');
+  const paused = HarnessSession.load(stale.id)!;
+  updateSession(stale.id, { metadata: { ...getSession(stale.id)!.metadata, newerMarker: 'keep me' } });
+  paused.clearInterruptState();
+  assert.equal(getSession(stale.id)!.metadata.newerMarker, 'keep me');
+  assert.deepEqual(getSession(stale.id)!.metadata.__conversation, before);
+});
+
+test('a stale approval clearer or saver cannot erase a replacement interruption', () => {
+  resetEventLog();
+  const first = HarnessSession.create({ kind: 'chat' });
+  first.saveInterruptState('first-pause');
+  const stale = HarnessSession.load(first.id)!;
+  const current = HarnessSession.load(first.id)!;
+  current.saveInterruptState('replacement-pause', { mcpToolScope: { reason: 'replacement only', allowedServerSlugs: [] } });
+  stale.clearInterruptState();
+  assert.equal(HarnessSession.load(first.id)!.loadInterruptState(), 'replacement-pause');
+  assert.equal(listEvents(first.id, { types: ['run_resumed'] }).length, 0);
+  assert.throws(() => first.saveInterruptState('late-pause'), /interrupt.*changed/i);
+  closeEventLog();
+  assert.equal(HarnessSession.load(first.id)!.loadInterruptState(), 'replacement-pause');
+  assert.equal(HarnessSession.load(first.id)!.loadInterruptMcpToolScope()?.reason, 'replacement only');
+});
+
+test('in-flight bookkeeping preserves newer metadata and cannot clear a replacement run marker', () => {
+  resetEventLog();
+  const old = HarnessSession.create({ kind: 'chat' });
+  updateSession(old.id, { metadata: { ...getSession(old.id)!.metadata, newerMarker: 'keep' } });
+  old.setRunInFlight('2026-09-23T01:00:00.000Z');
+  assert.equal(getSession(old.id)!.metadata.newerMarker, 'keep');
+  const newer = HarnessSession.load(old.id)!;
+  newer.setRunInFlight('2026-09-23T01:01:00.000Z');
+  old.clearRunInFlight();
+  assert.equal(HarnessSession.load(old.id)!.runInFlightSince(), '2026-09-23T01:01:00.000Z');
+  updateSession(old.id, { metadata: { ...getSession(old.id)!.metadata, lastMarker: 'also keep' } });
+  newer.clearRunInFlight();
+  assert.equal(HarnessSession.load(old.id)!.runInFlightSince(), null);
+  assert.equal(getSession(old.id)!.metadata.lastMarker, 'also keep');
+});
+
+test('workflow parent bookkeeping does not touch the foreground run marker', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat' });
+  session.setRunInFlight('2026-09-23T02:00:00.000Z');
+  const { withWorkflowParentActivation } = await import('./workflow-parent-activation.js');
+  let owned = true;
+  const activation = { sessionId: session.id, sourceUserSeq: 1, attemptId: 'parent-attempt', runId: 'parent-run',
+    conversation: { items: [], updatedAt: new Date().toISOString() },
+    assertOwned: () => { if (!owned) throw new Error('lost lease'); } };
+  withWorkflowParentActivation(activation, () => {
+    session.setRunInFlight('2026-09-23T03:00:00.000Z');
+    session.clearRunInFlight();
+    assert.equal(HarnessSession.load(session.id)!.runInFlightSince(), '2026-09-23T02:00:00.000Z');
+    owned = false;
+    assert.throws(() => session.saveInterruptState('late pause'), /lost lease/);
+    assert.throws(() => session.clearInterruptState(), /lost lease/);
+  });
+  assert.equal(HarnessSession.load(session.id)!.loadInterruptState(), null);
+});
+
 test('clearInterruptState is a no-op when nothing was saved', () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -314,4 +382,37 @@ test('two turns: second recordTurnResult overwrites the conversation snapshot', 
 
   const turnEnds = listEvents(sess.id, { types: ['turn_ended'] });
   assert.equal(turnEnds.length, 2, 'audit log records both boundaries');
+});
+
+test('source approval pauses migrate the old slot and clear only the selected task after reopen', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  sess.recordUserInput('first controlled request', 1);
+  const firstSource = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!.seq;
+  sess.recordUserInput('second controlled request', 2);
+  const secondSource = listEvents(sess.id, { types: ['user_input_received'] }).at(-1)!.seq;
+  const blob = (sourceUserSeq: number, marker = '') => JSON.stringify({ __clemHostInterrupt: 6,
+    pending: [], acceptedModelBatchRef: { sessionId: sess.id, sourceUserSeq, batchOrdinal: 1, batchId: marker || 'fixture' } });
+  const firstScope = { reason: 'first task only', allowedServerSlugs: ['first'] };
+  updateSession(sess.id, { metadata: { ...getSession(sess.id)!.metadata,
+    __interrupt_state: blob(firstSource), __interrupt_mcp_scope: firstScope, independentMarker: 'keep' } });
+  const second = HarnessSession.load(sess.id)!;
+  second.saveInterruptState(blob(secondSource), { mcpToolScope: { reason: 'second task only', allowedServerSlugs: ['second'] } });
+  closeEventLog();
+  const first = HarnessSession.load(sess.id)!;
+  assert.equal(first.loadInterruptState(firstSource), blob(firstSource));
+  assert.deepEqual(first.loadInterruptMcpToolScope(), firstScope);
+  const staleFirst = HarnessSession.load(sess.id)!;
+  staleFirst.loadInterruptState(firstSource);
+  first.saveInterruptState(blob(firstSource, 'replacement'), { mcpToolScope: firstScope });
+  staleFirst.clearInterruptState();
+  assert.equal(HarnessSession.load(sess.id)!.loadInterruptState(firstSource), blob(firstSource, 'replacement'));
+  assert.throws(() => staleFirst.saveInterruptState(blob(firstSource, 'late')), /changed/);
+  first.clearInterruptState();
+  const remaining = HarnessSession.load(sess.id)!;
+  assert.equal(remaining.loadInterruptState(), blob(secondSource), 'legacy presence projection follows the remaining task');
+  assert.equal(remaining.loadInterruptState(firstSource), null);
+  assert.equal(remaining.loadInterruptState(secondSource), blob(secondSource));
+  assert.equal(remaining.loadInterruptMcpToolScope()?.reason, 'second task only');
+  assert.equal(getSession(sess.id)!.metadata.independentMarker, 'keep');
 });

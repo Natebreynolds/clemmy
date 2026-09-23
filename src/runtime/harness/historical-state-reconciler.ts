@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { SOURCE_APPROVAL_CHECKPOINTS_KEY, hostApprovalCheckpointSource, sourceApprovalSnapshotFromMetadata } from './source-approval-checkpoints.js';
 import { openEventLog } from './eventlog.js';
 import {
   HISTORICAL_TERMINAL_COMPLETE_CLOSE_REASON,
@@ -503,6 +505,28 @@ function sessionPendingDatabaseOwnerReason(
       ) return 'pending_task_preparation';
     }
   }
+  // A newer terminal says nothing about an older independently parked task.
+  // Validate and prove every stored source before removing any session projection.
+  const checkpoints = metadata[SOURCE_APPROVAL_CHECKPOINTS_KEY];
+  if (checkpoints != null) {
+    if (typeof checkpoints !== 'object' || Array.isArray(checkpoints)) return 'source_approval_unreadable';
+    for (const key of Object.keys(checkpoints)) {
+      const sourceUserSeq = Number(key);
+      try {
+        const snapshot = sourceApprovalSnapshotFromMetadata(metadata, sourceUserSeq);
+        if (!snapshot.checkpoint) continue;
+        if (hostApprovalCheckpointSource(snapshot.checkpoint.serialized, sessionId) !== sourceUserSeq) {
+          return 'source_approval_unreadable';
+        }
+      } catch { return 'source_approval_unreadable'; }
+      const source = db.prepare(`SELECT id, turn FROM events
+        WHERE session_id = ? AND seq = ? AND role = 'user' AND type = 'user_input_received'`)
+        .get(sessionId, sourceUserSeq) as { id: string; turn: number } | undefined;
+      if (!source || !exactTerminalAndChildrenCompleteForSource(db, sessionId, sourceUserSeq, source.id, source.turn)) {
+        return 'source_approval_terminal_not_proven';
+      }
+    }
+  }
   const latestSource = db.prepare(`
     SELECT id, seq, turn
       FROM events
@@ -544,6 +568,8 @@ export function reconcileHistoricalInterruptPage(
        AND (
          json_type(metadata_json, '$.__interrupt_state') IS NOT NULL
          OR json_type(metadata_json, '$.__interrupt_mcp_scope') IS NOT NULL
+         OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.__source_approval_checkpoints') checkpoint
+           WHERE CASE WHEN json_valid(checkpoint.value) THEN json_type(checkpoint.value, '$.checkpoint') ELSE NULL END = 'object')
        )
        ${cursorClause}
      ORDER BY updated_at, id
@@ -585,6 +611,8 @@ export function reconcileHistoricalInterruptPage(
            AND (
              json_type(metadata_json, '$.__interrupt_state') IS NOT NULL
              OR json_type(metadata_json, '$.__interrupt_mcp_scope') IS NOT NULL
+         OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.__source_approval_checkpoints') checkpoint
+           WHERE CASE WHEN json_valid(checkpoint.value) THEN json_type(checkpoint.value, '$.checkpoint') ELSE NULL END = 'object')
            )
       `).get(row.id, row.metadata_json) as { metadata_json: string } | undefined;
       if (!current) return { status: 'cas_lost' };
@@ -597,17 +625,16 @@ export function reconcileHistoricalInterruptPage(
       if (heldReason) {
         return { status: 'held', code: heldReason };
       }
-      const updated = db.prepare(`
-        UPDATE sessions
-           SET metadata_json = json_remove(
-                 metadata_json,
-                 '$.__interrupt_state',
-                 '$.__interrupt_mcp_scope'
-               ),
-               updated_at = ?
-         WHERE id = ? AND status IN ('completed','failed','cancelled')
-           AND metadata_json = ?
-      `).run(new Date(nowMs).toISOString(), row.id, current.metadata_json);
+      const metadata = JSON.parse(current.metadata_json) as Record<string, unknown>;
+      delete metadata.__interrupt_state;
+      delete metadata.__interrupt_mcp_scope;
+      const checkpoints = metadata[SOURCE_APPROVAL_CHECKPOINTS_KEY] as Record<string, { revision: string; checkpoint: unknown }> | undefined;
+      if (checkpoints) for (const [key, checkpoint] of Object.entries(checkpoints)) {
+        if (checkpoint.checkpoint !== null) checkpoints[key] = { revision: randomUUID(), checkpoint: null };
+      }
+      const updated = db.prepare(`UPDATE sessions SET metadata_json = ?, updated_at = ?
+        WHERE id = ? AND status IN ('completed','failed','cancelled') AND metadata_json = ?`)
+        .run(JSON.stringify(metadata), new Date(nowMs).toISOString(), row.id, current.metadata_json);
       return { status: updated.changes === 1 ? 'cleared' : 'cas_lost' };
     }).immediate();
     if (applied.status === 'cleared') result.cleared += 1;

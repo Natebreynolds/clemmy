@@ -1,4 +1,5 @@
 import { redactSensitiveText } from '../security.js';
+import { workflowParentActivation } from './workflow-parent-activation.js';
 /**
  * The single durable foreground-delivery boundary.
  *
@@ -1010,6 +1011,18 @@ export function commitTurnOutcome(
   outcome: TurnOutcome,
   options: DeliveryCommitOptions = {},
 ): DeliveryCommitResult {
+  const parent = workflowParentActivation(outcome.identity.sessionId, outcome.identity.sourceUserSeq);
+  if (parent) {
+    if ((outcome.identity.attemptId && outcome.identity.attemptId !== parent.attemptId)
+      || (outcome.identity.runId && outcome.identity.runId !== parent.runId)) {
+      throw new InvalidTurnOutcomeError('Workflow parent terminal names a different executor.');
+    }
+    // Ordinary chat reductions may omit executor fields. Retain the durable
+    // original parent identity so its workflow group can acknowledge this
+    // terminal without mistaking it for the earlier child-only report.
+    outcome = { ...outcome, identity: { ...outcome.identity,
+      attemptId: parent.attemptId, runId: parent.runId } };
+  }
   const requested = presentationEventForOutcome(outcome);
   assertExactAcceptedSource(requested.identity);
   let effectiveOutcome = outcome;
