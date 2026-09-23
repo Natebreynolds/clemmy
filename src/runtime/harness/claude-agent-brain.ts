@@ -2410,7 +2410,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         allowedNames: new Set(advertisedUniverse),
       });
       // A dock chat IS editing a Workspace. Keep only its common read/targeted-
-      // edit kernel first-class alongside the global native-authoring floor;
+      // edit kernel first-class alongside the acquisition primitives;
       // specialized runner/publish/revert schemas remain
       // same-turn reachable through tool_search → call_tool. Pinning the entire
       // feature group here defeated schema-on-demand specifically in Workspace

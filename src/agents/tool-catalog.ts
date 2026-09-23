@@ -14,8 +14,8 @@
  * orchestrator or the runtime tool registry.
  */
 import { getRuntimeEnv } from '../config.js';
-import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
+import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
@@ -97,16 +97,9 @@ function namesNamespace(tokens: string[], namespace?: string): boolean {
  * results — first-class on every lane, every turn, never behind a search.
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
-  // Native product operations are instruments Clem owns. Keep their schemas
-  // stable instead of guessing an operation from request words. Explicit Plan
-  // and reviewed Execute still apply their existing surface restrictions.
-  ...NATIVE_PRODUCT_AUTHORING_TOOLS,
-  'space_list',
-  'space_get',
-  'workflow_list',
-  'workflow_get',
-  'workflow_run',
-  'workflow_run_status',
+  // Native product tools remain catalog-visible and same-turn discoverable. Its
+  // large schemas join the hot set through exact selection, recall or session
+  // use; unrelated reads do not pay for all authoring definitions.
   // Local inspection is an acquisition primitive too. A names-only catalog
   // made list_files(directory) repeatedly arrive as list_files(path), costing
   // a refused call and another model step. Expose the actual small schemas.
@@ -183,7 +176,8 @@ export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {
   const next = new Set<string>();
   for (const name of hot) {
-    if (TOOL_SEARCH_ALWAYS_LOADED.has(name) && !PROVEN_SKIP_KEEP_LOADED.has(name)) continue;
+    if ((TOOL_SEARCH_ALWAYS_LOADED.has(name) || NATIVE_PRODUCT_AUTHORING_TOOLS.has(name))
+      && !PROVEN_SKIP_KEEP_LOADED.has(name)) continue;
     next.add(name);
   }
   return next;
