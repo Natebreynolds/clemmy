@@ -17,7 +17,7 @@
  *    presets remain the floor. Discovery only ever ADDS options.
  */
 import { getRuntimeEnv, getOpenAiApiKey } from '../../config.js';
-import { getStoredClaudeTokens } from '../claude-oauth.js';
+import { getStoredClaudeTokens, loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 
 export interface DiscoveredModel { id: string; label: string }
@@ -167,7 +167,10 @@ export function claudeSdkModelDiscoveryOptions(): Record<string, unknown> {
 
 async function discoverAnthropicViaSdk(): Promise<DiscoveredModel[]> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const q = query({ prompt: 'ok', options: claudeSdkModelDiscoveryOptions() as never });
+  const accessToken = await loadFreshClaudeAccessToken();
+  const q = query({ prompt: 'ok', options: { ...claudeSdkModelDiscoveryOptions(),
+    env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: accessToken },
+  } as never });
   try {
     const models = await (q as unknown as { supportedModels: () => Promise<Array<{ value?: string; resolvedModel?: string; displayName?: string }>> }).supportedModels();
     const out: DiscoveredModel[] = [];

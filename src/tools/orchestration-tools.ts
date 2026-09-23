@@ -898,23 +898,17 @@ function listWorkflowFiles(): WorkflowEntry[] {
 export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_list',
-    'List all workflows with description, steps, and trigger metadata.',
-    {},
-    async () => {
+    'List saved workflows as structured records with an exact total. Use detail="names" when only names/count are needed; summary includes descriptions, steps and trigger metadata. Does not execute workflows.',
+    { detail: z.enum(['names', 'summary']).optional().describe('names returns only names and total; summary (default) includes workflow metadata.') },
+    async ({ detail }) => {
       const workflows = listWorkflowFiles();
-      if (workflows.length === 0) return textResult('No workflows found.');
-      return textResult(
-        workflows
-          .map(({ data }) => {
-            // Plain-English one-liner (name — when · N steps · pauses for approval),
-            // then the description so the user can pick the right one at a glance.
-            const summary = describeWorkflowOneLine(data);
-            const enabled = data.enabled ? '' : ' [disabled]';
-            const desc = data.description ? `\n  ${data.description}` : '';
-            return `**${summary}**${enabled}${desc}`;
-          })
-          .join('\n\n'),
-      );
+      const records = workflows.map(({ data }) => detail === 'names'
+        ? { name: data.name }
+        : { name: data.name, enabled: data.enabled, description: data.description ?? '',
+          summary: describeWorkflowOneLine(data), stepCount: data.steps.length, trigger: data.trigger });
+      // Keep the result queryable: prose forced models to recall and extract
+      // an already-known collection merely to count it or select its names.
+      return textResult(JSON.stringify({ total: records.length, workflows: records }), { maxChars: 40_000 });
     },
   );
 

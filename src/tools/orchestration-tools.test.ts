@@ -2436,3 +2436,18 @@ test('renderWorkflowRunsOverview shows a turn-held run as active, in English', (
   assert.match(out, /starting when this turn ends/i, 'and reads as English');
   assert.doesNotMatch(out, /awaiting_chat_dispatch_seal/, 'never a bare enum');
 });
+
+test('workflow list supplies exact count and queryable names without prose extraction', async () => {
+  resetState();
+  writeAuditWorkflow();
+  const handler = handlers.get('workflow_list')!;
+  const names = JSON.parse((await handler({ detail: 'names' })).content[0].text);
+  assert.deepEqual(names, { total: 1, workflows: [{ name: 'proposal-audit-brief' }] });
+  const summary = JSON.parse((await handler({})).content[0].text);
+  assert.equal(summary.total, 1);
+  assert.equal(summary.workflows[0].stepCount, 1);
+  assert.equal(summary.workflows[0].description, 'Generate an audit brief from a URL.');
+  assert.deepEqual(summary.workflows[0].trigger, { manual: true });
+  resetState();
+  assert.deepEqual(JSON.parse((await handler({})).content[0].text), { total: 0, workflows: [] });
+});

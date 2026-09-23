@@ -577,3 +577,19 @@ test('all_in: claude judge binding validates as claude while the wire classifier
     );
   });
 });
+
+test('a successful provider catalog replaces stale presets and saved model guesses', async () => {
+  const { __testChoices } = await import('./model-role-options.js');
+  _setDiscoveredModelsForTest({
+    anthropic: [{ id: 'claude-opus-55', label: 'Provider supplied Claude label' }],
+    openai: [{ id: 'gpt-66-sol', label: 'Provider supplied Codex label' }],
+  });
+  try {
+    withEnv({ OPENAI_API_KEY: 'test-only', ANTHROPIC_API_KEY: 'test-only' }, () => {
+      assert.deepEqual(__testChoices().claude, [{ id: 'claude-opus-55', label: 'Provider supplied Claude label' }]);
+      assert.deepEqual(__testChoices().codex, [{ id: 'gpt-66-sol', label: 'Provider supplied Codex label' }]);
+    });
+  } finally {
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
+});
