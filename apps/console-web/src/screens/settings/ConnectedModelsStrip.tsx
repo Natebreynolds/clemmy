@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Plus, Trash2, KeyRound, AlertTriangle, SlidersHorizontal } from 'lucide-react';
+import { Check, Plus, Trash2, KeyRound, AlertTriangle, SlidersHorizontal, ExternalLink } from 'lucide-react';
 import type { ModelProvider } from '@/lib/settings';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Select } from '@/components/ui/Field';
@@ -8,6 +8,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getSettings, addModelProvider, removeModelProvider, listProviderModels, type DiscoveredModel } from '@/lib/settings';
 import { PROVIDER_PRESETS } from '@/lib/model-provider-presets';
+import { keyUrlHost } from '@/lib/connect';
 
 /**
  * The connected API-key models, as a flat strip — add GLM/Z.ai, DeepSeek,
@@ -179,7 +180,9 @@ export function ConnectedModelsStrip() {
     finally { setBusy(false); }
   };
 
-  const currentHint = PROVIDER_PRESETS.find((p) => p.id === presetId)?.modelHint ?? '';
+  const currentPreset = PROVIDER_PRESETS.find((p) => p.id === presetId);
+  const currentHint = currentPreset?.modelHint ?? '';
+  const currentKeyUrl = currentPreset?.keyUrl;
 
   return (
     <div>
@@ -266,8 +269,16 @@ export function ConnectedModelsStrip() {
             <Field label="Base URL">{(id) => (
               <Input id={id} value={baseURL} placeholder="https://api.z.ai/api/paas/v4" onChange={(e) => setBaseURL(e.target.value)} />
             )}</Field>
-            <Field label="API key" hint="Stored locally on this machine.">{(id) => (
-              <Input id={id} type="password" value={apiKey} placeholder="paste your API key" onChange={(e) => setApiKey(e.target.value)} />
+            <Field label="API key">{(id) => (
+              <>
+                <Input id={id} type="password" value={apiKey} placeholder="paste your API key" onChange={(e) => setApiKey(e.target.value)} />
+                <p className="mt-1 text-caption text-muted">
+                  Stored locally on this machine.
+                  {currentKeyUrl && <>{' '}<a href={currentKeyUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
+                    Get a key at {keyUrlHost(currentKeyUrl)} <ExternalLink className="h-3 w-3" aria-hidden />
+                  </a></>}
+                </p>
+              </>
             )}</Field>
             <Field label="Models" hint={currentHint || 'Comma-separated model ids this provider serves.'}>{(id) => (
               <div className="flex gap-2">

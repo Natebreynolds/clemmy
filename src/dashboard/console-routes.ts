@@ -9908,8 +9908,8 @@ export function registerConsoleRoutes(
       const store = await getSecretStore();
       const live = req.query.live === '1' || req.query.live === 'true';
       const rows = await store.health({ passive: !live });
-      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; required: boolean; envVarName: string }>>(
-        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
+      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; keyUrl?: string; required: boolean; envVarName: string }>>(
+        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, keyUrl: d.keyUrl, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
       );
       // Surface the Discord allow-list alongside the token so the hub can

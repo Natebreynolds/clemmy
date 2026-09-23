@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, ExternalLink } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
 import { PROVIDER_LABEL, useModelRoles } from '@/lib/model-roles';
@@ -8,7 +8,7 @@ import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { CodexLoginForm } from './CodexLoginForm';
 import { XaiLoginForm } from './XaiLoginForm';
 import { ConnectedModelsStrip } from './ConnectedModelsStrip';
-import { JevConnectForm } from './JevConnectForm';
+import { JevConnectForm, JEV_KEY_URL } from './JevConnectForm';
 import { UsageMetersPanel } from '@/components/ModelStatusChips';
 
 /** Settings › Models: who thinks, who does the legwork, who checks. */
@@ -48,18 +48,34 @@ export function ConnectedSection() {
         <UsageMetersPanel />
       </div>
       <div className="flex flex-wrap gap-2">
-        {chips.map((c) => (
-          <span key={c.key} className={cn('inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1.5 pl-2.5 pr-3 text-small', !c.on && 'text-faint')}>
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color ?? PROVIDER_DOT[(c.provider as keyof typeof PROVIDER_DOT)] ?? PROVIDER_DOT.unknown, opacity: c.on ? 1 : 0.4 }} aria-hidden />
-            <span className="font-semibold text-fg">{c.label}</span>
-            <span className="text-caption">{c.detail}</span>
-          </span>
-        ))}
+        {chips.map((c) => {
+          const body = (
+            <>
+              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color ?? PROVIDER_DOT[(c.provider as keyof typeof PROVIDER_DOT)] ?? PROVIDER_DOT.unknown, opacity: c.on ? 1 : 0.4 }} aria-hidden />
+              <span className="font-semibold text-fg">{c.label}</span>
+              <span className="text-caption">{c.detail}</span>
+            </>
+          );
+          const chip = cn('inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1.5 pl-2.5 pr-3 text-small', !c.on && 'text-faint');
+          // Something not connected is one click from where it gets connected.
+          return c.on
+            ? <span key={c.key} className={chip}>{body}</span>
+            : <button key={c.key} type="button" onClick={() => setOpen(true)} className={cn(chip, 'hover:border-primary')} aria-label={`Connect ${c.label}`}>{body}</button>;
+        })}
         <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open} className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-border px-3 py-1.5 text-small text-muted hover:text-fg">
           <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', open && 'rotate-90')} aria-hidden />
           {open ? 'Hide sign-ins and keys' : 'Sign in, add a key, or manage'}
         </button>
       </div>
+      {!jev?.configured && (
+        <p className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-small text-muted">
+          <span><span className="font-semibold text-fg">New: Jev</span> makes Clem’s quick yes/no checks near-instant.</span>
+          <a href={JEV_KEY_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
+            Get a key at console.typesafe.ai <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+          </a>
+          {!open && <button type="button" onClick={() => setOpen(true)} className="text-primary hover:underline">Add it</button>}
+        </p>
+      )}
       {open && (
         <div className="mt-4 space-y-4">
           <div className="grid gap-3 sm:grid-cols-3">

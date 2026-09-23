@@ -128,7 +128,11 @@ export function searchToolkits(snap: ComposioSnapshot | undefined, q: string, li
 // `status` ('connected'|'env_only'|'missing'|'unreadable') + `hasValue`; the
 // `required`/`description` metadata lives in the separate `descriptors` map.
 export interface CredentialRow { name?: string; status?: string; hasValue?: boolean; source?: string; [k: string]: unknown }
-export interface CredentialDescriptor { required?: boolean; description?: string; setupHint?: string; label?: string; [k: string]: unknown }
+export interface CredentialDescriptor { required?: boolean; description?: string; setupHint?: string; keyUrl?: string; label?: string; [k: string]: unknown }
+/** "console.typesafe.ai" — the visible text of a get-a-key link. */
+export function keyUrlHost(url: string): string {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; }
+}
 export interface McpServer {
   slug?: string;
   name?: string;
