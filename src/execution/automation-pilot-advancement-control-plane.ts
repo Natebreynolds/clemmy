@@ -126,7 +126,8 @@ export interface AutomationPilotAcquisitionSnapshotV1 {
   schemaFingerprint: string;
   inputSchema: Record<string, unknown>;
   /** Exact read-only definition metadata. Absence is meaningful and causes
-   * automatic output-path authoring to refuse instead of sampling a live call. */
+   * conditional text interpretation to require explicit review and execution validation;
+   * no business read is sampled during authoring. */
   outputShape?: {
     source: 'carrier_declared' | 'host_reviewed';
     schemaFingerprint: string;

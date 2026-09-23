@@ -1513,3 +1513,46 @@ current prompt also still assumes only declared record-item fields and needs
 to expose the supported host provenance/text schema; behavior must remain
 validated by code. Then build clean HEAD, hotpatch with the Terminal recipe,
 and continue the unchanged real proposal through installed acceptance.
+
+
+## Conditional automatic authoring for undeclared text output
+
+Absent outputSchema now produces an explicitly named
+`conditional_text_interpretation` receipt instead of claiming a provider schema
+or blocking all authoring. It authorizes no read. A candidate must include the
+validated explicit text interpretation, use a single terminal result, and map
+only the generated string field or verified host provenance. Ordinary invented
+provider paths still fail. Declared metadata that is malformed or fingerprint-
+drifted does not fall back to conditional interpretation. A structured declared
+schema cannot be overridden by text parsing. Execution validates actual bytes
+using the previously pinned parser and source/selection receipt path.
+
+Authoring context now explains supported host field sources and conditional
+text semantics; the compact interpretation metadata appears only for text
+receipts. Parsing, bounds, identity, digest and evidence validation remain in
+code. No provider/model-name routing exception or business sample is added.
+
+Checks:15 focused output-shape/authoring/production-convergence checks passed
+(`/tmp/clem-text-authoring-final.log`, session71954 exit0). The absent-schema
+fixture submitted a candidate after exactly one constrained injected author
+call, reached the separate pilot approval, and performed zero business reads.
+The existing declared-output production convergence fixture also passed.
+These are recording/injected fixtures, not real model/provider acceptance.
+Final typecheck passed (`/tmp/clem-text-authoring-typecheck-final.log`,
+session81615 exit0). Initial new tests had wrong submitted-state and timestamp
+fixture assumptions; corrected fixtures, no runtime weakening. A negative run
+with the previous committed authoring module returned blocked instead of
+submitted (`/tmp/clem-text-authoring-red.log`, child exit1). Module restored
+byte-for-byte in finally before any subsequent edit/build. Diff check passed.
+
+Read-only installation preflight: live SHA d2aad1c41, fingerprint
+ff589a5c2b12685fbc0e5f0e158fa8415530fafa64b8a06128a4714cccdebccf, daemon10852.
+Command center active0/runningRuns0/backgroundActive0, waiting6, approvals0,
+runningWorkflows2. Main remains e77215d00 with owner's existing edits untouched.
+Recheck physical dispatches, live activity and agent build/patch processes
+immediately before quitting; this observation alone is not restart clearance.
+
+Next: build clean committed candidate, Terminal hotpatch, exact build-info
+verification, then continue original approved proposal without rewriting it.
+No tag readiness claim: full suite, broader release gates, native notification
+shell routing and physical mobile remain open.
