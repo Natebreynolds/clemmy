@@ -32,7 +32,9 @@ import { listProposals as listCheckInProposals } from '../agents/check-in-propos
 import { listTrustProposals } from '../agents/trust-graduation.js';
 import { listInboxQuestions } from '../execution/inbox-questions.js';
 import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
+import { listPendingRuns, type PendingRun } from '../execution/workflow-events.js';
 import { loadNotifications, type NotificationRecord } from '../runtime/notifications.js';
+import { readWorkflow } from '../memory/workflow-store.js';
 import { classifyNotification, type LiveReferents } from '../runtime/notification-intent.js';
 
 /** A run in one of these is stopped until a person acts. */
@@ -130,6 +132,43 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): R
   const index = { workflowOfRun, latestStatus };
   if (runsDir === WORKFLOW_RUNS_DIR) runIndexCache = { at: nowMs, dirMtimeMs, index };
   return index;
+}
+
+// ─── Runs paused after repeated restarts ─────────────────────────────────────
+
+export interface BootParkedWorkflow {
+  key: string;
+  workflowName: string;
+  runIds: string[];
+  /** When the oldest paused run began (or was last marked), ISO. */
+  oldest: string;
+  restarts: number;
+}
+
+/**
+ * Runs the boot-resume cap parked are a DECISION, not running work: Clem
+ * stopped re-running them after repeated restarts and waits for a person to
+ * resume or skip them. One item per WORKFLOW — ten paused occurrences of one
+ * workflow are one decision. Home's rows and the count both read this.
+ */
+export function bootParkedWorkflows(pendingRuns: readonly PendingRun[] = listPendingRuns()): BootParkedWorkflow[] {
+  const byWorkflow = new Map<string, BootParkedWorkflow>();
+  for (const run of pendingRuns) {
+    if (run.runStatus !== 'parked') continue;
+    try {
+      const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
+      if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) continue;
+      const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
+      const restarts = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : 0;
+      const group = byWorkflow.get(run.workflowName)
+        ?? { key: workflowKey(run.workflowName), workflowName: run.workflowName, runIds: [], oldest: since, restarts: 0 };
+      group.runIds.push(run.runId);
+      if (since && (!group.oldest || since < group.oldest)) group.oldest = since;
+      group.restarts = Math.max(group.restarts, restarts);
+      byWorkflow.set(run.workflowName, group);
+    } catch { /* an unreadable record is not a decision */ }
+  }
+  return [...byWorkflow.values()];
 }
 
 // ─── What is live right now ──────────────────────────────────────────────────
@@ -288,7 +327,7 @@ export interface NeedsYouSummary {
 
 export interface NeedsYouUnlistedItem {
   key: string;
-  kind: 'workflow_binding' | 'check_in_proposal';
+  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
   title: string;
   detail: string;
   /** The workflow's display name, when the item is about one. */
@@ -296,7 +335,7 @@ export interface NeedsYouUnlistedItem {
 }
 
 export async function summarizeNeedsYou(
-  input: { runtimeApprovalIds?: readonly string[]; nowMs?: number } = {},
+  input: { runtimeApprovalIds?: readonly string[]; nowMs?: number; pendingRuns?: readonly PendingRun[] } = {},
 ): Promise<NeedsYouSummary> {
   const nowMs = input.nowMs ?? Date.now();
   const ref = needsYouReferents(nowMs);
@@ -334,6 +373,13 @@ export async function summarizeNeedsYou(
       bindingStops.set(key, { workflow: stop.workflow });
     }
   } catch { /* no binding stops */ }
+  const paused = new Map<string, BootParkedWorkflow>();
+  try {
+    for (const group of bootParkedWorkflows(input.pendingRuns)) {
+      workflowKeys.add(group.key);
+      paused.set(group.key, group);
+    }
+  } catch { /* no workflow event logs */ }
 
   let unreadUpdates = 0;
   const notificationKeys = new Set<string>();
@@ -364,6 +410,21 @@ export async function summarizeNeedsYou(
       title: `${stop.workflow} can't run on its schedule`,
       detail: 'Pick the account or source it should use.',
       workflow: stop.workflow,
+    });
+  }
+  for (const [key, group] of paused) {
+    if (noticedWorkflows.has(key) || bindingStops.has(key)) continue;
+    const n = group.runIds.length;
+    let name = group.workflowName;
+    try { name = readWorkflow(group.workflowName)?.data?.name ?? name; } catch { /* keep the slug */ }
+    unlisted.push({
+      key,
+      kind: 'workflow_paused',
+      title: n === 1
+        ? `Paused after repeated restarts: ${name}`
+        : `${n} paused runs of ${name} after repeated restarts`,
+      detail: 'Resume or skip them.',
+      workflow: group.workflowName,
     });
   }
   for (const key of workflowKeys) add(key);

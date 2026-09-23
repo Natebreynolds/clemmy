@@ -24,10 +24,10 @@ const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const NOW = Date.now();
 const iso = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
 
-function writeRun(id: string, workflow: string, status: string, createdAt: string): void {
+function writeRun(id: string, workflow: string, status: string, createdAt: string, extra: Record<string, unknown> = {}): void {
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({
-    id, workflow, workflowSlug: workflow, status, createdAt,
+    id, workflow, workflowSlug: workflow, status, createdAt, ...extra,
   }));
 }
 
@@ -101,6 +101,27 @@ test('a notification carrying a pending approval is that approval, counted once'
   assert.equal(withReport.keys.includes(`session:${session.id}`), false);
   assert.equal(withReport.keys.filter((key) => key === `approval:${approval.approvalId}`).length, 1);
   approvalRegistry.resolve(approval.approvalId, 'rejected', 'test');
+});
+
+test('runs paused after repeated restarts are one decision per workflow, even after a newer run', async () => {
+  // Two paused occurrences, then a newer run that finished: the paused ones
+  // still wait for "resume or skip", and there is no notice to list them.
+  writeRun('run-p1', 'weekly-digest', 'parked', iso(-5 * 86_400_000), { bootResumeParkedAt: iso(-5 * 86_400_000), bootResumeCount: 3 });
+  writeRun('run-p2', 'weekly-digest', 'parked', iso(-4 * 86_400_000), { bootResumeParkedAt: iso(-4 * 86_400_000), bootResumeCount: 3 });
+  writeRun('run-p3', 'weekly-digest', 'completed', iso(-3_600_000));
+  // Parked on an approval is not a restart pause.
+  writeRun('run-q1', 'invoice-chase', 'parked', iso(-3_600_000), { bootResumeParkedAt: iso(-3_600_000), parked: { reason: 'approval' } });
+  const pendingRuns = [
+    { workflowName: 'weekly-digest', runId: 'run-p1', runStatus: 'parked' },
+    { workflowName: 'weekly-digest', runId: 'run-p2', runStatus: 'parked' },
+    { workflowName: 'invoice-chase', runId: 'run-q1', runStatus: 'parked' },
+  ];
+  const summary = await summarizeNeedsYou({ nowMs: NOW, pendingRuns });
+  assert.equal(summary.keys.filter((key) => key === 'flow:weekly-digest').length, 1);
+  assert.equal(summary.keys.includes('flow:invoice-chase'), false);
+  const row = summary.unlisted.find((item) => item.key === 'flow:weekly-digest');
+  assert.equal(row?.kind, 'workflow_paused');
+  assert.match(row?.title ?? '', /^2 paused runs of weekly-digest/);
 });
 
 test('the total is exactly the distinct keys, and every key is either listed or unlisted', async () => {

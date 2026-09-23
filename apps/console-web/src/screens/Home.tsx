@@ -203,8 +203,13 @@ function LiveHome() {
   // actually answered — see silentImmediatePanes.
   const immediateSettled = !cc.isLoading && !cc.isError
     && !workingNow.isLoading && !(workingNow.isError && !workingNow.data);
+  // The one needs-you number (the sidebar's, the phone's); the list below it
+  // may show fewer rows than it counts, never a different number.
+  const needsYouTotal = typeof cc.data?.counts?.waiting === 'number'
+    ? Math.max(cc.data.counts.waiting, needsYou.length)
+    : needsYou.length;
   const silent = new Set(silentImmediatePanes({
-    needsYou: needsYou.length,
+    needsYou: needsYouTotal,
     running: workingView.running,
     updates: away.updates,
     attention: away.attention,
@@ -254,7 +259,7 @@ function LiveHome() {
     : !immediateSettled && !servingCached
     ? null
     : presenceLine({
-        needsYou: needsYou.length,
+        needsYou: needsYouTotal,
         running: workingView.running,
         updates: away.updates,
         attention: away.attention,

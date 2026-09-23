@@ -587,10 +587,10 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
 
           {unlisted.map((item) => (
             <article key={item.key} class="inbox-card inbox-attention-card">
-              <CardMeta label={item.kind === 'workflow_binding' ? 'Flow · stopped' : 'Needs you'} urgent />
+              <CardMeta label={item.kind === 'workflow_binding' ? 'Flow · stopped' : item.kind === 'workflow_paused' ? 'Flow · paused' : 'Needs you'} urgent />
               <h2>{item.title}</h2>
               <p class="inbox-card-body">{item.detail}</p>
-              {item.kind === 'workflow_binding' ? (
+              {item.workflow ? (
                 <div class="inbox-card-actions">
                   <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Flows</button>
                 </div>

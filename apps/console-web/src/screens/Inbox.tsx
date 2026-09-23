@@ -639,7 +639,7 @@ export function Inbox() {
                   <Link key={item.key}
                     to={item.workflow ? `/automate?workflow=${encodeURIComponent(item.workflow)}` : '/home'}
                     className="flex w-full items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-3 text-left transition-colors hover:bg-hover">
-                    <StatusPill tone="warning">{item.kind === 'workflow_binding' ? 'Stopped' : 'Needs you'}</StatusPill>
+                    <StatusPill tone="warning">{item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you'}</StatusPill>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-body text-fg">{item.title}</span>
                       <span className="block truncate text-small text-muted">{item.detail}</span>

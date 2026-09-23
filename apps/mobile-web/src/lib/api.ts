@@ -487,7 +487,7 @@ export interface InboxSummary {
 
 export interface InboxUnlistedItem {
   key: string;
-  kind: 'workflow_binding' | 'check_in_proposal';
+  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
   title: string;
   detail: string;
   workflow?: string;

@@ -131,7 +131,7 @@ import {
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
-import { needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
+import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -13901,48 +13901,26 @@ export function registerConsoleRoutes(
           panel: 'approvals',
           urgency: 'high',
         })),
-        // Runs the boot-resume cap parked are a DECISION, not running work:
-        // Clementine stopped re-running them after repeated restarts and is
-        // waiting for a person to resume or skip. Live 2026-09-22: eleven of
-        // them, up to eleven days old, showed under Running as "Waiting for
-        // approval" while this list said one thing needed you. One queue.
-        // One item per WORKFLOW: ten paused standup-email occurrences are one
-        // decision ("resume or skip these"), not ten cards saying the same thing.
-        ...(() => {
-          const byWorkflow = new Map<string, { workflowName: string; runIds: string[]; oldest: string; restarts: number }>();
-          for (const run of pendingWorkflowRuns) {
-            if (run.runStatus !== 'parked') continue;
-            try {
-              const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
-              if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) continue;
-              const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
-              const restarts = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : 0;
-              const group = byWorkflow.get(run.workflowName) ?? { workflowName: run.workflowName, runIds: [], oldest: since, restarts: 0 };
-              group.runIds.push(run.runId);
-              if (since && (!group.oldest || since < group.oldest)) group.oldest = since;
-              group.restarts = Math.max(group.restarts, restarts);
-              byWorkflow.set(run.workflowName, group);
-            } catch { /* an unreadable record is not a decision */ }
-          }
-          return [...byWorkflow.values()].map((group) => {
-            const workflow = readWorkflow(group.workflowName);
-            const title = workflow?.data?.name ?? group.workflowName;
-            const n = group.runIds.length;
-            return {
-              kind: 'workflow-paused',
-              title: n === 1
-                ? `Paused after repeated restarts: ${title}`
-                : `${n} paused runs of ${title} after repeated restarts`,
-              meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
-              panel: 'workflows',
-              urgency: 'low',
-              actionKind: 'workflow-run',
-              workflowName: group.workflowName,
-              runId: group.runIds[0],
-              count: n,
-            };
-          });
-        })(),
+        // Runs paused after repeated restarts: one decision per workflow
+        // (dashboard/needs-you.ts `bootParkedWorkflows`, which the count reads).
+        ...bootParkedWorkflows(pendingWorkflowRuns).map((group) => {
+          const workflow = readWorkflow(group.workflowName);
+          const title = workflow?.data?.name ?? group.workflowName;
+          const n = group.runIds.length;
+          return {
+            kind: 'workflow-paused',
+            title: n === 1
+              ? `Paused after repeated restarts: ${title}`
+              : `${n} paused runs of ${title} after repeated restarts`,
+            meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
+            panel: 'workflows',
+            urgency: 'low',
+            actionKind: 'workflow-run',
+            workflowName: group.workflowName,
+            runId: group.runIds[0],
+            count: n,
+          };
+        }),
       ].map((item) => ({
         ...item,
         title: trimConsoleTitle(stripConsoleIds(item.title), 140),
@@ -14285,7 +14263,7 @@ export function registerConsoleRoutes(
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
       // Every badge shows this number: the same summary the phone's pill reads.
-      const waitingCount = (await summarizeNeedsYou({ runtimeApprovalIds: approvals.map((approval) => approval.id) })).total;
+      const waitingCount = (await summarizeNeedsYou({ runtimeApprovalIds: approvals.map((approval) => approval.id), pendingRuns: pendingWorkflowRuns })).total;
       const snoozes = activeHomeSnoozes();
       const isSnoozed = (item: unknown): boolean => {
         const key = (item as { snoozeKey?: unknown }).snoozeKey;
