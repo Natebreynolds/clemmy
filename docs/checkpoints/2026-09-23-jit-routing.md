@@ -105,3 +105,44 @@ Installed baseline discovery session sess-desktop-a76180a8c3973f6e1f3fb83c was
 submitted once on b30faf84f. Await exact terminal and source accounting before
 patching; then repeat its identical prompt on the new candidate. This checkpoint
 is written before that acceptance and does not claim it passed.
+
+## Runtime structural schema identity — discovery foundation
+
+A scoped run_worker search could return its name with no schema even though
+Clem had a callable foreground worker object. Static core-tool discovery does
+not own that object: it is constructed in the orchestrator with parent-bound
+execution and continuation closures. The schema lookup had no current runtime
+metadata source. This prevents reliable JIT acquisition if the worker schema
+is later removed from the initial frame.
+
+The orchestrator now resolves its registry-declared worker discovery entry to
+that exact runtime object. Scoped tool_search accepts a host-owned metadata
+view, populated after structural tool construction and read at invocation.
+Generic dispatch shares the same turn-owned objects. Metadata still does not
+add allowed names, planning refs, grants, or execution rights. No structural
+schema is hidden by this change; initial schema savings are still unproven.
+
+Pins: the scoped builder returns current/rebuilt metadata and does not disclose
+an excluded name. A recording-model turn through the real host runner and
+production orchestrator retrieves the actual worker packet schema without
+starting a worker. The latter failed with no schema until discovery's name
+resolver included the actual worker object. Direct invocation of the wrapped
+search without a host turn was rejected correctly (missing source/graph); the
+final regression uses the host runner instead of bypassing that boundary.
+Do not replace this with an unwrapped helper test.
+
+Trap for the next JIT step: enabled-surface membership owns carried-control
+resolution; source approval/restart can rebuild the agent. Any lazy activation
+must survive the exact-source rebuild and reactivate the same runtime control,
+not substitute the SDK worker handler or treat discovered metadata as authority.
+The existing full worker packet remains visible pending that implementation.
+
+Logs: /tmp/clem-jit-runtime-schema-{red,targeted,builder4,builder5,final,types3}.log.
+This note is written before the full affected-suite completion/build. Installed
+app remains671c620a9; runtime schema changes are not live acceptance yet.
+
+Affected-suite completion:91/91passed, including real host worker-dispatch
+recording-model variants, scoped/local discovery and action-control contracts.
+Typecheck passed. Isolation sentinel was not performed while daemon82711 owned
+the live home. The candidate now proceeds to its required post-commit build;
+no live or token-efficiency acceptance is inferred from these unit results.

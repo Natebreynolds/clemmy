@@ -361,7 +361,7 @@ const DESCRIPTION = [
   'Read-only.',
 ].join(' ');
 
-interface ToolSearchMetadata {
+export interface ToolSearchMetadata {
   schema: unknown;
   description: string;
 }
@@ -968,6 +968,9 @@ export function registerToolSearchTool(
     dispatchCarrierForName?: (name: string) => ToolSearchDispatchCarrier;
     /** Scope-bound provider adapters searched behind this same visible door. */
     candidateSources?: readonly ToolSearchCandidateSource[];
+    /** Current host-built structural tool contracts. Presentation only: names
+     * still pass the same allowed catalog and inner execution authority. */
+    runtimeToolMetadata?: () => ReadonlyMap<string, ToolSearchMetadata>;
     /** Fresh-host planning only. The callback may return a capabilityRef only
      * after independently matching/materializing this metadata result against
      * the current host catalog. Candidate prose itself grants nothing. */
@@ -1070,7 +1073,10 @@ export function registerToolSearchTool(
       // capability and its schema. Natural-language discovery still ranks the
       // whole allowed catalog below.
       const requestedLimit = Math.min(limit ?? TOP_RESULTS, TOOL_SEARCH_WINDOW_RESULTS);
-      const metadataMap = await toolMetadataMap();
+      const metadataMap = new Map(await toolMetadataMap());
+      for (const [name, metadata] of opts.runtimeToolMetadata?.() ?? []) {
+        metadataMap.set(name, metadata);
+      }
       const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames }).map((entry) => {
         const metadata = metadataMap.get(entry.name);
         const properties = (metadata?.schema as { properties?: object } | undefined)?.properties;

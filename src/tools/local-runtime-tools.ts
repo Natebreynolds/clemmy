@@ -51,6 +51,7 @@ import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
 import {
   registerToolSearchTool,
   type ToolSearchCandidateSource,
+  type ToolSearchMetadata,
   type ToolSearchPlanningDisclosureOutcome,
   type ToolSearchPlanningDisclosureCandidate,
   type ToolSearchPlanningDisclosureControl,
@@ -645,6 +646,7 @@ export function buildScopedLocalToolSearch(
   ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
     | Readonly<Record<string, string>>
     | ToolSearchPlanningDisclosureOutcome,
+  runtimeToolMetadata?: () => ReadonlyMap<string, ToolSearchMetadata>,
 ): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
@@ -664,6 +666,7 @@ export function buildScopedLocalToolSearch(
     ...(dispatchCarrierForName ? { dispatchCarrierForName } : {}),
     ...(candidateSources ? { candidateSources } : {}),
     ...(discloseForPlanning ? { discloseForPlanning } : {}),
+    ...(runtimeToolMetadata ? { runtimeToolMetadata } : {}),
   });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');

@@ -107,6 +107,33 @@ test('registers as read-only tool_search with a query param', () => {
   assert.ok('role_key' in t.schema, 'schema exposes the opaque requirement role');
 });
 
+test('scoped discovery uses current runtime metadata without widening the allowed catalog', async () => {
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const metadata = new Map([
+    ['run_worker', { description: 'Exact foreground worker packet.', schema: {
+      type: 'object', properties: { item: { type: 'string', const: 'current-runtime' } },
+      required: ['item'], additionalProperties: false,
+    } }],
+    ['write_file', { description: 'Excluded tool', schema: { type: 'object', properties: {} } }],
+  ]);
+  const scoped = buildScopedLocalToolSearch(new Set(['run_worker']), 'call_tool', undefined,
+    undefined, undefined, () => metadata) as { invoke: (context: unknown, input: string) => Promise<unknown> };
+  const search = async (query: string) => JSON.parse(String(await scoped.invoke(
+    { context: {} }, JSON.stringify({ query, role_key: null, limit: 1, cursor: null, account_selection: null }),
+  )));
+  const first = await search('run_worker');
+  assert.equal(first.schemas.run_worker.properties.item.const, 'current-runtime');
+  metadata.set('run_worker', { description: 'Rebuilt foreground worker packet.', schema: {
+    type: 'object', properties: { item: { type: 'string', const: 'rebuilt-runtime' } },
+    required: ['item'], additionalProperties: false,
+  } });
+  const second = await search('run_worker');
+  assert.equal(second.schemas.run_worker.properties.item.const, 'rebuilt-runtime', 'read the turn-owned view at invocation, not module import');
+  const excluded = await search('write_file');
+  assert.equal(excluded.results.some((row: { name: string }) => row.name === 'write_file'), false);
+  assert.equal(excluded.schemas.write_file, undefined, 'metadata does not grant discovery authority');
+});
+
 test('echoes role_key without changing an exact-name result', async () => {
   const t = captureToolSearch(new Set(['workspace_roots']));
   const out = await runSearch(t.handler, 'workspace_roots', undefined, 'requirement-7');

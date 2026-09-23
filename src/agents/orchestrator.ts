@@ -3391,8 +3391,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const allCoreTools = factorySkip
     ? []
     : await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  const turnOwnedDiscoveryTools = new Map<string, Tool<RuntimeContextValue>>([
+    [runWorkerTool.name, runWorkerTool],
+  ]);
   const byName = (n: string) =>
-    allCoreTools.find((t) => (t as { name?: string }).name === n) as
+    (turnOwnedDiscoveryTools.get(n) ?? allCoreTools.find((t) => (t as { name?: string }).name === n)) as
       | Tool<RuntimeContextValue>
       | undefined;
   // Discovery + direct-execute surfaces:
@@ -3533,6 +3536,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // is injected via the SAME instructions-trailer mechanism as batchShapeMandate (a
   // per-turn re-render), not baked into a separate cacheable prefix.
   let firstClassDiscovery = jitDiscoveryTools;
+  // Structural controls are built later, with turn-owned execution closures.
+  // Discovery reads this view when invoked, after those exact objects exist.
+  // It changes metadata only, never the allowed names or dispatch authority.
+  const structuralDiscoveryMetadata = new Map<string, { schema: unknown; description: string }>();
+  const turnOwnedDispatchTools = new Map<string, Tool<RuntimeContextValue>>();
   let callTool: Tool<RuntimeContextValue> | null = null;
   let workCallOptions: BuildWorkCallOptions | null = null;
   // Assigned after the capability universe seals (the agent does not exist yet
@@ -3669,9 +3677,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                     : 'work_call',
                 actionToolSearchCandidateSources,
                 planningDisclosure,
+                () => structuralDiscoveryMetadata,
               )
             : buildScopedLocalToolSearch(discoverableNames, 'call_tool', undefined,
-                actionToolSearchCandidateSources, planningDisclosure);
+                actionToolSearchCandidateSources, planningDisclosure, () => structuralDiscoveryMetadata);
         });
       // Suppress the generic dispatcher ONLY on the local-memory-scoped turn
       // (memory tools are first-class there; a generic door invites off-scope
@@ -3686,9 +3695,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         ? (planMode ? ['publish_plan'] : [...(taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? ['plan_step_result'] : []), ...(reviewedReadOnlyExecution ? [] : ['plan_task'])])
         : [];
       const dispatcherOptions: BuildCallToolOptions = {
-        localToolOverrides: new Map(firstClassDiscovery
-          .filter((tool) => typeof (tool as { name?: unknown }).name === 'string')
-          .map((tool) => [(tool as { name: string }).name, tool])),
+        localToolOverrides: turnOwnedDispatchTools,
         // Structural controls belong in BOTH reachability sets, on BOTH turn
         // kinds. call-tool.ts refuses when the target is in neither
         // reachableBuiltinNames nor firstClassNames; widening only the latter,
@@ -3920,6 +3927,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             undefined,
             actionToolSearchCandidateSources,
             planningDisclosure,
+            () => structuralDiscoveryMetadata,
           )
         : toolRef);
     callTool = null;
@@ -4000,6 +4008,23 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const structuralToolNames = new Set(structuralTools
     .map((toolRef) => (toolRef as { name?: string }).name ?? '')
     .filter(Boolean));
+  for (const toolRef of structuralTools) {
+    const runtimeTool = toolRef as { name?: string; parameters?: unknown; description?: string };
+    if (runtimeTool.name && runtimeTool.parameters) {
+      structuralDiscoveryMetadata.set(runtimeTool.name, {
+        schema: runtimeTool.parameters,
+        description: runtimeTool.description ?? '',
+      });
+    }
+  }
+  // Dispatch and discovery share the same turn-owned control objects. A core
+  // registry implementation with the same public name is not interchangeable
+  // with the foreground worker's parent/continuation closure.
+  for (const toolRef of [...firstClassDiscovery, ...structuralTools]) {
+    if ('name' in toolRef && typeof toolRef.name === 'string') {
+      turnOwnedDispatchTools.set(toolRef.name, toolRef);
+    }
+  }
   const nonStructuralDiscovery = firstClassDiscovery.filter((toolRef) => {
     const name = (toolRef as { name?: string }).name ?? '';
     return !name || !structuralToolNames.has(name);
