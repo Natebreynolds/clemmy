@@ -920,3 +920,29 @@ test('connector authority uses complete catalog identities, not task nouns from 
   });
   assert.equal(compileMcpAccessConstraint('Do not use any connectors.', ['Research Lab']).mode, 'deny_all');
 });
+
+
+test('task category contrasts do not revoke connector access', () => {
+  const prompts = [
+    "Create a reviewable automation opportunity named Harness acceptance \u2014 project inventory 0923. The goal is to keep a small Clementine Space showing up to 10 projects available through my connected Supabase MCP, with project identity, name, status where available, source provenance and observation time. Read project metadata only; do not inspect database contents or change any external resource. Propose a daily refresh after a successful reviewed pilot. Use a new, clearly named acceptance Space and leave every existing Space and workflow alone. Prepare the opportunity and any genuine questions for review first; do not enable recurrence or run the pilot before its review. This is a controlled framework acceptance test, not a business integration repair. Discover the tool if needed and use the native durable opportunity/pilot lifecycle.",
+    'Use the connected Supabase MCP for project metadata. This is a controlled framework acceptance test, not a business integration repair.',
+    'Use the connected Research MCP. This is not an integration migration.',
+    'Read from the connected Research MCP. We are not a connector repair service.',
+  ];
+  for (const userInput of prompts) {
+    for (const configuredServerNames of [undefined, ['Supabase', 'Research']]) {
+      const constraint = compileMcpAccessConstraint(userInput, configuredServerNames);
+      assert.notEqual(constraint.mode, 'deny_all', userInput);
+      assert.deepEqual(constraint.deny, [], userInput);
+      assert.notEqual(mcpToolScopeAuthority(resolveMcpToolScope({ userInput, configuredServerNames })), 'none', userInput);
+    }
+  }
+  assert.deepEqual(compileMcpAccessConstraint('Use whatever is available but not the Research MCP.', ['Research']).deny, ['research']);
+  for (const userInput of [
+    'Do not use external integrations.',
+    'This is a local task, not a task that may access external integrations.',
+    'No external connectors.',
+    'This is a local task: do not use any external connector.',
+    'This is a local task, not a single call to external connectors.',
+  ]) assert.equal(compileMcpAccessConstraint(userInput, []).mode, 'deny_all', userInput);
+});

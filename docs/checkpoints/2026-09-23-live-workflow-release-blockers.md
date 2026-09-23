@@ -851,3 +851,51 @@ approvals=1, runningWorkflows=2. No restart or new live acceptance was performed
 Desktop notification route defect remains open in UI-owned source; fix must
 retain exact selected notification, honor /console mount, verify navigation
 before read acknowledgement, and pass a rebuilt-shell native click test.
+
+### Cold durable-pilot attempt exposed scope and authoring issues — September 23
+
+Installed runtime still 23a41e05e/fingerprint90620de42b4fd695e2a6a21bacfc4a12727474cd2a407f29bda4a24a6d63d9bf,
+daemon15094. Submitted exactly one cold request, source291446/session
+sess-desktop-40c2639991b8f38354a4dc44, for an inert reviewed project-inventory
+opportunity, metadata only, no pilot or recurrence before review. Actual brain
+route was claude-opus-5-5. Saved request/acceptance/cancellation/events in
+output/harness-acceptance/2026-09-23-durable-pilot/.
+
+Event291450 incorrectly compiled zero external authority. The precise trigger
+was the category description "This is a controlled framework acceptance test,
+not a business integration repair", not the earlier restriction on external
+writes. The access compiler attached the negative identity/category statement
+to the connector noun. Candidate now distinguishes copular indefinite category
+contrasts without an access predicate from negative access instructions. The
+exact live request and generic contrasts are pinned, with genuine refusals as
+negative controls. The initial pin failed before the fix
+(/tmp/clem-pilot-scope-red.log).
+
+A negative control also exposed an existing exception fallback losing a known
+named exclusion: "Use whatever is available but not the Research MCP" returned
+mode=none. Preserve the compiled deny set when an exception exists, before the
+unknown-exception fallback. Ordinary blanket refusals still deny all; no provider
+names or model decisions were added to the kernel.
+
+The run separately learned Supabase is disabled. I initially inspected names and
+health but omitted enabled from the inventory: configured is NOT connected or
+enabled. Rechecked flags: DataForSEO enabled; Supabase and browsermcp disabled.
+No integration setting was changed. Next real dataset fixture must use an enabled
+provider. Scope fix alone cannot make that disabled provider available.
+
+Before cancellation settled, automation_opportunity_propose returned
+invalid_opportunity: partition.outcomeAuthority expected object, received null
+(event291510). This separate authoring/schema mismatch is still owed; no valid
+opportunity or pilot success is claimed. Exact cancellation was acknowledged and
+conversation_completed is event291516. Do not resubmit the saved client ID as new
+work or mislabel this cancellation as successful execution.
+
+Eight explicit-plan-execute integration checks passed. Scope matrix expanded
+with the exact live wording; 64 checks passed after repairing the negative-control
+failure (/tmp/clem-pilot-scope-complete.log). Final source verification log:
+/tmp/clem-pilot-scope-verified.log; typecheck:
+/tmp/clem-pilot-scope-final-typecheck.log. Installed acceptance of this candidate,
+the durable pilot lifecycle, and desktop notification routing remain open.
+Final source verification completed: 64/64 scope checks pass and typecheck exit0.
+Typecheck remained CPU-active for roughly two minutes under machine load; no
+restart or duplicate typecheck was launched. No installed acceptance claimed.

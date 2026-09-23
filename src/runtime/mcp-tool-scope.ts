@@ -209,6 +209,15 @@ function accessNegativeBefore(positions: number[], index: number, text: string):
   const negative = nearestBefore(positions, index, text);
   if (negative < 0) return negative;
   const span = text.slice(negative, index);
+  // A copular category contrast describes the task/actor; it does not revoke
+  // connector access ("this is a framework test, not an integration repair").
+  // Keep negative access predicates authoritative, including inside a contrast.
+  const prefix = text.slice(clauseStart(text, negative), negative);
+  const accessPredicate = /\b(?:use|using|call|calling|access|accessing|query|querying|invoke|invoking|connect|connecting|read|reading|touch|touching|search|searching)\b/i;
+  if (/^not\s+(?:a|an)\s/i.test(span)
+    && /\b(?:is|are|was|were)\b/i.test(prefix)
+    && !accessPredicate.test(span)) return -1;
+
   // A retained execution report is evidence, not an access instruction.
   // "Never dispatched ... Provider attempts" must not ban that provider now.
   if (/^(?:never|not)\s+(?:(?:previously|already)\s+)?(?:dispatched|executed|called|used|queried|connected|received|returned)\b/i.test(span)) return -1;
@@ -324,6 +333,7 @@ export function compileMcpAccessConstraint(
     // they just permitted, so decline to compile and let the caller's ordinary
     // routing decide — a constraint we cannot read is not a constraint we get
     // to invent.
+    if (exceptions.length > 0 && deny.size > 0) return { mode: 'deny_set', allow: [], deny: [...deny].sort() };
     if (exceptions.length > 0) return { mode: 'none', allow: [], deny: [] };
     return { mode: 'deny_all', allow: [], deny: [] };
   }
