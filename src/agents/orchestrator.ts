@@ -2457,9 +2457,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // the per-item batch ledger and "FAILED items" header, the manifest gates,
   // and the digest footer that names tool_output_query for parked shards.
   const runWorkerToolDescription = [
-    'Delegate only when it pays (4+ independent items, or long-running work); a worker is a full extra model session per item — for two or three quick reads, read directly. Fan stateless Workers out over independent same-shape items with a structured parent-planned job packet: 2+ items go ALL in `items` in ONE call (a concurrency-bounded pool with a per-item ledger); `item` for one.',
-    'Workers see only the packet, never your context or prior outputs. Name every external MCP capability in the typed exact `externalMcpToolNames` array (`server__tool`); resolvedTools carries schemas/commands/instructions but does not widen that lease.',
-    'Workers only COMPOSE external mutations (one exact payload each; the parent proposes ONE batch). A result beginning "ERROR:" means that item FAILED — name it; never report the batch complete.',
+    'Delegate independent work with a structured parent-planned job packet. Each item costs a model session; prefer direct calls for quick reads. Batch all items in one `items` call; use `item` for one.',
+    'Workers receive only packet context and shared result handles. Use the typed exact `externalMcpToolNames` array; resolvedTools carries schemas/commands/instructions but does not widen that lease.',
+    'Workers COMPOSE external mutations for parent approval. An "ERROR:" item FAILED; never claim full completion.',
   ].join(' ');
   /**
    * THE one door for a run_worker refusal that starts no child.
