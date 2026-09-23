@@ -255,7 +255,7 @@ export function NeedsYouPane({
 
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
-      <SectionHeader id={headingId} label="Needs you" count={count} />
+      <SectionHeader id={headingId} label="Needs you" count={count} countTone="muted" />
       <PaneCard>
         {loading ? (
           <RowSkeleton rows={2} tall />

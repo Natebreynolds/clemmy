@@ -4,7 +4,7 @@ import { cn } from '@/lib/cn';
 import { awayMeta, awayOutcome, awayTarget, clockLabel, plainText, type HomeFeedItem } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
-const MAX_ROWS = 6;
+const MAX_ROWS = 5;
 
 /**
  * WHILE YOU WERE AWAY — durable updates, including informational notices.

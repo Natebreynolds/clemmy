@@ -24,6 +24,7 @@ import { ALL_NAV, PRIMARY_NAV, type NavDest } from '@/lib/nav';
 import {
   DEFAULT_HOME_PANE_ORDER,
   DEFAULT_HOME_PREFERENCES,
+  RETIRED_HOME_PANES,
   useHomePreferences,
   type HomeLanding,
   type HomePaneId,
@@ -52,7 +53,7 @@ const PANE_LABELS: Record<HomePaneId, string> = {
   running: 'Running',
   while_away: 'While you were away',
   made: 'Made',
-  projects: 'Spaces',
+  projects: 'More Spaces',
   workstate: 'Working together card',
 };
 
@@ -141,7 +142,7 @@ function normalizeNav(nav: Nav): Nav {
 function normalizePreferences(p: HomePreferences): HomePreferences {
   const seen = new Set<string>();
   const order = [...p.panes.order, ...ALL_PANE_IDS].filter((id) => {
-    if (seen.has(id)) return false;
+    if (seen.has(id) || RETIRED_HOME_PANES.has(id)) return false;
     seen.add(id);
     return true;
   });

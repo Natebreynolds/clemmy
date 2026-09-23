@@ -132,6 +132,18 @@ export function silentImmediatePanes(input: HomeQuietInput): HomePaneId[] {
   return silent;
 }
 
+/**
+ * Clem's work in one phrase for the Home's summary line, which links to the
+ * board. The board owns the cards and their states; Home only says whether
+ * anything is moving. What stopped on a person is already in Needs you, and
+ * a second count of stopped rows here disagreed with the board's own columns.
+ * The running count is the shared presenter's, so it never says "running"
+ * about a row nothing has happened to for hours.
+ */
+export function workLine(view: { running: number }): string {
+  return view.running > 0 ? `Clem’s work: ${view.running} running` : 'Clem’s work: nothing running';
+}
+
 export interface PresenceCounts {
   needsYou: number;
   running: number;

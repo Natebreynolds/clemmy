@@ -66,12 +66,19 @@ export interface HomePreferences {
  */
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'needs_you',
-  'running',
   'while_away',
   'made',
   'projects',
   'quick_actions',
 ];
+
+/**
+ * Panes Home no longer draws. `running` moved to the board (/tasks), which
+ * owns Clem's work in detail; Home keeps a one-line summary that links there.
+ * A saved record that still names one keeps every other choice exactly — the
+ * id is skipped on read, never rewritten on the server's copy.
+ */
+export const RETIRED_HOME_PANES: ReadonlySet<HomePaneId> = new Set(['running']);
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',
@@ -164,7 +171,7 @@ export function useSaveHomePreferences() {
 /** Pane ids in render order, honoring the user's order and hidden set. */
 export function visiblePanes(prefs: HomePreferences): HomePaneId[] {
   const hidden = new Set(prefs.panes.hidden);
-  const ordered = prefs.panes.order.filter((id) => !hidden.has(id));
+  const ordered = prefs.panes.order.filter((id) => !hidden.has(id) && !RETIRED_HOME_PANES.has(id));
   const rest = DEFAULT_HOME_PANE_ORDER.filter((id) => !hidden.has(id) && !ordered.includes(id));
   return [...ordered, ...rest];
 }

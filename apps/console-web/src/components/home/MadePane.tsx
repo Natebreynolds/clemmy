@@ -32,7 +32,6 @@ export function MadePane({ headingId }: { headingId: string }) {
       <SectionHeader
         id={headingId}
         label="Made"
-        count={groups.length}
         aside={
           <Link to="/made" className="rounded-sm font-semibold text-primary hover:underline">
             All made

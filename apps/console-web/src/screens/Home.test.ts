@@ -1,5 +1,6 @@
 /**
- * Home is the command center. It must not bounce into Chat.
+ * Home is the owner's page. It must not bounce into Chat, and it summarizes
+ * Clem's work in one line that leads to the board rather than drawing it.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +9,6 @@ import { readFileSync } from 'node:fs';
 const HOME = readFileSync(new URL('./Home.tsx', import.meta.url), 'utf8');
 const CHAT = readFileSync(new URL('./Chat.tsx', import.meta.url), 'utf8');
 const APP = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
-const RUNNING = readFileSync(new URL('../components/home/RunningPane.tsx', import.meta.url), 'utf8');
 
 test('Home mock screens cover the visual contract', () => {
   const MOCK = readFileSync(new URL('./HomeMock.tsx', import.meta.url), 'utf8');
@@ -28,10 +28,26 @@ test('Home renders the command center instead of redirecting to Chat', () => {
   assert.match(HOME, /export function Home\(/);
   assert.doesNotMatch(HOME, /Navigate to="\/chat"/);
   assert.match(HOME, /headingId="home-needs-you"/);
-  assert.match(HOME, /headingId="home-running"/);
   assert.match(HOME, /headingId="home-made"/);
   assert.match(HOME, /MadePane/);
-  assert.match(HOME, /max-w-\[1180px\]/);
+  assert.match(HOME, /max-w-\[1240px\]/);
+});
+
+test('Spaces are the main content; running work is one line that opens the board', () => {
+  assert.match(HOME, /aria-labelledby="home-spaces"/);
+  assert.match(HOME, /xl:col-start-1 xl:row-span-2 xl:row-start-1/, 'Spaces hold the main column beside the rail');
+  assert.doesNotMatch(HOME, /RunningPane/);
+  assert.doesNotMatch(HOME, /headingId="home-running"/);
+  assert.match(HOME, /<Link to="\/tasks"[^>]*>\{work\}<\/Link>/);
+  // No eyebrow labels over the sections.
+  assert.doesNotMatch(HOME, /uppercase tracking-widest/);
+});
+
+test('Build home is a tracked journey, not a chat hand-off', () => {
+  assert.match(HOME, /useHomeBuilds\(/);
+  assert.match(HOME, /<BuildCard/);
+  assert.match(HOME, /startBuild=\{builds\.start\}/);
+  assert.doesNotMatch(HOME, /onBuild=\{text => sendAndOpen/);
 });
 
 test('Chat empty state is a composer, not the briefing', () => {
@@ -42,13 +58,6 @@ test('Chat empty state is a composer, not the briefing', () => {
   assert.doesNotMatch(CHAT, /RunningTasksDrawer/);
   assert.doesNotMatch(CHAT, /border-t border-border/);
   assert.match(CHAT, /New conversation only/);
-});
-
-test('the lead running row on Home streams live work', () => {
-  assert.match(RUNNING, /function LiveRunFeed/);
-  assert.match(RUNNING, /useWorkflowRunActivity/);
-  assert.match(RUNNING, /useSessionActivity/);
-  assert.match(RUNNING, /leadLiveKey && <LiveRunFeed/);
 });
 
 test('the app lands on Home by default', () => {

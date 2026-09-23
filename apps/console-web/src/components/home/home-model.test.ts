@@ -103,7 +103,7 @@ test('the shipped default puts work first and the two "talk to Clem" blocks last
   // sheet displays, rather than by the renderer overruling that order.
   assert.deepEqual(
     homeBlocks(visiblePanes(DEFAULT_HOME_PREFERENCES)),
-    ['needs_you', 'running', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
 });
 
@@ -149,7 +149,7 @@ test('the daemon\'s chips-first default is re-expressed as the chips-last defaul
   assert.deepEqual(migrated.panes.order, DEFAULT_HOME_PANE_ORDER);
   assert.deepEqual(
     homeBlocks(visiblePanes(migrated)),
-    ['needs_you', 'running', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
   const withMade = migrateHomePreferences(prefs(['quick_actions', 'needs_you', 'running', 'while_away', 'made', 'projects']));
   assert.deepEqual(withMade.panes.order, DEFAULT_HOME_PANE_ORDER);
@@ -165,6 +165,17 @@ test('an order the user actually saved is never re-expressed', () => {
 
   const reordered = prefs(['running', 'needs_you', 'quick_actions', 'while_away', 'projects']);
   assert.deepEqual(migrateHomePreferences(reordered).panes.order, reordered.panes.order);
+});
+
+test('a saved order that still names the retired Running pane keeps every other choice', () => {
+  // Running moved to the board. The record on the daemon is not rewritten:
+  // the id is skipped on read and the owner's order and hidden set stand.
+  const saved: HomePreferences = {
+    ...DEFAULT_HOME_PREFERENCES,
+    panes: { order: ['projects', 'running', 'quick_actions', 'needs_you', 'while_away', 'made', 'workstate'], hidden: ['made'] },
+  };
+  assert.deepEqual(visiblePanes(saved), ['projects', 'quick_actions', 'needs_you', 'while_away', 'workstate']);
+  assert.equal(saved.panes.order.includes('running'), true, 'the stored order itself is untouched');
 });
 
 test('needs-you and running still share a row when they stay adjacent', () => {

@@ -254,11 +254,12 @@ test('board feed uses durable terminal events and fails closed without one', () 
 // "Nothing is running right now." — the owner's "I don't see the ability to
 // clear certain things", exactly. And the words on the row come from the ONE
 // presenter, so the pill and the rows under it cannot disagree.
-test('the Running pane keeps stalled rows and words them from the shared presenter', async () => {
+test('Home words Clem\'s work from the shared presenter, stalled runs included', async () => {
   const { readFileSync } = await import('node:fs');
-  const source = readFileSync(new URL('../components/home/RunningPane.tsx', import.meta.url), 'utf8');
-  assert.match(source, /membership === 'stalled'/, 'stalled rows must still reach the pane');
-  assert.match(source, /workingNowStatusLabel\(/, 'the row must render the shared status label');
-  assert.match(source, /steer && !presented\.stalled/,
-    'Steer may not be offered on a run that stopped days ago');
+  const home = readFileSync(new URL('../screens/Home.tsx', import.meta.url), 'utf8');
+  assert.match(home, /presentWorkingNow\(/, 'the summary counts come from the shared presenter');
+  assert.match(home, /workLine\(workingView\)/, 'the line that links to the board reads those counts');
+  const { workLine } = await import('../components/home/home-model.js');
+  assert.equal(workLine({ running: 0 }), 'Clem’s work: nothing running');
+  assert.equal(workLine({ running: 2 }), 'Clem’s work: 2 running');
 });
