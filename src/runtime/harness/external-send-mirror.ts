@@ -8,7 +8,8 @@
  * back out to a channel, which would loop) and keyed by the call, so it is
  * written at most once per send.
  */
-import { addNotification } from '../notifications.js';
+import { createHash } from 'node:crypto';
+import { addNotification, getNotification } from '../notifications.js';
 import { registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
 
 export interface ExternalSendMirrorInput {
@@ -73,8 +74,11 @@ function workflowStepOf(sessionId: string): { runId: string; stepId: string } | 
  * the call carried (the body of any send); the shorter strings are its
  * destination and subject lines. No provider or field names are assumed.
  */
-export function externalSendMirrorNotification(input: ExternalSendMirrorInput, now = new Date()): ExternalSendMirrorNotification | null {
+export function externalSendMirrorNotification(input: ExternalSendMirrorInput): ExternalSendMirrorNotification | null {
   if (!input.ok) return null;
+  // Provider call IDs are scoped to a session, not globally unique. Without
+  // both durable parts, a replay cannot be distinguished from a fresh send.
+  if (!input.sessionId.trim() || !input.callId?.trim()) return null;
   if (input.accounting.effect !== 'external_write' || input.accounting.reversibility !== 'irreversible') return null;
   const args = decodeArgs(input.rawArgs);
   if (!args) return null;
@@ -90,7 +94,9 @@ export function externalSendMirrorNotification(input: ExternalSendMirrorInput, n
     .map((row) => `${row.path}: ${row.text}`);
   const label = toolkitLabel(input.accounting.toolSlug, input.toolName);
   const step = workflowStepOf(input.sessionId);
-  const callKey = (input.callId ?? '').trim() || `${input.sessionId}:${now.getTime()}`;
+  const callKey = createHash('sha256')
+    .update(JSON.stringify([input.sessionId, input.callId]))
+    .digest('hex');
   return {
     id: `sent:${callKey}`,
     title: step ? `Sent via ${label} by a workflow step` : `Sent via ${label}`,
@@ -117,6 +123,12 @@ export function mirrorExternalSendToFirstPartySurfaces(input: ExternalSendMirror
   try {
     const notification = externalSendMirrorNotification(input);
     if (!notification) return false;
+    // Already displayed by a pre-upgrade build: preserve the existing row.
+    // A colliding legacy call ID from another session must not hide this send.
+    const legacy = getNotification(`sent:${input.callId}`);
+    if (legacy?.metadata?.source === 'external-send'
+      && legacy.metadata.sessionId === input.sessionId
+      && legacy.metadata.callId === input.callId) return true;
     addNotification({
       id: notification.id,
       kind: 'system',
