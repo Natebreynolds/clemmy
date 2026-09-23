@@ -72,3 +72,36 @@ machine credential cases remain unproven.
 Full suite/journeys remain pending; machine still has a busy Chrome renderer.
 No tag, push, or fresh hotpatch in this continuation. Original release scope,
 mobile approval/recovery, broader tool acceptance and package gates remain open.
+
+## Unified discovery now calls Jev for ambiguous candidates
+
+The pre-existing block in tool-search-tool.ts claimed to rerank through Jev but
+only concatenated exact and fuzzy rows. The new production caller ranks compact
+metadata from the unified native/MCP/Composio/reviewed-local discovery window
+before schema selection/materialization. It uses the existing shared adapter,
+remaining broker deadline (at most the existing1200ms relevance allowance), and
+original ordering on unavailability. Exact selections, requests already naming
+operations and retained pages do not pay for ranking. No candidate is removed.
+Existing acquired-read, explicit namespace, effect compatibility and lifecycle
+precedence still wins over semantic scores. Jev supplies no dispatch authority.
+This improves discovery after tool_search; initial brain schema selection and
+runtime structural-tool deferral are still owed. No token or latency win yet.
+
+Regression exercises the actual registered tool_search with compact candidates
+from multiple sources, verifies changed ranking plus schema disclosure, exact
+bypass, namespace precedence, page reuse without reranking and HTTP503 fallback.
+It failed against80cf9a212 because zero Jev requests were made. Focused broker,
+control-plane, catalog and surface tests:88/88; typecheck passed. Logs under
+/tmp/clem-jit-broker-{red,final,types2}.log. The runner cannot certify its live-home
+sentinel while the installed daemon is active; isolated tests are not live proof.
+
+Also restored explicit JSON-encoded-string guidance and the structured example
+on workflow_create.inputs, matching workflow_update. The unchanged existing
+schema-contract test failed on both pre-change80cf9a212 and last tag8c11aa3c0,
+with the same missing guidance; it now passes. This did not relax its assertion
+or alter workflow execution. Tag attribution: /tmp/clem-jit-schema-last-tag.log.
+
+Installed baseline discovery session sess-desktop-a76180a8c3973f6e1f3fb83c was
+submitted once on b30faf84f. Await exact terminal and source accounting before
+patching; then repeat its identical prompt on the new candidate. This checkpoint
+is written before that acceptance and does not claim it passed.

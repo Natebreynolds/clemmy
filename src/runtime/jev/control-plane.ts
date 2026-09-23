@@ -6,7 +6,7 @@
 import { evaluateSystemOne } from './client.js';
 import type { ChoiceAnswer, NoulAnswer, SystemOneQuestions } from './system-one.js';
 
-const RANK_TIMEOUT_MS = 1_200;
+export const RANK_TIMEOUT_MS = 1_200;
 const PRIMER_TIMEOUT_MS = 1_200;
 const GATE_TIMEOUT_MS = 1_500;
 const PRIMER_DROP_BELOW = 0.25;

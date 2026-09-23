@@ -30,6 +30,7 @@ import { operationNamedInQuery, sameOperationName } from './operation-name-ident
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
 import { capabilityEffectIsCompatible, rememberedCapabilityEffect, requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
+import { rerankNamedCandidatesWithJev, RANK_TIMEOUT_MS } from '../runtime/jev/control-plane.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidates,
@@ -1380,14 +1381,43 @@ export function registerToolSearchTool(
       }
       // Jev reranks fuzzy neighbors only. Exact-name and exact-id hits stay
       // first; a missing key or timeout leaves the lexical window unchanged.
-      if (!selectedExactly && rankedWindow.length > 1) {
+      if (!deferredPage && !selectedExactly && rankedWindow.length > 1) {
         const exactNames = new Set(rankedWindow
           .filter((row) => queryExplicitlyNamesTool(query, row.name)
             || (requestedOperationInQuery && sameOperationName(row.name, requestedOperationInQuery)))
           .map((row) => row.name));
         const leading = rankedWindow.filter((row) => exactNames.has(row.name));
         const fuzzy = rankedWindow.filter((row) => !exactNames.has(row.name));
-        rankedWindow = [...leading, ...fuzzy];
+        // Spend only the remaining broker allowance, never a second discovery
+        // deadline. The transport's minimum timeout is 250ms; below that keep
+        // the existing order. Exact selections and retained pages pay nothing.
+        if (leading.length === 0 && fuzzy.length > 1 && remainingBrokerMs() >= 250) {
+          const ranked = await rerankNamedCandidatesWithJev(query, fuzzy, {
+            label: (row) => 'oneLiner' in row ? row.oneLiner : row.summary,
+            sessionId: continuationSessionId,
+            timeoutMs: Math.min(RANK_TIMEOUT_MS, remainingBrokerMs()),
+          });
+          // Relevance cannot demote independently acquired reads or override
+          // the existing namespace, effect and replacement precedence. Jev
+          // orders candidates within those same host-defined evidence tiers.
+          const tier = (row: (typeof fuzzy)[number]): number[] => {
+            const facts = row as { acquiredLiveRead?: boolean; namespaceMatch?: boolean;
+              effectCompatible?: boolean; lifecycleSuccessor?: boolean };
+            return [Number(Boolean(facts.acquiredLiveRead)), Number(Boolean(facts.namespaceMatch)),
+              Number(Boolean(facts.effectCompatible)), Number(Boolean(facts.lifecycleSuccessor && facts.namespaceMatch))];
+          };
+          ranked.sort((left, right) => {
+            const a = tier(left), b = tier(right);
+            for (let index = 0; index < a.length; index++) {
+              const difference = b[index]! - a[index]!;
+              if (difference) return difference;
+            }
+            return 0;
+          });
+          rankedWindow = [...leading, ...ranked];
+        } else {
+          rankedWindow = [...leading, ...fuzzy];
+        }
       }
       // Only sources with an exact selected-candidate contract may defer a
       // durable page. Existing opaque live-read authority keeps its old path.
