@@ -605,3 +605,78 @@ test('a real Space read → write → read plan keeps both reads selected and ex
   assert.deepEqual(spaceStore.snapshot(slug), after, 'publication preserves the exact title/data/view generation');
   await new Promise<void>(resolve => setImmediate(resolve));
 });
+
+// Live source287511: enabling an authored workflow changed its revision and
+// erased the create step's completion; enable then failed its own data lineage
+// proof. This uses production discovery, planning, writes and dependency proof.
+test('a created workflow remains completed after its planned enable revision and database reopen', async () => {
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const name = 'native-planned-lifecycle';
+  const session = eventlog.createSession({ kind: 'chat' });
+  const objective = `Create manual-only workflow ${name}, enable it, verify, then disable and verify again. Do not run it.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const plan = { preamble: 'Create, enable, then verify the saved workflow.', draft: {
+    criteria: ['A manual-only workflow is created, enabled and read back without running.'], cardinality: null,
+    destination: { posture: 'create_new', family: 'workflow', handleRequired: true },
+    topology: { version: 1, operations: [
+      { id: 'create', effect: 'local_write', coverage: null, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'enable', effect: 'local_write', coverage: null, dependsOn: ['create'], dataFrom: ['create'], cardinality: { kind: 'once' } },
+      { id: 'verify', effect: 'read', coverage: 'single', dependsOn: ['enable'], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'disable', effect: 'local_write', coverage: null, dependsOn: ['create', 'verify'], dataFrom: ['create'], cardinality: { kind: 'once' } },
+      { id: 'verify_disabled', effect: 'read', coverage: 'single', dependsOn: ['disable'], dataFrom: [], cardinality: { kind: 'once' } },
+    ], universes: [] },
+    bindings: [
+      { operationId: 'create', role: 'create', capabilityRef: 'cap:local:workflow_create:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'enable', role: 'enable', capabilityRef: 'cap:local:workflow_set_enabled:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'verify', role: 'readback', capabilityRef: 'cap:local:workflow_get:read', evidence: ['tool_result'] },
+      { operationId: 'disable', role: 'disable', capabilityRef: 'cap:local:workflow_set_enabled:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'verify_disabled', role: 'readback', capabilityRef: 'cap:local:workflow_get:read', evidence: ['tool_result'] },
+    ], deliverables: [{ id: 'workflow', kind: 'workflow' }], evidenceRequirements: ['local_commit_receipt', 'tool_result'],
+  } };
+  const selected = (id: string, requirement_id: string, toolName: string, args: unknown) => toolCall(id, 'work_call', {
+    requirement_id, name: toolName, args_json: JSON.stringify(args),
+  });
+  const model = stubModel([
+    [toolCall('lifecycle-discover-create', 'tool_search', { query: 'workflow_create', limit: 5 })],
+    [toolCall('lifecycle-discover-enable', 'tool_search', { query: 'workflow_set_enabled', limit: 5 })],
+    [toolCall('lifecycle-discover-read', 'tool_search', { query: 'workflow_get', limit: 5 })],
+    [toolCall('lifecycle-plan', 'plan_task', plan)],
+    [selected('lifecycle-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false,
+      steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'literal', value: { product: 323 } } }), sideEffect: 'read' }] })],
+    [selected('lifecycle-enable', 'enable', 'workflow_set_enabled', { name, enabled: true })],
+    [selected('lifecycle-verify', 'verify', 'workflow_get', { name, section: 'metadata' })],
+    [selected('lifecycle-disable', 'disable', 'workflow_set_enabled', { name, enabled: false })],
+    [selected('lifecycle-verify-disabled', 'verify_disabled', 'workflow_get', { name, section: 'metadata' })],
+    [textMessage('The saved workflow is disabled.')],
+  ]);
+  const agent = await buildOrchestratorAgent({ ...identity, userInput: objective, hostFreshPlanning: primed.planning,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'], allowToolJit: true,
+    mcpToolScope: { authority: 'none', reason: 'Native lifecycle fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 }, model: model as never });
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(12), behaviorScopeId: `${session.id}::source:${source.seq}` },
+    () => hostRunRunner(throwingRunner() as never, agent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never, { maxTurns: 12, hostTurnEngine: 'host_v1', context: identity } as never));
+  const history = (result as { history: unknown[] }).history;
+  assert.match(historyResult(history, 'lifecycle-create'), /Created workflow/);
+  assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
+  const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
+  const lines = () => expectedWorkPlanLines(identity).map(row => ({ id: row.requirementId, state: row.state }));
+  assert.deepEqual(lines(), [
+    { id: 'create', state: 'satisfied' }, { id: 'disable', state: 'satisfied' }, { id: 'enable', state: 'satisfied' }, { id: 'verify', state: 'satisfied' }, { id: 'verify_disabled', state: 'satisfied' },
+  ]);
+  assert.match(historyResult(history, 'lifecycle-verify'), /"enabled": true/);
+  assert.match(historyResult(history, 'lifecycle-verify-disabled'), /"enabled": false/);
+  const receiptPath = path.join(nativeReadHome, 'vault/00-System/workflows', name, 'SKILL.md');
+  const bytes = readFileSync(receiptPath);
+  try {
+    writeFileSync(receiptPath, Buffer.concat([bytes, Buffer.from('\n# Unrelated drift\n')]));
+    assert.ok(lines().filter(row => ['create', 'enable', 'disable'].includes(row.id)).every(row => row.state !== 'satisfied'),
+      'an unexplained final revision invalidates the predecessor chain');
+  } finally { writeFileSync(receiptPath, bytes); }
+  eventlog.closeEventLog();
+  assert.ok(lines().every(row => row.state === 'satisfied'), 'completion proof survives durable reopen without replay');
+});

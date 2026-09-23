@@ -245,3 +245,78 @@ plan/execute and host resolution/read integration checks; typecheck passed.
 Sentinel not performed while live daemon owned the home. No full-suite or
 journey acceptance claimed. Final predicate retains previous same-purpose
 compatibility in addition to the newly tested typed lifecycle route.
+
+## Lifecycle proof regression pinned (unfixed)
+
+Live9ec source287511 failed cleanup despite a successful product323 run. Exact
+record and operator-only fixture disable:
+output/harness-acceptance/2026-09-23-9ec240523/README.md. Do not claim this
+candidate accepted. The lineage admission repair worked with destination kept;
+subsequent revision proof did not. Installed fixture now disabled by operator.
+
+New production test in native-space-plan-read.integration.test.ts:
+"a created workflow remains completed after its planned enable revision and database reopen".
+Real scoped discovery→plan_task→work_call(create disabled)→work_call(enable)→
+selected metadata read, recording model only. Both mutations return success;
+expectedWorkPlanLines reports create=open, enable/verify=blocked_on_dependency.
+Red reproduced in /tmp/clem-lifecycle-proof-red2.log. Initial red log was a test
+setup mistake (missing hostTurnEngine/context identity); red2 is the actual
+live defect. Do not weaken the satisfied assertions or mark this fixed.
+
+Proof diagnosis: native-revision-commit-proof requires current artifact bytes
+for every past commit; authorized successor revision invalidates predecessor.
+It also routes ANY dataFrom edge to a Workspace-specific content-derivation
+proof, which cannot verify workflow identity consumption. Preserve the existing
+native-space negative assertions for unrelated byte drift, missing artifact,
+source/contract mismatch and tampered retained result. Historical completion
+needs exact settled successor lineage, not nominal tool success or order alone.
+An existing workflowActivationSuccessor mechanism recognizes exact source/call-
+bound priorDigest→facts transitions for verification activation. Evaluate reuse
+before introducing another mechanism; it currently does not cover foreground
+native lifecycle writes. Runtime proof fix and live reacceptance remain owed.
+
+### Candidate proof fix
+
+Native revision dependency proof now separates exact historical commit evidence
+from current artifact verification. Both use the same sealed selection, accepted
+source/task/contract, successful mutating settlement, host local-envelope binding,
+argument digest and canonical retained result. Historical mode is private: it
+cannot independently satisfy a public proof. Identity lineage requires one exact
+prior write per declared data source, matching artifact handle/createdId/revision
+output contract, a real dependency edge and settlement before successor binding.
+Non-identity lineage still goes through the existing stronger content derivation.
+
+If original bytes changed, completion requires a later settled revision in the
+same contract, causally ordered after it, sharing explicit artifact data lineage,
+with matching handle/id/output contract. Current bytes must verify at the end of
+the chain. This covers sibling lifecycle actions that both reference creation,
+not just a simple linked list. No unrelated current revision, other source,
+order-only write, missing file or malformed receipt is accepted. No dispatch or
+replay authority is created. Existing activation helper remains unchanged: it
+handles source-bound automatic verification activation, not arbitrary plan nodes.
+
+Production regression expanded through disable (both enable and disable reference
+creation), verification, final-byte drift and database reopen. Direct-only chain
+first failed at enable=open after disable (/tmp/clem-lifecycle-chain-red.log),
+then full native production file passed7/7 (/tmp/clem-lifecycle-chain-green.log).
+Existing Space tampered-byte/missing-artifact/tampered-retained-receipt/source-
+identity negatives remain intact. Typecheck passed. Broader affected dependency
+and explicit plan/execute tests are running in /tmp/clem-lifecycle-affected.log.
+Candidate is not installed/live accepted yet. Do not count fixture cleanup on
+source287511 as acceptance or claim performance gains from failed work.
+
+Broader affected checks:42/43 passed. The one failure is
+"a second DECLARED effect is its own requirement — the send never dies as already-executed"
+(expected-work-bypass-evidence.test.ts): expected refused, observed bound.
+Reproduced by that exact name on unchanged HEAD9ec240523 and last tag8c11aa3c0,
+logs /tmp/clem-lifecycle-{head,tag}-attribution.log. It is pre-existing, remains
+unresolved, and is not hidden or counted as a pass. Full release acceptance still
+owes its contract review. Native successor proof checks cache verified nodes only
+within a single proof invocation, avoiding repeated ancestor verification without
+retaining stale state across calls. Final native fixture/typecheck rerun pending
+in /tmp/clem-lifecycle-chain-final.log and /tmp/clem-lifecycle-types-final.log.
+
+Final native regression rerun7/7 and backend typecheck passed. Candidate now
+proceeds to commit/build. Live installed source remains9ec240523; the proof fix
+has not yet been hotpatched or accepted. Full suite/journeys were not run on the
+loaded machine, and isolation sentinel was not performed with the live daemon.
