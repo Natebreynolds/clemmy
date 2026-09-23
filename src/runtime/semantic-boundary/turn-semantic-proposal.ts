@@ -580,6 +580,23 @@ export interface HostCapabilityDescriptorV1 {
 export const MAX_HOST_CAPABILITY_DESCRIPTORS = 32;
 export const MAX_HOST_DESCRIPTOR_SERIALIZED_BYTES = 16_384;
 
+/** Creation and lifecycle actions may have different purposes while operating
+ * on the same artifact revision. A dispatch receipt is a different output
+ * contract, even when it shares the artifact's deliverable family. */
+export function capabilityProducesArtifactFor(
+  producer: HostCapabilityDescriptorV1,
+  consumer: HostCapabilityDescriptorV1,
+): boolean {
+  const sameArtifactContract = (producer.effect === 'local_write' || producer.effect === 'external_write')
+    && producer.outputKind.length > 0 && producer.outputKind === consumer.outputKind;
+  return producer.deliverableKind === consumer.deliverableKind
+    // Preserve existing same-purpose authoring contracts; lifecycle actions
+    // additionally qualify through the exact host-owned revision contract.
+    && (producer.purpose === consumer.purpose || sameArtifactContract)
+    && (producer.destinationPosture === 'create_new'
+      || (producer.destinationPostures ?? []).includes('create_new'));
+}
+
 export function boundHostCapabilityDescriptors(
   descriptors: readonly HostCapabilityDescriptorV1[],
 ): HostCapabilityDescriptorV1[] {
@@ -1005,8 +1022,8 @@ function validateProposedWork(
       // before an update shares the workflow family and would have looked like
       // it produced the workflow, when a run receipt is not an authored
       // artifact. The typed answer is the topology's `dataFrom` edge plus the
-      // host's own `purpose`: only a predecessor in the SAME authoring purpose
-      // can have produced the thing this operation now names.
+      // host's output contract: lifecycle operations can have a different
+      // purpose while operating on the revision the predecessor produced.
       const dataSources = new Set(
         work.topology?.operations.find((entry) => entry.id === operation.id)?.dataFrom ?? [],
       );
@@ -1018,10 +1035,7 @@ function validateProposedWork(
           : resolveDescriptorSuccessorId(predecessorOp.capabilityRef, descriptorById);
         const predecessor = predecessorId ? descriptorById.get(predecessorId) : undefined;
         if (!predecessor) return false;
-        return predecessor.deliverableKind === descriptor.deliverableKind
-          && predecessor.purpose === descriptor.purpose
-          && (predecessor.destinationPosture === 'create_new'
-            || (predecessor.destinationPostures ?? []).includes('create_new'));
+        return capabilityProducesArtifactFor(predecessor, descriptor);
       });
       const satisfiable = ownTargets.length === 0
         || (producedByPredecessor && supportedPostures.has('named_existing'))

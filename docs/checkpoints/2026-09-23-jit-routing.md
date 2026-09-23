@@ -204,3 +204,44 @@ source identity, and pending input continuity. Log:
 /tmp/clem-plan-continuity-0923.log. Live build-info rechecked d8807b834,
 fingerprint3123a52f5d0ae6593d35ee7b99f9891a0842386f6b76850cebe1bf16c185c8fc,
 daemon6402. No new live acceptance or model-cost claim.
+
+## Create then manage artifact lineage (source287277)
+
+Installed bfb7bd07c completed the controlled author→readback→enable→run once→
+verify323→disable→readback task. Exact-source evidence and canonical measurement
+are under output/harness-acceptance/2026-09-23-bfb7bd07c. Wall132471ms,
+16 top-level calls including6 discovery calls;277079 uncached input tokens,
+3 uncertified usage records. One canonical terminal287510, original attempt
+completed, one succeeded workflow run, final saved fixture disabled. No speed
+win claimed. Independent API checks confirmed run1790159971966-a3772f.
+
+Live plan initially rejected create_new workflow destination with later lifecycle
+operations. The submitted graph had dependsOn but no dataFrom; rejecting mere
+ordering is correct. However, even adding dataFrom could not fix it because
+creation and enablement have different purpose labels. The repair also falsely
+said no shown capability could create the destination. The model removed the
+destination on retry rather than retaining the complete typed intent.
+
+Candidate fixes the shared artifact-lineage predicate: existing same-purpose
+contracts remain supported, while a write that creates the same deliverable
+family with the same output contract can feed a different-purpose lifecycle
+operation through explicit dataFrom. A workflow_run output remains a different
+contract from workflow_revision. No tool/model/provider-name branching or
+execution authority change. Repair uses this same host predicate to identify
+already-cited creation/lifecycle operations and asks for explicit data lineage
+instead of another discovery search or removal of destination metadata.
+
+Regression red: explicit create→toggle data lineage failed before the fix;
+run-receipt data lineage correctly rejected. Added repair test requiring cited
+operation IDs, explicit dataFrom/dependsOn and preserved destination, without
+false cold discovery guidance. Existing order-only/cross-family/wrong-posture
+negative cases remain. Logs /tmp/clem-artifact-lineage-{red,green,final,final2,
+types,integration}.log. Tests are recording/fixture checks, not live acceptance.
+The candidate must be built after committing and reaccepted in the installed
+app before claiming this live planning defect fixed.
+
+Validation complete:72/72 focused checks on final predicate,21/21 production
+plan/execute and host resolution/read integration checks; typecheck passed.
+Sentinel not performed while live daemon owned the home. No full-suite or
+journey acceptance claimed. Final predicate retains previous same-purpose
+compatibility in addition to the newly tested typed lifecycle route.

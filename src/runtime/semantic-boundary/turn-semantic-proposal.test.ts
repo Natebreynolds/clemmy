@@ -1596,3 +1596,59 @@ test('a slot answer that also sketches work is admitted; a replacement goal is s
   assert.ok(issueCodes(validateTurnSemanticProposalV1(proposal({ ...answered, work: null, goal: goal() }), host()))
     .includes('illegal_relation_payload'));
 });
+
+test('artifact lineage admits lifecycle operations with a different purpose but the same revision contract', () => {
+  const base = authoringHost();
+  const toggle = authoring('cap:toggle', 'workflow', 'named_existing', 'workflow_reference', undefined, 'toggle_workflow');
+  const view = { ...base, catalog: { ...base.catalog,
+    capabilityIds: new Set([...base.catalog.capabilityIds, toggle.id]),
+    capabilities: [...(base.catalog.capabilities ?? []), toggle],
+  } };
+  for (const dataFrom of [[], ['create']]) {
+    const candidate = authoringWork([{ posture: 'create_new', family: 'workflow' }], [
+      { id: 'create', ref: WORKFLOW_CREATE },
+      { id: 'toggle', ref: toggle.id, dependsOn: ['create'], dataFrom },
+    ]);
+    assert.equal(issueCodes(validateTurnSemanticProposalV1(proposal({ work: candidate }), view))
+      .includes('capability_ref_destination_mismatch'), dataFrom.length === 0,
+    'only explicit artifact data lineage allows a later lifecycle operation');
+  }
+});
+
+test('a dispatch receipt cannot establish artifact lineage even with an explicit data edge', () => {
+  const base = authoringHost();
+  const run = { ...authoring(WORKFLOW_RUN, 'workflow', 'create_new', 'workflow_identity', undefined, 'dispatch_named_workflow'),
+    outputKind: 'workflow_run', outputShape: 'workflow_run', producedOutputKinds: ['workflow_run'],
+  };
+  const view = { ...base, catalog: { ...base.catalog,
+    capabilityIds: new Set([...base.catalog.capabilityIds, run.id]),
+    capabilities: [...(base.catalog.capabilities ?? []), run],
+  } };
+  const candidate = authoringWork([{ posture: 'create_new', family: 'workflow' }], [
+    { id: 'run', ref: WORKFLOW_RUN },
+    { id: 'edit', ref: WORKFLOW_UPDATE, dependsOn: ['run'], dataFrom: ['run'] },
+  ]);
+  assert.ok(issueCodes(validateTurnSemanticProposalV1(proposal({ work: candidate }), view))
+    .includes('capability_ref_destination_mismatch'));
+});
+
+test('destination repair uses the shown creator and lifecycle contract instead of another discovery round', async () => {
+  const { destinationMismatchRepair } = await import('../../tools/plan-tools.js');
+  const create = authoring(WORKFLOW_CREATE, 'workflow', 'create_new', 'workflow_definition');
+  const toggle = authoring('cap:toggle', 'workflow', 'named_existing', 'workflow_reference', undefined, 'toggle_workflow');
+  const draft = {
+    destination: { posture: 'create_new' as const, family: 'workflow', handleRequired: true },
+    bindings: [
+      { operationId: 'create', capabilityRef: create.id, role: 'create', evidence: ['receipt'] },
+      { operationId: 'enable', capabilityRef: toggle.id, role: 'enable', evidence: ['receipt'] },
+    ],
+  };
+  const repair = destinationMismatchRepair({ reason: 'capability_ref_destination_mismatch', draft, capabilities: [create, toggle] });
+  assert.match(repair ?? '', /enable can consume the artifact created by create/);
+  assert.match(repair ?? '', /dataFrom and dependsOn/);
+  assert.match(repair ?? '', /do not remove it/);
+  assert.doesNotMatch(repair ?? '', /Call tool_search once/);
+  const receipt = { ...create, outputKind: 'workflow_run' };
+  const wrong = destinationMismatchRepair({ reason: 'capability_ref_destination_mismatch', draft, capabilities: [receipt, toggle] });
+  assert.doesNotMatch(wrong ?? '', /can consume the artifact created by/);
+});

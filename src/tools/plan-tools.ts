@@ -10,6 +10,7 @@ import {
   type HostCapabilityDescriptorV1,
   type TurnSemanticProposalV1,
   boundedSemanticObjective,
+  capabilityProducesArtifactFor,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
@@ -1274,7 +1275,7 @@ function undisclosedRefRepairInstruction(
  * postures out of the English error prose, which could recommend the rejected
  * ref, name the wrong family, or disagree with recoveryTool.
  */
-function destinationMismatchRepair(input: {
+export function destinationMismatchRepair(input: {
   reason: string;
   draft: Pick<z.infer<typeof FreshActionPlanDraftSchema>, 'destination' | 'bindings'>;
   capabilities: readonly HostCapabilityDescriptorV1[];
@@ -1287,6 +1288,24 @@ function destinationMismatchRepair(input: {
     ...(entry.destinationPosture ? [entry.destinationPosture] : []),
     ...(entry.destinationPostures ?? []),
   ]);
+  const bound = input.draft.bindings.flatMap((binding) => {
+    const descriptor = byId.get(binding.capabilityRef);
+    return descriptor ? [{ binding, descriptor }] : [];
+  });
+  const lineage = sink.posture === 'create_new' ? bound.flatMap((consumer) => {
+    if (consumer.descriptor.deliverableKind !== sink.family
+      || !posturesOf(consumer.descriptor).has('named_existing')
+      || posturesOf(consumer.descriptor).has('create_new')) return [];
+    return bound.filter((producer) => producer.binding.operationId !== consumer.binding.operationId
+      && capabilityProducesArtifactFor(producer.descriptor, consumer.descriptor))
+      .map((producer) => `${consumer.binding.operationId} can consume the artifact created by ${producer.binding.operationId}`);
+  }) : [];
+  if (lineage.length > 0) {
+    return `The shown capabilities already cover creation and later artifact operations: ${lineage.join('; ')}. `
+      + 'If those later operations target that created artifact, declare the creator in both their dataFrom and dependsOn, then call plan_task again. '
+      + 'An ordering dependency alone does not establish artifact lineage. Preserve the requested destination; do not remove it to bypass this check. '
+      + 'If they target a different artifact, retain that distinction and discover a compatible operation only if needed.';
+  }
   // The refs this draft actually cited for the sink's family — those are the
   // ones that failed, and must never be recommended back.
   const citedForFamily = new Set(
