@@ -1391,3 +1391,17 @@ fs.writeFileSync(shot, Buffer.from('${png.toString('hex')}', 'hex'));
     else process.env.CLEMMY_PREVIEW_BROWSER = prior;
   }
 });
+
+test('manifest-only Workspace reads expose the manifest without inventing a saved view', async () => {
+  const slug = 'manifest-only-tool-read';
+  store.spaceStore.save({ id: slug, title: 'Awaiting pilot output' });
+  const got = text(await tools.space_get({ slug }));
+  assert.match(got, /Awaiting pilot output/);
+  assert.match(got, /View: missing/);
+  assert.doesNotMatch(got, /returns the saved HTML/);
+  assert.equal(existsSync(store.resolveInSpace(slug, 'view/index.html')), false);
+  const view = text(await tools.space_get_view({ slug, grep: null, around: null }));
+  assert.match(view, /no view yet/i);
+  const preview = text(await tools.space_preview({ slug }));
+  assert.match(preview, /no view to preview/i);
+});

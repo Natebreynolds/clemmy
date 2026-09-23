@@ -243,3 +243,17 @@ test('one invalid recovery journal leaves unrelated Spaces listable without pres
   assert.ok(listed.some(record => record.id === healthy.slug));
   assert.ok(!listed.some(record => record.id === broken.slug));
 });
+
+test('reading a missing view cannot authorize a static replacement or fabricate prior view bytes', () => {
+  const f = fixture();
+  const viewFile = store.resolveInSpace(f.slug, 'view/index.html');
+  const retained = ['space.json', 'data.json', receipts.HOST_LOCAL_WORKSPACE_COMMIT_BASENAME];
+  const before = retained.map(file => readFileSync(store.resolveInSpace(f.slug, file), 'utf8'));
+  rmSync(viewFile);
+  const snapshot = store.spaceStore.snapshot(f.slug)!;
+  assert.equal(snapshot.viewMissing, true);
+  assert.throws(() => store.spaceStore.replaceStaticDocument({ ...f.input, expectedRevision: snapshot.revision }), /no saved view/);
+  assert.deepEqual(retained.map(file => readFileSync(store.resolveInSpace(f.slug, file), 'utf8')), before);
+  assert.equal(existsSync(viewFile), false);
+  assert.equal(updates(f.slug).n, 0);
+});

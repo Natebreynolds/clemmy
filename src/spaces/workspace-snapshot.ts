@@ -220,7 +220,7 @@ export function withWorkspaceProjectionOwner<T>(slug: string, root: string, writ
   return withWorkspaceSnapshotMutation(slug, write);
 }
 
-export function workspaceSnapshotRevision(parts: { manifest: string; view: string; data: string }): string {
+export function workspaceSnapshotRevision(parts: { manifest: string; view: string; data: string; viewMissing?: true }): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
 

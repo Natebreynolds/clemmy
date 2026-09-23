@@ -1010,3 +1010,23 @@ test('hand-written manifest normalization accepts cli_argv (snake_case) and flag
   assert.equal(rec?.dataSources[1]?.cliArgv, undefined, 'malformed argv is not silently installed');
   assert.match((rec?.manifestErrors ?? []).join('\n'), /bad.*bare installed-command name/s);
 });
+
+test('manifest-only snapshot preserves data and distinguishes an absent view from an empty view', () => {
+  const slug = 'manifest-only-snapshot';
+  store.spaceStore.save({ id: slug, title: 'Pending dataset view' });
+  const file = store.resolveInSpace(slug, 'view/index.html');
+  assert.equal(existsSync(file), false);
+  const absent = store.spaceStore.snapshot(slug)!;
+  assert.equal(absent.record.id, slug);
+  assert.equal(absent.viewMissing, true);
+  assert.equal(absent.view, '');
+  assert.equal(existsSync(file), false, 'reading cannot fabricate a view');
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, '', 'utf8');
+  const empty = store.spaceStore.snapshot(slug)!;
+  assert.equal(empty.viewMissing, undefined);
+  assert.notEqual(empty.revision, absent.revision, 'missing and empty cannot share revision authority');
+  rmSync(file);
+  mkdirSync(file);
+  assert.throws(() => store.spaceStore.snapshot(slug), (error: unknown) => (error as NodeJS.ErrnoException).code === 'EISDIR', 'non-absence I/O errors must not masquerade as a missing view');
+});

@@ -1382,7 +1382,7 @@ export function registerSpaceTools(server: McpServer): void {
         observationStore.ok
           ? renderWorkspaceHistoryAvailability(getWorkspaceHistoryAvailability(rec.id, observationStore.db))
           : `Dataset history is temporarily unavailable: ${safeWorkspaceObservationError(observationStore.error)}. Do not infer a delta from the current snapshot.`,
-        `View source: space_get_view({slug:${JSON.stringify(slug)},grep:null,around:null}) returns the saved HTML. For a targeted change, read that source, apply space_edit_view, and read it again to verify.`,
+        snapshot.viewMissing ? 'View: missing. The manifest and dataset are readable; no saved HTML exists.' : `View source: space_get_view({slug:${JSON.stringify(slug)},grep:null,around:null}) returns the saved HTML. For a targeted change, read that source, apply space_edit_view, and read it again to verify.`,
         ...(rec.contentMode === 'static_snapshot' ? ['For a root data or phone-content edit, use space_save with replacement_data_json and this expected_revision; include view_html when the HTML also changes. space_edit_view alone changes only HTML; space_set_data changes a named source.'] : []),
         `Snapshot revision: ${snapshot.revision}`,
         `Content mode: ${rec.contentMode ?? 'source-based'}.`,
@@ -1552,7 +1552,7 @@ export function registerSpaceTools(server: McpServer): void {
       if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with view_html (or legacy view_path).`);
       let html: string;
       let revision: string;
-      try { const snapshot = spaceStore.snapshot(slug); if (!snapshot) throw new Error('Workspace disappeared'); html = snapshot.view; revision = snapshot.revision; }
+      try { const snapshot = spaceStore.snapshot(slug); if (!snapshot) throw new Error('Workspace disappeared'); if (snapshot.viewMissing) return textResult(`Workspace "${slug}" has no view yet.`); html = snapshot.view; revision = snapshot.revision; }
       catch (err) { return textResult(`Error reading the "${slug}" view: ${(err as Error).message}`); }
       return textResult(
         `Snapshot revision: ${revision}\n` + renderViewForRead(html, { slug, grep: grep?.trim() || undefined, around: around ?? undefined }),
