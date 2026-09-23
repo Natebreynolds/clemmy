@@ -142,6 +142,9 @@ test('resolveMcpToolScope: positive external-app intent does not compile as a re
 test('preserving integration configuration does not revoke read/discovery access', () => {
   for (const constraint of [
     'No changes to personal workflows or integrations.',
+    'Do not change connector or provider settings.',
+    'No connector or provider settings have changed.',
+    'Do not run the pilot, send externally, change provider settings, or edit business Spaces.',
     'Do not make any changes to integrations.',
     'Do not modify DataForSEO configuration.',
     'Without reconfiguring external MCP servers, inspect the available tools.',
@@ -160,6 +163,8 @@ test('preserving integration configuration does not revoke read/discovery access
     }
   }
   assert.equal(compileMcpAccessConstraint('Do not modify or use integrations.', []).mode, 'deny_all');
+  assert.equal(compileMcpAccessConstraint('Do not change or use integrations.', []).mode, 'deny_all');
+  assert.equal(compileMcpAccessConstraint('No connector settings have changed. Do not use external tools.', []).mode, 'deny_all');
   assert.equal(compileMcpAccessConstraint('No changes to integrations. Do not use external tools.', []).mode, 'deny_all');
   assert.deepEqual(compileMcpAccessConstraint('Do not modify or query DataForSEO.', ['dataforseo']).deny, ['dataforseo']);
 });

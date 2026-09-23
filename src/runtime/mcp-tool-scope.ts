@@ -223,7 +223,13 @@ function accessNegativeBefore(positions: number[], index: number, text: string):
   if (/^(?:never|not)\s+(?:(?:previously|already)\s+)?(?:dispatched|executed|called|used|queried|connected|received|returned)\b/i.test(span)) return -1;
   // "does not forbid reading MCP tools" negates a prohibition, not access.
   if (/^(?:not|do\s+not|don't|dont|never)\s+(?:forbid|prohibit|prevent|restrict|block)\b/i.test(span)) return -1;
-  const preservesConfiguration = /\b(?:changes?\s+to|changing|reconfigur(?:e|ing)|modifying|modify|migrat(?:e|ing)|repair(?:ing)?)\b/i.test(span);
+  // "No connector settings have changed" reports configuration state; the
+  // connector noun precedes the predicate, unlike "no changes to X".
+  const clauseTail = text.slice(negative).split(/[.!?;\n]/, 1)[0] ?? '';
+  if (/^no\s/i.test(span)
+    && /\b(?:settings|configuration)\s+(?:have|has|had|were|was|are|is)\s+(?:been\s+)?(?:changed|modified|reconfigured|updated)\b/i.test(clauseTail)
+    && !accessPredicate.test(clauseTail)) return -1;
+  const preservesConfiguration = /\b(?:changes?\s+to|change|changing|reconfigur(?:e|ing)|modifying|modify|migrat(?:e|ing)|repair(?:ing)?)\b/i.test(span);
   // A later access verb is a separate prohibition: "do not change or use X".
   const alsoRefusesAccess = /\b(?:use|using|call|calling|access|accessing|query|querying|invoke|invoking|connect|connecting)\b/i.test(span);
   return preservesConfiguration && !alsoRefusesAccess ? -1 : negative;
