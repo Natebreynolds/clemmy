@@ -54,6 +54,7 @@ function dominantArrayLocation(value: unknown): DominantArrayLocation | null {
   if (!value || typeof value !== 'object') return null;
 
   let best: DominantArrayLocation | null = null;
+  const unfamiliar: DominantArrayLocation[] = [];
   const visit = (node: unknown, path: string, depth: number): void => {
     if (depth > 5 || !node || typeof node !== 'object' || Array.isArray(node)) return;
     const record = node as Record<string, unknown>;
@@ -66,13 +67,20 @@ function dominantArrayLocation(value: unknown): DominantArrayLocation | null {
     // Provider envelopes are commonly nested as data -> data. Walk bounded
     // object carriers, but never descend into record arrays or arbitrary depth.
     for (const [key, child] of Object.entries(record)) {
+      // A tool may name its collection anything. A single unfamiliar record
+      // array is unambiguous; multiple unfamiliar collections need an explicit
+      // projection rather than guessing from a provider-specific key list.
+      if (Array.isArray(child) && !DOMINANT_LIST_KEYS.includes(key)
+        && child.length > 0 && child.every(row => row !== null && typeof row === 'object' && !Array.isArray(row))) {
+        unfamiliar.push({ key, rows: child, path: path ? `${path}.${key}` : key });
+      }
       if (child && typeof child === 'object' && !Array.isArray(child)) {
         visit(child, path ? `${path}.${key}` : key, depth + 1);
       }
     }
   };
   visit(value, '', 0);
-  return best;
+  return best ?? (unfamiliar.length === 1 ? unfamiliar[0]! : null);
 }
 
 /** Find the dominant list inside a parsed tool result — a records/items/results

@@ -567,3 +567,20 @@ test('tool_output_query given a capability reference redirects to the carrier an
     () => recall({ call_id: ref }));
   assert.match(recalled.content[0].text, /CAPABILITY reference, not a result handle/);
 });
+
+test('query projects records from an unfamiliar single-array envelope without paging raw output', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const rows = Array.from({ length: 114 }, (_, i) => ({ name: `Fixture ${i}`, details: 'x'.repeat(300) }));
+  writeToolOutput({ sessionId: sess.id, callId: 'unknown-envelope', tool: 'fixture_list',
+    output: JSON.stringify({ total: rows.length, arbitraryCollection: rows }) });
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'unknown-envelope', fields: ['name'], limit: 200 }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /114 total from arbitraryCollection/);
+  assert.match(text, /Fixture 113/);
+  assert.doesNotMatch(text, /details|None of/);
+});
