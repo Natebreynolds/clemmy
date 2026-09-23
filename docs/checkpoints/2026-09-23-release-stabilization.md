@@ -148,3 +148,22 @@ new signed installer or native click. Full suite held while load was12/12/12;
 no full-suite pass claimed. Evidence under output/harness-acceptance/
 2026-09-23-notification-click/ and2026-09-23-workspace-installed-read/.
 No business workflow rerun, no external message, no paid model, no tag/push.
+
+## Correction: login keychain is unlocked; signing still fails
+
+After owner reported unlocking, a disposable /usr/bin/true copy was signed via
+Terminal .command with the existing Developer ID, without quitting Clem or
+changing installed bytes. codesign still failed errSecInternalComponent.
+SecKeychainCopySettings still reports its passphrase error, BUT this is NOT a
+valid lock-state test: direct Security.framework SecKeychainOpen and
+SecKeychainGetStatus both returned0, statusBits7. Local SDK SecKeychain.h defines
+1=unlocked,2=readable,4=writable. Thus login keychain IS unlocked at this check.
+Do not ask the owner to keep unlocking based solely on the settings error.
+Keychain Access shows the Developer ID certificate valid, its private key
+present, and existing access unrestricted. These were read-only inspections;
+no key export, password access, trust change, permission change or reset.
+Root cause of signing failure remains unknown. Asked whether Mac/company
+password recently changed; no response yet. Probe log:
+/tmp/clem-notification-signing-probe/result.log. Clem stays on the restored shell;
+notification fix remains uninstalled. Rebuild after this docs commit before
+any further daemon hotpatch; no further patch or paid test performed here.
