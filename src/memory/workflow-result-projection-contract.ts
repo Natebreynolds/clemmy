@@ -486,18 +486,28 @@ export function parseWorkflowCanonicalEntityResultProjection(
   if (canonical.textInterpretation !== undefined) {
     const text = canonical.textInterpretation;
     if (!validWorkflowTextResultInterpretation(text)) errors.push('textInterpretation must be a closed explicit bounded interpretation.');
-    else if (canonical.recordsPath !== 'records'
-      || canonical.bounds?.maxPages !== 1
-      || text.maxSourceBytes > canonical.bounds.maxPageBytes
-      || text.selection.maxRecords !== canonical.bounds.maxRecords
-      || text.selection.maxRecords !== canonical.bounds.maxRecordsPerPage
-      || canonical.sourceRecord?.idPath !== text.field
-      || canonical.sourceRecord?.revisionPath !== undefined
-      || canonical.sourceRecord?.observedAt?.kind !== 'page_settled_at'
-      || !Array.isArray(canonical.fields)
-      || !canonical.fields.some(mapping => mapping.recordPath === text.field && mapping.required && mapping.type === 'string')
-      || canonical.fields.some(mapping => mapping.hostSource === undefined && (mapping.recordPath !== text.field || mapping.type !== 'string'))) {
-      errors.push('textInterpretation must match its single-result record mapping, host timestamp and exact selected-record bounds.');
+    else {
+      // Report independent mismatches together. A generic combined error makes
+      // authoring callers guess which invariant failed over repeated turns.
+      const field = JSON.stringify(text.field);
+      if (canonical.recordsPath !== 'records') errors.push('textInterpretation: recordsPath must equal "records" (the interpreted record collection, not the raw carrier envelope).');
+      if (canonical.bounds?.maxPages !== 1) errors.push('textInterpretation: bounds.maxPages must equal 1.');
+      if (text.maxSourceBytes > canonical.bounds?.maxPageBytes) errors.push('textInterpretation.maxSourceBytes must not exceed bounds.maxPageBytes.');
+      if (text.selection.maxRecords !== canonical.bounds?.maxRecords) errors.push('bounds.maxRecords must equal textInterpretation.selection.maxRecords.');
+      if (text.selection.maxRecords !== canonical.bounds?.maxRecordsPerPage) errors.push('bounds.maxRecordsPerPage must equal textInterpretation.selection.maxRecords.');
+      if (canonical.sourceRecord?.idPath !== text.field) errors.push(`sourceRecord.idPath must equal textInterpretation.field ${field}.`);
+      if (canonical.sourceRecord?.revisionPath !== undefined) errors.push('textInterpretation: sourceRecord.revisionPath must be omitted.');
+      if (canonical.sourceRecord?.observedAt?.kind !== 'page_settled_at') errors.push('textInterpretation: sourceRecord.observedAt.kind must equal "page_settled_at".');
+      if (!Array.isArray(canonical.fields)
+        || !canonical.fields.some(mapping => mapping.recordPath === text.field && mapping.required && mapping.type === 'string')) {
+        errors.push(`textInterpretation requires a required string field mapping with recordPath ${field}.`);
+      }
+      if (Array.isArray(canonical.fields)) canonical.fields.forEach((mapping, index) => {
+        if (mapping.hostSource === undefined) {
+          if (mapping.recordPath !== text.field) errors.push(`fields[${index}].recordPath must equal textInterpretation.field ${field}; other fields require explicit hostSource provenance.`);
+          if (mapping.type !== 'string') errors.push(`fields[${index}].type must equal "string" for an interpreted text field.`);
+        }
+      });
     }
   }
 

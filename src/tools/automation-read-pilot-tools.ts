@@ -336,6 +336,9 @@ function acquisitionScope(input: {
 
 function internalContract(input: z.infer<typeof typedContractSchema>): AutomationReadPilotTypedContractV1 {
   const projection = input.result_projection;
+  if (projection?.version === 2 && !projection.partition.outcome_authority) {
+    throw new Error('result_projection.partition.outcome_authority is required for version 2; supply the explicit workflow_read_aggregate terminal-state contract.');
+  }
   const projectionBase = projection ? {
     recordsPath: projection.records_path,
     ...(projection.text_interpretation ? { textInterpretation: {

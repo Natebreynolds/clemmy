@@ -1614,3 +1614,64 @@ This candidate is not installed or live-accepted yet. Full-suite, physical mobil
 packaged notification click and the rest of the release gates remain owed.
 Final typecheck passed, /tmp/clem-workspace-output-scope-typecheck-final.log
 (session12096 exit0). Diff whitespace check passed. Main/UI files unchanged.
+
+## Installed 0370fa93f and subsequent pilot authoring repair loop
+
+0370fa93f built clean (session69982 exit0), Terminal-hotpatched after active0/
+runningRuns0/backgroundActive0/physical-started0. Source fingerprint
+bc5f48a4df6523a68ecb4984ee5a4b7135125d03456d1b9ab75bd88e59fab2d8,
+daemon9643 instancea45fc0a5-800e-4ed6-9170-8d4ddf12a65e. Backups dist.backup-74ruDD,
+builtin-skills.backup-ZJ6Hov. Initial connection refusal was transient startup;
+no second restart. MCP metadata-only inventory verified four connected tools.
+Main stille77215d00, UI source untouched.
+
+Source291906→291953 done: same request staged Workspace review apr-ng3e in
+30950ms, three top-level calls/one discovery,212050input/73300cached/138750uncached/
+1333output. Five usage records (Opus3/Grok1/Jev1), exact source certified, one
+uncertifiedUsageCalls count remains. This run chose the existing READ pair, so
+it does not live-prove the new output-pair path. Not a matched causal speed win:
+prior turn failed, history differed and MCP metadata was prewarmed. Evidence
+output/harness-acceptance/2026-09-23-workspace-scope-037/acceptance.md.
+
+Inspected exact pending card: create-if-absent new acceptance Space only, no
+workflow binding, execution, recurrence or schedule. Approved through ordinary
+operator API. This is automated operator acceptance, not physical human/mobile
+proof. Daemon then created harness-acceptance-doc-inventory-0923 revision1,
+digestfb7ef4fd31762adc2da215976ad3bc28c38437b1eab802c33cf335bb86d6e526.
+No business Space mutation. Card presentation still exposes raw technical JSON;
+UI premium acceptance remains open. API response said resolved-stale even
+though the background Workspace reconciler successfully owned the creation.
+
+Continued pilot authoring at source291954. Workspace inventory returned52 items,
+compaction removed exact identities, requiring tool_output_query for the one
+known target. Five pilot_request attempts then guessed at vague contract
+validation. Exact attempt cancellation via its returned endpoint ended292057
+cancelled; no open attempt/approval, no pilot execution. Canonical measurement:
+100571ms,8top-levelcalls,0discovery,537494input/432390cached/105104uncached/8705output.
+Seventeen usage records Opus7/Grok5/Jev-latest3/Jev1.13two; exact attribution
+certified but uncertifiedUsageCalls3. These are failed/cancelled work totals,
+not successful efficiency results. No provider business read or external write.
+Evidence output/harness-acceptance/2026-09-23-pilot-author-037/.
+
+Observed argument defects: version2 omitted outcome_authority, which produced
+an internal undefined closed-JSON error. Then records_path was content and later
+$, while the explicit text interpreter produces records; field/id paths changed
+from value to text but the generic combined diagnostic never identified the
+remaining records_path error. Do not keep paying for guesses at an opaque error.
+
+Candidate diagnostic correction: the shared projection validator now reports
+independent text mapping/bounds/provenance mismatches together, including exact
+expected recordsPath, idPath and indexed field mappings. Same acceptance rules;
+no values inferred or silently repaired. Tool conversion reports required
+version2 outcome_authority before serialization. Red diagnostic pin failed
+against the previous generic error (/tmp/clem-text-contract-diagnostics-red.log).
+22 focused checks pass (/tmp/clem-text-contract-diagnostics-final.log), including
+wrong mappings, all original rejection cases, exact original pilot execution/
+replay and missing authority as repairable pre-dispatch with no card/body.
+Typecheck passed (/tmp/clem-text-contract-diagnostics-typecheck.log,50711 exit0).
+
+Remaining: build/install this candidate before repeating live pilot authoring;
+then review/execute and inspect canonical records/retained source/settlements.
+Do not claim pilot completion or tagging readiness. Exact Workspace filtering,
+compact review presentation, automated continuation ownership, desktop toast,
+physical mobile, full package/suite/release requirements remain open.

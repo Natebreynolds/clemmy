@@ -48,3 +48,17 @@ test('inconsistent selection, source mapping and pagination cannot enter the app
     assert.throws(() => createWorkflowCanonicalEntityResultProjection(candidate));
   }
 });
+
+test('text authoring reports every repairable mapping mismatch with the expected value', () => {
+  const candidate = contract();
+  candidate.recordsPath = 'content';
+  candidate.sourceRecord.idPath = 'value';
+  candidate.fields[0]!.recordPath = 'value';
+  assert.throws(() => createWorkflowCanonicalEntityResultProjection(candidate), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /recordsPath must equal "records"/);
+    assert.match(error.message, /sourceRecord.idPath must equal textInterpretation.field "section_name"/);
+    assert.match(error.message, /fields\[0\].recordPath must equal textInterpretation.field "section_name"/);
+    return true;
+  });
+});

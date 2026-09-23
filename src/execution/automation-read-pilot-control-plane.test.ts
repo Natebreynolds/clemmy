@@ -1691,3 +1691,23 @@ test('Workspace review accepts the exact output phase without granting read acqu
   assert.equal(fixture.bodies(), 0);
   assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, before + 1);
 });
+
+test('version-two authoring identifies missing outcome authority before closed-JSON serialization', async () => {
+  const fixture = blankStateFixture('missing_outcome_authority', { dataset: true });
+  const surface = chatPilotSurface(fixture);
+  const request = chatPilotRequest(fixture, surface.acquisitionRef);
+  const projection = (request.contract as any).result_projection;
+  projection.version = 2;
+  projection.identity_rules = projection.identity_rules.map((rule: any) => ({
+    kind: 'exact_identifier', rule_id: rule.rule_id, fields: rule.fields,
+    normalizers: rule.normalizers, namespace: rule.exact_identifier_namespace,
+  }));
+  const response = await surface.handlers.get('automation_read_pilot_request')!(request);
+  assert.equal(shared.isInvalidArgumentsTextResult(response), true);
+  const failure = pilotToolJson(response);
+  assert.equal(failure.code, 'pilot_contract_invalid');
+  assert.match(failure.reason, /result_projection.partition.outcome_authority is required for version 2/);
+  assert.doesNotMatch(failure.reason, /closed JSON domain/);
+  assert.equal(fixture.bodies(), 0);
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, 0);
+});
