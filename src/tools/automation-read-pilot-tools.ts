@@ -289,10 +289,11 @@ function acquisitionScope(input: {
   expectedProposalDigest: string;
   phaseId: string;
   requirementId: string;
-}): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
+}, purpose: 'acquisition' | 'workspace_creation' = 'acquisition'): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
   ok: false;
   code: string;
   reason: string;
+  repairableArguments?: true;
 } {
   const proposal = loadAutomationOpportunityProposal(input.proposalId);
   if (!proposal) return { ok: false, code: 'proposal_missing', reason: 'The exact automation proposal was not found.' };
@@ -306,9 +307,18 @@ function acquisitionScope(input: {
   const target = selectAutomaticReadPilotTarget(proposal.opportunity);
   if (!target.ok) return { ok: false, code: 'pilot_requirement_unsupported', reason: target.reason };
   const { phase, requirement } = target;
-  if (phase.id !== input.phaseId || requirement.id !== input.requirementId) return {
-    ok: false, code: 'pilot_requirement_unsupported',
-    reason: 'Acquisition references bind the selected read phase and requirement; Workspace output is bound separately in the pilot contract.',
+  // Workspace review may name its exact declared local output, but any
+  // acquisition scope returned remains bound to the selected source read.
+  // This grants no output execution: creation still needs its separate card.
+  const output = purpose === 'workspace_creation' ? target.workspaceOutputPhase : undefined;
+  const matchesOutput = output?.id === input.phaseId
+    && output.capabilityRequirementIds.length === 1
+    && output.capabilityRequirementIds[0] === input.requirementId;
+  if (!matchesOutput && (phase.id !== input.phaseId || requirement.id !== input.requirementId)) return {
+    ok: false, code: 'pilot_requirement_unsupported', repairableArguments: true,
+    reason: purpose === 'workspace_creation'
+      ? 'Workspace creation review must name the selected read phase and requirement or the exact declared Workspace output phase and requirement.'
+      : 'Acquisition references bind the selected read phase and requirement; Workspace output is bound separately in the pilot contract.',
   };
   return {
     ok: true,
@@ -561,8 +571,13 @@ export function registerAutomationReadPilotTools(
         expectedProposalDigest: expected_proposal_digest,
         phaseId: phase_id,
         requirementId: requirement_id,
-      });
-      if (!scoped.ok) return errorResult(scoped.code, scoped.reason);
+      }, 'workspace_creation');
+      if (!scoped.ok) {
+        if (scoped.repairableArguments) {
+          return invalidArgumentsTextResult(JSON.stringify({ ok: false, code: scoped.code, reason: scoped.reason }));
+        }
+        return errorResult(scoped.code, scoped.reason);
+      }
       const proposal = loadAutomationOpportunityProposal(proposal_id);
       if (!proposal?.opportunity.dataset) {
         return errorResult('workspace_creation_not_applicable', 'The exact approved proposal has no dataset contract.');

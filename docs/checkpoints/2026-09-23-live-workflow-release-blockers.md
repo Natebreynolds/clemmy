@@ -1556,3 +1556,61 @@ Next: build clean committed candidate, Terminal hotpatch, exact build-info
 verification, then continue original approved proposal without rewriting it.
 No tag readiness claim: full suite, broader release gates, native notification
 shell routing and physical mobile remain open.
+
+## 55d5098f3 live acceptance: Workspace output scope rejected before creation
+
+Installed exact SHA55d5098f35c18011da12acbf19288479f6b145f7, fingerprint
+cdc32940bfc05e5d59ebee65429b6cac4e377e8f633b9b0abf401d2f6623c65d,
+daemon88308 / instance7b9cbaf0-653e-4e66-9e24-e5ac65eee0c4. Original approved
+proposal automation_3da1c635b0a7dd98a928b7957369731f revision3/digest9574eff2
+was unchanged. Source291790 ended at291899 blocked; no Space or pilot created,
+no provider business read, schedule or external write. Evidence and canonical
+measurement: output/harness-acceptance/2026-09-23-text-pilot-55/.
+
+Canonical measurement: 103357ms, seven top-level calls (three discovery),
+470504 input / 211596 cached / 258908 uncached / 4230 output tokens. Eighteen
+usage records: Opus5.5 seven, Grok4.3 five, Jev1.13 four, Jev-latest two.
+Two uncertified calls and one unscoped-window usage record: attribution is not
+fully certified; not a matched efficiency comparison. One terminal, no unfinished
+attempt. Initial caller POST to /api/console/chat returned404; corrected to
+/api/harness/chat with the same persisted UUID, accepted once. Caller mistake,
+not a harness defect. Never blindly retry an accepted request.
+
+Acquisition-list accepted the original read phase. Workspace creation review
+correctly named write-space/acceptance-space-write, but its handler reused the
+read-only acquisition validator and refused. Recovery treated that host-only
+validation as unknown_read, excluding a repair call. Separate MCP discovery
+reported CONNECTING during the run; read-only recheck now reports connected,
+four tools, failureCount0. No credential repair performed. Multi-name native
+search yielded only one requested schema, forcing another search; still owed.
+Completion review correctly rejected unstaged work, but terminal disposition
+reported enabled_unavailable despite a recorded verdict; attribution fix owed.
+No durable retry was verified despite retry language in the rejected draft.
+
+## Workspace creation output-phase validation candidate
+
+The Workspace creation review path now accepts either the selected read pair
+(backward compatible) or the exact declared local Workspace output pair from
+the shared closed target selector. It still stages a separate human card and
+cannot execute, bind or schedule. Acquisition paths remain read-only. Only
+phase/requirement argument mismatches are branded repairable invalid arguments;
+stale proposal state and unsupported proposal structure retain their own errors.
+No provider/model names or task-specific phase names in production decisions.
+
+Regression uses the unchanged original approved proposal. Cross-paired and
+unrelated phase arguments create no cards; output scope cannot acquire a read
+capability; the valid output pair creates one pending card with no execution or
+schedule authority and zero carrier bodies. The original 13-to-five retained
+text execution/replay fixture now also requests Workspace review via the actual
+output phase. Red run against prior implementation failed the repairability
+assertion (17pass/1fail, /tmp/clem-workspace-output-scope-red.log). Final focused
+control-plane/selector run:25pass, /tmp/clem-workspace-output-scope-final.log.
+Disposable fixtures only; daemon-owned live-home sentinel explicitly NOT
+PERFORMED, not isolation proof. No paid model test in this test suite.
+
+Trap: exercising the original proposal with its read pair hid the exact argument
+choice made by the live model. Keep the output-pair call in the integration pin.
+This candidate is not installed or live-accepted yet. Full-suite, physical mobile,
+packaged notification click and the rest of the release gates remain owed.
+Final typecheck passed, /tmp/clem-workspace-output-scope-typecheck-final.log
+(session12096 exit0). Diff whitespace check passed. Main/UI files unchanged.

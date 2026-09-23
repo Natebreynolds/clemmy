@@ -1606,7 +1606,7 @@ test('original approved inventory contract executes 13 text records into five sc
     resolutionPolicy: { ...base.resolutionPolicy, preferNewerAfterExactIdentity: ['observed_at', 'run_ref', 'source_ref'] },
     bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
   });
-  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!({ ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' }));
   assert.equal(create.ok, true, JSON.stringify(create));
   assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.original-text-workspace').ok, true);
   const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
@@ -1658,4 +1658,36 @@ test('original approved inventory contract executes 13 text records into five sc
   await runner.processWorkflowRuns({} as ClementineAssistant);
   assert.equal(fixture.bodies(), 1);
   assert.deepEqual(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(created.projection.selection.bindingId), head);
+});
+
+
+test('Workspace review accepts the exact output phase without granting read acquisition or execution', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const fixture = blankStateFixture('output_phase_review', { dataset: true, opportunityOverride: original });
+  const surface = chatPilotSurface(fixture);
+  const handler = surface.handlers.get('automation_read_pilot_workspace_create_request')!;
+  const request = { ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' };
+  const before = eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length;
+  const stale = await handler({ ...request, expected_proposal_revision: fixture.proposal.revision + 1 });
+  assert.equal(pilotToolJson(stale).code, 'proposal_stale');
+  assert.equal(shared.isInvalidArgumentsTextResult(stale), false, 'state drift is not mislabeled as an argument mismatch');
+  for (const mismatch of [
+    { phase_id: 'write-space', requirement_id: 'doc-section-inventory-read' },
+    { phase_id: 'read-inventory', requirement_id: 'acceptance-space-write' },
+    { phase_id: 'unrelated', requirement_id: 'acceptance-space-write' },
+  ]) {
+    const rejected = await handler({ ...request, ...mismatch });
+    assert.equal(pilotToolJson(rejected).ok, false);
+    assert.equal(shared.isInvalidArgumentsTextResult(rejected), true, 'a scope mismatch before dispatch remains repairable');
+  }
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, before);
+  const readInventory = await surface.handlers.get('automation_read_pilot_acquisition_list')!({ ...chatPilotAcquisitionListRequest(fixture), phase_id: request.phase_id, requirement_id: request.requirement_id });
+  assert.equal(pilotToolJson(readInventory).ok, false, 'output scope cannot select read acquisitions');
+  const staged = pilotToolJson(await handler(request));
+  assert.equal(staged.ok, true, JSON.stringify(staged));
+  assert.equal(staged.workspaceAuthority, 'pending_exact_human_approval');
+  assert.equal(staged.executionAuthority, 'none');
+  assert.equal(staged.scheduleAuthority, 'none');
+  assert.equal(fixture.bodies(), 0);
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, before + 1);
 });
