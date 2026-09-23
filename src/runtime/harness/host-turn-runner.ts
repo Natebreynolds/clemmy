@@ -3355,7 +3355,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const hostWatcherEnabled = watcherJudgeEnabled() && !conversationalCheckInSurface();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
   const hostWatcherHistoryStart = history.length;
-  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string }) | null } = { pending: null };
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string; toolCallCount: number }) | null } = { pending: null };
   let hostWatcherChecksUsed = 0;
   let hostWatcherInjectionsUsed = 0;
   /** A drift verdict is outstanding. Keeps the watcher WATCHING after it has
@@ -3464,7 +3464,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         });
         const staleReason = judgedObjective() !== watcherObjective ? 'objective_changed'
           : summarizeWorkerProgressForWatcher(watcherIdentity.sessionId, watcherIdentity) !== workerProgress
-            ? 'worker_progress_changed' : undefined;
+            ? 'worker_progress_changed'
+            : hostWatcherToolCalls() !== watcherToolCalls ? 'settled_work_changed' : undefined;
         const stale = staleReason !== undefined;
         // Outstanding drift keeps the watch alive; an on_track clears it. The
         // escalation is RECORDED, not yet enforced: `bound` would end a turn,
@@ -3472,7 +3473,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // traffic before it is trusted — the same shadow-first discipline the
         // grounding gate adopted. Live 2026-09-21 this state was reached at
         // 18:37 and the turn then ran six unsupervised minutes.
-        if (verdict) hostWatcherUnresolvedDrift = !verdict.onTrack;
+        if (verdict && !stale) hostWatcherUnresolvedDrift = !verdict.onTrack;
         const escalation = watcherEscalation({
           verdict: verdict ? (verdict.onTrack ? 'on_track' : 'drift') : null,
           deliveredSteers: hostWatcherDeliveredSteers,
@@ -3501,7 +3502,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           evidenceBytes: Buffer.byteLength(sourceEvidence), latestAssistantNote,
         });
         if (verdict && !verdict.onTrack && !stale) {
-          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId, workerProgress };
+          hostWatcherSteer.pending = { ...verdict, objective: watcherObjective, reviewId, workerProgress, toolCallCount: watcherToolCalls };
         }
       } catch (error) {
         recordWatcherReview('completed', { reviewId, objectiveDigest, verdict: 'unavailable',
@@ -8428,12 +8429,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let watcherReviewForStep: string | undefined;
     let watcherDirectiveForStep: string | undefined;
     let watcherObjectiveForStep: string | undefined;
-    let watcherDriftForStep: (WatcherVerdict & { objective: string }) | undefined;
+    let watcherDriftForStep: (WatcherVerdict & { objective: string; toolCallCount: number }) | undefined;
     if (hostProduction && hostWatcherEnabled) {
       const pending = hostWatcherSteer.pending;
       const staleReason = pending && pending.objective !== judgedObjective() ? 'objective_changed'
         : pending && pending.workerProgress !== summarizeWorkerProgressForWatcher(exactHostIdentity().sessionId, exactHostIdentity())
-          ? 'worker_progress_changed' : undefined;
+          ? 'worker_progress_changed'
+          : pending && pending.toolCallCount !== hostWatcherToolCalls() ? 'settled_work_changed' : undefined;
       const drift = staleReason ? null : pending;
       if (!drift && hostWatcherSteer.pending) {
         recordWatcherReview('discarded', { reviewId: hostWatcherSteer.pending.reviewId, reason: staleReason });
@@ -8821,13 +8823,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // Owner notes can arrive after the verdict or even after this boundary
         // selected it. Check again AFTER adopting them, immediately before the
         // model request; an old review cannot redirect the revised objective.
-        if (watcherObjectiveForStep === judgedObjective()) {
+        const staleReason = watcherObjectiveForStep !== judgedObjective() ? 'objective_changed'
+          : watcherDriftForStep?.toolCallCount !== hostWatcherToolCalls() ? 'settled_work_changed' : undefined;
+        if (!staleReason) {
           modelInput.push({ role: 'user', content: watcherDirectiveForStep });
           hostWatcherInjectionsUsed += 1;
           hostWatcherDeliveredSteers += 1;
           recordWatcherReview('injected', { reviewId: watcherReviewForStep });
         } else {
-          recordWatcherReview('discarded', { reviewId: watcherReviewForStep, reason: 'objective_changed' });
+          recordWatcherReview('discarded', { reviewId: watcherReviewForStep, reason: staleReason });
           watcherReviewForStep = undefined;
         }
       }

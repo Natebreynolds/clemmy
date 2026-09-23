@@ -10773,8 +10773,10 @@ for (const variant of ['drift', 'unavailable', 'disabled', 'stale'] as const) te
   if (variant === 'unavailable') assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.unavailableReason,
     'judge_context_unavailable: complete prompt does not fit');
   if (variant === 'stale') assert.equal(reviews.find(e => e.data.phase === 'completed')?.data.stale, true);
-  assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, variant === 'drift' ? 1 : 0);
-  assert.equal(JSON.stringify(model.requests[2]).includes('Compare the retained version values before reporting.'), variant === 'drift');
+  assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, 0);
+  assert.equal(JSON.stringify(model.requests[2]).includes('Compare the retained version values before reporting.'), false);
+  if (variant === 'drift') assert.ok(reviews.some(e => e.data.phase === 'discarded' && e.data.reason === 'settled_work_changed'),
+    'a review of two records must not steer after the third record settles');
   assert.equal(model.calls(), 3, 'advisory review adds no model continuation or approval gate');
 });
 
@@ -10805,7 +10807,7 @@ test('successive advisory windows include each newly settled read once', async t
   }
 });
 
-test('a concrete tool failure starts advisory review before the ordinary cadence, and tool-free stop explanations do not start another review', async t => {
+for (const variant of ['corrected', 'discovery'] as const) test(`a concrete tool failure starts advisory review without stale correction (${variant})`, async t => {
   const watcher = await import('./watcher-judge.js');
   const keys = ['CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
   const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
@@ -10816,20 +10818,24 @@ test('a concrete tool failure starts advisory review before the ordinary cadence
   t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
     if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
   } });
-  const fixture = acceptHostCanarySource('early-failure-review', 'Read the current document and report its findings.');
+  const fixture = acceptHostCanarySource(`early-failure-review-${variant}`, 'Read the current document and report its findings.');
   const reader = brackets.wrapToolForHarness(tool({ name: 'read_file', description: 'Read the document.',
     parameters: z.object({ path: z.string() }), execute: async ({ path }) => {
       if (path === 'missing') return JSON.stringify({ ok: false, code: 'invalid_arguments', message: 'DOCUMENT_PATH_MISSING: use the retained exact path.' });
       return 'The current document contains four findings.';
     },
   }) as never);
+  const discovery = brackets.wrapToolForHarness(tool({ name: 'tool_search', description: 'Discover the reader schema.',
+    parameters: z.object({ query: z.string() }), execute: async () => 'Use read_file with the exact path.',
+  }) as never);
   const model = scriptedRecordingModel([
     [toolCall('early-failed-read', 'read_file', { path: 'missing' })],
-    [toolCall('early-corrected-read', 'read_file', { path: 'current' })],
+    [variant === 'corrected' ? toolCall('early-corrected-read', 'read_file', { path: 'current' })
+      : toolCall('early-discovery', 'tool_search', { query: 'read_file' })],
     [textMsg('The current document contains four findings.')],
   ]);
-  const agent = { model, tools: [reader] };
-  bindHostCanarySurface(fixture, agent, [reader]);
+  const agent = { model, tools: [reader, discovery] };
+  bindHostCanarySurface(fixture, agent, [reader, discovery]);
   const seen: watcher.WatcherJudgeInput[] = [];
   watcher._setWatcherJudgeForTests(async input => {
     seen.push(input);
@@ -10843,17 +10849,19 @@ test('a concrete tool failure starts advisory review before the ordinary cadence
     [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
     { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context } as never));
   assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
-  assert.equal(seen.length, 1, 'one new settled failure starts one check below twelve calls');
+  assert.equal(seen.length, variant === 'corrected' ? 1 : 2,
+    'corrected work retires stale advice; discovery alone leaves unresolved drift eligible for review');
   assert.match(seen[0].sourceEvidence ?? '', /DOCUMENT_PATH_MISSING/);
-  assert.match(JSON.stringify(model.requests[2]), /Use the retained exact document path/);
+  assert.equal(JSON.stringify(model.requests[2]).includes('Use the retained exact document path'), variant === 'discovery');
   const phases = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'trajectory_review');
-  assert.equal(phases.filter(e => e.data.phase === 'delivered').length, 1);
+  assert.equal(phases.filter(e => e.data.phase === 'delivered').length, variant === 'discovery' ? 1 : 0);
+  if (variant === 'corrected') assert.ok(phases.some(e => e.data.phase === 'discarded' && e.data.reason === 'settled_work_changed'));
   const checkin = { model: stubModel([[textMsg('The earlier read failed; the corrected read is retained.')]]), tools: [] };
   bindHostCanarySurface(fixture, checkin, []);
   await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(throwingRunner() as never, checkin as never,
     [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
     { maxTurns: 1, hostTurnEngine: 'host_v1', hostConversationalCheckIn: true, context: fixture.context } as never));
-  assert.equal(seen.length, 1, 'a tool-free explanation cannot receive a useful tool correction');
+  assert.equal(seen.length, variant === 'corrected' ? 1 : 2, 'a tool-free explanation cannot start another review');
 });
 
 for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wrong_plan_digest', 'card_reply', 'card_reply_altered'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
