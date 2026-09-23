@@ -7,6 +7,7 @@ const {
 } = await import('./client.js');
 const {
   filterPrimerHitsWithJev,
+  nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   rerankNamedCandidatesWithJev,
   selectProvenRunStrategyWithJev,
@@ -19,6 +20,31 @@ const {
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+});
+
+test('read nomination preserves accounts, ambiguity and unavailable outcomes', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let choice = 'candidate_0';
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      which: { type: 'choice', choice, confidence: 0.9, probabilities: { [choice]: 0.9 } },
+    }, usage: { input_tokens: 40, output_tokens: 4 } }),
+  }));
+  const rows = [
+    { name: 'a', operationId: 'list', description: 'List documentation' },
+    { name: 'b', operationId: 'list', description: 'List documentation' },
+    { name: 'c', operationId: 'fetch', description: 'Read a page' },
+  ];
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), ['a', 'b']);
+  choice = 'ambiguous';
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), ['a', 'b', 'c']);
+  choice = 'none';
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), []);
+  for (choice of ['uncertain', 'candidate_99']) {
+    assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
+  }
+  _setTypesafeKeyForTests(null);
+  assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
 });
 
 test('candidate and primer routing preserve late request constraints and retain fallback on rejection', async () => {

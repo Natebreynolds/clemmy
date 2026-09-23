@@ -47,6 +47,7 @@ import {
 import { createProductionReviewedCliReadCarrier } from './production-reviewed-cli-read-carrier.js';
 import { listReviewedCliReadDescriptors } from './reviewed-cli-read-config.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
+import { nominateReadCapabilitiesWithJev } from '../jev/control-plane.js';
 
 export const PRODUCTION_LIVE_READ_ACQUISITION_VERSION = 1 as const;
 
@@ -488,6 +489,7 @@ export function createAttestedLiveReadCarrierAdapter(input: {
     publicationGuard?: () => boolean,
   ): Promise<MaterializeLiveReadCapabilityResult>;
   now?: () => number;
+  semanticNomination?: typeof nominateReadCapabilitiesWithJev;
 }): ProductionLiveReadCarrierAdapterV1 {
   if (!boundedText(input.adapterId) || !boundedText(input.carrier.identity.name)) {
     throw new TypeError('live read carrier adapter identity is incomplete');
@@ -524,7 +526,7 @@ export function createAttestedLiveReadCarrierAdapter(input: {
       const exact = eligible.filter((row) => (
         normalizeText(row.identifier) === normalizedObjective
       ));
-      const rows = (exact.length > 0 ? exact : eligible.filter((row) => (
+      let rows = (exact.length > 0 ? exact : eligible.filter((row) => (
         rowIsAdvisoryObjectiveNomination(
           row,
           requirement.objective,
@@ -535,6 +537,27 @@ export function createAttestedLiveReadCarrierAdapter(input: {
           `${left.identifier}\0${left.accountIdentity}`
             .localeCompare(`${right.identifier}\0${right.accountIdentity}`)
         ));
+      if (rows.length === 0 && eligible.length > 0 && input.semanticNomination) {
+        const candidates = [];
+        for (const [index, row] of eligible.entries()) {
+          const reference = { identifier: row.identifier, accountId: row.accountIdentity! };
+          const attested = attestLiveReadDefinition({
+            carrier: input.carrier.identity, reference,
+            definition: input.carrier.observe(reference), now: (input.now ?? Date.now)(),
+          });
+          if (!attested.ok) return { status: 'unavailable', detail: 'semantic candidate definition could not be attested' };
+          candidates.push({ name: String(index), operationId: row.identifier,
+            description: [row.identifier, row.displayName, row.description].filter(Boolean).join('\n'),
+            inputSchema: attested.attestation.inputSchema,
+          });
+        }
+        const selected = await input.semanticNomination(requirement.objective, candidates);
+        if (selected === null || selected.some((id) => !/^\d+$/.test(id) || !eligible[Number(id)])) {
+          return { status: 'unavailable', detail: 'semantic read nomination could not be established' };
+        }
+        const selectedIds = new Set(selected);
+        rows = eligible.filter((_row, index) => selectedIds.has(String(index)));
+      }
       if (rows.length === 0) return { status: 'missing' };
       const nominations: ProductionLiveReadNominationV1[] = [];
       for (const row of rows) {
@@ -581,11 +604,13 @@ export function createAttestedLiveReadCarrierAdapter(input: {
 export function createProductionMcpLiveReadAcquisitionAdapter(input: {
   serverName: string;
   runtime?: ProductionMcpRuntime;
+  semanticNomination?: typeof nominateReadCapabilitiesWithJev;
 }): ProductionLiveReadCarrierAdapterV1 {
   const mcp = createProductionMcpReadCarrier(input);
   return createAttestedLiveReadCarrierAdapter({
     adapterId: `native_mcp:${mcp.carrier.identity.name}`,
     carrier: mcp.carrier,
+    semanticNomination: input.semanticNomination ?? nominateReadCapabilitiesWithJev,
     materialize: (objective, expectedIdentity, publicationGuard) => (
       mcp.materialize(objective, expectedIdentity, publicationGuard)
     ),
