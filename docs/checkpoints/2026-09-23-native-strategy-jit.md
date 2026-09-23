@@ -513,3 +513,39 @@ failed-open reviewer success. Typecheck passes for the accounting correction
 (/tmp/clem-carrier-accounting-types.log).
 Adjacent native integration, lifecycle hooks and tool-effect checks77/77 pass
 (/tmp/clem-carrier-accounting-adjacent.log). Full suite is still unqualified.
+
+
+## Installed02e2b accounting acceptance and next readback correction
+
+Hotpatched clean02e2b5665 with Terminal recipe; fingerprint0209e4f607138fdee378a8dd5151b2b6216ae6f9ee3b80086cf90a87b49392b7.
+Fresh source289625/session sess-desktop-53144b2b5b465ea08d48498f ran the same
+recovery prompt with a new fixture name. Terminal289815 done; native direct
+workflow_run289708 is now correctly accounted as workflow_run. One child
+1790171140597-e0a87e succeeded with product323. Independent API confirms fixture
+harness-plan-author-0923-02e2b-repair disabled; installed terminal proof ok, all7
+plan operations satisfied, earlier74e proofs preserved. No operator cleanup.
+One strategy update289817. Evidence: output/harness-acceptance/2026-09-23-02e2b5665/.
+
+113097ms,11 top-level calls,zero searches.609786prompt/350980cached/258806uncached
+input/9611output.29 records:13Opus5.5,8Grok4.3,7Jev1.13,1Jevlatest. Exact
+attribution certified but ONE uncertified token record. No speed improvement
+claimed. The extra workflow_get was an invalid section value corrected to
+metadata; do not misattribute that error to a missing enabled flag.
+
+The preceding51333 run separately exposed that the FULL workflow_get view does
+not show enabled at all, despite returning the complete definition. Metadata
+already has enabled. Add the saved flag at the beginning of the full view so it
+cannot be lost behind large step prompts and can verify definition+state in one
+read. No workflow state or defaults change. Production handler pin verifies
+both true/false, default/explicit full, and metadata agreement. Unchanged02e2b
+fails the pin (/tmp/clem-enabled-readback-red.log). Candidate live acceptance owed.
+
+Investigated bare-type-union schema compaction without shipping it: installed
+registry workflow_create would save684 bytes, workflow_update817; whole registry
+5149 bytes. This is not billed usage or a large efficiency win. Defer that
+change while higher-value repair/context work remains. Preserve stable tool
+surface and original accepted source/plan/evidence; prior mid-turn pruning broke
+recovery, so do not repeat it as an unmeasured optimization.
+
+Readback correction:143/143 orchestration and accepted-task terminal-preparation
+checks pass; typecheck passes (/tmp/clem-enabled-readback-{green,types}.log).

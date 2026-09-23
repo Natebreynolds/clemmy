@@ -1743,6 +1743,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult([
         describeWorkflowPlainEnglish(w),
         `Open workflow: ${workflowConsoleUrl(w.name)}`,
+        `Enabled: ${w.enabled}`,
         '',
         '— technical detail —',
         `File: ${path.relative(path.dirname(entry.dir), entry.filePath)}`,

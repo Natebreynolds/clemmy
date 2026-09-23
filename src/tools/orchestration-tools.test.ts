@@ -571,6 +571,23 @@ test('workflow_get full view shows the authorable shape of a gated call step in 
   assert.match(text, /draft\n[\s\S]*prompt:\n\s+1\tDraft three lines\./);
 });
 
+test('workflow_get full readback exposes the saved enabled state without a second metadata call', async () => {
+  for (const enabled of [true, false]) {
+    writeWorkflow('lifecycle-state-readback', {
+      name: 'Lifecycle State Readback', description: 'Controlled lifecycle readback', enabled,
+      trigger: { manual: true },
+      steps: [{ id: 'compute', transform: { version: 1, expression: { op: 'literal', value: 323 } }, sideEffect: 'read' }],
+    } as never);
+    for (const section of [undefined, 'full']) {
+      const text = resultText(await workflowGet()({name: 'Lifecycle State Readback', ...(section ? { section } : {})}));
+      assert.match(text, new RegExp(`^Enabled: ${enabled}$`, 'm'));
+      assert.match(text, /transform:/, 'definition and state are available in the same read');
+    }
+    const metadata = resultText(await workflowGet()({ name: 'Lifecycle State Readback', section: 'metadata' }));
+    assert.match(metadata, new RegExp(`"enabled": ${enabled}`));
+  }
+});
+
 test('workflow_get metadata section is structurally selectable and omits large step prompts', async () => {
   const promptSentinel = 'FULL-PROMPT-MUST-NOT-ENTER-METADATA';
   writeWorkflow('bounded-metadata-read', {
