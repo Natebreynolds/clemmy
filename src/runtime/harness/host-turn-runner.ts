@@ -9981,7 +9981,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               callIndex,
             })
           : null;
-        const consent = await (approvalExactProduction.boundary === 'nested_owned'
+        // A constraint refusal belongs to the exact effective write, including
+        // a nested work_call. Preparation must not replace it with a grant.
+        const consent = authoredWorkflowConsent && authoredWorkflowConsent.status !== 'decided'
+          ? authoredWorkflowConsent
+          : await (approvalExactProduction.boundary === 'nested_owned'
           && !approvalExactProduction.graphlessLocalMutation
           && isPlainOrClementineLocalTool(call.name, 'work_call')
           && isHostPlanRequiredWorkCall(tool)
@@ -10021,6 +10025,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             })()
           : authoredWorkflowConsent ?? evaluateExactHostMutationConsent(approvalExactProduction));
         if (!consent || consent.status !== 'decided') {
+          if (consent?.status === 'repair') preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           if (!preApprovalRepairDiagnostics.has(call.callId)) {
             preApprovalRepairDiagnostics.set(call.callId, {
               diagnostic: `Host refused ${call.name} before dispatch (${consent?.reason ?? 'consent_preparation_unavailable'}).`,

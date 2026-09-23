@@ -1,7 +1,7 @@
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
-import { workflowRunReadEvidence, summarizeWorkflowReadExecutions } from './workflow-read-evidence.js';
+import { validateWorkflowRunGoal, workflowGoalExecutionEvidence, workflowGoalValidationReceipt } from './workflow-goal-review.js';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -89,7 +89,7 @@ import {
   type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
-import { validateGoal, toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
+import { toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
 import {
   ensureWorkflowRunGoal,
   recordGoalValidation,
@@ -843,10 +843,12 @@ export interface WorkflowRunGoalValidationV1 {
   judgeFailedOpen: boolean;
   perCriterion: Array<{
     criterion: string;
+    scope?: 'objective';
     pass: boolean;
     method: 'deterministic' | 'judge' | 'skipped';
     detail?: string;
   }>;
+  objectiveReview?: GoalValidationResult['perCriterion'][number];
   validatedAt: string;
 }
 
@@ -15836,9 +15838,8 @@ async function processOneRunFile(
       let goalFeedbackNext = '';
       let goalRequeueId: string | undefined;
       if (runGoal) {
-        const readEvidence = workflowRunReadEvidence(run.id);
-        const readExecutions = summarizeWorkflowReadExecutions(readEvidence);
-        goalVerdict = await validateGoal({
+        const executionEvidence = workflowGoalExecutionEvidence(readWorkflowTargetEvidence(run.id), workflow.data);
+        goalVerdict = await validateWorkflowRunGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
           // The goal reviewer reads its own evidence text, not the target
@@ -15847,28 +15848,20 @@ async function processOneRunFile(
           // gated save ran four seconds later, and this reviewer scored the
           // run 4/5 for "saved without your review" because it never saw the
           // approval.
-          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), humanDecisionBlocks(run.id).join('\n'), readExecutions].filter(Boolean).join("\n\n"),
+          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), humanDecisionBlocks(run.id).join('\n'), executionEvidence.summary].filter(Boolean).join("\n\n"),
           // Structured outputs unlock the required-keys deterministic class —
           // key-presence criteria are checked in code, never by the judge
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).
           stepOutputs: publicRawStepOutputs,
-          readEvidence,
+          readEvidence: executionEvidence.evidence,
         });
         const goalValidatedAt = new Date().toISOString();
-        goalValidation = {
-          version: 1,
+        goalValidation = workflowGoalValidationReceipt({
           objective: runGoal.objective,
-          successCriteria: [...runGoal.successCriteria],
-          pass: goalVerdict.pass,
-          judgeFailedOpen: goalVerdict.judgeFailedOpen === true,
-          perCriterion: goalVerdict.perCriterion.map((criterion) => ({
-            criterion: criterion.criterion,
-            pass: criterion.pass,
-            method: criterion.method,
-            ...(criterion.detail !== undefined ? { detail: criterion.detail } : {}),
-          })),
+          successCriteria: runGoal.successCriteria,
+          verdict: goalVerdict,
           validatedAt: goalValidatedAt,
-        };
+        });
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         appendWorkflowEvent(workflow.name, run.id, {
           kind: 'verdict_recorded',
@@ -16423,7 +16416,7 @@ async function processOneRunFile(
       const goalSummary = goalMissed && goalMissAdvisoryOnly
           ? `\n\n🎯 Pinned goal review — the work above was delivered; the judge could not evidence every criterion:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nReview if the gap matters, or adjust the goal.`
           : goalMissed
-          ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
+          ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Inspect the existing results and reconcile any completed writes before deciding how to address the gaps.`
           : '';
       // Wave 2.2 (structured run summary): emit "succeeded because X + artifacts
       // (files/URLs/counts)" at completion. The structured `run_summary` event is

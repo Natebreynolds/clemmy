@@ -33,6 +33,12 @@ const observations = await import('./independent-capability-observation.js');
 const productionAdapters = await import('./production-capability-adapter.js');
 const acceptedCatalogScope = await import('./accepted-source-catalog-scope.js');
 const authorityAdapter = await import('./authored-workflow-write-authority.js');
+// These authority fixtures use a recording reviewer; never invoke paid models.
+test.beforeEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(async () => ({
+  verdict: 'compatible', reason: 'Recording reviewer accepts the fixture proposal.', proposalDigest: 'fixture-review',
+})));
+test.afterEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(null));
+
 const externalRisk = await import('./external-capability-risk-loader.js');
 const canonicalJson = await import('../../shared/closed-canonical-json.js');
 const composioSchemas = await import('../../tools/composio-schema-cache.js');

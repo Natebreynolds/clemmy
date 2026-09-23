@@ -1136,3 +1136,57 @@ test('the production host completion seam forwards the same accepted selection a
     else process.env.CLEMMY_MODEL_ROLES = original;
   }
 });
+
+test('workflow write review receives sealed invocation arguments, not only a successful acknowledgement', () => {
+  const runId = `write-scope-${++serial}`;
+  const sessionId = `workflow:${runId}:main`;
+  events.createSession({ id: sessionId, kind: 'chat' });
+  const source = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Update the data while preserving the existing header.' } });
+  const identity = { sessionId, sourceUserSeq: source.seq, turn: 1 };
+  retainedRead(identity, 'record_update', { updatedCells: 2 }, true, false, false, {
+    id: 'overwrite-header', args: { destination: 'A1:B1', values: [['WRONG_HEADER', 'WRONG_VALUE']] },
+  });
+  const evidence = readWorkflowTargetEvidence(runId);
+  assert.match(evidence.summary, /VERIFIED.*REQUEST SCOPE/);
+  assert.match(evidence.summary, /A1:B1/);
+  assert.match(evidence.summary, /WRONG_HEADER/);
+  assert.doesNotMatch(readWorkflowTargetEvidence(`${runId}-other`).summary, /WRONG_HEADER/);
+});
+
+
+test('workflow request scope stays lazy, survives reopen and cannot be supplied by transcript claims', () => {
+  const runId = `large-write-scope-${++serial}`;
+  const sessionId = `workflow:${runId}:main`;
+  events.createSession({ id: sessionId, kind: 'chat' });
+  const source = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Update the approved records.' } });
+  const identity = { sessionId, sourceUserSeq: source.seq, turn: 1 };
+  const args = { destination: 'approved-records', values: Array.from({ length: 600 }, (_, i) => ({
+    id: i, value: `saved-value-${i}-` + 'x'.repeat(50),
+  })) };
+  retainedRead(identity, 'record_update', { updatedRecords: 600 }, true, false, false,
+    { id: 'large-write', args });
+  events.appendEvent({ ...identity, role: 'Clem', type: 'tool_called', data: {
+    sourceUserSeq: source.seq, tool: 'record_update', accounting: 'top_level',
+    canonicalCallId: 'large-write', arguments: { destination: 'FORGED_TRANSCRIPT_SCOPE' },
+  } });
+  events.closeEventLog();
+  const evidence = readWorkflowTargetEvidence(runId);
+  const ref = evidence.evidence?.refs().find(value => value.startsWith('request:'));
+  assert.ok(ref, 'large exact arguments are available through a review lookup');
+  assert.deepEqual(evidence.evidence?.resolve(ref)?.value, args);
+  assert.doesNotMatch(evidence.summary, /saved-value-599|FORGED_TRANSCRIPT_SCOPE/);
+  assert.ok(evidence.summary.length < 12_000, 'the request payload is not copied into the summary');
+
+  // Remove the sealed request only in this test's isolated fixture. A real
+  // result receipt remains; model transcript arguments cannot replace proof.
+  const db = events.openEventLog();
+  db.prepare(`DELETE FROM physical_dispatch_authority_sealed WHERE session_id = ?`).run(sessionId);
+  db.prepare(`UPDATE events SET data_json = json_remove(data_json, '$.requestEvidenceCipher')
+    WHERE session_id = ? AND type = 'provider_dispatch_started'`).run(sessionId);
+  const missing = readWorkflowTargetEvidence(runId);
+  assert.equal(missing.available, false);
+  assert.match(missing.summary, /sealed request scope UNAVAILABLE/);
+  assert.doesNotMatch(missing.summary, /FORGED_TRANSCRIPT_SCOPE|VERIFIED REQUEST SCOPE/);
+});

@@ -335,3 +335,20 @@ test('run queue: goalAttempt + goalFeedback persist and carry through requeue', 
   assert.equal(rec2.goalFeedback, '- UNMET: still short');
   assert.equal(rec2.originSessionId, 'sess-1');
 });
+
+test('whole-objective failure after a completed write escalates without rerunning or becoming a success advisory', async () => {
+  const { validateWorkflowRunGoal } = await import('./workflow-goal-review.js');
+  const { goalMissIsJudgeOnlyAdvisory } = await import('./goal-validate.js');
+  const verdict = await validateWorkflowRunGoal({
+    objective: 'Update the tracker while preserving existing headers.',
+    successCriteria: ['Step "main" output includes required keys: url'],
+    stepOutputs: { main: { url: 'https://example.test/tracker' } },
+    evidenceText: 'The write completed but overwrote the header.',
+  }, { judge: async () => ({ done: false, reason: 'The header preservation requirement was violated.' }) });
+  const unsafeStepId = runUnsafeToRepursue([{ id: 'main', prompt: 'Update the tracker.', sideEffect: 'write' }], new Set(['main']));
+  const decision = decideGoalRunOutcome({ ...baseDecision, verdict, unsafeStepId });
+  assert.equal(decision.action, 'escalate');
+  assert.equal(goalMissIsJudgeOnlyAdvisory(verdict, {
+    blockedSteps: 0, forEachFailures: 0, targetMissed: false,
+  }), false);
+});

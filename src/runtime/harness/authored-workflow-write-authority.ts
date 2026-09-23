@@ -21,6 +21,7 @@ import {
 } from './tool-effect.js';
 import {
   localPlanningArgumentsMatch,
+  resolveConfiguredLocalPlanningTool,
   observeCurrentLocalPlanningDefinitions,
   type AuthorizedLocalPlanningDefinitionV1,
 } from './local-planning-capability.js';
@@ -59,6 +60,14 @@ import {
   journalInteractiveConsentDecision,
   type HostConsentCoverageScope,
 } from './host-consent-evidence.js';
+
+import { durableLogicalCallContract } from './logical-call-contract.js';
+import type { reviewWorkflowMutation } from './workflow-mutation-review.js';
+
+let mutationReviewerOverride: typeof reviewWorkflowMutation | null = null;
+export function _setWorkflowMutationReviewerForTests(review: typeof reviewWorkflowMutation | null): void {
+  mutationReviewerOverride = review;
+}
 
 const VERSION = 1 as const;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -634,6 +643,49 @@ function reopenAuthoredStepAuthority(
   return { receipt, step, planScope };
 }
 
+/** Constraint review is a refusal boundary, never a replacement for consent.
+ * Run before reserving an authored send, so a corrected proposal can still use
+ * its one occurrence. Errors return a non-null hold and cannot fall through. */
+async function reviewAuthoredWriteConstraints(input: {
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+  reopened: ReopenedAuthoredStep;
+  schema?: unknown;
+}): Promise<HostInteractiveConsentResult | null> {
+  try {
+    const argsDigest = digest(input.args);
+    if (durableLogicalCallContract(input.attestation.acceptedTaskId, input.attestation.toolName, input.args)?.argumentDigest !== input.attestation.argumentDigest) {
+      return { status: 'repair', retryable: true, reason: 'workflow_write_arguments_changed' };
+    }
+    const schema = input.schema ?? (await resolveConfiguredLocalPlanningTool(input.attestation.toolName, 'work_call'))?.parameters;
+    if (!schema) return { status: 'hold', retryable: true, reason: 'workflow_write_schema_unavailable' };
+    const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+    const evidence = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId);
+    const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
+    const result = await review({
+      sessionId: input.attestation.sessionId,
+      instructions: input.reopened.step.prompt,
+      tool: input.attestation.toolName,
+      schema,
+      args: input.args,
+      observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
+    });
+    // Model review is asynchronous. Do not project a verdict into an attempt
+    // that ended or whose adopted authority changed while it was running.
+    const current = reopenAuthoredStepAuthority(input.attestation);
+    if (!current || current.receipt.authorityDigest !== input.reopened.receipt.authorityDigest
+      || digest(input.args) !== argsDigest) {
+      return { status: 'hold', retryable: true, reason: 'workflow_write_authority_changed_during_review' };
+    }
+    if (result.verdict === 'compatible') return null;
+    return result.verdict === 'conflict'
+      ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}` }
+      : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}` };
+  } catch {
+    return { status: 'hold', retryable: true, reason: 'workflow_write_constraints_unavailable' };
+  }
+}
+
 function acceptedOccurrenceBinds(input: {
   attestation: HostCallAttestation;
   acceptedBatch: AcceptedModelBatchRef;
@@ -1032,6 +1084,10 @@ async function evaluateAuthoredCatalogWrite(input: {
     },
   });
   if (decision.kind === 'proceed' && ['exact_user_grant', 'settled_replay'].includes(decision.basis)) {
+    if (decision.basis !== 'settled_replay') {
+      const refusal = await reviewAuthoredWriteConstraints({ ...input, schema });
+      if (refusal) return refusal;
+    }
     if (gate === 'send' && decision.basis === 'exact_user_grant') {
       rememberSendGrant({
         acceptedBatch: input.acceptedBatch,
@@ -1212,6 +1268,10 @@ async function evaluateAuthoredLocalWrite(input: {
     decision.kind !== 'proceed'
     || !['exact_reversible_work', 'exact_ordinary_work', 'settled_replay'].includes(decision.basis)
   ) return null;
+  if (decision.basis !== 'settled_replay') {
+    const refusal = await reviewAuthoredWriteConstraints(input);
+    if (refusal) return refusal;
+  }
   return { status: 'decided', decision, call, coverage };
 }
 

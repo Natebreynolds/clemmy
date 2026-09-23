@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readWorkflowSettlementEvidence } from './workflow-settlement-evidence.js';
 import { isWorkflowParentTerminalIdentity } from './workflow-parent-terminal-proof.js';
 import { humanizeStepOutput } from './workflow-diagnosis.js';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -689,6 +690,7 @@ function resolveWorkflowOriginGroupReport(
  * review. Model-authored run ids, result text and observer objects cannot
  * supply or widen this evidence. Delivery bookkeeping is not execution data. */
 export function readWorkflowOriginCompletionEvidence(input: WorkflowOriginTerminalInput): {
+  toolSettlements: Array<{ runId: string; evidence: ReturnType<typeof readWorkflowSettlementEvidence> }>;
   digest: string;
   summary: string;
   allExecutionsCompleted: boolean;
@@ -718,11 +720,12 @@ export function readWorkflowOriginCompletionEvidence(input: WorkflowOriginTermin
       if (workflowRunReportBackContentDigest(reportBack) !== expected?.reportBackDigest) throw new Error('child report changed');
       const { notifiedAt: _notified, reportBackAcknowledgedAt: _ack,
         reportBackRetry: _retry, reportBack: _report, ...execution } = record;
-      return { ...execution, reportBack };
+      return { ...execution, reportBack, toolSettlements: readWorkflowSettlementEvidence(runId) };
     });
     const summary = JSON.stringify({ sourceGroupId: projection.sourceGroupId,
       sourceGroupDigest: projection.sourceGroupDigest, members });
     return { digest: createHash('sha256').update(summary).digest('hex'), summary,
+      toolSettlements: members.map(member => ({ runId: member.id, evidence: member.toolSettlements })),
       allExecutionsCompleted: members.every(member => member.status === 'completed'
         && typeof member.finishedAt === 'string'),
       sourceGroupId: projection.sourceGroupId, sourceGroupDigest: projection.sourceGroupDigest };

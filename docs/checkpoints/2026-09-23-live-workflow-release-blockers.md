@@ -1,0 +1,340 @@
+# Real workflow acceptance: release blocked
+
+Owner redirected work from continued optimization to the Friday dashboard failure
+and an actual Platform 49 run. Stop optional latency tuning. Installed clean
+327a7a14a/fingerprint9222e05a4fe93d17a4d12656eb4ad29d6d2646632db7d4afa80e0fc41a744c05.
+Main/UI remains e77215d0. No further runtime change or hotpatch in this incident.
+The pending-question inventory optimization has NOT shipped: its regression patch
+is saved at /tmp/clem-question-scan-unshipped.patch and the worktree test restored.
+
+## Friday dashboard: exact failure established, auth not repaired
+
+friday-dashboard-daily-refresh occurrence trigger-45b20a4bf64699eae1ce593262885700,
+Sept23 14:00:17–14:00:26UTC: six Salesforce CLI reads failed NamedOrgNotFoundError.
+No dashboard update completed. Sept22 and21 succeeded; Sept20 has the same error.
+Do not claim the latest patch caused this, or claim historical release attribution
+without unchanged-HEAD/last-tag reproductions.
+
+Independent /usr/local/bin/sf org display reproduces it outside Clem. sf org list
+auth returns no usable orgs and identifies both existing auth files as invalid:
+security SecKeychainItemCreateFromContent: user name or passphrase incorrect.
+security show-keychain-info on the default login.keychain-db independently fails
+with the same error. Daemon HOME is the real user home; no SF_STATE_FOLDER or
+SFDX_STATE_FOLDER override. Auth files exist. Credentials were not reset, copied,
+printed, migrated or reauthorized. Asked owner whether Mac is currently unlocked;
+answer pending. No inference that a Salesforce re-login alone fixes the Keychain.
+Evidence /tmp/clem-friday-failure/{workflow,runs,friday-run}.json.
+
+## Platform49: terminal success contradicted by execution
+
+Owner requested real-workflow validation. Asked Clem to run existing
+platform-49-slack-channel-review once with existing rules, no definition change.
+Parent source289927/session sess-desktop-10bc0c0a5968a1f69f04bc7b.
+Child1790172298675-ced878, session workflow:1790172298675-ced878:main.
+Started14:05:03.820, terminal succeeded14:07:12.494UTC; parent290187 done.
+Slack reads, thread/user lookups, Sheets reads/writes and space_refresh executed.
+No Slack post/reply/reaction/DM call observed. This is NOT an acceptance pass.
+
+Defect 1: first Sheets read retained BOTH Log and Daily Digest headers. Digest
+original row1 was [Date (PT), Items Logged, Requests, Feedback, Open / Unanswered,
+Sections Touched, Headline Insight, Run At (PT)]. Call290066 wrote today's digest
+values over A1:H1. Call290082 then wrote literal A,B,C,D,E,F,G,H over those headers.
+Call290103 wrote a digest at A100:H100. All three writes returned success.
+The saved workflow explicitly requires preserving team headers/non-owned cells.
+No personal workflow definition was edited as a workaround.
+
+Operator mitigation: exact pre-run header bytes recovered with installed
+getToolOutput for call toolu_01F8Xg6cTV7L6wbwUoHQGjPf. Fresh Composio read confirmed
+A-H still present; restored ONLY A1:H1 using exact original eight strings and RAW.
+Write log_xqS4FSInY5pN, then fresh readback matched all eight. This is operator
+repair, NOT Clem recovery/acceptance. /tmp/clem-friday-failure/{current-headers,
+repair-headers-args,repair-headers-receipt,repaired-headers-readback}.json.
+No other rows/formatting changed by operator. Asked owner whether to pause its
+8/12/16PT schedule pending framework fix; answer pending, enabled not changed.
+
+Defect 2: space_refresh290128 says sheet_log ok1row, slack_feed ok15rows.
+Parent final says no new rows, assumes Workspace and Digest unchanged, admits it
+has not confirmed, yet declares success/no failures. This contradicts receipts.
+Child output schema is only {url,leads}; actual result {url,leads:[]} is too weak
+to support claims about performed updates. Runtime/parent needs bounded actual
+execution evidence, not solely child prose or a URL-shaped output check.
+
+Context lead, not yet proven cause: tool_output_query289997 renders two nested
+range records with large first values array. Its result is20000chars, event clips
+at~8k; the visible preview never reaches the second header. Original retained
+read is complete. Investigate shape-aware bounded presentation and whether the
+model actually retrieved required destination headers before mutating. Do NOT
+silently authorize a write based on clipped previews, infer restored headers,
+or add provider/tool-name special rules to the kernel.
+
+Full incident events, excluding memory fragments:
+output/harness-acceptance/2026-09-23-platform49-incident/events.json.
+
+## Next implementation / release evidence
+
+1. Preserve exact user constraints across workflow execution and verify writes
+   against retained destination evidence, including header/non-owned-cell
+   preservation. Pin the failure at framework boundary; no prompt-only patch.
+2. Parent workflow completion/readback must contain settled effect evidence and
+   surface contradicted/uncertain outcomes. A terminal succeeded row alone cannot
+   justify claims that no writes happened or an unverified Workspace was unchanged.
+3. Verify in named controlled fixtures, then agreed real workflow under live home.
+   Do not repeat Platform49 unchanged as another test. Keep operator recovery
+   separate from autonomous success. Never claim tag readiness from arithmetic.
+4. Salesforce requires restored Keychain access before another live read can
+   validate that integration. Continue framework work while owner supplies state.
+
+## Unshipped candidate: pinned goal review coverage
+
+Confirmed the actual saved goal has only two criteria: main output contains
+url/leads and url is HTTP(S). Both passed. A declared goal skips the full target
+review, while pinned-goal evidence previously excluded write receipts. Thus those
+two schema checks were treated as completion of the broader objective.
+
+Candidate in workflow-goal-review.ts plus workflow-runner.ts adds the complete
+objective to the existing batched goal review and exposes saved workflow rules
+and the existing authenticated target evidence (reads AND writes) through lazy
+refs. Tool/outcome counts are bounded in the prompt; retained content remains
+available. Human review decisions remain inline. Persisted validation criteria
+now match the actual evaluated criteria. No personal workflow definition changes.
+
+Red pin: existing validation returned pass=true despite output containing only a
+URL/empty list and an unmet preservation objective. /tmp/clem-workflow-goal-review-red.log.
+Candidate's initial 21 goal tests and 10 adjacent evidence tests passed; typecheck
+passed. Final added outage regression and goal suite recorded separately in
+/tmp/clem-workflow-goal-final.log. No generative provider calls in these tests.
+The isolated runner did NOT perform its live-home sentinel while daemon13973 was
+running; unit tests explicitly create their own temporary home where needed.
+These are regression checks, NOT installed-app acceptance.
+
+Still owed: generic pre-dispatch constraint preservation, parent effect reporting,
+proper terminal treatment of unmet whole-objective review (existing judge-only
+misses can remain advisories), final checks/build/commit/hotpatch and controlled
+live acceptance. The candidate is NOT installed and does not prevent the original
+bad write yet. Do not rerun Platform49 as if this were fixed. Optional latency
+work remains deferred; no tag readiness claim.
+
+## Unshipped candidate: parent receives child settlement facts
+
+The authored workflow write-authority path reopens the frozen definition and
+checks exact operation/schema/account/risk/occurrence. It does NOT check the
+proposed argument values against preservation instructions. This remains the
+pre-dispatch defect; no new semantic gate or provider-specific rule was added.
+
+Implemented workflow-settlement-evidence.ts: read canonical joined logical-call
+settlements for the exact run session namespace, grouped by tool/execution kind/
+outcome/mutation flag, with a digest of every matching identity and argument/
+result-handle reference. Groups are bounded at40; omitted groups and unreadable
+or namespace-incomplete evidence never assert zero writes or unchanged state.
+No payloads or model calls are added. Shared partition/legacy sessions are
+explicitly outside this namespace; this is positive effect evidence, not a
+proof of all-workflow coverage.
+
+The authenticated all-member report-back snapshot now includes these facts,
+so the completion review's evidence digest changes if the child ledger changes.
+The original parent's continuation receives the same bounded facts immediately;
+it need not discover the writes by making another tool call. Historical report
+and settlement bytes are not rewritten.
+
+Read-only evaluation against the actual Platform49 incident found22 settled
+calls: three succeeded provider Sheets writes and one succeeded local Space
+refresh. This corroborates the incident, not live acceptance of the candidate.
+Ledger digest97aee795accc805dd266080c242a14ce4ad9f590e450951af62dbfe52240b7d8.
+
+Regression: all9 parent-review variants failed the new joined-evidence assertion
+on the old path, then passed after wiring (10 tests counting parent container).
+Two initial direct test invocations failed before assertions because they lacked
+the isolated runner's authority seal setup; those are NOT the red pin.
+Authoritative red/green: /tmp/clem-parent-settlements-{red,green}-isolated.log.
+Final resumed-parent check: /tmp/clem-parent-settlements-final.log (10pass).
+Report-back + settlement query checks: /tmp/clem-parent-settlements-adjacent.log
+(38pass). Final typecheck log /tmp/clem-parent-settlements-final-typecheck.log.
+The active daemon prevented the runner's live-home sentinel proof; WAL/SHM and
+contract state changed while it ran. Do not claim that sentinel passed.
+
+Still uncommitted/unbuilt/uninstalled. Required next: pre-dispatch preservation
+and whole-objective terminal semantics, then full targeted checks and a clean
+built hotpatch with controlled live acceptance. Platform49 must not be treated
+as fixed by improved evidence visibility alone.
+
+## Unshipped candidate: whole-objective terminal meaning
+
+Two additional red pins reproduced: whole-objective rejection became a judge-only
+advisory, and an objective mentioning a local filename passed via existence alone.
+Goal validation now accepts a host-typed objective criterion, always routes that
+criterion through semantic review, and preserves its scope on the verdict.
+The advisory reducer cannot downgrade a failed objective to successful work.
+A completed write still takes the existing unsafe-to-repursue escalation path;
+the regression proves no blind rerun decision. Ordinary criterion-only advisory
+behavior remains unchanged.
+
+Compatibility correction: the earlier candidate's changed successCriteria list
+would invalidate exact approved pilot receipts. workflowGoalValidationReceipt now
+preserves the original approved criteria and their perCriterion rows, records
+objectiveReview separately, and includes it in overall pass. This supersedes the
+prior checkpoint statement that persisted successCriteria contains every evaluated
+criterion. Failure text asks to inspect/reconcile existing results, not blindly
+rerun an external write.
+
+25 goal/review checks and21 workflow-goal/recurrence checks passed; final typecheck
+passed. Logs /tmp/clem-whole-objective-{terminal-red,final}.log,
+/tmp/clem-objective-goal-recurrence.log, /tmp/clem-objective-final-typecheck.log.
+Still unshipped; pre-dispatch preservation remains open.
+
+## Desktop notification click: installed shell base-path defect
+
+Owner reported Facebook Trends toast clicked but opened nowhere. Exact notice
+1790174047802-tool-notify, Scorpion Facebook Trends — Morning Report,
+created14:34:07.802UTC, runtrigger-0e87a8054f946564663ac6aca0a77244. Durable row
+is read=true and delivered to derived-desktop; no business workflow was rerun.
+
+console-routes desktop-pending emits router-relative
+/inbox?tab=notifications&select=<notification-id>. Installed app.asar dist/main.js
+contains focusDesktopNotificationRoute: it history.pushState's that href directly.
+Installed daemon/apps/console-web/dist/assets/index-BFe9bm3t.js confirms
+BrowserRouter basename:"/console". Thus the OS click navigates outside the app's
+router mount while marking the notice read. Both inspected artifacts are from the
+installed app, not just source assumptions. Shell reports3.18.19.
+
+Fix belongs in apps/desktop: translate validated router-relative Inbox href into
+/console/inbox?... at the browser-navigation boundary, with a routing regression
+that also preserves the exact selection and rejects foreign URLs. Backend router-
+relative links remain valid for React navigation; do not globally rewrite them.
+A daemon-only hotpatch cannot replace packaged desktop main.js. Need rebuilt
+shell/live native-click acceptance, not merely compiled web assets.
+
+UI ownership rule requires asking before crossing apps/desktop. Asked owner via
+async question; no approval received yet. No desktop/UI files changed. The other
+agent's main remains e77215d00. Continue independent framework work while pending.
+
+## Unshipped candidate: exact write arguments and bounded review evidence
+
+Workflow target evidence now reopens the sealed physical request paired with each
+redeemed result, with the existing authenticated physical-request fallback. The
+review can inspect actual destination and values rather than infer scope from an
+acknowledgement. Missing sealed arguments make evidence unavailable; transcript
+arguments never substitute. Large argument payloads use the existing on-demand
+evidence lookup instead of being copied into every review prompt.
+
+The original write-scope pin failed without this change. Combined target-evidence
+and host-completion checks passed52, skipped1, failed0; typecheck passed. Additional
+scope-integrity tests passed2: large arguments survive SQLite reopen and are
+retrievable by exact reference, forged transcript scope is excluded, and removing
+the sealed request in the isolated fixture produces explicit unavailable evidence.
+Logs: /tmp/clem-workflow-write-args-{red,green}.log,
+/tmp/clem-write-args-typecheck.log, /tmp/clem-write-scope-integrity.log.
+The live-daemon sentinel was NOT performed; these are isolated regression checks,
+not installed-app acceptance. No personal data was modified by these checks.
+
+A read-only Jev replay of the three recorded Platform49 write proposals used the
+saved step instructions and original header evidence. Actual jev-1.13.0 reviewed
+all three in398ms,4357 input/140 output tokens. The two header-overwriting calls
+were classified conflict (probability0.92/confidence0.88); the third was compatible
+with confidence0.28, insufficient to authorize a live write. This is a diagnostic
+replay, not a benchmark, guard implementation, or workflow acceptance. Receipt:
+/tmp/clem-friday-failure/write-review-replay-result.json. No proposals executed.
+
+Pre-dispatch review remains open. It must use exact reopened step constraints,
+canonical proposed arguments and authenticated destination evidence. A refusal
+must take the existing repair-arguments path, not return null and fall through
+to another consent reducer. An uncertain semantic result needs reconciliation;
+it cannot be promoted into authorization. Do not ship a provider-specific header
+rule or claim post-execution review prevents damage.
+
+Installed build-info was rechecked: clean327a7a14a, daemon13973, fingerprint
+9222e05a4fe93d17a4d12656eb4ad29d6d2646632db7d4afa80e0fc41a744c05.
+Main remains e77215d00; this candidate remains uncommitted, unbuilt and uninstalled.
+Desktop ownership question remains pending; no UI files changed.
+
+## Pre-dispatch constraint reviewer component — not wired yet
+
+Added workflow-mutation-review.ts with a separate proposed-write contract: exact
+saved instructions, tool schema, canonical arguments and authenticated prior
+observations. It does not reuse completion semantics or require an intermediate
+write to finish the whole workflow. Canonical proposal content is snapshotted and
+hashed; fallback verdicts must match that digest. Large proposals and retained
+observations remain accessible through evidence tools, not prefix truncation.
+
+A fully supplied high-confidence compatible Jev verdict avoids a second review.
+Conflict, low confidence, missing key, incomplete or retained observations use the
+configured reviewer for a specific repair reason. An unavailable reviewer returns
+uncertain, never compatible. A compatible result is explicitly not consent.
+Review spend has a separate mutation_constraints metric lane. The initial seven
+recording-model tests and typecheck passed; the final seven tests after schema/
+metric-lane/snapshot refinements also passed. Final typecheck still required.
+Logs /tmp/clem-mutation-review-tests.log, /tmp/clem-mutation-review-typecheck.log,
+/tmp/clem-mutation-review-tests-final.log. No provider calls in these tests.
+
+This component is NOT connected to dispatch and does not yet prevent a live write.
+Next: bind it to the reopened authored-step authority and exact current callable
+schema, feed authenticated run evidence, and pin refusal through the existing
+repair_arguments path without consent fallback or write-slot consumption. Cover
+local/catalog/send paths and outage recovery before installed controlled testing.
+Do not hotpatch this as a completed preservation fix.
+
+## Authored-write constraint review connected — unshipped
+
+Supersedes the prior 'not wired yet' status. Both authored catalog writes/sends
+and native local writes now review exact canonical arguments and current schema
+against the reopened immutable step prompt and authenticated run evidence before
+returning dispatch consent. Settled replay does not review or execute again.
+After asynchronous review, active authored authority and arguments are rechecked.
+Conflict returns a non-null repair; unavailable/uncertain review returns a non-null
+hold. Neither can fall through to another consent reducer. Authored sends reserve
+their one occurrence only after the review passes, leaving corrections possible.
+
+The host preserves a constraint refusal even through nested work_call preparation
+and projects repair results onto the existing repair_arguments edge. No approval
+card is introduced. This is additional constraint validation of an already covered
+write, never replacement consent or model-granted authority.
+
+Red pin: old host never called constraint review and accepted the first incorrect
+send proposal. /tmp/clem-write-constraint-host-red.log. Intermediate candidate
+failures caught use of a raw argument hash instead of the existing logical-contract
+digest; fixed by using durableLogicalCallContract. One test also incorrectly
+expected uppercase rather than the canonical lowercase tool identity; corrected
+without changing runtime identity. Disposition's outer retry remains replan; the
+typed nextEdge is repair_arguments, as required by the existing protocol.
+
+Final recording-model checks:30 passed,0 failed across authored external write,
+native local write, send host acceptance, and reviewer component suites. The
+conflicting send and native goal update dispatch zero bodies for the bad proposal
+and exactly one for its corrected successor; no approval cards. Uncertain review
+and thrown reviewer both dispatch zero sends. Existing once-per-send and settled
+replay fixtures still pass. Logs /tmp/clem-authored-constraint-final.log and
+/tmp/clem-write-constraint-host-final.log. Earlier failed candidate logs are not
+acceptance. Final typecheck passed: /tmp/clem-authored-constraint-final-typecheck.log.
+
+No paid models or business provider calls in these regression tests. Live-home
+sentinel remains NOT PERFORMED because daemon13973 is active. Installed bytes
+remain327a7a14a. Changes remain uncommitted/unbuilt/uninstalled. Still owed:
+review freshness/coverage and nested-carrier regression, measured real reviewer
+behavior (including uncertainty recovery), clean candidate build, installed
+controlled write-preservation acceptance and original release gates. Do not claim
+Platform49 safe or fixed from recording-model tests alone.
+
+## Candidate qualification before build
+
+The stopped-during-review host pin passed: a positive reviewer result cannot
+revive the cancelled authored run and no provider body executes. The real nested
+work_call carrier pin also passed: the conflict review is invoked, its refusal
+survives preparation, and no provider body executes. Logs:
+/tmp/clem-constraint-authority-freshness.log, /tmp/clem-constraint-nested.log.
+
+Combined scoped regression run:169 tests,168passed,1skipped,0failed;
+/tmp/clem-workflow-candidate-combined.log. Typecheck passed;
+/tmp/clem-workflow-candidate-typecheck.log. This is not the full suite or live
+acceptance. Main rechecked unchanged at e77215d00 with the owner's existing edits
+preserved. No UI files modified. The packaged notification navigation defect
+still requires the pending ownership handoff and shell rebuild.
+
+Next candidate step is commit and build on harness/3.19, then controlled installed
+acceptance after checking live activity. Do not rerun Platform49 to discover
+whether preservation works; use a named controlled fixture first. Measure actual
+Jev/reviewer fallback, write calls and tokens and verify preserved destination
+content independently. Original release gates, physical mobile and full suite
+remain owed; no tag or push authorized here.
+
+Exact named-workflow parent continuation regression also passed10 checks on this
+candidate: /tmp/clem-workflow-candidate-parent.log. Child settled-write facts reach
+the resumed parent's review without another discovery turn.

@@ -39,6 +39,8 @@ import { workflowFileEvidence } from './workflow-file-evidence.js';
 
 export interface GoalCriterionVerdict {
   criterion: string;
+  /** Host-authored whole-objective review; never inferred from model prose. */
+  scope?: 'objective';
   pass: boolean;
   method: 'deterministic' | 'judge' | 'skipped';
   detail?: string;
@@ -96,7 +98,8 @@ function directiveForFailure(c: GoalCriterionVerdict): GoalFailedDirective {
  *  verdicts. Pure; folded into every validateGoal return so callers always have
  *  a percentage and an actionable fix-list. */
 /**
- * A JUDGE-ONLY miss is an advisory, not a block.
+ * A criterion-only judge miss can remain an advisory. A failed whole-objective
+ * review cannot: it means the requested work has not been established.
  *
  * Live 2026-09-09: team-activity-slack-updates posted to Slack (receipt,
  * message ts, external_write_succeeded), then the pinned-goal judge failed one
@@ -122,7 +125,7 @@ export function goalMissIsJudgeOnlyAdvisory(
   if (verdict.judgeFailedOpen === true) return false;
   const failed = verdict.perCriterion.filter((criterion) => !criterion.pass);
   if (failed.length === 0) return false;
-  return failed.every((criterion) => criterion.method === 'judge');
+  return failed.every((criterion) => criterion.method === 'judge' && criterion.scope !== 'objective');
 }
 
 export function scoreGoalVerdicts(perCriterion: GoalCriterionVerdict[]): {
@@ -140,7 +143,7 @@ export function scoreGoalVerdicts(perCriterion: GoalCriterionVerdict[]): {
 
 export interface ValidateGoalInput {
   objective: string;
-  successCriteria: string[];
+  successCriteria: Array<string | { criterion: string; scope: 'objective' }>;
   /** The assistant's completion evidence — typically the final reply text
    *  plus any harness-collected artifact notes. */
   evidenceText: string;
@@ -264,7 +267,11 @@ export async function validateGoal(
   const judge = deps.judge ?? defaultJudge;
   const evidence = stepOutputEvidence(input.stepOutputs, input.readEvidence);
   const judgeContext: SkillExecutionContext | undefined = evidence ? { skills: [], toolCallSummary: '', evidence } : undefined;
-  const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter((c) => c.length > 0);
+  const normalizedCriteria = (input.successCriteria ?? []).map(c => typeof c === 'string'
+    ? { criterion: c.trim() }
+    : { criterion: c.criterion.trim(), scope: c.scope }).filter(c => c.criterion.length > 0);
+  const criteria = normalizedCriteria.map(c => c.criterion);
+  const objectiveCriteria = new Set(normalizedCriteria.filter(c => c.scope === 'objective').map(c => c.criterion));
 
   // No criteria declared → fall back to judging the objective itself, so a
   // criteria-less goal still gets the audit-checklist treatment.
@@ -304,6 +311,12 @@ export async function validateGoal(
   const fuzzy: string[] = [];
 
   for (const criterion of criteria) {
+    // The full task cannot be certified by a path/key mentioned in its text.
+    // Its constraints and content remain semantic even when the file exists.
+    if (objectiveCriteria.has(criterion)) {
+      fuzzy.push(criterion);
+      continue;
+    }
     const localPath = extractLocalPathFromCriterion(criterion);
     if (localPath) {
       const exists = fileExists(localPath);
@@ -376,6 +389,9 @@ export async function validateGoal(
     }
   }
 
+  for (const criterion of perCriterion) {
+    if (objectiveCriteria.has(criterion.criterion)) criterion.scope = 'objective';
+  }
   const failures = perCriterion.filter((c) => !c.pass);
   const pass = failures.length === 0;
   const advice = pass

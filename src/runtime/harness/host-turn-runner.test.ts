@@ -10225,6 +10225,10 @@ test('named workflow dispatch seals before review and final child evidence owns 
         assert.equal(report.checkpointWorkflowRunReportBack(file, { workflowName: name, outcome: childOutcome, detail }), true);
         const evidence = report.readWorkflowOriginCompletionEvidence(input);
         assert.ok(evidence);
+        const joinedMember = JSON.parse(evidence.summary).members[0];
+        assert.equal(joinedMember.toolSettlements?.available, true,
+          'joined parent evidence must include child dispatch facts, not only the child report');
+        assert.match(joinedMember.toolSettlements.meaning, /do not prove unchanged external state/);
         assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, detail: 'invented result' }), null);
         assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, evidenceRunIds: [runId, 'unowned-child'] }), null);
         assert.equal(report.readWorkflowOriginCompletionEvidence({ ...input, runId: '../outside' }), null);
@@ -10399,6 +10403,8 @@ test('named workflow dispatch seals before review and final child evidence owns 
               const foregroundSnapshot = eventlog.getSession(fixture.session.id)?.metadata.__conversation;
               const driven = await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
                 activateWorkflowParent: options => runConversation({ ...options, buildAgent: async identity => {
+                  assert.match(options.continuationSteer ?? '', /toolSettlements/,
+                    'the resumed parent receives child tool facts without another discovery turn');
                   const rebuilt = await options.buildAgent!(identity);
                   const { isHostPlanRequiredWorkCall } = await import('../../tools/work-call-mode.js');
                   assert.ok(rebuilt.tools.some(tool => (tool as { name?: string }).name === 'work_call'

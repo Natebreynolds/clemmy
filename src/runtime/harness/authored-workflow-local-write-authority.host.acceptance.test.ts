@@ -39,6 +39,12 @@ const brackets = await import('./brackets.js');
 const capabilityEnvelopes = await import('../../agents/capability-envelope.js');
 const planScopes = await import('../../agents/plan-scope.js');
 const authorityAdapter = await import('./authored-workflow-write-authority.js');
+// These authority fixtures use a recording reviewer; never invoke paid models.
+test.beforeEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(async () => ({
+  verdict: 'compatible', reason: 'Recording reviewer accepts the fixture proposal.', proposalDigest: 'fixture-review',
+})));
+test.afterEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(null));
+
 const hostConsent = await import('./host-interactive-consent.js');
 const callAuthority = await import('./accepted-turn-call-authority.js');
 const hostBindings = await import('./host-call-capability-binding.js');
@@ -683,4 +689,34 @@ test('a real schema-on-demand workflow agent writes through its configured carri
   const writes = nonRefusedSettlements(fixture).filter(row => row.logical_tool_call_id === 'scheduled-write');
   assert.equal(writes.length, 1, JSON.stringify(writes));
   assert.equal(writes[0].outcome_kind, 'succeeded');
+});
+
+test('native workflow write constraints reject before execution and allow corrected arguments', async () => {
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  const reviewed: unknown[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
+    assert.equal(input.tool, 'goal_upsert');
+    assert.match(input.instructions, /Approved title/);
+    reviewed.push(input.args.title);
+    return { verdict: input.args.title === 'Approved title' ? 'compatible' : 'conflict',
+      reason: 'Use the authored goal title.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('native-conflict', 'goal_upsert', { title: 'Wrong title', status: 'active' })],
+      [toolCall('native-corrected', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Approved goal saved.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.deepEqual(reviewed, ['Wrong title', 'Approved title']);
+    assert.equal(bodies.goal_upsert, 1);
+    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['native-corrected']);
+    assert.match(JSON.stringify(outcome.history), /workflow_write_constraint_conflict/);
+    assert.match(JSON.stringify(outcome.history), /repair_arguments/);
+    assert.equal(pendingApprovalCount(fixture), 0);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
