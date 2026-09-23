@@ -273,6 +273,7 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
+      ...(evidence?.results ? { verifiedReadResults: evidence.results } : {}),
       ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),
       ...(opts.reviewPolicy?.status === 'captured' ? { boundaryJudgeSelection: opts.reviewPolicy.judgeSelection } : {}),
     } : undefined));

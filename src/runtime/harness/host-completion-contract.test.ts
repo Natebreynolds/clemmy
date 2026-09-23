@@ -224,16 +224,21 @@ test('workflow target review uses exact run receipts, current file bytes and car
   assert.equal(evidence.available, true, evidence.summary);
   assert.match(evidence.summary, /call_tool -> write_file/);
   assert.match(evidence.summary, /current saved content matches the committed raw bytes/);
-  assert.ok(evidence.summary.includes(text));
+  assert.ok(evidence.evidence?.refs().some(ref => evidence.evidence?.resolve(ref)?.text === text),
+    'complete large content stays behind an authenticated evidence reference');
+  assert.ok(!evidence.summary.includes(text), 'large content is not duplicated into every review prompt');
   assert.ok(!evidence.summary.includes('UNRELATED_RESULT_MUST_NOT_LEAK'));
   let prompt = '';
   await judgeWorkflowTarget({ workflow: { name: 'target-proof', description: 'Create the report.' }, inputs: {},
     finalOutput: JSON.stringify({ file }), executionEvidence: () => readWorkflowTargetEvidence(runId),
     judgeFn: async (objective, response, context) => {
       prompt = buildObjectiveJudgePrompt(objective, response, context);
+      assert.ok(context?.evidence?.refs().some(ref => context.evidence?.resolve(ref)?.text === text));
+      assert.ok(context?.verifiedReadResults?.some(row => row.toolName === 'write_file' && row.authoringResult));
       return { done: true, reason: 'Report saved with the requested framework.' };
     } });
-  assert.ok(prompt.includes(text));
+  assert.ok(!prompt.includes(text));
+  assert.match(prompt, /evidence ref/);
   assert.match(prompt, /call_tool -> write_file/);
 
   // A positive judge cannot vouch for bytes changed during its own call.
@@ -1016,13 +1021,15 @@ test('writes that did not complete and calls refused before they ran are evidenc
 test('a blocked finding replaces the rejected draft; a plain negative keeps the generic note', () => {
   for (const [blocked, expected] of [
     [true, /^The invite was not changed because the update was refused before it reached the calendar\.$/],
-    [false, /Verification note: the completion review found this did not meet the request\./],
+    [false, /Verification note: the completion review did not accept this write-up\./],
   ] as const) {
     const identity = accepted('Update the invite description.');
     host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
       lane: 'host_v1', kind: 'completion', sourceUserSeq: identity.sourceUserSeq, fulfills: false,
       reason: 'The invite was not changed because the update was refused before it reached the calendar.',
+      objectiveDigest: createHash('sha256').update('Update the invite description.').digest('hex'),
+      replyDigest: createHash('sha256').update('I updated the invite.').digest('hex'),
       ...(blocked ? { blocked: true } : {}), continuation: false } });
     const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
       presentation: { kind: 'answer', text: 'I updated the invite.' } });
