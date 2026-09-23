@@ -37,6 +37,39 @@ import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext } from './model-wire-reg
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 
+export interface ToolSchemaCost {
+  name: string;
+  tokens: number;
+  bytes?: number;
+  deferred: boolean;
+}
+
+/** Observe the same schema projection used by the host budget estimator.
+ * Never include schema contents or mutate tools in telemetry. */
+export function measureToolPromptSurface(tools: readonly unknown[]) {
+  const costs: ToolSchemaCost[] = [];
+  for (const raw of tools) {
+    const tool = raw as Record<string, unknown>;
+    const deferred = tool.deferLoading === true;
+    const name = typeof tool.name === 'string' ? tool.name : String(tool.type ?? 'unnamed');
+    try {
+      const serialized = JSON.stringify({
+        type: tool.type, name: tool.name, description: tool.description,
+        ...(!deferred ? { parameters: tool.parameters, strict: tool.strict } : {}),
+      });
+      costs.push({ name, deferred, tokens: estimateTokens(serialized), bytes: Buffer.byteLength(serialized) });
+    } catch {
+      costs.push({ name, deferred: false, tokens: 50 });
+    }
+  }
+  return {
+    toolNames: costs.filter(cost => !cost.deferred).map(cost => cost.name),
+    measuredToolSchemaTokens: costs.filter(cost => !cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
+    deferredToolIndexTokens: costs.filter(cost => cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
+    toolSchemaCosts: costs,
+  };
+}
+
 /** Does this bucket survive unchanged into the next turn's prompt? */
 export type PromptBucketStability = 'stable' | 'variable';
 
@@ -53,6 +86,7 @@ export interface PromptBucket {
 }
 
 export interface PromptCompositionSummary {
+  toolSchemaCosts?: readonly ToolSchemaCost[];
   buckets: PromptBucket[];
   totalTokens: number;
   stableTokens: number;
@@ -67,6 +101,7 @@ export interface PromptCompositionSummary {
 }
 
 export interface PromptCompositionInput {
+  toolSchemaCosts?: readonly ToolSchemaCost[];
   /** System instructions / persona / standing rules — should be invariant. */
   instructions?: string;
   /** Prior-turn transcript. Grows monotonically; stable as a PREFIX only if
@@ -175,6 +210,7 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     variableTokens,
     stableShare: totalTokens > 0 ? Math.round((stableTokens / totalTokens) * 1000) / 1000 : 0,
     toolCount: toolNames.length,
+    ...(input.toolSchemaCosts ? { toolSchemaCosts: input.toolSchemaCosts } : {}),
   };
 }
 
@@ -202,6 +238,7 @@ export function recordPromptComposition(
         variableTokens: summary.variableTokens,
         stableShare: summary.stableShare,
         toolCount: summary.toolCount,
+        ...(summary.toolSchemaCosts ? { toolSchemaCosts: summary.toolSchemaCosts } : {}),
         buckets: summary.buckets,
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
       },

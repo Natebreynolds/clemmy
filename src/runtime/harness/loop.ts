@@ -100,7 +100,7 @@ import {
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
 import { discoveryGovernor } from './discovery-governor.js';
-import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
+import { measureToolPromptSurface, recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
@@ -4255,36 +4255,6 @@ function inFlightCompactionEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_INFLIGHT_COMPACTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-function estimateAgentToolPromptComponents(agent: Agent<any, any>): Record<string, number> {
-  let firstClass = 0;
-  let deferredIndex = 0;
-  for (const rawTool of agent.tools ?? []) {
-    const tool = rawTool as unknown as Record<string, unknown>;
-    try {
-      if (tool.deferLoading === true) {
-        deferredIndex += estimateTokens(JSON.stringify({
-          type: tool.type,
-          name: tool.name,
-          description: tool.description,
-        }));
-      } else {
-        firstClass += estimateTokens(JSON.stringify({
-          type: tool.type,
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters,
-          strict: tool.strict,
-        }));
-      }
-    } catch {
-      firstClass += 50;
-    }
-  }
-  return {
-    ...(firstClass > 0 ? { toolSchemas: firstClass } : {}),
-    ...(deferredIndex > 0 ? { deferredToolIndex: deferredIndex } : {}),
-  };
-}
 
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
@@ -11289,7 +11259,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const inFlightCompaction = createInFlightCompactionState();
   let archiveReferences: Map<string, ArchivedTaskMessageReference> | undefined;
   const archivedMessages = new Map<string, ArchivedTaskMessageReference>();
-  const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
+  const toolSurface = measureToolPromptSurface(options.agent.tools ?? []);
+  const toolPromptComponents = {
+    ...(toolSurface.measuredToolSchemaTokens > 0 ? { toolSchemas: toolSurface.measuredToolSchemaTokens } : {}),
+    ...(toolSurface.deferredToolIndexTokens > 0 ? { deferredToolIndex: toolSurface.deferredToolIndexTokens } : {}),
+  };
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
   }) => {
@@ -11438,7 +11412,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // prompt cost is paid once per step and ~100x per task, and the lever is
       // keeping the large part invariant rather than making everything small.
       // Observation only — this reads what is already being sent.
-      recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
+      recordPromptComposition(options.sessionId, 'host', summarizePromptComposition({
+        toolNames: toolSurface.toolNames,
+        toolSchemaCosts: toolSurface.toolSchemaCosts,
         instructions: value.instructions ?? '',
         // The MEASURED costs. This call previously passed neither tools nor
         // history, so a wire carrying 9,198 tokens was recorded as 6,850 — the

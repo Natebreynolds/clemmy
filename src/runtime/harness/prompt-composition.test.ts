@@ -20,7 +20,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'comp-machine\n');
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { summarizePromptComposition } = await import('./prompt-composition.js');
+const { measureToolPromptSurface, summarizePromptComposition } = await import('./prompt-composition.js');
 const { CACHE_BREAK_SENTINEL, CACHE_MEMORY_CONTEXT_SENTINEL } = await import('./model-wire-registry.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
@@ -168,4 +168,23 @@ test('instructions split at the cache sentinel: memory context is variable, not 
   const plain = summarizePromptComposition({ instructions: staticPart, currentMessage: 'hi' });
   const plainNames = new Map(plain.buckets.map((bucket) => [bucket.name, bucket]));
   assert.equal(plainNames.get('memoryContext')?.tokens ?? 0, 0);
+});
+
+
+test('host composition counts advertised schemas and separates deferred descriptions without mutating tools', () => {
+  const tools = [
+    { type: 'function', name: 'create', description: 'Create a record', parameters: { type: 'object', properties: { title: { type: 'string' } } }, strict: true },
+    { type: 'function', name: 'read', description: 'Read a record', parameters: { type: 'object' } },
+    { type: 'function', name: 'deferred', description: 'Find this later', parameters: { large: 'x'.repeat(10000) }, deferLoading: true },
+  ];
+  const before = structuredClone(tools);
+  const surface = measureToolPromptSurface(tools);
+  const summary = summarizePromptComposition({ instructions: 'Host instructions', ...surface });
+  assert.equal(summary.toolCount, 2, 'nonzero schema cost must not be reported as zero advertised tools');
+  assert.deepEqual(surface.toolNames, ['create', 'read']);
+  assert.equal(surface.toolSchemaCosts.length, 3);
+  assert.ok(surface.toolSchemaCosts[2].bytes! < 200, 'deferred schemas are not counted as transmitted full parameters');
+  assert.equal(surface.measuredToolSchemaTokens, surface.toolSchemaCosts.slice(0, 2).reduce((sum, cost) => sum + cost.tokens, 0));
+  assert.deepEqual(tools, before);
+  assert.equal('parameters' in surface.toolSchemaCosts[0], false, 'telemetry does not duplicate schema payloads');
 });
