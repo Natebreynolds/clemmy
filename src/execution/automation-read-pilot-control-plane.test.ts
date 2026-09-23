@@ -1711,3 +1711,29 @@ test('version-two authoring identifies missing outcome authority before closed-J
   assert.equal(fixture.bodies(), 0);
   assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, 0);
 });
+
+test('Workspace inventory accepts the declared output scope and an exact destination filter', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const fixture = blankStateFixture('exact_workspace_inventory', { dataset: true, opportunityOverride: original });
+  const surface = chatPilotSurface(fixture);
+  const createdRequest = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  assert.equal(createdRequest.ok, true);
+  assert.equal(approvals.resolve(createdRequest.approval.approvalId, 'approved', 'operator.inventory').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(createdRequest.projection.projectionId);
+  assert.equal(created.ok, true);
+  if (!created.ok || !created.projection.selection) return;
+  const id = created.projection.selection.workspaceId;
+  const handler = surface.handlers.get('automation_read_pilot_workspace_list')!;
+  for (const scope of [
+    { phase_id: 'read-inventory', requirement_id: 'doc-section-inventory-read' },
+    { phase_id: 'write-space', requirement_id: 'acceptance-space-write' },
+  ]) {
+    const input = { ...chatPilotAcquisitionListRequest(fixture), ...scope, workspace_id: id };
+    const found = pilotToolJson(await handler(input));
+    assert.equal(found.ok, true, JSON.stringify(found));
+    assert.deepEqual(found.workspaces, [{ workspaceId: id, expectedWorkspaceRevision: created.projection.selection.expectedWorkspaceRevision, expectedWorkspaceDigest: created.projection.selection.expectedWorkspaceDigest }]);
+    assert.equal(found.selectionAuthority, 'none');
+    assert.deepEqual(pilotToolJson(await handler({ ...input, workspace_id: 'missing-exact-workspace' })).workspaces, []);
+  }
+  assert.equal(fixture.bodies(), 0);
+});

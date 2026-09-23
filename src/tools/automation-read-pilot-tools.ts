@@ -289,7 +289,7 @@ function acquisitionScope(input: {
   expectedProposalDigest: string;
   phaseId: string;
   requirementId: string;
-}, purpose: 'acquisition' | 'workspace_creation' = 'acquisition'): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
+}, purpose: 'acquisition' | 'workspace' = 'acquisition'): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
   ok: false;
   code: string;
   reason: string;
@@ -310,14 +310,14 @@ function acquisitionScope(input: {
   // Workspace review may name its exact declared local output, but any
   // acquisition scope returned remains bound to the selected source read.
   // This grants no output execution: creation still needs its separate card.
-  const output = purpose === 'workspace_creation' ? target.workspaceOutputPhase : undefined;
+  const output = purpose === 'workspace' ? target.workspaceOutputPhase : undefined;
   const matchesOutput = output?.id === input.phaseId
     && output.capabilityRequirementIds.length === 1
     && output.capabilityRequirementIds[0] === input.requirementId;
   if (!matchesOutput && (phase.id !== input.phaseId || requirement.id !== input.requirementId)) return {
     ok: false, code: 'pilot_requirement_unsupported', repairableArguments: true,
-    reason: purpose === 'workspace_creation'
-      ? 'Workspace creation review must name the selected read phase and requirement or the exact declared Workspace output phase and requirement.'
+    reason: purpose === 'workspace'
+      ? 'Workspace operations must name the selected read phase and requirement or the exact declared Workspace output phase and requirement.'
       : 'Acquisition references bind the selected read phase and requirement; Workspace output is bound separately in the pilot contract.',
   };
   return {
@@ -574,7 +574,7 @@ export function registerAutomationReadPilotTools(
         expectedProposalDigest: expected_proposal_digest,
         phaseId: phase_id,
         requirementId: requirement_id,
-      }, 'workspace_creation');
+      }, 'workspace');
       if (!scoped.ok) {
         if (scoped.repairableArguments) {
           return invalidArgumentsTextResult(JSON.stringify({ ok: false, code: scoped.code, reason: scoped.reason }));
@@ -629,13 +629,14 @@ export function registerAutomationReadPilotTools(
 
   server.tool(
     'automation_read_pilot_workspace_list',
-    'List exact current Workspace revisions that a separately approved dataset pilot may name on its formal human approval card. Inventory grants no binding, workflow, schedule, or execution authority and never selects by name or list order.',
+    'List exact current Workspace revisions that a separately approved dataset pilot may name on its formal human approval card. Pass workspace_id when the destination is known to return only its exact revision and digest. Inventory grants no binding, workflow, schedule, or execution authority and never selects by name or list order.',
     {
       proposal_id: z.string().regex(EXACT_REF_RE),
       expected_proposal_revision: z.number().int().positive(),
       expected_proposal_digest: z.string().regex(DIGEST_RE),
       phase_id: z.string().regex(EXACT_REF_RE),
       requirement_id: z.string().regex(EXACT_REF_RE),
+      workspace_id: z.string().min(2).max(63).optional().describe('Exact Workspace ID; no fuzzy matching or fallback to other Workspaces.'),
     },
     async ({
       proposal_id,
@@ -643,6 +644,7 @@ export function registerAutomationReadPilotTools(
       expected_proposal_digest,
       phase_id,
       requirement_id,
+      workspace_id,
     }) => {
       const source = acceptedSource(options.acceptedSource);
       if (!source) return errorResult('accepted_source_required', 'An exact accepted chat source must own Workspace inventory.');
@@ -653,13 +655,18 @@ export function registerAutomationReadPilotTools(
         expectedProposalDigest: expected_proposal_digest,
         phaseId: phase_id,
         requirementId: requirement_id,
-      });
-      if (!scoped.ok) return errorResult(scoped.code, scoped.reason);
+      }, 'workspace');
+      if (!scoped.ok) {
+        if (scoped.repairableArguments) return invalidArgumentsTextResult(JSON.stringify({ ok: false, code: scoped.code, reason: scoped.reason }));
+        return errorResult(scoped.code, scoped.reason);
+      }
       const proposal = loadAutomationOpportunityProposal(proposal_id);
       if (!proposal?.opportunity.dataset) {
         return errorResult('workspace_binding_not_applicable', 'The exact approved proposal has no dataset contract.');
       }
-      const workspaces = spaceStore.list().map((workspace) => ({
+      const exact = workspace_id ? spaceStore.get(workspace_id) : undefined;
+      const candidates = workspace_id ? (exact ? [exact] : []) : spaceStore.list();
+      const workspaces = candidates.map((workspace) => ({
         workspaceId: workspace.id,
         expectedWorkspaceRevision: workspace.version,
         expectedWorkspaceDigest: canonicalEntityWorkspaceSelectionDigest(workspace),
