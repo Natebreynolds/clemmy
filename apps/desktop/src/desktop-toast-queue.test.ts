@@ -3,10 +3,12 @@
  */
 
 import { test } from 'node:test';
+import { EventEmitter } from 'node:events';
 import { strict as assert } from 'node:assert';
 
 import {
   DESKTOP_TOAST_BURST_CAP,
+  DesktopNotificationRetention,
   type DesktopPendingNotification,
   advanceWatermark,
   desktopNotificationRoute,
@@ -153,4 +155,50 @@ test('failed or rejected navigation and actionable notices remain unread', async
   await openDesktopNotification({ ...notice, markReadOnOpen: false }, async () => true, read);
   await openDesktopNotification({ ...notice, href: 'https://evil.example/inbox' }, async () => { throw new Error('must not navigate'); }, read);
   assert.equal(reads, 0);
+});
+
+
+class FakeNativeNotice extends EventEmitter {
+  closeCalls = 0;
+  close(): void { this.closeCalls++; this.emit('close'); }
+}
+
+test('native notices and click handlers remain owned after show until interaction', () => {
+  const retained = new DesktopNotificationRetention<FakeNativeNotice>(3);
+  const notice = new FakeNativeNotice(); let clicked = 0;
+  retained.retain(notice); notice.on('click', () => { clicked++; });
+  notice.emit('show');
+  assert.equal(retained.has(notice), true);
+  assert.equal(retained.size, 1);
+  notice.emit('click');
+  assert.equal(clicked, 1); assert.equal(retained.size, 0);
+});
+
+test('native failure and dismissal release ownership without consuming other notices', () => {
+  const retained = new DesktopNotificationRetention<FakeNativeNotice>(3);
+  const failed = new FakeNativeNotice(), closed = new FakeNativeNotice(), pending = new FakeNativeNotice();
+  for (const notice of [failed, closed, pending]) retained.retain(notice);
+  failed.emit('failed', {}, 'delivery refused'); closed.emit('close');
+  assert.equal(retained.size, 1); assert.equal(retained.has(pending), true);
+  assert.equal(pending.closeCalls, 0);
+});
+
+test('notification retention bounds memory, explicitly closes oldest, and deduplicates ownership', () => {
+  const retained = new DesktopNotificationRetention<FakeNativeNotice>(2);
+  const a = new FakeNativeNotice(), b = new FakeNativeNotice(), c = new FakeNativeNotice();
+  retained.retain(a); retained.retain(a); retained.retain(b); retained.retain(c);
+  assert.equal(retained.size, 2); assert.equal(a.closeCalls, 1);
+  assert.equal(retained.has(b), true); assert.equal(retained.has(c), true);
+  assert.throws(() => new DesktopNotificationRetention(0), RangeError);
+});
+
+
+test('banner timeout keeps the Action Center click handler alive', () => {
+  const retained = new DesktopNotificationRetention<FakeNativeNotice>(2);
+  const notice = new FakeNativeNotice();
+  retained.retain(notice);
+  notice.emit('close', { reason: 'timedOut' });
+  assert.equal(retained.has(notice), true);
+  notice.emit('close', { reason: 'userCanceled' });
+  assert.equal(retained.size, 0);
 });

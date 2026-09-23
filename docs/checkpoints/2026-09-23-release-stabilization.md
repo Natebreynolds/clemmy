@@ -167,3 +167,29 @@ password recently changed; no response yet. Probe log:
 /tmp/clem-notification-signing-probe/result.log. Clem stays on the restored shell;
 notification fix remains uninstalled. Rebuild after this docs commit before
 any further daemon hotpatch; no further patch or paid test performed here.
+
+## Reboot cleared signing; first native click still failed
+
+After owner reboot, disposable Developer ID signing probe passed. Rebuilt and
+installed31aab865b, fingerprint17306f38b4eca3ac73f0fc8315f2d89f7d225d4d4a64878cac7665fcb6f35bba.
+Two-module repaired shell SHA023dbe8a… signed with same identity and preserved
+metadata; strict signature verification passed. Exact app relaunched. Original
+rollback retained, including a persistent copy under output/harness-acceptance/
+2026-09-23-restart-recovery/. This is not notarized-installer acceptance.
+
+First controlled native notice was not seen. macOS Settings confirms Clementine
+notifications enabled for Desktop/Notification Center/Lock Screen, temporary
+banners. No settings changed. Second local notice while app backgrounded was
+seen and clicked per owner, but native AX remained Home and both fixture notices
+stayed unread. This is a FAILED native-click acceptance, not a pass from signing.
+Fixtures harness-notification-click-0923 and its -background suffix. No paid
+model or external provider delivery; installed local notification store only.
+
+Found another shell defect: locally scoped Notification objects are not retained.
+Electron43 docs explicitly require retained references for interactions; new
+objects can be removed on garbage collection. Added bounded strong ownership
+until click/dismissal/failure, stable native IDs and redacted id-only show/click/
+close/failure diagnostics in the existing supervisor log. Windows banner timeout
+retains the Action Center handler. New code still needs rebuilt installed native
+acceptance; do not equate the plausible cause with a proven live repair.
+Reference: https://raw.githubusercontent.com/electron/electron/v43.0.0/docs/api/notification.md

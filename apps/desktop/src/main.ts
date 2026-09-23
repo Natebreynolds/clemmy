@@ -115,6 +115,7 @@ import {
 } from './notch-click-helper.js';
 import {
   advanceWatermark,
+  DesktopNotificationRetention,
   openDesktopNotification,
   parseDesktopPendingResponse,
   planDesktopToasts,
@@ -2420,6 +2421,24 @@ let desktopNotificationPollInFlight = false;
 // Init to app-start time so a restart doesn't replay the backlog.
 let desktopNotificationSince = new Date().toISOString();
 const desktopNotifiedIds = new Set<string>();
+const desktopNotificationRetention = new DesktopNotificationRetention<Notification>(DESKTOP_NOTIFICATION_SEEN_CAP);
+
+function observeDesktopNotification(notification: Notification, id: string): void {
+  const record = (event: string, error?: string) => {
+    try {
+      appendFileSync(LOG_FILE, JSON.stringify({
+        component: 'desktop-notify', event, id, at: new Date().toISOString(),
+        ...(error ? { error: redactSensitiveText(error).slice(0, 500) } : {}),
+      }) + '\n');
+    } catch { /* Diagnostics must not prevent delivery or navigation. */ }
+  };
+  desktopNotificationRetention.retain(notification);
+  notification.on('show', () => record('shown'));
+  notification.on('click', () => record('clicked'));
+  notification.on('close', () => record('closed'));
+  notification.on('failed', (_event, error) => record('failed', error));
+  record('created');
+}
 
 function rememberDesktopNotifiedId(id: string): void {
   desktopNotifiedIds.add(id);
@@ -2471,10 +2490,12 @@ async function focusDesktopNotificationRoute(route: string): Promise<boolean> {
 function showDesktopNotificationToast(item: DesktopPendingNotification): void {
   if (!Notification.isSupported()) return;
   const notification = new Notification({
+    id: item.id,
     title: item.title || 'Clementine',
     body: item.body || '',
     silent: false,
   });
+  observeDesktopNotification(notification, item.id);
   notification.on('click', () => {
     revealMainWindow();
     void openDesktopNotification(item, focusDesktopNotificationRoute, (id) =>
@@ -2491,6 +2512,7 @@ function showDesktopNotificationSummaryToast(count: number): void {
     body: `${count} more update${count === 1 ? '' : 's'} — open Clementine`,
     silent: false,
   });
+  observeDesktopNotification(notification, 'summary');
   notification.on('click', () => { revealMainWindow(); });
   notification.show();
 }
