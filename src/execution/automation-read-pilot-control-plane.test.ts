@@ -1626,7 +1626,9 @@ test('original approved inventory contract executes 13 text records into five sc
   invalidWire.evidence.required_paths = ['/content'];
   invalidWire.completeness.evidence_paths = ['/content'];
   delete invalidWire.result_projection.resolution_policy.prefer_newer_after_exact_identity;
-  const invalidPreview = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalidContract));
+  const invalidPreviewResult = await surface.handlers.get('automation_read_pilot_request')!(invalidContract);
+  assert.equal(shared.isInvalidArgumentsTextResult(invalidPreviewResult), true, 'contract repair must remain admissible through host recovery');
+  const invalidPreview = pilotToolJson(invalidPreviewResult);
   assert.equal(invalidPreview.ok, false);
   assert.equal(invalidPreview.code, 'preview_blocked');
   assert.match(invalidPreview.reason, /evidence.required_paths must include/);

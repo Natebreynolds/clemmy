@@ -804,7 +804,14 @@ export function registerAutomationReadPilotTools(
         contract: typedContract,
         workflowInputs: structuredClone(workflow_inputs),
       });
-      if (!requested.ok) return errorResult(requested.code, requested.reason);
+      if (!requested.ok) {
+        if (requested.repairableArguments) {
+          return invalidArgumentsTextResult(JSON.stringify({
+            ok: false, code: requested.code, reason: requested.reason,
+          }));
+        }
+        return errorResult(requested.code, requested.reason);
+      }
       const executionAuthority = requested.projection.status === 'queued'
         ? 'queued_one_shot_pilot'
         : requested.projection.status === 'queueing'

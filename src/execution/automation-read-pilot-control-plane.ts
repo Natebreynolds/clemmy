@@ -179,6 +179,7 @@ export type RegisterAutomationReadPilotProjectionResult =
       ok: false;
       code: string;
       reason: string;
+      repairableArguments?: boolean;
       projection?: AutomationReadPilotProjectionV1;
     };
 
@@ -637,7 +638,7 @@ function proposalIssue(input: {
 
 function prepareProjection(
   input: RegisterAutomationReadPilotProjectionInputV1,
-): PreparedProjection | { code: string; reason: string } {
+): PreparedProjection | { code: string; reason: string; repairableArguments?: boolean } {
   try {
     canonicalJson(input);
   } catch (error) {
@@ -740,6 +741,12 @@ function prepareProjection(
     || !preview.pilotApprovalRequest
   ) return {
     code: 'preview_blocked',
+    // Typed preview failures occur before registration or execution. Preserve
+    // argument-repair semantics; never infer this from provider error prose.
+    repairableArguments: preview.issues.length > 0 && preview.issues.every((issue) =>
+      issue.code === 'workflow_dataset_contract_unrepresented'
+      || issue.code === 'workspace_binding_contract_unrepresented'
+      || issue.code === 'workflow_tool_kernel_binding_unrepresented'),
     reason: preview.issues.map((issue) => issue.message).join('; ')
       || 'The exact disabled pilot preview is not representable.',
   };
