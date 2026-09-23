@@ -1,3 +1,4 @@
+import { installedClaudeClientVersion } from './claude-client-version.js';
 /**
  * claude-usage — fetch Claude's authoritative Pro/Max usage windows for the
  * top-bar chips. Claude runs through the Claude Code CLI here (agent-SDK +
@@ -40,7 +41,6 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 // The endpoint buckets by User-Agent: a `claude-code/<version>` UA gets the
 // generous limit, anything else is throttled into uselessness. Keep the oauth
 // beta header in lockstep with applyClaudeEnvelope (claude-model.ts).
-const CLAUDE_CODE_UA = 'claude-code/2.1.195 (external, clementine)';
 const ENVELOPE_BETA = 'oauth-2025-04-20,claude-code-20250219';
 // Don't poll faster than this — the endpoint 429s hard and stays stuck for a
 // long time once tripped. The 15s UI poll only triggers a real fetch this often.
@@ -113,7 +113,7 @@ async function refresh(): Promise<void> {
         authorization: `Bearer ${token}`,
         'anthropic-version': '2023-06-01',
         'anthropic-beta': ENVELOPE_BETA,
-        'user-agent': CLAUDE_CODE_UA,
+        'user-agent': `claude-code/${installedClaudeClientVersion()} (external, clementine)`,
         accept: 'application/json',
       },
     });

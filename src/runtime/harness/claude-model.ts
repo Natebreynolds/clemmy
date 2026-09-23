@@ -1,3 +1,4 @@
+import { installedClaudeClientVersion } from './claude-client-version.js';
 /**
  * ClaudeModelProvider — runs Claude (Anthropic) as a flagship brain on the
  * user's Claude Max/Pro SUBSCRIPTION via OAuth, peer to CodexModelProvider.
@@ -69,7 +70,6 @@ function getClaudeDispatcher(): Agent {
 // the load-bearing element, not the beta header).
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const ENVELOPE_BETA = 'oauth-2025-04-20,claude-code-20250219';
-const CLAUDE_USER_AGENT = 'claude-cli/1.0.0 (external, clementine)';
 // Anthropic Messages REQUIRES max_tokens. The AI SDK passes the harness's
 // maxTokens through, but we defensively fill a generous default if a turn ever
 // omits it, so a Claude call can never 400 on a missing max_tokens.
@@ -110,6 +110,7 @@ export function withIdentityPrefix(system: unknown): unknown {
 export function applyClaudeEnvelope(
   init: { headers?: HeadersInit; body?: BodyInit | null } | undefined,
   token: string,
+  clientVersion = installedClaudeClientVersion(),
 ): { headers: Headers; body: BodyInit | null | undefined } {
   const headers = new Headers(init?.headers);
   headers.delete('x-api-key'); // BILLING GUARD — never API-bill
@@ -117,7 +118,7 @@ export function applyClaudeEnvelope(
   headers.set('anthropic-version', '2023-06-01');
   const existingBeta = headers.get('anthropic-beta');
   headers.set('anthropic-beta', existingBeta ? `${ENVELOPE_BETA},${existingBeta}` : ENVELOPE_BETA);
-  headers.set('user-agent', CLAUDE_USER_AGENT);
+  headers.set('user-agent', `claude-cli/${clientVersion} (external, clementine)`);
 
   let body = init?.body;
   if (typeof body === 'string') {
