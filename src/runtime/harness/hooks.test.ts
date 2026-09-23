@@ -1048,3 +1048,24 @@ test('an unpaired successful-looking callback cannot claim an external send', as
     assert.equal(listNotifications(100).filter((row) => row.metadata?.source === 'external-send' && row.metadata.sessionId === sess.id).length, 0);
   } finally { detach(); }
 });
+
+
+test('different accepted requests in one chat retain both send mirrors when the SDK reuses a call id', async () => {
+  resetEventLog();
+  const { listNotifications } = await import('../notifications.js');
+  const sess = createSession({ kind: 'chat' });
+  const stub = makeStub();
+  const detach = attachEventLogHooks(stub, { getSessionId: extractSessionIdFromContext });
+  try {
+    for (const sourceUserSeq of [101, 202]) {
+      withHarnessRunContext({ sessionId: sess.id, sourceUserSeq, counter: new ToolCallsCounter() }, () => {
+        const details = { toolCall: { callId: 'reused-send', arguments: JSON.stringify({ tool_slug: 'PROOF_SEND_NOTE', arguments: { body: `Reviewed message for request ${sourceUserSeq}` } }) } };
+        stub.emit('agent_tool_start', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, details);
+        stub.emit('agent_tool_end', ctx(sess.id), { name: 'executor' }, { name: 'composio_execute_tool' }, '{"ok":true}', details);
+      });
+    }
+    const rows = listNotifications(100).filter(row => row.metadata?.source === 'external-send' && row.metadata.sessionId === sess.id);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map(row => row.metadata?.sourceUserSeq).sort(), [101, 202]);
+  } finally { detach(); }
+});

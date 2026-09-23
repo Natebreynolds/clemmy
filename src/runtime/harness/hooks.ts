@@ -663,6 +663,7 @@ export function attachEventLogHooks(
       mirrorExternalSendToFirstPartySurfaces({
         sessionId,
         callId,
+        sourceUserSeq: sourceAttribution.sourceUserSeq,
         toolName: tool?.name ?? '',
         accounting,
         rawArgs: admittedSendArguments,

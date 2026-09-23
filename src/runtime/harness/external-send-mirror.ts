@@ -15,6 +15,8 @@ import { registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slu
 export interface ExternalSendMirrorInput {
   sessionId: string;
   callId: string | null | undefined;
+  /** Durable accepted request, stable across physical attempts/restarts. */
+  sourceUserSeq?: number;
   toolName: string;
   accounting: { effect: string; toolSlug?: string; reversibility?: 'reversible' | 'irreversible' };
   /** The call arguments as the runtime received them (JSON text or object). */
@@ -79,6 +81,8 @@ export function externalSendMirrorNotification(input: ExternalSendMirrorInput): 
   // Provider call IDs are scoped to a session, not globally unique. Without
   // both durable parts, a replay cannot be distinguished from a fresh send.
   if (!input.sessionId.trim() || !input.callId?.trim()) return null;
+  if (input.sourceUserSeq !== undefined
+    && (!Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0)) return null;
   if (input.accounting.effect !== 'external_write' || input.accounting.reversibility !== 'irreversible') return null;
   const args = decodeArgs(input.rawArgs);
   if (!args) return null;
@@ -95,7 +99,9 @@ export function externalSendMirrorNotification(input: ExternalSendMirrorInput): 
   const label = toolkitLabel(input.accounting.toolSlug, input.toolName);
   const step = workflowStepOf(input.sessionId);
   const callKey = createHash('sha256')
-    .update(JSON.stringify([input.sessionId, input.callId]))
+    .update(JSON.stringify(input.sourceUserSeq === undefined
+      ? [input.sessionId, input.callId]
+      : [input.sessionId, input.sourceUserSeq, input.callId]))
     .digest('hex');
   return {
     id: `sent:${callKey}`,
@@ -112,6 +118,7 @@ export function externalSendMirrorNotification(input: ExternalSendMirrorInput): 
       toolkit: label,
       ...(input.accounting.toolSlug ? { operation: input.accounting.toolSlug } : {}),
       sessionId: input.sessionId,
+      ...(input.sourceUserSeq !== undefined ? { sourceUserSeq: input.sourceUserSeq } : {}),
       ...(input.callId ? { callId: input.callId } : {}),
       ...(step ? { runId: step.runId, stepId: step.stepId } : {}),
     },
@@ -128,6 +135,7 @@ export function mirrorExternalSendToFirstPartySurfaces(input: ExternalSendMirror
     const legacy = getNotification(`sent:${input.callId}`);
     if (legacy?.metadata?.source === 'external-send'
       && legacy.metadata.sessionId === input.sessionId
+      && legacy.metadata.sourceUserSeq === input.sourceUserSeq
       && legacy.metadata.callId === input.callId) return true;
     addNotification({
       id: notification.id,

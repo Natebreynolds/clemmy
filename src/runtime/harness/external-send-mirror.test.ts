@@ -92,7 +92,7 @@ test('a replay after upgrade keeps the existing mirror but does not inherit anot
 
 
 test('replaying a settled send in a fresh process preserves one mirror', () => {
-  const input = { ...slackSend, callId: 'restart-call', sessionId: 'workflow:restart-run:send' };
+  const input = { ...slackSend, callId: 'restart-call', sourceUserSeq: 99, sessionId: 'workflow:restart-run:send' };
   assert.equal(mirrorExternalSendToFirstPartySurfaces(input), true);
   const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
     const { mirrorExternalSendToFirstPartySurfaces } = await import(${JSON.stringify(new URL('./external-send-mirror.ts', import.meta.url).href)});
@@ -102,4 +102,25 @@ test('replaying a settled send in a fresh process preserves one mirror', () => {
   assert.equal(child.status, 0, child.stderr);
   const rows = listNotifications(100).filter((row) => row.metadata?.callId === input.callId);
   assert.equal(rows.length, 1);
+});
+
+
+test('request-scoped mirror is stable on replay and rejects invalid request identities', () => {
+  const input = { ...slackSend, callId: 'request-replay', sourceUserSeq: 42 };
+  assert.equal(mirrorExternalSendToFirstPartySurfaces(input), true);
+  assert.equal(mirrorExternalSendToFirstPartySurfaces(input), true);
+  assert.equal(listNotifications(100).filter(row => row.metadata?.callId === input.callId).length, 1);
+  for (const sourceUserSeq of [0, -1, NaN, Infinity, 1.5]) {
+    assert.equal(externalSendMirrorNotification({ ...input, sourceUserSeq }), null);
+  }
+});
+
+test('a legacy mirror cannot hide a send from a different accepted request', () => {
+  const input = { ...slackSend, callId: 'legacy-source', sourceUserSeq: 77 };
+  const projected = externalSendMirrorNotification(input)!;
+  addNotification({ id: `sent:${input.callId}`, kind: 'system', title: projected.title,
+    body: projected.body, createdAt: new Date().toISOString(), read: true,
+    metadata: { ...projected.metadata, sourceUserSeq: 55 } });
+  assert.equal(mirrorExternalSendToFirstPartySurfaces(input), true);
+  assert.equal(listNotifications(100).filter(row => row.metadata?.callId === input.callId).length, 2);
 });
