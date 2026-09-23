@@ -1,3 +1,4 @@
+import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
 /**
  * Persistent memory context for the 0.3 harness.
  *
@@ -266,10 +267,12 @@ const VOLATILE_CONTEXT_TITLES = new Set<string>([
   'Active Goals',
   'Held For Later',
   'Current Focus',
+  'Offer Being Discussed',
 ]);
 
 export function renderHarnessMemoryContext(opts?: {
   sessionId?: string;
+  sourceUserSeq?: number;
   query?: string;
   /** Current accepted user input used only to decide whether a cross-session
    * focus summary is historical. Unlike `query`, this does not enable recall or
@@ -357,6 +360,11 @@ export function renderHarnessMemoryContext(opts?: {
   // (if anything) may steer this turn.
   const goals = renderActiveGoals();
   const heldTasks = renderHeldTasks(opts?.sessionId);
+  let offerContext = '';
+  if (partition !== 'stable' && opts?.sessionId && opts.sourceUserSeq) {
+    try { offerContext = proactiveOfferContextForTurn(opts.sessionId, opts.sourceUserSeq); }
+    catch { /* Optional offer context cannot prevent ordinary chat. */ }
+  }
   const nowLine = renderCurrentTimeForInstructions();
   const sessionWorkingMemory = opts?.sessionId
     ? loadWorkingMemoryForSession(opts.sessionId)
@@ -420,6 +428,7 @@ export function renderHarnessMemoryContext(opts?: {
     // other context. Without this the model defaults to its training
     // cutoff for date math, which is months stale.
     { title: 'Now', text: section('Now', nowLine) },
+    { title: 'Offer Being Discussed', text: section('Offer Being Discussed', offerContext) },
     { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
     { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
     { title: 'Completed Actions This Conversation', text: section('Completed Actions This Conversation', sessionActions) },
@@ -474,6 +483,7 @@ export function renderHarnessMemoryContext(opts?: {
  */
 export function harnessInstructions(roleInstructions: string, opts?: {
   sessionId?: string;
+  sourceUserSeq?: number;
   focusInput?: string;
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
@@ -493,6 +503,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   // the Agent and therefore receives a fresh snapshot.
   const ctx = renderHarnessMemoryContext({
     sessionId: opts?.sessionId,
+    sourceUserSeq: opts?.sourceUserSeq,
     focusInput: opts?.focusInput,
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     includeSessionActions: opts?.includeSessionActions,

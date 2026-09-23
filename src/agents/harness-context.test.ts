@@ -629,3 +629,12 @@ test('HARNESS lane ranks memos by the CURRENT MESSAGE, not focus alone (live 202
     'the request-relevant proven route ranks ABOVE fresher unrelated memos',
   );
 });
+
+test('engaged offer context stays in the volatile first-reply context and out of the stable prefix', async () => {
+  const offers = await import('../runtime/proactive-offers.js');
+  const offer = offers.publishProactiveOffer({ id: 'harness-offer', userId: 'owner', kind: 'goal', title: 'Explore a goal', summary: 'OFFER_CONTEXT_FIXTURE', whyNow: 'Recent related work', evidenceRefs: ['fact:fixture'] });
+  const { sessionId } = offers.discussProactiveOffer(offer.id, 1, 'owner');
+  const event = appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Tell me more' } });
+  assert.match(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'volatile' }), /OFFER_CONTEXT_FIXTURE/);
+  assert.doesNotMatch(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'stable' }), /OFFER_CONTEXT_FIXTURE/);
+});

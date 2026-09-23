@@ -61,6 +61,7 @@ function clip(text: string, max: number): string {
 
 export function renderCanonicalMemoryContext(opts?: {
   sessionId?: string;
+  sourceUserSeq?: number;
   query?: string;
   focusInput?: string;
   partition?: CanonicalContextPartition;

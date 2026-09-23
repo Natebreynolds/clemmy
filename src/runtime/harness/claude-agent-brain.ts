@@ -1034,6 +1034,7 @@ export function renderClaudeAgentBrainSystemAppend(
   const persistentContext = split
     ? renderStableMemoryFrozen(request)
     : renderCanonicalMemoryContext({
+        sourceUserSeq: request.sourceUserSeq,
         sessionId: request.sessionId,
         query: retrievalTaskInput(request),
         partition: 'all',
@@ -1178,6 +1179,7 @@ async function buildClaudeAgentBrainTurnContext(
   // Claude lane stops knowledge-starving on paraphrased requests (Phase 4).
   const volatile = splitContext
     ? renderCanonicalMemoryContext({
+        sourceUserSeq: request.sourceUserSeq,
         sessionId: request.sessionId,
         focusInput: taskInput,
         partition: 'volatile',

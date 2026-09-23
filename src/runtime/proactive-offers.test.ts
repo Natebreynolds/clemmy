@@ -175,3 +175,30 @@ test('invalid snoozes and attempted scope changes leave the offer untouched', ()
   assert.equal(offers.getProactiveOffer('bounded', 'owner')!.status, 'offered');
   assert.equal(offers.getProactiveOffer('bounded', 'owner')!.revision, 1);
 });
+
+test('offer context is available to its first accepted reply only, never another chat or later turn', () => {
+  offers.publishProactiveOffer(input('reply-context'));
+  const { sessionId } = offers.discussProactiveOffer('reply-context', 1, 'owner');
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, 999), '');
+  const synthetic = log.appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Internal continuation', synthetic: true } });
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, synthetic.seq), '');
+  const first = log.appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Yes, focus on California' } });
+  assert.equal(JSON.parse(offers.proactiveOfferContextForTurn(sessionId, first.seq)).offerId, 'reply-context');
+  offers.discussProactiveOffer('reply-context', 1, 'owner');
+  const second = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Another question' } });
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, second.seq), '');
+  assert.equal(offers.proactiveOfferContextForTurn('existing-chat', first.seq), '');
+  offers.withdrawProactiveOffer('reply-context', 1, 'owner', 'Evidence corrected');
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, first.seq), '');
+});
+
+test('a changed offer waits for renewed engagement before contributing context', () => {
+  offers.publishProactiveOffer(input('fresh-context'));
+  const { sessionId } = offers.discussProactiveOffer('fresh-context', 1, 'owner');
+  offers.reviseProactiveOffer({ ...input('fresh-context'), summary: 'Corrected context' }, 1);
+  const first = log.appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Tell me more' } });
+  assert.equal(offers.proactiveOfferContextForTurn(sessionId, first.seq), '');
+  offers.discussProactiveOffer('fresh-context', 2, 'owner');
+  const next = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the revised context' } });
+  assert.equal(JSON.parse(offers.proactiveOfferContextForTurn(sessionId, next.seq)).summary, 'Corrected context');
+});

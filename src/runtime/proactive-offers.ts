@@ -45,10 +45,13 @@ function db() {
       const columns = database.pragma('table_info(proactive_offers)') as Array<{ name: string }>;
       if (!columns.some(c => c.name === 'snoozed_until')) database.exec('ALTER TABLE proactive_offers ADD COLUMN snoozed_until TEXT');
       if (!columns.some(c => c.name === 'resolution_reason')) database.exec('ALTER TABLE proactive_offers ADD COLUMN resolution_reason TEXT');
+      if (!columns.some(c => c.name === 'context_after_seq')) database.exec('ALTER TABLE proactive_offers ADD COLUMN context_after_seq INTEGER');
+      if (!columns.some(c => c.name === 'context_revision')) database.exec('ALTER TABLE proactive_offers ADD COLUMN context_revision INTEGER');
       database.exec(`CREATE TABLE IF NOT EXISTS proactive_offer_revisions (
         offer_id TEXT NOT NULL, revision INTEGER NOT NULL, input_json TEXT NOT NULL,
         recorded_at TEXT NOT NULL, PRIMARY KEY (offer_id, revision)
       )`);
+      database.exec('CREATE INDEX IF NOT EXISTS proactive_offer_conversation ON proactive_offers (conversation_id, user_id, status)');
       database.exec(`INSERT OR IGNORE INTO proactive_offer_revisions
         SELECT id, revision, input_json, updated_at FROM proactive_offers`);
     }).immediate();
@@ -183,6 +186,7 @@ export function discussProactiveOffer(id: string, expectedRevision: number, user
       if (!bound || bound.userId !== userId || bound.kind !== 'chat') throw new Error('offer conversation unavailable');
       if (offer.status !== 'discussing') database.prepare("UPDATE proactive_offers SET status = 'discussing', snoozed_until = NULL, updated_at = ? WHERE id = ?")
         .run(now.toISOString(), id);
+      armOfferContext(id, offer.revision, bound.id);
       return { sessionId: bound.id, offer: getProactiveOffer(id, userId)! };
     }
     const origin = offer.originSessionId ? getSession(offer.originSessionId) : null;
@@ -196,6 +200,7 @@ export function discussProactiveOffer(id: string, expectedRevision: number, user
     }
     database.prepare(`UPDATE proactive_offers SET conversation_id = ?, status = 'discussing', snoozed_until = NULL, updated_at = ? WHERE id = ?`)
       .run(sessionId, new Date().toISOString(), id);
+    armOfferContext(id, offer.revision, sessionId);
     return { sessionId, offer: getProactiveOffer(id, userId)! };
   }).immediate();
 }
@@ -211,4 +216,39 @@ export function dismissProactiveOffer(id: string, expectedRevision: number, user
       .run(new Date().toISOString(), id);
     return getProactiveOffer(id, userId)!;
   }).immediate();
+}
+
+
+function armOfferContext(id: string, revision: number, sessionId: string): void {
+  // A repeated tap on the same revision must not keep injecting it into later
+  // turns. A newly reviewed revision is armed against the current user source.
+  db().prepare(`UPDATE proactive_offers SET context_revision = ?, context_after_seq =
+    (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ? AND type = 'user_input_received' AND role = 'user')
+    WHERE id = ? AND (context_revision IS NULL OR context_revision != ?)`)
+    .run(revision, sessionId, id, revision);
+}
+
+/** Resolve data only for the exact first accepted user reply after engagement.
+ * No new messages, no task authority, no repeated full context on later turns.
+ * Ambiguous multiple offers in one chat require explicit UI selection later. */
+export function proactiveOfferContextForTurn(sessionId: string, sourceUserSeq: number, now = new Date()): string {
+  if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) return '';
+  const session = getSession(sessionId);
+  if (!session?.userId || session.kind !== 'chat') return '';
+  const rows = db().prepare(`SELECT o.* FROM proactive_offers o
+    WHERE o.conversation_id = ? AND o.user_id = ? AND o.status = 'discussing'
+      AND o.context_revision = o.revision
+      AND (json_extract(o.input_json, '$.expiresAt') IS NULL OR julianday(json_extract(o.input_json, '$.expiresAt')) > julianday(?))
+      AND ? = (SELECT MIN(e.seq) FROM events e WHERE e.session_id = o.conversation_id
+        AND e.seq > o.context_after_seq AND e.type = 'user_input_received' AND e.role = 'user'
+        AND COALESCE(json_extract(e.data_json, '$.synthetic'), 0) != 1)
+    LIMIT 2`).all(sessionId, session.userId, now.toISOString(), sourceUserSeq) as Row[];
+  if (rows.length !== 1) return '';
+  const offer = decode(rows[0]);
+  return JSON.stringify({
+    kind: 'proactive_offer_context', authority: 'context_only',
+    offerId: offer.id, revision: offer.revision, proposedKind: offer.kind,
+    title: offer.title, summary: offer.summary, whyNow: offer.whyNow,
+    evidenceRefs: offer.evidenceRefs, contextQuestion: offer.contextQuestion ?? null,
+  });
 }

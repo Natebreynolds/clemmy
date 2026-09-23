@@ -3952,6 +3952,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
     : rubricChoice.instructions;
   const instructions = harnessInstructions(acceptedActionRubric, {
+    sourceUserSeq: options.sourceUserSeq,
     sessionId: options.sessionId ?? undefined,
     focusInput: scopeUserInput || undefined,
     volatileInstructions,
