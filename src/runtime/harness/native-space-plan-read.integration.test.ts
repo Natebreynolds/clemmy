@@ -688,6 +688,8 @@ for (const repair of ['none', 'plan', 'definition'] as const) test(`a created wo
   assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
   const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
   const lines = () => expectedWorkPlanLines(identity).map(row => ({ id: row.requirementId, state: row.state }));
+  const { plannedNativeDirectCarry } = await import('./planned-native-direct-carry.js');
+  assert.equal(plannedNativeDirectCarry({ ...identity, authoredName: 'workflow_set_enabled', authoredArgs: { name, enabled: true }, authoredArgumentsJson: JSON.stringify({name,enabled:true}) }), null, 'multiple selected operations using the same native tool require explicit requirement identity');
   assert.deepEqual(lines(), [
     { id: 'create', state: 'satisfied' }, { id: 'disable', state: 'satisfied' }, { id: 'enable', state: 'satisfied' }, { id: 'verify', state: 'satisfied' }, { id: 'verify_disabled', state: 'satisfied' },
   ]);
@@ -841,12 +843,12 @@ for (const repair of ['none', 'plan', 'definition'] as const) test(`a created wo
     .get(warm.id, 'warm-plan') as { n: number }).n, 0, 'only the explicitly invoked plan may settle; learning and rebuild execute no business work');
 });
 
-for (const toolJit of [true, false]) test(`plan-selected workflow dispatch retains its requirement through terminal (JIT ${toolJit})`, async () => {
+for (const toolJit of [true, false]) for (const directCall of ['work_call', 'direct', 'call_tool'] as const) test(`plan-selected workflow dispatch retains its requirement through terminal (JIT ${toolJit}, direct ${directCall})`, async () => {
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
   const { writeWorkflow } = await import('../../memory/workflow-store.js');
   const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
-  const name = `native-planned-dispatch-${toolJit}`;
+  const name = `native-planned-dispatch-${toolJit}-${directCall}`;
   writeWorkflow(name, { name, description: 'Controlled dispatch fixture', enabled: true, trigger: { manual: true },
     steps: [{ id: 'product', transform: { version: 1, expression: { op: 'literal', value: { product: 323 } } }, sideEffect: 'read' }] } as never);
   const session = eventlog.createSession({ kind: 'chat' });
@@ -855,7 +857,7 @@ for (const toolJit of [true, false]) test(`plan-selected workflow dispatch retai
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: objective, originReplyTarget: replyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget) } });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
-  const attempt = eventlog.beginRunAttempt(session.id, { runId: `native-planned-dispatch-parent-${toolJit}` });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `native-planned-dispatch-parent-${toolJit}-${directCall}` });
   eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: source.data }, { existingEventSeq: source.seq, armRunInFlight: true });
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.ok(primed.ok);
@@ -882,7 +884,7 @@ for (const toolJit of [true, false]) test(`plan-selected workflow dispatch retai
       [toolCall(`dispatch-discover-${index}`, 'tool_search', { query: name, limit: 5 })]) : []),
     [toolCall('dispatch-plan', 'plan_task', plan)],
     [toolCall('dispatch-resolve-selected', 'tool_search', { query: 'workflow_run', limit: 5 })],
-    [toolCall('dispatch-selected-run', 'work_call', { requirement_id: 'run_once', name: 'workflow_run', args_json: JSON.stringify({ name, inputs: '{}' }) })],
+    [directCall === 'direct' ? toolCall('dispatch-selected-run', 'workflow_run', { name, inputs: '{}' }) : directCall === 'call_tool' ? toolCall('dispatch-selected-run', 'call_tool', { name: 'workflow_run', args_json: JSON.stringify({name,inputs:'{}'}) }) : toolCall('dispatch-selected-run', 'work_call', { requirement_id: 'run_once', name: 'workflow_run', args_json: JSON.stringify({ name, inputs: '{}' }) })],
     [textMessage('The workflow is starting; verification and disable remain pending.')],
   ];
   const model = stubModel(responseFrames);

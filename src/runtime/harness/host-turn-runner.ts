@@ -1,3 +1,5 @@
+import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
+import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
 import { verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
 import { hostModelOutputPreview } from './host-model-output-preview.js';
@@ -2809,6 +2811,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // below consumes the same locally schema-completed carrier bytes instead.
   const localArgumentPreparations = new Map<string, string>();
   const directLocalCallRequirements = new Map<string, string>();
+  const selectedDirectCarry = (name: string, args: Record<string, unknown> | null, argumentsJson: string) => {
+    const carrier = toolByName.get('work_call');
+    return hostProduction && carrier && isHostPlanRequiredWorkCall(carrier)
+      ? plannedNativeDirectCarry({ ...exactHostIdentity(), authoredName: name, authoredArgs: args, authoredArgumentsJson: argumentsJson })
+      : null;
+  };
+
   const materializedArgumentsJson = (tool: FunctionToolLike | undefined, raw: string): string => (
     localArgumentPreparations.get(`${tool?.name ?? ''}\0${raw}`) ?? materializedToolArgumentsJson(tool, raw)
   );
@@ -5346,6 +5355,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
     }
 
+    if (declaresWorkflowDispatchReceipt(effectiveName) && !isPlainOrClementineLocalTool(name, 'work_call') && actionExpectedWorkRequired(identity)) {
+      return miss('planned_dispatch_requires_exact_requirement');
+    }
     if (authorityBinding !== 'local_envelope') return miss(`authority_binding:${authorityBinding}`);
     const effectClass = capability[0]!.effectClass;
     const localEffect: HostCallAttestation['effect'] | null = decision.effect === 'read'
@@ -5851,14 +5863,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let tool = toolByName.get(authoredName);
     const authoredArgumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
     const authoredParsedArguments = parsedArgs(authoredArgumentsJson);
-    const offSurfaceCarry = (!tool || typeof tool.invoke !== 'function')
+    const offSurfaceCarry = selectedDirectCarry(authoredName, authoredParsedArguments, authoredArgumentsJson) ?? ((!tool || typeof tool.invoke !== 'function')
       ? resolveOffSurfaceDirectCarry({
           authoredName,
           authoredArgs: authoredParsedArguments,
           authoredArgumentsJson,
           surfaceHas: (name) => toolByName.has(name),
         })
-      : null;
+      : null);
     if (offSurfaceCarry) {
       const carrierTool = toolByName.get(offSurfaceCarry.carrierName);
       if (carrierTool && typeof carrierTool.invoke === 'function') tool = carrierTool;
@@ -9539,7 +9551,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const effectiveName = provenRead?.effectiveName ?? (argumentsValue
           ? unwrapRuntimeEffectiveToolIdentity(call.name, argumentsValue).toolName
           : null);
-        const classifiedEffect = argumentsValue
+        const selectedNative = selectedDirectCarry(call.name, argumentsValue, argumentsJson);
+        const classifiedEffect = selectedNative ? 'local_write' as const : argumentsValue
           ? classifyRuntimeToolEffect(call.name, argumentsValue).effect
           : 'unknown' as const;
         return {
@@ -9787,14 +9800,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // compares against.
       const authoredSurfaceTool = toolByName.get(authoredCall.name);
       const authoredAdmittedJson = materializedArgumentsJson(authoredSurfaceTool, authoredCall.argumentsJson);
-      const admissionCarry = (!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
+      const admissionCarry = selectedDirectCarry(authoredCall.name, parsedArgs(authoredAdmittedJson), authoredAdmittedJson) ?? ((!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
         ? resolveOffSurfaceDirectCarry({
             authoredName: authoredCall.name,
             authoredArgs: parsedArgs(authoredAdmittedJson),
             authoredArgumentsJson: authoredAdmittedJson,
             surfaceHas: (name) => toolByName.has(name),
           })
-        : null;
+        : null);
       const call: CanonicalHostCall = admissionCarry
         ? {
             callId: authoredCall.callId,

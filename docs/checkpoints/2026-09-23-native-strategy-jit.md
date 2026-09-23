@@ -392,3 +392,77 @@ repair/evidence, consent grants/binding projection, and terminal publication
 checks pass (/tmp/clem-definition-repair-adjacent.log); typecheck passes
 (/tmp/clem-definition-repair-types.log). Full suite was not run on this loaded
 machine. No speed/token improvement is claimed until fresh installed completion.
+
+## Installed ba83075d6 — definition repair passes, direct dispatch gap
+
+Installed clean ba83075d661fb811dac9a85b3e671855565dda37, fingerprint
+d6915fd5d2203bf27abd68e341ff0f8d3c8dcbe71967b0b783921fbb70b872f2. Fresh live
+source289253/session sess-desktop-0752e134edeb06dafa7d5378 used actual Opus5.5.
+The prompt deliberately requested one invalid aggregate definition (empty
+groupBy), then correction under the SAME saved requirement. This is a recovery
+acceptance, not an ordinary performance benchmark. After a first plan repair,
+plan289292 was saved; workflow_create289295 was rejected as intended, corrected
+creation289306 succeeded and the dependent read/enable progressed. This supplies
+live evidence of consent/lineage repair, not whole-task completion.
+
+The run exposed another gap: the model chose bare workflow_run289339 after the
+plan. It queued one child1790169545253-6936e2, which succeeded with product323,
+but it did not bind run_once. Parent verification through work_call was refused
+work_dependency_pending. A contextual status call could read the result, but
+could not settle the graph; direct disable then hit native_authoring_definition_
+unavailable. Cancelled exact parent to cap repairs and disabled only the named
+fixture harness-plan-author-0923-ba830-repair via the operator API. Do not count
+that cleanup as Clem acceptance or rewrite/resume the cancelled graph.
+
+Canonical terminal289431 cancelled:158605ms,13 top-level tools,one search,
+812441 prompt/538406 cached/274035 uncached input/11232 output tokens.38 records:
+17Opus5.5,10Grok4.3,8Jev1.13,3Jevlatest; exact attribution certified but3 token
+records uncertified. No speed win. Evidence under output/harness-acceptance/
+2026-09-23-ba83075d6/:repair-{accepted,cancel,operator-cleanup,workflow,runs,
+run-detail,events,measurement}.json; raw memory context excluded from trace.
+
+## Candidate: bind native spellings through the existing planned call path
+
+A unique once-only selected native local-write operation can now carry a direct
+native name or call_tool spelling into the existing work_call preparation,
+consent, dispatch and proof path. The durable selected capability and operation
+are re-read; the host does not choose among multiple requirements by order or
+prose. Explicit work_call keeps its own requirement. Model-call identity/history
+remain authored, as in the existing off-surface carrier path. No graph is
+replaced, no extra user permission or model turn is introduced, and arguments,
+dependencies, current capability authority and once-only effects still pass the
+normal work_call checks. Selection cannot mint authority for another provider.
+If a planned workflow dispatch cannot be uniquely bound, it must not queue a
+child outside the saved plan; it requires an explicit exact requirement.
+
+Recording-model production-path cases now cover work_call/direct/call_tool with
+JIT both on/off, durable parent handoff and resume, exactly one queue receipt,
+result verification and disable, final transactional proof and terminal replay.
+All6 pass (/tmp/clem-direct-planned-dispatch-green.log). Substituting unchanged
+ba830 host runner yields2 passing carrier cases and4 failing direct/generic cases
+(/tmp/clem-direct-planned-dispatch-red.log). Multiple native toggles with the same
+tool name remain ambiguous to automatic binding. Live acceptance is still owed.
+
+Trap: extending same-process fixture variants must also make runAttempt IDs
+unique; workflow names alone do not prevent source ownership collisions. Those
+fixture-construction failures were repaired before using red/green evidence.
+
+## Next optimization target measured, not yet changed
+
+Successful e949 source288872 repeatedly exposed approximately16.3k estimated
+schema tokens per model turn (workflow_create alone5272, plan_task2840,
+run_worker1329, work_call1280). History rose1631→11922, total24911→35322 over13
+model requests. This is composition estimation, distinct from billed usage.
+Reduce schema/repair overhead without erasing the objective, accepted plan,
+constraints or receipts; do not call failed recovery tests matched benchmarks.
+Private metadata-only baseline: prompt-composition-baseline.json in ba830 folder.
+
+Direct-carrier candidate validation:64/64 native lifecycle, named host dispatch,
+tool-effect and model-frame-policy checks pass (/tmp/clem-direct-planned-dispatch-
+adjacent.log); typecheck passes (/tmp/clem-direct-planned-dispatch-types.log).
+Final ambiguity tightening counts ALL matching selected writes before allowing
+one once-only operation; each/set candidates cannot be silently ignored. Final
+native integration15/15 passes (/tmp/clem-direct-planned-dispatch-final.log).
+Full suite remains unqualified on the loaded machine. Live home is never reset;
+fixture tests use explicit mkdtemp homes, with the live-daemon sentinel reporting
+NOT PERFORMED rather than certifying isolation while that daemon is active.
