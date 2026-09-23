@@ -1,3 +1,4 @@
+import { automationReviewPreview } from './automation-review-preview.js';
 import type { PendingApproval } from '../types.js';
 import type { PendingApprovalRow } from './harness/approval-registry.js';
 import { listEvents as listHarnessEvents } from './harness/eventlog.js';
@@ -226,6 +227,17 @@ export function presentApproval(
   context: ApprovalPresentationContext = {},
 ): ApprovalPresentation {
   const args = row.args ?? {};
+  if (row.tool === 'automation_opportunity_review_decision') {
+    return {
+      title: 'Review automation proposal',
+      detail: automationReviewPreview(args),
+      approveLabel: 'Approve proposal',
+      editLabel: 'Review proposal',
+      rejectLabel: 'Reject proposal',
+      canPauseWorkflow: false,
+    };
+  }
+
   const slug = pickString(args, ['tool_slug', 'slug']);
   const inner = nestedArgs(args);
   const normalized = `${row.tool ?? ''} ${slug}`.toUpperCase();
@@ -399,6 +411,7 @@ export function extractApprovalContentPreview(
   args: Record<string, unknown> | null | undefined,
 ): ApprovalContentPreview | undefined {
   try {
+    if (_tool === 'automation_opportunity_review_decision') return { body: automationReviewPreview(args) };
     if (!args || typeof args !== 'object') return undefined;
     // Carriers nest the real fields: composio_execute_tool under `arguments`,
     // work_call under `args_json` (which may itself be a composio call). Peel

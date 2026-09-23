@@ -1062,3 +1062,94 @@ opportunity/recurrence-tool checks pass (/tmp/clem-review-staging-green.log).
 owned approval. Typecheck exit0 (/tmp/clem-review-staging-typecheck.log). Live-home
 sentinel NOT PERFORMED while daemon owned its stores; no isolation-proof claim.
 Candidate still needs build/hotpatch and live exact review-card staging acceptance.
+
+### 624d4c9f3 installed review staging — bounded success, review gap remains
+
+Build session71330 completed exit0. Clean candidate hotpatched through the
+Terminal .command recipe after active/runningRuns/backgroundActive=0 and no
+started physical dispatch. Main remained e77215d00; UI source diff empty.
+Installed GET build-info confirms 624d4c9f3261442f389a3cbd2222f567cb7f571d,
+fingerprint e650112baa52449de45470b8835e68cb4126cc64a1df84e3c3d17a2b73d943c5,
+daemon90472, schema81. Prior dist retained as dist.backup-fskUct.
+
+Resumed saved proposal in the same session; did not reauthor it. Source291688
+called automation_opportunity_review_request once through call_tool, classified
+host_only. Exact proposal digest unchanged; formal approval apr-e9ap created at
+291708 and independently returned by approvals/list. Review staging transitions
+the proposal from proposed revision1 to reviewed revision2; this is not approval.
+No pilot, recurrence or external write was requested or approved. Terminal291719
+correctly reports the pending decision. No repeated discovery or coverage_missing.
+
+Canonical measurement: 58,036ms, 1 top-level tool call, 0 discovery, 89,073 input,
+43,743 cached, 45,330 uncached, 443 output; actual Opus5.5 x2, Grok4.3 x1,
+Jev-latest x1. One usage call uncertified. This is a resumed review-stage case,
+not a matched end-to-end efficiency improvement. Terminal completionReview is
+**enabled_unavailable**; no completion-judge event was emitted. Therefore the
+card mutation is verified, but reviewed completion is NOT accepted. Investigate
+whether host-only control work deliberately skips review and is misprojected or
+whether the review path is missing; do not infer provider outage from this field.
+Evidence: output/harness-acceptance/2026-09-23-review-624/. Export excludes prompt
+composition, memory-context fragments and requestEvidenceCipher.
+
+Notification report reconfirmed against source: desktop main.ts
+focusDesktopNotificationRoute pushes /inbox while BrowserRouter mounts /console;
+click read acknowledgement is not coupled to successful navigation. Desktop
+ownership remains with UI agent. Requires shell rebuild/native click, not daemon
+hotpatch. No desktop files changed. Full release gates remain outstanding.
+
+### Follow-up diagnosis of source291688 (no new model calls)
+
+The absent judge is explained by existing policy: host-turn-runner's
+judgeHostCompletion reads pending approvals for the session, and
+shouldRunObjectiveJudge explicitly returns false when openApprovalCard=true.
+The conversational skip recorder excludes this case, so no skip event exists;
+delivery-committer maps missing verdict to enabled_unavailable. Thus this trace
+is NOT evidence of a provider outage. Do not add a judge call just to make that
+field green or call the answer reviewed. Missing typed deferral provenance is
+an observability defect; pending human authority must remain intact.
+
+Prompt-composition receipts saved as prompt-costs.json alongside prior evidence:
+first estimated35,359 tokens, second35,911 (+552). First history15,916,
+schemas13,123, memory3,016, instructions1,566, turnContext1,205,
+contextPacket414,currentMessage119. Opportunity-propose schema3,235 and plan_task
+2,840 remain first-class even though this exact continuation only stages review.
+These estimates differ from provider token accounting. Two brain frames account
+for88,150 input; side frames923. Do not blame a completion-judge loop or claim
+exponential growth from this trace. Next optimization must preserve retrievable
+history/plan evidence while selecting the relevant tool surface, not strip all
+context or add a provider-specific budget.
+
+Independent approvals/list inspection found a second acceptance gap: apr-e9ap
+contentPreview.body is only "proposed"; presentation lists controlVersion,
+kind, projectionId, proposalDigest, proposalId and revisions, with no objective,
+capabilities, schedule or effect preview. Registration in
+src/execution/automation-opportunity-review-control-plane.ts passes exact CAS
+args and generic subject, with no human-readable proposal summary. Do not treat
+card existence as a usable human-in-the-loop approval experience. Fix the shared
+approval projection with exact proposal-bound content; keep decision args/CAS
+separate from presentation, preserve replay and stale rejection, and verify both
+served API and desktop/mobile rendering. No approval was supplied, no business
+workflow was run, no desktop file changed in this investigation.
+
+### Exact proposal preview candidate (not installed yet)
+
+Added shared runtime automation-review-preview projection and wired it into
+approval-summary content preview and human presentation. It loads only the
+exact reviewed revision/digest, recomputes the opportunity digest, and displays
+objective, rationale, capability constraints, phases/effects, recurrence, pilot,
+budgets, deliverables, missing inputs and success evidence. The preview states
+that approval starts neither pilot nor Space/execution/schedule. No authority
+args or stored proposal/approval data are changed. Missing, stale, corrupt or
+resolved proposals produce an explicit fresh-review requirement; they cannot
+fall back to a misleading status-string draft. Existing cards gain the preview
+without reauthoring or rewriting their CAS. The full body is retained; existing
+desktop/mobile expandable-draft components can expose it without UI file edits.
+
+Red pin: /tmp/clem-review-preview-red.log, 13 pass/1 fail, exact objective absent.
+First focused green: 27/27 approval-summary and opportunity-review-control-plane
+checks (/tmp/clem-review-preview-green.log). Final strengthened cases add stale
+revision, wrong identity/version, shared presentation and resolved-state checks;
+final rerun passed 14/14 (/tmp/clem-review-preview-final.log); typecheck passed exit0
+(/tmp/clem-review-preview-typecheck.log). Live-home sentinel is
+NOT PERFORMED while daemon owns stores, not an isolation proof. No paid model
+calls. Candidate still requires build and installed API/rendered acceptance.
