@@ -23,7 +23,7 @@ import {
   getComposioCliDefaultAccounts, authorizeComposioCliDefaultAccount, revokeComposioCliDefaultAccount,
   setAccountLabel, setComposioApiKey, setupComposioCredentials,
   getCredentials, setCredential, setDiscordOwner,
-  normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
+  normalizeCredentialRows, isConnected, keyUrlHost, CODEX_MANAGED_SECRETS,
   connectedToolkits, reconnectConnectionId, searchToolkits, staleConnectionStory, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
   type ComposioAuthorization, type ComposioConnectResult, type ComposioSetupMeta,
@@ -803,6 +803,7 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
     : descriptor?.description;
   const showDiscordOwner = discordAllowedUsers !== undefined;
   const [ownerOpen, setOwnerOpen] = useState(false);
+  const keyUrl = !managed && typeof descriptor?.keyUrl === 'string' ? descriptor.keyUrl : undefined;
 
   const save = async () => {
     if (!value.trim() || !name) return;
@@ -824,6 +825,11 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
             {discordAllowedUsers?.trim() ? 'Bot owner' : 'Set bot owner'}
           </button>
         )}
+        {keyUrl && !connected && !editing && (
+          <a href={keyUrl} target="_blank" rel="noopener noreferrer" className="inline-flex shrink-0 items-center gap-0.5 text-caption text-primary hover:underline">
+            Get a key <ExternalLink className="h-3 w-3" aria-hidden />
+          </a>
+        )}
         <StatusPill tone={connected ? 'success' : required ? 'warning' : 'neutral'}>
           {connected ? 'Connected' : managed ? 'Sign in needed' : required ? 'Action needed' : 'Optional'}
         </StatusPill>
@@ -837,6 +843,14 @@ function CredentialCard({ row, descriptor, discordAllowedUsers, codexSignedIn = 
           <Button size="sm" onClick={save} disabled={saving || !value.trim()}>{saving ? '…' : <Check className="h-4 w-4" aria-hidden />}</Button>
           <Button variant="ghost" size="icon" onClick={() => { setEditing(false); setValue(''); setError(''); }} aria-label="Cancel"><X className="h-4 w-4" aria-hidden /></Button>
         </div>
+      )}
+      {editing && keyUrl && (
+        <p className="mt-2 text-caption text-muted">
+          No key yet?{' '}
+          <a href={keyUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
+            Get one at {keyUrlHost(keyUrl)} <ExternalLink className="h-3 w-3" aria-hidden />
+          </a>
+        </p>
       )}
       {error && <p className="mt-2 text-caption text-danger">{error}</p>}
       {codexRow && !connected && <CodexReauth signedIn={connected} onDone={onSaved} />}

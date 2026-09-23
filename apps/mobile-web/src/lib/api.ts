@@ -417,6 +417,9 @@ export interface InboxNotification {
   createdAt: string;
   read: boolean;
   needsAttention: boolean;
+  /** Server-owned grouping identity (dashboard/needs-you.ts). Older daemons
+   *  omit it; the row then stands alone. */
+  needsYouKey?: string;
   deliveredAt: string | null;
   deliveryError: string | null;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
@@ -476,6 +479,18 @@ export interface InboxSummary {
   trustProposals: number;
   notificationNeedsYou: number;
   unreadUpdates: number;
+  stoppedWorkflows?: number;
+  checkInProposals?: number;
+  /** Items in `needsYou` no Inbox feed has a row for; the Inbox renders them. */
+  unlisted?: InboxUnlistedItem[];
+}
+
+export interface InboxUnlistedItem {
+  key: string;
+  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
+  title: string;
+  detail: string;
+  workflow?: string;
 }
 
 export interface InboxQuestion {

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, CheckCircle2, AlertCircle, X } from 'lucide-react';
@@ -113,22 +113,31 @@ interface RowState {
  */
 export function NeedsYouPane({
   items,
+  total,
   loading,
   error,
   onRetry,
   headingId,
+  layout = 'list',
+  maxRows = MAX_ROWS,
 }: {
   items: readonly HomeFeedItem[];
+  /** The one needs-you count (the sidebar's number); the list shows the
+   *  first few of those items. */
+  total?: number;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
   headingId: string;
+  /** A stacked list (a tile, a rail) or a row of cards you act on in place. */
+  layout?: 'list' | 'strip';
+  maxRows?: number;
 }) {
   const qc = useQueryClient();
   const [rows, setRows] = useState<Record<string, RowState>>({});
 
   const settle = () => {
-    for (const key of ['command-center', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
+    for (const key of ['command-center', 'needs-you-summary', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
       void qc.invalidateQueries({ queryKey: [key] });
     }
   };
@@ -245,19 +254,39 @@ export function NeedsYouPane({
     }
   };
 
-  const visible = items.slice(0, MAX_ROWS);
-  const overflow = items.length - visible.length;
+  const visible = items.slice(0, maxRows);
+  const strip = layout === 'strip' && !loading && !error && visible.length > 0;
+  // A function, not a component: the rows keep their state (a typed answer)
+  // across re-renders because the element types never change identity.
+  const wrap = (children: ReactNode) => strip
+    ? <div className="grid items-stretch gap-3 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
+    : <PaneCard>{children}</PaneCard>;
+  const rowCard = strip ? 'rounded-md border border-border bg-surface first:border-t' : '';
+  const count = typeof total === 'number' ? Math.max(total, items.length === 0 ? 0 : visible.length) : items.length;
+  const overflow = count - visible.length;
 
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
-      <SectionHeader id={headingId} label="Needs you" count={items.length} />
-      <PaneCard>
+      <SectionHeader
+        id={headingId}
+        label="Needs you"
+        count={count}
+        countTone="muted"
+        aside={strip && overflow > 0 ? <Link to="/inbox?tab=needs" className="rounded-sm font-semibold text-primary hover:underline">See all {count}</Link> : undefined}
+      />
+      {wrap(<>
         {loading ? (
           <RowSkeleton rows={2} tall />
         ) : error ? (
           <LoadFailedLine what="what needs you" onRetry={onRetry} />
-        ) : items.length === 0 ? (
+        ) : items.length === 0 && count === 0 ? (
           <QuietLine>Nothing needs you right now.</QuietLine>
+        ) : items.length === 0 ? (
+          <PaneRow className="justify-center">
+            <Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">
+              {count === 1 ? 'One thing needs you — open Needs you' : `${count} things need you — open Needs you`}
+            </Link>
+          </PaneRow>
         ) : (
           <>
             {visible.map((item, index) => {
@@ -268,7 +297,7 @@ export function NeedsYouPane({
               const when = agoLabel(item.createdAt);
               const canDismiss = Boolean(item.dismissKind && item.dismissId);
               return (
-                <PaneRow key={key} className="flex-col items-stretch gap-2">
+                <PaneRow key={key} className={cn('flex-col items-stretch gap-2', rowCard)}>
                   <div className="flex items-start gap-2">
                     <Link
                       to={href}
@@ -346,16 +375,16 @@ export function NeedsYouPane({
                 </PaneRow>
               );
             })}
-            {overflow > 0 && (
+            {overflow > 0 && !strip && (
               <PaneRow className="justify-center">
                 <Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">
-                  See all {items.length} in Inbox
+                  See all {count} in Inbox
                 </Link>
               </PaneRow>
             )}
           </>
         )}
-      </PaneCard>
+      </>)}
     </section>
   );
 }

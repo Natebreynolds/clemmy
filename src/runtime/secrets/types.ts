@@ -140,6 +140,9 @@ export interface SecretDescriptor {
   required: boolean;
   /** Brief help text the dashboard shows in the "how to set this" hint. */
   setupHint?: string;
+  /** The page where a person creates this credential. Every surface that
+   *  asks for the value links here, so nobody has to search for it. */
+  keyUrl?: string;
   /** Optional pre-save probe. When present, /api/console/credentials/set
    *  calls this with the candidate value BEFORE persisting. Returns
    *  'invalid' to reject the save (with a helpful message); 'unknown'

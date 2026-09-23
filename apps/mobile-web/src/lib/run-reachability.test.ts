@@ -30,12 +30,11 @@ test('the shell makes a run a destination and hands every surface the same door'
     'opening a run inside Activity updates the URL, so reload and swipe-back land in the same place');
 });
 
-test("Home's running rows open the run they are about", () => {
+test("Home leaves run rows to Activity; its header chip opens the same run screen", () => {
   const home = read('../screens/Home.tsx');
-  assert.match(home, /const sessionId = entry\.sessionId/);
-  assert.match(home, /class="home-run-open"[\s\S]*?onOpenRun\(sessionId\)/);
-  assert.match(home, /\{sessionId \? \([\s\S]*?\) : head\}/,
-    'a row with no run screen shows no dead affordance');
+  assert.doesNotMatch(home, /class="home-run-open"/, 'no run rows on Home');
+  const app = read('../app.tsx');
+  assert.match(app, /\{headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\}/);
 });
 
 test('a finished run row says what it did, not what the engine calls it', () => {

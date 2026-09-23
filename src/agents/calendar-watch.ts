@@ -402,7 +402,8 @@ function isCommitment(e: CalEvent): boolean {
 function isFirm(e: CalEvent): boolean {
   return isCommitment(e) && e.showAs !== 'tentative';
 }
-function isUnansweredInvite(e: CalEvent): boolean {
+/** The watch's one rule for an invite waiting on the owner; Home's Today reads it too. */
+export function isUnansweredInvite(e: CalEvent): boolean {
   return isCommitment(e) && e.attendeeCount >= 1 && e.myResponse !== 'organizer' && UNANSWERED.has(e.myResponse);
 }
 

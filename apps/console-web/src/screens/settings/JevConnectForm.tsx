@@ -5,7 +5,8 @@ import { Button } from '@/components/ui/Button';
 import { Field, Input } from '@/components/ui/Field';
 import { connectJev, disconnectJev, type JevStatus } from '@/lib/settings';
 
-const KEY_URL = 'https://console.typesafe.ai/keys';
+/** Where a person creates a Jev key (the registry's `typesafe_api_key.keyUrl`). */
+export const JEV_KEY_URL = 'https://console.typesafe.ai/keys';
 
 export function JevConnectForm({ status, onDone }: { status?: JevStatus; onDone: () => void }) {
   const qc = useQueryClient();
@@ -53,10 +54,13 @@ export function JevConnectForm({ status, onDone }: { status?: JevStatus; onDone:
       </p>
       {connected
         ? <p className="mb-3 inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Connected · {status?.model} · fast decisions {status?.enabled ? 'on' : 'paused'}</p>
-        : <p className="mb-3 text-small text-muted">Not connected. Paste a key to turn Jev on for the next turn.</p>}
-      <a href={KEY_URL} target="_blank" rel="noopener noreferrer" className="mb-3 inline-flex items-center gap-1 text-small text-primary hover:underline">
-        Get a TypeSafe API key <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-      </a>
+        : <p className="mb-3 text-small text-muted">
+            Not connected. Jev keys come from TypeSafe:{' '}
+            <a href={JEV_KEY_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
+              get one at console.typesafe.ai <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+            </a>
+            , then paste it below.
+          </p>}
       {!connected && (
         <Field label="API key" hint="The key stays on this machine. Ranking, primer, and write checks send a short request plus session snippets to api.typesafe.ai.">{(id) => (
           <Input id={id} type="password" value={apiKey} placeholder="paste your API key" autoComplete="off"

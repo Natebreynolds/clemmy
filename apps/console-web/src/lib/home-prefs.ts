@@ -15,6 +15,7 @@ export type HomeLanding = 'home' | 'last_conversation' | 'current_project';
 export type HomePaneId =
   | 'quick_actions'
   | 'needs_you'
+  | 'today'
   | 'running'
   | 'while_away'
   | 'made'
@@ -29,10 +30,21 @@ export interface QuickAction {
   value: string;
 }
 
+/** How Home is arranged: decisions first, or a grid of tiles. */
+export type HomeStyle = 'briefing' | 'dashboard';
+/** The header that shows Clem at work: moving, still, or not shown. */
+export type HomeLiveStatus = 'animated' | 'still' | 'off';
+/** How one Space shows on Home. */
+export type HomeSpaceView = 'summary' | 'full';
+
 export interface HomePreferences {
   /** The server's epoch marks untouched defaults; saved choices have a real timestamp. */
   updatedAt?: string;
   landing: HomeLanding;
+  style: HomeStyle;
+  liveStatus: HomeLiveStatus;
+  /** Space id → how it shows on Home; a Space not named here shows its summary. */
+  spaceViews: Record<string, HomeSpaceView>;
   panes: {
     /** Render order. Ids absent here render after, in default order. */
     order: HomePaneId[];
@@ -66,15 +78,26 @@ export interface HomePreferences {
  */
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'needs_you',
-  'running',
+  'today',
   'while_away',
   'made',
   'projects',
   'quick_actions',
 ];
 
+/**
+ * Panes Home no longer draws. `running` moved to the board (/tasks), which
+ * owns Clem's work in detail; Home keeps a one-line summary that links there.
+ * A saved record that still names one keeps every other choice exactly — the
+ * id is skipped on read, never rewritten on the server's copy.
+ */
+export const RETIRED_HOME_PANES: ReadonlySet<HomePaneId> = new Set(['running']);
+
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',
+  style: 'dashboard',
+  liveStatus: 'animated',
+  spaceViews: {},
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
     pinned: ['/home', '/chat', '/inbox', '/tasks', '/workspaces'],
@@ -101,6 +124,10 @@ export function desktopHomePreferences(prefs: HomePreferences): HomePreferences 
   const migrated = migrateHomePreferences(prefs);
   return {
     ...migrated,
+    // A daemon older than the style fields sends none: the defaults stand in.
+    style: migrated.style ?? DEFAULT_HOME_PREFERENCES.style,
+    liveStatus: migrated.liveStatus ?? DEFAULT_HOME_PREFERENCES.liveStatus,
+    spaceViews: migrated.spaceViews ?? {},
     landing: migrated.updatedAt === '1970-01-01T00:00:00.000Z' ? 'home' : migrated.landing,
     nav: primaryHomeNavigation(migrated.nav),
   };
@@ -164,7 +191,7 @@ export function useSaveHomePreferences() {
 /** Pane ids in render order, honoring the user's order and hidden set. */
 export function visiblePanes(prefs: HomePreferences): HomePaneId[] {
   const hidden = new Set(prefs.panes.hidden);
-  const ordered = prefs.panes.order.filter((id) => !hidden.has(id));
+  const ordered = prefs.panes.order.filter((id) => !hidden.has(id) && !RETIRED_HOME_PANES.has(id));
   const rest = DEFAULT_HOME_PANE_ORDER.filter((id) => !hidden.has(id) && !ordered.includes(id));
   return [...ordered, ...rest];
 }

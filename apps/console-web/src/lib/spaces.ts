@@ -278,6 +278,10 @@ export interface StarterRecipe {
 }
 export const listStarterRecipes = () =>
   apiGet<{ starters: StarterRecipe[] }>('/api/console/spaces/starters').then((r) => r.starters);
+/** Starters with whether the connection lookup actually answered. */
+export const getStarterRecipes = () =>
+  apiGet<{ starters: StarterRecipe[]; connectionsKnown?: boolean }>('/api/console/spaces/starters')
+    .then((r) => ({ starters: r.starters, connectionsKnown: r.connectionsKnown !== false }));
 
 /** Export a static, share-ready snapshot (no tokens, actions frozen). Returns
  *  the local folder; ask Clem in the dock to deploy it for a link. */

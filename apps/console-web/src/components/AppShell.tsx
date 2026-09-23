@@ -10,6 +10,7 @@ import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
 import { ALL_NAV, DEVELOPER_NAV } from '@/lib/nav';
+import { ShellTitleContext } from '@/lib/shell-title';
 import { usePoll } from '@/lib/poll';
 import { apiGet } from '@/lib/api';
 import type { CommandCenter } from '@/lib/types';
@@ -143,7 +144,9 @@ export function AppShell() {
           className={`min-h-0 flex-1 ${location.pathname === '/chat' || location.pathname.startsWith('/chat/') ? 'overflow-hidden' : 'overflow-y-auto'}`}
         >
           <ErrorBoundary resetKey={location.pathname}>
-            <Outlet />
+            <ShellTitleContext.Provider value={title}>
+              <Outlet />
+            </ShellTitleContext.Provider>
           </ErrorBoundary>
         </main>
       </div>

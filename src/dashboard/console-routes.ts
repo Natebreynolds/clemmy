@@ -131,6 +131,7 @@ import {
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
+import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -352,7 +353,7 @@ import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
-import { addNotification, getNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, getNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { applySessionMountPrimers, composeSessionFromStore } from '../runtime/harness/session-composition.js';
@@ -9907,8 +9908,8 @@ export function registerConsoleRoutes(
       const store = await getSecretStore();
       const live = req.query.live === '1' || req.query.live === 'true';
       const rows = await store.health({ passive: !live });
-      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; required: boolean; envVarName: string }>>(
-        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
+      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; keyUrl?: string; required: boolean; envVarName: string }>>(
+        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, keyUrl: d.keyUrl, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
       );
       // Surface the Discord allow-list alongside the token so the hub can
@@ -13598,12 +13599,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const since = typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+      const ref = needsYouReferents();
       const items = listNotifications(50)
         .filter((n) => !n.silent && !n.read)
         .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
         .slice(0, 5)
         .map((n) => {
-          const needsAttention = isNeedsAttentionNotification(n);
+          const needsAttention = notificationNeedsYou(n, ref);
           return {
             id: n.id,
             title: n.title,
@@ -13691,6 +13693,72 @@ export function registerConsoleRoutes(
     try {
       const until = await snoozeHomeItem(key, hours);
       res.json({ ok: true, key, until });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // The one needs-you count and the rows no other feed carries — the Needs
+  // you tab's badge and its unlisted rows (dashboard/needs-you.ts). The
+  // sidebar reads the same total from the command centre.
+  app.get('/api/console/needs-you/summary', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const runtimeApprovalIds = assistant.getRuntime().listPendingApprovals().map((approval) => approval.id);
+      const summary = await summarizeNeedsYou({ runtimeApprovalIds });
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Today on Home: the calendar watch's last read of the next day, projected
+  // (dashboard/home-today.ts). No provider call and no model call.
+  app.get('/api/console/home/today', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { calendarWatchStatus, loadCalendarWatchState } = await import('../agents/calendar-watch-runtime.js');
+      const { projectHomeToday } = await import('./home-today.js');
+      const status = calendarWatchStatus();
+      res.json(projectHomeToday({
+        state: loadCalendarWatchState(),
+        connectedOperations: status.connectedOperations,
+        ...(status.nextTickAt ? { nextTickAt: status.nextTickAt } : {}),
+        nowMs: Date.now(),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Summaries of the Spaces on Home, from the same projection the phone uses
+  // (dashboard/home-space-summary.ts). Read-only; nothing is refreshed.
+  app.get('/api/console/home/space-summaries', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const raw = typeof req.query.ids === 'string' ? req.query.ids : '';
+      const ids = [...new Set(raw.split(',').map((id) => id.trim()).filter(Boolean))].slice(0, 32);
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      const { readData } = await import('../spaces/data-store.js');
+      const { summarizeSpaceForHome } = await import('./home-space-summary.js');
+      const summaries = ids.flatMap((id) => {
+        if (!isValidSpaceSlug(id)) return [];
+        const record = spaceStore.get(id);
+        if (!record || record.status === 'archived') return [];
+        const health = spaceStore.health(id);
+        let data: unknown = null;
+        try { data = readData(id); } catch { data = null; }
+        return [summarizeSpaceForHome({
+          id,
+          title: record.title,
+          objective: record.contract?.objective ?? null,
+          lastRefreshedAt: record.lastRefreshedAt ?? null,
+          freshness: health?.freshness.state ?? 'unknown',
+          issues: health?.issues ?? [],
+          data,
+        })];
+      });
+      res.json({ summaries });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -13885,48 +13953,26 @@ export function registerConsoleRoutes(
           panel: 'approvals',
           urgency: 'high',
         })),
-        // Runs the boot-resume cap parked are a DECISION, not running work:
-        // Clementine stopped re-running them after repeated restarts and is
-        // waiting for a person to resume or skip. Live 2026-09-22: eleven of
-        // them, up to eleven days old, showed under Running as "Waiting for
-        // approval" while this list said one thing needed you. One queue.
-        // One item per WORKFLOW: ten paused standup-email occurrences are one
-        // decision ("resume or skip these"), not ten cards saying the same thing.
-        ...(() => {
-          const byWorkflow = new Map<string, { workflowName: string; runIds: string[]; oldest: string; restarts: number }>();
-          for (const run of pendingWorkflowRuns) {
-            if (run.runStatus !== 'parked') continue;
-            try {
-              const raw = JSON.parse(fs.readFileSync(path.join(WORKFLOW_RUNS_DIR, `${run.runId}.json`), 'utf8')) as Record<string, unknown>;
-              if (typeof raw.bootResumeParkedAt !== 'string' || (raw.parked && typeof raw.parked === 'object')) continue;
-              const since = typeof raw.bootResumeMark === 'string' ? raw.bootResumeMark : typeof raw.createdAt === 'string' ? raw.createdAt : '';
-              const restarts = typeof raw.bootResumeCount === 'number' ? raw.bootResumeCount : 0;
-              const group = byWorkflow.get(run.workflowName) ?? { workflowName: run.workflowName, runIds: [], oldest: since, restarts: 0 };
-              group.runIds.push(run.runId);
-              if (since && (!group.oldest || since < group.oldest)) group.oldest = since;
-              group.restarts = Math.max(group.restarts, restarts);
-              byWorkflow.set(run.workflowName, group);
-            } catch { /* an unreadable record is not a decision */ }
-          }
-          return [...byWorkflow.values()].map((group) => {
-            const workflow = readWorkflow(group.workflowName);
-            const title = workflow?.data?.name ?? group.workflowName;
-            const n = group.runIds.length;
-            return {
-              kind: 'workflow-paused',
-              title: n === 1
-                ? `Paused after repeated restarts: ${title}`
-                : `${n} paused runs of ${title} after repeated restarts`,
-              meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
-              panel: 'workflows',
-              urgency: 'low',
-              actionKind: 'workflow-run',
-              workflowName: group.workflowName,
-              runId: group.runIds[0],
-              count: n,
-            };
-          });
-        })(),
+        // Runs paused after repeated restarts: one decision per workflow
+        // (dashboard/needs-you.ts `bootParkedWorkflows`, which the count reads).
+        ...bootParkedWorkflows(pendingWorkflowRuns).map((group) => {
+          const workflow = readWorkflow(group.workflowName);
+          const title = workflow?.data?.name ?? group.workflowName;
+          const n = group.runIds.length;
+          return {
+            kind: 'workflow-paused',
+            title: n === 1
+              ? `Paused after repeated restarts: ${title}`
+              : `${n} paused runs of ${title} after repeated restarts`,
+            meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
+            panel: 'workflows',
+            urgency: 'low',
+            actionKind: 'workflow-run',
+            workflowName: group.workflowName,
+            runId: group.runIds[0],
+            count: n,
+          };
+        }),
       ].map((item) => ({
         ...item,
         title: trimConsoleTitle(stripConsoleIds(item.title), 140),
@@ -14066,9 +14112,6 @@ export function registerConsoleRoutes(
           .split('\n')
           .map((line) => line.trim())
           .find((line) => line && !line.startsWith('#') && !/^[{}\[\]\-=*`>|"',:]+$/.test(line)) || '';
-      // Shared with markNotificationGroupRead so dismiss clears exactly the
-      // set of notifications this feed would surface.
-      const isNeedsAttentionNotif = isNeedsAttentionNotification;
       // Collapse the generic "Workflow completed/needs attention: <name>"
       // echo when a richer notify_user report already covers the same run —
       // otherwise every run double-reports (the clutter the inbox must avoid).
@@ -14141,13 +14184,20 @@ export function registerConsoleRoutes(
         }
         return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       };
+      // The one needs-you definition (dashboard/needs-you.ts), shared with the
+      // Needs you tab and the phone so their lists and badges agree.
+      const needsYouRef = needsYouReferents();
       const notifNeedsYou = dedupeByWorkflow(
         // Unread only: a read needs-attention notification is one the user
         // has already seen/dismissed — leaving it here made stale "Workflow
         // needs attention" cards immortal on Home (clicking led to an empty
         // approvals tab; observed 2026-06-11).
-        inboxNotifs.filter((notification) => !notification.read && isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
-        6,
+        inboxNotifs.filter((notification) => !notification.read
+          && notificationNeedsYou(notification, needsYouRef)
+          && !isGenericWorkflowEcho(notification)
+          // A carrier for a decision already on this list is that decision.
+          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef))),
+        50,
       ).map((notification) => ({
         kind: 'workflow',
         title: trimConsoleTitle(stripConsoleIds(notification.title.replace(/^[⚠️️\s]+/, '')), 140),
@@ -14163,7 +14213,7 @@ export function registerConsoleRoutes(
         dismissId: notification.id,
       }));
       const notifRecent = dedupeByWorkflow(
-        inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        inboxNotifs.filter((notification) => !notificationNeedsYou(notification, needsYouRef) && !isGenericWorkflowEcho(notification)),
         12,
       ).map((notification) => {
         const undelivered = !notification.deliveredAt && (Boolean(notification.deliveryError) || (notification.deliveryAttempts || 0) > 0);
@@ -14264,7 +14314,8 @@ export function registerConsoleRoutes(
       // sessions + workflow runs/executions only. Background tasks and
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
-      const waitingCount = needsYouMerged.length;
+      // Every badge shows this number: the same summary the phone's pill reads.
+      const waitingCount = (await summarizeNeedsYou({ runtimeApprovalIds: approvals.map((approval) => approval.id), pendingRuns: pendingWorkflowRuns })).total;
       const snoozes = activeHomeSnoozes();
       const isSnoozed = (item: unknown): boolean => {
         const key = (item as { snoozeKey?: unknown }).snoozeKey;

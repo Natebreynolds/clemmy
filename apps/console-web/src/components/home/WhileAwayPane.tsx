@@ -4,11 +4,12 @@ import { cn } from '@/lib/cn';
 import { awayMeta, awayOutcome, awayTarget, clockLabel, plainText, type HomeFeedItem } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
-const MAX_ROWS = 6;
+const MAX_ROWS = 5;
 
 /**
- * WHILE YOU WERE AWAY — durable updates, including informational notices.
- * Notification delivery must not be presented as task completion.
+ * WHAT CAME BACK — durable updates, including informational notices, as a
+ * list (a tile) or a timeline down the page (Briefing). Notification delivery
+ * must not be presented as task completion.
  */
 export function WhileAwayPane({
   items,
@@ -16,22 +17,60 @@ export function WhileAwayPane({
   error,
   onRetry,
   headingId,
+  variant = 'list',
 }: {
   items: readonly HomeFeedItem[];
   loading: boolean;
   error: boolean;
   onRetry: () => void;
   headingId: string;
+  variant?: 'list' | 'timeline';
 }) {
   const visible = items.slice(0, MAX_ROWS);
+  if (variant === 'timeline' && !loading && !error && visible.length > 0) {
+    return (
+      <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
+        <SectionHeader
+          id={headingId}
+          label="What came back"
+          aside={<Link to="/inbox?tab=notifications" className="rounded-sm font-semibold text-primary hover:underline">All updates</Link>}
+        />
+        <ol className="relative flex flex-col gap-3.5 rounded-md border border-border bg-surface px-5 py-4 before:absolute before:bottom-6 before:left-[7rem] before:top-6 before:w-px before:bg-border-strong">
+          {visible.map((item, index) => {
+            const outcome = awayOutcome(item);
+            const href = awayTarget(item);
+            const meta = awayMeta(item);
+            const key = item.notifId ?? item.taskId ?? item.targetRunId ?? `${index}:${item.title ?? ''}`;
+            const text = (
+              <span className="min-w-0 flex-1 text-body">
+                <span className="font-semibold text-fg">{plainText(item.title, 160) || 'Update from Clem'}</span>
+                {meta && <span className="text-muted"> — {plainText(meta, 200)}</span>}
+              </span>
+            );
+            return (
+              <li key={key} className="relative flex items-baseline gap-4">
+                <span className="w-[4.5rem] shrink-0 text-caption tabular-nums text-faint">{clockLabel(item.createdAt)}</span>
+                <span
+                  className={cn('relative z-10 mt-1 h-2.5 w-2.5 shrink-0 self-start rounded-full border-2 bg-surface', outcome === 'update' ? 'border-border-strong' : 'border-warning')}
+                  aria-label={outcome === 'update' ? 'Update' : 'Needs a look'}
+                  role="img"
+                />
+                {href ? <Link to={href} className="min-w-0 flex-1 hover:[&_span.font-semibold]:text-primary">{text}</Link> : text}
+              </li>
+            );
+          })}
+        </ol>
+      </section>
+    );
+  }
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
         id={headingId}
-        label="While you were away"
+        label="What came back"
         aside={
           <Link to="/inbox?tab=notifications" className="rounded-sm font-semibold text-primary hover:underline">
-            All in Inbox
+            All updates
           </Link>
         }
       />

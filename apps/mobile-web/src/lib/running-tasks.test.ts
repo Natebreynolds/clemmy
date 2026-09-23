@@ -198,7 +198,6 @@ test('a stalled row states that it stopped, and how long ago', () => {
 // if that happens again.
 test('every phone surface that shows a run row renders runStatusLabel', () => {
   const surfaces = [
-    '../screens/Home.tsx',
     '../screens/Activity.tsx',
     '../components/RunningTasksSheet.tsx',
   ];

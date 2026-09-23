@@ -23,7 +23,7 @@ import {
   listInboxQuestions, answerInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
-  approvalDecisionSuccessText, collapseAttentionRows, notifTone, notifFailed,
+  approvalDecisionSuccessText, attentionPill, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
@@ -97,6 +97,9 @@ export function Inbox() {
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
   const planProposals = usePoll(['plan-proposals'], listPlanProposals, 6000);
   const questions = usePoll(['inbox-questions'], listInboxQuestions, 5000);
+  // The one count (dashboard/needs-you.ts): the same total the sidebar and the
+  // phone show, plus rows no other feed carries.
+  const needsSummary = usePoll(['needs-you-summary'], getNeedsYouSummary, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
   const workspaceChooserRows = workspaceChoosers.data?.choosers ?? [];
@@ -110,14 +113,26 @@ export function Inbox() {
   const questionRows = questions.data?.questions ?? [];
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
-  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
+  // A carrier for a decision already on this list as a card is that decision.
+  const listedDecisionKeys = new Set([
+    ...approvalRows.map((row) => `approval:${row.approvalId}`),
+    ...planRows.map((row) => `plan:${row.id}`),
+    ...trustRows.map((row) => `trust:${row.id}`),
+    ...questionRows.map((row) => row.id),
+  ]);
+  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n)
+    && !(n.needsYouKey && listedDecisionKeys.has(n.needsYouKey)));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
-  const needsCount = workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
-  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
+  const unlistedRows = needsSummary.data?.unlisted ?? [];
+  // The badge is the server's total whenever it has answered: the sidebar and
+  // the phone show that same number. The local sum is only the fallback.
+  const needsCount = needsSummary.data?.total
+    ?? (workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length);
+  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -133,7 +148,8 @@ export function Inbox() {
   const hasRows = !queryUnavailable && (tab === 'needs' ? anyDecisionRows : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
-  const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
+  // Every decision moves the one count too, so the badge never lags the list.
+  const invalidate = (...keys: string[]) => [...keys, 'needs-you-summary'].forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
 
   const onDecide = async (id: string, decision: 'approve' | 'reject', note?: string) => {
     const row = approvalRows.find((a) => a.approvalId === id);
@@ -616,8 +632,19 @@ export function Inbox() {
                     <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
                       title={n.title || n.body || 'Needs attention'}
                       meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
-                      tone={{ tone: 'warning', label: 'Needs attention' }} />
+                      tone={attentionPill(n)} />
                   )
+                ))}
+                {unlistedRows.map((item) => (
+                  <Link key={item.key}
+                    to={item.workflow ? `/automate?workflow=${encodeURIComponent(item.workflow)}` : '/home'}
+                    className="flex w-full items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-3 text-left transition-colors hover:bg-hover">
+                    <StatusPill tone="warning">{item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you'}</StatusPill>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-body text-fg">{item.title}</span>
+                      <span className="block truncate text-small text-muted">{item.detail}</span>
+                    </span>
+                  </Link>
                 ))}
               </>
             ))}

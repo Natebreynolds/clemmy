@@ -56,7 +56,6 @@ export function Settings() {
   return (
     <div className="flex h-full min-h-0">
       <nav aria-label="Settings sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
-        <h1 className="mb-3 px-2 text-h2 text-fg">Settings</h1>
         {NAV_GROUPS.map((g, i) => (
           <div key={g.group} className={cn('flex flex-col', i > 0 && 'mt-3 border-t border-border pt-3')}>
             <p className="px-2.5 pb-1 text-caption font-semibold uppercase tracking-widest text-faint">{g.group}</p>
@@ -73,7 +72,6 @@ export function Settings() {
       </nav>
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-8">
-          <h1 className="text-h1 text-fg md:hidden">Settings</h1>
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Clementine</p>
           <ModelsSection />
           <ConnectedSection />

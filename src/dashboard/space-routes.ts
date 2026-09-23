@@ -500,8 +500,12 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   app.get('/api/console/spaces/starters', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     let slugs: string[] = [];
-    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { /* offline → connection-free only */ }
-    res.json({ starters: availableStarterRecipes(slugs) });
+    // A failed lookup is not "nothing connected": say which one it was, so a
+    // surface can offer the connection-free starters without claiming the rest
+    // need connecting.
+    let connectionsKnown = true;
+    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { connectionsKnown = false; }
+    res.json({ starters: availableStarterRecipes(slugs), connectionsKnown });
   });
 
   app.get('/api/console/spaces/:id', (req, res) => {

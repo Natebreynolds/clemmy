@@ -55,7 +55,6 @@ export interface HomePreferences {
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'quick_actions',
   'needs_you',
-  'running',
   'while_away',
   'made',
   'projects',
@@ -94,10 +93,9 @@ export function visiblePanes(prefs: HomePreferences): HomePaneId[] {
 export const PHONE_PANES: ReadonlyArray<{ id: HomePaneId; label: string }> = [
   { id: 'quick_actions', label: 'Quick actions' },
   { id: 'needs_you', label: 'Needs you' },
-  // The pane's own heading is derived from what is in it — "Running" only when
-  // the server certified something live, "Still open" when it did not — so the
-  // switch that turns it on names the pane, not one of its states.
-  { id: 'running', label: 'Current work' },
+  // Current work is not a Home pane any more: Activity owns it, the header's
+  // work chip and the headline lead there. A stored `running` id passes
+  // through every write untouched, like any id the phone does not draw.
   { id: 'while_away', label: 'While you were away' },
   { id: 'made', label: 'Made' },
   { id: 'projects', label: 'Coming up · Projects' },

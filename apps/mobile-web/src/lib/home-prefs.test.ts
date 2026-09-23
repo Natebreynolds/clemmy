@@ -25,7 +25,9 @@ test('visible panes honor the stored order, then default order, minus hidden', (
     panes: { order: ['running', 'needs_you'], hidden: ['quick_actions', 'workstate'] },
   };
   assert.deepEqual(visiblePanes(prefs), ['running', 'needs_you', 'while_away', 'made', 'projects']);
-  assert.deepEqual(phoneVisiblePanes(prefs), ['running', 'needs_you', 'while_away', 'made', 'projects']);
+  // Current work moved to Activity: a stored `running` stays in the record
+  // but the phone never draws it.
+  assert.deepEqual(phoneVisiblePanes(prefs), ['needs_you', 'while_away', 'made', 'projects']);
 });
 
 test('the phone never renders or lists the desktop-only workstate pane, but preserves its setting', () => {
@@ -35,12 +37,12 @@ test('the phone never renders or lists the desktop-only workstate pane, but pres
   };
   assert.ok(!phoneVisiblePanes(prefs).includes('workstate'));
   const rows = phonePaneRows(prefs);
-  assert.deepEqual(rows.map((row) => row.id), ['needs_you', 'quick_actions', 'running', 'while_away', 'made', 'projects']);
+  assert.deepEqual(rows.map((row) => row.id), ['needs_you', 'quick_actions', 'while_away', 'made', 'projects']);
   assert.ok(rows.every((row) => row.on));
   // Hide one pane on the phone: workstate keeps its place in the stored order.
-  const next = panesFromPhoneRows(prefs, rows.map((row) => (row.id === 'running' ? { ...row, on: false } : row)));
+  const next = panesFromPhoneRows(prefs, rows.map((row) => (row.id === 'made' ? { ...row, on: false } : row)));
   assert.ok(next.order.includes('workstate'));
-  assert.deepEqual(next.hidden, ['running']);
+  assert.deepEqual(next.hidden, ['made']);
   // A desktop hide of workstate survives a phone write too.
   const hiddenOnDesktop: HomePreferences = { ...prefs, panes: { order: ['needs_you'], hidden: ['workstate'] } };
   const written = panesFromPhoneRows(hiddenOnDesktop, phonePaneRows(hiddenOnDesktop));

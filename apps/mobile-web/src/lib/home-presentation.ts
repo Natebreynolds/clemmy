@@ -378,8 +378,9 @@ export function homeWorkPane(input: {
 
 /** Screens that put the Needs-you list in their own content. */
 const NEEDS_YOU_IN_CONTENT: ReadonlySet<string> = new Set(['home', 'inbox']);
-/** Screens that put current work in their own content. */
-const WORK_IN_CONTENT: ReadonlySet<string> = new Set(['home', 'activity']);
+/** Screens that put current work in their own content. Home does not any
+ *  more — Activity owns it — so Home shows the chip that leads there. */
+const WORK_IN_CONTENT: ReadonlySet<string> = new Set(['activity']);
 
 export interface PhoneHeaderChrome {
   needsPill: boolean;
