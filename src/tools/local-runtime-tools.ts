@@ -256,6 +256,7 @@ import {
   normalizeZodForCodexStrict as normalizeZodForResponses,
   normalizeShapeForCodexStrict as normalizeShapeForResponses,
   normalizeShapeForDeferredJson,
+  decodeProjectedOptionalNulls,
 } from '../runtime/schema-normalizer.js';
 export { normalizeZodForResponses, normalizeShapeForResponses };
 
@@ -270,7 +271,10 @@ function captureLocalTools(): CapturedLocalTool[] {
       parameters: z.ZodRawShape,
       handler: LocalToolHandler,
     ): void {
-      captured.push({ name, description, parameters, handler });
+      const originalParameters = z.object(parameters);
+      captured.push({ name, description, parameters,
+        handler: input => handler(decodeProjectedOptionalNulls(input, originalParameters) as Record<string, unknown>),
+      });
     },
   };
   const server = fakeServer as unknown as McpServer;

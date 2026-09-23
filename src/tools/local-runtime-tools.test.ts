@@ -533,3 +533,29 @@ test('omitted nullable recovery fills nested records without guessing required f
     assert.equal(recoverOmittedNullableFields({ ...error, toolInvocation: { input: JSON.stringify(value) } }, parameters), null);
   }
 });
+
+
+test('deferred opportunity creation decodes transport-only nested null without granting execution', async () => {
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const propose = getLocalDeferredDispatchTools().find(candidate => candidate.name === 'automation_opportunity_propose');
+  assert.ok(propose && propose.type === 'function');
+  const opportunity = JSON.parse(readFileSync(new URL('./fixtures/opportunity-single-null-optional.json', import.meta.url), 'utf8'));
+  const output = await harnessRunContextStorage.run({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }, () =>
+    propose.invoke(new RunContext({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }), JSON.stringify({
+      proposal_key: 'nested-optional', opportunity,
+    })));
+  assert.ok(!(output instanceof HostLocalExecutionFailureResult), String(output));
+  const result = JSON.parse(String(output));
+  assert.equal(result.ok, true, String(output));
+  assert.equal(result.executionAuthority, 'none');
+  assert.equal(result.nextBoundary, 'user_review');
+  assert.equal(Object.hasOwn(result.proposal.opportunity.partition, 'outcomeAuthority'), false);
+  opportunity.trigger = { kind: 'manual' };
+  const invalid = await harnessRunContextStorage.run({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }, () =>
+    propose.invoke(new RunContext({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }), JSON.stringify({
+      proposal_key: 'invalid-recurrence', opportunity,
+    })));
+  assert.ok(invalid instanceof HostLocalExecutionFailureResult);
+  assert.match(String(invalid), /recurrence proposal requires the recurrence trigger/);
+
+});

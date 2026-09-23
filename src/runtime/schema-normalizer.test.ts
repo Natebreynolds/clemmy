@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 import {
   compactAdvertisedJsonSchema,
+  decodeProjectedOptionalNulls,
   materializeStrictNullableFields,
   normalizeZodForCodexStrict,
   normalizeZodForDeferredJson,
@@ -249,4 +250,36 @@ test('an empty array becomes null only when the schema rejects empty and accepts
   // A populated list is never touched.
   const populated = materializeStrictNullableFields({ source_record_ids: ['rec_1'] }, schema) as Record<string, unknown>;
   assert.deepEqual(populated.source_record_ids, ['rec_1']);
+});
+
+
+test('projected optional nulls decode against original semantics, including nested union branches', () => {
+  const schema = z.object({
+    required: z.string(),
+    clear: z.string().nullable().optional(),
+    options: z.array(z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('one'), authority: z.object({ id: z.string() }).optional() }),
+      z.object({ kind: z.literal('two'), authority: z.object({ id: z.string() }).nullable() }),
+    ])),
+    payload: z.record(z.string(), z.unknown()),
+    omitted: z.string().optional(),
+  });
+  const wire = { required: 'keep', clear: null, omitted: null,
+    options: [{ kind: 'one', authority: null }, { kind: 'two', authority: null }],
+    payload: { exact: null, nested: { exact: null } }, unknown: null };
+  const decoded = decodeProjectedOptionalNulls(wire, schema);
+  assert.deepEqual(decoded, { required: 'keep', clear: null,
+    options: [{ kind: 'one' }, { kind: 'two', authority: null }],
+    payload: wire.payload, unknown: null });
+  assert.equal(wire.omitted, null, 'the sealed wire arguments are never mutated');
+  assert.ok(schema.safeParse(decoded).success);
+  assert.deepEqual(decodeProjectedOptionalNulls({ required: null }, schema), { required: null },
+    'a required invalid value must not become omission or a default');
+  assert.deepEqual(decodeProjectedOptionalNulls({ required: 'bad', options: [{ kind: 'unknown', authority: null }] }, schema),
+    { required: 'bad', options: [{ kind: 'unknown', authority: null }] }, 'unknown branches are not repaired');
+});
+
+test('ambiguous optional/null unions keep the explicit value', () => {
+  const schema = z.union([z.object({ item: z.string().optional() }), z.object({ item: z.string().nullable() })]);
+  assert.deepEqual(decodeProjectedOptionalNulls({ item: null }, schema), { item: null });
 });

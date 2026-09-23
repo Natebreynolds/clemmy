@@ -1,0 +1,266 @@
+{
+  "version": 1,
+  "title": "Harness acceptance \u2014 project inventory fixture",
+  "objective": "Maintain a small, new, clearly named Clementine acceptance Space showing up to 10 projects available through the user's connected Inventory MCP, with project identity, name, status where available, source provenance and observation time. Read project metadata only; never inspect database contents or change any external resource. Leave all existing Spaces and workflows untouched.",
+  "rationale": "Controlled framework acceptance test of the durable opportunity \u2192 reviewed pilot \u2192 optional recurrence lifecycle using a read-only metadata inventory.",
+  "lifetime": {
+    "kind": "ongoing"
+  },
+  "recurrence": {
+    "mode": "proposed",
+    "cadence": {
+      "kind": "interval",
+      "every": 1,
+      "unit": "day"
+    },
+    "overlapPolicy": "skip",
+    "catchUpPolicy": "skip",
+    "activation": "requires_pilot_success_and_recurrence_consent"
+  },
+  "trigger": {
+    "kind": "recurrence"
+  },
+  "partition": {
+    "mode": "single",
+    "checkpointEvery": 1,
+    "completion": {
+      "kind": "terminal_evidence",
+      "evidence": [
+        "project_metadata_listing_completed",
+        "space_snapshot_written"
+      ]
+    },
+    "outcomeAuthority": null
+  },
+  "capabilityRequirements": [
+    {
+      "id": "project_metadata_read",
+      "description": "List projects visible through the user's connected Inventory MCP and return project metadata (id/ref, name, status where available).",
+      "minimumEffect": "read",
+      "constraints": [
+        "project metadata only",
+        "no database content, table, row, SQL, storage, log or secret access",
+        "no external writes of any kind",
+        "max 10 projects"
+      ]
+    },
+    {
+      "id": "acceptance_space_write",
+      "description": "Write the inventory snapshot into a single new, clearly named local acceptance Space.",
+      "minimumEffect": "local_write",
+      "constraints": [
+        "create/update only the new acceptance Space",
+        "never modify existing Spaces or workflows"
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "id": "read_projects",
+      "objective": "Read up to 10 project metadata records from the Inventory MCP.",
+      "dependsOn": [],
+      "capabilityRequirementIds": [
+        "project_metadata_read"
+      ],
+      "effect": {
+        "class": "read",
+        "approval": "not_required",
+        "maxOperationsPerRun": 3
+      },
+      "partitioned": false,
+      "outputEvidence": [
+        "project_metadata_listing_completed"
+      ]
+    },
+    {
+      "id": "write_space",
+      "objective": "Upsert the project inventory snapshot into the new acceptance Space with provenance and observed_at.",
+      "dependsOn": [
+        "read_projects"
+      ],
+      "capabilityRequirementIds": [
+        "acceptance_space_write"
+      ],
+      "effect": {
+        "class": "local_write",
+        "approval": "not_required",
+        "maxOperationsPerRun": 1
+      },
+      "partitioned": false,
+      "outputEvidence": [
+        "space_snapshot_written"
+      ]
+    }
+  ],
+  "effectCeiling": {
+    "class": "local_write",
+    "maxOperationsPerRun": 4
+  },
+  "dataset": {
+    "schema": {
+      "fields": [
+        {
+          "name": "project_id",
+          "type": "string",
+          "required": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "required": false,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "source_ref",
+          "type": "string",
+          "required": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "observed_at",
+          "type": "timestamp",
+          "required": true,
+          "sensitivity": "internal"
+        }
+      ],
+      "additionalFields": "reject"
+    },
+    "identity": {
+      "rules": [
+        {
+          "id": "project_id_exact",
+          "fields": [
+            "project_id"
+          ],
+          "match": "exact",
+          "normalizers": [
+            "trim"
+          ]
+        }
+      ],
+      "ambiguousMatch": "review_required"
+    },
+    "merge": {
+      "mode": "field_policy_after_exact_identity",
+      "defaultConflict": "review_required",
+      "fieldPolicies": [
+        {
+          "field": "name",
+          "onConflict": "prefer_newer"
+        },
+        {
+          "field": "status",
+          "onConflict": "prefer_newer"
+        },
+        {
+          "field": "observed_at",
+          "onConflict": "prefer_newer"
+        },
+        {
+          "field": "source_ref",
+          "onConflict": "prefer_newer"
+        }
+      ],
+      "preserveSourceRecords": true
+    },
+    "provenance": {
+      "required": true,
+      "retainSourceSnapshots": true,
+      "requiredReferences": [
+        "source_ref",
+        "run_ref",
+        "observed_at"
+      ]
+    }
+  },
+  "deliverables": [
+    {
+      "id": "inventory_snapshot",
+      "description": "Project inventory snapshot (\u226410 rows) in the new acceptance Space.",
+      "kind": "dataset_snapshot",
+      "required": true,
+      "successCriterionIds": [
+        "sc_rows",
+        "sc_provenance",
+        "sc_no_side_effects"
+      ],
+      "evidence": [
+        "space_snapshot_written"
+      ]
+    }
+  ],
+  "missingInputs": [
+    {
+      "id": "inventory_mcp_connection",
+      "description": "No Inventory MCP server is currently configured/connected; a read-only project-listing capability must be connected and bound before the pilot can run.",
+      "required": true,
+      "blockingPhaseIds": [
+        "read_projects"
+      ]
+    },
+    {
+      "id": "acceptance_space_name",
+      "description": "Confirm the new Space name (default: 'Harness acceptance \u2014 project inventory fixture').",
+      "required": false,
+      "blockingPhaseIds": [
+        "write_space"
+      ]
+    }
+  ],
+  "successCriteria": [
+    {
+      "id": "sc_rows",
+      "description": "Between 0 and 10 project rows, each with project_id and name; status populated where the source exposes it.",
+      "evidence": [
+        "project_metadata_listing_completed",
+        "space_snapshot_written"
+      ]
+    },
+    {
+      "id": "sc_provenance",
+      "description": "Every row carries source_ref, run_ref and observed_at.",
+      "evidence": [
+        "space_snapshot_written"
+      ]
+    },
+    {
+      "id": "sc_no_side_effects",
+      "description": "No database contents read, no external writes, and no existing Space or workflow changed.",
+      "evidence": [
+        "project_metadata_listing_completed",
+        "space_snapshot_written"
+      ]
+    }
+  ],
+  "pilot": {
+    "required": true,
+    "maxPartitions": 1,
+    "maxRecords": 10,
+    "effectCeiling": {
+      "class": "local_write",
+      "maxOperationsPerRun": 4
+    },
+    "successCriterionIds": [
+      "sc_rows",
+      "sc_provenance",
+      "sc_no_side_effects"
+    ],
+    "haltOnFailure": true
+  },
+  "budgets": {
+    "maxWallClockMinutesPerRun": 10,
+    "maxConcurrentPartitions": 1,
+    "maxAttemptsPerPartition": 1,
+    "maxPartitionsPerRun": 1,
+    "maxRecordsPerRun": 10,
+    "maxOperationsPerRun": 4,
+    "reserveOperations": 0
+  }
+}

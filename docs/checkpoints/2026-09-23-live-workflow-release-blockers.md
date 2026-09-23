@@ -899,3 +899,40 @@ the durable pilot lifecycle, and desktop notification routing remain open.
 Final source verification completed: 64/64 scope checks pass and typecheck exit0.
 Typecheck remained CPU-active for roughly two minutes under machine load; no
 restart or duplicate typecheck was launched. No installed acceptance claimed.
+
+### Native schema projection round-trip — September 23
+
+Traced event291510 to the shared native-tool adapter: model/deferred schemas
+represent optional fields as nullable; handler receives null although its original
+domain schema permits omission, not null. The model's original call actually
+OMITTED partition.outcomeAuthority. Transport materialization introduced it.
+
+Candidate adds schema-aware decoding at local-tool capture, shared by first-class,
+deferred, and validation-recovery handlers. Only an original optional field whose
+inner schema rejects null becomes omitted. Explicit nullable values, required
+invalid values, opaque payloads, and unknown keys are preserved. Nested object,
+array, record and union fields use original schemas; ambiguous union interpretations
+stay unchanged. Wire arguments are not mutated. No tool/provider-name exceptions,
+no global null stripping, and no execution authority is granted by decoding.
+
+Actual deferred opportunity invocation reproduced the exact null failure before
+the fix (/tmp/clem-native-null-red.log). With decoding, two additional domain
+errors in the recorded model proposal became visible: recurrence proposed with a
+manual trigger, and a local-write phase requiring an external-effect approval.
+The regression fixture isolates null projection by correcting those two authoring
+errors; a separate assertion retains rejection of invalid recurrence. Do not
+claim the original proposal would be accepted unchanged, or silently repair its
+semantics in production. The model should receive the real validation feedback.
+
+33 focused schema-normalizer/local-runtime/opportunity-tool checks pass
+(/tmp/clem-native-null-verified.log), typecheck exit0
+(/tmp/clem-native-null-typecheck.log). The fixture grants no execution authority
+and ends at user_review. These recording checks use no paid providers. Final
+schema-only check after defensive own-property lookup:
+/tmp/clem-native-null-schema-final.log.
+
+Confirmed scope candidate60e085062 build completed successfully. No hotpatch yet.
+Live DataForSEO metadata listing reports enabled and connected, exposing four
+tools: api_request, docs_index, docs_list_sections, docs_search. Next controlled
+pilot can use the documentation-section inventory, without paid API data queries,
+provider changes or business dataset mutation. Installed acceptance remains owed.
