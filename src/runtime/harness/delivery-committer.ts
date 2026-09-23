@@ -9,7 +9,7 @@ import { redactSensitiveText } from '../security.js';
  * into the user-facing terminal payload.
  */
 import { acceptedTaskMode } from './accepted-task-mode.js';
-import { appendEvent, finishRunAttempt } from './eventlog.js';
+import { appendEvent, finishRunAttempt, getKillRequest, getRunAttemptBySourceUserSeq } from './eventlog.js';
 import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
@@ -967,6 +967,16 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
         ? outcome
         : { ...outcome, presentation: { kind: 'blocked', text } };
     }
+    case 'cancelled': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      return text === outcome.presentation.text
+        ? outcome
+        : { ...outcome, presentation: { kind: 'stopped', text } };
+    }
     case 'failed': {
       const text = renderFailureWithRetainedWork({
         sessionId: outcome.identity.sessionId,
@@ -1097,20 +1107,35 @@ export function commitTurnOutcome(
       || effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
     && acceptedSourceHasZeroExternalEffectSurface(effectiveOutcome.identity)
   ) {
-    effectiveOutcome = {
-      ...effectiveOutcome,
-      // Nothing left the machine, so retrying is provably safe: the honest
-      // terminal is a resumable checkpoint, not a locked reconciliation door.
-      resumable: true,
-      presentation: { kind: 'blocked', text: HOST_LOCAL_FAILURE_BLOCKED_TEXT },
-    };
-    effectiveOptions = {
-      ...effectiveOptions,
-      metadata: {
-        ...(effectiveOptions.metadata ?? {}),
-        blockedReason: 'host_control_failure_no_external_effect',
-      },
-    };
+    const attempt = getRunAttemptBySourceUserSeq(
+      effectiveOutcome.identity.sessionId, effectiveOutcome.identity.sourceUserSeq,
+    );
+    const stopped = attempt !== null && getKillRequest(effectiveOutcome.identity.sessionId, {
+      attemptId: attempt.attemptId, runId: attempt.runId,
+    }) !== null;
+    if (stopped) {
+      effectiveOutcome = {
+        ...effectiveOutcome,
+        status: 'cancelled',
+        resumable: false,
+        presentation: { kind: 'stopped', text: 'Stopped as requested. Completed results are kept.' },
+      };
+      const { blockedReason: _reason, blockedDetail: _detail, ...metadata } = effectiveOptions.metadata ?? {};
+      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata };
+    } else {
+      effectiveOutcome = {
+        ...effectiveOutcome,
+        resumable: true,
+        presentation: { kind: 'blocked', text: HOST_LOCAL_FAILURE_BLOCKED_TEXT },
+      };
+      effectiveOptions = {
+        ...effectiveOptions,
+        metadata: {
+          ...(effectiveOptions.metadata ?? {}),
+          blockedReason: 'host_control_failure_no_external_effect',
+        },
+      };
+    }
   }
   // A PLAN TURN'S DELIVERABLE IS A PLAN.
   //
