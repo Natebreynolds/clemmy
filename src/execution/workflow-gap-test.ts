@@ -37,11 +37,6 @@ export interface WorkflowGap {
 /** Cap so a complex workflow doesn't bury the author in questions. */
 const MAX_GAPS = 5;
 
-const DELIVERABLE_PRODUCER_RE =
-  /\b(?:create|creates|build|builds|generate|generates|writ\w*|draft\w*|compile|compiles|produce|produces|export\w*|save\w*|assemble|assembles|populate|populates|fill\w*)\b[\s\S]{0,40}\b(?:sheets?|spreadsheets?|docs?|documents?|reports?|briefs?|csv|pdfs?|decks?|presentations?|slides?|files?|drafts?)\b/i;
-const DELIVERABLE_PRODUCER_REV_RE =
-  /\b(?:sheets?|spreadsheets?|docs?|documents?|reports?|briefs?|csv|pdfs?|decks?|presentations?|slides?|files?|drafts?)\b[\s\S]{0,40}\b(?:create|creates|build|builds|generate|generates|writ\w*|draft\w*|compile|compiles|produce|produces|export\w*|save\w*|assemble|assembles|populate|populates|fill\w*)\b/i;
-
 const CADENCE_RE =
   /\b(?:daily|nightly|hourly|weekly|monthly|mornings?|evenings?|every\s+(?:day|morning|evening|night|week|hour|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each\s+(?:day|morning|week|month))\b/i;
 
@@ -74,11 +69,6 @@ const VISUAL_REFERENCE_RE = [
 const DATA_SOURCE_RE =
   /\b(?:fetch\w*|pull\w*|quer\w+|search\w*|retriev\w*|list\w*|gather\w*|collect\w*|find\w*|load\w*|scrape\w*|extract\w*|enumerate\w*|look\s*up)\b[\s\S]{0,40}\b(?:prospects?|leads?|rows?|records?|contacts?|results?|items?|entries|companies|firms|accounts?|emails?|messages?|tickets?|deals?|opportunities|customers?|users?|candidates?|listings?|posts?|articles?|threads?)\b/i;
 
-function looksLikeDeliverableProducer(prompt: string): boolean {
-  const p = prompt ?? '';
-  return DELIVERABLE_PRODUCER_RE.test(p) || DELIVERABLE_PRODUCER_REV_RE.test(p);
-}
-
 function looksLikeDataSource(prompt: string): boolean {
   return DATA_SOURCE_RE.test(prompt ?? '');
 }
@@ -99,11 +89,6 @@ function hasDurableVisualImplementation(step: WorkflowDefinition['steps'][number
   return /\b(?:references|scripts)\//i.test(text)
     || /\bworkflow\s+(?:references|scripts)\b/i.test(text)
     || /\b(?:read|load|copy)\b[\s\S]{0,80}\b(?:references|scripts)\//i.test(text);
-}
-
-function hasOutputContract(step: WorkflowDefinition['steps'][number]): boolean {
-  const o = step.output as { type?: unknown; required_keys?: unknown; verify?: unknown } | undefined;
-  return Boolean(o && (o.type || o.required_keys || o.verify));
 }
 
 /** Wave 3 P1-9: does the step declare an emptiness contract (non_empty / min_items)? */
@@ -128,29 +113,13 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
   const gaps: WorkflowGap[] = [];
   const declared = declaredInputNames(def);
   const steps = def.steps ?? [];
-  // A step is "terminal" if nothing depends on it — these tend to be the ones
-  // that yield the final deliverable, so an undeclared output there is worse.
+  // Track collection producers whose results are consumed downstream.
   const dependedOn = new Set<string>();
   for (const s of steps) for (const d of s.dependsOn ?? []) dependedOn.add(d);
 
-  // 1 + 7: deliverable producers that declare no output contract. Worse on a
-  // terminal step (the final hand-off), but worth a question on any of them.
-  for (const step of steps) {
-    if (step.usesSkill) continue; // a skill owns its own output shape
-    if (!looksLikeDeliverableProducer(step.prompt ?? '')) continue;
-    if (hasOutputContract(step)) continue;
-    const terminal = !dependedOn.has(step.id);
-    gaps.push({
-      severity: 'clarify',
-      stepId: step.id,
-      question: terminal
-        ? `Step "${step.id}" produces the final deliverable but doesn't declare what it must return — should it create a NEW destination each run, or write to a specific existing one (share the URL/ID)? And what concrete handle (a sheet URL, a file path) proves it actually produced something?`
-        : `Step "${step.id}" produces a deliverable but doesn't declare where it goes — create a NEW one each run, or a specific existing destination (URL/ID)?`,
-      why: terminal
-        ? 'Without a declared output the run can report "done" with nothing to show, and the result is unverifiable.'
-        : 'Downstream steps and your report-back need a real handle, not a hollow "done".',
-    });
-  }
+  // An omitted result schema is not evidence of a missing destination.
+  // Saved instructions remain a valid completion contract; actual bindings,
+  // declared output schemas and execution evidence have their own validators.
 
   // 2: irreversible sends — who is the audience, and is it a hard-coded list?
   // F1 (live 2026-07-23): classify through the CANONICAL side-effect
@@ -277,9 +246,8 @@ export function renderWorkflowGapQuestions(gaps: WorkflowGap[]): string {
   return [
     '',
     '',
-    "Gap test — before this workflow is reliable, get the user's answer on:",
+    'Optional authoring questions (not execution blockers):',
     ...lines,
     '',
-    'Ask these now, then refine the workflow with workflow_update. Do not present it as ready until they\'re resolved.',
   ].join('\n');
 }

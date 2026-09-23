@@ -621,3 +621,78 @@ can overlap other work; do not add them to derive wall latency. Tool schema size
 is the next evidence-backed JIT optimization target, not indiscriminate memory
 truncation. Preserve discovery reachability and the accepted plan/context when
 retiring irrelevant schema exposure; no such optimization shipped in this edit.
+
+
+## Installed 5707a3e89 — effect advisory acceptance
+
+Build session16769 completed exit0; clean5707a3e89c443b19dc430966b9f5db78d301c724,
+fingerprinta9f7ae281f40252ecf427432971a032eefb97c3cebdf04ea55d036fd3518212b.
+Idle preflight and no started dispatches; same three blocked/parked workflows.
+Quit exact app, confirmed daemon68401 exited; Terminal recipe hotpatch completed.
+Start script confirmed installed SHA before submitting one accepted request.
+
+Parent source291109/session sess-desktop-ed86bf88a3b54a145886d088;
+child1790179010187-b6bb48/source291171/step update_alpha.
+Parent terminal291274 done, child291218 done. Independent exact bytes verified
+Name,Value\nAlpha,2\nBeta,9\n; exactly one child, terminalOutcome succeeded,
+needsAttention false, fixture disabled, allowSends false, manual/no schedule.
+Saved step retained prompt, allowedTools read_file/write_file, sideEffect write,
+no output contract. Evidence output/harness-acceptance/2026-09-23-5707a3e89/.
+
+False SEND advisory absent from workflow_create result291134. Other advisory
+noise remains: optional remembered Google Sheets candidate despite the exact
+local-only tool scope; missing-output question asks for a destination already
+specified in prose and contradictorily says not to present readiness until
+answered. bindStepsToToolChoices in src/tools/orchestration-tools.ts picks by
+prose/effect without checking allowedTools. formatWorkflowGapQuestions in
+workflow-gap-test.ts turns optional gap candidates into imperative clarification.
+Next fix should respect authored scope/actual missing bindings, not add another
+keyword exception or widen tools. Canonical discovery must remain available
+when the authored scope permits it.
+
+Author created disabled; initial workflow_run correctly refused without queuing
+(291141), then enabled (291150) and dispatched once. Extra model turn, not duplicate
+execution. This differs from preceding authoring trajectory; no causal speed claim.
+Canonical certified parent109612ms/8calls/0discovery/411756prompt/183543cached/
+3212output (Opus5.5 x9,Grok4.3 x6,Jev1.13.0 x6).
+Child39773ms/4calls/0discovery/31038prompt/0cached/584output
+(Haiku4.5 x4,Jev1.13.0 x1). Parent tokens rose despite removing one warning;
+child roughly stable. Do not add nested wall times. Structural defaults path
+not exercised by this explicitly surfaced overwrite, still only recording-host
+validated. No new external service write; broader release gates still owed.
+Checkpoint changed after build; rebuild after next commit before next patch.
+
+
+## Follow-up: scoped memory suggestions and honest optional questions
+
+Live5707 save suggested a remembered external operation for a step explicitly
+limited to read_file/write_file. Red /tmp/clem-candidate-scope-red.log reproduces
+that class with a remembered operation outside exact authored scope. Candidate
+selection now filters by exact identifier or declared tool family before choosing
+the first matching record. Exact names, prefix families and unrestricted scopes
+remain supported; discovery-only carriers do not confer permission on unrelated
+remembered operations. No tool scope or remembered record is changed.
+Five scoped authoring tests passed: /tmp/clem-scope-candidates-green.log.
+
+Removed the gap heuristic that inferred missing destinations/unverifiability from
+an omitted output schema. Live instructions name the file and verification;
+existing whole-objective review can judge that without invented output keys.
+The initial short regression paraphrase did not trigger (correctly recorded pass
+in /tmp/clem-gap-output-red.log); adding the live sentence about deciding what to
+write reproduced the false gap: /tmp/clem-gap-output-exact-red.log (1fail).
+Keep this trap: do not claim a shortened prompt reproduced the real wording.
+Removed its regexes and output-presence helper; no special-case path/keyword fix.
+Optional gap rendering no longer commands asking now or withholding readiness.
+True missing-input, binding and explicit-output validators remain intact.
+64 gap/certification/objective checks passed /tmp/clem-scope-gap-green.log,
+including objective completion without guessed path/items keys.
+
+These changes are not yet installed; installed app remains5707a3e89. Full suite
+and live acceptance remain owed. No dashboard/desktop files touched; main remains
+e77215d00. The legacy dashboard proof projection still independently treats any
+remaining optional questions as capability blocks and needs separate ownership
+coordination. This edit removes the observed false gap, not that entire mismatch.
+
+Scope/gap follow-up typecheck completed exit0, /tmp/clem-scope-gap-typecheck.log.
+The prolonged typecheck remained a live CPU-active process; observed its original
+session14910 through completion rather than restarting it.

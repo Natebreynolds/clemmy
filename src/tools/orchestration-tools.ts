@@ -454,7 +454,14 @@ export function bindStepsToToolChoices(
     const effect = step.sideEffect === 'read' ? 'read' : 'write';
     let matches: StepToolChoiceMatch[];
     try { matches = matchToolChoicesForStep(step.prompt, { choices: opts.choices }); } catch { continue; }
-    const top = matches.find((m) => !m.alreadyBound && m.effectClass === effect);
+    const scope = step.allowedTools?.map(name => name.trim()) ?? [];
+    const unrestricted = scope.length === 0 || scope.some(name => !name || name === '*' || name === '**');
+    // Retrieval cannot widen the authored operation family. Discovery/control
+    // carriers alone are not evidence that a remembered operation is allowed.
+    const scopeAllows = (match: StepToolChoiceMatch): boolean => unrestricted
+      || [match.identifier, ...match.family].some(name => scope.some(entry =>
+        entry.endsWith('*') ? name.startsWith(entry.slice(0, -1)) : name === entry));
+    const top = matches.find((m) => !m.alreadyBound && m.effectClass === effect && scopeAllows(m));
     if (!top) continue;
     advisories.push(
       `Optional discovery candidate for step \`${step.id ?? '?'}\`: remembered ${top.kind} \`${neutralizeTemplatePlaceholders(top.command)}\`. Confirm that it serves the authored step and inspect its current argument and account contract before selecting it.`,

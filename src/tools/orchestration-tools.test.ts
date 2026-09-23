@@ -1850,6 +1850,22 @@ test('a compatible declared operation can receive an optional retrieval candidat
   assert.deepEqual(steps, before);
 });
 
+test('remembered candidates respect exact authored scope without treating discovery as permission', () => {
+  const choice: ToolChoiceRecord = { intent: 'salesforce.query.soql', description: 'Run a Salesforce SOQL query',
+    choice: { kind: 'composio', identifier: 'SALESFORCE_RUN_SOQL_QUERY', testedAt: '2026-06-01T00:00:00Z' },
+    fallbacks: [], body: '', filePath: '/tmp/scoped-candidate.md' };
+  for (const [allowedTools, expected] of [
+    [['read_file', 'write_file'], 0], [['tool_search', 'call_tool'], 0],
+    [['OTHER_READ_OPERATION'], 0], [['SALESFORCE_RUN_SOQL_QUERY'], 1],
+    [['composio_execute_tool'], 1], [['composio_*'], 1], [['*'], 1], [[], 1],
+  ] as Array<[string[], number]>) {
+    const steps = [{ id: 'find', prompt: 'Query Salesforce with a SOQL query for prospects.', sideEffect: 'read' as const, allowedTools }];
+    const before = structuredClone(steps);
+    assert.equal(bindStepsToToolChoices(steps, { choices: [choice] }).advisories.length, expected, JSON.stringify(allowedTools));
+    assert.deepEqual(steps, before);
+  }
+});
+
 test('explicit calls, embedded bindings and skills retain their authored authority', () => {
   for (const step of [
     { id: 'find', prompt: 'Query Salesforce: run `sf data query --json --query "SELECT Id FROM Account"`.', sideEffect: 'read' as const, allowedTools: ['run_shell_command'] },
