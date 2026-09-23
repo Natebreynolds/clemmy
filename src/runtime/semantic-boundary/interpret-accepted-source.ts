@@ -1401,8 +1401,10 @@ export function taskRelationFromLastInterpretation(
 /** Exact persisted relation identity for the one unresolved-slot reoffer
  * owner. A generic keepOpen projection also covers a legitimately new goal
  * with its own questions, so callers cloning the prior Q must require this
- * narrower admitted `ambiguous` record and its original goal revision. */
-export function ambiguousOpenSlotTargetFromLastInterpretation(
+ * narrower admitted ambiguous/continue_goal record and its original goal revision.
+ * Continuing without an answer must preserve the open question, not block
+ * catalog preparation. It never supplies an answer or grants effect authority. */
+export function unresolvedOpenSlotTargetFromLastInterpretation(
   sessionId: string,
   sourceUserSeq: number,
 ): { target: { goalId: string; baseRevision: number } | null } | null {
@@ -1417,7 +1419,7 @@ export function ambiguousOpenSlotTargetFromLastInterpretation(
   const raw = persisted.raw as Record<string, unknown>;
   const target = raw.targetGoal;
   if (
-    raw.relation !== 'ambiguous'
+    (raw.relation !== 'ambiguous' && raw.relation !== 'continue_goal')
     || raw.goal !== null
     || raw.work !== null
     || !Array.isArray(raw.slotAnswers)
@@ -1426,7 +1428,7 @@ export function ambiguousOpenSlotTargetFromLastInterpretation(
   // A legal ambiguous interpretation may be unable to nominate a goal at all
   // (the exact live workflow-name correction did this). Absence carries no
   // goal authority; when the model does nominate one, bind it exactly below.
-  if (target === null) return { target: null };
+  if (target === null) return raw.relation === 'ambiguous' ? { target: null } : null;
   if (!target || typeof target !== 'object' || Array.isArray(target)) return null;
   const goalId = (target as Record<string, unknown>).goalId;
   const baseRevision = (target as Record<string, unknown>).baseRevision;

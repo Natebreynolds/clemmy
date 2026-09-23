@@ -361,7 +361,9 @@ test('a low-level consumed provided row without an admitted semantic answer cann
   );
 });
 
-test('an ambiguous correction reoffers the exact question as an adjacent answerable successor', async () => {
+for (const relation of ['ambiguous', 'continue_goal'] as const) {
+test(`${relation} without an answer reoffers the exact question as an adjacent answerable successor`, async () => {
+  const reofferOptions = relation === 'continue_goal' ? [] : OPTIONS;
   writeWorkflow('platform-49-slack-channel-review', {
     name: 'Platform 49 Slack Channel Review',
     description: 'Review the Platform 49 Slack channel.',
@@ -370,11 +372,11 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
     steps: [{ id: 'main', prompt: 'Review the channel.' }],
   });
   const session = eventlog.createSession({
-    id: 'workflow-name-correction-reoffer',
+    id: `workflow-name-correction-reoffer-${relation}`,
     kind: 'chat',
     channel: 'mobile',
   });
-  const parentAttempt = eventlog.beginRunAttempt(session.id, { runId: 'workflow-reoffer-parent' });
+  const parentAttempt = eventlog.beginRunAttempt(session.id, { runId: `workflow-reoffer-parent-${relation}` });
   const parent = eventlog.recordRunAttemptUserInput(parentAttempt, {
     turn: 1,
     role: 'user',
@@ -385,7 +387,7 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
     turn: parent.turn,
     role: 'Clem',
     type: 'awaiting_user_input',
-    data: { question: QUESTION, options: OPTIONS, purpose: 'clarification', sourceUserSeq: parent.seq },
+    data: { question: QUESTION, options: reofferOptions, purpose: 'clarification', sourceUserSeq: parent.seq },
   });
   const parentIdentity = { sessionId: session.id, turn: parent.turn, sourceUserSeq: parent.seq };
   const parentTerminal = commitTurnOutcome({
@@ -405,7 +407,7 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
   assert.ok(awaiting.id && parentTerminal.event.id);
 
   const ambiguousText = 'Sorry platform';
-  const ambiguousAttempt = eventlog.beginRunAttempt(session.id, { runId: 'workflow-reoffer-ambiguous' });
+  const ambiguousAttempt = eventlog.beginRunAttempt(session.id, { runId: `workflow-reoffer-ambiguous-${relation}` });
   const ambiguousSource = eventlog.recordRunAttemptUserInput(ambiguousAttempt, {
     turn: 2,
     role: 'user',
@@ -423,8 +425,8 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
       return {
         raw: {
           version: 1,
-          relation: 'ambiguous',
-          targetGoal: null,
+          relation,
+          targetGoal: relation === 'continue_goal' ? { goalId: question!.goalId, baseRevision: question!.goalRevision } : null,
           goal: null,
           work: null,
           slotAnswers: [],
@@ -444,7 +446,7 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
     surface: 'home',
   }), 'admitted');
   const typed = typedClassificationFromLastInterpretation(session.id, ambiguousSource.seq);
-  assert.deepEqual(typed, { keepOpen: true });
+  assert.deepEqual(typed, relation === 'ambiguous' ? { keepOpen: true } : undefined);
   const unresolved = await continuity.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
     sourceUserSeq: ambiguousSource.seq,
@@ -491,7 +493,7 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
     limit: 1,
   })[0];
   assert.equal(latestAwaiting?.data.question, QUESTION);
-  assert.deepEqual(latestAwaiting?.data.options, OPTIONS);
+  assert.deepEqual(latestAwaiting?.data.options, reofferOptions);
   const successor = taskContinuity.peekTaskContinuityPacket({ sessionId: session.id });
   assert.equal(successor.status, 'available');
   if (successor.status !== 'available') return;
@@ -499,14 +501,14 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
   assert.equal(successor.packet.parentPacketId, original.packet.packetId);
   assert.equal(successor.packet.rootSourceUserSeq, parent.seq);
   assert.equal(successor.packet.pause.question, QUESTION);
-  assert.deepEqual(successor.packet.pause.options, OPTIONS);
+  assert.deepEqual(successor.packet.pause.options, reofferOptions);
   assert.equal(
     eventlog.listEvents(session.id, { types: ['turn_model_routed', 'tool_called'] }).length,
     0,
     'reoffering the durable question spends neither an orchestrator model nor a provider call',
   );
 
-  const correctedAttempt = eventlog.beginRunAttempt(session.id, { runId: 'workflow-reoffer-corrected' });
+  const correctedAttempt = eventlog.beginRunAttempt(session.id, { runId: `workflow-reoffer-corrected-${relation}` });
   const corrected = eventlog.recordRunAttemptUserInput(correctedAttempt, {
     turn: 3,
     role: 'user',
@@ -559,6 +561,8 @@ test('an ambiguous correction reoffers the exact question as an adjacent answera
   assert.equal(resolved.taskContinuation?.answer, ANSWER);
   assert.deepEqual(taskContinuity.peekTaskContinuityPacket({ sessionId: session.id }), { status: 'none' });
 });
+
+}
 
 test('a legitimately new goal with open slots never clones the prior clarification', async () => {
   const session = eventlog.createSession({
