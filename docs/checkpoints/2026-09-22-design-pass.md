@@ -65,3 +65,25 @@ Live installed app (sealed 3.18.19, daemon hotpatched), owner's home, 22 desktop
   `presentStatus()` six-status presenter; the Space view kit's source strip still prints raw
   refresh errors; phone device labels fall back to the browser user agent; Automate has no search or
   sort for 111 workflows; historical notifications and chat messages keep their old wording.
+
+## Release gates for 3.18.20 after this pass (runtime `ad91ccf9`)
+
+Re-run on shared `main` after the design commits and the other session's
+readiness-hold and dead-occurrence fixes, since the last gated commit
+`a7099a68`:
+
+- `npm run build` clean (stamp `ad91ccf9`, dirty only from the owner's
+  uncommitted `docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md` and an untracked
+  critique file); `npm run typecheck`, console-web and mobile-web `tsc`
+  clean; both web builds clean.
+- `test:release-assets` 56/56, `test:release-closure` 137/137,
+  `test:public-hygiene` 4/4.
+- Every test file covering code changed since `a7099a68` (137 files: the
+  touched backend files, route gating, the board, and every console-web,
+  mobile-web and chat-engine test): 1,514 tests, 1,508 pass, 6 fail. All
+  six fail by name at `a7099a68` in a clean worktree: `useChat` empty
+  completion, the Home mock route, space-routes manual refresh manifest,
+  the ambiguous-account `label` pin, and two `orchestration-tools`
+  workflow_create tests. **No regression.**
+- Version is already 3.18.20; tag this commit or its successor (docs-only
+  after `ad91ccf9`). Not tagged, nothing pushed by this session.
