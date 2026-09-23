@@ -779,3 +779,75 @@ Session paging follow-up: full eventlog file80passed,0failed, exit0
 dispatch/receipt contracts. Typecheck exit0 (/tmp/clem-session-page-typecheck.log).
 Machine load extended duration; existing process handles observed to completion.
 No full-suite or installed-app latency acceptance yet.
+
+
+## Installed23a41e05e — session-page read-only live acceptance
+
+Build session35401 completed exit0, clean23a41e05e6df4abddbc9f8b912400e5e8775a5d2,
+fingerprint90620de42b4fd695e2a6a21bacfc4a12727474cd2a407f29bda4a24a6d63d9bf.
+Before patch active0/runningRuns0/backgroundActive0; two pending parked workflows,
+no started physical dispatch. Quit exact app; daemon96681 exited; Terminal recipe
+applied and exact-path app relaunched. Build-info confirmed SHA/fingerprint,
+schema81, daemon15094/start16:20:58.869UTC. Prior dist retained dist.backup-TQcyZ5.
+
+Live GET /api/console/home/command-center samples (ms):
+- before during build1398.66,1137.47,2451.79 — excluded from comparison;
+- before with build completed1031.87,811.02,3406.80;
+- after688.97,423.65,371.02.
+All after counts and response keys match baseline (active0/waiting7/approvals1/
+runningWorkflows2/backgroundActive0). This endpoint exercises full-state
+listSessions(limit60). The separate read-only SQL transaction proved complete
+row equality; the API check pins counts/shape, not every dynamic response value.
+Three samples around a restart with variable host load are observational, not
+proof of a general speedup or whole idle-CPU resolution. No generative call or
+business write used. Evidence output/harness-acceptance/2026-09-23-session-page/.
+
+Installed query correction now accepted on this bounded read surface. Full suite,
+journeys, physical phone approval/restart, durable pilot, crash mutation matrix,
+packaged-shell notification click, model comparison and other gates remain owed.
+Machine is still running Zoom; do not run full suite under known user load.
+No tag/main merge. This checkpoint update postdates build; next commit needs build.
+
+### Pilot review fixture and approval gates — 2026-09-23 16:34 UTC
+
+At runtime HEAD 23a41e05e, all 18 checks in approval-restart-race,
+approval-resume-source, and chat-approval-resume passed (serialized isolated
+runner; /tmp/clem-23a41e05e-approval-gates.log). These prove recording paths,
+not the owed physical-phone approval/double-tap acceptance.
+
+The production pilot convergence check failed at this HEAD: its recording
+authoring adapter supplied no reviewer after whole-objective review became
+mandatory. The deterministic output criterion passed, but the unavailable
+objective review correctly left goalOutcome=advisory. Original failure retained
+in /tmp/clem-23a41e05e-pilot-gate.log. Do not classify this as pre-existing.
+
+Updated only the test to configure an isolated recording BYO reviewer and
+intercept its HTTP wire. The real routing, SDK review runner, verdict parser,
+goal receipt, and recurrence admission remain in use. Assertions require the
+full objective, correct generated task identity, evidence lookup tools and
+workflow execution reference, exactly one review request, and a persisted
+objective-scoped judge verdict. Other network destinations are rejected.
+No production behavior, live provider settings, or business workflow changed.
+The fixture proves wiring, not reviewer intelligence or installed acceptance.
+
+Trap: a single semantic criterion uses the DONE/INCOMPLETE completion parser,
+not the numbered checklist parser. A numbered MET recording response correctly
+failed parsing (/tmp/clem-pilot-review-fixture.log); correcting the fixture to
+DONE passed (/tmp/clem-pilot-review-fixture-green.log).
+
+Final serialized pilot + workflow-goal-review + goal-validate + recurrence-runtime
+checks: 27/27 pass (/tmp/clem-pilot-review-adjacent.log); typecheck passes
+(/tmp/clem-pilot-review-typecheck.log). The runner's live-home sentinel was NOT
+PERFORMED because daemon 15094 owns and writes its WAL; no isolation-proof claim.
+No paid model calls were used. Full suite/journeys remain unrun on this active
+machine. The original failed test also emitted an asynchronous report-back FK
+warning during cleanup; it did not recur in successful runs, but that observation
+does not establish a separate production fix.
+
+Rechecked installed build-info: 23a41e05e, fingerprint
+90620de42b4fd695e2a6a21bacfc4a12727474cd2a407f29bda4a24a6d63d9bf,
+daemon 15094. Active=0, runningRuns=0, backgroundActive=0; waiting=7,
+approvals=1, runningWorkflows=2. No restart or new live acceptance was performed.
+Desktop notification route defect remains open in UI-owned source; fix must
+retain exact selected notification, honor /console mount, verify navigation
+before read acknowledgement, and pass a rebuilt-shell native click test.

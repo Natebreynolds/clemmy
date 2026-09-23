@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import type { MCPServer, Model, ModelRequest } from '@openai/agents';
 import type { ManagedMcpServer } from '../types.js';
 
@@ -12,6 +12,16 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-pilot-production-conv
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
+// Exercise the real review runner/parser without provider quota or live credentials.
+process.env.BYO_PROVIDERS = JSON.stringify([{
+  id: 'pilot-review', label: 'Recording pilot reviewer',
+  baseURL: 'https://pilot-review.invalid/v1', modelIds: ['pilot-review-fixture'],
+}]);
+process.env.BYO_PROVIDER_PILOT_REVIEW_API_KEY = 'fixture-only';
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+  { role: 'judge', modelId: 'pilot-review-fixture', scope: 'durable', source: 'settings' },
+]);
 
 const convergence = await import('./automation-pilot-production-convergence.js');
 const dispatcher = await import('./automation-pilot-authoring-dispatcher.js');
@@ -257,6 +267,7 @@ async function waitUntil(predicate: () => boolean, detail: string): Promise<void
 }
 
 test.after(() => {
+  mock.restoreAll();
   for (const workspace of spaces.spaceStore.list(true)) spaces.spaceStore.remove(workspace.id);
   catalogs.installHostCapabilityCatalogFactory(null);
   manifestStores.installCapabilityManifestStore(null);
@@ -269,6 +280,25 @@ test.after(() => {
 
 test('approved proposal advances without another chat turn through exact chooser, live metadata, constrained authoring, and full pilot card', async () => {
   const label = generated('nationwide');
+  const reviewRequests: Array<Record<string, unknown>> = [];
+  mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init);
+    assert.equal(request.url, 'https://pilot-review.invalid/v1/chat/completions',
+      'the isolated pilot must never reach a real provider');
+    const body = await request.json() as Record<string, unknown>;
+    reviewRequests.push(body);
+    assert.equal(body.model, 'pilot-review-fixture');
+    assert.match(JSON.stringify(body.messages), /Complete the full workflow objective, including its constraints/);
+    assert.match(JSON.stringify(body.messages), new RegExp(label));
+    assert.match(JSON.stringify(body.tools), /open_evidence/);
+    assert.match(JSON.stringify(body.messages), /workflow_execution/);
+    return new Response(JSON.stringify({
+      id: 'pilot-review-recording', object: 'chat.completion', created: 1,
+      model: 'pilot-review-fixture',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'DONE: recording reviewer accepts the bounded read fixture' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
   const serverName = generated('source');
   const toolName = `${serverName}__${generated('records')}`;
   const counts = { list: 0, call: 0, model: [] as ModelRequest[] };
@@ -437,6 +467,7 @@ test('approved proposal advances without another chat turn through exact chooser
     goalValidation?: {
       pass?: boolean;
       judgeFailedOpen?: boolean;
+      objectiveReview?: { pass?: boolean; method?: string; scope?: string };
       perCriterion?: Array<{ pass?: boolean; method?: string; detail?: string }>;
     };
     stepOutputs?: Record<string, unknown>;
@@ -460,6 +491,10 @@ test('approved proposal advances without another chat turn through exact chooser
   assert.equal(terminal.terminalOutcome, 'succeeded', runBytes);
   assert.equal(terminal.goalValidation?.pass, true);
   assert.equal(terminal.goalValidation?.judgeFailedOpen, false);
+  assert.equal(reviewRequests.length, 1, 'whole-objective review uses one recorded provider request');
+  assert.equal(terminal.goalValidation?.objectiveReview?.pass, true);
+  assert.equal(terminal.goalValidation?.objectiveReview?.scope, 'objective');
+  assert.equal(terminal.goalValidation?.objectiveReview?.method, 'judge');
   assert.deepEqual(
     terminal.goalValidation?.perCriterion?.map((criterion) => ({
       pass: criterion.pass,
