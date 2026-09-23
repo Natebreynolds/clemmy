@@ -572,7 +572,7 @@ function serializeInboxNotificationForMobile(row: NotificationRecord, ref: Needs
     // The one definition every surface counts by (dashboard/needs-you.ts),
     // and the identity to group by — a workflow blocked five times is one row.
     needsAttention: notificationNeedsYou(row, ref),
-    needsYouKey: needsYouKey(row, ref.runs),
+    needsYouKey: needsYouKey(row, ref),
     deliveredAt: row.deliveredAt ?? null,
     deliveryError: row.deliveryError ?? null,
     workflowCapability: projectWorkflowCapabilityInboxGate(row),

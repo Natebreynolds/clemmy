@@ -139,17 +139,21 @@ export interface NeedsYouReferents extends LiveReferents {
   planIds: ReadonlySet<string>;
   trustIds: ReadonlySet<string>;
   questionIds: ReadonlySet<string>;
+  /** sessionId → the pending approval that conversation is waiting on. */
+  approvalBySession: ReadonlyMap<string, string>;
   runs: RunIndex;
   nowMs: number;
 }
 
 export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
-  const approvalIds = new Set(
-    approvalRegistry.listPending({ status: 'pending' })
-      .filter((row) => !approvalRegistry.isExpired(row))
-      .filter((row) => approvalRegistry.isFormalApprovalSurface(row))
-      .map((row) => row.approvalId),
-  );
+  const approvals = approvalRegistry.listPending({ status: 'pending' })
+    .filter((row) => !approvalRegistry.isExpired(row))
+    .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
+  const approvalIds = new Set(approvals.map((row) => row.approvalId));
+  const approvalBySession = new Map<string, string>();
+  for (const row of approvals) {
+    if (!approvalBySession.has(row.sessionId)) approvalBySession.set(row.sessionId, row.approvalId);
+  }
   const planIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
   const trustIds = new Set(listTrustProposals('pending').map((row) => row.id));
   const questionIds = new Set(listInboxQuestions().map((row) => row.id));
@@ -158,6 +162,7 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
     planIds,
     trustIds,
     questionIds,
+    approvalBySession,
     runs: readRunIndex(WORKFLOW_RUNS_DIR, nowMs),
     nowMs,
     approvalPending: (id) => approvalIds.has(id),
@@ -203,16 +208,23 @@ function notificationWorkflowKey(notification: Pick<NotificationRecord, 'metadat
 /**
  * The one identity every surface groups by and the count counts. A carrier
  * for a decision IS that decision; a workflow notice is its workflow; a
- * meeting is its calendar item; a chat run is its conversation.
+ * meeting is its calendar item; a chat run is its conversation — unless that
+ * conversation is waiting on a pending approval, when the report and the
+ * approval are one ask.
  */
-export function needsYouKey(notification: Pick<NotificationRecord, 'id' | 'kind' | 'metadata'>, runs: RunIndex): string {
+export function needsYouKey(
+  notification: Pick<NotificationRecord, 'id' | 'kind' | 'metadata'>,
+  ref: Pick<NeedsYouReferents, 'runs'> & { approvalBySession?: ReadonlyMap<string, string> },
+): string {
   const meta = notification.metadata;
   const actionItemId = notificationActionItemId(notification);
   if (actionItemId) return actionItemId;
   if (str(meta, 'watch') === 'calendar' && str(meta, 'itemKey')) return `calendar:${str(meta, 'itemKey')}`;
-  const workflow = notificationWorkflowKey(notification, runs);
+  const workflow = notificationWorkflowKey(notification, ref.runs);
   if (workflow) return workflow;
   const sessionId = str(meta, 'sessionId', 'targetSessionId');
+  const sessionApproval = sessionId ? ref.approvalBySession?.get(sessionId) : undefined;
+  if (sessionApproval) return `approval:${sessionApproval}`;
   if (sessionId) return `session:${sessionId}`;
   return `notification:${notification.id}`;
 }
@@ -335,7 +347,7 @@ export async function summarizeNeedsYou(
     // The owner's rule already answered "not live" for a carrier whose
     // decision settled, so what reaches here is current; a carrier for a
     // pending decision shares that decision's key and adds nothing.
-    const key = needsYouKey(notification, ref.runs);
+    const key = needsYouKey(notification, ref);
     if (key.startsWith('flow:')) {
       workflowKeys.add(key);
       noticedWorkflows.add(key);

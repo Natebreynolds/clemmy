@@ -89,3 +89,12 @@ test('workflow capability cards expose exact choices and truthful recovery actio
   assert.match(source, /Review preserved run/);
   assert.match(api, /choiceSetDigest: gate\.resolution\.choiceSetDigest/);
 });
+
+test('a notice the server keys to a decision on screen is not listed a second time', () => {
+  const source = read('../screens/Inbox.tsx');
+  // A chat run's "needs you" report names only its session; the daemon keys
+  // it to the pending approval that session waits on, and the phone shows
+  // that approval once.
+  assert.match(source, /listedDecisionKeys = useMemo\(\(\) => new Set\(\[/);
+  assert.match(source, /if \(row\.needsYouKey && listedDecisionKeys\.has\(row\.needsYouKey\)\) return false;/);
+});

@@ -240,15 +240,25 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const planIds = useMemo(() => new Set(plans.map((row) => row.id)), [plans]);
   const trustIds = useMemo(() => new Set(trustProposals.map((row) => row.id)), [trustProposals]);
 
+  // The server's identity for a row names the decision it is about (a chat
+  // run's report is its pending approval), so a card already on screen is
+  // never listed twice under another name.
+  const listedDecisionKeys = useMemo(() => new Set([
+    ...[...approvalIds].map((id) => `approval:${id}`),
+    ...[...planIds].map((id) => `plan:${id}`),
+    ...[...trustIds].map((id) => `trust:${id}`),
+  ]), [approvalIds, planIds, trustIds]);
+
   const stillNeedsUser = useCallback((row: InboxNotification) => {
     if (row.read || !row.needsAttention) return false;
+    if (row.needsYouKey && listedDecisionKeys.has(row.needsYouKey)) return false;
     if (row.context.actionItemId && questionIds.has(row.context.actionItemId)) return false;
     if (row.context.approvalId && approvalIds.has(row.context.approvalId)) return false;
     if (notificationIsRepresentedByApprovals(row, approvalIds)) return false;
     if (row.context.planProposalId && planIds.has(row.context.planProposalId)) return false;
     if (row.context.trustProposalId && trustIds.has(row.context.trustProposalId)) return false;
     return true;
-  }, [approvalIds, planIds, questionIds, trustIds]);
+  }, [approvalIds, listedDecisionKeys, planIds, questionIds, trustIds]);
 
   const notificationNeeds = useMemo(
     () => collapseAttentionNotifications(notifications.filter(stillNeedsUser)),

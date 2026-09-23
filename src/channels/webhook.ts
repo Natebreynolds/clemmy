@@ -1832,7 +1832,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
       notifications: prioritized.map((notification) => ({
         ...notification,
         needsAttention: notificationNeedsYou(notification, ref),
-        needsYouKey: needsYouKey(notification, ref.runs),
+        needsYouKey: needsYouKey(notification, ref),
         workflowCapability: projectWorkflowCapabilityInboxGate(notification),
         workflowEnableGate: projectWorkflowEnableInboxGate(notification),
       })),

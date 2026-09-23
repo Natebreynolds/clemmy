@@ -91,8 +91,15 @@ test('a notification carrying a pending approval is that approval, counted once'
 
   const ref = needsYouReferents(NOW);
   const row = { id: 'carrier', kind: 'execution' as const, title: 'Approval pending', metadata: { approvalId: approval.approvalId } };
-  assert.equal(needsYouKey(row, ref.runs), `approval:${approval.approvalId}`);
+  assert.equal(needsYouKey(row, ref), `approval:${approval.approvalId}`);
   assert.equal(notificationNeedsYou(row, ref), true);
+
+  // The conversation's own report ("Chat run needs you … Review apr-… to
+  // continue") names only its session: it is the same ask as the approval.
+  notify('chat-report', 'execution', 'Chat run needs you: send the summary', { status: 'needs_input', sessionId: session.id, needsAttention: true });
+  const withReport = await summarizeNeedsYou({ nowMs: NOW });
+  assert.equal(withReport.keys.includes(`session:${session.id}`), false);
+  assert.equal(withReport.keys.filter((key) => key === `approval:${approval.approvalId}`).length, 1);
   approvalRegistry.resolve(approval.approvalId, 'rejected', 'test');
 });
 

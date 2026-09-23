@@ -14166,7 +14166,7 @@ export function registerConsoleRoutes(
           && notificationNeedsYou(notification, needsYouRef)
           && !isGenericWorkflowEcho(notification)
           // A carrier for a decision already on this list is that decision.
-          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef.runs))),
+          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef))),
         50,
       ).map((notification) => ({
         kind: 'workflow',
