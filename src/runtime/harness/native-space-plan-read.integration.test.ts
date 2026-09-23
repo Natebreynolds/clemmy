@@ -759,11 +759,12 @@ test('a created workflow remains completed after its planned enable revision and
   const warmPlanning = await semantic.primePrimaryModelPlanningCatalog(warmIdentity);
   assert.ok(warmPlanning.ok);
   if (!warmPlanning.ok) throw new Error(warmPlanning.reason);
+  const warmModel = stubModel([[toolCall('warm-plan', 'plan_task', plan)], [textMessage('Plan saved; no effects executed.')]]);
   const warmAgent = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
     hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
     allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
     mcpToolScope: { authority: 'none', reason: 'Native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
-    model: stubModel([[textMessage('Surface check only')]]) as never });
+    model: warmModel as never });
   for (const name of learned.toolsUsed) {
     const tool = warmAgent.tools.find(row => row.name === name);
     assert.ok(tool, `${name} must be present before the first model request`);
@@ -772,6 +773,26 @@ test('a created workflow remains completed after its planned enable revision and
     assert.ok('parameters' in tool && JSON.stringify(tool.parameters).includes('name'), 'complete configured schema');
   }
   assert.ok(warmAgent.tools.some(row => row.name === 'tool_search'));
+  const envelopeModule = await import('../../agents/capability-envelope.js');
+  const originalEnvelope = envelopeModule.boundAgentCapabilityEnvelope(warmAgent);
+  const plannedWarm = await brackets.withHarnessRunContext({ ...warmIdentity,
+    counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${warm.id}::source:${warmSource.seq}` },
+    () => hostRunRunner(throwingRunner() as never, warmAgent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never,
+      { maxTurns: 3, hostTurnEngine: 'host_v1', context: warmIdentity } as never));
+  assert.equal(JSON.parse(historyResult(plannedWarm.history as unknown[], 'warm-plan')).ok, true);
+  const resumedPlanning = await semantic.primePrimaryModelPlanningCatalog(warmIdentity);
+  assert.ok(resumedPlanning.ok);
+  if (!resumedPlanning.ok) throw new Error(resumedPlanning.reason);
+  const resumedWarm = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: resumedPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    mcpToolScope: { authority: 'none', reason: 'Native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: stubModel([[textMessage('Rebuild only')]]) as never });
+  assert.ok(!resumedWarm.tools.some(row => row.name === 'workflow_get'), 'selected read moves behind the plan carrier');
+  assert.equal(envelopeModule.boundAgentCapabilityEnvelope(resumedWarm)?.envelopeDigest,
+    originalEnvelope?.envelopeDigest, 'planning hint presentation must not change the admitted callable universe on resume');
+
   const restricted = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
     hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
     allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
@@ -780,6 +801,6 @@ test('a created workflow remains completed after its planned enable revision and
     model: stubModel([[textMessage('Surface check only')]]) as never });
   assert.ok(!restricted.tools.some(row => row.name === 'workflow_set_enabled'),
     'learned hints cannot restore a policy-excluded tool');
-  assert.equal((db.prepare('SELECT count(*) AS n FROM logical_call_settlements WHERE session_id=?')
-    .get(warm.id) as { n: number }).n, 0, 'learning/disclosure must not execute work');
+  assert.equal((db.prepare('SELECT count(*) AS n FROM logical_call_settlements WHERE session_id=? AND logical_tool_call_id != ?')
+    .get(warm.id, 'warm-plan') as { n: number }).n, 0, 'only the explicitly invoked plan may settle; learning and rebuild execute no business work');
 });

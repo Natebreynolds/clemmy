@@ -119,3 +119,35 @@ Next acceptance must prove a saved plan before writes, retained identities and
 ordered settlement through create/enable/run/result/disable, and exact terminal
 proof. Never repair a missed pre-write ordering requirement by retrospectively
 claiming a later plan satisfies it. Keep paid pilot/50-firm work paused.
+
+## Installed f5b planned acceptance found a continuation regression
+
+Installed clean f5bfe6d1a, fingerprint
+1681e2ee5b4a7859810bf4beb71db43e7f6d7ff3e415066cec947f9e4d7428e4.
+Source288556 / sess-desktop-f59639c98719c2f7efa8125a selected the learned native
+strategy before reasoning, saved plan at288582 before create288595, enabled and
+dispatched once. It made no discovery call before handoff. Parent recovery then
+repeatedly refused `workflow parent tool surface requires readmission`. The
+request was cancelled and the named manual-only fixture disabled by operator.
+This is FAILED acceptance, not a speed win or completed task. Local private
+evidence: output/harness-acceptance/2026-09-23-f5bfe6d1a/.
+
+Cause: learned native capability refs were appended to descriptions that enter
+the permanent callable fingerprint. When the saved plan selects a native reader,
+the rebuilt surface properly defers it behind the plan carrier; its original
+description then replaces the decorated one in the catalog universe. Presentation
+hints incorrectly looked like contract drift. The resume guard correctly refused.
+
+Fix preserves `contractDescription` before adding source-bound hints; fingerprints
+still cover original contract prose and complete parameters. Deferred and promoted
+presentations now have the same callable identity. No readmission check removed,
+no historical checkpoint rewritten, no new authority granted. Existing requests
+whose old fingerprint already includes presentation hints are not silently migrated.
+
+Production regression test builds a learned native surface, saves a plan through
+the host runner, rebuilds with its reader plan-bound, and requires identical
+envelope identity. A pure pin also requires real description/schema changes to
+change fingerprints. Prior production code fails both (15 pass/2 fail):
+/tmp/clem-native-resume-red.log. Candidate17/17 pass:
+/tmp/clem-native-resume-green.log. Typecheck passed in
+/tmp/clem-native-resume-types.log. Live acceptance of this correction remains owed.

@@ -34,6 +34,8 @@ import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
 export interface SealableToolLike {
   name?: unknown;
   description?: unknown;
+  /** Stable callable prose before a host appends source-bound planning hints. */
+  contractDescription?: unknown;
   parameters?: unknown;
   /**
    * Set by a builder whose description is re-rendered from per-turn host
@@ -67,7 +69,9 @@ export function toolSchemaFingerprint(tool: SealableToolLike): string {
   const volatileDescription = tool.descriptionCarriesTurnState === true;
   return sha256(stableJson({
     name: typeof tool.name === 'string' ? tool.name : '',
-    description: !volatileDescription && typeof tool.description === 'string' ? tool.description : '',
+    description: volatileDescription ? ''
+      : typeof tool.contractDescription === 'string' ? tool.contractDescription
+        : typeof tool.description === 'string' ? tool.description : '',
     parameters: tool.parameters ?? null,
   }));
 }

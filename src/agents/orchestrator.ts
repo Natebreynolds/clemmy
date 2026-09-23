@@ -4143,7 +4143,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const modelTools = toolPolicy.tools.map(t => {
     const ref = nativePlanRefs[t.name];
     return ref && t.type === 'function'
-      ? { ...t, description: `${t.description}\nFor a saved plan, capabilityRef=${ref}. This current native reference is already available; no discovery call is needed.` }
+      ? { ...t, contractDescription: t.description, description: `${t.description}\nFor a saved plan, capabilityRef=${ref}. This current native reference is already available; no discovery call is needed.` }
       : t;
   });
   if (options.sessionId) {
