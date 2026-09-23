@@ -20,3 +20,10 @@ Broader installed-app workflow, cold-tool, restart, mobile, packaging and full-s
 Release assets passed 56 checks across the initial run and a four-test rerun after restoring this worktree's missing desktop node_modules link. Release closure initially passed 137/138: the SDK update invalidated the upgrade rehearsal's shared-dependency assumption. The rehearsal now uses shared dependencies only if they cover every archived lock entry unchanged; otherwise it performs npm ci from the exact release lock in the disposable archived checkout and checks the lock remains unchanged. The report states which dependency source executed. All six upgrade tests passed, including actual migration and second-boot idempotency; typecheck passed. No graph-comparison assertion was weakened. Trap: dependency updates must not invalidate the old-release execution proof or quietly run old source on newer dependencies.
 
 The upgraded rehearsal scripts are newer than the installed runtime candidate; rebuild before the next hotpatch. The read-only cancellation presentation remains under investigation, and full suite/journeys plus broader live acceptance remain owed.
+
+
+## Retained-work cancellation presentation
+
+Live source 285834 had twelve host-only dispatches, a cancelled non-mutating extraction, and no settlement requiring write reconciliation. The runner enriched its blocked text with retained-work details before the committer compared that text against an exact constant. This bypassed the existing ledger-backed correction and falsely advertised effect uncertainty. The committer now recognizes the typed host blockedReason as well as the legacy exact text, while retaining the same zero-external-effect proof. It neither retries cancelled work nor relaxes uncertain-write admission.
+
+A new enriched-terminal regression failed before the fix. All 16 effect-truth, cancelled-read classification and retained-work tests pass afterward, including the enriched genuine-uncertain-write direction. Typecheck passes. Installed acceptance is owed for this change at the time of writing.

@@ -1091,7 +1091,10 @@ export function commitTurnOutcome(
   // unresolved external crossing keeps the reconciliation copy unchanged.
   if (
     effectiveOutcome.status === 'blocked'
-    && effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT
+    // The runner may already have appended retained-work context. Its typed
+    // reason survives that rendering; presentation bytes are not identity.
+    && (effectiveOptions.metadata?.blockedReason === 'tool_effect_uncertain'
+      || effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
     && acceptedSourceHasZeroExternalEffectSurface(effectiveOutcome.identity)
   ) {
     effectiveOutcome = {

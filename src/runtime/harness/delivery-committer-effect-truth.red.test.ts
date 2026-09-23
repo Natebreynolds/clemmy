@@ -153,8 +153,25 @@ test('a turn with a genuinely unresolved external write keeps the reconciliation
     outcome: 'unknown',
   }).status, 'inserted');
 
-  commitTurnOutcome(uncertainBlockedOutcome(source));
+  const outcome = uncertainBlockedOutcome(source);
+  outcome.presentation.text += '\n\nRetained work (durable checkpoint):\nExternal write state: unknown.';
+  commitTurnOutcome(outcome, { metadata: { blockedReason: 'tool_effect_uncertain' } });
   const text = committedText(source.sessionId);
   assert.match(text, /reconcil/i,
     'a real unresolved external write keeps the reconciliation-required terminal');
+});
+
+
+test('host reason survives retained-work rendering before effect-truth correction', () => {
+  const source = acceptedSource('sess-effect-truth-rendered-host-read');
+  const outcome = uncertainBlockedOutcome(source);
+  // Production blockedOutcome renders retained-work details before the
+  // committer receives it, so an exact prose comparison misses this shape.
+  outcome.presentation.text += '\n\nRetained work (durable checkpoint):\nExternal write state: no settled external-write attempt is recorded.';
+  commitTurnOutcome(outcome, { metadata: { blockedReason: 'tool_effect_uncertain' } });
+  const text = committedText(source.sessionId);
+  assert.doesNotMatch(text, /may have begun|must be reconciled/i);
+  assert.equal(text, HOST_LOCAL_FAILURE_BLOCKED_TEXT);
+  const terminal = listEvents(source.sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal(terminal.data.blockedReason, 'host_control_failure_no_external_effect');
 });
