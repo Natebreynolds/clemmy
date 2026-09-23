@@ -1141,3 +1141,35 @@ test('a file-backed store survives restart and keyset-pages more than 10,005 ret
     if (db.open) db.close();
   }
 });
+
+test('prefer-newer policy and all evidence survive database reopen and exact replay', () => {
+  const file = path.join(TEST_DIRECTORY, 'prefer-newer.sqlite');
+  let db = new Database(file);
+  const datasetId = 'prefer-newer-reopen';
+  const policy: EntityResolutionPolicy = { ...POLICY, preferNewerAfterExactIdentity: ['label'] };
+  const old = observation({ key: 'old', label: 'Old', confidence: 1, exactValue: 'same' });
+  const next = observation({ key: 'new', label: 'New', confidence: 0.2, exactValue: 'same', at: '2026-08-02T00:00:00Z' });
+  try {
+    createEntityDataset(db, datasetId);
+    for (const item of [old, next]) {
+      const current = requireDataset(db, datasetId);
+      requireOk(commitCanonicalEntityBatch({ datasetId, expectedResolutionRevision: current.resolutionRevision,
+        expectedResolutionDigest: current.resolutionDigest, observations: [item], policy,
+        committedAt: '2026-08-03T00:00:00.000Z', db }));
+    }
+    db.close(); db = new Database(file);
+    assert.ok(auditCanonicalDatasetIntegrity(datasetId, db));
+    const ids = listCanonicalRecordIds({ datasetId, limit: 10, db });
+    assert.equal(ids.items.length, 1);
+    const record = getCanonicalRecord(datasetId, ids.items[0]!, db)!;
+    const field = record.fields.label!;
+    assert.equal(field.evidence.length, 2);
+    assert.equal(field.evidence.find(e => e.evidenceId === field.selectedEvidenceId)?.value, 'New');
+    assert.equal(field.conflicting, false);
+    const current = requireDataset(db, datasetId);
+    requireOk(commitCanonicalEntityBatch({ datasetId, expectedResolutionRevision: current.resolutionRevision,
+      expectedResolutionDigest: current.resolutionDigest, observations: [next], policy,
+      committedAt: '2026-08-04T00:00:00.000Z', db }));
+    assert.deepEqual(getCanonicalRecord(datasetId, ids.items[0]!, db), record);
+  } finally { db.close(); }
+});

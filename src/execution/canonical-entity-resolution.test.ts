@@ -803,3 +803,28 @@ test('an explicitly empty closed dataset can truthfully complete at exact zero',
     reasons: [],
   });
 });
+
+test('reviewed prefer-newer fields retain evidence and require an exact identity match', () => {
+  const policy: EntityResolutionPolicy = { ...POLICY, preferNewerAfterExactIdentity: ['label'] };
+  const old = observed({ key: 'older', label: 'Old', confidence: 1, exact: [{ namespace: 'index', value: 'same' }] });
+  const newer = observed({ key: 'newer', label: 'New', confidence: 0.2, at: '2026-01-02T00:00:00Z', exact: [{ namespace: 'index', value: 'same' }] });
+  const initial = upsertEntityObservation(createEntityResolutionState(), old, policy);
+  const merged = upsertEntityObservation(initial.state, newer, policy);
+  const field = Object.values(merged.state.records)[0]!.fields.label!;
+  assert.equal(field.evidence.find(e => e.evidenceId === field.selectedEvidenceId)?.value, 'New');
+  assert.equal(field.evidence.length, 2);
+  assert.equal(field.conflicting, false, 'distinct older values are resolved by the reviewed rule');
+  assert.equal(Object.values(initial.state.records)[0]!.fields.label!.evidence.length, 1);
+  const replay = upsertEntityObservation(merged.state, newer, POLICY);
+  assert.equal(replay.state, merged.state);
+  const tied = upsertEntityObservation(merged.state, { ...newer, origin: { sourceId: 'tie', recordId: 'tie' }, fields: { label: { ...newer.fields.label!, value: 'Other new' } } }, policy);
+  assert.equal(Object.values(tied.state.records)[0]!.fields.label!.conflicting, true, 'equal-time disagreement stays reviewable');
+  const compoundPolicy = { ...policy, weights: { defaultExactIdentifierMatch: 10, defaultCompoundSignalMatch: 12 } };
+  const compoundOld = { ...old, exactIdentifiers: [], compoundSignals: sharedSignal() };
+  const compoundNew = { ...newer, exactIdentifiers: [], compoundSignals: sharedSignal() };
+  const compound = upsertEntityObservation(upsertEntityObservation(createEntityResolutionState(), compoundOld, compoundPolicy).state, compoundNew, compoundPolicy);
+  const uncertain = Object.values(compound.state.records)[0]!.fields.label!;
+  assert.equal(uncertain.conflicting, true);
+  assert.equal(uncertain.evidence.find(e => e.evidenceId === uncertain.selectedEvidenceId)?.value, 'Old', 'compound-only match cannot use the override');
+  assert.notEqual(createEntityResolutionPolicySnapshot(policy).policyDigest, createEntityResolutionPolicySnapshot(POLICY).policyDigest);
+});

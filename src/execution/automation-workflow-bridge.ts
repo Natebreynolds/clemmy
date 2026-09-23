@@ -906,10 +906,15 @@ function exactSingleReadPlan(input: {
     const projectedOutcomeAuthority = exactProjection.version === 2
       ? exactProjection.partition.outcomeAuthority
       : undefined;
+    const preferredFields = dataset.merge.fieldPolicies.filter(policy => policy.onConflict === 'prefer_newer')
+      .map(policy => policy.field).sort();
+    const projectedPreferred = [...(exactProjection.resolutionPolicy.preferNewerAfterExactIdentity ?? [])].sort();
     const supportedMerge = dataset.schema.additionalFields === 'reject'
-      && dataset.merge.mode === 'review_required'
+      && (dataset.merge.mode === 'review_required' || dataset.merge.mode === 'field_policy_after_exact_identity')
       && dataset.merge.defaultConflict === 'review_required'
-      && dataset.merge.fieldPolicies.every((policy) => policy.onConflict === 'review_required')
+      && dataset.merge.fieldPolicies.every(policy => policy.onConflict === 'review_required'
+        || (dataset.merge.mode === 'field_policy_after_exact_identity' && policy.onConflict === 'prefer_newer'))
+      && stableJson(preferredFields) === stableJson(projectedPreferred)
       && dataset.merge.preserveSourceRecords === true
       && dataset.provenance.required === true
       && dataset.provenance.retainSourceSnapshots === true;

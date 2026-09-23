@@ -121,6 +121,7 @@ const resultProjectionSchema = z.object({
     currentIdentityRuleSchema,
   ])).min(1).max(64),
   resolution_policy: z.object({
+    prefer_newer_after_exact_identity: z.array(z.string().regex(EXACT_KEY_RE)).max(512).optional(),
     policy_id: z.string().regex(EXACT_REF_RE),
     merge_threshold: z.number().nonnegative(),
     distinct_threshold: z.number().nonnegative(),
@@ -335,6 +336,7 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
     },
     entityKind: projection.entity_kind,
     resolutionPolicy: {
+      ...(projection.resolution_policy.prefer_newer_after_exact_identity ? { preferNewerAfterExactIdentity: [...projection.resolution_policy.prefer_newer_after_exact_identity] } : {}),
       policyId: projection.resolution_policy.policy_id,
       mergeThreshold: projection.resolution_policy.merge_threshold,
       distinctThreshold: projection.resolution_policy.distinct_threshold,

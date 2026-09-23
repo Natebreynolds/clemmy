@@ -185,6 +185,8 @@ function approvedProposal(
     authored.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
     authored.pilot.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
     authored.budgets.maxOperationsPerRun = maxOperations + 1;
+    authored.dataset!.merge.mode = 'field_policy_after_exact_identity';
+    authored.dataset!.merge.fieldPolicies = [{ field: 'scope', onConflict: 'prefer_newer' }];
   }
   const proposalId = unique(`proposal_${label}`);
   const created = opportunityStore.createAutomationOpportunityProposal({
@@ -432,6 +434,7 @@ function blankStateFixture(label: string, options: {
               exactIdentifierNamespace: 'generic-key',
             }],
             resolutionPolicy: {
+              ...(options.localOutput ? { preferNewerAfterExactIdentity: ['scope'] } : {}),
               policyId: 'exact-generic-key',
               mergeThreshold: 10,
               distinctThreshold: 2,
@@ -617,6 +620,7 @@ function chatPilotRequest(
             exact_identifier_namespace: rule.exactIdentifierNamespace,
           })),
           resolution_policy: {
+            ...(projection.resolutionPolicy.preferNewerAfterExactIdentity ? { prefer_newer_after_exact_identity: projection.resolutionPolicy.preferNewerAfterExactIdentity } : {}),
             policy_id: projection.resolutionPolicy.policyId,
             merge_threshold: projection.resolutionPolicy.mergeThreshold,
             distinct_threshold: projection.resolutionPolicy.distinctThreshold,
@@ -1049,6 +1053,13 @@ test('reviewed read plus local output crosses three pages and publishes canonica
   }]);
   assert.equal(inventory.selectionAuthority, 'none');
 
+  for (const fields of [[], ['key']]) {
+    const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+    ((invalid.contract as any).result_projection.resolution_policy).prefer_newer_after_exact_identity = fields;
+    const denied = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalid));
+    assert.equal(denied.ok, false, 'omitted or substituted merge policies cannot be compiled');
+    assert.equal(fixture.bodies(), 0);
+  }
   for (const phaseBinding of [undefined, 'read-result', 'unrelated-output']) {
     const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
     (invalid.contract as Record<string, unknown>).workspace_output_phase_id = phaseBinding;

@@ -1262,3 +1262,43 @@ that original field-merge policy. Preserve the approved live contract; implement
 and pin its exact merge semantics before another paid live attempt. Do not simply
 relax supportedMerge, replace the proposal, or claim this candidate alone passes
 the original lifecycle. Current installed build remains d2aad1c41.
+
+
+## Reviewed prefer-newer merge policies — candidate follow-up
+
+The original approved documentation-inventory proposal remains unchanged. Its
+`field_policy_after_exact_identity` merge mode with explicit `prefer_newer`
+fields was still rejected by the workflow compiler after the local-output
+phase fix. The candidate now represents this policy through the authored tool
+schema, projection contract, compiler, canonical resolver and persisted policy.
+The compiler requires exact equality between approved and projected preferred
+fields. Missing or substituted field rules are rejected before dispatch.
+
+Only a non-conflicting exact identity match enables the override. Newer field
+evidence wins even at lower confidence; all source assertions remain retained.
+Equal-time disagreement remains conflicting and compound-only matches retain
+the prior confidence-first behavior. Optional policy data participates in the
+digest when present; old policy shapes and digests are unchanged. Durable-store
+reopen, integrity audit and exact replay passed.
+
+Validation: final typecheck exited 0 (session 49261;
+`/tmp/clem-prefer-newer-typecheck-final.log`); 32 engine/store tests passed in
+`/tmp/clem-prefer-newer-store-final.log`; 30 pilot-control/compiler tests passed
+in `/tmp/clem-prefer-newer-pilot.log`; 13 downstream Workspace finalizer, store
+projection and runner-recovery tests passed in
+`/tmp/clem-prefer-newer-downstream.log`. `git diff --check` passed.
+The original engine regression failed before implementation. An initial raw
+store-test invocation was refused by the live-home config guard; it was rerun
+through the disposable-home runner, never bypassing that guard. One initial
+store fixture timestamp lacked canonical milliseconds and was corrected.
+The runner's independent live-home sentinel was NOT PERFORMED because the
+installed daemon owns that home. No paid model calls or business writes.
+
+Not installed: the live app remains d2aad1c41. This is not live acceptance or
+release readiness. Before another paid pilot, address the additional contract
+gap: required run reference and observation time fields currently only accept
+provider record paths. The projection producer has verified page settlement
+time and redeemed workflow lineage available, but does not expose explicit
+field mappings from that host evidence. Do not fabricate provider fields, infer
+a mapping from field names, or weaken the approved proposal to pass. Preserve
+the full original schema and success criteria in offline and installed checks.

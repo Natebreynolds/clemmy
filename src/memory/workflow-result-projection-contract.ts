@@ -62,6 +62,7 @@ export type WorkflowCanonicalEntityIdentityRuleProjectionV2 =
     };
 
 export interface WorkflowCanonicalEntityResolutionPolicyV1 {
+  preferNewerAfterExactIdentity?: string[];
   policyId: string;
   mergeThreshold: number;
   distinctThreshold: number;
@@ -91,7 +92,7 @@ export interface WorkflowCanonicalEntityResultProjectionV1 {
   /** Exact policy consumed by the canonical resolution engine. */
   resolutionPolicy: WorkflowCanonicalEntityResolutionPolicyV1;
   /** The current engine retains every evidence assertion and marks conflicting
-   * values. Other proposal merge modes remain unrepresented and fail closed. */
+   * values, except reviewed per-field prefer-newer overrides after exact identity. */
   fieldResolution: {
     kind: 'retain_all_evidence';
     selection: 'highest_confidence_then_newest';
@@ -369,7 +370,7 @@ export function parseWorkflowCanonicalEntityResultProjection(
   const policy = record(canonical.resolutionPolicy);
   if (!policy || !exactKeys(policy, [
     'policyId', 'mergeThreshold', 'distinctThreshold', 'ambiguityMargin', 'weights',
-  ], ['exclusiveIdentifierNamespaces']) || !id(canonical.resolutionPolicy?.policyId)) {
+  ], ['exclusiveIdentifierNamespaces', 'preferNewerAfterExactIdentity']) || !id(canonical.resolutionPolicy?.policyId)) {
     errors.push('resolutionPolicy must be a closed exact policy.');
   } else {
     for (const key of ['mergeThreshold', 'distinctThreshold', 'ambiguityMargin'] as const) {
@@ -379,6 +380,12 @@ export function parseWorkflowCanonicalEntityResultProjection(
       && finiteNonNegative(canonical.resolutionPolicy.distinctThreshold)
       && canonical.resolutionPolicy.distinctThreshold >= canonical.resolutionPolicy.mergeThreshold) {
       errors.push('resolutionPolicy.distinctThreshold must be below mergeThreshold.');
+    }
+    const preferred = canonical.resolutionPolicy.preferNewerAfterExactIdentity;
+    if (preferred !== undefined && (!Array.isArray(preferred) || preferred.length > 512
+      || new Set(preferred).size !== preferred.length
+      || preferred.some(name => !field(name) || !names.has(name)))) {
+      errors.push('resolutionPolicy.preferNewerAfterExactIdentity must name unique projected fields.');
     }
     const weights = record(canonical.resolutionPolicy.weights);
     if (!weights || !exactKeys(weights, [
