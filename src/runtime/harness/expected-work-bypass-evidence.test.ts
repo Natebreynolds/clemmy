@@ -65,6 +65,11 @@ const priorCapabilityCatalog = currentCapabilities.installCurrentCapabilityManif
     destination: { family: 'google_doc', posture: 'create_new' },
     operationSemantics: googleDocCreateSemantics,
   },
+  { operationId: 'ARCHIVE_CREATE_ENTRY', providerKind: 'composio', effect: 'external_write',
+    destination: { family: 'archive', posture: 'create_new' },
+    operationSemantics: { version: 1, reversibility: 'reversible' } },
+  { operationId: 'RESEARCH_JOB_START', providerKind: 'composio', effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'reversible' } },
   {
     operationId: 'GMAIL_SEND_EMAIL',
     providerKind: 'composio',
@@ -601,7 +606,14 @@ test('productive distinct reads keep flowing; only loops and writes stay capped'
   }
 });
 
-test('a second DECLARED effect is its own requirement — the send never dies as already-executed', () => {
+for (const fixture of [
+  { name: 'a second DECLARED effect is its own requirement — the send never dies as already-executed',
+    operation: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', artifactProofRequired: true },
+  { name: 'an unfamiliar declared artifact creator cannot bypass content proof through generic success',
+    operation: 'ARCHIVE_CREATE_ENTRY', artifactProofRequired: true },
+  { name: 'a generic external job with no artifact contract discharges from its retained successful response',
+    operation: 'RESEARCH_JOB_START', artifactProofRequired: false },
+]) test(fixture.name, () => {
   // Live 2026-08-18 sess-synthetic-003 seq 58097: GOOGLEDOCS create succeeded and
   // the declared OUTLOOK send was refused work_effect_already_executed —
   // because the frozen contract held ONE write requirement, so the second
@@ -648,7 +660,7 @@ test('a second DECLARED effect is its own requirement — the send never dies as
     requirementId: 'n5:retrieve',
   });
   // Doc create binds and settles under n7.
-  const docArgs = { tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', arguments: JSON.stringify({ title: 'Attachment summary', markdown: '# hi' }) };
+  const docArgs = { tool_slug: fixture.operation, arguments: JSON.stringify({ title: 'Attachment summary', markdown: '# hi' }) };
   const docId = `logical:write:${serial}:doc`;
   assert.ok(['inserted', 'existing'].includes(dispatch.admitLogicalCall({
     identity: { ...task, logicalToolCallId: docId }, tool: 'composio_execute_tool', args: docArgs,
@@ -662,16 +674,16 @@ test('a second DECLARED effect is its own requirement — the send never dies as
   assert.equal(doc.status, 'bound', JSON.stringify(doc).slice(0, 300));
   const begun = dispatch.beginPhysicalDispatch({
     identity: { ...task, logicalToolCallId: docId, physicalDispatchId: `dispatch:two:${serial}:doc`, ordinal: 0 },
-    tool: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', args: { title: 'Attachment summary', markdown: '# hi' },
+    tool: fixture.operation, args: { title: 'Attachment summary', markdown: '# hi' },
   });
   assert.equal(begun.status, 'inserted', JSON.stringify(begun).slice(0, 150));
   assert.equal(dispatch.settlePhysicalDispatch({
     identity: begun.status === 'inserted' ? begun.identity : (null as never),
-    tool: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', outcome: 'returned',
+    tool: fixture.operation, outcome: 'returned',
   }).status, 'inserted');
   assert.equal(settlements.commitLogicalCallSettlement({
     identity: { ...task, logicalToolCallId: docId },
-    contract: { toolName: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN', args: { title: 'Attachment summary', markdown: '# hi' } },
+    contract: { toolName: fixture.operation, args: { title: 'Attachment summary', markdown: '# hi' } },
     execution: { kind: 'provider_execution' },
     result: { payload: { successful: true, data: { documentId: 'doc-123', title: 'Attachment summary' } } },
     outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
@@ -696,6 +708,14 @@ test('a second DECLARED effect is its own requirement — the send never dies as
   // truthful kernel sequence — the irreversible send WAITS on the doc's
   // read-back discharge (receipt/read-back before send), then admits. The
   // model's ordinary readback step satisfies that without any user message.
+  if (!fixture.artifactProofRequired) {
+    assert.equal(send.status, 'bound', JSON.stringify(send));
+    assert.equal(admission.dischargedRequirementSettlements(db, prepared.contract, 'n7:execute').length, 1,
+      'successful non-artifact invocation remains usable without an invented readback');
+    return;
+  }
+  assert.equal(admission.dischargedRequirementSettlements(db, prepared.contract, 'n7:execute').length, 0,
+    'a create acknowledgement cannot discharge unverified artifact content');
   assert.equal(send.status, 'refused');
   assert.equal(
     send.status === 'refused' && send.kind,
