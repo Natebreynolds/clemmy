@@ -4,7 +4,7 @@ import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer }
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
-import { createMcpNamespaceShim, parseNamespacedTool, slugifyServerName } from './mcp-namespace-shim.js';
+import { type McpNamespaceShim, createMcpNamespaceShim, parseNamespacedTool, slugifyServerName } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import {
   mcpServerAliasMatches,
@@ -445,14 +445,15 @@ function createScopedExternalShim(
   base: MCPServer,
   scope: McpToolScope,
   opts: { semantic?: boolean } = {},
-): MCPServer {
+): MCPServer & Pick<McpNamespaceShim, 'listToolsAuthoritative'> {
   let selectedToolNames: Set<string> | null = null;
   // Where an acquired tool actually lives. Without this the first cross-server
   // call succeeds and the second one goes back to the turn's base — which never
   // hosted that server — so a recovery that worked once broke on the next call.
   const acquiredTargets = new Map<string, MCPServer>();
-  const listScopedTools = async () => {
-    const tools = await base.listTools();
+  const listScopedTools = async (authoritative = false) => {
+    const exact = (base as Partial<McpNamespaceShim>).listToolsAuthoritative;
+    const tools = authoritative && exact ? await exact.call(base) : await base.listTools();
     // T1: on the fail-open surface, rank the user's connected tools by
     // semantic relevance to the query (returns undefined → keyword/index
     // order, zero behavior change). Only the fresh per-query fail-open shim
@@ -480,6 +481,9 @@ function createScopedExternalShim(
     },
     async listTools() {
       return listScopedTools();
+    },
+    async listToolsAuthoritative() {
+      return listScopedTools(true);
     },
     async callTool(toolName, args) {
       const executableToolName = stripMcpToolCarrier(toolName);

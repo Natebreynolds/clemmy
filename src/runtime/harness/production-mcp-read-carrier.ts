@@ -106,7 +106,7 @@ type McpToolDefinition = {
 
 export interface ProductionMcpRuntime {
   configuredServers(): readonly ManagedMcpServer[];
-  serverForEnumeration(serverSlug: string): Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'>;
+  serverForEnumeration(serverSlug: string): Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'> & { listToolsAuthoritative?: MCPServer['listTools'] };
   serverForOperation(operationId: string): Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'>;
   /** Production's namespace shim historically owns its own logical/physical
    * wrapper. The exact carrier has already admitted that work, so production
@@ -485,7 +485,7 @@ async function freshSnapshot(input: {
   // never re-select a server from an operation name at this last edge.
   const server = input.runtime.serverForEnumeration(input.serverSlug);
   await server.invalidateToolsCache();
-  const rawTools = await server.listTools();
+  const rawTools = await (server.listToolsAuthoritative?.() ?? server.listTools());
   const tools = parseClosedToolList(rawTools, input.serverSlug);
   const observedAt = Date.now();
   const providerIdentity = `mcp-config:${input.serverSlug}:${config.digest}`;

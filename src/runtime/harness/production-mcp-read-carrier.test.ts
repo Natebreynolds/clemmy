@@ -1356,3 +1356,58 @@ for (const shape of ['sdk_array', 'envelope', 'structured', 'empty', 'success_te
     }
   });
 }
+
+test('cold carrier enumeration waits for real metadata instead of accepting an unavailable placeholder', async () => {
+  const { createMcpNamespaceShim } = await import('../mcp-namespace-shim.js');
+  const priorBudget = process.env.MCP_ATTACH_CONNECT_BUDGET_MS;
+  process.env.MCP_ATTACH_CONNECT_BUDGET_MS = '20';
+  const fixture = generatedRuntime({ objective: 'documentation inventory' });
+  let release!: () => void;
+  const connected = new Promise<void>(resolve => { release = resolve; });
+  const realTool = readTool({ server: fixture.server, name: 'sections', objective: 'documentation inventory' });
+  const raw = {
+    name: fixture.server,
+    cacheToolsList: false,
+    async connect() { await connected; },
+    async close() {},
+    async invalidateToolsCache() {},
+    async listTools() { return [{ ...realTool, name: 'sections' }]; },
+    async callTool() { throw new Error('metadata acquisition must not execute'); },
+  } as unknown as MCPServer;
+  const shim = createMcpNamespaceShim({ servers: [raw] });
+  const runtime = { ...fixture.runtime, serverForEnumeration: () => shim };
+  const carrier = mcp.createProductionMcpReadCarrier({ serverName: fixture.server, runtime });
+  // Keep the handshake pending longer than advertisement's short budget.
+  const pending = carrier.carrier.enumerate();
+  const timer = setTimeout(release, 350);
+  try {
+    const rows = await pending;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.identifier, realTool.name);
+    assert.equal(rows[0]?.effectClass, 'read');
+  } finally { clearTimeout(timer); release(); await shim.close();
+    if (priorBudget === undefined) delete process.env.MCP_ATTACH_CONNECT_BUDGET_MS;
+    else process.env.MCP_ATTACH_CONNECT_BUDGET_MS = priorBudget;
+  }
+});
+
+test('authoritative carrier enumeration reports connection failure rather than an empty read inventory', async () => {
+  const { createMcpNamespaceShim } = await import('../mcp-namespace-shim.js');
+  const fixture = generatedRuntime({ objective: 'documentation inventory' });
+  const raw = {
+    name: fixture.server,
+    cacheToolsList: false,
+    async connect() { throw new Error('controlled connection failure'); },
+    async close() {},
+    async invalidateToolsCache() {},
+    async listTools() { throw new Error('must not list a disconnected server'); },
+    async callTool() { throw new Error('must not execute'); },
+  } as unknown as MCPServer;
+  const shim = createMcpNamespaceShim({ servers: [raw] });
+  const carrier = mcp.createProductionMcpReadCarrier({
+    serverName: fixture.server,
+    runtime: { ...fixture.runtime, serverForEnumeration: () => shim },
+  });
+  try { await assert.rejects(carrier.carrier.enumerate(), /authoritative tool inventory is unavailable/); }
+  finally { await shim.close(); }
+});

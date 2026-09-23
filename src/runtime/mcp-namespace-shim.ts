@@ -828,7 +828,11 @@ export function parseNamespacedTool(namespaced: string): { serverSlug: string; t
 /** The base namespace shim plus a blocking `prewarm()` for startup warming.
  *  Scoped/fail-open VIEWS (createScopedExternalShim) are plain MCPServer and
  *  delegate to this base, so warming the base warms every view. */
-export type McpNamespaceShim = MCPServer & { prewarm: () => Promise<boolean> };
+export type McpNamespaceShim = MCPServer & {
+  prewarm: () => Promise<boolean>;
+  /** Await real metadata; never return advertisement placeholders as evidence. */
+  listToolsAuthoritative: MCPServer['listTools'];
+};
 
 export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNamespaceShim {
   const { servers, name = 'clemmy-mcp', cacheToolsList = true } = options;
@@ -1090,10 +1094,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
    *  the caller (listTools) uses it to AVOID caching a partial surface, so a
    *  background-warmed server is picked up on the next turn's rebuild (no stale
    *  cache, no explicit invalidation needed). */
-  async function buildFlattenedTools(): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
+  async function buildFlattenedTools(authoritative = false): Promise<{ tools: MCPTool[]; routing: Map<string, MCPServer>; allConnected: boolean }> {
     const tools: MCPTool[] = [];
     const routing = new Map<string, MCPServer>(); // namespaced name -> underlying server
-    const skipUnconnected = attachConnectedOnly();
+    const skipUnconnected = !authoritative && attachConnectedOnly();
 
     // Connect + list per server in parallel. If one fails, log and continue.
     const results = await Promise.allSettled(
@@ -1269,6 +1273,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       );
       cachedTools = null;
       cachedToolToServer = null;
+    },
+
+    async listToolsAuthoritative(): Promise<MCPTool[]> {
+      // Exact acquisition pays the existing bounded connect/list cost. The
+      // fast advertisement path can still return a connecting placeholder.
+      const { tools, routing, allConnected } = await buildFlattenedTools(true);
+      if (!allConnected) throw new Error('MCP authoritative tool inventory is unavailable');
+      cachedTools = cacheToolsList ? tools : null;
+      cachedToolToServer = routing;
+      return tools;
     },
 
     async listTools(): Promise<MCPTool[]> {
