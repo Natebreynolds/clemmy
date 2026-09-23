@@ -149,6 +149,7 @@ export interface V314UpgradeRehearsalReport {
     currentLockSha256: string;
     normalizedLockGraphEqual: boolean;
     tagGraphCovered: boolean;
+    executionDependencies: 'current_verified' | 'exact_tag_install';
     extraPackages: string[];
   };
   paths: {
@@ -294,7 +295,7 @@ function isolatedChildEnv(home: string): NodeJS.ProcessEnv {
 }
 
 /**
- * The rehearsal executes archived source against the already-installed
+ * The rehearsal may execute archived source against the already-installed
  * package records in current node_modules. Root package metadata describes
  * how that identical tree was requested; it is not an installed dependency.
  * Compare every non-root lock record byte-for-byte so a promoted direct
@@ -349,6 +350,7 @@ function verifyReleaseCheckout(checkout: string): {
   currentLockSha256: string;
   normalizedLockGraphEqual: boolean;
   tagGraphCovered: boolean;
+  executionDependencies: 'current_verified' | 'exact_tag_install';
   extraPackages: string[];
 } {
   const commit = run('git', ['rev-parse', `${V314_RELEASE.commit}^{commit}`]).stdout.trim();
@@ -368,18 +370,32 @@ function verifyReleaseCheckout(checkout: string): {
   const normalizedLockGraphEqual = stable(normalizedInstalledPackageGraph(tagLock))
     === stable(normalizedInstalledPackageGraph(currentLock));
   const coverage = installedPackageGraphCoversTag(tagLock, currentLock);
-  if (!coverage.covered) {
-    throw new Error(
-      'The installed dependency graph no longer covers v3.14.0 exactly '
-      + `(missing: ${coverage.missingPackages.join(', ') || 'none'}; changed: ${coverage.changedPackages.join(', ') || 'none'}); `
-      + 'refusing to call current node_modules an exact-tag execution dependency set.',
-    );
+  const nodeModules = path.join(repoRoot, 'node_modules');
+  let executionDependencies: 'current_verified' | 'exact_tag_install';
+  if (coverage.covered) {
+    if (!existsSync(nodeModules)) throw new Error('node_modules is missing; run npm ci before the rehearsal');
+    symlinkSync(nodeModules, path.join(checkout, 'node_modules'), 'dir');
+    executionDependencies = 'current_verified';
+  } else {
+    // A normal dependency update must not make the upgrade gate execute old
+    // source with new dependencies. Install the archived lock in the disposable
+    // checkout instead; npm ci verifies tarball integrity and preserves the lock.
+    assertDisposablePath(checkout, 'exact-tag dependency checkout');
+    const lockBefore = sha256File(tagLockPath);
+    run(process.platform === 'win32' ? 'npm.cmd' : 'npm', [
+      'ci', '--no-audit', '--no-fund', '--cache', path.join(tempRoot, 'clem-upgrade-npm-cache'),
+    ], { cwd: checkout });
+    if (sha256File(tagLockPath) !== lockBefore) {
+      throw new Error('Exact-tag dependency installation changed the archived lockfile');
+    }
+    executionDependencies = 'exact_tag_install';
   }
   return {
     tagLockSha256: sha256File(tagLockPath),
     currentLockSha256: sha256File(currentLockPath),
     normalizedLockGraphEqual,
-    tagGraphCovered: coverage.covered,
+    tagGraphCovered: true,
+    executionDependencies,
     extraPackages: coverage.extraPackages,
   };
 }
@@ -393,9 +409,6 @@ function checkoutExactRelease(checkout: string, archivePath: string): void {
     V314_RELEASE.commit,
   ]);
   run('tar', ['-xf', archivePath, '-C', checkout]);
-  const nodeModules = path.join(repoRoot, 'node_modules');
-  if (!existsSync(nodeModules)) throw new Error('node_modules is missing; run npm ci before the rehearsal');
-  symlinkSync(nodeModules, path.join(checkout, 'node_modules'), 'dir');
 }
 
 async function importFrom(root: string, relativePath: string): Promise<Record<string, unknown>> {
@@ -1866,7 +1879,7 @@ export async function runV314UpgradeRehearsal(
     limitations: [
       'This is a two-process schema/store boot, not a daemon boot; it does not run recovery workers, timers, providers, notification delivery, or workflow dispatch.',
       'The fixture covers public v3.14 APIs and representative healthy rows. A sanitized production-home clone is still required to exercise historical corruption, partial writes, and machine-specific credentials.',
-      'The exact v3.14 source tree is used with the repository node_modules only after proving the lock graphs are identical modulo root package-version metadata.',
+      'The exact v3.14 source uses shared dependencies only when the current lock covers every archived package unchanged; otherwise npm ci installs the archived lock into its disposable checkout. The report identifies which path ran.',
     ],
   };
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });

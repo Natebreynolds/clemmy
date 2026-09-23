@@ -11,3 +11,12 @@ Three named fixture failures are resolved: native space_save remains first-class
 Traps to retain: failed zero usage is unknown cost, not free work; SDK and native client versions are distinct; new model discovery does not prove transport compatibility; standalone CLI login is not Clem OAuth authority. The isolated runner could not certify its live-home sentinel while the daemon owned that home; no isolated acceptance claim is made.
 
 Broader installed-app workflow, cold-tool, restart, mobile, packaging and full-suite gates remain owed. No tag is authorized by these focused checks alone.
+
+
+## Installed result and upgrade gate follow-up
+
+8de2c1448 was hotpatched through Terminal and build-info matched fingerprint a3b44740025e6f46216536970712f6f26efc76e950b50652a3500986346a523d. The live Usage API retained 52 calls and changed uncertifiedCalls from zero to two; read-only ledger inspection found exactly two failed zero-usage timeouts. No induced provider timeout or extra generative call was needed.
+
+Release assets passed 56 checks across the initial run and a four-test rerun after restoring this worktree's missing desktop node_modules link. Release closure initially passed 137/138: the SDK update invalidated the upgrade rehearsal's shared-dependency assumption. The rehearsal now uses shared dependencies only if they cover every archived lock entry unchanged; otherwise it performs npm ci from the exact release lock in the disposable archived checkout and checks the lock remains unchanged. The report states which dependency source executed. All six upgrade tests passed, including actual migration and second-boot idempotency; typecheck passed. No graph-comparison assertion was weakened. Trap: dependency updates must not invalidate the old-release execution proof or quietly run old source on newer dependencies.
+
+The upgraded rehearsal scripts are newer than the installed runtime candidate; rebuild before the next hotpatch. The read-only cancellation presentation remains under investigation, and full suite/journeys plus broader live acceptance remain owed.

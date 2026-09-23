@@ -165,6 +165,11 @@ test('exact v3.14 APIs seed a disposable home and current store boots migrate it
     assert.equal(report.checks.every((check) => check.ok), true);
     assert.equal(report.dependencyProof.tagGraphCovered, true, 'every v3.14.0 package must be present at its exact entry');
     assert.equal(typeof report.dependencyProof.normalizedLockGraphEqual, 'boolean');
+    const archivedLock = JSON.parse(readFileSync(path.join(report.paths.exactTagCheckout, 'package-lock.json'), 'utf8'));
+    const currentLock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
+    assert.equal(report.dependencyProof.executionDependencies,
+      installedPackageGraphCoversTag(archivedLock, currentLock).covered ? 'current_verified' : 'exact_tag_install',
+      'dependency drift must exercise a real exact-tag install, never borrow the changed graph');
     assert.ok(Array.isArray(report.dependencyProof.extraPackages));
     assert.equal(existsSync(report.paths.immutableSnapshot), true, 'rollback snapshot remains recoverable');
     assert.equal(existsSync(report.paths.migratedHome), true);
