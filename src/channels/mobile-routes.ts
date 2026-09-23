@@ -1,4 +1,5 @@
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
+import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
@@ -66,11 +67,9 @@ import {
   type MobileAttemptScope,
   type MobileRateLimitOptions,
 } from '../runtime/mobile-rate-limit.js';
-import { classifyNotification } from '../runtime/notification-intent.js';
 import {
   addNotification,
   getNotification,
-  isNeedsAttentionNotification,
   loadNotifications,
   listNotifications,
   markNotificationRead,
@@ -140,7 +139,6 @@ import { recallMemory } from '../memory/recall-memory.js';
 import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
-import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import { workflowResourceBindingGaps } from '../execution/workflow-resource-binding.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
 import {
@@ -510,6 +508,8 @@ interface MobileInboxNotification {
   createdAt: string;
   read: boolean;
   needsAttention: boolean;
+  /** Server-owned grouping identity (dashboard/needs-you.ts `needsYouKey`). */
+  needsYouKey: string;
   deliveredAt: string | null;
   deliveryError: string | null;
   workflowCapability: WorkflowCapabilityInboxGate | null;
@@ -553,7 +553,7 @@ function notificationMetadataStrings(
     .slice(0, 50);
 }
 
-function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInboxNotification {
+function serializeInboxNotificationForMobile(row: NotificationRecord, ref: NeedsYouReferents = needsYouReferents()): MobileInboxNotification {
   const checkInId = notificationMetadataString(row.metadata, 'checkInId');
   const questionId = notificationMetadataString(row.metadata, 'questionId');
   const approvalId = notificationMetadataString(row.metadata, 'approvalId');
@@ -562,7 +562,6 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
   const relatedApprovalIds = notificationMetadataStrings(row.metadata, 'approvalIds');
   const runId = notificationMetadataString(row.metadata, 'runId', 'workflowRunId', 'backgroundTaskId');
   const stepId = notificationMetadataString(row.metadata, 'stepId');
-  const workflowQuestion = row.kind === 'workflow' && Boolean(questionId && runId && stepId);
   return {
     id: row.id,
     kind: row.kind,
@@ -570,7 +569,10 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
     body: row.body,
     createdAt: row.createdAt,
     read: row.read,
-    needsAttention: isNeedsAttentionNotification(row),
+    // The one definition every surface counts by (dashboard/needs-you.ts),
+    // and the identity to group by — a workflow blocked five times is one row.
+    needsAttention: notificationNeedsYou(row, ref),
+    needsYouKey: needsYouKey(row, ref.runs),
     deliveredAt: row.deliveredAt ?? null,
     deliveryError: row.deliveryError ?? null,
     workflowCapability: projectWorkflowCapabilityInboxGate(row),
@@ -578,13 +580,7 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
     // plans, provider receipts, webhook destinations, and arbitrary metadata
     // stay daemon-side.
     context: {
-      actionItemId: checkInId
-        ? `checkin:${checkInId}`
-        : workflowQuestion ? `workflow:${runId}|${questionId}`
-          : questionId ? `task:${questionId}`
-          : approvalId ? `approval:${approvalId}`
-            : planProposalId ? `plan:${planProposalId}`
-              : trustProposalId ? `trust:${trustProposalId}` : null,
+      actionItemId: notificationActionItemId(row),
       approvalId,
       planProposalId,
       trustProposalId,
@@ -605,14 +601,14 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
   };
 }
 
-function mobileInboxNotifications(limit = 200): NotificationRecord[] {
+function mobileInboxNotifications(limit = 200, ref: NeedsYouReferents = needsYouReferents()): NotificationRecord[] {
   // The durable store is bounded to 1,000 rows. Filter the complete bounded
   // set before applying the mobile page limit; otherwise silent heartbeats at
   // the front can crowd real Inbox rows out and make list/summary disagree.
   const rows = loadNotifications()
     .filter((row) => !row.silent && row.metadata?.heartbeat !== true)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  const actionable = rows.filter((row) => !row.read && isNeedsAttentionNotification(row));
+  const actionable = rows.filter((row) => !row.read && notificationNeedsYou(row, ref));
   const actionableIds = new Set(actionable.map((row) => row.id));
   return [
     ...actionable,
@@ -2468,8 +2464,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   router.get('/api/inbox/notifications', requireMobileSession, (req, res) => {
     try {
       const limit = clampInt(req.query.limit, 100, 1, 200);
-      const notifications = mobileInboxNotifications(limit)
-        .map(serializeInboxNotificationForMobile);
+      const ref = needsYouReferents();
+      const notifications = mobileInboxNotifications(limit, ref)
+        .map((row) => serializeInboxNotificationForMobile(row, ref));
       res.json({ notifications, count: notifications.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -2739,71 +2736,25 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.get('/api/inbox/summary', requireMobileSession, async (_req, res) => {
     try {
-      const approvalRows = approvalRegistry.listPending({ status: 'pending' })
-        .filter((row) => !approvalRegistry.isExpired(row))
-        .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
-      const planRows = listPlanProposals({ status: 'pending', limit: 100 });
-      const {
-        listAutomationPilotWorkspaceChoosers,
-      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
-      const chooserRows = listAutomationPilotWorkspaceChoosers({ status: 'pending', limit: 100 });
-      const questionRows = mobileInboxQuestions();
-      const trustRows = listTrustProposals('pending');
-      const approvalIds = new Set(approvalRows.map((row) => row.approvalId));
-      const planIds = new Set(planRows.map((row) => row.id));
-      const trustIds = new Set(trustRows.map((row) => row.id));
-      const questionActionIds = new Set(questionRows.map((row) => row.id));
-      let notificationNeedsYou = 0;
-      let unreadUpdates = 0;
-      for (const notification of mobileInboxNotifications(200)) {
-        if (notification.read) continue;
-        const approvalId = notificationMetadataString(notification.metadata, 'approvalId');
-        const planProposalId = notificationMetadataString(notification.metadata, 'planProposalId');
-        const trustProposalId = notificationMetadataString(notification.metadata, 'trustProposalId');
-        const relatedApprovalIds = notificationMetadataStrings(notification.metadata, 'approvalIds');
-        const actionItemId = serializeInboxNotificationForMobile(notification).context.actionItemId;
-        if ((approvalId && approvalIds.has(approvalId)) || (planProposalId && planIds.has(planProposalId))) continue;
-        if (trustProposalId && trustIds.has(trustProposalId)) continue;
-        if (relatedApprovalIds.length > 0 && relatedApprovalIds.every((id) => approvalIds.has(id))) continue;
-        if (actionItemId && questionActionIds.has(actionItemId)) continue;
-        // Rule (1) vs rule (2), decided in ONE place. The old predicate ended
-        // in a regex over the TITLE, so "Chat run blocked: …" — a past-tense
-        // report of something that already stopped — counted as a decision
-        // forever, because nothing ever edits that word out. Measured on the
-        // owner's store: a badge of 86 against ZERO pending approvals.
-        // classifyNotification asks instead whether there is something to
-        // ANSWER, and reads a terminal status before any flag stamped earlier.
-        const intent = classifyNotification(notification, {
-          approvalPending: (id) => approvalIds.has(id),
-          planPending: (id) => planIds.has(id),
-          trustPending: (id) => trustIds.has(id),
-        });
-        if (intent !== 'awaiting_you') {
-          // A finished run is worth telling someone about once; it is not an
-          // obligation, so it never enters the count that shapes the badge.
-          unreadUpdates += 1;
-          continue;
-        }
-        notificationNeedsYou += 1;
-      }
-      const approvals = approvalRows.length;
-      const plans = planRows.length;
-      // Scheduled workflows that cannot run until a resource is bound (capability
-      // gates already arrive here as needs-attention notifications).
-      let bindingStops = 0;
-      try { bindingStops = listWorkflowBindingStops().filter((stop) => stop.scheduled).length; } catch { /* zero */ }
-      const workspaceChoices = chooserRows.length;
-      const questions = questionRows.length;
-      const trustProposals = trustRows.length;
+      // ONE definition for every surface (dashboard/needs-you.ts): the desktop
+      // sidebar, Home and the Needs you tab count the same items this pill
+      // does. It keeps this route's old rules — the owner's notification
+      // intent, carriers of pending decisions counted once — and adds the
+      // live checks the desktop needed: a workflow counts while its newest
+      // run is stopped, a meeting invite while it still waits for a reply.
+      const summary = await summarizeNeedsYou();
       res.json({
-        needsYou: questions + approvals + plans + workspaceChoices + trustProposals + notificationNeedsYou + bindingStops,
-        questions,
-        approvals,
-        plans,
-        workspaceChoices,
-        trustProposals,
-        notificationNeedsYou,
-        unreadUpdates,
+        needsYou: summary.total,
+        questions: summary.questions,
+        approvals: summary.approvals,
+        plans: summary.plans,
+        workspaceChoices: summary.workspaceChoices,
+        trustProposals: summary.trustProposals,
+        checkInProposals: summary.checkInProposals,
+        stoppedWorkflows: summary.stoppedWorkflows,
+        notificationNeedsYou: summary.notificationNeedsYou,
+        unreadUpdates: summary.unreadUpdates,
+        unlisted: summary.unlisted,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

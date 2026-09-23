@@ -72,6 +72,9 @@ export interface NotificationRow {
   deliveryAttempts?: number;
   deliveryError?: string;
   needsAttention?: boolean;
+  /** Server-owned grouping identity (dashboard/needs-you.ts): a workflow
+   *  blocked five times is one row; a carrier for an approval is that approval. */
+  needsYouKey?: string;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
   /** A workflow the system switched off that only a person can switch back on. */
   workflowEnableGate?: WorkflowEnableInboxGate | null;
@@ -129,6 +132,7 @@ export interface CollapsedAttentionRow {
 export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttentionRow[] {
   const keyFor = (row: NotificationRow): string => {
     if (row.workflowCapability) return `capability:${row.workflowCapability.notificationId}`;
+    if (row.needsYouKey) return row.needsYouKey;
     const title = (row.title || row.body || '').trim();
     const workflow = /workflow needs attention:\s*(.+)$/i.exec(title)?.[1]?.trim();
     return workflow ? `wf:${workflow.toLowerCase()}` : `title:${title.toLowerCase()}`;
@@ -444,4 +448,33 @@ export function notifTone(n: NotificationRow): { tone: Tone; label: string } {
 /** A notification whose delivery to an external destination failed. */
 export function notifFailed(n: NotificationRow): boolean {
   return Boolean(n.deliveryError) || ((n.deliveryAttempts ?? 0) > 0 && !n.deliveredAt);
+}
+
+/** The one needs-you count and the rows no other feed carries
+ *  (GET /api/console/needs-you/summary, dashboard/needs-you.ts). */
+export interface NeedsYouSummary {
+  total: number;
+  keys: string[];
+  unlisted: Array<{
+    key: string;
+    kind: 'workflow_binding' | 'check_in_proposal';
+    title: string;
+    detail: string;
+    workflow?: string;
+  }>;
+}
+
+export const getNeedsYouSummary = () => apiGet<NeedsYouSummary>('/api/console/needs-you/summary');
+
+/** What a needs-you row is, from its server key: a meeting to reply to, a
+ *  stopped workflow, a chat waiting on an answer. One pill for every row said
+ *  nothing (live 2026-09-22: 26 identical "Needs attention" chips). */
+export function attentionPill(row: Pick<NotificationRow, 'needsYouKey'>): { tone: 'info' | 'warning'; label: string } {
+  const key = row.needsYouKey ?? '';
+  if (key.startsWith('calendar:')) return { tone: 'info', label: 'Reply' };
+  if (key.startsWith('flow:')) return { tone: 'warning', label: 'Stopped' };
+  if (key.startsWith('session:') || key.startsWith('task:') || key.startsWith('checkin:') || key.startsWith('workflow:')) {
+    return { tone: 'warning', label: 'Your answer' };
+  }
+  return { tone: 'warning', label: 'Needs you' };
 }

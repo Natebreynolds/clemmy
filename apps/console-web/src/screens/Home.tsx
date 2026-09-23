@@ -140,6 +140,7 @@ function LiveHome() {
             key={id}
             headingId="home-needs-you"
             items={needsYou}
+            total={cc.data?.counts?.waiting}
             loading={ccLoading}
             error={ccError}
             onRetry={retryCommandCenter}

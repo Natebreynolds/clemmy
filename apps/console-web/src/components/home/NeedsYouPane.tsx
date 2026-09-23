@@ -113,12 +113,16 @@ interface RowState {
  */
 export function NeedsYouPane({
   items,
+  total,
   loading,
   error,
   onRetry,
   headingId,
 }: {
   items: readonly HomeFeedItem[];
+  /** The one needs-you count (the sidebar's number); the list shows the
+   *  first few of those items. */
+  total?: number;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
@@ -128,7 +132,7 @@ export function NeedsYouPane({
   const [rows, setRows] = useState<Record<string, RowState>>({});
 
   const settle = () => {
-    for (const key of ['command-center', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
+    for (const key of ['command-center', 'needs-you-summary', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
       void qc.invalidateQueries({ queryKey: [key] });
     }
   };
@@ -246,18 +250,25 @@ export function NeedsYouPane({
   };
 
   const visible = items.slice(0, MAX_ROWS);
-  const overflow = items.length - visible.length;
+  const count = typeof total === 'number' ? Math.max(total, items.length === 0 ? 0 : visible.length) : items.length;
+  const overflow = count - visible.length;
 
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
-      <SectionHeader id={headingId} label="Needs you" count={items.length} />
+      <SectionHeader id={headingId} label="Needs you" count={count} />
       <PaneCard>
         {loading ? (
           <RowSkeleton rows={2} tall />
         ) : error ? (
           <LoadFailedLine what="what needs you" onRetry={onRetry} />
-        ) : items.length === 0 ? (
+        ) : items.length === 0 && count === 0 ? (
           <QuietLine>Nothing needs you right now.</QuietLine>
+        ) : items.length === 0 ? (
+          <PaneRow className="justify-center">
+            <Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">
+              {count === 1 ? 'One thing needs you — open Needs you' : `${count} things need you — open Needs you`}
+            </Link>
+          </PaneRow>
         ) : (
           <>
             {visible.map((item, index) => {
@@ -349,7 +360,7 @@ export function NeedsYouPane({
             {overflow > 0 && (
               <PaneRow className="justify-center">
                 <Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">
-                  See all {items.length} in Inbox
+                  See all {count} in Inbox
                 </Link>
               </PaneRow>
             )}

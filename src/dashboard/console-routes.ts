@@ -131,6 +131,7 @@ import {
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
+import { needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -352,7 +353,7 @@ import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
-import { addNotification, getNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, getNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { applySessionMountPrimers, composeSessionFromStore } from '../runtime/harness/session-composition.js';
@@ -13598,12 +13599,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const since = typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+      const ref = needsYouReferents();
       const items = listNotifications(50)
         .filter((n) => !n.silent && !n.read)
         .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
         .slice(0, 5)
         .map((n) => {
-          const needsAttention = isNeedsAttentionNotification(n);
+          const needsAttention = notificationNeedsYou(n, ref);
           return {
             id: n.id,
             title: n.title,
@@ -13691,6 +13693,20 @@ export function registerConsoleRoutes(
     try {
       const until = await snoozeHomeItem(key, hours);
       res.json({ ok: true, key, until });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // The one needs-you count and the rows no other feed carries — the Needs
+  // you tab's badge and its unlisted rows (dashboard/needs-you.ts). The
+  // sidebar reads the same total from the command centre.
+  app.get('/api/console/needs-you/summary', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const runtimeApprovalIds = assistant.getRuntime().listPendingApprovals().map((approval) => approval.id);
+      const summary = await summarizeNeedsYou({ runtimeApprovalIds });
+      res.json(summary);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -14066,9 +14082,6 @@ export function registerConsoleRoutes(
           .split('\n')
           .map((line) => line.trim())
           .find((line) => line && !line.startsWith('#') && !/^[{}\[\]\-=*`>|"',:]+$/.test(line)) || '';
-      // Shared with markNotificationGroupRead so dismiss clears exactly the
-      // set of notifications this feed would surface.
-      const isNeedsAttentionNotif = isNeedsAttentionNotification;
       // Collapse the generic "Workflow completed/needs attention: <name>"
       // echo when a richer notify_user report already covers the same run —
       // otherwise every run double-reports (the clutter the inbox must avoid).
@@ -14141,13 +14154,20 @@ export function registerConsoleRoutes(
         }
         return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       };
+      // The one needs-you definition (dashboard/needs-you.ts), shared with the
+      // Needs you tab and the phone so their lists and badges agree.
+      const needsYouRef = needsYouReferents();
       const notifNeedsYou = dedupeByWorkflow(
         // Unread only: a read needs-attention notification is one the user
         // has already seen/dismissed — leaving it here made stale "Workflow
         // needs attention" cards immortal on Home (clicking led to an empty
         // approvals tab; observed 2026-06-11).
-        inboxNotifs.filter((notification) => !notification.read && isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
-        6,
+        inboxNotifs.filter((notification) => !notification.read
+          && notificationNeedsYou(notification, needsYouRef)
+          && !isGenericWorkflowEcho(notification)
+          // A carrier for a decision already on this list is that decision.
+          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef.runs))),
+        50,
       ).map((notification) => ({
         kind: 'workflow',
         title: trimConsoleTitle(stripConsoleIds(notification.title.replace(/^[⚠️️\s]+/, '')), 140),
@@ -14163,7 +14183,7 @@ export function registerConsoleRoutes(
         dismissId: notification.id,
       }));
       const notifRecent = dedupeByWorkflow(
-        inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        inboxNotifs.filter((notification) => !notificationNeedsYou(notification, needsYouRef) && !isGenericWorkflowEcho(notification)),
         12,
       ).map((notification) => {
         const undelivered = !notification.deliveredAt && (Boolean(notification.deliveryError) || (notification.deliveryAttempts || 0) > 0);
@@ -14264,7 +14284,8 @@ export function registerConsoleRoutes(
       // sessions + workflow runs/executions only. Background tasks and
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
-      const waitingCount = needsYouMerged.length;
+      // Every badge shows this number: the same summary the phone's pill reads.
+      const waitingCount = (await summarizeNeedsYou({ runtimeApprovalIds: approvals.map((approval) => approval.id) })).total;
       const snoozes = activeHomeSnoozes();
       const isSnoozed = (item: unknown): boolean => {
         const key = (item as { snoozeKey?: unknown }).snoozeKey;
