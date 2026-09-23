@@ -77,7 +77,11 @@ export async function prepareSharedEvidenceDecisionsWithJev<
       ? 'jev-rank'
       : 'jev-primer';
   const result = await evaluateSystemOne({
-    state: { request: query.replace(/\s+/g, ' ').trim().slice(0, 800) },
+    // Rank against the complete caller-supplied request. Prefix truncation
+    // erased late constraints (including "read only") and could promote the
+    // wrong skill or discard relevant memory. Candidate descriptions remain
+    // compact; transport rejection retains the caller's original ordering.
+    state: { request: query },
     questions,
     timeoutMs: input.timeoutMs ?? Math.max(RANK_TIMEOUT_MS, PRIMER_TIMEOUT_MS),
     sessionId: input.sessionId,

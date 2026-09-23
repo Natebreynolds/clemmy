@@ -21,6 +21,25 @@ afterEach(() => {
   _setSystemOneFetchForTests(undefined);
 });
 
+test('candidate and primer routing preserve late request constraints and retain fallback on rejection', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 413, ok: false, text: async () => 'request rejected' };
+  });
+  const query = 'Background on the requested research. '.repeat(35)
+    + '\nOnly read existing records. Do not send email or create a workflow.\n'
+    + 'Preserve the exact search string: "two  spaces".';
+  const candidates = [{ name: 'read_records' }, { name: 'send_email' }];
+  const hits = [{ title: 'Research preference', snippet: 'Read existing records', score: 0.8 }];
+  assert.deepEqual(await rerankNamedCandidatesWithJev(query, candidates), candidates);
+  assert.deepEqual(await filterPrimerHitsWithJev(query, hits), hits);
+  assert.deepEqual(await prepareSharedEvidenceDecisionsWithJev(query, { candidates, hits }), { candidates, hits });
+  assert.equal(posted.length, 3);
+  for (const request of posted) assert.equal(request.state.request, query);
+});
+
 test('rerankNamedCandidatesWithJev reorders by Choice probabilities', async () => {
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async () => ({
