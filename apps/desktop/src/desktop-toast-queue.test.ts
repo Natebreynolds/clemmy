@@ -9,6 +9,8 @@ import {
   DESKTOP_TOAST_BURST_CAP,
   type DesktopPendingNotification,
   advanceWatermark,
+  desktopNotificationRoute,
+  openDesktopNotification,
   parseDesktopPendingResponse,
   planDesktopToasts,
 } from './desktop-toast-queue.js';
@@ -119,4 +121,36 @@ test('parseDesktopPendingResponse tolerates junk payloads', () => {
   assert.deepEqual(parseDesktopPendingResponse({ items: 'no' }).items, []);
   // A malformed `now` is dropped to undefined so the watermark holds.
   assert.equal(parseDesktopPendingResponse({ now: 'bad', items: [] }).now, undefined);
+});
+
+
+test('desktop notification maps the Inbox mount and preserves exact selection', () => {
+  assert.equal(desktopNotificationRoute('/inbox?tab=notifications&select=a%2Fb#detail'),
+    '/console/inbox?tab=notifications&select=a%2Fb#detail');
+  for (const bad of [undefined, '/settings', '//evil.example/inbox', 'https://evil.example/inbox', 'javascript:alert(1)']) {
+    assert.equal(desktopNotificationRoute(bad), undefined);
+  }
+});
+
+test('desktop notification acknowledges only after confirmed navigation', async () => {
+  const calls: string[] = [];
+  let finish!: (ok: boolean) => void;
+  const opened = openDesktopNotification(item('notice', { href: '/inbox?select=notice' }),
+    async (route) => { calls.push(route); return new Promise<boolean>((resolve) => { finish = resolve; }); },
+    async (id) => { calls.push(`read:${id}`); });
+  assert.deepEqual(calls, ['/console/inbox?select=notice']);
+  finish(true);
+  await opened;
+  assert.deepEqual(calls, ['/console/inbox?select=notice', 'read:notice']);
+});
+
+test('failed or rejected navigation and actionable notices remain unread', async () => {
+  let reads = 0;
+  const read = async () => { reads++; };
+  const notice = item('notice', { href: '/inbox?select=notice' });
+  await openDesktopNotification(notice, async () => false, read);
+  await assert.rejects(openDesktopNotification(notice, async () => { throw new Error('renderer gone'); }, read));
+  await openDesktopNotification({ ...notice, markReadOnOpen: false }, async () => true, read);
+  await openDesktopNotification({ ...notice, href: 'https://evil.example/inbox' }, async () => { throw new Error('must not navigate'); }, read);
+  assert.equal(reads, 0);
 });

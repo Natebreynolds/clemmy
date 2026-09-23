@@ -91,3 +91,21 @@ manifest/data/receipt bytes unchanged and no new observation/view created.
 Final typecheck passed (/tmp/clem-workspace-stabilization-typecheck-final.log,
 session65587 exit0). Whitespace diff check passed. Still no installed acceptance
 of these edits, no full-suite/package qualification, no tag authorization.
+
+## Desktop notification repair authorized
+
+Owner explicitly authorized narrowly scoped apps/desktop routing/read-ack repair,
+rebuild and real native click acceptance. This supersedes the permission-pending
+note above; other UI ownership remains unchanged. Desktop boundary now prefixes
+validated Inbox routes with /console, preserves selection/query/hash, waits for
+load and successful navigation before read acknowledgement, and preserves
+markReadOnOpen:false. Failed/destroyed/untrusted renderer leaves notice unread.
+21 toast/navigation/media-policy checks pass; desktop TypeScript/preload/native
+helper build passes. Installed main.js differs from the rebuilt main.js only in
+this repair; delivery must replace app.asar, not merely the daemon. Preserve
+archive unpack flags, executable modes, unchanged entries and signing identity.
+Native click and installed acceptance are still owed at this checkpoint.
+
+Additional recorded native plan/Space regression suite:15/15 pass, including
+read/write/read, retained plan requirements, workflow enable/reopen and one
+mutation. No paid providers. /tmp/clem-workspace-plan-regressions.log.

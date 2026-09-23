@@ -115,6 +115,7 @@ import {
 } from './notch-click-helper.js';
 import {
   advanceWatermark,
+  openDesktopNotification,
   parseDesktopPendingResponse,
   planDesktopToasts,
   type DesktopPendingNotification,
@@ -2433,20 +2434,38 @@ function rememberDesktopNotifiedId(id: string): void {
   }
 }
 
-function focusDesktopNotificationRoute(href: string | undefined): void {
-  if (!href || !/^\/inbox(?:[?#]|$)/.test(href)) return;
+async function focusDesktopNotificationRoute(route: string): Promise<boolean> {
   const win = mainWindow;
-  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return false;
+  const contents = win.webContents;
+  if (contents.isLoadingMainFrame()) {
+    const loaded = await new Promise<boolean>((resolve) => {
+      const finish = (ok: boolean) => {
+        clearTimeout(timer);
+        contents.removeListener('did-finish-load', ready);
+        contents.removeListener('destroyed', gone);
+        resolve(ok);
+      };
+      const ready = () => finish(true);
+      const gone = () => finish(false);
+      const timer = setTimeout(() => finish(false), 15_000);
+      contents.once('did-finish-load', ready);
+      contents.once('destroyed', gone);
+    });
+    if (!loaded) return false;
+  }
+  if (win.isDestroyed() || contents.isDestroyed()) return false;
+  if (!isTrustedDashboardMediaUrl(contents.getURL(), dashboardOrigins())) return false;
   const script = `(() => {
-    const next = ${JSON.stringify(href)};
+    const next = ${JSON.stringify(route)};
+    const origins = ${JSON.stringify([...dashboardOrigins()])};
+    if (!origins.includes(window.location.origin)) return false;
     window.history.pushState(null, '', next);
     window.dispatchEvent(new PopStateEvent('popstate'));
+    return window.location.pathname + window.location.search + window.location.hash === next;
   })()`;
-  const navigate = () => {
-    void win.webContents.executeJavaScript(script).catch(() => { /* best-effort focus */ });
-  };
-  if (win.webContents.isLoadingMainFrame()) win.webContents.once('did-finish-load', navigate);
-  else navigate();
+  try { return await contents.executeJavaScript(script) === true; }
+  catch { return false; }
 }
 
 function showDesktopNotificationToast(item: DesktopPendingNotification): void {
@@ -2458,14 +2477,9 @@ function showDesktopNotificationToast(item: DesktopPendingNotification): void {
   });
   notification.on('click', () => {
     revealMainWindow();
-    focusDesktopNotificationRoute(item.href);
-    // An actionable toast remains unread until its exact decision authority
-    // resolves it. Merely opening the Inbox can never consume a capability
-    // choice or leave an indefinitely blocked run without its chooser.
-    if (item.markReadOnOpen !== false) {
-      postDaemonJson(`/api/console/notifications/${encodeURIComponent(item.id)}/read`, {})
-        .catch(() => { /* best-effort */ });
-    }
+    void openDesktopNotification(item, focusDesktopNotificationRoute, (id) =>
+      postDaemonJson(`/api/console/notifications/${encodeURIComponent(id)}/read`, {}),
+    ).catch(() => { /* Leave unread when navigation or acknowledgement fails. */ });
   });
   notification.show();
 }

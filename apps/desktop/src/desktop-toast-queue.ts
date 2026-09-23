@@ -55,6 +55,23 @@ function safeInboxHref(value: unknown): string | undefined {
   }
 }
 
+/** Convert router-relative Inbox links at the desktop boundary only. */
+export function desktopNotificationRoute(href: unknown): string | undefined {
+  const safe = safeInboxHref(href);
+  return safe ? `/console${safe}` : undefined;
+}
+
+/** Opening a decision is never settlement; failed navigation is never a read. */
+export async function openDesktopNotification(
+  item: DesktopPendingNotification,
+  navigate: (route: string) => Promise<boolean>,
+  markRead: (id: string) => Promise<unknown>,
+): Promise<void> {
+  const route = desktopNotificationRoute(item.href);
+  if (!route || !await navigate(route)) return;
+  if (item.markReadOnOpen !== false) await markRead(item.id);
+}
+
 /**
  * Normalize an untrusted `desktop-pending` payload into typed items + `now`.
  * Anything missing an id or with a malformed shape is dropped rather than
