@@ -23,6 +23,7 @@ import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { getRuntimeEnv } from '../config.js';
 import {
   listActiveGoalContracts,
+  getPlanProposal,
   recordGoalResumeScheduled,
   parkGoal,
   goalProgressSnapshot,
@@ -51,7 +52,7 @@ function selfDriveEnabled(): boolean {
  *  items by construction (the monitor only cards an item it scored as needing
  *  the user) — so the re-Orient injector reuses that verdict instead of
  *  re-scoring, and only adds a relevance-to-this-goal filter on top. */
-const REORIENT_MONITOR_SOURCES: ReadonlySet<string> = new Set(['inbox-monitor', 'calendar-monitor']);
+const REORIENT_MONITOR_SOURCES: ReadonlySet<string> = new Set(['inbox-monitor', 'calendar-monitor', 'calendar-watch']);
 /** Cap injected lines — a re-orient nudge, never a digest dump. */
 const REORIENT_OBS_CAP = 3;
 /** Never reach back further than a day for "what changed since last cycle",
@@ -134,6 +135,8 @@ export interface GoalResumeDeps {
   sessionIdleMs: (sessionId: string) => number | null;
   /** True if the goal's session has a pending approval (blocks resumption). */
   hasPendingApproval: (sessionId: string) => boolean;
+  /** Execution authority, independent of how recently an event was emitted. */
+  hasActiveRun?: (sessionId: string) => boolean;
   /** Fire ONE resume turn for the goal (fire-and-forget). */
   fireResume: (goal: PlanProposal, directive: string) => void;
   /** Escalate a freshly-parked goal to the human (one notification). */
@@ -200,6 +203,9 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
     // Due? (a due-timestamp compare is what makes sleep catch-up automatic)
     const due = goal.nextResumeAt ? Date.parse(goal.nextResumeAt) <= now : true;
     if (!due) continue;
+    // An already-running final resume must be allowed to settle before the
+    // next tick evaluates its budget/progress. Quiet event history is not idle.
+    if (resumingSessions.has(goal.sessionId) || deps.hasActiveRun?.(goal.sessionId)) { skipped++; continue; }
 
     // Resume budget exhausted → park for review (a bounded autonomy guarantee).
     if ((goal.resumeCount ?? 0) >= (goal.maxResumes ?? Infinity)) {
@@ -243,11 +249,12 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
     // Schedule the NEXT resume + snapshot BEFORE firing (crash-safe: a crashed
     // resume costs one slot, never a double fire), then fire exactly one.
     const resumeEveryMs = goal.resumeEveryMs ?? GOAL_DEFAULT_RESUME_EVERY_MS;
-    recordGoalResumeScheduled(goal.id, {
+    const scheduled = recordGoalResumeScheduled(goal.id, {
       nextResumeAt: new Date(now + resumeEveryMs).toISOString(),
       snapshot: snap,
       noProgressStreak: streak,
     });
+    if (!scheduled) { skipped++; continue; }
     // Re-Orient (OODA feedback edge): before resuming, fold in fresh monitor
     // observations that landed since the last cycle so the turn re-reads the world
     // instead of continuing blind. Graduated to the default 2026-06-27. Best-effort
@@ -260,7 +267,7 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
       catch { /* telemetry is best-effort */ }
     }
     try {
-      deps.fireResume(goal, buildResumeDirective(goal, injectedObs));
+      deps.fireResume(scheduled, buildResumeDirective(scheduled, injectedObs));
       fired = goal.id;
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err, goalId: goal.id }, 'goal resume fire failed');
@@ -271,6 +278,34 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
   return { fired, parked, skipped };
 }
 
+// Keep the reservation through asynchronous setup AND execution, not just the
+// heartbeat pass. Durable run leases remain the cross-process authority.
+const resumingSessions = new Set<string>();
+
+export async function runScheduledGoalResume(
+  scheduled: PlanProposal,
+  prepare: () => Promise<(current: PlanProposal) => Promise<void>>,
+  isSessionBusy: (sessionId: string) => boolean,
+): Promise<boolean> {
+  const sessionId = scheduled.sessionId;
+  if (!sessionId || resumingSessions.has(sessionId)) return false;
+  resumingSessions.add(sessionId);
+  try {
+    const run = await prepare();
+    const current = getPlanProposal(scheduled.id);
+    if (!selfDriveEnabled() || !current || current.status !== 'active'
+      || !current.selfDriving || current.parked || current.sessionId !== sessionId
+      || current.resumeCount !== scheduled.resumeCount
+      || current.nextResumeAt !== scheduled.nextResumeAt
+      || (current.deadlineAt && Date.parse(current.deadlineAt) <= Date.now())
+      || isSessionBusy(sessionId)) return false;
+    await run(current);
+    return true;
+  } finally {
+    resumingSessions.delete(sessionId);
+  }
+}
+
 /**
  * Daemon entry point: wire the live seams (event-log idle, approval registry,
  * runConversation, notifications) and run one resumption pass. Best-effort —
@@ -279,12 +314,18 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
 export async function processGoalResumptions(): Promise<void> {
   if (!selfDriveEnabled()) return;
   try {
-    const [{ listEvents, appendEvent }, approvalRegistry] = await Promise.all([
+    const [{ listEvents, appendEvent, getLatestRunAttempt }, approvalRegistry] = await Promise.all([
       import('../runtime/harness/eventlog.js'),
       import('../runtime/harness/approval-registry.js'),
     ]);
+    const hasActiveRun = (sessionId: string): boolean => {
+      const attempt = getLatestRunAttempt(sessionId);
+      return Boolean(attempt && !attempt.finishedAt && attempt.leaseOwner
+        && attempt.leaseExpiresAt && Date.parse(attempt.leaseExpiresAt) > Date.now());
+    };
     const deps: GoalResumeDeps = {
       now: () => Date.now(),
+      hasActiveRun,
       sessionIdleMs: (sessionId) => {
         try {
           const last = listEvents(sessionId, { limit: 1, desc: true })[0];
@@ -294,25 +335,34 @@ export async function processGoalResumptions(): Promise<void> {
       hasPendingApproval: (sessionId) => {
         try { return approvalRegistry.hasPending(sessionId); } catch { return false; }
       },
-      fireResume: (goal, directive) => {
+      fireResume: (goal) => {
         // Fire-and-forget: a resume failure must never affect the tick.
         void (async () => {
           try {
-            const [{ runConversation }, { buildOrchestratorAgent }] = await Promise.all([
-              import('../runtime/harness/loop.js'),
-              import('../agents/orchestrator.js'),
-            ]);
-            await runConversation({
-              sessionId: goal.sessionId!,
-              input: directive,
-              judgeCompletion: completionReviewEnabled(),
-              buildAgent: (identity) => buildOrchestratorAgent({
-                userInput: directive,
-                sessionId: identity.sessionId,
-                sourceUserSeq: identity.sourceUserSeq,
-                acceptedRoute: identity.route,
-              }),
-            });
+            await runScheduledGoalResume(goal, async () => {
+              const [{ runConversation }, { buildOrchestratorAgent }] = await Promise.all([
+                import('../runtime/harness/loop.js'),
+                import('../agents/orchestrator.js'),
+              ]);
+              return async (current) => {
+                const observations = liveRecentObservations(current);
+                const directive = buildResumeDirective(current, observations);
+                if (observations.length > 0) {
+                  deps.emitReorient?.(current, { observationsInjected: observations.length });
+                }
+                await runConversation({
+                  sessionId: current.sessionId!,
+                  input: directive,
+                  judgeCompletion: completionReviewEnabled(),
+                  buildAgent: (identity) => buildOrchestratorAgent({
+                    userInput: directive,
+                    sessionId: identity.sessionId,
+                    sourceUserSeq: identity.sourceUserSeq,
+                    acceptedRoute: identity.route,
+                  }),
+                });
+              };
+            }, (sessionId) => hasActiveRun(sessionId) || approvalRegistry.hasPending(sessionId));
           } catch (err) {
             logger.warn({ err: err instanceof Error ? err.message : err, goalId: goal.id }, 'goal resume turn failed');
           }
@@ -331,7 +381,6 @@ export async function processGoalResumptions(): Promise<void> {
           });
         } catch { /* escalation is best-effort */ }
       },
-      recentObservations: liveRecentObservations,
       emitReorient: (goal, payload) => {
         if (!goal.sessionId) return;
         try {

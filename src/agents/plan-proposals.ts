@@ -1407,7 +1407,7 @@ export function recordGoalResumeScheduled(
   next: { nextResumeAt: string; snapshot: { ledger: number; evidence: number; stagesDone: number }; noProgressStreak: number },
 ): PlanProposal | null {
   const proposal = readProposal(id);
-  if (!proposal || proposal.status !== 'active') return null;
+  if (!proposal || proposal.status !== 'active' || !proposal.selfDriving || proposal.parked) return null;
   const updated: PlanProposal = {
     ...proposal,
     resumeCount: (proposal.resumeCount ?? 0) + 1,
