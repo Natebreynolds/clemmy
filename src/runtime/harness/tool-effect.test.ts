@@ -995,3 +995,19 @@ test('a provider operation named in the composio:SLUG form classifies by its slu
   assert.equal(classifyRuntimeToolEffect('composio:OUTLOOK_GET_CALENDAR_VIEW', {}).source, 'composio');
   assert.equal(classifyRuntimeToolEffect('composio:OUTLOOK_SEND_EMAIL', {}).effect, 'external_write');
 });
+
+
+test('automation review staging stays host-only through direct and deferred calls', () => {
+  for (const name of ['automation_opportunity_propose', 'automation_opportunity_revise',
+    'automation_opportunity_review_request', 'automation_read_pilot_request',
+    'automation_read_pilot_workspace_create_request', 'automation_recurrence_request']) {
+    const args = { proposal_id: 'exact-proposal', expected_proposal_revision: 1 };
+    const expected = { effect: 'host_only', mutating: true, dangerousWrite: false, source: 'registry' };
+    assert.deepEqual(classifyRuntimeToolEffect(name, args), expected, name);
+    assert.deepEqual(classifyRuntimeToolEffect('call_tool', { name, args_json: JSON.stringify(args) }), expected, name);
+  }
+  assert.notEqual(classifyRuntimeToolEffect('write_file', { path: '/tmp/fixture', content: 'x' }).effect, 'host_only');
+  assert.notEqual(classifyRuntimeToolEffect('composio_execute_tool', {
+    tool_slug: 'MAIL_SEND', arguments: { to: 'fixture@example.test', body: 'x' },
+  }).effect, 'host_only');
+});

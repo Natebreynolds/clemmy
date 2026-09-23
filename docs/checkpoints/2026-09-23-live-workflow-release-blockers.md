@@ -1015,3 +1015,50 @@ No schema fields or authority contracts were removed to get past the API.
 Installed app remains12e140d6f until this candidate is built and patched. Must
 repeat the docs inventory request on the exact new fingerprint and prove repair
 can produce a review card before claiming the durable pilot gate is accepted.
+
+### Installedc90f4cd4c: proposal repaired; review staging refused
+
+Build and Terminal hotpatch completed after idle preflight (active0/runningRuns0/
+backgroundActive0, no started physical dispatches; main/UI unchanged). Prior dist
+retained as dist.backup-q09131. Installed build-info:
+c90f4cd4c52d9d3ad7f262feca0bc320cfeb9d9f,
+fingerprint8e6b85a858ff1363ac3adc82ed8cd030fc5921b6e7b86c4e3a67b3e1b466badb,
+daemon73522/instance17157dba-0695-4ef2-8024-7290e4c1f88b,
+started2026-09-23T17:07:40.676Z/schema81. Exact same input as previous candidate,
+new accepted source291590/session sess-desktop-05429d6d7b59bb354cf4a72c.
+
+Live repair now works: first proposal rejected for local-only phase approval;
+classified schema_invalid rather than execution:unknown_read. Clem corrected and
+saved revision1 of automation_3da1c635b0a7dd98a928b7957369731f,
+digest9574eff2192f943e63a3ae49e3f4d7122082f04d8ab8f716e623bf444ff8f207,
+with no outcomeAuthority:null error and no provider schema rejection.
+
+Review card staging then hit coverage_missing repeatedly. Terminal291681 is
+blocked/resumable and correctly says the formal card was never presented. A
+subsequent attempt-specific cancellation received409 because the turn had already
+settled; no cancellation success claimed and no second cancel was sent. The saved
+proposal is inert; no pilot, Space or recurrence was created. Do not author a
+replacement fixture: resume this exact saved proposal after the staging fix.
+
+Canonical accounting:128134ms,5 top-level calls,2 discovery operations,
+370518 input tokens (252772cached),7122output. Models Opus5.5×9,Grok4.3×6,
+Jev1.13.0×6,Jev-latest×1. Faster wall than the earlier failed turn does NOT establish
+an efficiency win: the repeated refusals spent substantially more input. Evidence:
+output/harness-acceptance/2026-09-23-pilot-c90/.
+
+Class-level metadata defect: opportunity creation was runtimeEffect=host_only,
+but its inert revision/review, read-pilot request, Workspace-create request, and
+recurrence-request staging siblings lacked the declaration. They create local
+previews/cards, not approval or external execution, but defaulted to ordinary
+write authority. Candidate declares these five siblings host_only; sideEffect
+remains write, mutating=true; exact revision checks, lane restrictions and formal
+human decisions remain in the existing implementations. No keyword allowlist in
+the kernel and no widening of real write/execute grants.
+
+Pin failed before change (/tmp/clem-review-staging-red.log).65 tool-effect/registry/
+opportunity/recurrence-tool checks pass (/tmp/clem-review-staging-green.log).
+41 proposal-review/read-pilot/recurrence control-plane checks pass
+(/tmp/clem-review-staging-authority.log), including idempotence and inertness without
+owned approval. Typecheck exit0 (/tmp/clem-review-staging-typecheck.log). Live-home
+sentinel NOT PERFORMED while daemon owned its stores; no isolation-proof claim.
+Candidate still needs build/hotpatch and live exact review-card staging acceptance.
