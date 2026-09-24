@@ -6210,6 +6210,7 @@ async function runConversationWithinRuntimeConfig(
                 descriptors: proven.descriptors,
                 boundAccounts: proven.boundAccounts,
                 liveReads: proven.liveReads,
+                liveReadOutcomes: proven.liveReadOutcomes,
               },
             });
           }

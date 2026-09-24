@@ -2056,7 +2056,7 @@ export async function acquireProvenLiveReadForSource(input: {
     });
     const acquired = await registry.acquire(requirement(mcpOperation), guard);
     if (!discoveryStillActive(guard)) return { status: 'skipped', reason: 'deadline' };
-    if (acquired.status !== 'installed') return { status: 'skipped', reason: acquired.reason };
+    if (acquired.status !== 'installed') return { status: 'skipped', reason: `${acquired.reason}: ${acquired.detail}`.slice(0, 200) };
     return {
       status: 'installed',
       kind: 'mcp',
@@ -2073,7 +2073,7 @@ export async function acquireProvenLiveReadForSource(input: {
   if (!registry) return { status: 'skipped', reason: 'no_reviewed_cli_registry' };
   const acquired = await registry.acquire(requirement(reviewed.operationId), guard);
   if (!discoveryStillActive(guard)) return { status: 'skipped', reason: 'deadline' };
-  if (acquired.status !== 'installed') return { status: 'skipped', reason: acquired.reason };
+  if (acquired.status !== 'installed') return { status: 'skipped', reason: `${acquired.reason}: ${acquired.detail}`.slice(0, 200) };
   return {
     status: 'installed',
     kind: 'cli',

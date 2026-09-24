@@ -31,6 +31,16 @@ export interface ProvenLiveRead {
   accountId: string;
 }
 
+/** Why each proven live read was or was not warmed; recorded on the
+ * selection event so a familiar question that still rediscovers can be read
+ * from the log instead of guessed at. */
+export interface ProvenLiveReadOutcome {
+  operation: string;
+  status: 'installed' | 'skipped' | 'failed';
+  reason?: string;
+  elapsedMs: number;
+}
+
 export interface ProvenOperationPreparation {
   text?: string;
   strategyId?: string;
@@ -44,6 +54,7 @@ export interface ProvenOperationPreparation {
   /** Native MCP / reviewed CLI reads the host re-attested and recorded as
    * this source's proven resolution before the first frame; callable by name. */
   liveReads: ProvenLiveRead[];
+  liveReadOutcomes: ProvenLiveReadOutcome[];
 }
 
 export interface ProvenOperationDependencies {
@@ -494,6 +505,7 @@ export async function prepareProvenOperationForRequest(input: {
     descriptors: [],
     boundAccounts: [],
     liveReads: [],
+    liveReadOutcomes: [],
   };
   void import('./active-surface-heartbeat.js')
     .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
@@ -583,6 +595,7 @@ export async function prepareProvenOperationForRequest(input: {
   // for it and record the installed manifest as this source's proven
   // resolution, so the brain can call it by name on its first frame.
   const liveReads: ProvenLiveRead[] = [];
+  const liveReadOutcomes: ProvenLiveReadOutcome[] = [];
   const liveReadIds = strategy.toolsUsed.filter((name) => {
     const trimmed = name.trim();
     return trimmed
@@ -602,8 +615,29 @@ export async function prepareProvenOperationForRequest(input: {
       const deadlineAt = Date.now() + PROVEN_PROVISION_BUDGET_MS;
       const entries: CapabilityResolutionEntry[] = [];
       for (const operation of liveReadIds) {
-        if (Date.now() >= deadlineAt) break;
-        const acquired = await acquire({ operation, scope: input.mcpToolScope, identity, deadlineAt });
+        if (Date.now() >= deadlineAt) {
+          liveReadOutcomes.push({ operation, status: 'skipped', reason: 'budget_exhausted', elapsedMs: 0 });
+          continue;
+        }
+        const startedAt = Date.now();
+        let acquired: Awaited<ReturnType<typeof acquire>>;
+        try {
+          acquired = await acquire({ operation, scope: input.mcpToolScope, identity, deadlineAt });
+        } catch (error) {
+          liveReadOutcomes.push({
+            operation,
+            status: 'failed',
+            reason: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+            elapsedMs: Date.now() - startedAt,
+          });
+          continue;
+        }
+        liveReadOutcomes.push({
+          operation,
+          status: acquired.status,
+          ...(acquired.status === 'skipped' ? { reason: acquired.reason } : {}),
+          elapsedMs: Date.now() - startedAt,
+        });
         if (acquired.status !== 'installed') continue;
         liveReads.push({ operation: acquired.operation, kind: acquired.kind, accountId: acquired.accountId });
         if (acquired.schema) schemas[operation] = acquired.schema;
@@ -631,7 +665,15 @@ export async function prepareProvenOperationForRequest(input: {
           entries,
         });
       }
-    } catch { /* live-read warming is fail-open: tool_search remains */ }
+    } catch (error) {
+      // Live-read warming is fail-open: tool_search remains. Say why.
+      liveReadOutcomes.push({
+        operation: '*',
+        status: 'failed',
+        reason: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+        elapsedMs: 0,
+      });
+    }
   }
 
   return {
@@ -646,5 +688,6 @@ export async function prepareProvenOperationForRequest(input: {
     capabilityRefs,
     descriptors,
     liveReads,
+    liveReadOutcomes,
   };
 }
