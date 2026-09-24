@@ -10,6 +10,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-quantifie
 const eventlog = await import('./eventlog.js');
 const {
   evaluateQuantifiedWorkManifestGate: evaluateGate,
+  evaluateQuantifiedWorkManifestGateWithArbitration: evaluateGateWithArbitration,
+  _setQuantifiedUniverseArbiterForTests,
 } = await import('./quantified-work-manifest.js');
 const { detectMultiItemIntent } = await import('./multi-item-intent.js');
 const { prepareWorkerManifest } = await import('./work-manifest.js');
@@ -856,4 +858,51 @@ test('a quantified batch above the run_worker schema cap routes to durable workf
     assert.match(decision.error ?? '', /workflow.*forEach/i);
     assert.match(decision.error ?? '', /subset/i);
   }
+});
+
+test('a number inside an item\'s evidence does not fix the contract when a model confirms the declared universe (chat only)', async (t) => {
+  t.after(() => _setQuantifiedUniverseArbiterForTests(null));
+  const text = 'Using the outbound skill, I need three separate cold prospect emails for review. Delegate one draft per prospect to a worker. Fixture prospects: (1) Dana Lee, Northwind Plumbing. (2) Priya Nair, Nair & Voss Injury Law. (3) Marcus Bell, Bell Family Dental, angle: 3.9 star rating with 40 reviews vs a competitor at 4.8 with 600. Do not send anything.';
+  const items = ['prospect-1-dana-lee', 'prospect-2-priya-nair', 'prospect-3-marcus-bell'];
+  const manifest = { id: 'prospects-0924', phase: 'draft', mode: 'declare' } as unknown as WorkerManifestDescriptor;
+  const asked: Array<{ detectedCount: number; declaredItems: readonly string[] }> = [];
+
+  // The synchronous gate still reads 40 from the text and refuses the three.
+  const chat = openTurn('arbitrate-chat', 'chat', text, { policyCount: 40 });
+  const sync = gate({ sessionId: chat, items, workManifest: manifest });
+  assert.equal(sync.ok, false);
+  assert.equal(sync.code, 'fixed_contract_mismatch');
+  assert.equal(sync.expectedCount, 40);
+
+  // A model confirms the declared three are the whole request: workers may start.
+  _setQuantifiedUniverseArbiterForTests(async (input) => { asked.push(input); return { ok: true, noul: 0.93 }; });
+  const confirmed = await evaluateGateWithArbitration({ sessionId: chat, sourceUserSeq: sourceSeqBySession.get(chat), items, workManifest: manifest });
+  assert.equal(confirmed.ok, true, JSON.stringify(confirmed));
+  assert.equal(confirmed.expectedCount, 3);
+  assert.deepEqual(confirmed.arbitrated, { detectedCount: 40, declaredCount: 3, noul: 0.93 });
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].detectedCount, 40);
+  assert.deepEqual(asked[0].declaredItems, items);
+  const recorded = eventlog.listEvents(chat, { types: ['guardrail_tripped'] }).filter((e) => e.data.kind === 'quantified_universe_arbitrated');
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].data.accepted, true);
+
+  // Unsure or unavailable keeps the refusal and says a model was asked.
+  const unsureChat = openTurn('arbitrate-chat-unsure', 'chat', text, { policyCount: 40 });
+  _setQuantifiedUniverseArbiterForTests(async () => ({ ok: true, noul: 0.4 }));
+  const unsure = await evaluateGateWithArbitration({ sessionId: unsureChat, sourceUserSeq: sourceSeqBySession.get(unsureChat), items, workManifest: manifest });
+  assert.equal(unsure.ok, false);
+  assert.match(unsure.error ?? '', /did not confirm it/);
+  _setQuantifiedUniverseArbiterForTests(async () => ({ ok: false }));
+  const down = await evaluateGateWithArbitration({ sessionId: unsureChat, sourceUserSeq: sourceSeqBySession.get(unsureChat), items, workManifest: manifest });
+  assert.equal(down.ok, false);
+  assert.match(down.error ?? '', /was unavailable/);
+
+  // An execution session never arbitrates: its universe must be durable.
+  const execution = openTurn('arbitrate-execution', 'execution', text, { policyCount: 40 });
+  let executionAsked = 0;
+  _setQuantifiedUniverseArbiterForTests(async () => { executionAsked += 1; return { ok: true, noul: 1 }; });
+  const hard = await evaluateGateWithArbitration({ sessionId: execution, sourceUserSeq: sourceSeqBySession.get(execution), items, workManifest: manifest });
+  assert.equal(hard.ok, false);
+  assert.equal(executionAsked, 0);
 });

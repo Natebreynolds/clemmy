@@ -1,6 +1,7 @@
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import { detectMultiItemIntentFromConversation } from './multi-item-intent.js';
 import {
+  appendEvent,
   getSession,
   listEvents,
   type EventRow,
@@ -26,6 +27,137 @@ export interface QuantifiedWorkManifestGateDecision {
   required: boolean;
   expectedCount?: number;
   error?: string;
+  /** A fixed-contract refusal that a model may still arbitrate (chat only). */
+  code?: 'fixed_contract_mismatch';
+  /** Set when a model, not the detector, settled the item universe. */
+  arbitrated?: { detectedCount: number; declaredCount: number; noul: number };
+}
+
+export type QuantifiedUniverseArbiter = (input: {
+  sessionId: string;
+  requestText: string;
+  detectedCount: number;
+  declaredItems: readonly string[];
+}) => Promise<{ ok: true; noul: number } | { ok: false }>;
+
+let quantifiedUniverseArbiterOverride: QuantifiedUniverseArbiter | null = null;
+
+export function _setQuantifiedUniverseArbiterForTests(arbiter: QuantifiedUniverseArbiter | null): void {
+  quantifiedUniverseArbiterOverride = arbiter;
+}
+
+const ARBITRATION_TIMEOUT_MS = 2_500;
+const ARBITRATION_NOUL_MIN = 0.7;
+
+/**
+ * The detector reads counts out of the user's text with patterns. Live
+ * 2026-09-24 (source 294452): "three separate cold prospect emails … a
+ * competitor at 4.8 with 600 … 3.9 star rating with 40 reviews" was read as a
+ * 40-item contract, and the brain's three-worker declaration was refused three
+ * times until the task died. A number in the text is evidence, not the answer:
+ * when a chat declaration disagrees with the detected count, a model reasons
+ * about which one the user meant. Only its clear yes lifts the refusal;
+ * unavailable or unsure keeps today's fail-closed behavior. Execution and
+ * background sessions never arbitrate: their universe must be durable.
+ */
+async function arbitrateQuantifiedUniverse(input: {
+  sessionId: string;
+  requestText: string;
+  detectedCount: number;
+  declaredItems: readonly string[];
+}): Promise<{ ok: true; noul: number } | { ok: false }> {
+  if (quantifiedUniverseArbiterOverride) return quantifiedUniverseArbiterOverride(input);
+  try {
+    const { evaluateSystemOne } = await import('../jev/client.js');
+    const result = await evaluateSystemOne({
+      state: {
+        request: input.requestText.replace(/\s+/g, ' ').trim().slice(0, 1_200),
+        declaredItems: input.declaredItems.slice(0, 64),
+        numberFoundInText: input.detectedCount,
+      },
+      questions: {
+        complete: {
+          type: 'noul',
+          instructions: 'The user asked for work on some set of items. A pattern found the number numberFoundInText in the request text. Do the declaredItems name every item the user actually asked to be produced or processed, so that numberFoundInText refers to something else (a statistic, a rating, a count inside one item, or source material)?',
+          criteria: {
+            true: 'declaredItems is exactly the set of units the user asked for; the number in the text is not the count of those units.',
+            false: 'The user asked for numberFoundInText units and declaredItems is a subset, a guess, or you are not sure.',
+          },
+        },
+      },
+      timeoutMs: ARBITRATION_TIMEOUT_MS,
+      sessionId: input.sessionId,
+      channel: 'jev-quantified-universe',
+    });
+    if (!result.ok) return { ok: false };
+    const answer = result.answers.complete as { type: 'noul'; noul: number } | undefined;
+    if (!answer || typeof answer.noul !== 'number') return { ok: false };
+    return { ok: true, noul: answer.noul };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function acceptedRequestText(sessionId: string, sourceUserSeq: number): string {
+  const current = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+  }).find((event) => event.seq === sourceUserSeq);
+  return current ? eventText(current) : '';
+}
+
+/**
+ * The gate every fan-out call goes through: the synchronous contract check,
+ * then, for a chat refusal whose only ground is a detected count that the
+ * declaration disagrees with, a model decides which count the user meant.
+ */
+export async function evaluateQuantifiedWorkManifestGateWithArbitration(
+  input: QuantifiedWorkManifestGateInput,
+): Promise<QuantifiedWorkManifestGateDecision> {
+  const decision = evaluateQuantifiedWorkManifestGate(input);
+  if (decision.ok || decision.code !== 'fixed_contract_mismatch') return decision;
+  const sessionId = input.sessionId?.trim() ?? '';
+  const sourceUserSeq = input.sourceUserSeq;
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return decision;
+  const detectedCount = decision.expectedCount;
+  const declaredItems = [...new Set(input.items.map((item) => item.trim()).filter(Boolean))];
+  if (!detectedCount || declaredItems.length === 0 || declaredItems.length === detectedCount) return decision;
+  let session: ReturnType<typeof getSession>;
+  try { session = getSession(sessionId); } catch { return decision; }
+  if (!session || session.kind !== 'chat') return decision;
+  const requestText = acceptedRequestText(sessionId, sourceUserSeq as number);
+  if (!requestText) return decision;
+  const verdict = await arbitrateQuantifiedUniverse({ sessionId, requestText, detectedCount, declaredItems });
+  const accepted = verdict.ok && verdict.noul >= ARBITRATION_NOUL_MIN;
+  try {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'quantified_universe_arbitrated',
+        sourceUserSeq,
+        detectedCount,
+        declaredCount: declaredItems.length,
+        declaredItems: declaredItems.slice(0, 64),
+        arbiter: verdict.ok ? { noul: verdict.noul } : { unavailable: true },
+        accepted,
+      },
+    });
+  } catch { /* the record never blocks the decision */ }
+  if (!accepted) {
+    return {
+      ...decision,
+      error: `${decision.error ?? ''} A model was asked whether the declared ${declaredItems.length} items are the whole request and ${verdict.ok ? 'did not confirm it' : 'was unavailable'}; if the user's text names a different set of items than the number suggests, declare that set exactly and say why.`.trim(),
+    };
+  }
+  return {
+    ok: true,
+    required: true,
+    expectedCount: declaredItems.length,
+    arbitrated: { detectedCount, declaredCount: declaredItems.length, noul: verdict.ok ? verdict.noul : 0 },
+  };
 }
 
 interface QuantifiedWorkContract {
@@ -131,6 +263,7 @@ function fixedContractError(expectedCount: number, detail: string): QuantifiedWo
     ok: false,
     required: true,
     expectedCount,
+    code: 'fixed_contract_mismatch',
     error: (
       `This clearly quantified task has a fixed ${expectedCount}-item contract, but ${detail}. `
       + `Retry run_worker with the full ${expectedCount}-item \`items\` array and a workManifest `

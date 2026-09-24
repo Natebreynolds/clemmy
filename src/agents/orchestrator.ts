@@ -162,7 +162,7 @@ import {
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
-import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
+import { evaluateQuantifiedWorkManifestGateWithArbitration } from '../runtime/harness/quantified-work-manifest.js';
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
@@ -2568,7 +2568,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const manifestSessionId = extractSessionId(runContext) ?? '';
       const manifestSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq
         ?? extractSourceUserSeq(runContext);
-      const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
+      const quantifiedManifestGate = await evaluateQuantifiedWorkManifestGateWithArbitration({
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,

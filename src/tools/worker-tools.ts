@@ -43,7 +43,7 @@ import {
   type PreparedWorkerManifest,
   type WorkerManifestDescriptor,
 } from '../runtime/harness/work-manifest.js';
-import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantified-work-manifest.js';
+import { evaluateQuantifiedWorkManifestGateWithArbitration } from '../runtime/harness/quantified-work-manifest.js';
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 
 /**
@@ -194,7 +194,7 @@ export function registerWorkerTools(server: McpServer): void {
       );
       const manifestSessionId = getToolOutputContext()?.sessionId ?? '';
       const manifestSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
-      const quantifiedManifestGate = evaluateQuantifiedWorkManifestGate({
+      const quantifiedManifestGate = await evaluateQuantifiedWorkManifestGateWithArbitration({
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
