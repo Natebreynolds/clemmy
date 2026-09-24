@@ -1,5 +1,5 @@
 /**
- * Durable resolve-once guard for direct Composio reads.
+ * Durable resolve-once guard for direct Composio reads and declared local reads.
  *
  * The ordinary loop guard is intentionally permissive for reads because an
  * identical status poll can be legitimate. That leaves a narrower waste case:
@@ -22,6 +22,8 @@ import {
 } from '../../integrations/composio/slug-effect.js';
 import { settlementCarriesVerifiedData } from '../../memory/verified-read-learning.js';
 import { getRuntimeEnv } from '../../config.js';
+import { registeredToolReadReuse } from '../../tools/tool-registry.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import {
   getEvent,
   getRunAttemptSourceUserEvent,
@@ -170,6 +172,37 @@ function composioSlugFromArgs(toolName: string, args: unknown): string | null {
 }
 
 /**
+ * A local read whose registry row declares `readReuse: 'settled_within_source'`
+ * is identified by its effective tool name (the same name the lifecycle rows
+ * carry as effectiveTool). Live 2026-09-24, source 294013: `space_get` was
+ * re-issued byte-identical in the next frame and paid a second read. Undeclared
+ * rows (status polls, anything whose state moves between reads) return null.
+ */
+function declaredLocalReadIdentity(toolName: string, args: unknown): string | null {
+  if (toolName === DIRECT_COMPOSIO_TOOL) return null;
+  try {
+    const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args).toolName ?? toolName;
+    const key = effective.split('__').pop() ?? effective;
+    return registeredToolReadReuse(key) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The replayable identity of a read: a Composio slug (non-poll, non-compute)
+ * or a declared local read's effective tool name. */
+function readReplayIdentity(toolName: string, args: unknown): string | null {
+  const slug = composioSlugFromArgs(toolName, args);
+  if (slug) {
+    if (classifyComposioSlugEffect(slug) !== 'read') return null;
+    if (composioActionIsEphemeralCompute(slug)) return null;
+    if (composioReadHasPollSemantics(slug)) return null;
+    return slug;
+  }
+  return declaredLocalReadIdentity(toolName, args);
+}
+
+/**
  * Poll-shaped actions are excluded even if one sample happens to be terminal.
  * Resolve-once is for snapshot reads; an explicit status/result/run endpoint
  * owns different freshness semantics and stays on the existing poll rail.
@@ -260,7 +293,7 @@ export function formatSettledReadRepeatAdvisory(input: {
 }): string {
   const recovery = input.recoveredAcrossBehaviorScope
     ? 'The harness recovered the settled result from the earlier internal attempt for this same accepted request; no provider call was repeated.'
-    : 'This exact read already succeeded in the current internal turn; no provider call was repeated.';
+    : 'This exact read already succeeded in the current internal turn; no provider call was repeated. Nothing in this request changed state since, so the bytes are current.';
   return `[harness settled-read replay] ${recovery} Use the ${input.toolSlug} result from call_id "${input.sourceCallId}" for the next step or answer naturally. Do not issue this exact read again in this accepted request.`;
 }
 
@@ -286,6 +319,9 @@ export function stripSettledReadHarnessAdvisory(output: string): string {
 export function settledReadRepeatReplayMarker(input: {
   replayCallId: string;
   replayCalledEventId: string;
+  /** The SDK tool name the replayed call was issued under; the disposition
+   * matches it exactly. Defaults to the direct Composio gateway. */
+  replayTool?: string;
   sourceCallId: string;
   sourceUserSeq: number;
   toolSlug: string;
@@ -296,7 +332,7 @@ export function settledReadRepeatReplayMarker(input: {
     kind: SETTLED_READ_REPEAT_REPLAY_KIND,
     replayCallId: input.replayCallId,
     replayCalledEventId: input.replayCalledEventId,
-    replayTool: DIRECT_COMPOSIO_TOOL,
+    replayTool: input.replayTool ?? DIRECT_COMPOSIO_TOOL,
     replayEffect: 'read',
     sourceCallId: input.sourceCallId,
     sourceUserSeq: input.sourceUserSeq,
@@ -326,7 +362,7 @@ export function settledReadRepeatReplayDisposition(
     if (!input.sessionId.trim()
       || !input.replayCallId.trim()
       || !input.replayCalledEventId.trim()
-      || input.toolName !== DIRECT_COMPOSIO_TOOL
+      || !(input.toolName === DIRECT_COMPOSIO_TOOL || registeredToolReadReuse(input.toolSlug))
       || input.effect !== 'read'
       || !Number.isSafeInteger(input.sourceUserSeq)
       || input.sourceUserSeq <= 0
@@ -651,10 +687,9 @@ export function resolveSettledReadRepeat(
       || !input.currentCallId.trim()
       || !input.currentBehaviorScopeId.trim()) return null;
 
-    const currentSlug = composioSlugFromArgs(input.toolName, input.args);
-    if (!currentSlug || classifyComposioSlugEffect(currentSlug) !== 'read') return null;
-    if (composioActionIsEphemeralCompute(currentSlug)) return null;
-    if (composioReadHasPollSemantics(currentSlug)) return null;
+    const currentSlug = readReplayIdentity(input.toolName, input.args);
+    if (!currentSlug) return null;
+    const localRead = input.toolName !== DIRECT_COMPOSIO_TOOL;
     if (acceptedSourceRequestsPolling(input.sessionId, input.sourceUserSeq)) return null;
 
     const events = listEvents(input.sessionId, {
@@ -718,12 +753,19 @@ export function resolveSettledReadRepeat(
       if (authority.status !== 'ok'
         || authority.effect !== 'read'
         || authority.record.truncatedAtWrite) return null;
-      const settled = classifySettledDirectComposioRead({
-        toolName: input.toolName,
-        args: input.args,
-        output: authority.record.output,
-      });
-      if (!settled || settled.toolSlug !== currentSlug) return null;
+      if (localRead) {
+        // A declared local read settles on its own success: the lifecycle row
+        // recorded ok:false for refusals and failures, and a bounded read that
+        // was clipped at write is not exact authority.
+        if (returned.data.ok === false) return null;
+      } else {
+        const settled = classifySettledDirectComposioRead({
+          toolName: input.toolName,
+          args: input.args,
+          output: authority.record.output,
+        });
+        if (!settled || settled.toolSlug !== currentSlug) return null;
+      }
       const modelFacingOutput = returned.data.result;
       if (typeof modelFacingOutput !== 'string' || !modelFacingOutput.trim()) return null;
       let replayOutput = stripSettledReadHarnessAdvisory(modelFacingOutput);

@@ -3065,6 +3065,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             data: settledReadRepeatReplayMarker({
               replayCallId: callId,
               replayCalledEventId: replay.currentCalledEventId,
+              replayTool: tool.name,
               sourceCallId: replay.sourceCallId,
               sourceUserSeq: ctx.sourceUserSeq as number,
               toolSlug: replay.toolSlug,

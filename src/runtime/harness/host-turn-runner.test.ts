@@ -11543,3 +11543,59 @@ test('a deferLoading tool stays callable but leaves the schema block when the se
   await runProductionHost(bare, bareAgent);
   assert.deepEqual(bareSurfaces[0], ['workspace_roots', 'memory_search']);
 });
+
+for (const variant of ['identical', 'mutation_between', 'undeclared'] as const) test(`an identical declared local read in the same accepted source is answered from its settled result (${variant})`, async t => {
+  const keys = ['CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1'; process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key]; } });
+  const fixture = acceptHostCanarySource(`settled-local-read-${variant}`, 'Summarise the notes file.');
+  const readName = variant === 'undeclared' ? 'workflow_run_status' : 'read_file';
+  let reads = 0;
+  const reader = brackets.wrapToolForHarness(tool({ name: readName, description: 'Read one local artifact.',
+    parameters: z.object({ path: z.string() }), execute: async ({ path }) => { reads += 1; return `NOTES(${path}) read #${reads}: three findings`; },
+  }) as never);
+  // A settled host-only local write between the two reads is changed state:
+  // the second read must cross again (see interveningMutationOrSteer).
+  let writes = 0;
+  const writer = brackets.wrapToolForHarness(tool({ name: 'memory_remember', description: 'Remember one fact.',
+    parameters: z.object({ text: z.string() }), execute: async () => { writes += 1; return JSON.stringify({ ok: true, remembered: true }); },
+  }) as never);
+  const frames = [
+    [toolCall('settled-read-1', readName, { path: 'notes.md' })],
+    ...(variant === 'mutation_between' ? [[toolCall('settled-write', 'memory_remember', { text: 'notes changed' })]] : []),
+    [toolCall('settled-read-2', readName, { path: 'notes.md' })],
+    [textMsg('The notes hold three findings.')],
+  ];
+  const model = scriptedRecordingModel(frames);
+  const agent = { model, tools: [reader, writer] };
+  bindHostCanarySurface(fixture, agent, [reader, writer]);
+  const runner = throwingRunner();
+  const { attachEventLogHooks } = await import('./hooks.js');
+  const detach = attachEventLogHooks(runner, { getSessionId: () => fixture.session.id, getTurn: () => fixture.source.turn });
+  t.after(detach);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(runner as never, agent as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns: 5, hostTurnEngine: 'host_v1', context: fixture.context } as never));
+  assert.equal(result.terminal, undefined, JSON.stringify(result));
+  const returned = eventlog.listEvents(fixture.session.id, { types: ['tool_returned'] })
+    .filter(e => e.data.callId === 'settled-read-2' && e.data.accounting !== 'transport_mirror');
+  assert.equal(returned.length, 1, JSON.stringify(returned));
+  const secondFrameInput = JSON.stringify(model.requests[frames.length - 1]);
+  if (variant === 'identical') {
+    assert.equal(reads, 1, 'the second identical read must not execute again');
+    assert.equal(returned[0].data.providerDispatched, false, JSON.stringify(returned[0].data));
+    assert.equal(returned[0].data.replayedFromCallId, 'settled-read-1');
+    assert.match(secondFrameInput, /read #1: three findings/);
+    assert.match(secondFrameInput, /harness settled-read replay/);
+    const markers = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'same_source_settled_read_replay');
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0].data.replayTool, 'read_file');
+  } else {
+    assert.equal(reads, 2, `${variant}: a fresh read is owed after a mutation or for an undeclared status read`);
+    assert.notEqual(returned[0].data.providerDispatched, false);
+    assert.match(secondFrameInput, /read #2: three findings/);
+    assert.doesNotMatch(secondFrameInput, /harness settled-read replay/);
+  }
+  if (variant === 'mutation_between') assert.equal(writes, 1, 'the intervening call must have executed for the pin to mean anything');
+});

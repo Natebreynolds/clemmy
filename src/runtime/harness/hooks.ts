@@ -13,7 +13,7 @@ import {
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
 import { mirrorExternalSendToFirstPartySurfaces } from './external-send-mirror.js';
-import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { registeredToolReadReuse, registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -508,23 +508,27 @@ export function attachEventLogHooks(
               }
             })();
     const sourceAttribution = currentSourceAttribution();
+    const replayToolName = typeof tool?.name === 'string' ? tool.name : '';
+    const replayReadIdentity = accounting.toolSlug ?? accounting.effectiveTool ?? '';
     const settledReadReplay = physicalAttemptAuthoritative
       && callId
       && parentEventId
-      && tool?.name === 'composio_execute_tool'
+      && replayToolName
+      && replayReadIdentity
+      && (replayToolName === 'composio_execute_tool'
+        || registeredToolReadReuse(replayReadIdentity) !== null)
       && accounting.effect === 'read'
       && typeof sourceAttribution.sourceUserSeq === 'number'
       && typeof sourceAttribution.runScopeId === 'string'
-      && typeof accounting.toolSlug === 'string'
       ? settledReadRepeatReplayDisposition({
           sessionId,
           replayCallId: callId,
           replayCalledEventId: parentEventId,
-          toolName: tool.name,
+          toolName: replayToolName,
           effect: accounting.effect,
           sourceUserSeq: sourceAttribution.sourceUserSeq,
           replayBehaviorScopeId: sourceAttribution.runScopeId,
-          toolSlug: accounting.toolSlug,
+          toolSlug: replayReadIdentity,
         })
       : null;
     // The SDK lifecycle sees the model-facing result, which can carry harness
