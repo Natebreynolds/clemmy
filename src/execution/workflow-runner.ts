@@ -958,6 +958,8 @@ export interface QueuedRunRecord {
    * identity, current binding revision, and clean completion receipt.
    */
   canonicalEntityWorkspaceProjectionClaim?: unknown;
+  /** Time of the immutable dataset receipt; whole-run completion follows goal review. */
+  canonicalEntityWorkspaceProjectionFinishedAt?: string;
   /** Exact closed read-authority root captured before step completion. This is
    * the restart bridge to the producer; it contains no provider/result body. */
   canonicalEntityWorkflowResultRoot?: CanonicalEntityWorkflowResultRootV1;
@@ -1895,6 +1897,9 @@ function finalizeCanonicalEntityWorkspaceProjection(
     status: record.status,
     terminalOutcome: record.terminalOutcome,
     finishedAt: record.finishedAt,
+    ...(record.canonicalEntityWorkspaceProjectionFinishedAt === undefined ? {} : {
+      projectionFinishedAt: record.canonicalEntityWorkspaceProjectionFinishedAt,
+    }),
     needsAttention: record.needsAttention,
     ...(Object.hasOwn(record, 'canonicalEntityWorkspaceProjectionClaim')
       ? { claim: record.canonicalEntityWorkspaceProjectionClaim }
@@ -16151,16 +16156,14 @@ async function processOneRunFile(
         : '';
 
       throwIfWorkflowRunCancelled(run.id);
-      let terminalFinishedAt = new Date().toISOString();
+      const terminalFinishedAt = new Date().toISOString();
+      let canonicalEntityWorkspaceProjectionFinishedAt: string | undefined;
       let canonicalEntityWorkspaceProjectionClaim: unknown;
-      // The reviewed projection lineage was produced before the goal review
-      // (see JUDGE VIEW OF THE REVIEWED PROJECTION above). Same gate as
-      // before: it publishes only when the run needs no attention and is not
-      // re-pursuing. On a post-receipt restart the retained completed receipt
-      // owns the timestamp, so the terminal projection is byte-stable and
-      // cannot conflict with its own lineage claim.
+      // The dataset receipt predates goal review. Keep its immutable timestamp
+      // for exact projection replay, but never backdate the whole run's terminal:
+      // recurrence requires the judge receipt to precede run completion.
       if (!needsAttention && !goalRepursuing && reviewedProjectionLineage) {
-        terminalFinishedAt = reviewedProjectionLineage.finishedAt;
+        canonicalEntityWorkspaceProjectionFinishedAt = reviewedProjectionLineage.finishedAt;
         canonicalEntityWorkspaceProjectionClaim = reviewedProjectionLineage.claim;
       }
       const terminalProjection: QueuedRunRecord = {
@@ -16183,7 +16186,7 @@ async function processOneRunFile(
         stepOutputs: runRecordStepOutputs,
         output: finalOutput,
         ...(canonicalEntityWorkspaceProjectionClaim
-          ? { canonicalEntityWorkspaceProjectionClaim }
+          ? { canonicalEntityWorkspaceProjectionClaim, canonicalEntityWorkspaceProjectionFinishedAt }
           : {}),
         ...(needsAttention
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }

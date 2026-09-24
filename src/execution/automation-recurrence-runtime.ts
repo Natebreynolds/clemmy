@@ -233,6 +233,9 @@ export function projectAutomationRecurrencePilotSuccess(
     status: run.status,
     terminalOutcome: run.terminalOutcome,
     finishedAt: run.finishedAt,
+    ...(run.canonicalEntityWorkspaceProjectionFinishedAt === undefined ? {} : {
+      projectionFinishedAt: run.canonicalEntityWorkspaceProjectionFinishedAt,
+    }),
     needsAttention: run.needsAttention,
     claim: run.canonicalEntityWorkspaceProjectionClaim,
   });

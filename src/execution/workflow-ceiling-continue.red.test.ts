@@ -20,6 +20,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -48,6 +49,17 @@ const loop = await import('../runtime/harness/loop.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { HostInterruptState } = await import('../runtime/harness/host-turn-runner.js');
+
+// The harness loop is recorded in these runner tests. Its pause must still
+// carry the accepted source and exact native-card key produced by today's host.
+function recordedPause(sessionId: string, sourceUserSeq: number, calls: Array<{ callId: string; name: string; arguments: string }>) {
+  assert.ok(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).some(event => event.seq === sourceUserSeq));
+  const digest = createHash('sha256').update(JSON.stringify({ sessionId, sourceUserSeq, calls })).digest('hex');
+  return new HostInterruptState([], calls.map(call => ({ callId: call.callId, name: call.name, rawItem: { ...call } })) as never,
+    undefined, 'host_v1', undefined, { sessionId, sourceUserSeq, acceptedTaskId: `task:${sessionId}#${sourceUserSeq}`,
+      batchOrdinal: 1, batchId: digest, authorityDigest: digest });
+}
+
 const { readWorkflowEvents } = await import('./workflow-events.js');
 
 // No live judge / no live voice model in this hermetic file.
@@ -375,17 +387,14 @@ test('a tool ceiling returned by approval resume enters the same source-bound co
         settleFixtureBusinessRead(sessionId, request.sourceUserSeq!);
         const session = HarnessSession.load(sessionId);
         assert.ok(session);
-        session.saveInterruptState(new HostInterruptState([], [{
-          callId: 'approval-call-1',
-          name: 'fixture_approval_tool',
-          rawItem: {
-            callId: 'approval-call-1',
-            name: 'fixture_approval_tool',
-            arguments: JSON.stringify({ scope: 'approved-rows' }),
-          },
-        }] as never, undefined, 'host_v1').toString());
+        const pause = recordedPause(sessionId, request.sourceUserSeq!, [{
+          callId: 'approval-call-1', name: 'fixture_approval_tool',
+          arguments: JSON.stringify({ scope: 'approved-rows' }),
+        }]);
+        session.saveInterruptState(pause.toString());
         const approval = approvalRegistry.register({
           sessionId,
+          resumeKey: pause.getInterruptions()[0]!.approvalResumeKey,
           subject: 'Read the approved rows',
           tool: 'fixture_approval_tool',
           args: { scope: 'approved-rows' },
@@ -484,23 +493,18 @@ test('two sequential approval pauses bind each current card despite cumulative h
   process.env.WORKFLOW_APPROVAL_PARKING = 'off';
   const resumedApprovalIds: string[] = [];
   let ordinaryCalls = 0;
+  let acceptedTaskSource = 0;
 
-  const installPause = (sessionId: string, suffix: 'first' | 'second'): string => {
+  const installPause = (sessionId: string, sourceUserSeq: number, suffix: 'first' | 'second'): string => {
     const session = HarnessSession.load(sessionId);
     assert.ok(session);
     const callId = `sequential-${suffix}-call`;
     const args = { scope: suffix };
-    session.saveInterruptState(new HostInterruptState([], [{
-      callId,
-      name: 'fixture_approval_tool',
-      rawItem: {
-        callId,
-        name: 'fixture_approval_tool',
-        arguments: JSON.stringify(args),
-      },
-    }] as never, undefined, 'host_v1').toString());
+    const pause = recordedPause(sessionId, sourceUserSeq, [{ callId, name: 'fixture_approval_tool', arguments: JSON.stringify(args) }]);
+    session.saveInterruptState(pause.toString());
     const row = approvalRegistry.register({
       sessionId,
+      resumeKey: pause.getInterruptions()[0]!.approvalResumeKey,
       subject: `Protected ${suffix} read`,
       tool: 'fixture_approval_tool',
       args,
@@ -516,7 +520,8 @@ test('two sequential approval pauses bind each current card despite cumulative h
     runConversation: (async (request: { sessionId?: string; sourceUserSeq?: number }) => {
       ordinaryCalls += 1;
       const sessionId = String(request.sessionId ?? '');
-      installPause(sessionId, 'first');
+      acceptedTaskSource = request.sourceUserSeq!;
+      installPause(sessionId, acceptedTaskSource, 'first');
       return {
         sessionId,
         status: 'awaiting_approval',
@@ -537,7 +542,9 @@ test('two sequential approval pauses bind each current card despite cumulative h
         decision: request.decision,
       });
       if (resumedApprovalIds.length === 1) {
-        installPause(request.sessionId, 'second');
+        // Resuming records a synthetic control event, but the host keeps the
+        // original accepted task as the authority for the next tool batch.
+        installPause(request.sessionId, acceptedTaskSource, 'second');
         return {
           sessionId: request.sessionId,
           status: 'awaiting_approval',
@@ -587,7 +594,7 @@ test('workflow approval resume fails closed when sibling cards are ambiguous', a
   let stepSessionId = '';
   _setWorkflowHarnessLoopImplsForTests({
     configureRuntime: (async () => ({ ok: true })) as never,
-    runConversation: (async (request: { sessionId?: string }) => {
+    runConversation: (async (request: { sessionId?: string; sourceUserSeq?: number }) => {
       stepSessionId = String(request.sessionId ?? '');
       const session = HarnessSession.load(stepSessionId);
       assert.ok(session);
@@ -595,14 +602,12 @@ test('workflow approval resume fails closed when sibling cards are ambiguous', a
         { callId: 'sibling-call-a', name: 'fixture_approval_tool', arguments: JSON.stringify({ scope: 'a' }) },
         { callId: 'sibling-call-b', name: 'fixture_approval_tool', arguments: JSON.stringify({ scope: 'b' }) },
       ];
-      session.saveInterruptState(new HostInterruptState([], calls.map((call) => ({
-        callId: call.callId,
-        name: call.name,
-        rawItem: { ...call },
-      })) as never, undefined, 'host_v1').toString());
+      const pause = recordedPause(stepSessionId, request.sourceUserSeq!, calls);
+      session.saveInterruptState(pause.toString());
       for (const call of calls) {
         const row = approvalRegistry.register({
           sessionId: stepSessionId,
+          resumeKey: pause.getInterruptions().find(item => item.rawItem.callId === call.callId)!.approvalResumeKey,
           subject: `Protected ${call.callId}`,
           tool: call.name,
           args: JSON.parse(call.arguments) as Record<string, unknown>,

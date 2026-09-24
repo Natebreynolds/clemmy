@@ -491,6 +491,9 @@ test('approved proposal advances without another chat turn through exact chooser
     }, null, 2),
   );
   assert.equal(terminal.terminalOutcome, 'succeeded', runBytes);
+  assert.ok(Date.parse((terminal as { finishedAt: string }).finishedAt)
+    >= Date.parse((terminal.goalValidation as { validatedAt: string }).validatedAt),
+  'whole-run completion cannot precede the goal review that made it successful');
   assert.equal(terminal.goalValidation?.pass, true);
   assert.equal(terminal.goalValidation?.judgeFailedOpen, false);
   assert.equal(reviewRequests.length, 1, 'whole-objective review uses one recorded provider request');

@@ -111,6 +111,8 @@ export interface FinalizeCanonicalEntityWorkflowCompletionInputV1 {
   status?: string;
   terminalOutcome?: WorkflowTerminalOutcome;
   finishedAt?: string;
+  /** Immutable dataset receipt time, when goal review completed afterward. */
+  projectionFinishedAt?: string;
   needsAttention?: boolean;
   claim?: unknown;
 }
@@ -478,11 +480,16 @@ export function finalizeCanonicalEntityWorkflowCompletion(
   if (!validResolvedReceipt(resolved.receipt, claim)) {
     return block(input, 'canonical_entity_lineage_receipt_invalid', identity.bindingId);
   }
+  const projectionFinishedAt = input.projectionFinishedAt ?? input.finishedAt!;
+  if (!exactIso(projectionFinishedAt)
+    || Date.parse(projectionFinishedAt) > Date.parse(input.finishedAt!)) {
+    return block(input, 'workflow_completion_receipt_missing', identity.bindingId);
+  }
   const terminalStatus = failedProjection ? 'failed' : 'completed';
   if (!hasExactTerminalReceipt(
     resolved.receipt.request,
     identity,
-    input.finishedAt!,
+    projectionFinishedAt,
     terminalStatus,
   )) {
     return block(input, 'workflow_completion_receipt_missing', identity.bindingId);

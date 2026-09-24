@@ -492,3 +492,33 @@ test('an exact compositor fixture reaches the real canonical store projector and
     workspaceDb.close();
   }
 });
+
+
+test('a verified dataset receipt may precede whole-run completion after review', () => {
+  const { claim, compositor } = ready();
+  let projectCalls = 0;
+  const result = finalizeCanonicalEntityWorkflowCompletion({
+    ...completion(claim),
+    projectionFinishedAt: FINISHED_AT,
+    finishedAt: new Date(Date.parse(FINISHED_AT) + 1000).toISOString(),
+  }, dependencies({ compositor, project: () => {
+    projectCalls += 1; return projectedResult({ inserted: true });
+  } }));
+  assert.equal(result.status, 'projected');
+  assert.equal(projectCalls, 1);
+});
+
+test('a split projection timestamp must match the receipt and cannot follow run completion', () => {
+  const { claim, compositor } = ready();
+  for (const delta of [-1000, 1000]) {
+    let projectCalls = 0;
+    const result = finalizeCanonicalEntityWorkflowCompletion({
+      ...completion(claim),
+      projectionFinishedAt: new Date(Date.parse(FINISHED_AT) + delta).toISOString(),
+    }, dependencies({ compositor, project: () => {
+      projectCalls += 1; return projectedResult({ inserted: true });
+    } }));
+    assert.equal(result.status, 'blocked');
+    assert.equal(projectCalls, 0);
+  }
+});
