@@ -918,6 +918,9 @@ test('inline numbered worker targets outrank incidental counts inside their deta
   assert.equal(detected.itemCount, 3);
   assert.equal(detected.exactMembers?.length, 3);
   assert.match(detected.exactMembers![2], /40 reviews/);
+  const sentences = detectMultiItemIntent(text.replaceAll('; (', '. ('));
+  assert.equal(sentences.itemCount, 3, 'sentence-separated inline items retain the same universe');
+  assert.equal(sentences.exactMembers?.length, 3);
   const sessionId = openTurn('inline-packets-preserved', 'chat', text, { policyCount: detected.itemCount });
   // Each original packet can proceed separately: no forced conversion of
   // distinct instructions into one shared packet to satisfy a false count.
@@ -935,4 +938,15 @@ test('inline enumeration keeps arbitrary cardinality and single-artifact boundar
   assert.equal(sections.isMultiItem, false);
   assert.equal(detectMultiItemIntent('Audit sources: (1) Alpha; (3) Beta; (4) Gamma').exactMembers, undefined);
   assert.equal(detectMultiItemIntent('Compare the values (10) and (20) with (30).').exactMembers, undefined);
+});
+
+
+test('recorded three-prospect draft request keeps its three independent worker packets', () => {
+  const input = "Using the scorpion-outbound skill, I need three separate cold prospect emails for review. Delegate one draft per prospect to a worker, in parallel, then review all three against the skill checklist and present each with To, Subject, Body and word count. Fixture prospects: (1) Dana Lee, Northwind Plumbing, Portland OR, home services, angle: outranked for \"emergency plumber Portland\", no online booking. (2) Priya Nair, Nair & Voss Injury Law, Denver CO, legal, angle: competitors run Google Local Services Ads for \"car accident lawyer Denver\" and they do not. (3) Marcus Bell, Bell Family Dental, Tampa FL, healthcare, angle: 3.9 star rating with 40 reviews vs a competitor at 4.8 with 600. Do not send anything, do not touch any CRM, change nothing.";
+  const detected = detectMultiItemIntent(input);
+  assert.equal(detected.itemCount, 3);
+  assert.equal(detected.exactMembers?.length, 3);
+  assert.match(detected.exactMembers![0], /Dana Lee/);
+  assert.match(detected.exactMembers![1], /Priya Nair/);
+  assert.match(detected.exactMembers![2], /Marcus Bell/);
 });

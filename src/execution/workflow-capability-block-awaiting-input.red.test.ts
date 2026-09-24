@@ -246,7 +246,7 @@ test('ambiguous account block asks one visible bounded question and cannot timer
   assert.deepEqual(runRecord.pendingInput.resolution, {
     kind: 'choose_account',
     actionTool: 'workflow_capability_resolve',
-    accountCandidates: choices.candidates,
+    accountCandidates: choices.candidates.map(candidate => ({ ...candidate, label: candidate.accountId })),
     choiceSetDigest: choices.digest,
     choiceTotal: 2,
     choicesTruncated: false,
@@ -260,7 +260,7 @@ test('ambiguous account block asks one visible bounded question and cannot timer
   assert.ok(notification);
   assert.equal(isNeedsAttentionNotification(notification), true);
   assert.match(notification.title, /Workflow needs you — choose an account for alpha/i);
-  assert.match(notification.body, /Choose the exact account ID in Needs You/i);
+  assert.match(notification.body, /Choose the account in Needs you\. I will save that choice and resume this same run\./i);
   assert.deepEqual(notification.metadata?.resolution, runRecord.pendingInput.resolution);
 });
 

@@ -186,10 +186,10 @@ function referencesCountedKind(text: string, kind: string | null): boolean {
 }
 
 /** An inline numbered list is a structural universe, just like a line list.
- * Require a colon/semicolon/newline boundary and a complete 1..N sequence;
+ * Require a sentence/list boundary and a complete 1..N sequence;
  * parenthesized statistics, citations and skipped labels are not a list proof. */
 function inlineNumberedMembers(text: string): Array<{ index: number; body: string }> {
-  const markers = [...text.matchAll(/(?:^|[;:\n])[ \t]*\((\d+)\)[ \t]+/g)];
+  const markers = [...text.matchAll(/(?:^|[;:.!?\n])[ \t]*\((\d+)\)[ \t]+/g)];
   if (markers.length < 3 || markers.some((marker, index) => Number(marker[1]) !== index + 1)) return [];
   const members = markers.map((marker, index) => ({
     index: marker.index!,
