@@ -899,8 +899,49 @@ export async function runRoutedJudgeAttempt<T>(
     ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
     : buildJudgeAgent(routing, instructions);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
-  const value = parse(result.finalOutput);
-  if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
+  let value = parse(result.finalOutput);
+  if (value === null) {
+    // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
+    // review of three drafts and never emitted the one verdict line; the
+    // review became "unreadable", failed open, and the owner was told the
+    // work stood unreviewed with nothing to read. A reviewer that has already
+    // reviewed can state its verdict from its own words: one bounded re-ask,
+    // without the evidence packet, before the failure is declared, and the
+    // head of what it wrote travels with the failure so the next reader is
+    // not guessing.
+    const prior = redactSensitiveText(String(result.finalOutput ?? '')).trim();
+    const head = prior.replace(/\s+/g, ' ').slice(0, 600);
+    if (prior) {
+      try {
+        const repairAgent = buildJudgeAgent(routing, instructions);
+        const repairPrompt = [
+            'You already reviewed a response and wrote the review below, but it did not contain the required verdict line.',
+            'Do not review again. From your own review, state the verdict now.',
+            '',
+            '[YOUR REVIEW]',
+            prior,
+            '[/YOUR REVIEW]',
+            '',
+            'Reply with EXACTLY ONE LINE and nothing else, in the verdict format your instructions require.',
+          ].join('\n');
+        // A missing verdict must not turn an incomplete review excerpt into
+        // completion authority. Preserve the whole review or decline repair.
+        const repairAdmission = completionJudgeContextAdmission(routing.modelId, instructions, repairPrompt);
+        if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
+        const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
+          repairAgent, repairPrompt, { maxTurns: 1 },
+        );
+        value = parse(repaired.finalOutput);
+      } catch (error) {
+        logDebugSafe(error);
+      }
+    }
+    if (value === null) {
+      throw new JudgeVerdictParseError(
+        head ? `judge output did not parse; it began: ${head.slice(0, 240)}` : 'judge output did not parse; the reviewer returned no text',
+      );
+    }
+  }
   return value;
 }
 
@@ -913,6 +954,7 @@ interface CompletionJudgeRun {
   /** The winning attempt's routing (primary routing when nothing won). */
   routing?: BoundaryJudgeRouting;
   unavailableReason?: string;
+  invalidDetail?: string;
 }
 
 /**
@@ -937,7 +979,7 @@ export async function runHedgedJudge<T>(
     timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
     evidence?: JudgeEvidenceSource;
   } = {},
-): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string }> {
+): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
@@ -976,6 +1018,9 @@ export async function runHedgedJudge<T>(
         : raced.errors.some((e) => e instanceof JudgeVerdictParseError)
           ? 'invalid'
           : 'error';
+    const invalidDetail = failure === 'invalid'
+      ? raced.errors.find((e) => e instanceof JudgeVerdictParseError)?.message.replace(/^judge output did not parse;?\s*/, '').slice(0, 260)
+      : undefined;
     recordCompletionJudgeMetric(failure, startedAt, routing, lane);
     const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
     const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
@@ -985,7 +1030,7 @@ export async function runHedgedJudge<T>(
         : transportError instanceof Error
           ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
-    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}) };
+    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
   } catch (err) {
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
@@ -1036,7 +1081,8 @@ async function runCompletionJudge(
       ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}) },
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing,
-    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}) };
+    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
+    ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
 }
 
 /** Swallow-with-trace: the judge lanes are fail-open/fail-strict by CONTRACT,
@@ -1328,7 +1374,7 @@ export async function judgeObjectiveComplete(
       run.failure === 'timeout'
         ? 'The completion reviewer timed out; no review was completed.'
         : run.failure === 'invalid'
-          ? 'The completion reviewer returned an unreadable verdict; no review was completed.'
+          ? `The completion reviewer returned an unreadable verdict; no review was completed.${run.invalidDetail ? ` (${run.invalidDetail})` : ''}`
           : 'The completion reviewer was unavailable; no review was completed.';
     return { done: true, reason: why, failedOpen: true, ...(jevAttempt ? { jevAttempt } : {}) };
   }

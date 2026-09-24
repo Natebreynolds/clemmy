@@ -457,3 +457,21 @@ test('valid receipts and a done vote do not certify missing or uncertain request
     else assert.equal(result, null, 'uncertain coverage must defer to the reviewer');
   }
 });
+
+ test('completion sends an identical embedded read block once without dropping distinct evidence', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 503, ok: false, text: async () => 'unavailable' };
+  });
+  const reads = 'VERIFIED RECEIPT: current enabled=false; source=exact';
+  const evidence = 'Write receipt.\n' + reads + '\nPending approval remains pending.';
+  await tryJevCompletionVerdict('Inspect status', 'Disabled', { verifiedReads: reads, toolCallSummary: evidence });
+  assert.equal(posted.state.evidence, evidence);
+  assert.equal(posted.state.verifiedReads, undefined);
+  assert.equal(posted.state.verifiedReadsIncludedIn, 'evidence');
+  await tryJevCompletionVerdict('Inspect status', 'Disabled', { verifiedReads: reads + ' distinct tail', toolCallSummary: evidence });
+  assert.equal(posted.state.verifiedReads, reads + ' distinct tail');
+  assert.equal(posted.state.evidence, evidence);
+});

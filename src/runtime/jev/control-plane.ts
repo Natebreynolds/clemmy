@@ -492,8 +492,13 @@ export async function tryJevCompletionVerdict(
             },
           }
         : {}),
+      // The host summary already embeds its verified reads verbatim. Send
+      // that evidence once, preserving every byte and its surrounding scope.
+      // A partial or differently formatted match must retain both blocks.
       ...(opts?.verifiedReads
-        ? { verifiedReads: opts.verifiedReads }
+        ? opts.toolCallSummary?.includes(opts.verifiedReads)
+          ? { verifiedReadsIncludedIn: 'evidence' }
+          : { verifiedReads: opts.verifiedReads }
         : {}),
       ...(opts?.toolCallSummary ? { evidence: opts.toolCallSummary } : {}),
     },

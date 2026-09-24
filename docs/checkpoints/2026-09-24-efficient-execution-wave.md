@@ -55,7 +55,7 @@ Usage rows confirm who served what (`role:model`).
 |---|---|---|---|---|---|---|---|---|
 | 294384 fresh | scorpion-outbound skill: one cold email, present for approval | 30 | 4 | 3 (trajectory review + completion judge) | 3 | 159,213 | 113,901 (reviewer 55,216) | success; skill + 6 reference files read; 82-word on-brand draft; proof point flagged for verification; judge `fulfills: true` |
 | 294452 fresh | same skill, three prospects, explicit worker fan-out | 43 | 5 | 3 | 2 | 107,256 | 55,416 | `awaiting_user_input`: `run_worker` refused ×3 — the pattern detector read "with 40 reviews" as a 40-item contract (`fanout_policy_decision.itemCount: 40`) and the gate rejected the 3-item declaration; DeepSeek's third packet was otherwise correct and it stopped retrying as told |
-| re-run after `f89bf014e` | same | (pending in this session) | | | | | | |
+| 294528 fresh, after `f89bf014e` | same | 62 | 4 (+ 3 DeepSeek workers, 6 worker frames) | 6 (1 packet check, 4 watcher, 1 completion) | 6 | 194,220 | 141,745 (reviewer 110,385) | detector still read 40; arbitration accepted (`quantified_universe_arbitrated.accepted: true`); 3 workers started and returned; all three drafts delivered with checklist notes; **completion judge failed open**: Opus wrote a 2,827-token review with no verdict line → `unreadable verdict`, `failedOpen: true` |
 
 Observations for the tag decision:
 - DeepSeek V4.1 Flash follows a multi-file skill faithfully at ~30 s and produces
@@ -66,7 +66,29 @@ Observations for the tag decision:
 - The fan-out failure was a harness defect of the banned class (regex over user
   text as a hard validator), not a model failure. Fix: a chat-session disagreement
   between the detected count and the declared universe is arbitrated by Jev's
-  system-one; execution/background sessions stay fail-closed (`f89bf014e`).
+  system-one; execution/background sessions stay fail-closed (`f89bf014e`,
+  hotpatched and proven live on 294528).
+- Second harness defect, judge side: a flagship reviewer over a large evidence
+  packet wrote the review and skipped the one verdict line; the harness declared
+  it unreadable and failed open. Fix staged (working tree, not yet committable, see
+  below): one bounded re-ask for the verdict line from the reviewer's own words,
+  no evidence resent; a persisting failure carries the head of the review in the
+  recorded reason. Pins green (3) and the judge suite green under the isolated
+  runner (66/66). Not yet built or hotpatched.
+- Reviewer spend is now the dominant uncached block on DeepSeek turns (55k on one
+  email, 110k on three): the completion judge re-reads the full evidence, and the
+  trajectory watcher reviews every worker. Worth a separate look before tagging.
+- Worktree state at the end of this session: three files hold merge-conflict
+  markers from an accidental `git stash pop` of another agent's parked stash
+  (stash@{0}, still intact): `src/agents/tool-catalog.test.ts`,
+  `src/tools/publish-plan.test.ts`, `src/tools/publish-plan.ts`. Until they are
+  returned to HEAD (`git checkout HEAD -- <those three>`), no commit, typecheck or
+  build succeeds in this worktree. The judge repair sits staged behind that.
+- Model configuration left as the owner asked for this test: brain + worker
+  `deepseek-ai/DeepSeek-V4.1-Flash` (Together AI), judge `claude-opus-5-5`.
+  Previous: brain `zai-org/GLM-5.3-Flash`, judge `grok-4.3`, worker
+  `claude-haiku-4-5` (restore through Settings → Models or the same two PATCH
+  routes: `/api/console/settings/active-brain`, `/api/console/settings/models/roles`).
 
 ## Remaining release gates (unchanged unless stated)
 
