@@ -39,7 +39,17 @@ rows.sort((a, b) => a.at.localeCompare(b.at));
 
 const db = `file:${path.join(home, 'state', 'harness.db')}?mode=ro`;
 const sql = (q) => JSON.parse(execFileSync('sqlite3', ['-readonly', '-json', db, q], { maxBuffer: 1 << 28 }).toString() || '[]');
-const events = sql(`select seq, type, created_at, substr(data_json,1,600) as d from events where session_id='${sessionId.replace(/'/g, "''")}' and seq >= ${seq} and (type in ('user_input_received','conversation_completed','run_completed','tool_called','guardrail_tripped','approval_requested') ) and (json_extract(data_json,'$.sourceUserSeq') = ${seq} or seq = ${seq} or type in ('conversation_completed','run_completed','approval_requested')) order by seq`);
+// Structured fields only (json_extract), never a substring of the payload:
+// a truncated row would silently undercount calls and repairs.
+const events = sql(`select seq, type, created_at,
+    json_extract(data_json,'$.kind') as kind,
+    json_extract(data_json,'$.accounting') as accounting,
+    json_extract(data_json,'$.reason') as reason,
+    json_extract(data_json,'$.sourceUserSeq') as sourceUserSeq
+  from events where session_id='${sessionId.replace(/'/g, "''")}' and seq >= ${seq}
+    and type in ('user_input_received','conversation_completed','run_completed','tool_called','guardrail_tripped','approval_requested')
+    and (json_extract(data_json,'$.sourceUserSeq') = ${seq} or seq = ${seq} or type in ('conversation_completed','run_completed','approval_requested'))
+  order by seq`);
 const started = events.find((e) => e.seq === seq)?.created_at;
 const completed = events.find((e) => e.type === 'conversation_completed' && e.seq > seq)?.created_at
   ?? events.find((e) => e.type === 'run_completed' && e.seq > seq)?.created_at;
@@ -60,13 +70,12 @@ const repairKinds = ['refused_pre_dispatch', 'recovery_surface_reprompt', 'tool_
 const repairs = {};
 let toolCalls = 0; let approvals = 0; let retries = 0;
 for (const e of events) {
-  let d = {}; try { d = JSON.parse(e.d); } catch { /* truncated */ }
-  if (e.type === 'tool_called' && d.accounting === 'top_level') toolCalls += 1;
+  if (e.type === 'tool_called' && e.accounting === 'top_level') toolCalls += 1;
   if (e.type === 'approval_requested') approvals += 1;
   if (e.type === 'guardrail_tripped') {
-    const k = String(d.kind ?? '');
+    const k = String(e.kind ?? '');
     if (repairKinds.includes(k)) repairs[k] = (repairs[k] ?? 0) + 1;
-    if (k === 'no_progress_decision' && d.reason === 'retry_available') retries += 1;
+    if (k === 'no_progress_decision' && e.reason === 'retry_available') retries += 1;
   }
 }
 const out = {

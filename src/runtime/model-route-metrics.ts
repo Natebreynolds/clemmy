@@ -20,6 +20,7 @@ import {
   type ProviderPromptCacheUsageV1,
 } from './harness/prompt-cache-observation.js';
 import { harnessRunContextStorage } from './harness/brackets.js';
+import { modelUsageAttributionStorage, type ModelUsageAttributionContext, type UsageRequestRole } from './usage-log.js';
 import { appendEvent } from './harness/eventlog.js';
 
 export const MODEL_ROUTE_METRICS_SCHEMA_VERSION = 1;
@@ -446,6 +447,24 @@ export function successfulRouteOutcome(
   };
 }
 
+/** The routing role IS the explicit request role: brain, worker, or judge
+ *  (accounted as reviewer). A judge or worker route inside a brain turn
+ *  overrides the turn's scope; a brain route never overrides an explicit outer
+ *  worker/reviewer scope; an unscoped call (a post-turn reflection judge) gets
+ *  a role-only scope so its rows are never "unset". */
+function usageRoleForRoute(role: ModelRouteRole): UsageRequestRole {
+  return role === 'judge' ? 'reviewer' : role;
+}
+
+function routeAttributionContext(role: ModelRouteRole): ModelUsageAttributionContext | null {
+  const routeRole = usageRoleForRoute(role);
+  const inherited = modelUsageAttributionStorage.getStore();
+  if (!inherited) return { sessionId: 'unknown', sourceUserSeq: 0, role: routeRole };
+  if (inherited.role === routeRole) return null;
+  if (routeRole === 'brain' && inherited.role) return null;
+  return { ...inherited, role: routeRole };
+}
+
 class ModelRouteMetricsModel implements Model {
   constructor(
     private readonly inner: Model,
@@ -453,12 +472,17 @@ class ModelRouteMetricsModel implements Model {
     private readonly db?: Database.Database,
   ) {}
 
+  private inRouteRole<T>(work: () => T): T {
+    const context = routeAttributionContext(this.context.role);
+    return context ? modelUsageAttributionStorage.run(context, work) : work();
+  }
+
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     const startedAt = Date.now();
     const promptCacheRequest = observePromptCacheRequest(request);
     const decisionId = this.startCall('getResponse', promptCacheRequest);
     try {
-      const response = await this.inner.getResponse(request);
+      const response = await this.inRouteRole(() => this.inner.getResponse(request));
       const usage = modelRouteUsageFromResponse(response);
       const resolution = fallbackRouteResolution(response);
       const outcome = successfulRouteOutcome(resolution, { path: 'getResponse', responseCompleted: true });
@@ -493,7 +517,18 @@ class ModelRouteMetricsModel implements Model {
     let failed = false;
     let resolution: FallbackRouteResolution | undefined;
     try {
-      for await (const event of this.inner.getStreamedResponse(request)) {
+      // Each pull of the inner stream runs inside the route's attribution scope,
+      // so the wire's usage row (written when the stream settles) carries the role.
+      const innerStream = this.inRouteRole(() => this.inner.getStreamedResponse(request));
+      const iterator = innerStream[Symbol.asyncIterator]();
+      const scoped: AsyncIterable<StreamEvent> = {
+        [Symbol.asyncIterator]: () => ({
+          next: () => this.inRouteRole(() => iterator.next()),
+          return: (value?: unknown) => this.inRouteRole(() => iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined })),
+          throw: (error?: unknown) => this.inRouteRole(() => iterator.throw?.(error) ?? Promise.reject(error)),
+        }),
+      };
+      for await (const event of scoped) {
         servedModel = providerReportedModel(event) ?? servedModel;
         const doneUsage = usageFromStreamEvent(event);
         if (doneUsage) { usage = doneUsage; responseCompleted = true; }
