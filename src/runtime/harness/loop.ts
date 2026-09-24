@@ -2413,7 +2413,7 @@ function turnDurableMemoryCaptureEvidence(
       (event?.data as { queuedCandidateCount?: unknown } | undefined)?.queuedCandidateCount ?? 0,
     );
     if (!event || !Number.isFinite(queuedCandidateCount) || queuedCandidateCount <= 0) return null;
-    const redeemed = redeemDurableMemoryIntakeReceipt({
+    const redeemed = prepareDurableMemoryIntakeHostCompletion({
       sessionId,
       sourceUserSeq: Number(activeSourceUserSeq),
     });
@@ -6778,7 +6778,6 @@ async function runConversationCore(
       turnResult.turn,
       activeSourceUserSeq,
     );
-    const durableMemoryCaptureEvidence = durableMemoryCapture !== null;
     const durableMemoryConversationOnly = durableMemoryCapture?.conversationOnly === true;
 
     // A verified queue receipt transfers ownership to the durable workflow
@@ -7309,7 +7308,7 @@ async function runConversationCore(
     // an exact durable receipt finish without generic stall/completion judges.
     if (
       !decision
-      && (meaningfulToolEvidence || durableMemoryCaptureEvidence)
+      && (meaningfulToolEvidence || durableMemoryConversationOnly)
       && typeof turnResult.finalOutput === 'string'
     ) {
       const acknowledgement = turnResult.finalOutput.trim();

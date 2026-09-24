@@ -454,3 +454,24 @@ test('concurrent host receipt issuers serialize to one issued row and one replay
   );
   assert.equal(receipts.redeemDurableMemoryIntakeReceipt(task).status, 'redeemed');
 });
+
+
+test('multiline accepted memory binds raw graph bytes while preserving normalized intake evidence', () => {
+  const task = acceptActivatedMemoryAction(
+    'Remember this: Cedar is Cedar-41.\n\nA natural acknowledgement is enough.',
+  );
+  assert.equal(task.captured?.queuedCandidateIds?.length, 1);
+  const issued = receipts.issueDurableMemoryIntakeReceipt(task);
+  assert.equal(issued.status, 'issued', JSON.stringify(issued));
+  eventlog.closeEventLog();
+  memory.closeMemoryDb();
+  assert.equal(receipts.redeemDurableMemoryIntakeReceipt(task).status, 'redeemed');
+});
+
+
+test('a pure remember request needs no special acknowledgement wording, but secondary work stays ineligible', () => {
+  const pure = acceptActivatedMemoryAction('Remember this: my durable harness marker is AUTO-CAPTURE-ACK-42.');
+  assert.equal(receipts.issueDurableMemoryIntakeReceipt(pure).status, 'issued');
+  const compound = acceptActivatedMemoryAction('Remember this: my durable harness marker is AUTO-CAPTURE-ACK-42. Then analyze these 50 deals.');
+  assert.equal(receipts.issueDurableMemoryIntakeReceipt(compound).status, 'ineligible');
+});

@@ -128,8 +128,9 @@ function hasExplicitDurableMemoryReceipt(input: DurableMemoryReceiptInput): bool
 
 function hasOnlyDeclarativeMemoryPayload(message: string): boolean {
   const acknowledgement = message.match(ACKNOWLEDGEMENT_ONLY_RE);
-  if (acknowledgement?.index === undefined) return false;
-  const beforeAcknowledgement = message.slice(0, acknowledgement.index).trim();
+  const beforeAcknowledgement = acknowledgement?.index === undefined
+    ? message
+    : message.slice(0, acknowledgement.index).trim();
   const payload = beforeAcknowledgement
     .replace(MEMORY_REQUEST_PREFIX_RE, '')
     .replace(/[.!;:\s]+$/g, '')
@@ -167,7 +168,6 @@ export function durableMemoryReceiptAllowsConversationOnly(input: DurableMemoryR
     && hasExplicitDurableMemoryReceipt(input)
     && instruction !== null
     && !instruction.hasSecondaryWork
-    && ACKNOWLEDGEMENT_ONLY_RE.test(message)
     && hasOnlyDeclarativeMemoryPayload(message)
     && !message.includes('?')
     && !hasExplicitActionContinuation(message, true)

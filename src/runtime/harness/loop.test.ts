@@ -6630,7 +6630,7 @@ test('objective judge: exact-source collection receipt removes only the redundan
     runRunner,
   }));
 
-  assert.equal(result.status, 'completed');
+  assert.equal(result.status, 'completed', JSON.stringify({ result, terminal: listEventsForConv(sess.id, { types: ['conversation_completed', 'run_failed', 'guardrail_tripped'] }) }));
   assert.equal(result.steps, 1);
   assert.equal(modelTurns, 1);
   assert.equal(judgeCalls, 0, 'the exact read receipt replaces the plural-noun transcript judge');
@@ -11777,10 +11777,10 @@ test('runConversation: an exact reply to a verbatim request is DELIVERED, no sta
   const sess = HarnessSession.create({ kind: 'chat' });
   // The model complies exactly — "ok", zero tools — the correct deliverable.
   const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: 'ok' });
-  const result = await runConversation(withSettledWork({
+  const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'Reply with just the word: ok',
     makeRunner: makeRunnerStub, runRunner,
-  }));
+  });
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'verbatim_reply_fulfilled');
@@ -11812,8 +11812,10 @@ test('runConversation: a bare "ok" on an OPEN task is NOT verbatim-salvaged (equ
     0,
     'a lazy ack on an open task is never delivered as verbatim fulfillment',
   );
+  assert.equal(completed.some(event => event.data.delivered === true && event.data.reply === 'ok'), false,
+    'queued memory candidates cannot authorize delivery of an unfinished task acknowledgement');
   // It IS treated as a stall (the deliberate lazy-punt rejection is intact).
-  assert.ok(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length > 0, 'a bare ack on an open task still stalls');
+  assert.ok(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length > 0, JSON.stringify({ result, completed }));
 });
 
 test('runConversation: a substantive answer repeated identically across stall retries is SALVAGED, not replaced by the banner', async () => {
