@@ -247,9 +247,16 @@ async function claimInTwoWorkers(
 ): Promise<Array<Awaited<ReturnType<AcceptedSourceSessionBranchApi['claimSessionForAcceptedSource']>>>> {
   assert.equal(claims.length, 2);
   const gate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  // Bootstrap JavaScript first: --import tsx does not reliably install the
+  // worker entrypoint loader under the full test runner. tsImport registers
+  // the TypeScript graph explicitly without changing the two-worker race.
+  const bootstrap = new URL(`data:text/javascript,${encodeURIComponent(
+    `import { tsImport } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))};\n`
+      + `await tsImport(${JSON.stringify(new URL('./accepted-source-session-claim.worker.ts', import.meta.url).href)}, ${JSON.stringify(import.meta.url)});`,
+  )}`);
   const workers = claims.map((claim) => new Worker(
-    new URL('./accepted-source-session-claim.worker.ts', import.meta.url),
-    { workerData: { gate, claim }, execArgv: ['--import', 'tsx'] },
+    bootstrap,
+    { workerData: { gate, claim }, execArgv: [] },
   ));
   let ready = 0;
   const results = workers.map((worker) => new Promise<Awaited<ReturnType<
