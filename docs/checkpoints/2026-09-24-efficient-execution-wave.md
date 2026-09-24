@@ -141,3 +141,29 @@ settlement, receipt) with no model request, then the surface without
 `plan_task`. The WIP branch holds the helper, the loop hook, the instruction
 change and the pin updates; the integration pins fail on the graph precondition
 and were not weakened. Stage 1 stays owed.
+
+## Main is the release base (2026-09-24 ~09:30 PT)
+
+The Codex agent's last commit was a5a9e94ce at 08:41 PT with no activity after
+it. `main` was fast-forwarded from e77215d00 to 49fb69653 (its 110 commits plus
+this branch's three); the owner's uncommitted main edits were untouched. On
+49fb69653: typecheck clean, public-hygiene and operation-identity gates pass,
+the three files that regressed at bb13116fc pass 96/96. Built from main and
+hotpatched; the installed app serves 49fb69653 (fp b4ed75d1f3e8).
+
+Live proof of the Jev-first watcher, same three-prospect fan-out (298364):
+
+| | before (294528, Opus judge) | after (298364, main, grok judge) |
+|---|---|---|
+| wall | 62 s | 94 s (6 DeepSeek brain frames vs 4) |
+| flagship watcher calls | 5 | 0 on the parent, 1 of 5 worker windows escalated |
+| trajectory windows decided by Jev | 0 | 6 of 7, confidence 0.99 |
+| reviewer uncached tokens | 110,385 | 53,584 (completion judge 52,695 + one 889 packet check) |
+| total uncached | 141,745 | 97,212 |
+| completion verdict | unreadable → failed open | positive, specific, not failed open |
+
+Started from main after the proof: full isolated suite then journeys
+(`gates-main.sh`, logs in the session scratchpad). Still owed before a tag:
+their results, fresh-install smoke, packaged-candidate smoke, upgrade
+rehearsal, release-asset tests, `origin/main` equal to the release commit,
+and the owner's Windows scope decision (`[mac-only]` or hold).
