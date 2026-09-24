@@ -16,6 +16,7 @@ import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../inte
 import { classifyComposioSlugEffect } from '../../integrations/composio/slug-effect.js';
 import type { CapabilityResolutionEntry } from '../harness/capability-resolution.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
+import { canonicalMcpToolIdentity } from '../mcp-tool-authority.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
@@ -142,6 +143,12 @@ function composioSlugsFromStrategy(toolsUsed: readonly string[]): string[] {
     if (!trimmed) continue;
     const local = TOOL_REGISTRY.find((entry) => entry.name === trimmed || entry.name === trimmed.toLowerCase());
     if (local) continue;
+    // A native MCP operation is server__operation. When the server shares its
+    // name with a connected Composio toolkit (live 2026-09-24:
+    // dataforseo__docs_search beside DATAFORSEO_* actions) the uppercased id
+    // also passes the slug shape test and was provisioned as a Composio
+    // action that does not exist, so the read it named was never warmed.
+    if (canonicalMcpToolIdentity(trimmed)) continue;
     const slug = trimmed.toUpperCase();
     if (!composioSlugLooksWellFormed(slug) || seen.has(slug)) continue;
     seen.add(slug);

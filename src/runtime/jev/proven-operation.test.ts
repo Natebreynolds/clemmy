@@ -307,6 +307,36 @@ test('a proven strategy naming a native MCP read is re-attested and recorded as 
       terminalSuccess: true, controllerValidation: true,
     }).receipt!,
   });
+  // A server that shares its name with a connected Composio toolkit still
+  // names an MCP operation, never a Composio action (live: dataforseo).
+  recordRunStrategy({
+    objective: 'look up the serp depth limit in the dataforseo documentation',
+    toolsUsed: ['dataforseo__docs_search'],
+    workerCount: 0,
+    durationMs: 9_000,
+    learningReceipt: evaluateLearningCandidate({
+      target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:docs-a', sourceId: 'docs-a',
+      terminalSuccess: true, controllerValidation: true,
+    }).receipt!,
+  });
+  const docsSession = createSession({ kind: 'chat', channel: 'desktop', title: 'docs lookup' });
+  const docsAccepted = appendEvent({ sessionId: docsSession.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'look up the serp depth limit in the dataforseo documentation' } });
+  const docsAsked: string[] = [];
+  const docs = await prepareProvenOperationForRequest({
+    query: 'look up the serp depth limit in the dataforseo documentation',
+    sessionId: docsSession.id,
+    sourceUserSeq: docsAccepted.seq,
+    acceptedInput: 'look up the serp depth limit in the dataforseo documentation',
+  }, {
+    acquireLiveRead: async ({ operation }) => {
+      docsAsked.push(operation);
+      return { status: 'installed', kind: 'mcp', operation, accountId: 'native_mcp:dataforseo:acct' };
+    },
+  });
+  assert.deepEqual(docsAsked, ['dataforseo__docs_search'], 'the MCP id reaches the live-read branch, not the Composio one');
+  assert.deepEqual(docs.liveReadOutcomes.map((row) => `${row.operation}:${row.status}`), ['dataforseo__docs_search:installed']);
+  assert.deepEqual(docs.liveReads.map((row) => row.operation), ['dataforseo__docs_search']);
+
   const asked: string[] = [];
   const prepared = await prepareProvenOperationForRequest({
     query: 'search the records index for the quarterly inventory',
