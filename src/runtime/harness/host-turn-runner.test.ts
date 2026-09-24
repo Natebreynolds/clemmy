@@ -9472,6 +9472,55 @@ test('completion repairs stay bounded while the final candidate is still reviewe
 });
 
 
+test('workflow parent continuation gives the completion reviewer its owned child execution evidence', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const { withWorkflowParentActivation } = await import('./workflow-parent-activation.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const fixture = acceptJudgedSource('judge-workflow-child', 'Run the workflow and report its actual execution.');
+  let judged = 0;
+  let evidenceReads = 0;
+  let reviewedEvidence = '';
+  host._setHostObjectiveJudgeForTests(async (_objective, _reply, options) => {
+    judged++;
+    reviewedEvidence = options?.toolCallSummary ?? '';
+    return { done: true, reason: 'The child execution supports the report.' };
+  });
+  const agent = { instructions: 'Report the completed workflow.',
+    model: stubModel([[textMsg('The workflow completed and refreshed its workspace.')]]), tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  await withWorkflowParentActivation({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+    attemptId: 'recording-parent', runId: 'recording-parent', assertOwned: () => {},
+    conversation: { items: [], updatedAt: new Date().toISOString() },
+    completionEvidence: () => { evidenceReads++; return 'child-ledger-verified-742: workspace refresh succeeded'; },
+  }, () => runJudgedHost(fixture, agent, true));
+  assert.equal(judged, 1);
+  assert.match(reviewedEvidence, /child-ledger-verified-742/);
+  assert.ok(evidenceReads >= 2, 'reopen before judging and revalidate after the asynchronous review');
+});
+
+test('workflow child evidence changing during parent review cannot produce a verified success', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const { withWorkflowParentActivation } = await import('./workflow-parent-activation.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const fixture = acceptJudgedSource('judge-workflow-child-drift', 'Run the workflow and report its actual execution.');
+  let current = 'original child execution';
+  host._setHostObjectiveJudgeForTests(async () => {
+    current = 'changed child execution';
+    return { done: true, reason: 'The old snapshot passed.' };
+  });
+  const agent = { instructions: 'Report the completed workflow.',
+    model: stubModel([[textMsg('The workflow completed and refreshed its workspace.')]]), tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  await withWorkflowParentActivation({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+    attemptId: 'recording-parent', runId: 'recording-parent', assertOwned: () => {},
+    conversation: { items: [], updatedAt: new Date().toISOString() }, completionEvidence: () => current,
+  }, () => runJudgedHost(fixture, agent, true));
+  const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0].data.failedOpen, true);
+  assert.match(String(verdicts[0].data.reason), /evidence changed during completion review/);
+});
+
 test('completion review receives the memory actually shown to the brain, not a fresh vault read', async (t) => {
   const fs = await import('node:fs');
   const { MEMORY_FILE } = await import('../../memory/vault.js');

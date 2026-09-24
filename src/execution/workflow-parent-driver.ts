@@ -86,6 +86,11 @@ export async function driveWorkflowParentContinuation(
       },
     };
     await withWorkflowParentActivation({ ...lease, assertOwned,
+      completionEvidence: () => {
+        const current = readOwnedWorkflowParentContinuation(lease, input, reply);
+        if (!current) throw new Error('workflow completion evidence lost its exact parent owner');
+        return current.child.summary;
+      },
       runId: getRunAttemptBySourceUserSeq(lease.sessionId, lease.sourceUserSeq)?.runId ?? lease.attemptId,
       conversation: { items: recovered.checkpoint.history,
         lastResponseId: recovered.checkpoint.lastResponseId ?? undefined,

@@ -259,3 +259,38 @@ constraints/optional source_id, and reach a recording mutation reviewer.
 Red:work_call failed,call_tool passed. Green:37/37 local-planning,mutation,
 and host-authored-send tests. Logs:/private/tmp/clem-native-schema-{red,green}.log.
 Final live acceptance, exact-commit full gates, main and tag remain owed.
+
+## bc9cddcd installed: workflow goal passes; parent review handoff gap
+
+Installed fingerprintdeb381591e0d1c1826713c82f36ec618f0ac8cf9168f869f5d67adf4539389ab.
+Platform49 run1790252855811-25a0bd/source297093 completed with terminalOutcome
+succeeded, goalValidation.pass=true, judgeFailedOpen=false. It re-pulled six
+Slack threads, updated Daily DigestH102 only, refreshed workspace sources
+(sheet_log1row,slack_feed15rows), and notified. Independent readback confirms
+only H102 changed05:12→05:28 across the observed windows; no duplicate row,
+Log or header change. Canonical child:122.2seconds,19model records,
+496414prompt,223430uncached,13718output,15top-level tools. Do not compare
+this successful run to an incomplete run as a matched benchmark.
+Controlled run1790253058137-666cc5 also succeeded, COUNT3/TOTAL27, reviewed
+pass with no failed-open; its parent source297238 delivered one terminal.
+
+The Platform49 PARENT source297023 did not pass delivery review. The child
+notification included an unsupported open-items tally (5); the parent sought
+a direct read and corrected it. Its resumed completion reviewer also rejected
+true child settlement details (refresh and six thread fetches) as unseen. The
+parent continuation gave the brain the host-verified child tool ledger, but the
+ordinary completion reviewer only reopened the parent's own tool results.
+Do not present the child's goal pass as clean end-to-end parent acceptance.
+
+Wire the existing, owned child execution snapshot into the ordinary parent
+completion review through a private runtime callback. Reopen the source-group/
+report/lease bindings and compare the snapshot again after the asynchronous
+review. No model text creates evidence and no child is rerun. A production-host
+recording test fails without this evidence; a second pin rejects a snapshot
+that changes during review. Both pass. The related host/session/completion
+run passed382 tests, skipped1, and failed only the new drift fixture because
+its original text did not trigger completion review; after using the same
+actual-execution claim as the positive pin, both new tests passed. No existing
+assertion was relaxed. Exact final full suite still required. Logs under
+/private/tmp/clem-parent-review-{red,green,neighbors}.log. Live receipts are in
+ignored output/release-acceptance-2026-09-24/clem-release-bc9cddcd-live/.

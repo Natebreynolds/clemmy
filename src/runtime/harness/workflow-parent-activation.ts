@@ -12,6 +12,9 @@ export interface WorkflowParentActivation {
   attemptId: string;
   runId: string;
   assertOwned(): void;
+  /** Reopened child execution evidence for the parent's completion reviewer.
+   * This host callback is never supplied through model continuation text. */
+  completionEvidence?(): string;
   conversation: PersistedConversation;
 }
 
