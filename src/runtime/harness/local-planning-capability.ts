@@ -146,7 +146,11 @@ async function defaultConfiguredLocalTool(
     if (schema) {
       return {
         name,
-        parameters: z.toJSONSchema(schema),
+        // Zod's JSON Schema result also carries non-enumerable Standard Schema
+        // runtime callbacks. Publish its JSON wire representation, not those
+        // callbacks, into canonical authority/review packets. Arguments retain
+        // their strict canonicalization and the original validator stays below.
+        parameters: JSON.parse(JSON.stringify(z.toJSONSchema(schema))),
         description: getLocalToolCatalog().find(tool => tool.name === name)?.description,
         workCallLocalDispatch: true,
         argumentSchema: schema,

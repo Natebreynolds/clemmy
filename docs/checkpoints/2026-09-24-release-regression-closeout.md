@@ -226,3 +226,36 @@ production host compact-index pin failed with compact presentation removed.
 Public hygiene also found four tracked handoffs containing personal paths/address;
 portable home paths and an explicitly redacted address clear those findings.
 Final candidate live acceptance and the release gates are still required.
+
+## f6608b52 live: write verified, objective not accepted
+
+Platform49 run1790251949224-825e58/source296865 finished with a completed step
+but terminalOutcome=blocked, needsAttention=true, goalValidation.pass=false,
+judgeFailedOpen=false. The objective reviewer rejected the missing workspace
+refresh and missing thread/name checks; required output keys alone passed.
+Do not call this clean workflow acceptance or automatically replay its write.
+One Sheets batch update physically crossed at296935. Independent readback
+against the pre-run baseline found changes only in Daily Digest row102,
+columnsA:E/G:H (09/24/2026, zero counts, no-new-items text,05:12). LogA1:Z469
+and existing cells in the observed DigestA1:Z200 window were unchanged.
+Definition hash remained491efb983465afd1b174c797d2a4b62441af22141929dbc31c041766b9342bd7.
+No Slack writes. All attempts ended before app shutdown.
+
+Canonical child measurement:212.9seconds,30model records,822014prompt,
+261344uncached input,26377output,10top-level tools. Brain14DeepSeek frames;
+reviewer13Opus records/152906uncached; router3Jev. This incomplete run is not
+an end-to-end speed acceptance. Raw receipts and independent readback are
+preserved in ignored output/release-acceptance-2026-09-24/clem-release-f6608b52-live/.
+
+The post-write space_refresh refusals reproduced without network/model calls:
+resolveConfiguredLocalPlanningTool(work_call) returned z.toJSONSchema's result
+including non-enumerable ~standard runtime metadata. Strict canonicalization
+correctly rejected that non-JSON property before the mutation reviewer ran.
+Publish the library-generated schema's JSON wire representation at the shared
+local schema boundary; retain the original Zod argument validator and strict
+canonicalization for arguments. No tool-specific permission or review bypass.
+New actual-native-schema pins cover work_call and call_tool, preserve slug
+constraints/optional source_id, and reach a recording mutation reviewer.
+Red:work_call failed,call_tool passed. Green:37/37 local-planning,mutation,
+and host-authored-send tests. Logs:/private/tmp/clem-native-schema-{red,green}.log.
+Final live acceptance, exact-commit full gates, main and tag remain owed.
