@@ -835,8 +835,10 @@ for (const effect of ['read', 'external_write'] as const) for (const reacquire o
   const identity = { sessionId: session.id, sourceUserSeq: source.seq };
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) return;
-  await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority,
-    candidates: [{ sourceKind: 'authorized_external_mcp', name: tool.name, schema: tool.inputSchema as Record<string, unknown>, carrier: 'work_call' }] });
+  const disclosed = await semantic.disclosePrimaryModelPlanningCapabilities({ authority: primed.planning.authority,
+    candidates: [{ sourceKind: 'authorized_external_mcp', name: first.manifest.manifestId, schema: tool.inputSchema as Record<string, unknown>, carrier: 'work_call' }] });
+  assert.equal(disclosed[first.manifest.manifestId], first.manifest.manifestId,
+    'publish the exact observed reference used by this plan, not a second manifest for the same operation');
   const synthesisSteps: unknown[] = [];
   const outputPath = path.join(TEST_HOME, `reviewed-native-comparison-${source.seq}.md`);
   const content = 'The source reports a: 7, b: 9, c: 11. These are observations, not causal claims.\n';

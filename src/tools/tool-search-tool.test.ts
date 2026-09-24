@@ -1274,7 +1274,7 @@ test('first discovery preserves a proven ref when Composio fuzzy search and stag
         kind: 'authorized_external_mcp',
         search: async () => [{
           name: 'LIVE_MCP_SEARCH',
-          summary: 'A separately proven provider capability.',
+          summary: 'Read live provider records from the connected source.',
           schema: { type: 'object', properties: { query: { type: 'string' } } },
           carrier: 'work_call',
           score: 1000,

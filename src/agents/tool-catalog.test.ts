@@ -353,6 +353,18 @@ test('an operation purpose outranks a neighbor mentioning it as a prerequisite o
   }
 });
 
+test('a compound opening purpose keeps the requested object ahead of a different destination', () => {
+  const entries = [
+    { name: 'ARTIFACT_WRITE', oneLiner: 'Create, append to, or overwrite a local file.' },
+    { name: 'TABLE_APPEND', oneLiner: 'Append rows to a table.' },
+  ];
+  for (const ordered of [entries, [...entries].reverse()]) {
+    const ranked = rankCatalogEntriesLexically('append to a local file', ordered);
+    assert.equal(ranked[0].name, 'ARTIFACT_WRITE');
+    assert.equal(ranked.length, 2);
+  }
+});
+
 
 test('a complete compound operation name in ordinary word order precedes incidental description coverage', () => {
   for (const fixture of [

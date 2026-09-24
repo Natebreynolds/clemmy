@@ -352,7 +352,8 @@ function lexicalRelevance(queryTokens: string[], queryLead: string | undefined, 
   // Long descriptions also name prerequisites and alternative operations.
   // Keep those searchable, but prefer evidence in the operation's own name
   // and opening purpose over incidental matches later in its documentation.
-  const purposeLead = lexicalTokens(e.oneLiner)[0];
+  const openingPurpose = e.oneLiner.split(/[.;\n]|\b(?:a|an|the)\b/i, 1)[0] ?? '';
+  const purposeTokens = new Set(lexicalTokens(openingPurpose));
   let covered = 0;
   let nameHits = 0;
   let queryWeight = 0;
@@ -370,7 +371,10 @@ function lexicalRelevance(queryTokens: string[], queryLead: string | undefined, 
   const nameSimilarity = 2 * nameHits / (queryWeight + nameWeight);
   return {
     score: (covered / queryWeight + nameSimilarity) / 2,
-    purposeLeadMatch: Boolean(queryLead && (purposeLead === queryLead || nameTokens.has(queryLead))),
+    // Retain compound opening purposes such as "create, append, or overwrite".
+    // Later instructions about other operations remain searchable but do not
+    // turn those operations into this tool's purpose.
+    purposeLeadMatch: Boolean(queryLead && (purposeTokens.has(queryLead) || nameTokens.has(queryLead))),
     // A compound operation identifier explicitly present in ordinary word
     // order is stronger lexical evidence than incidental description words.
     // A single generic token (including a repeated-token name) is insufficient.
