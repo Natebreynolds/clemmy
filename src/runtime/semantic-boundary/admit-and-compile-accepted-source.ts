@@ -1957,7 +1957,6 @@ function repackPlanningCardWithSameSourceDisclosures(input: {
     capabilities: readonly HostCapabilityDescriptorV1[];
     effectCeiling: HostCapabilityDescriptorV1['effect'];
   };
-  liveCapabilities: readonly HostCapabilityDescriptorV1[];
   disclosed: readonly HostCapabilityDescriptorV1[];
 }): {
   capabilities: HostCapabilityDescriptorV1[];
@@ -1966,7 +1965,8 @@ function repackPlanningCardWithSameSourceDisclosures(input: {
   digest: string;
 } {
   const live = new Map<string, HostCapabilityDescriptorV1>();
-  for (const descriptor of input.liveCapabilities) live.set(descriptor.id, descriptor);
+  // A disclosure extends this request, not the whole configured inventory.
+  // Current definition validation happens before descriptors reach this repack.
   for (const descriptor of input.card.capabilities) live.set(descriptor.id, descriptor);
   for (const descriptor of input.disclosed) live.set(descriptor.id, descriptor);
   let effectCeiling = input.card.effectCeiling;
@@ -2463,7 +2463,6 @@ export async function primePrimaryModelPlanningCatalog(input: {
     ? repackPlanningCardWithSameSourceDisclosures({
         objective,
         card: reopenedInitialCard.card,
-        liveCapabilities: catalogDescriptors,
         disclosed: replayed.descriptors,
       })
     : {
@@ -2909,7 +2908,6 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
     const repacked = repackPlanningCardWithSameSourceDisclosures({
       objective: catalog.objective,
       card: { capabilities: catalog.capabilities, effectCeiling: catalog.effectCeiling },
-      liveCapabilities: catalog.liveCapabilities,
       disclosed: newlyDisclosed.flatMap((row) => (row.descriptor ? [row.descriptor] : [])),
     });
     catalog.effectCeiling = repacked.effectCeiling;

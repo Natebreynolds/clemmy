@@ -423,6 +423,8 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
   });
   assert.equal(initial.ok, true, initial.ok ? '' : initial.reason);
   if (!initial.ok) throw new Error(initial.reason);
+  const initialSnapshot = eventlog.listEvents(replaySession.id, { types: ['primary_model_planning_card_snapshot'] }).at(-1)?.data.snapshotJson;
+  assert.ok(initialSnapshot);
   const currentByIdentifier = new Map([create, readback, generic].map((identifier) => {
     const entry = factory.snapshot().find((candidate) =>
       candidate.manifest?.operationId === identifier);
@@ -485,10 +487,12 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
   assert.equal(replayed.ok, true, replayed.ok ? '' : replayed.reason);
   if (!replayed.ok) throw new Error(replayed.reason);
   assert.deepEqual(
-    replayed.planning.capabilities,
-    initial.planning.capabilities,
+    eventlog.listEvents(replaySession.id, { types: ['primary_model_planning_card_snapshot'] }).at(-1)?.data.snapshotJson,
+    initialSnapshot,
     'a later disclosure cannot rewrite the immutable initial planning card',
   );
+  assert.deepEqual(replayed.planning.capabilities.map(row => row.id).filter(id => !initial.planning.capabilities.some(row => row.id === id)), [currentByIdentifier.get(generic)!.descriptor.id],
+    'only the valid same-source disclosure extends the current card');
   const staged = new Set(semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
     authority: replayed.planning.authority,
     identity: replayed.planning.identity,
