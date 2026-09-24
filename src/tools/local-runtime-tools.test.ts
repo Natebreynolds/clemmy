@@ -574,3 +574,27 @@ test('promoted native opportunity schema is valid on the actual Claude wire', as
   const ajv = new Ajv2020({ strict: false });
   assert.equal(ajv.validateSchema(schema), true, JSON.stringify(ajv.errors));
 });
+
+test('the structural control lookup hands back schema handles when the host built the controls this turn', async () => {
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const { RunContext } = await import('@openai/agents');
+  const planSchema = { type: 'object', properties: { preamble: { type: 'string' }, draft: { type: 'object' } }, required: ['preamble', 'draft'], additionalProperties: false };
+  const search = buildScopedLocalToolSearch(
+    new Set(['space_save', 'workflow_run']),
+    'call_tool',
+    undefined,
+    [],
+    undefined,
+    () => new Map([['plan_task', { schema: planSchema, description: 'Admit and freeze one action plan.' }]]),
+  );
+  const context = new RunContext({ sessionId: 'structural-lookup-handles' });
+  const output = await search.invoke(context, JSON.stringify({ query: 'plan_task schema', role_key: null, limit: 5 }));
+  const payload = JSON.parse(String(output)) as { kind?: string; schema_handles?: Record<string, { cursor?: string }>; hint?: string };
+  assert.equal(payload.kind, 'host_structural_control_lookup_v1');
+  assert.ok(payload.schema_handles?.plan_task?.cursor, 'plan_task schema is reopenable from the lookup');
+  assert.equal(payload.schema_handles?.work_call, undefined, 'only controls the host built this turn get handles');
+  assert.match(String(payload.hint), /callable now by name/);
+  assert.ok(Buffer.byteLength(String(output), 'utf8') <= 2_048, 'handles keep the structural answer bounded');
+  const reopened = await search.invoke(context, JSON.stringify({ query: 'plan_task schema', role_key: null, limit: 5, cursor: payload.schema_handles!.plan_task!.cursor }));
+  assert.match(String(reopened), /"preamble"/, 'the handle redeems the complete current schema');
+});

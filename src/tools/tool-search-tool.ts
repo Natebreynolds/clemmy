@@ -1062,7 +1062,27 @@ export function registerToolSearchTool(
       // disclosure callback can run. The result grants no capabilityRef; the
       // ordinary orchestrator lifecycle owns when their real schemas appear.
       const structuralControl = deferredPage ? null : hostStructuralPlanningControlLookup(query);
-      if (structuralControl) return textResult(JSON.stringify(structuralControl));
+      if (structuralControl) {
+        // When the host built these controls for this turn, hand back their
+        // complete current schemas as bounded handles: off the act route
+        // plan_task is schema-on-demand (not in the prefix), and a model that
+        // needs it must be able to reopen the exact contract from this answer.
+        const runtime = opts.runtimeToolMetadata?.();
+        const schemaHandles: Record<string, ToolSearchSchemaHandle> = {};
+        for (const row of structuralControl.results) {
+          const metadata = runtime?.get(row.name);
+          if (!metadata || metadata.schema === undefined) continue;
+          const handle = continuations.storeSchema(metadata.schema, continuationSessionId);
+          if (handle) schemaHandles[row.name] = handle;
+        }
+        return textResult(JSON.stringify(Object.keys(schemaHandles).length > 0
+          ? {
+              ...structuralControl,
+              schema_handles: schemaHandles,
+              hint: `${structuralControl.hint} These controls are callable now by name (or through call_tool); reopen a complete schema with tool_search cursor = schema_handles[name].cursor.`,
+            }
+          : structuralControl));
+      }
       let brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
       let skippedBroadDiscovery = false;

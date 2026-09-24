@@ -4017,7 +4017,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // control on the fresh planning surface so that exact host evidence can
       // produce one visible, resumable choice instead of falling back to the
       // background-agent check-in tool with the same public name.
-      ? [...reviewedComputeResults, buildPlanTaskTool({ planning: hostFreshPlanning }), buildAskUserQuestionTool(), runWorkerTool]
+      // plan_task is called on ~5% of turns (48 of 1,045 in the week to
+      // 2026-09-24) yet rode the schema block on 443 frames at ~3k tokens each,
+      // and its mid-turn enablement was the last remaining prefix break on every
+      // wire. Off the act route its schema stays reachable through tool_search
+      // (the structural control lookup returns a schema handle) and it remains
+      // callable directly or through call_tool; only the always-on schema bytes
+      // leave the prefix. The host advertises it normally when the acquisition
+      // doors are absent.
+      ? [...reviewedComputeResults, Object.assign(buildPlanTaskTool({ planning: hostFreshPlanning }), {
+          // Route-aware: an act route keeps plan_task first-class from frame
+          // one; a retrieve or direct-reply route reaches it by search then
+          // call (the structural lookup hands back a schema handle).
+          deferLoading: options.acceptedRoute === 'retrieve' || options.acceptedRoute === 'direct_reply',
+        }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
     ? [plannerTool!, buildAskUserQuestionTool()]

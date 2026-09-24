@@ -11492,3 +11492,54 @@ test('a retained tool re-enabled with its sealed schema keeps its place; a chang
   await runProductionHost(fresh, freshAgent);
   assert.deepEqual(freshSurfaces[0], ['task_list', 'workspace_roots'], 'after a restart the order is the configured first-seen order, not a stale memory');
 });
+
+test('a deferLoading tool stays callable but leaves the schema block when the search and call doors are present', async () => {
+  const { _resetAdvertisedSurfaceMemoryForTests } = await import('./host-turn-runner.js');
+  _resetAdvertisedSurfaceMemoryForTests();
+  const invoked: string[] = [];
+  const build = (name: string, extra: Record<string, unknown> = {}) => brackets.wrapToolForHarness({
+    type: 'function', name, description: `${name} fixture`,
+    parameters: { type: 'object', properties: {} },
+    invoke: async () => { invoked.push(name); return `${name} ran`; }, needsApproval: async () => false,
+    ...extra,
+  } as never);
+  const doorSearch = build('tool_search');
+  const doorCall = build('call_tool');
+  const read = build('workspace_roots');
+  const deferred = build('memory_search', { deferLoading: true });
+  // With both doors: the deferred schema is absent, the tool still runs by name.
+  const fixture = acceptHostCanarySource('deferred-with-doors');
+  const surfaces: string[][] = [];
+  let call = 0;
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      surfaces.push((request.tools ?? []).map((t) => t.name ?? ''));
+      call += 1;
+      return { usage: {}, output: call === 1 ? [toolCall('d1', 'memory_search', {})] : [textMsg('deferred done')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = { model, tools: [doorSearch, doorCall, read, deferred], getAllTools: async () => [doorSearch, doorCall, read, deferred] };
+  bindHostCanarySurface(fixture, agent, [doorSearch, doorCall, read, deferred]);
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(outcome.finalOutput, 'deferred done', JSON.stringify(outcome.history).slice(0, 1500));
+  assert.deepEqual(surfaces[0], ['tool_search', 'call_tool', 'workspace_roots'], 'the deferred schema is not on the wire');
+  assert.deepEqual(surfaces[1], surfaces[0]);
+  assert.deepEqual(invoked, ['memory_search'], 'and it still executed when called by name');
+
+  // Without the doors the same tool is advertised: nothing becomes unreachable.
+  _resetAdvertisedSurfaceMemoryForTests();
+  const bare = acceptHostCanarySource('deferred-without-doors');
+  const bareSurfaces: string[][] = [];
+  const bareModel = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      bareSurfaces.push((request.tools ?? []).map((t) => t.name ?? ''));
+      return { usage: {}, output: [textMsg('bare done')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const bareAgent = { model: bareModel, tools: [read, deferred], getAllTools: async () => [read, deferred] };
+  bindHostCanarySurface(bare, bareAgent, [read, deferred]);
+  await runProductionHost(bare, bareAgent);
+  assert.deepEqual(bareSurfaces[0], ['workspace_roots', 'memory_search']);
+});

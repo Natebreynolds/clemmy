@@ -2774,8 +2774,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
    *  source so far, in first-seen order, each with its last shown schema. */
   const advertisedSchemas = (enabled: FunctionToolLike[]): unknown[] => {
     const memory = surfaceMemory();
-    const current = serializedTools(enabled);
-    enabled.forEach((tool, index) => memory.shown.set(tool.name, current[index]));
+    // Schema on demand: a tool marked deferLoading stays enabled and callable
+    // (directly or carried through call_tool) but its schema rides the prefix
+    // only when the model has no search/call doors to fetch it with.
+    const acquisitionDoors = enabled.some((tool) => tool.name === 'tool_search')
+      && enabled.some((tool) => tool.name === 'call_tool');
+    const advertised = acquisitionDoors
+      ? enabled.filter((tool) => (tool as { deferLoading?: unknown }).deferLoading !== true)
+      : enabled;
+    const current = serializedTools(advertised);
+    advertised.forEach((tool, index) => memory.shown.set(tool.name, current[index]));
     const enabledNames = new Set(enabled.map((tool) => tool.name));
     // Bounded: release the oldest names that are not enabled right now.
     for (const name of [...memory.shown.keys()]) {
