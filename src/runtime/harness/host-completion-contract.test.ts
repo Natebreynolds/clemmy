@@ -1190,3 +1190,40 @@ test('workflow request scope stays lazy, survives reopen and cannot be supplied 
   assert.match(missing.summary, /sealed request scope UNAVAILABLE/);
   assert.doesNotMatch(missing.summary, /FORGED_TRANSCRIPT_SCOPE|VERIFIED REQUEST SCOPE/);
 });
+
+ test('parent and verified worker reads share identical content once while preserving scope and distinct results', () => {
+  const parent = accepted('Use two workers to compare the provided records.');
+  retainedRead(parent, 'run_worker', { status: 'completed' });
+  const common = 'SHARED_REFERENCE_BODY_UNIQUE';
+  retainedRead(parent, 'read_file', common);
+  const children: Array<ReturnType<typeof accepted>> = [];
+  for (const item of ['first', 'second']) {
+    const session = events.createSession({ id: `dedup-worker-${++serial}`, kind: 'chat' });
+    const binding = { parentSessionId: parent.sessionId, parentSourceUserSeq: parent.sourceUserSeq,
+      parentAcceptedTaskId: identities.acceptedTaskIdFor(parent.sessionId, parent.sourceUserSeq),
+      parentLogicalCallId: 'read:run_worker', packetDigest: `packet-${item}`, item };
+    const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: `Compare ${item}`, delegatedWorker: binding } });
+    const child = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+    children.push(child);
+    events.appendEvent({ sessionId: parent.sessionId, turn: 1, role: 'system', type: 'worker_started',
+      data: { ...binding, childSessionId: child.sessionId, childSourceUserSeq: child.sourceUserSeq } });
+    retainedRead(child, 'read_file', common);
+    retainedRead(child, 'records__read', `DISTINCT_RESULT_${item}`);
+  }
+  const bulk = 'COMPLETE_RETAINED_PAGE '.repeat(DEFAULT_TOOL_RESULT_MAX_CHARS);
+  retainedRead(parent, 'atlas__bulk', bulk);
+  retainedRead(children[0]!, 'tool_output_query', bulk);
+  const evidence = sourceSettledReadEvidence(parent);
+  assert.equal(evidence.results.find(row => row.toolName === 'tool_output_query')?.contentComplete, true,
+    'a bounded parent source cannot suppress a full worker projection');
+  assert.equal(evidence.summary.split(common).length - 1, 1);
+  for (const item of ['first', 'second']) assert.ok(evidence.summary.includes(`DISTINCT_RESULT_${item}`));
+  for (const child of children) {
+    assert.ok(evidence.summary.includes(child.sessionId));
+    const reopened = sourceEvidenceLookup(parent).resolve(`worker:${child.sessionId}:${child.sourceUserSeq}:read:read_file`);
+    assert.equal(reopened?.text, common, 'deduplication never removes independently redeemable worker evidence');
+  }
+  assert.equal(evidence.results.filter(row => row.toolName === 'read_file').length, 3);
+  assert.equal(evidence.results.filter(row => row.contentDisposition === 'duplicate_content').length, 2);
+});

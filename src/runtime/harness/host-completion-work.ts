@@ -437,7 +437,7 @@ export function sourceSettledReadEvidence(input: {
   /** Parent completion can inspect already-settled writes. This is evidence,
    * never permission to execute again or proof of later scheduled effects. */
   includeWriteReceipts?: boolean;
-}): CompletionReadEvidence {
+}, sharedContent: Map<string, string> = new Map()): CompletionReadEvidence {
   try {
     const rows = openEventLog().prepare(`
       SELECT s.rowid AS settlementIndex, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
@@ -473,7 +473,10 @@ export function sourceSettledReadEvidence(input: {
         return false;
       }
     };
-    const seenContent = new Map<string, string>();
+    // One rendering owns one content dictionary across the exact parent and
+    // authenticated child scopes. Receipts and request scope remain per call;
+    // only identical payload bytes share their presentation, never authority.
+    const seenContent = sharedContent;
     const succeeded = (outcome: string): boolean => outcome === 'succeeded' || outcome === 'empty_result';
     // Discovery is scaffolding once a business read has answered; when nothing
     // else was read, what discovery found may itself be the answer.
@@ -583,8 +586,12 @@ export function sourceSettledReadEvidence(input: {
       // distinct result; the final state alone cannot prove an intermediate
       // enable, edit, or recovery the user explicitly asked us to verify.
       // Identical bytes still appear once, with every call retaining its scope.
-      const duplicateOf = seenContent.get(value.rawPayloadSha256);
-      if (!seenContent.has(value.rawPayloadSha256)) seenContent.set(value.rawPayloadSha256, row.callId);
+      // A full retained page cannot be replaced by an earlier bounded source
+      // view, and discovery navigation cannot stand in for business data.
+      const presentationKey = `${value.rawPayloadSha256}:${evidenceKind}:${row.toolName === 'tool_search' ? 'discovery' : 'data'}`;
+      const duplicateOf = seenContent.get(presentationKey);
+      if (!seenContent.has(presentationKey)) seenContent.set(presentationKey,
+        `${row.callId} (session=${input.sessionId}, source=${input.sourceUserSeq})`);
       // A discovery that found nothing stays whole: that absence can be the
       // evidence for a reply saying no capability fits.
       // An advisory cursor already covered these schemas. Keep the receipt
@@ -644,7 +651,7 @@ export function sourceSettledReadEvidence(input: {
     let throughSettlementIndex = rows.at(-1)?.settlementIndex ?? input.afterSettlementIndex ?? 0;
     if (input.includeWorkerResults !== false) {
       for (const worker of sourceWorkerEvidenceScopes(input)) {
-        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false });
+        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false }, seenContent);
         evidenceAvailable = evidenceAvailable && evidence.evidenceAvailable;
         throughSettlementIndex = Math.max(throughSettlementIndex, evidence.throughSettlementIndex ?? 0);
         results.push(...evidence.results);

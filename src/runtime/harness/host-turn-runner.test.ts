@@ -1968,7 +1968,9 @@ test('fresh chat selects production host_v1, bypasses the SDK loop, and closes o
     let legacyRunnerCalls = 0;
     const outcome = await runConversation({
       sessionId: session.id,
-      input: 'hello from a fresh chat',
+      // A bare greeting is the declared zero-tool case. Ambiguous free text
+      // deliberately retains discovery; that is covered by the surface suite.
+      input: 'hello',
       turnEngine: 'host_v1',
       maxSteps: 1,
       judgeCompletion: false,
@@ -3648,37 +3650,37 @@ test('production host refuses a spill-capable table read before its real body', 
 
 test('host lifecycle listener propagates an over-limit pre-invoke checkpoint', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
-  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('listener-tool-limit', 'Read both local result slots.');
   let firstRuns = 0;
   let secondRuns = 0;
   const model = stubModel([[
-    toolCall('cap-first', 'cap_fixture', { slot: 1 }),
-    toolCall('cap-second', 'cap_fixture', { slot: 2 }),
+    toolCall('cap-first', 'list_files', { slot: 1 }),
+    toolCall('cap-second', 'list_files', { slot: 2 }),
   ]]);
   const runner = throwingRunner();
   const counter = new brackets.ToolCallsCounter(1);
   runner.on('agent_tool_start', () => counter.increment());
   try {
     let caught: unknown;
-    await assert.rejects(hostRunRunner(
-        runner as never,
-        {
-        model,
-        tools: [{
-          type: 'function', name: 'cap_fixture', description: 'cap-only local fixture',
-          parameters: { type: 'object', properties: { slot: { type: 'number' } } },
-          needsApproval: async () => false,
-          invoke: async (_context: unknown, raw: string) => {
-            const slot = (JSON.parse(raw) as { slot: number }).slot;
-            if (slot === 1) firstRuns += 1;
-            else secondRuns += 1;
-            return `slot-${slot}`;
-          },
-        }],
-        } as never,
-        [{ type: 'message', role: 'user', content: 'cap-only fixture' }] as never,
-        { maxTurns: 3 },
-      ), (error) => {
+    const read = brackets.wrapToolForHarness({
+      type: 'function', name: 'list_files', description: 'cap-only local fixture',
+      parameters: { type: 'object', properties: { slot: { type: 'number' } } },
+      needsApproval: async () => false,
+      invoke: async (_context: unknown, raw: string) => {
+        const slot = (JSON.parse(raw) as { slot: number }).slot;
+        if (slot === 1) firstRuns += 1;
+        else secondRuns += 1;
+        return `slot-${slot}`;
+      },
+    } as never);
+    const agent = { model, tools: [read] };
+    bindHostCanarySurface(fixture, agent, agent.tools);
+    await assert.rejects(brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+      runner as never, agent as never,
+      [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+      { maxTurns: 3, hostTurnEngine: 'host_v1', context: fixture.context } as never,
+    )), (error) => {
         caught = error;
         return error instanceof brackets.ToolCallsLimitExceeded;
       });
@@ -3714,45 +3716,61 @@ test('host lifecycle listener propagates an over-limit pre-invoke checkpoint', a
   }
 });
 
-test('host-owned accounting propagates an over-limit native MCP checkpoint', async () => {
+test('host-owned accounting propagates an over-limit native MCP checkpoint', async (t) => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   let firstRuns = 0;
   let secondRuns = 0;
-  const model = stubModel([[
-    toolCall('mcp-cap-first', 'native_cap_fixture', { slot: 1 }),
-    toolCall('mcp-cap-second', 'native_cap_fixture', { slot: 2 }),
-  ]]);
-  const parent = {
-    sessionId: 'cap-only-no-durable-source',
-    counter: new brackets.ToolCallsCounter(1),
-    behaviorScopeId: 'cap-only-no-durable-source::turn',
+  const fixture = acceptHostCanarySource('native-mcp-budget', 'Read both slots from the connected records service.');
+  fixture.parent.counter = new brackets.ToolCallsCounter(1);
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  t.after(() => {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    capabilityManifestStores.installCapabilityManifestStore(priorStore);
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+  });
+  const mcpTool = brackets.wrapToolForHarness({
+    type: 'function', name: 'budgetrecords__read', description: 'Read a record slot.',
+    parameters: { type: 'object', properties: { slot: { type: 'number' } }, required: ['slot'] },
+    needsApproval: async () => false,
+    invoke: async () => { throw new Error('only the admitted MCP port may execute'); },
+  });
+  const server = {
+    async invalidateToolsCache() {},
+    async listTools() { return [{ name: mcpTool.name, description: mcpTool.description, inputSchema: mcpTool.parameters,
+      annotations: { readOnlyHint: true, destructiveHint: false } }]; },
+    async callTool(_name: string, args: { slot: number }) {
+      if (args.slot === 1) firstRuns++; else secondRuns++;
+      return [{ type: 'text', text: JSON.stringify({ slot: args.slot }) }];
+    },
   };
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore([], { durable: true }));
+  const materialized = await productionMcp.createProductionMcpReadCarrier({ serverName: 'budgetrecords', runtime: {
+    configuredServers: () => [{ name: 'budgetrecords', type: 'stdio', command: '/fixture/records-mcp', args: [], enabled: true, source: 'user' }] as never,
+    serverForEnumeration: () => server as never, serverForOperation: () => server as never,
+  } }).materializeExact({ operationId: mcpTool.name, inputSchema: mcpTool.parameters });
+  assert.equal(materialized.status, 'installed', JSON.stringify(materialized));
+  capabilityResolution.recordAdmissionCapabilityResolution({
+    sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, acceptedInput: String(fixture.source.data.text),
+    entries: [{ intent: 'read the two slots', kind: 'mcp', identifier: mcpTool.name, status: 'proven',
+      connection: 'active', effectClass: 'read', accountIdentity: materialized.status === 'installed' ? materialized.manifest.accountId : undefined }],
+  });
+  const model = stubModel([[
+    toolCall('mcp-cap-first', mcpTool.name, { slot: 1 }),
+    toolCall('mcp-cap-second', mcpTool.name, { slot: 2 }),
+  ]]);
+  const agent = { model, tools: [], getAllTools: async () => [mcpTool] };
+  bindHostCanarySurface(fixture, agent, [mcpTool]);
   try {
     let caught: unknown;
-    await assert.rejects(brackets.withHarnessRunContext(parent, () => hostRunRunner(
-        throwingRunner() as never,
-        {
-          model,
-          tools: [],
-          getAllTools: async () => [{
-            type: 'function', name: 'native_cap_fixture', description: 'cap-only external fixture',
-            parameters: { type: 'object', properties: { slot: { type: 'number' } } },
-            needsApproval: async () => false,
-            invoke: async (_context: unknown, raw: string) => {
-              const slot = (JSON.parse(raw) as { slot: number }).slot;
-              if (slot === 1) firstRuns += 1;
-              else secondRuns += 1;
-              return `slot-${slot}`;
-            },
-          }],
-        } as never,
-        [{ type: 'message', role: 'user', content: 'cap-only fixture' }] as never,
-        { maxTurns: 3 },
-      )), (error) => {
-        caught = error;
-        return error instanceof brackets.ToolCallsLimitExceeded;
-      });
+    await assert.rejects(runProductionHost(fixture, agent, undefined, { maxTurns: 3 }), (error) => {
+      caught = error;
+      return error instanceof brackets.ToolCallsLimitExceeded;
+    });
     const checkpoint = hostToolCallsLimitCheckpointFor(caught);
     assert.ok(checkpoint);
     assert.equal(model.calls(), 1, 'the model cannot reason past host budget control');
@@ -4505,27 +4523,24 @@ test('unsupported tool, handoff, namespace, and output surfaces fail closed befo
 });
 
 test('toolUseBehavior remains the terminal control boundary without another model step', async () => {
+  const fixture = acceptHostCanarySource('terminal-control', 'Ask me which account to use.');
   const model = stubModel([
-    [toolCall('terminal-control', 'ask_once', {})],
+    [toolCall('terminal-control', 'ask_user_question', {})],
     [textMsg('must not run')],
   ]);
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [{
-        type: 'function', name: 'ask_once', description: 'ask', parameters: { type: 'object', properties: {} },
-        invoke: async () => 'Question posted: Which account?', needsApproval: async () => false,
-      }],
-      toolUseBehavior: async (_context: unknown, results: Array<{ output: unknown }>) => ({
-        isFinalOutput: true,
-        isInterrupted: undefined,
-        finalOutput: String(results[0]?.output ?? ''),
-      }),
-    } as never,
-    [] as never,
-    { maxTurns: 4 },
-  );
+  const question = brackets.wrapToolForHarness({
+    type: 'function', name: 'ask_user_question', description: 'ask', parameters: { type: 'object', properties: {} },
+    invoke: async () => 'Question posted: Which account?', needsApproval: async () => false,
+  } as never);
+  const agent = {
+    model, tools: [question],
+    toolUseBehavior: async (_context: unknown, results: Array<{ output: unknown }>) => ({
+      isFinalOutput: true, isInterrupted: undefined,
+      finalOutput: String(results[0]?.output ?? ''),
+    }),
+  };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent);
   assert.equal(model.calls(), 1);
   assert.equal(outcome.finalOutput, 'Question posted: Which account?');
 });
@@ -4710,27 +4725,31 @@ test('FunctionTool errors remain model-visible and post-invocation control error
 });
 
 test('a response-window limit retries a smaller piece without accepting or executing the truncated frame', async () => {
+  const fixture = acceptHostCanarySource('response-window-recovery', 'Read the complete local result.');
   let calls = 0;
   const dispatched: string[] = [];
   const model = {
     async getResponse(request: { input?: unknown }) {
       calls += 1;
-      if (calls === 1) return { usage: {}, output: [textMsg('partial private draft'), toolCall('truncated-call', 'ping', { q: 'discarded' })],
+      if (calls === 1) return { usage: {}, output: [textMsg('partial private draft'), toolCall('truncated-call', 'read_file', { q: 'discarded' })],
         providerData: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } };
       if (calls === 2) {
         const input = JSON.stringify(request.input);
         assert.match(input, /smaller complete piece/);
         assert.doesNotMatch(input, /partial private draft|truncated-call|discarded/);
-        return { usage: {}, output: [toolCall('complete-call', 'ping', { q: 'complete' })] };
+        return { usage: {}, output: [toolCall('complete-call', 'read_file', { q: 'complete' })] };
       }
       return { usage: {}, output: [textMsg('all done')] };
     },
     getStreamedResponse: testModelStream,
   };
-  const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [{
-    type: 'function', name: 'ping', description: 'test', parameters: { type: 'object', properties: {} },
+  const read = brackets.wrapToolForHarness({
+    type: 'function', name: 'read_file', description: 'test', parameters: { type: 'object', properties: {} },
     invoke: async (_context: unknown, input: string) => { dispatched.push(input); return 'pong'; }, needsApproval: async () => false,
-  }] } as never, [] as never, { maxTurns: 8 });
+  } as never);
+  const agent = { model, tools: [read] };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 8 });
   assert.equal(calls, 3);
   assert.equal(dispatched.length, 1);
   assert.match(dispatched[0]!, /complete/);
@@ -4833,6 +4852,7 @@ test('continuous private reasoning may exceed the first-content wall without exc
 });
 
 test('an empty current step cannot complete with stale text from an earlier tool frame', async () => {
+  const fixture = acceptHostCanarySource('empty-current-step', 'Read the current local result.');
   let step = 0;
   let toolRuns = 0;
   const model = {
@@ -4840,7 +4860,7 @@ test('an empty current step cannot complete with stale text from an earlier tool
     async *getStreamedResponse() {
       step += 1;
       const output = step === 1
-        ? [textMsg('stale earlier narration'), toolCall('stale-call', 'stale_read', {})]
+        ? [textMsg('stale earlier narration'), toolCall('stale-call', 'read_file', {})]
         : [{ type: 'reasoning', content: [{ type: 'input_text', text: 'private only' }] }];
       yield {
         type: 'model',
@@ -4856,20 +4876,15 @@ test('an empty current step cannot complete with stale text from an earlier tool
       } as never;
     },
   };
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [{
-        type: 'function', name: 'stale_read', description: 'read',
-        parameters: { type: 'object', properties: {} },
-        needsApproval: async () => false,
-        invoke: async () => { toolRuns += 1; return 'read'; },
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 3 },
-  );
+  const read = brackets.wrapToolForHarness({
+    type: 'function', name: 'read_file', description: 'read',
+    parameters: { type: 'object', properties: {} },
+    needsApproval: async () => false,
+    invoke: async () => { toolRuns += 1; return 'read'; },
+  } as never);
+  const agent = { model, tools: [read] };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 3 });
   assert.equal(toolRuns, 1);
   assert.equal(step, 2);
   assert.equal(outcome.terminal?.status, 'blocked');
@@ -5998,41 +6013,33 @@ test('a blocked turn retains the PRIOR accepted response id rather than losing i
 });
 
 test('host consumes only the admitted canonical call projection', async () => {
+  const fixture = acceptHostCanarySource('canonical-call', 'Read the literal local result.');
   const exactArguments = '{"q":"literal"}';
   let invokedWith = '';
   const model = stubModel([
     [{
       type: 'function_call',
       callId: '  canonical-call  ',
-      name: '  ping  ',
+      name: '  read_file  ',
       arguments: exactArguments,
     }],
     [textMsg('canonical done')],
   ]);
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      instructions: 'base system',
-      tools: [{
-        type: 'function', name: 'ping', description: 'test',
-        parameters: { type: 'object', properties: { q: { type: 'string' } } },
-        invoke: async (_context: unknown, input: string) => {
-          invokedWith = input;
-          return 'pong';
-        },
-      }],
-    } as never,
-    [{ type: 'message', role: 'user', content: 'go' }] as never,
-    { maxTurns: 3, context: { sessionId: 'host-canonical-call' } },
-  );
+  const read = brackets.wrapToolForHarness({
+    type: 'function', name: 'read_file', description: 'test',
+    parameters: { type: 'object', properties: { q: { type: 'string' } } },
+    invoke: async (_context: unknown, input: string) => { invokedWith = input; return 'pong'; },
+  } as never);
+  const agent = { model, instructions: 'base system', tools: [read] };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 3 });
   assert.equal(outcome.finalOutput, 'canonical done');
   assert.equal(invokedWith, exactArguments, 'execution received the canonical admitted argument bytes');
   const stored = outcome.history.find((item) => (item as { type?: string }).type === 'function_call') as {
     callId: string; name: string; arguments: string;
   };
   assert.equal(stored.callId, 'canonical-call');
-  assert.equal(stored.name, 'ping');
+  assert.equal(stored.name, 'read_file');
   assert.equal(stored.arguments, invokedWith, 'history and execution came from the same canonical frame');
 });
 

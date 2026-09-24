@@ -19,3 +19,18 @@ Owner requested takeover through optimization and tag. Work remains on harness/3
 5. Full idle-machine tests/journeys and package/upgrade/release gates on the final candidate, then merge/tag only that verified series.
 
 No release, full-suite, latency improvement or live judge-repair success is claimed by these focused tests.
+
+## Installed acceptance and reviewer cost
+
+- Installed 0693a9ab8 via Terminal command, Developer ID signing and verification; fingerprint cf3ad523f0f77036e94aa6b1f4cbb4525b37e2f5db1af617b5021e3ca8e6b3dc. App UI archive digest unchanged. Rollback in /private/tmp/clem-takeover-patch and daemon dist.backup-NDHT08.
+- Repeated the exact three fictional prospect draft-only request. Parent source 294694 in sess-desktop-7f1c79608e9ef856beedd471 completed in 92.6 s with a real positive completion verdict after a genuine draft inconsistency was corrected; no failed-open completion. This did not force a malformed verdict, so the repair branch itself remains recording-tested, not forced live.
+- Parent-only measurements: 263,922 uncached tokens; 232,819 reviewer, 27,017 brain, 4,086 router. Three workers have separate accepted sources (294724, 294727, 294730); their totals are 25,108 / 26,484 / 22,811 uncached. Combined total 338,325. Do not label parent-only totals as the complete task cost. Existing measure-source-turn.mjs produced each measurement; receipts in /private/tmp/clem-takeover-live/baseline-parent-and-workers.json.
+- Cross-worker evidence duplication pin failed before fix (same reference rendered 3 times). One per-render content dictionary now spans authenticated parent/worker lineage; every receipt and request scope stays visible and original worker evidence stays redeemable. Distinct results stay whole. A retained full page and bounded source view never share a presentation key. Completion contract suite: 47 pass, 1 existing opt-in private fixture skipped. Live benefit pending.
+
+## Test debt attribution and first production migrations
+
+All 15 previously failing top-level names were run individually on the candidate and v3.18.19; all reproduced. Logs and per-name results: /private/tmp/clem-takeover-failure-attribution/results.json. This establishes history, not release clearance.
+
+Seven fixtures now pass together via the production host: fresh bare greeting, lifecycle pre-invoke limit, native MCP limit, terminal tool behavior, truncated-response retry, stale-text rejection, and canonical admitted argument projection. They use real accepted-source metadata and sealed envelopes; the MCP case materializes an adapter-shaped recording server through the production carrier. Original body-count, ordering, no-repeat, paired-receipt and terminal assertions remain. The greeting uses the explicit bare greeting case; ambiguous greeting-prefixed hosted requests retain the separate regression coverage. No runtime authority was loosened.
+
+An attempted shared component-helper migration was discarded because supplying metadata alone did not satisfy actual execution authority and created a new fixture failure. The original unowned component helper is unchanged. Remaining fixtures require individual migration, not broader bypasses. Typecheck and diff check pass. Whole-file rerun and full release gates still owed.
