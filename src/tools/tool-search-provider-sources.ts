@@ -1,6 +1,7 @@
 import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { createProductionMcpReadCarrier, type ProductionMcpRuntime } from '../runtime/harness/production-mcp-read-carrier.js';
+import { learnComposioOperationEffects } from '../integrations/composio/learned-operation-effect.js';
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
@@ -1657,6 +1658,15 @@ export async function provisionExactWorkflowProviderOperations(input: {
     };
   }
 
+  try {
+    await learnComposioOperationEffects(
+      operationIds.map((operation) => {
+        const candidate = materializedBySlug.get(operation);
+        return { slug: operation, description: candidate?.description, inputSchema: candidate?.inputParameters };
+      }),
+      { sessionId: input.sessionId, deadlineAt: Date.now() + Math.max(2_000, Math.min(totalDeadlineMs, 8_000)) },
+    );
+  } catch { /* the conservative default stands */ }
   const selectedAccounts = new Map((input.selectedAccounts ?? []).map(entry => [
     entry.operationId.trim().toUpperCase(), entry.accountId.trim(),
   ]));
@@ -2509,6 +2519,15 @@ export function buildAuthorizedToolSearchCandidateSources(
         return true;
       });
       if (signal?.aborted) return [];
+      // A noun-shaped operation learns its effect from its own description and
+      // schema before anything routes on that effect (live 2026-09-24:
+      // MONDAY_BOARDS, a board read, was reviewed and refused as a write).
+      try {
+        await learnComposioOperationEffects(
+          merged.slice(0, 20).map((candidate) => ({ slug: candidate.slug, description: candidate.description, inputSchema: candidate.inputParameters })),
+          { ...(planningIdentity ? { sessionId: planningIdentity.sessionId } : {}), ...(deadlineAt !== undefined ? { deadlineAt } : {}) },
+        );
+      } catch { /* the conservative write default stands */ }
       const liveCandidates = merged
         .map((candidate, index): ToolSearchBrokerCandidate => ({
           name: candidate.slug,

@@ -563,8 +563,14 @@ export async function prepareProvenOperationForRequest(input: {
   let invocations: unknown[] = [];
   let boundAccounts: ProvenBoundAccount[] = [];
   const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
+  // A strategy that does not cover the request must not spend the request's
+  // time provisioning its operations. Live 2026-09-24 (source 299433): "I just
+  // connected monday.com, check that" matched a calendar strategy and spent
+  // 19 s publishing Outlook operations before the brain's first frame.
+  const coversRequest = provenStrategyCoversRequest(input.query, strategy);
   if (
-    composioSlugs.length > 0
+    coversRequest
+    && composioSlugs.length > 0
     && input.sessionId
     && Number.isSafeInteger(input.sourceUserSeq)
     && (input.sourceUserSeq ?? 0) > 0
@@ -619,7 +625,8 @@ export async function prepareProvenOperationForRequest(input: {
       && !composioSlugs.includes(trimmed.toUpperCase());
   });
   if (
-    liveReadIds.length > 0
+    coversRequest
+    && liveReadIds.length > 0
     && input.sessionId
     && Number.isSafeInteger(input.sourceUserSeq)
     && (input.sourceUserSeq ?? 0) > 0

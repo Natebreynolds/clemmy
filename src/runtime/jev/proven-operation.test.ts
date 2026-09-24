@@ -402,3 +402,27 @@ test('proven request shapes are rendered for the brain and a generic MCP operati
   assert.equal(entry.effectClass, 'unknown', 'a generic operation is never recorded as a proven read');
   assert.match(entry.intent, /effect is decided per call/);
 });
+
+test('a strategy that matches but does not cover the request provisions nothing before the first frame', async () => {
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  recordRunStrategy({
+    objective: 'check the monday boards and items for the launch project status',
+    toolsUsed: ['records__search'],
+    workerCount: 0, durationMs: 9_000,
+    learningReceipt: evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:cov-a', sourceId: 'cov-a', terminalSuccess: true, controllerValidation: true }).receipt!,
+  });
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'coverage' });
+  const query = 'i just connected monday for a project i am working on can you check that for me please';
+  const accepted = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: query } });
+  const asked: string[] = [];
+  const prepared = await prepareProvenOperationForRequest({ query, sessionId: session.id, sourceUserSeq: accepted.seq, acceptedInput: query }, {
+    acquireLiveRead: async ({ operation }) => { asked.push(operation); return { status: 'installed', kind: 'mcp', operation, accountId: 'acct' }; },
+  });
+  if (prepared.strategyId) {
+    assert.deepEqual(asked, [], 'a partial match is offered as guidance only; nothing is provisioned on the request\'s clock');
+    assert.deepEqual(prepared.liveReads, []);
+    assert.equal(prepared.skipDiscoverySearch, false);
+  } else {
+    assert.deepEqual(asked, []);
+  }
+});

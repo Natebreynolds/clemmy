@@ -8,6 +8,7 @@
 import {
   documentedComposioOperationSemantic,
 } from './operation-semantics.js';
+import { learnedComposioOperationEffect } from './learned-operation-effect-store.js';
 
 export type ComposioSlugEffect = 'read' | 'external_write';
 
@@ -234,6 +235,17 @@ export function composioSlugHasCuratedReadRule(slug: string | null | undefined):
 }
 
 export function composioSlugEffectEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
+  const verb = composioSlugVerbEvidence(slug);
+  if (verb !== 'unknown') return verb;
+  // A verdict a model reached from the operation's own description and schema
+  // (learned-operation-effect.ts) is affirmative evidence for that exact slug.
+  const learned = learnedComposioOperationEffect(String(slug ?? '').trim().toUpperCase());
+  return learned ? learned.effect : 'unknown';
+}
+
+/** Verb evidence from the slug alone, without the learned layer. The learner
+ * uses this to decide which operations still need a model's reading. */
+export function composioSlugVerbEvidence(slug: string | null | undefined): ComposioSlugEffectEvidence {
   const upper = String(slug ?? '').trim().toUpperCase();
   if (!upper) return 'unknown';
 
@@ -278,9 +290,10 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   // Bare CALL/POST actions (no anchoring read verb) are outbound writes.
   if (tokens.some((token) => AMBIGUOUS_OBJECT_TOKENS.has(token))) return 'write';
   // No recognized read/write/ambiguous token at all: a pure noun endpoint such
-  // as SLACK_CONVERSATIONS_HISTORY or TWITTER_USER_TIMELINE. Genuinely unknown
-  // — a caller's declared `sideEffect: read` is the best available signal, so
-  // an existing declared-read workflow keeps validating (fold 2026-07-17 #4).
+  // as SLACK_CONVERSATIONS_HISTORY, TWITTER_USER_TIMELINE or MONDAY_BOARDS.
+  // Genuinely unknown from the name alone — a caller's declared
+  // `sideEffect: read` is the best available signal, so an existing
+  // declared-read workflow keeps validating (fold 2026-07-17 #4).
   return 'unknown';
 }
 
