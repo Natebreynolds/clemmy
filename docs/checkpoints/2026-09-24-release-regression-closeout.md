@@ -105,3 +105,43 @@ The mixed variant allows no second request when no cold row is selected.
 Full file: 14/14 passed (`/private/tmp/clem-planning-card-final.log`). This update
 changes only test coverage and this checkpoint; runtime bytes are unchanged.
 Final exact-commit gates and installed workflow acceptance remain owed.
+
+## Installed workflow authoring: correct work, unreviewed goal
+
+9877d9978 built and passed Terminal hotpatch/signature verification. Served
+fingerprint 3b5b72c0448920fe36fca5a07421c98252e6ccbfcc0a420f4f43a9092f24bea0,
+daemon69607. Source295938, session sess-desktop-864ee7e8f18b3653cce870da, created
+`harness-release-9877d997-check`, passed its creation test, enabled it, read back
+enabled=true, then ran saved workflow1790248549015-42a436. Actual local input
+contained three records with amounts7,9,11. Final result COUNT3/TOTAL27 is correct.
+No schedule, external effect, or business workflow mutation. Source finished
+with no open attempts. Evidence under `/private/tmp/clem-release-9877d997-live/`.
+
+This is NOT clean acceptance: the goal review failed open with the generic
+`judge unavailable`, and the run delivered a truthful unreviewed advisory.
+Whole-objective pass=false; no verifier success is claimed. Transport failures
+also appeared in other services near that time, but the root judge error was
+discarded, so do not infer quota exhaustion, bad credentials, or a network cause.
+
+A second class defect was visible in its criterion receipt: the COUNT/TOTAL
+criterion passed deterministically merely because its source JSON path existed.
+The separate objective review prevented verified overall success. Restrict that
+shortcut to complete existence-only claims; calculations, content constraints,
+and qualifications after a path go to the existing batched semantic review.
+Plain existence claims retain deterministic handling. Keep extraction separate
+from proof. Three content-shaped negatives reproduce the previous false pass.
+
+Strict single-objective and checklist reviewers now preserve the already
+redacted/bounded underlying error and parse-repair diagnostics. A real route/
+Runner test with fake provider wires reproduced the old lost diagnostic and
+proves no extra attempt or provider substitution. Both red pins failed on9877.
+Final focused review group123/123, caller group54/54, typecheck passed.
+Logs `/private/tmp/clem-live-workflow-review-{red,green,callers,typecheck}.log`.
+
+Canonical source measurement:159.2seconds,453464prompt,248664uncached input,
+12139output,27model records,9top-level tool calls. Ledger labels13 records brain,
+including three Opus records during discovery and ten DeepSeek records; do not
+call this an exclusively DeepSeek brain benchmark or infer a fallback without
+further attribution. Reviewers:7Opus records/112688uncached input. Creation test
+and child-run attribution must be respected in any later comparison. No general
+performance claim. Platform49 has not been rerun in this acceptance wave.

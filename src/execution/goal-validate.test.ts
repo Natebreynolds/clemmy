@@ -78,6 +78,24 @@ test('deterministic criterion passes/fails on file existence without calling the
 
 // ─── judge path ──────────────────────────────────────────────────────────────
 
+test('content criteria mentioning an existing source file still require semantic review', async () => {
+  for (const criterion of [
+    'The final output reports COUNT and TOTAL equal to the records and amounts in /tmp/clemmy-gv/input.json.',
+    'A brief exists at /tmp/clemmy-gv/brief.md with sources listed',
+    'The report at /tmp/clemmy-gv/report.md contains all requested accounts.',
+  ]) {
+    let reviews = 0;
+    const result = await validateGoal({ objective: 'Produce the requested content.',
+      successCriteria: [criterion], evidenceText: 'The file exists, but its required contents are not verified.' }, {
+      fileExists: () => true,
+      judge: async () => { reviews++; return { done: false, reason: 'required content was not proved' }; },
+    });
+    assert.equal(result.pass, false, criterion);
+    assert.equal(reviews, 1, criterion);
+    assert.equal(result.perCriterion[0].method, 'judge');
+  }
+});
+
 test('fuzzy criteria are batched into ONE judge call rendered as a parked checklist', async () => {
   const judgeCalls: { objective: string; evidence: string }[] = [];
   const result = await validateGoal(

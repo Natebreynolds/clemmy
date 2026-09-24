@@ -211,6 +211,18 @@ export function extractLocalPathFromCriterion(criterion: string): string | null 
   return raw;
 }
 
+/** Existence proves only an explicit, complete existence claim. A source path
+ * inside a calculation or a content requirement does not prove that work. */
+function isFileExistenceCriterion(criterion: string): boolean {
+  const match = LOCAL_PATH_RE.exec(criterion);
+  if (!match) return false;
+  const pathStart = match.index + match[0].indexOf(match[1]);
+  const before = criterion.slice(0, pathStart).trim();
+  const after = criterion.slice(pathStart + match[1].length).trim();
+  return /^(?:(?:a|an|the)\s+)?[\w-]+\s+exists?\s+at\s*["'`(]?$/i.test(before)
+    && /^["'`).\s]*$/.test(after);
+}
+
 /** Build per-criterion GoalEvidence rows from a validation result. */
 export function toGoalEvidence(result: GoalValidationResult, attempt: number, at: string): GoalEvidence[] {
   return result.perCriterion.map((c) => ({
@@ -318,7 +330,7 @@ export async function validateGoal(
       continue;
     }
     const localPath = extractLocalPathFromCriterion(criterion);
-    if (localPath) {
+    if (localPath && isFileExistenceCriterion(criterion)) {
       const exists = fileExists(localPath);
       perCriterion.push({
         criterion,

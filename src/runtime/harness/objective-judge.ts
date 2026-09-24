@@ -1035,7 +1035,7 @@ export async function runHedgedJudge<T>(
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
     return { value: null, failure: 'error', routing,
-      ...(opts.boundaryJudgeSelection && err instanceof Error ? { unavailableReason: err.message } : {}) };
+      ...(err instanceof Error ? { unavailableReason: redactSensitiveText(err.message).replace(/\s+/g, ' ').slice(0, 400) } : {}) };
   }
 }
 
@@ -1193,7 +1193,8 @@ export async function judgeGoalCriteriaStrict(
   );
   if (!run.value) {
     throw new Error(
-      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
+      run.unavailableReason ?? (run.failure === 'timeout' ? 'judge timed out'
+        : run.failure === 'invalid' ? `judge output did not parse${run.invalidDetail ? `; ${run.invalidDetail}` : ''}` : 'judge unavailable'),
     );
   }
   return run.value;
@@ -1222,7 +1223,8 @@ export async function judgeObjectiveCompleteStrict(
   });
   if (!run.verdict) {
     throw new Error(
-      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
+      run.unavailableReason ?? (run.failure === 'timeout' ? 'judge timed out'
+        : run.failure === 'invalid' ? `judge output did not parse${run.invalidDetail ? `; ${run.invalidDetail}` : ''}` : 'judge unavailable'),
     );
   }
   return { done: run.verdict.done, reason: run.verdict.reason,

@@ -16,7 +16,7 @@ const { ClaudeModelProvider } = await import('./claude-model.js');
 const originalClaudeGetModel = ClaudeModelProvider.prototype.getModel;
 const { CodexModelProvider } = await import('./codex-model.js');
 const { captureBoundaryJudgeSelection, resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
-const { runHedgedJudge, parseCompletionVerdict } = await import('./objective-judge.js');
+const { runHedgedJudge, parseCompletionVerdict, judgeObjectiveCompleteStrict, judgeGoalCriteriaStrict } = await import('./objective-judge.js');
 const { getJudgeMetricsSnapshot, resetJudgeMetricsForTests } = await import('./judge-family.js');
 const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
 const { closeEventLog, createSession, appendEvent } = await import('./eventlog.js');
@@ -91,6 +91,15 @@ async function completion(timeoutMs = 2_000) {
   return runHedgedJudge('Audit the requested worker receipts.', 'Eight workers were requested; none ran.',
     parseCompletionVerdict, value => value.done, 'completion', { timeoutMs });
 }
+
+test('strict workflow reviews preserve the underlying unavailable diagnostic', async () => {
+  claudeBehavior = 'error';
+  await assert.rejects(judgeObjectiveCompleteStrict('Verify the total.', 'COUNT: 3; TOTAL: 27'),
+    /fixture pinned judge transport unavailable/);
+  await assert.rejects(judgeGoalCriteriaStrict('Verify the result.', ['Correct count', 'Correct total'], 'COUNT: 3; TOTAL: 27'),
+    /fixture pinned judge transport unavailable/);
+  assert.equal(calls.length, 2, 'diagnostics do not add a retry or substitute reviewer');
+});
 
 test('a faster brain-family hedge cannot replace the pinned completion judge', async () => {
   const result = await completion();
