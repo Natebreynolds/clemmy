@@ -145,3 +145,44 @@ call this an exclusively DeepSeek brain benchmark or infer a fallback without
 further attribution. Reviewers:7Opus records/112688uncached input. Creation test
 and child-run attribution must be respected in any later comparison. No general
 performance claim. Platform49 has not been rerun in this acceptance wave.
+
+
+## 05f90b16 installed acceptance and recovery blockers
+
+Installed SHA05f90b16a/fingerprint006e8e8690406e0ebae632add8aef1b24b8ef38621a288178ed3337553dee88c
+passed the controlled saved workflow again: source296144,
+session sess-desktop-3a82cfead514bfafd9a8a5df, run1790249277793-c3d101,
+COUNT3/TOTAL27, enabled=true, goalValidation.pass=true, judgeFailedOpen=false.
+One source terminal, no open attempts. Run took18.4seconds; this is not matched
+against the earlier author-and-run request. One runId/run_id schema repair.
+
+Platform49 run1790249457091-f42225, childsource296305, was cancelled after
+recovery failed. The write review correctly refused a proposal lacking evidence.
+Then a proven GOOGLESHEETS_BATCH_GET through composio_execute_tool was refused
+by the recovery surface, which admitted the prior write's inner name but not
+this known read. The permitted diagnostic only showed its first12 entries;
+absence from that event did NOT prove call_tool was absent from the full set.
+
+A subsequent held workflow consumer finished its run attempt as interrupted at
+11:34:02.832Z while same-source recovery was still armed. Resumed tools then
+failed child_lease_activation_failed; a second source296473 also started.
+Do not weaken dispatch-lease checks: the consumer must preserve its real owner.
+No external mutation crossed in this child ledger. Independent before/after
+FORMULA reads of Log A1:Z500 and Daily Digest A1:Z200 matched exactly. This does
+not certify uncaptured cells. Evidence: /private/tmp/clem-release-05f90b16-live/.
+
+Framework candidate: admit exact proven inner reads during zero-crossing repair,
+without granting every operation in the carrier; retain normal schema/account/
+effect checks and no admission during uncertain effects/reconciliation. Workflow
+held consumers retain their exact attempt, authored scope and cancellation
+registration until the exact typed terminal; peer holds still close the loser.
+The terminal releases the scope and registration. Diagnostics name the actual
+surface and exact read operations instead of an incomplete first12 list.
+
+Red pins: recovery selector12/13, workflow-owner5/6; full production host
+read→refused write→fresh read→re-reviewed write failed with the read fix removed.
+With the final fixes and complete diagnostics, 61/61 focused host/workflow/
+recovery checks and typecheck passed. Logs: /private/tmp/clem-workflow-recovery-final.log,
+/private/tmp/clem-recovery-typecheck.log.
+No paid model tests. Never observe live SQLite during isolated sentinel checks.
+Final hotpatch, Platform49 clean run, full gates, merge, push and tag remain owed.

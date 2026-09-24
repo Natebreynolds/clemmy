@@ -107,6 +107,7 @@ function installOperation(input: {
   capabilityId: string;
   accountId: string;
   schema: Record<string, unknown>;
+  readOnly?: boolean;
 }) {
   composioSchemas.rememberToolSchema(
     input.operationId,
@@ -130,9 +131,9 @@ function installOperation(input: {
       version: 1,
       providerInputSchemaDigest,
       semanticName: input.operationId,
-      behaviorHints: { readOnly: false, destructive: false, idempotent: null, openWorld: false },
+      behaviorHints: { readOnly: input.readOnly === true, destructive: false, idempotent: null, openWorld: false },
     },
-    effect: 'external_write',
+    effect: input.readOnly ? 'read' : 'external_write',
     destination: { family: 'external_message', posture: 'named_existing' },
     accountId: input.accountId,
     idempotency: { required: true, policy: 'key_before_dispatch' },
@@ -189,7 +190,10 @@ function installOperation(input: {
   });
   assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
     productionPorts.productionPortIdentityFromManifest(manifest),
-    { invoke: invoke as never },
+    { invoke: invoke as never, ...(input.readOnly ? {
+      admitPreparation: () => {}, prepareInvocation: async () => ({ fixture: input.operationId }),
+      invokeWithPreparation: async (_proof: unknown, work: () => Promise<unknown>) => work(),
+    } : {}) },
   ), { ok: true });
   return { manifest, entry, providerInputSchemaDigest };
 }
@@ -213,11 +217,16 @@ const DELETE = installOperation({
   accountId: 'account:workflow:messages-owner',
   schema: DELETE_SCHEMA,
 });
+const READ = installOperation({
+  operationId: 'FIXTURE_RECORDS_FETCH', capabilityId: 'cap:workflow:records-fetch',
+  accountId: 'account:workflow:messages-owner', readOnly: true,
+  schema: { type: 'object', properties: { page: { type: 'integer' } }, required: ['page'], additionalProperties: false },
+});
 manifestStores.installCapabilityManifestStore(
-  manifestStores.createCapabilityManifestStore([SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest], { durable: true }),
+  manifestStores.createCapabilityManifestStore([SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest, READ.manifest], { durable: true }),
 );
 catalogs.installHostCapabilityCatalogFactory(
-  catalogs.createHostCapabilityCatalogFactory([SEND.entry, FOREIGN_SEND.entry, DELETE.entry]),
+  catalogs.createHostCapabilityCatalogFactory([SEND.entry, FOREIGN_SEND.entry, DELETE.entry, READ.entry]),
 );
 const sendIdentity = catalogs.canonicalCatalogIdentityOf(SEND.entry)!;
 const foreignIdentity = catalogs.canonicalCatalogIdentityOf(FOREIGN_SEND.entry)!;
@@ -886,4 +895,43 @@ test('a nested work_call cannot replace a constraint refusal with its preparatio
     assert.deepEqual(nonRefusedSettlements(fixture), []);
     assert.match(JSON.stringify(outcome.history), /workflow_write_constraint_conflict/);
   } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+test('a refused authored mutation can gather missing evidence through a proven read carrier and is reviewed again', async () => {
+  const readIdentity = catalogs.canonicalCatalogIdentityOf(READ.entry)!;
+  const fixture = createSendStepFixture({ identities: [sendIdentity, readIdentity],
+    prompt: `Read ${READ.manifest.operationId}, verify the destination, then send the approved standup with ${SEND.manifest.operationId}.` });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const readBefore = portBodies[READ.manifest.operationId]!;
+  const writeBefore = portBodies[SEND.manifest.operationId]!;
+  const reviews: number[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    const reads = portBodies[READ.manifest.operationId]! - readBefore;
+    reviews.push(reads);
+    return { verdict: reads >= 2 ? 'compatible' : 'conflict',
+      reason: 'A fresh destination read is required.', proposalDigest: 'fixture-review' };
+  });
+  const carrier = brackets.wrapToolForHarness({ type: 'function', name: 'composio_execute_tool',
+    description: 'Invoke an exact catalog operation.',
+    parameters: { type: 'object', properties: { tool_slug: { type: 'string' }, arguments: { type: 'string' } },
+      required: ['tool_slug', 'arguments'] }, needsApproval: async () => false,
+    invoke: async () => { throw new Error('Only the bound production port may execute.'); },
+  });
+  const call = (id: string, op: string, args: object) => toolCall(id, carrier.name,
+    { tool_slug: op, arguments: JSON.stringify(args) });
+  const model = stubModel([
+    [call('first-evidence', READ.manifest.operationId, { page: 1 })],
+    [call('unverified-write', SEND.manifest.operationId, SEND_ARGS)],
+    [call('missing-evidence', READ.manifest.operationId, { page: 2 })],
+    [call('verified-write', SEND.manifest.operationId, SEND_ARGS)],
+    [textMsg('Completed with verified evidence.')],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindSurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
+  assert.equal(portBodies[READ.manifest.operationId]! - readBefore, 2, JSON.stringify(outcome));
+  assert.equal(portBodies[SEND.manifest.operationId]! - writeBefore, 1, JSON.stringify(outcome));
+  assert.deepEqual(reviews, [1, 2]);
+  assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id),
+    ['first-evidence', 'missing-evidence', 'verified-write']);
 });

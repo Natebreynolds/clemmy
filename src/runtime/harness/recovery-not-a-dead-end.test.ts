@@ -22,7 +22,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
-import { HostRecoveryState, hostNoProgressRecoveryToolNames } from './host-turn-runner.js';
+import { HostRecoveryState, hostNoProgressRecoveryToolNames, hostRecoveryCallMatchesOperation } from './host-turn-runner.js';
 import {
   createNoProgressConsequence,
   initializeNoProgressGovernor,
@@ -228,4 +228,26 @@ test('a failed DECLARED READ is not reconciliation-owned, and a mutation still i
   );
   assert.match(site, /return 'effect_may_have_started';\s*\}\s*catch/,
     'anything else keeps reconciliation ownership');
+});
+
+// Live 2026-09-24: a refused sheet write required a fresh evidence read, but
+// the read's carrier was outside the repair surface. Exact read provenance,
+// not permission for an entire carrier, must survive the repair boundary.
+test('a zero-crossing write repair admits proven inner reads without widening a carrier', () => {
+  const repair = createNoProgressConsequence({ stage: 'host_disposition:refused_pre_dispatch',
+    recovery: 'repair_model', effectState: 'not_started', recoveryToolNames: ['OPAQUE_WRITE'] });
+  const reads = ['opaque_read'];
+  for (const [name, args] of [
+    ['composio_execute_tool', { tool_slug: 'OPAQUE_READ', arguments: '{}' }],
+    ['call_tool', { name: 'OPAQUE_READ', args_json: '{}' }],
+    ['OPAQUE_READ', {}],
+  ] as const) {
+    assert.equal(hostRecoveryCallMatchesOperation(repair, name, args, reads), true);
+  }
+  assert.equal(hostRecoveryCallMatchesOperation(repair, 'composio_execute_tool',
+    { tool_slug: 'UNRELATED_WRITE', arguments: '{}' }, reads), false);
+  for (const effectState of ['unknown', 'known_terminal'] as const) {
+    assert.equal(hostRecoveryCallMatchesOperation({ ...repair, effectState },
+      'OPAQUE_READ', {}, reads), false);
+  }
 });

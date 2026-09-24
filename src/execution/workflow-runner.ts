@@ -15,6 +15,7 @@ import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
 } from '../runtime/sandboxed-script.js';
 import pino from 'pino';
+import { actionBus } from '../runtime/action-bus.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
@@ -5382,6 +5383,8 @@ async function runStepViaHarness(
     attemptId: `attempt:workflow:${workflowRunId}:${randomUUID().slice(0, 12)}`,
   });
   let stepAttemptStatus: 'completed' | 'cancelled' | 'failed' | 'interrupted' = 'failed';
+  let heldByExactRecoveryOwner = false;
+  let acceptedStepSourceSeq: number | undefined;
   let graphSpecialistEvent: {
     item: string;
     role: string;
@@ -5547,6 +5550,7 @@ async function runStepViaHarness(
         attemptId: stepAttempt.attemptId,
       },
     });
+    acceptedStepSourceSeq = sourceUserEvent.seq;
     const stepExecutionSourceUserSeqs = new Set<number>([sourceUserEvent.seq]);
     // A prompt step may explicitly name exact provider operations and call
     // them directly without foreground tool_search. After a daemon restart the
@@ -6023,7 +6027,13 @@ async function runStepViaHarness(
 
     const disposition = runConversationDisposition(result);
     switch (disposition.kind) {
-      case 'held':
+      case 'held': {
+        // Returning the consumer is not completion of the exact source. Its
+        // scheduled recovery still needs this attempt and execution scope.
+        const owner = session.continuationOwnerState({
+          sourceUserSeq: sourceUserEvent.seq, attemptId: stepAttempt.attemptId,
+        });
+        heldByExactRecoveryOwner = owner === 'ours' || owner === 'unreadable';
         throw new WorkflowHarnessHeldSignal({
           stepId: step.id,
           sessionId: realSessionId,
@@ -6032,6 +6042,7 @@ async function runStepViaHarness(
           hold: disposition.hold,
           recoveredContract: disposition.recoveredContract,
         });
+      }
       case 'dispatched':
         // An async dispatch receipt is not the workflow step's deliverable.
         // Recovery owns the exact source until it publishes a durable terminal.
@@ -6282,17 +6293,31 @@ async function runStepViaHarness(
         });
       } catch { /* specialist visibility is best-effort */ }
     }
-    unregisterActiveAttempt();
-    try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
-    // The submission-time contract dies with the step session (a later chat
-    // turn on a reused session must never be gated).
-    clearStepContract(realSessionId);
-    // Belt + suspenders: clear the heartbeat gate in finally so a throw
-    // mid-resume doesn't leave the heartbeat permanently suppressed
-    // for the rest of the workflow run.
-    clearWorkflowRunPausedForApproval(workflowRunId);
-    closePlanScope(realSessionId, 'workflow-step-finished');
-    clearSessionWorkerModelOverride(realSessionId);
+    const releaseStepScope = (): void => {
+      unregisterActiveAttempt();
+      // A newer activation must not lose its scope when the old one settles.
+      if (acceptedStepSourceSeq !== undefined && session.continuationOwnerState({
+        sourceUserSeq: acceptedStepSourceSeq, attemptId: stepAttempt.attemptId,
+      }) === 'other') return;
+      clearStepContract(realSessionId);
+      clearWorkflowRunPausedForApproval(workflowRunId);
+      closePlanScope(realSessionId, 'workflow-step-finished');
+      clearSessionWorkerModelOverride(realSessionId);
+    };
+    if (heldByExactRecoveryOwner) {
+      // Keep cancellation and the authored scope alive with the exact source.
+      // Its typed terminal owns settlement; do not finish its attempt here.
+      const unsubscribe = actionBus.subscribe(event => {
+        if (event.kind !== 'harness.event' || event.sessionId !== realSessionId
+          || event.event.type !== 'conversation_completed'
+          || event.event.data.sourceUserSeq !== acceptedStepSourceSeq) return;
+        unsubscribe();
+        releaseStepScope();
+      });
+    } else {
+      releaseStepScope();
+      try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
+    }
     // MEASURE (2026-09-01): the step's own efficiency from the usage rows its
     // host session wrote — frames, cache-hit share, tokens, largest prompt —
     // on the run's event log and in the daemon log, so "smarter and faster"

@@ -88,6 +88,7 @@ import { persistHostCallCapabilityBinding } from './host-call-capability-binding
 import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 import {
+  canonicalLogicalToolName,
   durableLogicalCallContract,
   durableLogicalCallRecoveryMaterial,
 } from './logical-call-contract.js';
@@ -1052,10 +1053,17 @@ export function hostRecoveryCallMatchesOperation(
   consequence: NoProgressGovernorState['lastConsequence'],
   name: string,
   args: unknown,
+  provenReads: readonly string[] = [],
 ): boolean {
   if (consequence?.recovery !== 'repair_model' || consequence.effectState !== 'not_started') return false;
   const operation = unwrapRuntimeEffectiveToolIdentity(name, args).toolName;
-  return Boolean(operation && consequence.recoveryToolNames.includes(operation));
+  if (!operation) return false;
+  if (consequence.recoveryToolNames.includes(operation)) return true;
+  // Proven reads may obtain missing evidence for a refused mutation. Admit
+  // the exact inner operation, never every operation carried by its wrapper.
+  // The normal dispatch boundary still revalidates schema/account/effect.
+  const canonical = canonicalLogicalToolName(operation);
+  return canonical !== null && provenReads.some(name => canonicalLogicalToolName(name) === canonical);
 }
 
 export function hostNoProgressRecoveryToolNames(
@@ -8542,6 +8550,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     let modelStepSchemas: readonly unknown[] = schemas;
     let permittedNoProgressRecoveryToolNames: ReadonlySet<string> | null = null;
+    let permittedRecoveryReadOperations: readonly string[] = [];
     // TRAJECTORY WATCHER — the mid-run "is this still the thing the user asked
     // for?" check. It has existed for a while but only in the legacy core
     // (loop.ts) and the workflow lane, and a live chat turn runs host_v1 which
@@ -8833,6 +8842,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             .map((entry) => entry.identifier),
           ...settledReadToolNamesForSource(identity),
         ])];
+        permittedRecoveryReadOperations = provenReads;
         permittedNoProgressRecoveryToolNames = planFinalPublishStep
           ? new Set(tools.map((tool) => tool.name).filter((name) => {
             const bare = bareTerminalToolName(name);
@@ -9467,6 +9477,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             noProgressState?.lastConsequence ?? null,
             call.name,
             parsedArgs(authoredArgumentsJson),
+            permittedRecoveryReadOperations,
           )) return false;
           const carry = resolveOffSurfaceDirectCarry({
             authoredName: call.name,
@@ -9497,7 +9508,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? canonicalCalls.map((call) => [
               call.callId,
               `This call was refused before execution — no effect occurred. While recovering, `
-                + `only these capabilities are available: ${permittedForDiagnostic.slice(0, 12).join(', ')}. `
+                + `only these capabilities are available: ${permittedForDiagnostic.join(', ')}. `
+                + (noProgressState?.lastConsequence?.effectState === 'not_started'
+                  && noProgressState.lastConsequence.recovery === 'repair_model'
+                  && permittedRecoveryReadOperations.length > 0
+                  ? `Proven read operations may also use their configured carriers: ${permittedRecoveryReadOperations.join(', ')}. `
+                  : '')
                 + `Call one of them, or say what you need.`,
             ] as const)
           : [],
@@ -9529,7 +9545,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         if (permitted.length > 0) {
           journalHostGuide('recovery_surface_reprompt', {
             attempted: canonicalCalls.map((call) => call.name).slice(0, 6),
-            permitted: permitted.slice(0, 12),
+            permitted,
+            provenReadOperations: permittedRecoveryReadOperations,
             // What the recovery was chosen FROM: a permitted set can be narrow
             // because the rule excluded a tool or because the step never had it.
             available: tools.map((tool) => tool.name).slice(0, 40),
