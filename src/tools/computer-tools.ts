@@ -1152,6 +1152,9 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
     const child = spawn(command, {
       cwd,
       shell: true,
+      // Own one POSIX process group so a deadline stops the command's children
+      // as well as its shell wrapper. Windows keeps its taskkill /T owner.
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
       // Augmented PATH so CLI-backed skills resolve on a packaged .app
       // launch instead of "command not found". See spawn-env.ts.
@@ -1169,6 +1172,11 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
         try {
           spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
         } catch { child.kill('SIGTERM'); }
+      } else if (process.platform !== 'win32' && child.pid) {
+        // This is the hard tool deadline, equivalent to taskkill /F above.
+        // Killing only the shell orphaned live CLI searches after timeout.
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch { try { child.kill('SIGKILL'); } catch { /* already exited */ } }
       } else {
         child.kill('SIGTERM');
       }
