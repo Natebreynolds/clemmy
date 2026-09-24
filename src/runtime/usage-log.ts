@@ -424,6 +424,8 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
 export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router';
 
 export interface ModelUsageAttributionContext {
+  /** Request-local estimates override ambient parent prompt measurements. */
+  promptComponents?: Record<string, number>;
   sessionId: string;
   sourceUserSeq: number;
   attemptId?: string;
@@ -598,7 +600,7 @@ export function recordModelUsage(args: {
     ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
-    promptComponents: reconcilePromptComponents(args.promptComponents, args.inputTokens),
+    promptComponents: reconcilePromptComponents(attribution?.promptComponents ?? args.promptComponents, args.inputTokens),
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
     firstByteMs: args.firstByteMs,

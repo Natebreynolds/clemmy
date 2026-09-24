@@ -468,3 +468,43 @@ test('selectBestRouteCandidate skips disabled candidates and tie-breaks by sampl
 
   assert.equal(best?.model, 'm-model');
 });
+
+
+test('nested reviewer usage measures its own request on ordinary and streamed calls', async () => {
+  const { withModelUsageAttribution, recordModelUsage, readUsageEventsForDate } = await import('./usage-log.js');
+  const { estimateTokens } = await import('./harness/budget.js');
+  const db = metricsDb();
+  const source = 'reviewer-request-components-fixture';
+  const record = () => recordModelUsage({
+    sessionId: source, model: 'recording-reviewer', inputTokens: 1000, outputTokens: 1,
+    cacheDialect: 'inclusive',
+    // This is the ambient brain breakdown passed by today's provider adapters.
+    promptComponents: { instructions: 5584, toolSchemas: 6983, memoryPrimer: 486 },
+  });
+  const response = responseWith({ inputTokens: 1000, outputTokens: 1, totalTokens: 1001 });
+  const inner: Model = {
+    getResponse: async () => { record(); return response; },
+    getStreamedResponse: async function* () { record(); yield { type: 'response_done', response } as never; },
+  };
+  const model = withModelRouteMetrics(inner, {
+    sessionId: source, role: 'judge', resolvedModel: 'recording-reviewer', provider: 'byo', source: 'explicit', reason: {},
+  }, db);
+  const request = { ...requestWithSentinel(), systemInstructions: 'Review the evidence.', input: 'First evidence packet.' };
+  try {
+    await withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, role: 'brain',
+      promptComponents: { instructions: 9999 } }, async () => {
+      await model.getResponse(request);
+      for await (const _ of model.getStreamedResponse({ ...request, input: 'Repair.' })) { /* consume */ }
+    });
+    const rows = readUsageEventsForDate().filter(row => row.source === source);
+    assert.equal(rows.length, 2);
+    for (const [index, row] of rows.entries()) {
+      assert.equal(row.role, 'reviewer');
+      assert.equal(row.promptComponents?.instructions, estimateTokens(request.systemInstructions));
+      assert.equal(row.promptComponents?.toolSchemas, estimateTokens('[]'));
+      assert.equal(row.promptComponents?.history, estimateTokens(index === 0 ? request.input : 'Repair.'));
+      assert.equal(row.promptComponents?.memoryPrimer, undefined);
+      assert.equal(row.inputTokens, 1000, 'provider token totals remain unchanged');
+    }
+  } finally { db.close(); }
+});
