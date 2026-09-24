@@ -2145,6 +2145,38 @@ function mergeWorkflowStepsForPatch(existingSteps: WorkflowDefinition['steps'], 
   });
 }
 
+/**
+ * Apply edits to the steps they name, and leave every other step alone.
+ *
+ * The difference from mergeWorkflowStepsForPatch is the one that matters: that
+ * one maps over what the client SENT, so a step the client omitted is gone.
+ * This one maps over what is STORED, so an omitted step is simply not edited.
+ * An editor that owns one facet of a step — the canvas owns dependsOn — can
+ * then save without having to restate the whole workflow to avoid destroying
+ * it, which is what made a stale tab dangerous.
+ *
+ * Edits naming an id that does not exist yet are appended, so the canvas can
+ * still add a node. Order is otherwise the stored order; the runner derives
+ * execution order from dependsOn and does not read array position.
+ */
+function applyWorkflowStepEdits(existingSteps: WorkflowDefinition['steps'], edits: unknown[]): WorkflowDefinition['steps'] {
+  const editsById = new Map<string, Record<string, unknown>>();
+  const appended: WorkflowDefinition['steps'] = [];
+  const storedIds = new Set(existingSteps.map((step) => step?.id).filter((id): id is string => typeof id === 'string'));
+  for (const raw of edits) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const edit = raw as Record<string, unknown>;
+    if (typeof edit.id !== 'string' || !edit.id) continue;
+    if (storedIds.has(edit.id)) editsById.set(edit.id, edit);
+    else appended.push(edit as unknown as WorkflowDefinition['steps'][number]);
+  }
+  const merged = existingSteps.map((step) => {
+    const edit = step && typeof step.id === 'string' ? editsById.get(step.id) : undefined;
+    return (edit ? { ...step, ...edit } : step) as WorkflowDefinition['steps'][number];
+  });
+  return [...merged, ...appended];
+}
+
 function dashboardWorkflowSmokeInputs(body: Record<string, unknown>): Record<string, string> {
   const raw = body.testInputs ?? body.test_inputs;
   if (!raw) return {};
@@ -5808,7 +5840,19 @@ export function registerConsoleRoutes(
     } else if (body.clearProject === true || body.clear_project === true) {
       delete next.project;
     }
-    if (Array.isArray(body.steps)) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
+    // `steps` is authoritative (omitted = deleted); `stepEdits` is additive
+    // (omitted = untouched). One write cannot be both, and silently picking a
+    // winner would mean a caller who sent both got a deletion it never asked
+    // for, so say so instead.
+    const authoritativeSteps = Array.isArray(body.steps);
+    const additiveStepEdits = Array.isArray(body.stepEdits);
+    if (authoritativeSteps && additiveStepEdits) {
+      res.status(400).json({ error: 'Send steps (the full list) or stepEdits (changes by id), not both.' });
+      return;
+    }
+    const stepsChanged = authoritativeSteps || additiveStepEdits;
+    if (authoritativeSteps) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
+    else if (additiveStepEdits) next.steps = normalizeWorkflowSteps(applyWorkflowStepEdits(entry.data.steps, body.stepEdits));
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
     if (typeof body.allowSends === 'boolean') next.allowSends = body.allowSends;
     else if (typeof body.allow_sends === 'boolean') next.allowSends = body.allow_sends;
@@ -5840,7 +5884,7 @@ export function registerConsoleRoutes(
       const resources = normalizeWorkflowResources(body.resources);
       next.resources = resources && Object.keys(resources).length > 0 ? resources : undefined;
     }
-    if (Array.isArray(body.steps)) {
+    if (stepsChanged) {
       const stepGraphError = validateWorkflowStepGraph(next.steps);
       if (stepGraphError) { res.status(400).json({ error: stepGraphError }); return; }
     }
@@ -5865,7 +5909,7 @@ export function registerConsoleRoutes(
     await warmExactScheduledSendSchemaAuthorityForWrite(next);
     const patchPrep = prepareWorkflowUpdateForWrite(entry.data, next, {
       modelPortability: workflowModelPortabilityFromUnknown(body),
-      codifyMechanicalSteps: Array.isArray(body.steps),
+      codifyMechanicalSteps: stepsChanged,
     });
     if (patchPrep.status === 'invalid') {
       res.status(400).json({ error: 'workflow failed validation', errors: patchPrep.errors }); return;
