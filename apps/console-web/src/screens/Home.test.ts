@@ -88,7 +88,7 @@ test('the app lands on Home by default', () => {
 });
 
 test('the Home mock is a side door, not the live landing', () => {
-  assert.match(APP, /path="\/dev\/home-mock" element=\{<HomeMock \/>\}/);
+  assert.match(APP, /path="\/dev\/home-mock" element=\{deferred\(<HomeMock \/>\)\}/);
   assert.doesNotMatch(APP, /Navigate to="\/dev\/home-mock"/);
   const HOME = readFileSync(new URL('./Home.tsx', import.meta.url), 'utf8');
   assert.match(HOME, /function LiveHome\(/);

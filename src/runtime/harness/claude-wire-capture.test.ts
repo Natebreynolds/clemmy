@@ -150,12 +150,12 @@ test('CLAUDE wire (parity on, no-sentinel sub-agent + large tools): tools-array 
   assert.equal(countCacheControl(parsed), 1, 'exactly one breakpoint, on the tools array');
 });
 
-test('BYO wire restores legacy order in the system message, sentinel-free', () => {
+test('BYO wire preserves the stable prefix in the system message, sentinel-free', () => {
   const relaxed = relaxRequestForCompatBackend({
     model: 'deepseek-reasoner',
     messages: [{ role: 'system', content: ASSEMBLED_PARITY }, { role: 'user', content: 'hi' }],
   }) as any;
-  assert.equal(relaxed.messages[0].content, ASSEMBLED_LEGACY);
+  assert.equal(relaxed.messages[0].content, `${ORCHESTRATOR_INSTRUCTIONS}\n\n---\n\n${DYNAMIC_CTX}`);
   assert.equal(relaxed.messages[0].content.includes(CACHE_BREAK_SENTINEL), false);
 });
 

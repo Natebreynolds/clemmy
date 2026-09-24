@@ -8168,7 +8168,7 @@ function carrierMirrorInvocationOutput(
   const carrierRows = rows.filter((row) => row.tool === occurrence.tool);
   let innerRows = rows.filter((row) => row.tool === effectiveTool);
   // Live 2026-09-21 source 272188: work_call stores effectiveTool as the
-  // operation (OUTLOOK_GET_CALENDAR_VIEW) while the transport-mirror
+  // provider operation while the transport-mirror
   // invocation is composio_execute_tool. That is still one carrier dispatch.
   if (innerRows.length !== 1 && carrierRows.length === 1) {
     const gateway = rows.filter((row) => row.tool === 'composio_execute_tool');
