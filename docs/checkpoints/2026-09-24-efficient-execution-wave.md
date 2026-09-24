@@ -167,3 +167,15 @@ Started from main after the proof: full isolated suite then journeys
 their results, fresh-install smoke, packaged-candidate smoke, upgrade
 rehearsal, release-asset tests, `origin/main` equal to the release commit,
 and the owner's Windows scope decision (`[mac-only]` or hold).
+
+## Gate results on the release commit (2026-09-24 10:37 PT)
+
+All local gates from `docs/NEXT-TAG-RELEASE-GATE.md` ran on `main`; the full table
+is in `docs/releases/v3.18.20.md`. Summary: suite 17,072 with every failure either
+passing alone or failing identically at v3.18.19; journeys 37 with three
+pre-existing failures and no regression (down from 51 failures on the last full
+journey gate); release closure 138/138; release assets, fresh-install smoke,
+packaged candidate, v3.14 upgrade rehearsal and packaged upgrade (clean worktree,
+own build, 21/21) all pass. Not done in this session: pushing `main`, cutting the
+tag, and the 16:00 PT Slack occurrence check. Owner decisions pending: push, and
+Mac-only versus hold for Windows.
