@@ -108,3 +108,22 @@ Observations for the tag decision:
 7. Live proof of an actual reused local read is still owed: no natural repeat
    occurred in the re-runs; the mechanism is proven by pins and by the Composio
    rail it extends.
+
+## Incident 2026-09-24 09:00 PT — team-activity-slack-updates posted nothing
+
+Run `trigger-6e84aad2089a7ef1fba8bbd1b222890b`: `pull_activity` (deterministic
+script) completed; `post_slack` had `SLACK_SEND_MESSAGE` refused pre-dispatch
+twice with `workflow_write_constraints_unverified`, then closed blocked. No
+message reached C0BHT7WHZDL; nothing was retried. The write-constraint
+reviewer was `claude-opus-5-5` (the owner-selected judge binding set for the
+DeepSeek/Opus test at 05:20 UTC) and answered `uncertain` twice: it could not
+verify byte-for-byte that `markdown_text` equals the deterministic summary,
+because that summary reaches the step as prompt context, not as retained
+evidence the reviewer can open. Yesterday's 16:00 PT occurrence passed the same
+review under `grok-4.3` in one 4k-token call. Judge binding restored to
+`grok-4.3` at ~09:45 PT; brain and worker remain DeepSeek V4.1 Flash for the
+test. Framework gaps left for the owner of workflow evidence: (1) deterministic
+step outputs are not retained as reviewer-openable evidence; (2)
+`refused_pre_dispatch.refusalDetail` is clipped to ~150 characters in the event
+record, so the reviewer's actual reason is lost. Next natural check: the 16:00
+PT occurrence today.
