@@ -1164,7 +1164,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         return nonWriteTextResult('invalid_test_inputs', error instanceof Error ? error.message : String(error));
       }
       const stepGraphError = validateWorkflowStepGraph(steps);
-      if (stepGraphError) return nonWriteTextResult('invalid_graph', stepGraphError);
+      if (stepGraphError) return nonWriteTextResult('invalid_graph', `Workflow "${name}" was NOT created — ${stepGraphError}`);
       const triggerResult = buildWorkflowTrigger({
         schedule: trigger_schedule,
         onceAt: trigger_once_at,
@@ -1927,8 +1927,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!entry) return nonWriteTextResult('not_found', `Workflow "${name}" not found. Use its exact saved name or slug.`);
 
       if (steps) {
+        // Structural faults are refused here, before any merge. The deeper
+        // readiness gate below says "NOT updated" for an enabled workflow; this
+        // one has to say it too, or a caller reads a bare sentence about a loop
+        // and has no idea whether the live definition just changed under it.
         const stepGraphError = validateWorkflowStepGraph(steps);
-        if (stepGraphError) return nonWriteTextResult('invalid_graph', stepGraphError.replace('found.', 'in update.'));
+        if (stepGraphError) {
+          return nonWriteTextResult('invalid_graph', `Workflow "${entry.name}" was NOT updated — ${stepGraphError}`);
+        }
       }
 
       const next: WorkflowDefinition = { ...entry.data };

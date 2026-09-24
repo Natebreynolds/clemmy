@@ -22,6 +22,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { validateCronExpression } from '../shared/cron.js';
 import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { codifyMechanicalSteps } from './workflow-codify.js';
+import { describeCycle, findCycle } from './graph-cycle.js';
 import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { parseWorkflowTransformAuthoringValue } from './workflow-transform.js';
@@ -257,6 +258,13 @@ export function validateWorkflowStepGraph(steps: Array<Pick<WorkflowStepInput, '
       if (!ids.has(dep)) return `Step "${step.id}" depends on unknown step "${dep}".`;
     }
   }
+  // A loop passes both checks above and then costs the user a workflow: the
+  // runner orders steps by dependsOn, so nothing inside a loop ever becomes
+  // ready, and the failure surfaces at run time with the definition already
+  // stored. Refuse it here, where the author can still see what they drew.
+  const dependsOn = new Map(steps.map((step) => [step.id, step.dependsOn ?? []]));
+  const loop = findCycle(ids, (id) => dependsOn.get(id) ?? []);
+  if (loop) return `Workflow steps form a dependency loop: ${describeCycle(loop)}.`;
   return null;
 }
 

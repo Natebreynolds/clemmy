@@ -375,3 +375,61 @@ test('writeWorkflowAndSyncTriggers updates the event trigger registry immediatel
     .filter((result) => result.workflowName === 'event-authoring-wf');
   assert.equal(afterDelete.length, 0);
 });
+
+/**
+ * A dependency cycle used to reach storage.
+ *
+ * The authoring validator checked duplicate ids and unknown deps but not
+ * cycles, so `a -> b -> a` persisted happily and the workflow then sat there:
+ * the runner derives execution order from dependsOn, and no step in a loop is
+ * ever ready. The only detector lived in workflow-graph.ts and ran at run time,
+ * long after the definition was written. Both now share one traversal, and the
+ * message names the loop instead of merely asserting one exists.
+ */
+test('the authoring validator refuses a dependency cycle, and names the loop', () => {
+  const twoStep = validateWorkflowStepGraph([
+    { id: 'draft', dependsOn: ['review'] },
+    { id: 'review', dependsOn: ['draft'] },
+  ]);
+  assert.equal(twoStep, 'Workflow steps form a dependency loop: "draft" → "review" → "draft".');
+
+  assert.equal(
+    validateWorkflowStepGraph([{ id: 'solo', dependsOn: ['solo'] }]),
+    'Workflow steps form a dependency loop: "solo" → "solo".',
+    'a step depending on itself is a cycle of one',
+  );
+
+  assert.match(
+    validateWorkflowStepGraph([
+      { id: 'a', dependsOn: ['c'] },
+      { id: 'b', dependsOn: ['a'] },
+      { id: 'c', dependsOn: ['b'] },
+    ]) ?? '',
+    /dependency loop/,
+    'a cycle longer than two steps is still a cycle',
+  );
+});
+
+test('the authoring validator still accepts every shape that is merely not a chain', () => {
+  // A diamond: two independent middles over one root, joined at the end. Every
+  // node is reachable twice, which a naive "have I seen this?" check mistakes
+  // for a loop.
+  assert.equal(validateWorkflowStepGraph([
+    { id: 'root', dependsOn: [] },
+    { id: 'left', dependsOn: ['root'] },
+    { id: 'right', dependsOn: ['root'] },
+    { id: 'join', dependsOn: ['left', 'right'] },
+  ]), null);
+
+  // Disconnected roots, and a step with no dependsOn at all.
+  assert.equal(validateWorkflowStepGraph([
+    { id: 'first' },
+    { id: 'second', dependsOn: [] },
+  ]), null);
+
+  // An unknown dep must still be reported as unknown, not swallowed as a cycle.
+  assert.match(
+    validateWorkflowStepGraph([{ id: 'only', dependsOn: ['ghost'] }]) ?? '',
+    /depends on unknown step "ghost"/,
+  );
+});
