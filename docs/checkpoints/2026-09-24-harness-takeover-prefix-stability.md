@@ -129,3 +129,42 @@ a fresh session would not.
   naming the 5 projected records; the outcome composer should see the
   projection summary too.
 - Promote the provenance layer-drift analysis into `scripts/`.
+
+## 6. Closing the original pilot — 2026-09-23 18:40 → 19:35 PT (owner directive: close it, no new features)
+
+Installed now: `3230e3de8`, fingerprint `eb69d7619c58…`, receipts `/tmp/clem-roles-patch` (4f76b423) and `/tmp/clem-truth-patch` (3230e3de8), rollbacks kept.
+
+### Completed and proven on the installed build
+
+| Claim | Proof |
+| --- | --- |
+| Approval → execution → correct Space records | Card `apr-6lp2` approved 18:36 PT; run `trigger-cbba991a` completed in 1.0 s, terminal `succeeded`, goal 5/5. Canonical store: 5 records = the first five of the 13 raw lines (`- SERP API`, `- AI Optimization API`, `- Keywords Data API`, `- Domain Analytics API`, `- DataForSEO Labs API`), each with section_name, source_ref (page receipt `509edf14…`), run_ref (the run id), observed_at. The leading `- ` is the reviewed contract's `prefix: ""`, not a projection fault. |
+| Restart / replay | Daemon restarted three times since publication (hotpatches 4f76b423, 3230e3de8 and one more). Head digest `f7011ae4…` unchanged, 5 records, 0 replayed/duplicate observations, 1 partition; boot reconcile logged `replayed: 1, projected: 0`. Projection row still `queued` on the proven run with `apr-6lp2`. |
+| Failure / retry | The first approved run (`trigger-0a70cd32`, judged negative) left the Space empty and its projection stuck; after 5f5a6d73 the released projection re-opened with a fresh card and the second run published. Pinned end to end in `automation-read-pilot-control-plane.test.ts` (negative judge → no claim, no head; release; fresh card; clean run publishes exactly once with its own dataset; boot reconcile + second drain change nothing). |
+| Early dataset commit vs negative review | Same pin: the lineage produced before the judge is never published while the run needs attention, and no record of the clean run cites the judged-negative run. The judge is asserted to have SEEN the projection facts. |
+| Truthful completion | Run report now says "Projected 5 documentation_section records into the … Space" (pinned). `space_get` reports canonical records; fresh-session status turn at 19:26 PT answered with the five names, coverage 5/5, recurrence inactive. Before the fix (19:08 PT, same question in the pilot session) the reply said the Space "holds nothing". |
+| Explicit request roles | Usage rows carry `role` + `roleReason`; the route layer tags judge→reviewer and worker at the wire. Rows since 19:26 PT: brain 5, reviewer 7 (incl. post-turn reflection judges that were `unset` at 19:13), router 2, unset 0. |
+| Retention bounded + tested | 128 names per source, oldest disabled released first; pins: re-enable keeps place and sealed schema; a changed schema is refused by the sealed universe (unchanged behavior); a restart rebuilds first-seen order. |
+| getAllTools MCP fixture | passes (fixture records the turn's proven read); runner file 305 tests, same 20 pre-existing failures. |
+
+### Measured (scripts/measure-source-turn.mjs, live home)
+
+| Turn | Wall s | Frames (brain/rev/router) | Uncached tok | Total prompt | Largest prompt | Output | Tool calls | Repairs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 293174 pilot prep (before lifecycle fix) | 120.6 | 21 (8 Flash) | 138,356 | 443,892 | 54,884 | 17,460 | 9 | 0 |
+| 293289 stuck-projection loop | 806.4 | 40 (21 Flash) | 538,815 | 1,852,543 | 109,617 | 78,980 | 34 | 0 (2 retry decisions) |
+| 293628 pilot prep (all fixes) | 49.0 | 8 (3 Flash) | 143,607 | 350,007 | 114,386 | 2,847 | 4 | 0 |
+| 293703 status check, heavy session | 282.4 | 10 (5 brain) | 295,037 | 519,549 | 121,449 | 11,434 | 5 | 0 |
+| 293783 status check, fresh session | 70.1 | 9 (5/2/2) | 83,775 | 119,935 | 20,214 | 4,928 | 6 | 0 |
+| pilot run `trigger-cbba991a` | 1.0 | 0 model frames | — | — | — | — | 1 read | 0 |
+
+Reading: the controlled session's own history (110k+ tokens) is now the dominant cost, not the harness: the same question costs 70 s / 84k uncached in a fresh session versus 282 s / 295k in the pilot session. Together GLM-5.3-Flash frames at 120k context took 66–98 s each. Together also misses the cache on a frame issued within ~1–2 s of the previous frame settling (frame 2 of 293783 and of 293628), and evicted once at 120k (frame 4 of 293703) with the input append-only — provider behavior, recorded, not ours.
+
+### Still open (release gates, reported separately from the fixes above)
+
+- **Owner decisions:** publish a reviewed projection over a failed judge (classifier refused; gate unchanged); advertise plan_task from frame 1 (one ~60k re-bill per planning turn today).
+- **Recurrence:** proven pilot awaits the owner's separate recurrence approval; not activated.
+- **Section 6 items 1, 3–8:** mobile approval after restart with duplicate tap; P1/P3 mutation crash matrix; judge under Claude quota; request-sized latency walls; Jev trajectory decision; cold unfamiliar-tool discovery; test debt (20 host-runner failures still unattributed) and the full idle-machine suite/journeys.
+- **Not proven here:** a provider-failure path live (MCP server down during the read) — covered only by the blocked-status branch of the release pin; physical mobile routing; fresh/upgrade installer; long-horizon plan preservation; proactive surfaces.
+- Contract authoring quality: the reviewed text interpretation kept the markdown bullet in section_name (`prefix: ""`); fine for acceptance, worth a nudge in authoring.
+- No tag, push, or main merge. UI untouched.
