@@ -4026,10 +4026,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // leave the prefix. The host advertises it normally when the acquisition
       // doors are absent.
       ? [...reviewedComputeResults, Object.assign(buildPlanTaskTool({ planning: hostFreshPlanning }), {
-          // Route-aware: an act route keeps plan_task first-class from frame
-          // one; a retrieve or direct-reply route reaches it by search then
-          // call (the structural lookup hands back a schema handle).
-          deferLoading: options.acceptedRoute === 'retrieve' || options.acceptedRoute === 'direct_reply',
+          // Evidence, not a route label (ordinary host chat turns carry no
+          // accepted-route label): plan_task rides the prefix from frame one
+          // when the turn is already planning-primed — an act route, or a
+          // planning catalog that holds capabilities at build time. Otherwise
+          // it is reached by search then call; the structural lookup hands
+          // back its schema handle, and enablement later in the turn never
+          // changes the prefix.
+          deferLoading: options.acceptedRoute !== 'act' && hostFreshPlanning.capabilities.length === 0,
         }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
