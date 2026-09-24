@@ -1759,3 +1759,76 @@ test('Workspace inventory accepts the declared output scope and an exact destina
   }
   assert.equal(fixture.bodies(), 0);
 });
+
+// Live 2026-09-24 00:37Z (trigger-0a70cd32): the approved pilot run finished
+// needs-attention, its projection stayed `queued` forever, and every later
+// request for the same proposal got the same projection back with no new card.
+test('a queued projection whose run finished without proving the pilot re-opens with a fresh card', async () => {
+  const fixture = blankStateFixture('unproven');
+  const registered = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  if (!registered.ok) return;
+  assert.equal(approvals.resolve(registered.approval.approvalId, 'approved', 'human.unproven').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(registered.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  const runId = queued.projection.runId;
+
+  // The run is still live: the same request must NOT mint another card.
+  const stillLive = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(stillLive.ok, true, JSON.stringify(stillLive));
+  if (stillLive.ok) {
+    assert.equal(stillLive.cardCreated, false);
+    assert.equal(stillLive.projection.status, 'queued');
+  }
+
+  // The run terminates needing attention (the live shape): the projection is
+  // released, and the next exact request re-opens it with a new card.
+  const runFile = path.join(shared.WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const record = JSON.parse(readFileSync(runFile, 'utf8')) as Record<string, unknown>;
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(runFile, JSON.stringify({
+    ...record,
+    status: 'completed',
+    finishedAt: new Date().toISOString(),
+    needsAttention: true,
+    terminalOutcome: 'blocked',
+  }));
+  assert.equal(
+    control.automationReadPilotRunUnprovenReason({ status: 'completed', finishedAt: 'x', needsAttention: true }),
+    'the pilot run finished needing attention',
+  );
+  assert.equal(control.automationReadPilotRunUnprovenReason({ status: 'completed', finishedAt: 'x' }), null, 'a clean run proves the pilot');
+  assert.equal(control.automationReadPilotRunUnprovenReason({ status: 'running' }), null, 'an unfinished run releases nothing');
+
+  const reopened = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(reopened.ok, true, JSON.stringify(reopened));
+  if (!reopened.ok) return;
+  assert.equal(reopened.projection.projectionId, registered.projection.projectionId, 'same durable identity');
+  assert.equal(reopened.cardCreated, true, 'a fresh review card');
+  assert.notEqual(reopened.approval.approvalId, registered.approval.approvalId);
+  assert.equal(reopened.projection.status, 'approval_pending');
+  assert.equal(reopened.projection.runId ?? null, null);
+  assert.equal(reopened.projection.triggerReceiptId ?? null, null);
+
+  // The boot/timer reconciler releases a stuck row too, without a request.
+  assert.equal(approvals.resolve(reopened.approval.approvalId, 'approved', 'human.unproven').ok, true);
+  const requeued = control.reconcileAutomationReadPilotProjection(registered.projection.projectionId);
+  assert.equal(requeued.ok, true, JSON.stringify(requeued));
+  if (!requeued.ok || !requeued.projection.runId) return;
+  const secondRun = path.join(shared.WORKFLOW_RUNS_DIR, `${requeued.projection.runId}.json`);
+  const second = JSON.parse(readFileSync(secondRun, 'utf8')) as Record<string, unknown>;
+  writeFileSync(secondRun, JSON.stringify({ ...second, status: 'blocked', finishedAt: new Date().toISOString(), terminalOutcome: 'blocked' }));
+  const swept = control.reconcileAutomationReadPilotProjections({ limit: 50 });
+  assert.ok(swept.runUnproven >= 1, `the sweep released this projection (sweeps are global): ${JSON.stringify(swept)}`);
+  assert.equal(control.loadAutomationReadPilotProjection(registered.projection.projectionId)?.status, 'refused');
+});

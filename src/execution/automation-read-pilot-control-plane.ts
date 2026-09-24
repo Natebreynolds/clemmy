@@ -11,6 +11,9 @@
  * consulted for execution authority.
  */
 import { createHash } from 'node:crypto';
+import path from 'node:path';
+import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { readWorkflowRunRecord } from './workflow-run-record.js';
 
 import type { WorkflowInputDef } from '../memory/workflow-store.js';
 import type {
@@ -203,6 +206,9 @@ export interface ReconcileAutomationReadPilotProjectionsResult {
   alreadyQueued: number;
   refused: number;
   failed: number;
+  /** Queued projections whose run reached a terminal without proving the
+   * pilot, now released so the same proposal can be re-staged. */
+  runUnproven: number;
 }
 
 interface ProjectionSqlRow {
@@ -364,6 +370,101 @@ export function automationReadPilotCatalogIdentityDigest(
     version: CONTROL_PLANE_VERSION,
     identity,
   }));
+}
+
+/** Refusal code of a queued projection released because its run finished
+ *  without proving the pilot. Such a projection re-opens on the next request
+ *  (see registerAutomationReadPilotProjection); every other refusal is final. */
+export const AUTOMATION_READ_PILOT_RUN_UNPROVEN = 'run_unproven' as const;
+
+/**
+ * Why a pilot run's terminal record does NOT prove the pilot, or null when it
+ * does (a clean completed run) or when the run has not finished yet.
+ *
+ * Live 2026-09-24 00:37Z (trigger-0a70cd32): the approved pilot run finished
+ * needs-attention, the projection stayed `queued` forever, and every later
+ * request for the same proposal was handed the same projection with no new
+ * card — the model then spent twelve minutes searching for a control that did
+ * not exist. A queued projection must have exactly one live run; a run that
+ * ended without proving the pilot releases it.
+ */
+export function automationReadPilotRunUnprovenReason(record: {
+  status?: string;
+  finishedAt?: string;
+  needsAttention?: boolean;
+  terminalOutcome?: string;
+} | null | undefined): string | null {
+  if (!record || typeof record.finishedAt !== 'string' || !record.finishedAt) return null;
+  if (record.needsAttention === true) return 'the pilot run finished needing attention';
+  if (record.terminalOutcome === 'blocked') return 'the pilot run finished blocked';
+  if (record.status && record.status !== 'completed') return `the pilot run finished ${record.status}`;
+  return null;
+}
+
+function pilotRunRecordFor(runId: string): {
+  status?: string;
+  finishedAt?: string;
+  needsAttention?: boolean;
+  terminalOutcome?: string;
+} | null {
+  try {
+    return readWorkflowRunRecord<{
+      status?: string;
+      finishedAt?: string;
+      needsAttention?: boolean;
+      terminalOutcome?: string;
+    }>(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  } catch {
+    return null;
+  }
+}
+
+/** Release one queued projection whose run finished without proving the
+ *  pilot. Idempotent; a projection that is not exactly queued on that run is
+ *  left alone. */
+export function releaseUnprovenAutomationReadPilotRun(input: {
+  runId: string;
+  reason: string;
+}): { released: boolean } {
+  const changes = database().prepare(`
+    UPDATE automation_read_pilot_projections
+       SET status = 'refused', refusal_code = ?, refusal_detail = ?, updated_at = ?
+     WHERE run_id = ? AND status = 'queued'
+  `).run(
+    AUTOMATION_READ_PILOT_RUN_UNPROVEN,
+    input.reason.slice(0, 8_192),
+    new Date().toISOString(),
+    input.runId,
+  ).changes;
+  return { released: changes === 1 };
+}
+
+function releaseIfRunUnproven(row: ProjectionSqlRow): ProjectionSqlRow {
+  if (row.status !== 'queued' || !row.run_id) return row;
+  const reason = automationReadPilotRunUnprovenReason(pilotRunRecordFor(row.run_id));
+  if (!reason) return row;
+  releaseUnprovenAutomationReadPilotRun({ runId: row.run_id, reason });
+  return database().prepare(
+    'SELECT * FROM automation_read_pilot_projections WHERE projection_id = ?',
+  ).get(row.projection_id) as ProjectionSqlRow;
+}
+
+/** Re-open a released projection for a fresh review card: same durable
+ *  identity and bytes, no approval, receipt or run. Only the typed
+ *  run-unproven release re-opens; any other refusal stays final. */
+function reopenReleasedProjection(row: ProjectionSqlRow): ProjectionSqlRow | null {
+  if (row.status !== 'refused' || row.refusal_code !== AUTOMATION_READ_PILOT_RUN_UNPROVEN) return null;
+  const db = database();
+  const changed = db.prepare(`
+    UPDATE automation_read_pilot_projections
+       SET status = 'registering', approval_id = NULL, trigger_receipt_id = NULL, run_id = NULL,
+           refusal_code = NULL, refusal_detail = NULL, updated_at = ?
+     WHERE projection_id = ? AND status = 'refused' AND refusal_code = ?
+  `).run(new Date().toISOString(), row.projection_id, AUTOMATION_READ_PILOT_RUN_UNPROVEN).changes;
+  if (changed !== 1) return null;
+  return db.prepare(
+    'SELECT * FROM automation_read_pilot_projections WHERE projection_id = ?',
+  ).get(row.projection_id) as ProjectionSqlRow;
 }
 
 function rowToProjection(row: ProjectionSqlRow): AutomationReadPilotProjectionV1 {
@@ -876,7 +977,7 @@ export function registerAutomationReadPilotProjection(
 ): RegisterAutomationReadPilotProjectionResult {
   const prepared = prepareProjection(input);
   if ('code' in prepared) return { ok: false, ...prepared };
-  const inserted = insertProjectionIntent({ prepared, request: input });
+  let inserted = insertProjectionIntent({ prepared, request: input });
   if ('code' in inserted) {
     return {
       ok: false,
@@ -885,6 +986,10 @@ export function registerAutomationReadPilotProjection(
       ...(inserted.row ? { projection: rowToProjection(inserted.row) } : {}),
     };
   }
+  // A queued projection whose run already finished without proving the pilot
+  // is released here, and a released projection re-opens for a fresh card.
+  inserted = releaseIfRunUnproven(inserted);
+  inserted = reopenReleasedProjection(inserted) ?? inserted;
   if (inserted.status === 'refused') {
     return {
       ok: false,
@@ -1521,7 +1626,27 @@ export function reconcileAutomationReadPilotProjections(input: {
     alreadyQueued: 0,
     refused: 0,
     failed: 0,
+    runUnproven: 0,
   };
+  const queuedRows = input.approvalId
+    ? database().prepare(`
+        SELECT * FROM automation_read_pilot_projections
+         WHERE approval_id = ? AND status = 'queued' AND run_id IS NOT NULL
+         ORDER BY updated_at ASC, projection_id ASC LIMIT ?
+      `).all(input.approvalId, limit) as ProjectionSqlRow[]
+    : database().prepare(`
+        SELECT * FROM automation_read_pilot_projections
+         WHERE status = 'queued' AND run_id IS NOT NULL
+         ORDER BY updated_at ASC, projection_id ASC LIMIT ?
+      `).all(limit) as ProjectionSqlRow[];
+  for (const row of queuedRows) {
+    try {
+      const released = releaseIfRunUnproven(row);
+      if (released.status !== 'queued') result.runUnproven += 1;
+    } catch {
+      result.failed += 1;
+    }
+  }
   for (const row of rows) {
     result.scanned += 1;
     try {
