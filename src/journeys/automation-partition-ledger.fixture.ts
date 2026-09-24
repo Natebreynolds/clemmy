@@ -15,6 +15,7 @@ const proposalId = process.env.ROW10_PROPOSAL_ID;
 assert.ok(runId && activationId && workflowId && firstFireAt && proposalId, 'fixture lineage environment is incomplete');
 
 const support = await import('./automation-partition-ledger.fixture-support.js');
+const recordingReview = support.installRecordingPartitionReview();
 const opportunityStore = await import('../execution/automation-opportunity-store.js');
 const targets = await import('../execution/automation-pilot-target.js');
 const scheduler = await import('../execution/workflow-scheduler.js');
@@ -73,6 +74,7 @@ assert.equal(completedRuns[0]?.id, runId);
 assert.equal(completedRuns[0]?.status, 'completed', JSON.stringify(completedRuns[0]));
 assert.equal(completedRuns[0]?.terminalOutcome, 'succeeded');
 assert.equal(completedRuns[0]?.goalOutcome, 'satisfied');
+assert.equal(recordingReview.requests.length, 1, 'the restarted scheduled run receives a real parsed review');
 assert.equal(carrier.counts.call, support.PARTITION_PAGE_COUNT);
 assert.deepEqual(carrier.counts.cursors, [null, 'partition-page-1', 'partition-page-2']);
 

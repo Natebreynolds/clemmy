@@ -124,6 +124,16 @@ export function normalizeFieldsInput(raw: unknown): string[] | undefined {
     return arr.length > 0 ? arr : undefined;
   }
   if (typeof raw === 'string' && raw.trim()) {
+    // String-only tool transports can serialize the documented array form.
+    // Decode only a nonempty string array; malformed input must not widen a
+    // projection into returning every field.
+    try {
+      const decoded: unknown = JSON.parse(raw);
+      if (Array.isArray(decoded) && decoded.length > 0
+        && decoded.every((field) => typeof field === 'string' && field.trim().length > 0)) {
+        return decoded.map((field: string) => field.trim());
+      }
+    } catch { /* the existing comma-separated spelling is also supported */ }
     const arr = raw.split(',').map((s) => s.trim()).filter(Boolean);
     return arr.length > 0 ? arr : undefined;
   }

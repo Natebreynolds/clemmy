@@ -98,7 +98,7 @@ function throwingRunner(): EventEmitter {
   return runner;
 }
 
-test('empty initial catalog gains plan_task on the next real model surface after exact tool_search disclosure', async () => {
+test('empty initial catalog discovers callable plan_task without growing the stable schema prefix', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
 
@@ -186,8 +186,12 @@ test('empty initial catalog gains plan_task on the next real model surface after
       } else if (modelCalls === 2) {
         assert.match(serialized, new RegExp(observed.definition.capabilityRef),
           'tool_search returned the exact citable live ref');
-        assert.ok(tools.includes('plan_task'),
-          'the next SDK model surface re-evaluates plan_task against the live disclosed catalog');
+        assert.equal(tools.includes('plan_task'), false, 'deferred control does not inflate the schema prefix');
+        output = [functionCall('discover-plan-control', 'tool_search', { query: 'plan_task', role_key: null, limit: 1 })];
+      } else if (modelCalls === 3) {
+        assert.match(serialized, /plan_task/, 'structural discovery supplies the callable control');
+        assert.match(serialized, /draft/, 'the discovered control supplies its argument schema');
+        assert.equal(tools.includes('plan_task'), false, 'schema acquisition keeps the stable prefix');
         output = [functionCall('freeze-write-file-plan', 'plan_task', {
           preamble: 'I’ll create the requested fixture file now.',
           draft: exactDraft,
@@ -256,7 +260,7 @@ test('empty initial catalog gains plan_task on the next real model surface after
     } as never,
   ));
 
-  assert.equal(modelCalls, 3, JSON.stringify({
+  assert.equal(modelCalls, 4, JSON.stringify({
     planOutput: eventlog.getToolOutput(session.id, 'freeze-write-file-plan'),
     expectedWork: expectedWork.loadExpectedWorkContract(session.id, source.seq),
     events: eventlog.listEvents(session.id).map((event) => ({
@@ -266,7 +270,8 @@ test('empty initial catalog gains plan_task on the next real model surface after
     })),
   }));
   assert.equal(modelSurfaces[0]?.includes('plan_task'), false);
-  assert.equal(modelSurfaces[1]?.includes('plan_task'), true);
+  assert.equal(modelSurfaces[1]?.includes('plan_task'), false);
+  assert.deepEqual(modelSurfaces[2], modelSurfaces[1], 'structural lookup adds no always-on schemas');
   assert.equal(modelSurfaces[1]?.includes('work_call'), true,
     'the same bounded post-discovery model surface can execute the frozen plan');
   assert.ok((modelRequestBytes[1] ?? Number.POSITIVE_INFINITY) <= 64 * 1024,

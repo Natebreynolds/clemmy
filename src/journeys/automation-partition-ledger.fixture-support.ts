@@ -145,3 +145,26 @@ export function installGeneratedPartitionCarrier(): GeneratedPartitionCarrier {
     counts,
   };
 }
+
+/** Recording provider transport used in both processes; the real review runner
+ * and verdict parser remain in charge of workflow completion. */
+export function installRecordingPartitionReview() {
+  const previous = globalThis.fetch;
+  const requests: unknown[] = [];
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init);
+    assert.equal(request.url, 'https://partition-review.invalid/v1/chat/completions');
+    const body = await request.json() as Record<string, unknown>;
+    assert.equal(body.model, 'partition-review-fixture');
+    assert.match(JSON.stringify(body.messages), /Complete the full workflow objective, including its constraints/);
+    assert.match(JSON.stringify(body.messages), /workflow_execution/);
+    assert.match(JSON.stringify(body.tools), /open_evidence/);
+    requests.push(body);
+    return new Response(JSON.stringify({ id: 'partition-recording-review', object: 'chat.completion', created: 1,
+      model: 'partition-review-fixture', choices: [{ index: 0, message: { role: 'assistant',
+        content: 'DONE: the recording pilot evidence satisfies its bounded objective' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  return { requests, restore: () => { globalThis.fetch = previous; } };
+}

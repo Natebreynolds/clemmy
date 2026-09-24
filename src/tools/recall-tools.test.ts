@@ -28,6 +28,25 @@ const {
 
 type RecallHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 
+test('JSON-encoded field arrays query exact retained fields without widening the projection', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'encoded-fields', tool: 'work_call',
+    output: JSON.stringify({ data: { value: [{ subject: 'Example', start: '09:30', privateNote: 'must stay hidden' }] } }) });
+  const query = captureToolOutputQueryHandler();
+  for (const fields of [['subject', 'start'], '["subject","start"]', 'subject,start']) {
+    const result = await withHarnessRunContext({ sessionId: session.id, turn: 1, toolCalls: new ToolCallsCounter(10) },
+      () => query({ call_id: 'encoded-fields', fields }));
+    assert.match(result.content[0].text, /Example/);
+    assert.match(result.content[0].text, /09:30/);
+    assert.doesNotMatch(result.content[0].text, /privateNote|must stay hidden|None of/);
+  }
+  for (const fields of ['[]', '["subject",null]', '["subject"']) {
+    const result = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => query({ call_id: 'encoded-fields', fields }));
+    assert.doesNotMatch(result.content[0].text, /must stay hidden/);
+  }
+});
+
 test('queries of a recall call recover the original data, not the JSON example in its preamble', async () => {
   const session = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: session.id, callId: 'original-cli', tool: 'work_call', output: JSON.stringify({

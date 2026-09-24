@@ -421,7 +421,7 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
         output = [functionCall(`discover-${primaryStep}`, 'tool_search',
           { query: queries[primaryStep - 1], role_key: roleKey, limit: 8 })];
       } else if (primaryStep === searchSteps + 1) {
-        assert.ok(tools.includes('plan_task'), 'disclosure exposes plan_task');
+        assert.equal(tools.includes('plan_task'), false, 'deferred planning remains callable without permanent schema growth');
         modelToolCalls.push('plan_task');
         // BUSINESS PLAN ONLY. Two operations. No verification is authored here,
         // ever — that is the entire point of the vertical.
