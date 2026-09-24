@@ -78,3 +78,30 @@ review verdict, exact settlements, and one terminal with no open owner.
 Windows production signing secrets were absent at the last check. Do not bypass
 the production signing gate or represent an unsigned private candidate as a
 signed Windows release. Recheck availability before publication.
+
+## Second full gate and selected-window call accounting
+
+a5fcba79f was built, Terminal-hotpatched, signed and strictly verified with
+fingerprint 1951d3476677ddc779e97ab5434fca904abb5b0ea997ded7e82ba98fbb897644.
+The complete two-worker run finished in 1,916,893 ms: 17,187 tests, 17,180 passed,
+one failed, six skipped, no cancellations. Live-home sentinel stayed unchanged;
+no live SQLite observations ran during the gate. All five earlier failures passed.
+Evidence: ignored `output/release-candidate-a5fcba79/full-suite.log`.
+
+The sole failure was `provider-keyword-relaxation.test.ts`'s production planning
+long-role card. It selected the correct current web-search tool and schema with
+one fuzzy request. Its call-count assertion expected two exact provider requests,
+but only the hydrated successor and native tools made this page, so there was no
+cold provider row to materialize. The failure reproduced alone at a5fcba79f;
+v3.18.19 passed alone. This is not a failed discovery or a reason to restore an
+unnecessary network call.
+
+The fixture now exercises both the real mixed surface and a provider-only
+surface. Both retain the exact first result, schema, deprecated-row exclusion,
+one fuzzy request, and bounded lifecycle hydration assertions. The provider-only
+variant must select cold rows and verifies the second request contains exactly
+those rows, excluding the hydrated successor and every off-page candidate.
+The mixed variant allows no second request when no cold row is selected.
+Full file: 14/14 passed (`/private/tmp/clem-planning-card-final.log`). This update
+changes only test coverage and this checkpoint; runtime bytes are unchanged.
+Final exact-commit gates and installed workflow acceptance remain owed.
