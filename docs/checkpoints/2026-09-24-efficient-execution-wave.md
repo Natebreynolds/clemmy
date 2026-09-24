@@ -179,3 +179,57 @@ packaged candidate, v3.14 upgrade rehearsal and packaged upgrade (clean worktree
 own build, 21/21) all pass. Not done in this session: pushing `main`, cutting the
 tag, and the 16:00 PT Slack occurrence check. Owner decisions pending: push, and
 Mac-only versus hold for Windows.
+
+## Release (2026-09-24, tagged 12:37 PT, published 13:28 PT)
+
+v3.18.20 is tagged on `09fc7139a` (Mac-only) and published as the latest
+release with signed and notarized arm64 and x64 builds. After the 10:37 PT
+pass the release took three more commits: the organic-traffic refinements, the
+learned effect for verb-less operations (the monday.com first-read refusal),
+and the release commit. The published update's build stamp names `09fc7139a`,
+a clean tree, and source fingerprint `6bb7af7a…`, the same fingerprint the
+owner's app served for the canaries below. The full gate table is in
+`docs/releases/v3.18.20.md`.
+
+**Correction to the 10:37 PT summary.** "Journeys 37 with three pre-existing
+failures" misread the log: 37 is the number of journey files, and that run
+(`49fb69653`) failed 34 of 169 journey tests across 9 files. The tag fails the
+same set minus the partition-ledger timeout. Against a full v3.18.19 run (174 tests, 43 fail in 10 files), no journey file
+newly fails and two now pass, but six of the eight fail at a different point.
+Traced: the restaurant-sheet journeys fail their first step since `45254ff2b`
+(09-23, the work carrier stays visible on an empty catalog, an intentional
+change the journey never absorbed). With that one expectation relaxed they
+fail step two, because `a5fcba79f` (09-24 catalog ranking) fills the first
+discovery page with built-in search tools and drops the Sheet operation.
+Untraced: capability-lifecycle row 6, the local-LLM Workspace ask ("plan_task
+retires after exact activation"), provider-neutral local plans (3 failing
+subtests at v3.18.19, 6 here), and the 100-worker gate. When the runner's
+result stream breaks, `--experimental-test-isolation=none` through the
+isolated runner shows the real assertion.
+
+**Canaries on the tag, installed fingerprint-exact:** read-only check 8 s; a
+repeated standing rule recognized as already saved in 4 s with no tool call;
+the organic-traffic ask in 54 s through five direct calls to the raw API
+operation; the owner's monday.com first ask, refused before the fix, answered in
+42 s, with both verb-less board operations learned as reads during the ask
+(confidence 0.97 and 0.93). The owner-selected reviewer judged both provider
+answers fulfilled.
+
+**After the tag:** a comment-only commit on `main` clears the provider-literal
+gate that the tag's CI run tripped. The marketing-site security merge also
+landed on `main`; it does not ship in the desktop app.
+
+**Owed:**
+- Feed unannotated MCP operation definitions to the learned-effect mechanism;
+  today only Composio operations learn their effect.
+- Publish a cold toolkit's operation proof past the discovery deadline, so a
+  freshly connected app's first ask does not pay the proof twice.
+- Host activation of a selected reviewed plan (parked on
+  `wip/plan-host-activation`).
+- Retain a deterministic workflow step's output as evidence the write reviewer
+  can open, and stop clipping the refusal detail.
+- Fix the compound-request ranking regression from `a5fcba79f`, bring the
+  restaurant journeys up to the 09-23 carrier change, and trace the four other
+  journey differences.
+- The packaged-candidate smoke needs `build:mobile-web` and `build:console-web`
+  in the clean worktree before it runs.
