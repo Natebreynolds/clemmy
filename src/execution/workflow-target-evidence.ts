@@ -70,7 +70,7 @@ export function humanDecisionBlocks(runId: string): string[] {
   }
 }
 
-export function readWorkflowTargetEvidence(runId: string): WorkflowTargetEvidence {
+export function readWorkflowTargetEvidence(runId: string, options: { compactResults?: boolean } = {}): WorkflowTargetEvidence {
   try {
     const db = openEventLog();
     const prefix = `workflow:${runId}:`;
@@ -108,7 +108,10 @@ export function readWorkflowTargetEvidence(runId: string): WorkflowTargetEvidenc
     const blocks: string[] = [];
     const retained = new Map<string, JudgeEvidenceEntry>();
     const present = (ref: string, text: string): string => {
-      if (text.length <= 12_000) return text;
+      // Share the existing inline allowance across this review's settlements;
+      // retained contents remain whole and independently queryable.
+      const inlineAllowance = options.compactResults ? Math.floor(12_000 / Math.max(1, rows.length)) : 12_000;
+      if (text.length <= inlineAllowance) return text;
       let value: unknown;
       value = judgeEvidenceJsonValue({ text });
       if (typeof value === 'string') value = undefined;

@@ -19,7 +19,7 @@ creation test") was driven three times through the installed app.
 |---|---|---|---|---|---|---|
 | before | `e1011bc8` | 517 s | 14 (grok-4.6) | 24: workflow_get ×10, run_status ×4, list ×3, tool_search ×4, create ×1 | 825k (428k cached) | **blocked** — Jev "named work still missing" on a created, tested, enabled workflow |
 | after fixes 1–2 | `4276ea62` | 600 s+ (three attempts) | — | — | — | creation test parked on "which account?", then `live_observation_missing`; the brain thrashed with `workflow_update`/`set_enabled` |
-| after fixes 1–5 | `eca325f1` | **333 s** | 5 (grok-4.6) | **8**: list, tool_search ×3, recall, get ×2, create | **281k** (105k cached) | **done** — "created, enabled… reads on nathan.reynolds@scorpion.co" |
+| after fixes 1–5 | `eca325f1` | **333 s** | 5 (grok-4.6) | **8**: list, tool_search ×3, recall, get ×2, create | **281k** (105k cached) | **done** — "created, enabled… reads on [account redacted]" |
 
 **2. A human-in-the-loop workflow, authored and exercised.** `Invite digest`
 (read calendar → draft → `save_digest` gated with `requiresApproval`) was

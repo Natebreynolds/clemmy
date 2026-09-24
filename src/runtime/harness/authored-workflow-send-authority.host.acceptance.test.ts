@@ -175,7 +175,9 @@ function installOperation(input: {
   portBodies[input.operationId] = 0;
   const invoke = async () => {
     portBodies[input.operationId] = (portBodies[input.operationId] ?? 0) + 1;
-    return { successful: true, data: { id: `msg-${portBodies[input.operationId]}`, delivered: true } };
+    return input.readOnly
+      ? { successful: true, data: { records: Array.from({ length: 100 }, (_, id) => ({ id, text: 'retained'.repeat(10) })) } }
+      : { successful: true, data: { id: `msg-${portBodies[input.operationId]}`, delivered: true } };
   };
   const entry = productionAdapters.registeredCapabilityFromManifest({
     manifest,
@@ -934,4 +936,13 @@ test('a refused authored mutation can gather missing evidence through a proven r
   assert.deepEqual(reviews, [1, 2]);
   assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id),
     ['first-evidence', 'missing-evidence', 'verified-write']);
+  const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+  const full = readWorkflowTargetEvidence(fixture.workflowRunId);
+  const compact = readWorkflowTargetEvidence(fixture.workflowRunId, { compactResults: true });
+  assert.ok(compact.summary.length < full.summary.length / 2,
+    'the mutation review gets an index instead of repeated inline record dumps');
+  const ref = compact.results?.find(row => row.logicalToolCallId === 'missing-evidence')?.resultHandleId;
+  assert.ok(ref);
+  const retained = compact.evidence?.resolve(ref!)?.value as { data: { records: unknown[] } };
+  assert.equal(retained.data.records.length, 100, 'every record remains available for exact queries');
 });

@@ -15,7 +15,7 @@ You are the harness agent for Clementine. You refine the framework on top of the
 it left open. A separate UI agent owns the console/mobile design changes and will cut the v3.18.20 tag; you do not
 tag, you do not touch their files, and you do not put unreviewed runtime changes under their tag.
 
-Repo: /Users/nathan.reynolds/clementine-next (shared `main` worktree). Read, in this order:
+Repo: ~/clementine-next (shared `main` worktree). Read, in this order:
 docs/NEXT-TAG-HANDOFF-2026-09-22.md (this), docs/checkpoints/2026-09-22-author-fix-suggest.md (measurements),
 docs/JEV-FRAMEWORK-HANDOFF-2026-09-21.md (the mandate), docs/NEXT-TAG-RELEASE-GATE.md ("Candidate and tag procedure").
 

@@ -16,7 +16,7 @@ Keep work in the existing harness worktree, preserve the other agent's edits, an
 
 At writing:
 
-- Worktree: `/Users/nathan.reynolds/clementine-next-harness-3-19`, branch `harness/3.19`, clean before adding this document.
+- Worktree: `~/clementine-next-harness-3-19`, branch `harness/3.19`, clean before adding this document.
 - HEAD: `fcacf2b2ebc23e38b5b345b2c62dda070d2b63c6`, latest checkpoint commit.
 - Installed daemon: `d8362bf691bb5783c938fc71bd154e9deb1f36b7`, fingerprint `ed7098034e2a830204f8e271efdd1a5ecc0387c4058f446d9aa105d05204abbc`, PID 88701, schema 81.
 - Main remains a separate checkout. Recheck current state before editing or hotpatching; these identifiers will age.

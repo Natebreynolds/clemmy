@@ -73,3 +73,22 @@ test('large writes and retained observations stay inspectable, without a partial
   assert.equal(called, 1);
   assert.equal(result.verdict, 'compatible');
 });
+
+test('large observations do not hide the write or saved constraints behind a lookup', async () => {
+  const summary = 'Authenticated result index. '.repeat(600);
+  const result = await reviewWorkflowMutation({ ...input, observations: { complete: true, summary } }, {
+    evaluate: async () => { throw new Error('large proposal must be reviewed'); },
+    judge: async (_system, prompt, parse, _isPass, _lane, opts) => {
+      const packet = JSON.parse(prompt);
+      assert.equal(packet.instructions, input.instructions);
+      assert.equal(packet.tool, input.tool);
+      assert.deepEqual(packet.args, input.args);
+      assert.equal(packet.observations, summary);
+      const full = opts?.evidence?.resolve(packet.proposalRef)?.value as { observations: string };
+      assert.equal(full.observations, summary);
+      return { value: parse({ verdict: 'compatible', reason: 'Checked the complete proposal.',
+        proposalDigest: packet.proposalDigest }), failure: null };
+    },
+  });
+  assert.equal(result.verdict, 'compatible', result.reason);
+});

@@ -3,7 +3,8 @@ import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge } from './objective-judge.js';
 import { recordJudgeMetric } from './judge-family.js';
-import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
+import type { JudgeEvidenceSource, JudgeEvidenceEntry } from './judge-evidence-tools.js';
+import { describeJsonShape } from './tool-output-digest.js';
 
 export type WorkflowMutationReview = {
   verdict: 'compatible' | 'conflict' | 'uncertain';
@@ -61,14 +62,28 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   const large = serialized.length > 12_000;
   const proposalRef = `proposed-write:${proposalDigest}`;
   const sourceEvidence = input.observations.evidence;
+  const fields = new Map<string, JudgeEvidenceEntry>();
+  const present = (name: string, value: unknown): unknown => {
+    const text = JSON.stringify(value);
+    if (text.length <= 12_000) return value;
+    const ref = `${proposalRef}:${name}`;
+    fields.set(ref, { text, value });
+    return { ref, shape: describeJsonShape(value), characters: text.length };
+  };
+  // The reviewer must see what it is judging before spending a lookup. Keep
+  // constraints and the authenticated evidence index visible; retain large
+  // argument/schema fields separately instead of hiding the entire request.
+  const prompt = large ? JSON.stringify({ proposalDigest, proposalRef,
+    instructions: proposal.instructions, tool: proposal.tool,
+    schema: present('schema', proposal.schema), args: present('args', proposal.args),
+    observations: proposal.observations,
+  }) : serialized;
   const evidence: JudgeEvidenceSource = {
     refKind: 'the exact proposed write and authenticated prior observations',
-    refs: () => [proposalRef, ...(sourceEvidence?.refs() ?? [])],
+    refs: () => [proposalRef, ...fields.keys(), ...(sourceEvidence?.refs() ?? [])],
     resolve: ref => ref === proposalRef ? { text: serialized, value: { ...proposal, proposalDigest } }
-      : sourceEvidence?.resolve(ref),
+      : fields.get(ref) ?? sourceEvidence?.resolve(ref),
   };
-  const prompt = large ? JSON.stringify({ proposalDigest, proposalRef,
-    notice: 'Inspect the exact proposed write before ruling; no payload was discarded.' }) : serialized;
   // Only fully supplied, confident compatibility takes the quick path. Jev's
   // uncertainty, outage or conflict goes to a reviewer that can inspect evidence
   // and return an actionable repair reason. No classifier result grants consent.

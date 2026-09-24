@@ -18,12 +18,12 @@ Read the repository AGENTS instructions and these existing mandates before editi
 
 | Item | Verified value |
 | --- | --- |
-| Harness checkout | `/Users/nathan.reynolds/clementine-next-harness-3-19` |
+| Harness checkout | `~/clementine-next-harness-3-19` |
 | Harness branch | `harness/3.19` |
 | HEAD | `a8b0cb9478b9c827b37024f1831011cb054868a6` |
-| Shared main checkout | `/Users/nathan.reynolds/clementine-next` |
+| Shared main checkout | `~/clementine-next` |
 | Main HEAD | `e77215d008623bf30bddf13448f00496483a5e2c` |
-| Installed app | `/Users/nathan.reynolds/Applications/Clementine.app` |
+| Installed app | `~/Applications/Clementine.app` |
 | Running gitSha | `a8b0cb9478b9c827b37024f1831011cb054868a6` |
 | Running fingerprint | `50b78c6dd10ac2d4af89c5f19503638298beb4a8e8916bb4b10813580933bf30` |
 | Build-info version/schema | 3.18.19 / 81; source package version is 3.18.20 |

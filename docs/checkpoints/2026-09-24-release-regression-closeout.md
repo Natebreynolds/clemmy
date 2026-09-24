@@ -186,3 +186,43 @@ recovery checks and typecheck passed. Logs: /private/tmp/clem-workflow-recovery-
 /private/tmp/clem-recovery-typecheck.log.
 No paid model tests. Never observe live SQLite during isolated sentinel checks.
 Final hotpatch, Platform49 clean run, full gates, merge, push and tag remain owed.
+
+
+## 45872c92 live recovery passes; reviewer evidence blocks completion
+
+Installed SHA45872c922, fingerprintf83d605b93ab2ff320ca6d632d0326440ef683c01671d5950c026bff7b7a1d8b,
+daemon2689; Terminal patch/signature verified, UI archive unchanged. Platform49
+retry1790251019711-72a447, childsource296645, parent296601, preserved the saved
+definition. A write refusal296751 was followed by successful evidence read296757:
+the previously dead recovery edge now works live. No child_lease_activation_failed.
+
+The run still did NOT pass. Mutation reviews repeatedly opened partial text
+views, then asked the brain to re-read already retained data. The full proposal
+(including its rules, args, and evidence index) was itself hidden behind one
+large-result ref, wasting lookups before the reviewer could identify the evidence.
+The reviewer also could not project tuple columns: query_evidence ignored fields
+on array records and returned entire long rows. Its filtered output lacked source
+indices, contributing to ambiguous row position reasoning. No sheet-specific
+exception or consent bypass is an acceptable fix.
+
+Cancelled at12:02:37Z after repeated unverified proposals. Exactly zero mutating
+physical/host crossings in the child settlement ledger; both sources terminal,
+zero open attempts. Receipts: /private/tmp/clem-release-45872c92-live/. This is
+bounded recovery acceptance, not end-to-end Platform49 success or a speed win.
+
+Next candidate keeps rules, proposed operation, small args and the authenticated
+evidence index visible to mutation review; large args/schema remain whole in
+separate scoped refs. Mutation evidence shares the existing inline allowance
+across settlements, preserving every retained byte and exact request scope.
+Other workflow completion evidence presentation stays unchanged. Reviewer JSON
+queries now project numeric tuple columns and retain original zero-based source
+indices after filtering, while counting over all rows. No writes or added tools.
+
+Red/green evidence: packet visibility pin failed on45872; tuple-column pin failed;
+production host compact-index pin failed with compact presentation removed.
+135 focused review/host/workflow checks and typecheck passed. Logs in
+/private/tmp/clem-review-evidence-{red,green,neighbors,typecheck}.log,
+/private/tmp/clem-review-packet-red.log, /private/tmp/clem-compact-review-host-red.log.
+Public hygiene also found four tracked handoffs containing personal paths/address;
+portable home paths and an explicitly redacted address clear those findings.
+Final candidate live acceptance and the release gates are still required.
