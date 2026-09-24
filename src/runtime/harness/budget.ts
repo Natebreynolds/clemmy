@@ -24,6 +24,7 @@
  */
 
 import pino from 'pino';
+import { effectiveContextWindow } from './model-window-observations.js';
 
 const logger = pino({ name: 'clementine.harness.budget' });
 
@@ -266,6 +267,14 @@ export function getEffectiveContextLimit(modelId: string): number {
     }
     logger.warn({ modelId, envKey, raw: overrideRaw }, 'modelContextLimit: env override is not a positive integer, ignoring');
   }
+  // One window authority. The compaction budget already tracks the observed
+  // window (provider catalog, accepted inputs, rejections); the preflight
+  // check read a static table and warned at 128k on a 1M model while
+  // compaction sized itself to 1M (live 2026-09-24, Together GLM-5.3-Flash).
+  try {
+    const observed = effectiveContextWindow(modelId);
+    if (Number.isFinite(observed) && observed > 0) return observed;
+  } catch { /* fall back to the static table */ }
   return modelContextLimit(modelId);
 }
 

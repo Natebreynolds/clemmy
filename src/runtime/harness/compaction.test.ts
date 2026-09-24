@@ -998,22 +998,20 @@ test('compactionBudgetForModel: budget tracks the ROUTED model window, never a f
   assert.equal(compactionBudgetForModel(undefined), resolveModelCapability(undefined).contextWindow);
 });
 
-test('layer1CompactionBudgetForModel: lossless Layer 1 is absolute on a wire without a cached prefix, the window on one with', async () => {
+test('layer1CompactionBudgetForModel: lossless Layer 1 is absolute on every wire; Layers 2/3 keep the window', async () => {
   // Layer 1 clips and collapses OLD tool results that stay recallable by call
-  // id, so it only ever answers "what does the next prefill cost" — and that
-  // is absolute bytes unless the wire serves a cached prefix in practice. The
-  // mid-turn thresholds already make exactly this split (2026-09-01); between
-  // turns the window governed every layer, so on the Codex OAuth wire (880k
-  // window, ~37% cache reads) a 67k-token history never compacted at all.
+  // id. A cached prefix is not free — it still prefills, costs a tenth on every
+  // frame and is re-billed in full on each new turn after the provider TTL —
+  // so the caching exemption (2026-09-15) let a 1M-window Together session
+  // carry a 118k history with 60-turn-old results forever (live 2026-09-24).
   const { layer1CompactionBudgetForModel, compactionBudgetForModel } = await import('./compaction.js');
-  // Seeded non-caching, large window: Layer 1 at the historical absolute.
   assert.equal(layer1CompactionBudgetForModel('gpt-5.6-sol'), 200_000);
   assert.equal(layer1CompactionBudgetForModel('kimi-k3'), 200_000);
   // Layers 2/3 keep the real window — the 2026-08-05 pin above is untouched.
   assert.equal(compactionBudgetForModel('gpt-5.6-sol'), 880_000);
-  // Seeded caching: the prefix is never rewritten for nothing.
-  assert.equal(layer1CompactionBudgetForModel('claude-sonnet-5'), 1_000_000);
-  assert.equal(layer1CompactionBudgetForModel('claude-opus-4-8'), 1_000_000);
+  // Caching wires too: lossless clipping between turns is paid once.
+  assert.equal(layer1CompactionBudgetForModel('claude-sonnet-5'), 200_000);
+  assert.equal(layer1CompactionBudgetForModel('claude-opus-4-8'), 200_000);
   // A window below the absolute is still the honest ceiling.
   assert.equal(layer1CompactionBudgetForModel('glm-4.7'), 200_000);
   assert.ok(layer1CompactionBudgetForModel('totally-unknown-model') <= 200_000);
@@ -1206,4 +1204,33 @@ test('Layer 2 preserves complete tool arguments and results outside its prose su
     assert.equal(keptResult.output?.text, resultText);
     assert.ok(!received.includes('TOOL_CALL'), 'exact tool state is retained rather than sent through prose compression');
   } finally { _setCompactionSummarizerForTests(null); }
+});
+
+
+test('compactSessionIfNeeded — prior-turn reasoning is dropped at the between-turn boundary, at any size, without a model call', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'reasoning boundary test' });
+  const items: AgentInputItem[] = [
+    userMessage('first ask'),
+    { type: 'reasoning', content: [], rawContent: [{ type: 'reasoning_text', text: 'private scratch '.repeat(400) }] } as unknown as AgentInputItem,
+    toolCall('call_r1', 'read_file', '{"path":"a"}'),
+    toolResult('call_r1', 'small result'),
+    { type: 'reasoning', content: [], rawContent: [{ type: 'reasoning_text', text: 'more scratch '.repeat(400) }] } as unknown as AgentInputItem,
+    { role: 'assistant', content: 'done' } as AgentInputItem,
+  ];
+  session.updateConversationSnapshot(items);
+  // Far below every threshold: only Layer 0 acts.
+  const { result, nextItems } = await compactSessionIfNeeded(session, structuredClone(items), {
+    disable: 'layer1_only', inputBudgetTokens: 880_000, layer1ItemThreshold: 1_000,
+  });
+  assert.equal(result.reasoningDropped, 2);
+  assert.equal(result.modified, true);
+  assert.equal(result.layer1.applied, false, 'nothing else moved');
+  assert.deepEqual(nextItems.map((item) => (item as { type?: string; role?: string }).type ?? (item as { role?: string }).role),
+    ['user', 'function_call', 'function_call_result', 'assistant']);
+  assert.ok(result.afterTokens < result.beforeTokens);
+  // With no reasoning present the pass reports nothing and returns the same array.
+  const clean = await compactSessionIfNeeded(session, nextItems, { disable: 'layer1_only', inputBudgetTokens: 880_000, layer1ItemThreshold: 1_000 });
+  assert.equal(clean.result.reasoningDropped, undefined);
+  assert.equal(clean.result.modified, false);
 });
