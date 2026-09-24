@@ -906,3 +906,33 @@ test('a number inside an item\'s evidence does not fix the contract when a model
   assert.equal(hard.ok, false);
   assert.equal(executionAsked, 0);
 });
+
+
+test('inline numbered worker targets outrank incidental counts inside their details', async () => {
+  const text = 'Draft three separate prospect emails. Delegate one per prospect in parallel. '
+    + 'Prospects: (1) Northstar Plumbing, outranked in local search; '
+    + '(2) Valley Legal, competitors advertise; '
+    + '(3) Riverside Dental, 3.9 stars with 40 reviews against 4.8 stars with 600 reviews. Do not send anything.';
+  const detected = detectMultiItemIntent(text);
+  assert.equal(detected.isMultiItem, true);
+  assert.equal(detected.itemCount, 3);
+  assert.equal(detected.exactMembers?.length, 3);
+  assert.match(detected.exactMembers![2], /40 reviews/);
+  const sessionId = openTurn('inline-packets-preserved', 'chat', text, { policyCount: detected.itemCount });
+  // Each original packet can proceed separately: no forced conversion of
+  // distinct instructions into one shared packet to satisfy a false count.
+  for (const item of ['northstar', 'valley', 'riverside']) {
+    const result = await evaluateGateWithArbitration({ sessionId,
+      sourceUserSeq: sourceSeqBySession.get(sessionId), items: [item] });
+    assert.deepEqual(result, { ok: true, required: false });
+  }
+});
+
+test('inline enumeration keeps arbitrary cardinality and single-artifact boundaries', () => {
+  const members = Array.from({ length: 12 }, (_, index) => `(${index + 1}) target-${index + 1} with 40 reviews`).join('; ');
+  assert.equal(detectMultiItemIntent(`Audit each target in parallel: ${members}`).itemCount, 12);
+  const sections = detectMultiItemIntent('Create one report with sections: (1) Overview; (2) Evidence; (3) Recommendations');
+  assert.equal(sections.isMultiItem, false);
+  assert.equal(detectMultiItemIntent('Audit sources: (1) Alpha; (3) Beta; (4) Gamma').exactMembers, undefined);
+  assert.equal(detectMultiItemIntent('Compare the values (10) and (20) with (30).').exactMembers, undefined);
+});
