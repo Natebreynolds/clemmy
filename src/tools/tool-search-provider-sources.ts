@@ -2027,6 +2027,10 @@ export type ProvenLiveReadAcquisition =
       operation: string;
       accountId: string;
       schema?: Readonly<Record<string, unknown>>;
+      /** Set when the operation is not a declared read and was materialized
+       * exactly from its live definition instead; `effect` is the manifest's. */
+      generic?: boolean;
+      effect?: string;
     }
   | { status: 'skipped'; reason: string };
 
@@ -2075,7 +2079,38 @@ export async function acquireProvenLiveReadForSource(input: {
     });
     const acquired = await registry.acquire(requirement(mcpOperation), guard);
     if (!discoveryStillActive(guard)) return { status: 'skipped', reason: 'deadline' };
-    if (acquired.status !== 'installed') return { status: 'skipped', reason: `${acquired.reason}: ${acquired.detail}`.slice(0, 200) };
+    if (acquired.status !== 'installed') {
+      // A generic operation (a raw API passthrough, an endpoint that reads and
+      // writes) can never acquire a read-only proof, but it can be materialized
+      // exactly from its live definition, as call_tool discovery already does.
+      // Live 2026-09-24 (source 299146): dataforseo__api_request came back
+      // "carrier_unavailable" from the read acquisition although the server
+      // was connected and the call went through by name a second later.
+      try {
+        const exact = await resolveAuthorizedExternalMcpToolDefinition(mcpOperation, scope);
+        if (exact?.inputSchema !== undefined && discoveryStillActive(guard)) {
+          const materialized = await createProductionMcpReadCarrier({
+            serverName,
+            ...(dependencies.mcpRuntimeForServer ? { runtime: dependencies.mcpRuntimeForServer(serverName) } : {}),
+          }).materializeExact({ operationId: mcpOperation, inputSchema: exact.inputSchema });
+          if (materialized.status === 'installed') {
+            return {
+              status: 'installed',
+              kind: 'mcp',
+              operation: materialized.manifest.operationId,
+              accountId: materialized.manifest.accountId,
+              generic: true,
+              effect: String(materialized.manifest.effect),
+              ...(exact.inputSchema && typeof exact.inputSchema === 'object'
+                ? { schema: exact.inputSchema as Readonly<Record<string, unknown>> }
+                : {}),
+            };
+          }
+          return { status: 'skipped', reason: `generic_operation: ${materialized.reason}: ${materialized.detail ?? ''}`.slice(0, 200) };
+        }
+      } catch { /* the acquisition refusal below stands */ }
+      return { status: 'skipped', reason: `${acquired.reason}: ${acquired.detail}`.slice(0, 200) };
+    }
     return {
       status: 'installed',
       kind: 'mcp',

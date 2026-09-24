@@ -30,6 +30,9 @@ export interface ProvenLiveRead {
   operation: string;
   kind: 'mcp' | 'cli';
   accountId: string;
+  /** A generic operation (not a declared read) materialized exactly; every
+   * call still has its effect decided at the invocation gate. */
+  generic?: boolean;
 }
 
 /** Why each proven live read was or was not warmed; recorded on the
@@ -387,10 +390,16 @@ export function renderProvenOperationGuidance(
     // Live 279653: with three Outlook accounts connected, the brain spent a
     // 31 s frame on tool_search account_selection for an operation whose
     // account the host had already routed. Say so, in the brain's own terms.
+    ...((strategy.provenShapes?.length ?? 0) > 0
+      ? [
+          'Request shapes that succeeded in the proven run (values elided; method and path literal). Reuse the same field names:',
+          ...strategy.provenShapes!.map((row) => `- ${row.tool}: ${row.shape}`),
+        ]
+      : []),
     ...(liveReads.length > 0
       ? [
           'Native reads the host already re-attested for this request; call each by its exact name now (no tool_search is needed to find or disclose it):',
-          ...liveReads.map((row) => `- ${row.operation} (${row.kind === 'mcp' ? 'connected MCP server' : 'reviewed CLI read'}, account ${row.accountId})`),
+          ...liveReads.map((row) => `- ${row.operation} (${row.kind === 'mcp' ? 'connected MCP server' : 'reviewed CLI read'}, account ${row.accountId}${row.generic ? '; generic operation, effect decided per call' : ''})`),
         ]
       : []),
     ...(callable && boundAccounts.length > 0
@@ -646,16 +655,21 @@ export async function prepareProvenOperationForRequest(input: {
           elapsedMs: Date.now() - startedAt,
         });
         if (acquired.status !== 'installed') continue;
-        liveReads.push({ operation: acquired.operation, kind: acquired.kind, accountId: acquired.accountId });
+        liveReads.push({ operation: acquired.operation, kind: acquired.kind, accountId: acquired.accountId, ...(acquired.generic ? { generic: true } : {}) });
         if (acquired.schema) schemas[operation] = acquired.schema;
+        const effectClass: 'read' | 'write' | 'unknown' = acquired.generic
+          ? (acquired.effect === 'read' ? 'read' : acquired.effect === 'external_write' || acquired.effect === 'local_write' ? 'write' : 'unknown')
+          : 'read';
         entries.push({
-          intent: 'proven live read for this request',
+          intent: acquired.generic
+            ? 'proven operation for this request; its effect is decided per call'
+            : 'proven live read for this request',
           kind: acquired.kind,
           identifier: acquired.operation,
           status: 'proven',
           connection: 'active',
           accountIdentity: acquired.accountId,
-          effectClass: 'read',
+          effectClass,
           matchedTokens: [acquired.kind === 'mcp'
             ? acquired.operation.slice(0, Math.max(0, acquired.operation.indexOf('__')))
             : acquired.operation],

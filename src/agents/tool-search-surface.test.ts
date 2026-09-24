@@ -167,6 +167,10 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.doesNotMatch(catalog, /\bmemory_recall_all\b/, 'a first-class tool is not duplicated in the deferred catalog');
   assert.match(catalog, /\bmemory_recall\b/, 'specialized recall stays reachable through the deferred catalog');
   assert.doesNotMatch(catalog, /\bcron_list\b/, 'a CLI-only tool is never advertised on the chat catalog');
+  // Live 2026-09-24 (source 298961): the name of the memory door was in this
+  // index and the brain still spent a discovery frame asking how to save a
+  // preference. The block says a listed name is callable now.
+  assert.match(instr, /A name listed below is callable now|If you already know the exact name/, 'the catalog block tells the brain a listed name needs no search');
 
   // Telemetry records the split.
   const scope = listEvents(onSess.id, { types: ['tool_search_scope'] });

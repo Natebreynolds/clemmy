@@ -376,3 +376,29 @@ test('a proven strategy naming a native MCP read is re-attested and recorded as 
   assert.doesNotMatch(blocked.text ?? '', /re-attested for this request/);
   assert.equal(provenCapabilityEntriesForTurn({ sessionId: other.id, sourceUserSeq: otherAccepted.seq }).some((entry) => entry.identifier === 'records__search'), false);
 });
+
+test('proven request shapes are rendered for the brain and a generic MCP operation is recorded with its manifest effect, not as a read', async () => {
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  const { provenCapabilityEntriesForTurn } = await import('../harness/capability-resolution.js');
+  recordRunStrategy({
+    objective: 'organic traffic value and seo data for a law firm website',
+    toolsUsed: ['dataforseo__api_request'],
+    provenShapes: [{ tool: 'dataforseo__api_request', shape: '{"method":"POST","path":"/v3/dataforseo_labs/google/bulk_traffic_estimation/live","data":[{"targets":["string"],"location_code":"number","language_code":"string"}]}' }],
+    workerCount: 0, durationMs: 15_000,
+    learningReceipt: evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:seo-a', sourceId: 'seo-a', terminalSuccess: true, controllerValidation: true }).receipt!,
+  });
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'seo lookup' });
+  const accepted = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'organic traffic value and seo data for a law firm website' } });
+  const prepared = await prepareProvenOperationForRequest({
+    query: 'organic traffic value and seo data for a law firm website', sessionId: session.id, sourceUserSeq: accepted.seq,
+    acceptedInput: 'organic traffic value and seo data for a law firm website',
+  }, { acquireLiveRead: async ({ operation }) => ({ status: 'installed', kind: 'mcp', operation, accountId: 'native_mcp:dataforseo:acct', generic: true, effect: 'unknown' }) });
+  assert.match(prepared.text ?? '', /Request shapes that succeeded in the proven run/);
+  assert.match(prepared.text ?? '', /"targets":\["string"\]/);
+  assert.match(prepared.text ?? '', /generic operation, effect decided per call/);
+  assert.deepEqual(prepared.liveReads, [{ operation: 'dataforseo__api_request', kind: 'mcp', accountId: 'native_mcp:dataforseo:acct', generic: true }]);
+  const entry = provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: accepted.seq }).find((row) => row.identifier === 'dataforseo__api_request');
+  assert.ok(entry);
+  assert.equal(entry.effectClass, 'unknown', 'a generic operation is never recorded as a proven read');
+  assert.match(entry.intent, /effect is decided per call/);
+});

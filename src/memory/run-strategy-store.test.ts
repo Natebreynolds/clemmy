@@ -204,3 +204,26 @@ test('replaying the same learning receipt does not inflate successful uses', () 
   assert.equal(replay.id, first.id);
   assert.equal(replay.uses, first.uses);
 });
+
+test('proven request shapes elide values, keep operation selectors literal, dedupe and cap', async () => {
+  const { shapeOfProvenArguments, recordRunStrategy, listVerifiedRunStrategies } = await import('./run-strategy-store.js');
+  const { evaluateLearningCandidate } = await import('./learning-receipt.js');
+  const shape = shapeOfProvenArguments({ method: 'POST', path: '/v3/dataforseo_labs/google/domain_rank_overview/live', data: [{ target: 'weartriallaw.com', location_code: 2840, language_code: 'en', flag: true, nested: { key: 'secret' } }] });
+  assert.equal(shape, '{"method":"POST","path":"/v3/dataforseo_labs/google/domain_rank_overview/live","data":[{"target":"string","location_code":"number","language_code":"string","flag":"boolean","nested":{"key":"string"}}]}');
+  assert.doesNotMatch(shape, /weartriallaw|secret/, 'no user value survives');
+  const receipt = evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:shapes', sourceId: 'shapes-1', terminalSuccess: true, controllerValidation: true }).receipt!;
+  const shapes = Array.from({ length: 12 }, (_, i) => ({ tool: 'dataforseo__api_request', shape: `{"method":"POST","path":"/v3/endpoint-${i}"}` }));
+  const recorded = recordRunStrategy({ objective: 'organic traffic value for a law firm domain over six months', toolsUsed: ['dataforseo__api_request'], workerCount: 0, durationMs: 5_000, learningReceipt: receipt,
+    provenShapes: [...shapes, shapes[0]!, { tool: '', shape: 'x' }, { tool: 'dataforseo__api_request', shape: '' }] });
+  assert.ok(recorded);
+  assert.equal(recorded.provenShapes?.length, 8, 'capped at eight distinct shapes, blanks and duplicates dropped');
+  const reopened = listVerifiedRunStrategies().find((row) => row.id === recorded.id);
+  assert.equal(reopened?.provenShapes?.[0]?.shape, shapes[0]!.shape, 'shapes persist with the strategy');
+  // A later observation of the same strategy merges new shapes ahead of old ones without duplicates.
+  const again = recordRunStrategy({ objective: 'organic traffic value for a law firm domain over six months', toolsUsed: ['dataforseo__api_request'], workerCount: 0, durationMs: 4_000,
+    learningReceipt: evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:shapes-2', sourceId: 'shapes-2', terminalSuccess: true, controllerValidation: true }).receipt!,
+    provenShapes: [{ tool: 'dataforseo__api_request', shape: '{"method":"POST","path":"/v3/new"}' }, shapes[0]!] });
+  assert.equal(again?.id, recorded.id);
+  assert.equal(again?.provenShapes?.[0]?.shape, '{"method":"POST","path":"/v3/new"}');
+  assert.equal(new Set(again?.provenShapes?.map((r) => r.shape)).size, again?.provenShapes?.length);
+});

@@ -21,11 +21,24 @@ import {
  * nothing (the no-regression property).
  */
 
+/** One request shape that succeeded in a proven run: the tool and its argument
+ * structure with values elided (method and path literal). Learned from the
+ * tool's own settled calls, never from the user's text. */
+export interface ProvenCallShape {
+  tool: string;
+  shape: string;
+}
+
 export interface RunStrategyRecord {
   id: string;
   objective: string;
   keywords: string[];
   toolsUsed: string[];
+  /** Request shapes that succeeded when this strategy was learned. Live
+   *  2026-09-24 (source 299146): a generic MCP passthrough was re-called with
+   *  `targets` after `target` had already succeeded and paid an invalid-field
+   *  refusal; the shape that worked was already on record. */
+  provenShapes?: ProvenCallShape[];
   workerCount: number;
   durationMs: number;
   /** WHERE the deliverable went (file path / sheet / mailbox target) — so a
@@ -55,6 +68,50 @@ interface StrategyFile {
 }
 
 const STORE_FILE = path.join(BASE_DIR, 'state', 'run-strategies.json');
+const MAX_PROVEN_SHAPES = 8;
+const MAX_SHAPE_CHARS = 400;
+
+function mergeProvenShapes(
+  existing: readonly ProvenCallShape[] | undefined,
+  incoming: readonly ProvenCallShape[] | undefined,
+): ProvenCallShape[] {
+  const out: ProvenCallShape[] = [];
+  const seen = new Set<string>();
+  for (const row of [...(incoming ?? []), ...(existing ?? [])]) {
+    const tool = String(row?.tool ?? '').trim();
+    const shape = String(row?.shape ?? '').trim().slice(0, MAX_SHAPE_CHARS);
+    if (!tool || !shape) continue;
+    const key = `${tool}\u0000${shape}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ tool, shape });
+    if (out.length >= MAX_PROVEN_SHAPES) break;
+  }
+  return out;
+}
+
+/** The structure of one successful call's arguments with values elided.
+ * Strings under `method`, `path`, `endpoint` and `tool_slug` stay literal: they
+ * select the operation, they are not the user's data. */
+export function shapeOfProvenArguments(args: unknown, depth = 0): string {
+  const shape = (value: unknown, key: string | null, level: number): unknown => {
+    if (level > 6) return '…';
+    if (value === null || value === undefined) return 'null';
+    if (typeof value === 'string') return key && LITERAL_SHAPE_KEYS.has(key) ? value.slice(0, 120) : 'string';
+    if (typeof value === 'number') return 'number';
+    if (typeof value === 'boolean') return 'boolean';
+    if (Array.isArray(value)) return value.length ? [shape(value[0], null, level + 1)] : [];
+    if (typeof value === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 24)) out[k] = shape(v, k, level + 1);
+      return out;
+    }
+    return typeof value;
+  };
+  return JSON.stringify(shape(args, null, depth)).slice(0, MAX_SHAPE_CHARS);
+}
+
+const LITERAL_SHAPE_KEYS: ReadonlySet<string> = new Set(['method', 'path', 'endpoint', 'tool_slug']);
 const MAX_RECORDS = 200;
 const MAX_OBJECTIVE_CHARS = 200;
 
@@ -121,6 +178,7 @@ export function overlapScore(a: readonly string[], b: readonly string[]): number
 export interface RecordRunStrategyInput {
   objective: string;
   toolsUsed: string[];
+  provenShapes?: ProvenCallShape[];
   workerCount: number;
   durationMs: number;
   deliverable?: string;
@@ -171,6 +229,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     existing.objective = objective;
     existing.keywords = keywords;
     existing.toolsUsed = toolsUsed;
+    existing.provenShapes = mergeProvenShapes(existing.provenShapes, input.provenShapes);
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
     if (input.deliverable?.trim()) existing.deliverable = input.deliverable.trim().slice(0, 240);
@@ -186,6 +245,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     objective,
     keywords,
     toolsUsed,
+    ...(mergeProvenShapes(undefined, input.provenShapes).length ? { provenShapes: mergeProvenShapes(undefined, input.provenShapes) } : {}),
     workerCount: Math.max(0, Math.round(input.workerCount)),
     durationMs: Math.max(0, Math.round(input.durationMs)),
     ...(input.deliverable?.trim() ? { deliverable: input.deliverable.trim().slice(0, 240) } : {}),
