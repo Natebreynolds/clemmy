@@ -201,6 +201,7 @@ export interface AutomationSingleReadPilotContractV1 {
   continuation?: WorkflowNodeContinuationContractV1;
   resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
+  workspaceOutputPhaseId?: string;
 }
 
 export type AutomationWorkflowBridgeIssueCode =
@@ -813,6 +814,15 @@ function exactSingleReadPlan(input: {
   const target = selectAutomaticReadPilotTarget(input.opportunity);
   if (!target.ok) throw new Error(target.reason);
   const { phase, requirement } = target;
+  if (target.workspaceOutputPhase) {
+    if (contract.workspaceOutputPhaseId !== target.workspaceOutputPhase.id
+      || !contract.resultProjection || !contract.workspaceBindingSelection) {
+      throw new Error('workspace_binding_contract_unrepresented: the local output phase needs its exact explicit Workspace projection binding');
+    }
+  } else if (contract.workspaceOutputPhaseId !== undefined) {
+    throw new Error('workspace_binding_contract_unrepresented: the proposal has no matching local output phase');
+  }
+
   const binding = input.bindings.find((candidate) => candidate.requirementId === contract.requirementId);
   if (
     contract.phaseId !== phase.id
@@ -896,24 +906,55 @@ function exactSingleReadPlan(input: {
     const projectedOutcomeAuthority = exactProjection.version === 2
       ? exactProjection.partition.outcomeAuthority
       : undefined;
+    const preferredFields = dataset.merge.fieldPolicies.filter(policy => policy.onConflict === 'prefer_newer')
+      .map(policy => policy.field).sort();
+    const projectedPreferred = [...(exactProjection.resolutionPolicy.preferNewerAfterExactIdentity ?? [])].sort();
     const supportedMerge = dataset.schema.additionalFields === 'reject'
-      && dataset.merge.mode === 'review_required'
+      && (dataset.merge.mode === 'review_required' || dataset.merge.mode === 'field_policy_after_exact_identity')
       && dataset.merge.defaultConflict === 'review_required'
-      && dataset.merge.fieldPolicies.every((policy) => policy.onConflict === 'review_required')
+      && dataset.merge.fieldPolicies.every(policy => policy.onConflict === 'review_required'
+        || (dataset.merge.mode === 'field_policy_after_exact_identity' && policy.onConflict === 'prefer_newer'))
+      && stableJson(preferredFields) === stableJson(projectedPreferred)
       && dataset.merge.preserveSourceRecords === true
       && dataset.provenance.required === true
       && dataset.provenance.retainSourceSnapshots === true;
-    if (
-      stableJson(expectedFields) !== stableJson(projectedFields)
-      || stableJson(expectedRules) !== stableJson(projectedRules)
-      || stableJson(expectedOutcomeAuthority ?? null) !== stableJson(projectedOutcomeAuthority ?? null)
-      || !supportedMerge
-      || !contract.evidence.requiredPaths.includes(exactProjection.recordsPath)
-      || !contract.completeness.evidencePaths.includes(exactProjection.recordsPath)
-      || exactProjection.bounds.maxPages !== (continuation.kind === 'cursor' ? continuation.maxPages : 1)
-      || exactProjection.bounds.maxRecords > input.opportunity.pilot.maxRecords
-      || exactProjection.bounds.maxRecords > input.opportunity.budgets.maxRecordsPerRun
-    ) throw new Error('workflow_dataset_contract_unrepresented: result mapping, merge/provenance semantics, evidence, or reviewed bounds are incomplete');
+    // Explain each mismatch against the approved contract. A generic refusal
+    // forces the caller to guess and repeat discovery without changing the
+    // failing input. These diagnostics do not relax any admission predicate.
+    const mismatches: string[] = [];
+    if (stableJson(expectedFields) !== stableJson(projectedFields)) {
+      mismatches.push(`result_projection.fields must match approved fields ${stableJson(expectedFields)}`);
+    }
+    if (stableJson(expectedRules) !== stableJson(projectedRules)) {
+      mismatches.push(`result_projection.identity_rules must match approved identity ${stableJson(expectedRules)}`);
+    }
+    if (stableJson(expectedOutcomeAuthority ?? null) !== stableJson(projectedOutcomeAuthority ?? null)) {
+      mismatches.push(`result_projection.partition.outcome_authority must match approved authority ${stableJson(expectedOutcomeAuthority ?? null)}`);
+    }
+    if (!supportedMerge) {
+      if (stableJson(preferredFields) !== stableJson(projectedPreferred)) {
+        mismatches.push(`result_projection.resolution_policy.prefer_newer_after_exact_identity must match approved fields ${stableJson(preferredFields)}`);
+      } else {
+        mismatches.push('approved dataset merge/provenance policy is not representable by this projection; preserve the proposal and report the unsupported policy');
+      }
+    }
+    if (!contract.evidence.requiredPaths.includes(exactProjection.recordsPath)) {
+      mismatches.push(`contract.evidence.required_paths must include result_projection.records_path ${JSON.stringify(exactProjection.recordsPath)}`);
+    }
+    if (!contract.completeness.evidencePaths.includes(exactProjection.recordsPath)) {
+      mismatches.push(`contract.completeness.evidence_paths must include result_projection.records_path ${JSON.stringify(exactProjection.recordsPath)}`);
+    }
+    const expectedMaxPages = continuation.kind === 'cursor' ? continuation.maxPages : 1;
+    if (exactProjection.bounds.maxPages !== expectedMaxPages) {
+      mismatches.push(`result_projection.bounds.max_pages must equal continuation page bound ${expectedMaxPages}`);
+    }
+    if (exactProjection.bounds.maxRecords > input.opportunity.pilot.maxRecords
+      || exactProjection.bounds.maxRecords > input.opportunity.budgets.maxRecordsPerRun) {
+      mismatches.push(`result_projection.bounds.max_records must not exceed approved pilot/run bound ${Math.min(input.opportunity.pilot.maxRecords, input.opportunity.budgets.maxRecordsPerRun)}`);
+    }
+    if (mismatches.length > 0) {
+      throw new Error(`workflow_dataset_contract_unrepresented: ${mismatches.join('; ')}`);
+    }
   }
   return createWorkflowNodeInvocationPlan({
     requirementId: requirement.id,
@@ -988,7 +1029,10 @@ function buildPreview(input: {
     enabled: false,
     trigger: workflowTriggerFor(input.opportunity, input.target),
     ...(!invocationPlan ? { allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS] } : {}),
-    ...(invocationPlan ? { inputs: structuredClone(input.readPilotContract!.workflowInputs) } : {}),
+    // The durable store omits an empty inputs map. Review the same canonical
+    // representation so a no-argument read survives approval and persistence.
+    ...(invocationPlan && Object.keys(input.readPilotContract!.workflowInputs).length > 0
+      ? { inputs: structuredClone(input.readPilotContract!.workflowInputs) } : {}),
     steps: workflowPhases.map((phase) => ({
       id: phase.id,
       prompt: invocationPlan ? '' : phase.objective,
@@ -1067,6 +1111,7 @@ function buildPreview(input: {
     partition: input.opportunity.partition,
     dataset: input.opportunity.dataset ?? null,
     recurrence: input.target === 'recurrence' ? input.opportunity.recurrence : { mode: 'none' },
+    ...(input.readPilotContract?.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.readPilotContract.workspaceOutputPhaseId } : {}),
     phaseEffects: input.opportunity.phases.map((phase) => ({
       phaseId: phase.id,
       effect: phase.effect,
@@ -1144,7 +1189,10 @@ function representationIssues(
       });
     }
   }
-  if (opportunity.phases.some((phase) => phase.effect.class !== 'read')) {
+  const representedLocalOutput = pilotTarget.ok && pilotTarget.workspaceOutputPhase
+    && exactReadPlan?.resultProjection && preview.canonicalEntityWorkspaceBinding;
+  if (opportunity.phases.some((phase) => phase.effect.class !== 'read'
+    && !(representedLocalOutput && phase.id === pilotTarget.workspaceOutputPhase?.id))) {
     issues.push({
       code: 'workflow_effect_authority_unrepresented',
       message: 'WorkflowDefinition collapses local/external effects and cannot persist exact prior approval plus readback authority.',

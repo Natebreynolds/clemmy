@@ -1,8 +1,8 @@
 import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
-// Conservative deliverable-shape inference shared by authoring advisories and
-// legacy run-target validation. This is never used to execute a tool or mutate a
-// workflow; it only turns already-authored prompts into concrete evidence checks.
+// Optional authoring suggestions only. Word matches cannot establish required
+// output keys or completion criteria; runtime review uses authored contracts,
+// saved instructions and authenticated execution evidence.
 
 const DELIVERABLE_RE = /\b(report|brief|audit|summary|summaries|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|records?|rows?|list|items?|leads|prospects|meetings|accounts|contacts|results?|page|website|saved to|written to|upload(?:ed)?)\b/i;
 const PRODUCE_RE = /\b(produce|generate|create|build|write|draft|deploy|publish|save|export|render|compile|assemble|deliver|output)\b/i;

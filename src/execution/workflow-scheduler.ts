@@ -476,10 +476,37 @@ export interface LegacyScheduledReadinessReconcileResult {
   recovered: number;
   noticesEnsured: number;
   notificationsRetired: number;
+  /** Holds whose workflow has completed successfully since the block: stamped
+   *  retired, their notices read, never announced again. */
+  retired: number;
   rejected: number;
   failed: number;
   limitReached: boolean;
   migratedRunIds: string[];
+  retiredRunIds: string[];
+}
+
+/** The latest successful completion per workflow slug across the run records,
+ *  built once per reconcile. A hold is dead once its workflow ran after it. */
+function latestSuccessfulCompletionBySlug(files: readonly string[]): Map<string, { runId: string; finishedAt: string }> {
+  const latest = new Map<string, { runId: string; finishedAt: string }>();
+  for (const file of files) {
+    let record: Record<string, unknown> | null;
+    try {
+      record = scheduledReadinessObject(JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as unknown);
+    } catch {
+      continue;
+    }
+    if (!record || record.status !== 'completed') continue;
+    if (record.terminalOutcome !== undefined && record.terminalOutcome !== 'succeeded') continue;
+    const slug = scheduledReadinessString(record.workflowSlug) ?? scheduledReadinessString(record.workflow);
+    const finishedAt = scheduledReadinessString(record.finishedAt);
+    const runId = scheduledReadinessString(record.id);
+    if (!slug || !finishedAt || !runId || !Number.isFinite(Date.parse(finishedAt))) continue;
+    const prior = latest.get(slug);
+    if (!prior || Date.parse(finishedAt) > Date.parse(prior.finishedAt)) latest.set(slug, { runId, finishedAt });
+  }
+  return latest;
 }
 
 function scheduledReadinessObject(value: unknown): Record<string, unknown> | null {
@@ -735,10 +762,12 @@ export function reconcileLegacyScheduledReadinessHolds(
     recovered: 0,
     noticesEnsured: 0,
     notificationsRetired: 0,
+    retired: 0,
     rejected: 0,
     failed: 0,
     limitReached: false,
     migratedRunIds: [],
+    retiredRunIds: [],
   };
   if (!existsSync(WORKFLOW_RUNS_DIR)) return result;
 
@@ -752,6 +781,7 @@ export function reconcileLegacyScheduledReadinessHolds(
     return result;
   }
 
+  let latestSuccess: Map<string, { runId: string; finishedAt: string }> | undefined;
   for (const file of files) {
     let snapshot: Record<string, unknown>;
     try {
@@ -767,6 +797,8 @@ export function reconcileLegacyScheduledReadinessHolds(
       && snapshot.status !== 'blocked_readiness'
     ) continue;
     if (!hasRawSubprocessReadinessRefusal(snapshot)) continue;
+    // A hold retired on an earlier boot stays quiet forever.
+    if (scheduledReadinessString(scheduledReadinessObject(snapshot.scheduledReadinessBlock)?.retiredAt)) continue;
     if (result.inspected >= limit) {
       result.limitReached = true;
       break;
@@ -824,6 +856,49 @@ export function reconcileLegacyScheduledReadinessHolds(
       result.migratedRunIds.push(identity.runId);
     } else {
       result.recovered += 1;
+    }
+
+    // Live 2026-09-22: six holds from 2026-08-30/09-01 were re-announced on
+    // every launch (18 that day) as "did not start", while their workflows had
+    // run successfully dozens of times since. A hold whose workflow completed
+    // after the block is dead: stamp it, read its notices, never announce it.
+    latestSuccess ??= latestSuccessfulCompletionBySlug(files);
+    const later = latestSuccess.get(identity.workflowSlug);
+    if (later && Date.parse(later.finishedAt) > Date.parse(identity.createdAt)) {
+      try {
+        withWorkflowRunRecordLock(filePath, () => {
+          const current = readWorkflowRunRecordUnlocked<Record<string, unknown>>(filePath);
+          if (!current) return;
+          const marker = scheduledReadinessObject(current.scheduledReadinessBlock) ?? {};
+          writeWorkflowRunRecordDurablyUnlocked(filePath, {
+            ...current,
+            scheduledReadinessBlock: {
+              ...marker,
+              retiredAt: new Date().toISOString(),
+              retiredBy: { reason: 'later_successful_run', runId: later.runId, finishedAt: later.finishedAt },
+            },
+          });
+        });
+      } catch (err) {
+        result.failed += 1;
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), file },
+          'Legacy scheduled readiness hold retirement failed closed',
+        );
+        continue;
+      }
+      for (const stale of [
+        getNotification(`system-workflow-readiness-blocked-${identity.runId}`),
+        matchingLegacyCatchupNotice(identity),
+        matchingLegacyEnqueueFailureNotice(identity),
+      ]) {
+        if (!stale || stale.read) continue;
+        const read = markNotificationRead(stale.id);
+        if (read?.read) result.notificationsRetired += 1;
+      }
+      result.retired += 1;
+      result.retiredRunIds.push(identity.runId);
+      continue;
     }
 
     const oldCatchup = matchingLegacyCatchupNotice(identity);

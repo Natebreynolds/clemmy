@@ -33,6 +33,8 @@ import { workspaceComposioIsProvablyReadOnly } from '../spaces/space-execution-p
 import { ensureWorkspaceReadClassification } from '../spaces/space-read-authority.js';
 import { ensureToolSchema } from './composio-schema-cache.js';
 import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonical-consent.js';
+import { readWorkspaceCanonicalEntityProjectionPage } from '../dashboard/workspace-canonical-entity-projection.js';
+import { getCanonicalRecord, listCanonicalRecordIds } from '../execution/canonical-entity-store.js';
 import { countWorkspaceRecords, renderWorkspaceDataDigest, renderWorkspaceSourceRecords } from '../spaces/workspace-data-digest.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
@@ -1353,6 +1355,35 @@ export function registerSpaceTools(server: McpServer): void {
         || Buffer.byteLength(dataPreview, 'utf8') <= SPACE_GET_COMPLETE_DATASET_MAX_BYTES
         ? `Dataset (complete JSON): ${dataPreview}`
         : `Dataset (${Buffer.byteLength(dataPreview, 'utf8')} bytes, summarized per source; space_get with source_id pages through one source's records):\n${renderWorkspaceDataDigest(parsedDataset, rec.dataSources.map((source) => source.id))}`;
+      // Canonical records are host-projected from reviewed workflow runs and
+      // live beside the dataset JSON, not inside it. Without this line a model
+      // reading an empty dataset told the owner the Space "holds nothing"
+      // while five projected records were available (live 2026-09-24 02:12Z).
+      let canonicalLine = '';
+      try {
+        const projection = readWorkspaceCanonicalEntityProjectionPage({ workspaceId: slug, limit: 1 });
+        if (projection.ok && projection.value.status === 'available') {
+          const head = projection.value.head;
+          const datasetId = head.identity.datasetId;
+          const ids = listCanonicalRecordIds({ datasetId, limit: 5 }).items;
+          const rows = ids.map((id) => {
+            const record = getCanonicalRecord(datasetId, id);
+            if (!record) return `  - ${id}`;
+            const fields = Object.entries(record.fields)
+              .map(([name, field]) => `${name}=${JSON.stringify(field.evidence[0]?.value ?? null).slice(0, 80)}`)
+              .join(', ');
+            return `  - ${fields}`;
+          });
+          const total = head.records.canonicalRecords;
+          canonicalLine = [
+            `Canonical records (host-projected from reviewed workflow runs; the Space holds these even when the dataset JSON above is empty): ${total} record${total === 1 ? '' : 's'}, coverage ${head.coverage.status} (${head.coverage.observed}/${head.coverage.denominator.kind === 'exact' ? head.coverage.denominator.total : head.coverage.denominator.kind === 'lower_bound' ? `≥${head.coverage.denominator.atLeast}` : '?'}), projected ${head.projectedAt} by run ${head.identity.runId}.`,
+            ...rows,
+            ...(total > rows.length ? [`  (+${total - rows.length} more)`] : []),
+          ].join('\n');
+        } else if (projection.ok && projection.value.status === 'unavailable' && projection.value.reason === 'projection_not_ready') {
+          canonicalLine = 'Canonical records: a reviewed workflow binding exists, but no run has projected records yet.';
+        }
+      } catch { canonicalLine = ''; }
       const parts = [
         `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.`,
         rec.contract
@@ -1382,11 +1413,12 @@ export function registerSpaceTools(server: McpServer): void {
         observationStore.ok
           ? renderWorkspaceHistoryAvailability(getWorkspaceHistoryAvailability(rec.id, observationStore.db))
           : `Dataset history is temporarily unavailable: ${safeWorkspaceObservationError(observationStore.error)}. Do not infer a delta from the current snapshot.`,
-        `View source: space_get_view({slug:${JSON.stringify(slug)},grep:null,around:null}) returns the saved HTML. For a targeted change, read that source, apply space_edit_view, and read it again to verify.`,
+        snapshot.viewMissing ? 'View: missing. The manifest and dataset are readable; no saved HTML exists.' : `View source: space_get_view({slug:${JSON.stringify(slug)},grep:null,around:null}) returns the saved HTML. For a targeted change, read that source, apply space_edit_view, and read it again to verify.`,
         ...(rec.contentMode === 'static_snapshot' ? ['For a root data or phone-content edit, use space_save with replacement_data_json and this expected_revision; include view_html when the HTML also changes. space_edit_view alone changes only HTML; space_set_data changes a named source.'] : []),
         `Snapshot revision: ${snapshot.revision}`,
         `Content mode: ${rec.contentMode ?? 'source-based'}.`,
         datasetLine,
+        canonicalLine,
         notes.length > 0 ? `Recent notes:\n${notes.map((n) => `  - [${n.kind ?? 'note'}] ${n.text}`).join('\n')}` : 'No notes yet.',
         audit.length > 0 ? `Recent activity: ${audit.length} data-plane call(s).` : '',
       ].filter(Boolean);
@@ -1552,7 +1584,7 @@ export function registerSpaceTools(server: McpServer): void {
       if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with view_html (or legacy view_path).`);
       let html: string;
       let revision: string;
-      try { const snapshot = spaceStore.snapshot(slug); if (!snapshot) throw new Error('Workspace disappeared'); html = snapshot.view; revision = snapshot.revision; }
+      try { const snapshot = spaceStore.snapshot(slug); if (!snapshot) throw new Error('Workspace disappeared'); if (snapshot.viewMissing) return textResult(`Workspace "${slug}" has no view yet.`); html = snapshot.view; revision = snapshot.revision; }
       catch (err) { return textResult(`Error reading the "${slug}" view: ${(err as Error).message}`); }
       return textResult(
         `Snapshot revision: ${revision}\n` + renderViewForRead(html, { slug, grep: grep?.trim() || undefined, around: around ?? undefined }),

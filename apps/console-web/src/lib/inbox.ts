@@ -14,6 +14,17 @@ export interface ApprovalRow {
   requestedAt?: string;
   expiresAt?: string;
   kind?: string;
+  /** The draft or body the approval is about, when the server could name one. */
+  contentPreview?: { body?: string; imageUrl?: string };
+  /** The call as a person reads it: action in words, app, and the provider's
+   * own fields — never the carrier envelope. */
+  presentation?: {
+    action: string;
+    app?: string;
+    operation?: string;
+    details: Array<{ label: string; value: string; long: boolean }>;
+    unwrapped: boolean;
+  };
   pendingAction?: PendingActionApprovalView;
   /** Unanswered 48h+ with nothing parked on it — sinks out of the urgent
    * header but stays fully approvable. */
@@ -61,6 +72,9 @@ export interface NotificationRow {
   deliveryAttempts?: number;
   deliveryError?: string;
   needsAttention?: boolean;
+  /** Server-owned grouping identity (dashboard/needs-you.ts): a workflow
+   *  blocked five times is one row; a carrier for an approval is that approval. */
+  needsYouKey?: string;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
   /** A workflow the system switched off that only a person can switch back on. */
   workflowEnableGate?: WorkflowEnableInboxGate | null;
@@ -118,6 +132,7 @@ export interface CollapsedAttentionRow {
 export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttentionRow[] {
   const keyFor = (row: NotificationRow): string => {
     if (row.workflowCapability) return `capability:${row.workflowCapability.notificationId}`;
+    if (row.needsYouKey) return row.needsYouKey;
     const title = (row.title || row.body || '').trim();
     const workflow = /workflow needs attention:\s*(.+)$/i.exec(title)?.[1]?.trim();
     return workflow ? `wf:${workflow.toLowerCase()}` : `title:${title.toLowerCase()}`;
@@ -182,22 +197,30 @@ export const resolveWorkspaceDestinationChooser = (
 export const decideApproval = (
   id: string,
   decision: 'approve' | 'reject',
-  opts?: { kind?: string; modifiedArgs?: string },
+  opts?: { kind?: string; modifiedArgs?: string; note?: string },
 ) => {
   const path = opts?.kind === 'runtime'
     ? `/api/approvals/${encodeURIComponent(id)}/${decision}`
     : `/api/console/harness-approvals/${encodeURIComponent(id)}/${decision}`;
-  return apiPost<ApprovalDecisionResponse>(
-    path,
-    opts?.modifiedArgs ? { modifiedArgs: opts.modifiedArgs } : undefined,
-  );
+  const body: Record<string, string> = {};
+  if (opts?.modifiedArgs) body.modifiedArgs = opts.modifiedArgs;
+  // A rejection with a note is "request changes": the server records the
+  // note on the parked run so the draft's owner gets it, not a bare stop.
+  if (decision === 'reject' && opts?.note?.trim()) body.note = opts.note.trim();
+  return apiPost<ApprovalDecisionResponse>(path, Object.keys(body).length > 0 ? body : undefined);
 };
 
 export function approvalDecisionSuccessText(
   row: ApprovalRow,
   decision: 'approve' | 'reject',
   response?: ApprovalDecisionResponse,
+  note?: string,
 ): string {
+  // A rejection that carried a note is a change request: say what happens
+  // to the note, not just that nothing will be dispatched.
+  if (decision === 'reject' && note?.trim()) {
+    return 'Changes requested — this draft stops here and your note goes back to Clem to revise before anything is saved or sent.';
+  }
   if (decision === 'reject') return 'Rejected — this action will not be dispatched.';
   if (row.pendingAction) {
     const status = response?.status ?? '';
@@ -343,6 +366,10 @@ export const listNotifications = () =>
 export const dismissInboxItem = (kind: string, id: string) =>
   apiPost(`/api/console/inbox/dismiss`, { kind, id });
 
+/** "Not now": off Home for a few hours, still pending in Needs you. Never a decline. */
+export const snoozeNeedsYou = (key: string) =>
+  apiPost<{ ok: true; key: string; until: string }>(`/api/console/home/needs-you/snooze`, { key });
+
 export const markNotificationRead = (id: string) =>
   apiPost(`/api/notifications/${encodeURIComponent(id)}/read`);
 
@@ -421,4 +448,33 @@ export function notifTone(n: NotificationRow): { tone: Tone; label: string } {
 /** A notification whose delivery to an external destination failed. */
 export function notifFailed(n: NotificationRow): boolean {
   return Boolean(n.deliveryError) || ((n.deliveryAttempts ?? 0) > 0 && !n.deliveredAt);
+}
+
+/** The one needs-you count and the rows no other feed carries
+ *  (GET /api/console/needs-you/summary, dashboard/needs-you.ts). */
+export interface NeedsYouSummary {
+  total: number;
+  keys: string[];
+  unlisted: Array<{
+    key: string;
+    kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
+    title: string;
+    detail: string;
+    workflow?: string;
+  }>;
+}
+
+export const getNeedsYouSummary = () => apiGet<NeedsYouSummary>('/api/console/needs-you/summary');
+
+/** What a needs-you row is, from its server key: a meeting to reply to, a
+ *  stopped workflow, a chat waiting on an answer. One pill for every row said
+ *  nothing (live 2026-09-22: 26 identical "Needs attention" chips). */
+export function attentionPill(row: Pick<NotificationRow, 'needsYouKey'>): { tone: 'info' | 'warning'; label: string } {
+  const key = row.needsYouKey ?? '';
+  if (key.startsWith('calendar:')) return { tone: 'info', label: 'Reply' };
+  if (key.startsWith('flow:')) return { tone: 'warning', label: 'Stopped' };
+  if (key.startsWith('session:') || key.startsWith('task:') || key.startsWith('checkin:') || key.startsWith('workflow:')) {
+    return { tone: 'warning', label: 'Your answer' };
+  }
+  return { tone: 'warning', label: 'Needs you' };
 }

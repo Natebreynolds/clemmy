@@ -177,3 +177,22 @@ test('presentApproval handles alternate Outlook recipient shapes and strips HTML
   assert.doesNotMatch(presentation.detail, /<p>|<li>/);
   assert.equal(presentation.canPauseWorkflow, false);
 });
+
+test('extractApprovalContentPreview: finds the draft inside a work_call carrier around a composio call', () => {
+  const p = extractApprovalContentPreview('work_call', {
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({
+      tool_slug: 'SLACK_SEND_MESSAGE',
+      arguments: JSON.stringify({ channel: 'D0TEST', markdown_text: 'Morning — the pipeline review moved to 3pm.' }),
+    }),
+  });
+  assert.equal(p?.body, 'Morning — the pipeline review moved to 3pm.');
+});
+
+test('extractApprovalContentPreview: an id-shaped field is never the draft', () => {
+  const p = extractApprovalContentPreview('composio_execute_tool', {
+    tool_slug: 'SOCIAL_DELETE_POST',
+    arguments: { post_id: 'urn:li:share:7300000000000000000' },
+  });
+  assert.equal(p, undefined);
+});

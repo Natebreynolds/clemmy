@@ -10,7 +10,7 @@ import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
-import { StatusPill } from '@/components/ui/StatusPill';
+import { Tag } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
@@ -34,7 +34,7 @@ function Header({ session }: { session: Session }) {
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <h2 className="truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
-          <StatusPill tone={meta.tone}>{meta.label}</StatusPill>
+          <Tag>{meta.label}</Tag>
         </div>
       </div>
       <Button

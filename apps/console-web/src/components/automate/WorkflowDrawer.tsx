@@ -11,7 +11,7 @@ import { detectedTimezone } from '@/lib/cron';
 import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
-import { certPrimaryAction, certificationActionLabel, certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
+import { certPrimaryAction, certificationActionLabel, certificationTone, workflowCertificationCounts, workflowPrimaryAction, sentenceCaseLabel } from '@/lib/workflowCertification';
 import { getWorkflow, patchWorkflow, deleteWorkflow, runWorkflow, setWorkflowEnabled, type WorkflowCertification, type WorkflowDetail, type WorkflowResourceBinding, type WorkflowResourceBindingReport, type WorkflowResourceProposalStatus } from '@/lib/automate';
 
 function engineToneClasses(tone: Tone) {
@@ -102,7 +102,7 @@ function WorkflowEnginePanel({
     <section className="mt-5">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-h3 text-fg">Readiness</h3>
-        <StatusPill tone={certificationTone(certification.state)}>{certification.label}</StatusPill>
+        <StatusPill tone={certificationTone(certification.state)}>{sentenceCaseLabel(certification.label)}</StatusPill>
       </div>
       <div className="rounded-md border border-border bg-subtle p-3">
         <p className="mb-3 text-small text-muted">{certification.summary}</p>
@@ -461,13 +461,28 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
   // (which queues a creation test when one is needed), then refetches so the
   // certification state + next step update in place. `guide` scrolls the
   // operator to the details they need to fill in.
+  // Enabling IS the creation test. When the route queues one, stay on the
+  // page and follow it to its settled result (passed → on; needs review →
+  // the daemon's report), instead of refetching once and showing the switch
+  // the user just flipped back off with nothing saying why.
+  const [testing, setTesting] = useState(false);
   const activate = async () => {
     setRunning(true); setError('');
     try {
-      await setWorkflowEnabled(name, true);
-      const fresh = await getWorkflow(name);
+      const result = await setWorkflowEnabled(name, true);
+      let fresh = await getWorkflow(name);
+      if (result.verificationQueued) {
+        setTesting(true);
+        setWf(fresh); setEnabled(!!fresh.enabled);
+        const deadline = Date.now() + 4 * 60_000;
+        while (Date.now() < deadline && !fresh.enabled && fresh.creationTest?.status === 'running') {
+          await new Promise((resolve) => setTimeout(resolve, 3_000));
+          fresh = await getWorkflow(name);
+        }
+        setTesting(false);
+      }
       setWf(fresh); setEnabled(!!fresh.enabled); invalidate();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) { setError((e as Error).message); setTesting(false); }
     finally { setRunning(false); }
   };
   const scrollToEngine = () => document.getElementById('wf-engine-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -496,9 +511,22 @@ export function WorkflowDrawer({ name, onClose }: { name: string; onClose: () =>
             <p className="text-body text-danger">{error || 'Could not load this workflow.'}</p>
           ) : (
             <>
-              <div className="mb-4 flex items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-3">
-                <Switch checked={enabled} onChange={setEnabled} label="Enabled" />
-                <span className="text-body text-fg">{enabled ? 'On — runs on its schedule' : 'Off — won’t run automatically'}</span>
+              <div className="mb-4 rounded-md border border-border bg-subtle px-3.5 py-3">
+                <div className="flex items-center gap-3">
+                  <Switch checked={enabled} onChange={setEnabled} label="Enabled" />
+                  <span className="text-body text-fg">
+                    {testing ? 'Testing before it goes live…' : enabled ? 'On — runs on its schedule' : 'Off — won’t run automatically'}
+                  </span>
+                </div>
+                {(testing || wf.creationTest) && (
+                  <p className="mt-2 text-caption text-muted" data-testid="wf-creation-test">
+                    {testing || wf.creationTest?.status === 'running'
+                      ? 'Creation test running: the read-only steps run against the real tools; it turns on by itself when they return data.'
+                      : wf.creationTest?.status === 'passed'
+                        ? `Creation test passed${wf.creationTest.at ? ` (${new Date(wf.creationTest.at).toLocaleString()})` : ''}.`
+                        : `Creation test needs review: ${(wf.creationTest?.body ?? '').split('\n').filter((line) => line.trim()).slice(0, 4).join(' · ')}`}
+                  </p>
+                )}
               </div>
 
               <label className="mb-1.5 block text-label text-fg">What it does</label>

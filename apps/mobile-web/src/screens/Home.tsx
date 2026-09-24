@@ -36,7 +36,6 @@ import {
   rejectPlanProposal,
   resolveWorkspaceDestinationChooser,
   runWorkflow,
-  type ActivityEntry,
   type ApprovalRow,
   type DeliveredGroup,
   type InboxNotification,
@@ -50,13 +49,11 @@ import { greetingName, timeGreeting } from '../lib/greeting';
 import { relativeTime } from '../components/Approvals';
 import { PushPrompt } from '../components/PushPrompt';
 import { ScreenNotice } from '../components/ScreenNotice';
-import { RunControl } from '../components/RunControl';
 import { haptic } from '../lib/native-bridge';
-import { mobileRunControl, runStatusLabel } from '../lib/running-tasks';
-import { presentWorkingNow, type PresentedWorkingNowEntry } from '@clem/chat-engine';
+import { presentWorkingNow } from '@clem/chat-engine';
 import { useScreenData } from '../lib/use-screen-data';
 import { approvalKindLabel, approvalQuestion } from '../lib/inbox-presentation';
-import { homeLead, homeNeedsYouPane, homeWorkPane, type NeedsYouPane } from '../lib/home-presentation';
+import { homeLead, homeNeedsYouPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
 import { HomeTiles } from '../components/HomeTiles';
@@ -66,7 +63,6 @@ const MAX_NEEDS_ROWS = 3;
 const MAX_AWAY_ROWS = 4;
 // Every other pane on this screen is capped. This one was not, which is why
 // the owner's twenty-one stalled runs were the tallest thing on his phone.
-const MAX_WORK_ROWS = 4;
 const MAX_QUICK_CHIPS = 3;
 
 interface Props {
@@ -117,17 +113,9 @@ const EMPTY: HomeData = {
   approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [], workspaces: [],
 };
 
-/** Sort key for the work pane's cap: a person blocking outranks live work,
- *  which outranks a run that has been silent for days. Membership is the
- *  shared presenter's, so this orders rows without re-deciding what they are. */
-function workRank(presented: PresentedWorkingNowEntry<ActivityEntry>): number {
-  if (presented.membership === 'needs_you') return 0;
-  if (presented.membership === 'stalled') return 2;
-  return 1;
-}
 
 export function Home({
-  name, onAsk, onOpenInbox, onOpenWorkspace, onOpenRun, onOpenActivity, onCustomize,
+  name, onAsk, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
   needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
 }: Props) {
   const { prefs } = useHomePreferences();
@@ -193,16 +181,6 @@ export function Home({
   const workNeedsYou = workingView.needsYou;
   // Quiet past the stall threshold: started, never ended, nobody waiting.
   const unfinished = workingView.stalled;
-  const workPane = homeWorkPane({
-    running: liveNow, needsYou: workNeedsYou, unfinished, max: MAX_WORK_ROWS,
-  });
-  // The cap decides what does NOT get shown, so the order decides what
-  // survives it: a row a person is blocking outranks live work, which outranks
-  // a run that has been silent for days. Within a group the server's order
-  // stands (Array#sort is stable).
-  const workRows = workingView.entries.slice()
-    .sort((a, b) => workRank(a) - workRank(b))
-    .slice(0, workPane.shown);
 
   // Durable results only. Open decisions live in Needs you; everything that
   // is finished, or was read, is what happened while you were away.
@@ -244,7 +222,7 @@ export function Home({
     workNeedsYou,
     unfinished,
     workKnown: workingNow.known,
-    workPaneShown: paneSet.has('running') && workPane.show,
+    workPaneShown: false,
     awayCount: awayRows.length,
     otherRows: upcoming.length + projects.length,
   });
@@ -266,26 +244,8 @@ export function Home({
         onChanged={refresh}
       />
     ) : null),
-    running: () => (workPane.show ? (
-      <section class="home-section" aria-labelledby="home-running">
-        <h2 id="home-running" class="section-head pane-head">{workPane.title}</h2>
-        <div class="home-card">
-          {workRows.map((p, i) => (
-            <RunningRow key={p.entry.runKey} presented={p} index={i} onChanged={workingNow.refresh} onOpenRun={onOpenRun} />
-          ))}
-          {/* The remainder, named against Activity — the one screen that maps
-              the whole projection. Same rule the Needs-you pane obeys. */}
-          {workPane.moreLabel ? (
-            <button type="button" class="home-row home-row-tap home-row-link" onClick={() => { haptic('light'); onOpenActivity(); }}>
-              <span>{workPane.moreLabel}</span>
-              <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                <path d="m9 18 6-6-6-6" />
-              </svg>
-            </button>
-          ) : null}
-        </div>
-      </section>
-    ) : null),
+    // Current work lives in Activity; the headline and the header chip lead there.
+    running: () => null,
     made: () => <MadeSection />,
     while_away: () => (awayRows.length > 0 ? (
       <section class="home-section" aria-labelledby="home-away">
@@ -724,78 +684,6 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
       )}
       {error ? <p class="home-row-error" role="alert">{error}</p> : null}
     </div>
-  );
-}
-
-// ─── running ────────────────────────────────────────────────────────────────
-
-function RunningRow({ presented, index, onChanged, onOpenRun }: {
-  presented: PresentedWorkingNowEntry<ActivityEntry>;
-  index: number;
-  onChanged: () => void | Promise<void>;
-  onOpenRun: (sessionId: string) => void;
-}) {
-  const entry = presented.entry;
-  const control = mobileRunControl(entry);
-  // Only a harness session has a run screen; a row without one stays static
-  // rather than offering a tap that goes nowhere.
-  const sessionId = entry.sessionId;
-  const progress = entry.progress && entry.progress.total > 0
-    ? entry.progress
-    : entry.activity && typeof entry.activity.total === 'number' && entry.activity.total > 0
-      ? { completed: entry.activity.completed ?? 0, total: entry.activity.total }
-      : null;
-  const pct = progress ? Math.max(0, Math.min(100, Math.round((progress.completed / progress.total) * 100))) : null;
-  // The warn accent means A PERSON IS THE BLOCKER, which is `membership`, not
-  // `presentation`: the presenter collapses stalled rows into the same quiet
-  // `needs_you` presentation, so reading it here painted a run that has been
-  // silent for two days as a question waiting on the owner.
-  const waiting = presented.membership === 'needs_you';
-  const head = (
-    <>
-      <div class="home-run-head">
-        {/* The pulse is a certificate: it animates only when the server said
-            liveness === 'live'. Anything else gets a quiet dot. */}
-        {presented.pulse
-          ? <span class="pulse-dot" aria-hidden="true" />
-          : <span class="running-task-state" style={{ background: waiting ? 'var(--accent-warn)' : 'var(--line-strong)' }} aria-hidden="true" />}
-        <span class="home-row-title truncate">{entry.headline || 'Current task'}</span>
-        {presented.elapsed ? <span class="home-run-elapsed">{presented.elapsed}</span> : null}
-      </div>
-      {/* The heading is derived, but the ROW used to speak present tense under
-          it: a stalled `reasoning` run printed "Running" and a stalled
-          `blocked` run printed "Needs review" under a heading that correctly
-          said "Still open". runStatusLabel is the one place that decides, from
-          the presenter's own stall verdict and server-derived silence. */}
-      <div class="home-row-note">
-        {runStatusLabel(presented)}
-        {progress ? ` · ${progress.completed} of ${progress.total}` : ''}
-      </div>
-      {pct !== null ? (
-        <div class="home-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
-          <div class="home-progress-fill" style={{ transform: `scaleX(${pct / 100})` }} />
-        </div>
-      ) : null}
-    </>
-  );
-  return (
-    <article class={`home-row home-row-static home-run${waiting ? ' home-run-waiting' : ''}`} style={{ '--i': index }}>
-      {sessionId ? (
-        <button
-          type="button"
-          class="home-run-open"
-          aria-label={`Open ${entry.headline || 'this run'}`}
-          onClick={() => onOpenRun(sessionId)}
-        >
-          {head}
-        </button>
-      ) : head}
-      {control ? (
-        <div class="home-run-control">
-          <RunControl target={control.target} resumable={control.resumable} onChanged={() => void onChanged()} />
-        </div>
-      ) : null}
-    </article>
   );
 }
 

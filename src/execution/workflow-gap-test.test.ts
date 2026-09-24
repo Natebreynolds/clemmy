@@ -23,14 +23,21 @@ test('clean, well-formed workflow produces no gaps', () => {
   assert.equal(analyzeWorkflowGaps(def).length, 0);
 });
 
-test('flags a deliverable producer with no output contract', () => {
+test('authored local destination and preservation instructions do not become missing-output questions', () => {
+  const def = wf({ allowSends: false, steps: [{ id: 'update', sideEffect: 'write',
+    allowedTools: ['read_file', 'write_file'],
+    prompt: 'Read /tmp/preservation.csv. Change only Alpha to 2. Preserve the header and Beta. Inspect the current content before deciding what to write. Read the file back and verify the change. Do not use external tools or send messages.' }] });
+  assert.deepEqual(analyzeWorkflowGaps(def), []);
+});
+
+test('an omitted output schema alone is not a missing destination', () => {
   const def = wf({
     steps: [
       { id: 'build', prompt: 'Generate a Google Sheet with the prospect data and populate every row.' },
     ],
   });
   const gaps = analyzeWorkflowGaps(def);
-  assert.ok(gaps.some((g) => g.stepId === 'build'));
+  assert.deepEqual(gaps, []);
 });
 
 test('does NOT flag a deliverable producer that declares an output contract', () => {
@@ -284,6 +291,7 @@ test('renderWorkflowGapQuestions: empty for no gaps, formatted otherwise', () =>
   const rendered = renderWorkflowGapQuestions([
     { severity: 'clarify', question: 'Q?', why: 'because' },
   ]);
-  assert.ok(rendered.includes('Gap test'));
+  assert.ok(rendered.includes('not execution blockers'));
+  assert.doesNotMatch(rendered, /Ask these now|Do not present it as ready/);
   assert.ok(rendered.includes('Q?'));
 });

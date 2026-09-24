@@ -1,3 +1,4 @@
+import { warmDurableProviderOperation } from './workflow-live-call-compiler.js';
 import {
   revalidateSelectedComposioDefinitions,
   type RevalidatedComposioDefinition,
@@ -8,7 +9,7 @@ import {
   isRegisteredToolkitSlug,
   registeredToolkitOfSlug,
 } from '../integrations/composio/toolkit-slug.js';
-import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
+import { currentCapabilityManifest, type CapabilityManifestV1 } from '../runtime/harness/capability-manifest.js';
 import pino from 'pino';
 import {
   peekCapabilityManifestStore,
@@ -66,6 +67,21 @@ export type WorkflowStepExternalCatalogPreparation =
 
 export interface WorkflowStepExternalCatalogDependencies {
   manifestStore?: CapabilityManifestStore | null;
+  /** Refresh the independent crossing-time observation of a selected manifest. */
+  refreshObservation?: (manifest: CapabilityManifestV1) => Promise<unknown>;
+  /** Rebuild the process state a durable provider operation needs before it
+   * can be revalidated or observed here: the provider schema lease and the
+   * connected toolkits, then one observation per account. */
+  warm?: (operationId: string) => Promise<unknown>;
+  /** Route an ambiguous operation to the account the run's ORIGIN source
+   * already established (the same host policy a chat turn uses). Returns the
+   * connection id, or null when the origin established nothing. */
+  routeOriginAccount?: (input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    toolkit: string;
+    operation: string;
+  }) => Promise<string | null>;
   catalogFactory?: HostCapabilityCatalogFactory | null;
   revalidate?: (
     selections: readonly SelectedComposioDefinition[],
@@ -77,6 +93,7 @@ export interface WorkflowStepExternalCatalogDependencies {
     sourceUserSeq: number;
     acceptedInput: string;
     operationIds: readonly string[];
+    selectedAccounts?: readonly { operationId: string; accountId: string }[];
     deadlineAt?: number;
   }) => Promise<ExactWorkflowProviderProvisionResult>;
 }
@@ -318,6 +335,67 @@ function isSelectedDefinitionDriftCode(code: string): boolean {
     || code === 'selected_definition_semantic_contract_drift';
 }
 
+/**
+ * The account the run's origin source already routes to for this toolkit,
+ * by the host's own source-account policy (remembered read default,
+ * established route for the principal). Chat resolved the calendar read to
+ * one of three Outlook connections without asking; a workflow authored from
+ * that same conversation should not park on "which account?" for the same
+ * operation (live 2026-09-22, "Invite digest" creation test).
+ */
+async function defaultRefreshObservation(manifest: CapabilityManifestV1): Promise<unknown> {
+  const { ensureFreshIndependentCapabilityObservation } = await import('../runtime/harness/independent-capability-observation.js');
+  return ensureFreshIndependentCapabilityObservation({
+    operationId: manifest.operationId,
+    accountId: manifest.accountId,
+    definitionFingerprint: manifest.definitionFingerprint,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+  });
+}
+
+async function routeOriginAccountByHostPolicy(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  toolkit: string;
+  operation: string;
+}): Promise<string | null> {
+  try {
+    const [{ resolveSourceAccountRouting }, { listUsableConnectedToolkits }] = await Promise.all([
+      import('../tools/source-account-routing.js'),
+      import('../integrations/composio/client.js'),
+    ]);
+    const routed = await resolveSourceAccountRouting({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      toolkit: input.toolkit,
+      operation: input.operation,
+      connections: await listUsableConnectedToolkits(),
+      effect: 'read',
+    });
+    return routed.kind === 'resolved' ? routed.connection.connectionId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Route a multi-account operation to the connected account the host's own
+ *  source-account policy picks for a conversation (the run's origin). Null
+ *  when the policy cannot decide; the caller then parks on the exact choice. */
+export async function routeOriginAccountForOperation(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  operation: string;
+}): Promise<string | null> {
+  const operation = input.operation.trim().toUpperCase();
+  return routeOriginAccountByHostPolicy({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    toolkit: registeredToolkitOfSlug(operation).trim().toLowerCase(),
+    operation,
+  });
+}
+
 export async function prepareWorkflowStepExternalCatalog(input: {
   immutablePrompt: string;
   allowedTools: readonly string[];
@@ -325,6 +403,13 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     sessionId: string;
     sourceUserSeq: number;
     acceptedInput: string;
+  };
+  /** The chat source this run was authored or dispatched from, when there
+   * is one. Its established account routing disambiguates a multi-account
+   * operation the step does not name. */
+  originSource?: {
+    sessionId: string;
+    sourceUserSeq: number;
   };
   deadlineAt?: number;
 }, dependencies: WorkflowStepExternalCatalogDependencies = {}): Promise<WorkflowStepExternalCatalogPreparation> {
@@ -354,6 +439,27 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     ...(input.immutablePrompt.match(/[A-Za-z0-9_-]+/g) ?? []),
     ...((input.acceptedSource?.acceptedInput ?? '').match(/[A-Za-z0-9_-]+/g) ?? []),
   ]);
+  // An operation with several current accounts and no name in the step: ask
+  // the run's origin source which account it already routes to. One lookup
+  // per ambiguous operation, before either provisioning pass.
+  if (input.originSource) {
+    const routeOrigin = dependencies.routeOriginAccount ?? routeOriginAccountByHostPolicy;
+    const seenOperations = new Set<string>();
+    for (const entry of currentRows) {
+      const key = entry.manifest.operationId.toUpperCase();
+      if (!operationIds.includes(key) || seenOperations.has(key)) continue;
+      const siblings = currentRows.filter((row) => row.manifest.operationId.toUpperCase() === key);
+      if (siblings.length < 2 || siblings.some((row) => namedAccountTokens.has(row.manifest.accountId))) continue;
+      seenOperations.add(key);
+      const routed = await routeOrigin({
+        sessionId: input.originSource.sessionId,
+        sourceUserSeq: input.originSource.sourceUserSeq,
+        toolkit: registeredToolkitOfSlug(key).trim().toLowerCase(),
+        operation: key,
+      });
+      if (routed && siblings.some((row) => row.manifest.accountId === routed)) namedAccountTokens.add(routed);
+    }
+  }
   const rowsByOperation = (): Map<string, InstalledCapabilityManifest[]> => {
     const rows = new Map<string, InstalledCapabilityManifest[]>();
     for (const entry of currentRows) {
@@ -429,6 +535,18 @@ export async function prepareWorkflowStepExternalCatalog(input: {
   }
 
   if (selected.length > 0) {
+    // A durable manifest's provider schema lease and the connected toolkits
+    // are process state that chat rebuilds through discovery; a step on a
+    // freshly launched daemon never did, so revalidation and the observation
+    // below refused a connected provider (live 2026-09-22: 12 runs parked
+    // "not connected" after launches, Outlook and Sheets connected the whole
+    // time). Supply only; the revalidator still decides.
+    const warm = dependencies.warm ?? (dependencies.revalidate ? null : warmDurableProviderOperation);
+    if (warm) {
+      for (const operationId of new Set(selected.map((entry) => entry.manifest.operationId))) {
+        try { await warm(operationId); } catch { /* supply, never authority */ }
+      }
+    }
     const revalidate = dependencies.revalidate ?? revalidateSelectedComposioDefinitions;
     let revalidated = await revalidate(selected.map(selectionFromManifest));
     // A DEFINITION DRIFT (input/output schema, fingerprint, or a non-label
@@ -484,6 +602,8 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       )({
         ...input.acceptedSource,
         operationIds: reboundOperationIds,
+        selectedAccounts: selected.filter(entry => reboundOperationIds.includes(entry.manifest.operationId))
+          .map(entry => ({ operationId: entry.manifest.operationId, accountId: entry.manifest.accountId })),
         ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
       });
       if (!reprovisioned.ok) {
@@ -590,6 +710,8 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       )({
         ...input.acceptedSource,
         operationIds: retryable,
+        selectedAccounts: selected.filter(entry => retryable.includes(entry.manifest.operationId))
+          .map(entry => ({ operationId: entry.manifest.operationId, accountId: entry.manifest.accountId })),
         ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
       });
       if (!republished.ok) {
@@ -646,6 +768,14 @@ export async function prepareWorkflowStepExternalCatalog(input: {
 
   const manifestIds = selected.map((entry) => entry.manifest.manifestId).sort();
   if (manifestIds.length > 0) {
+    // The selected manifests must be observable at the step's crossings. A
+    // background run's process holds no fresh independent observation until
+    // something refreshes it (live 2026-09-22: creation test
+    // live_observation_missing on the same operation chat had just used).
+    const refreshObservation = dependencies.refreshObservation ?? defaultRefreshObservation;
+    for (const entry of selected) {
+      try { await refreshObservation(entry.manifest); } catch { /* readiness below reports */ }
+    }
     (dependencies.refresh ?? refreshTypedExecutionReadiness)(manifestIds);
     if (!(dependencies.ready ?? typedExecutionCatalogReady)(manifestIds)) {
       // The readiness evaluator records WHY each manifest was refused; this

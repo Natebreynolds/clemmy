@@ -144,7 +144,7 @@ function recordsOf(value: unknown, path: string | undefined): { rows: unknown[];
 }
 
 function project(record: unknown, fields: readonly string[] | undefined): unknown {
-  if (!fields?.length || !record || typeof record !== 'object' || Array.isArray(record)) return record;
+  if (!fields?.length || !record || typeof record !== 'object') return record;
   return Object.fromEntries(fields.map((field) => [field, at(record, field)]));
 }
 
@@ -185,7 +185,7 @@ export function judgeEvidenceTools(
     }),
     tool({
       name: 'query_evidence',
-      description: 'Query the records of a retained JSON result under review: choose the list (path, default its main list), keep records whose where_field equals or contains a value, return chosen fields, with the true match count. Use a ref listed in the review evidence references.',
+      description: 'Query the records of a retained JSON result under review: choose the list (path, default its main list), keep records whose where_field equals or contains a value, return chosen fields, with the true match count and original zero-based sourceIndex for each match. Numeric fields select tuple columns. Use a ref listed in the review evidence references.',
       parameters: schema(queryInput) as never,
       strict: false,
       execute: async (raw) => {
@@ -194,11 +194,11 @@ export function judgeEvidenceTools(
         if (typeof entry === 'string') return entry;
         const records = recordsOf(judgeEvidenceJsonValue(entry), input.path);
         if (typeof records === 'string') return records;
-        let rows = records.rows;
+        let rows = records.rows.map((record, sourceIndex) => ({ record, sourceIndex }));
         if (input.where_field && (input.equals !== undefined || input.contains !== undefined)) {
           const needle = input.contains?.toLowerCase();
           rows = rows.filter((row) => {
-            const found = at(row, input.where_field!);
+            const found = at(row.record, input.where_field!);
             const text = found === null || found === undefined
               ? ''
               : typeof found === 'string' ? found : JSON.stringify(found);
@@ -206,7 +206,7 @@ export function judgeEvidenceTools(
           });
         }
         const offset = input.offset ?? 0;
-        const page = rows.slice(offset, offset + (input.limit ?? 50)).map((row) => project(row, input.fields));
+        const page = rows.slice(offset, offset + (input.limit ?? 50)).map(({ record, sourceIndex }) => ({ sourceIndex, record: project(record, input.fields) }));
         return clip(`${input.ref}: ${rows.length} of ${records.rows.length} records at ${records.from} match; showing ${page.length} from offset ${offset}.\n\n${JSON.stringify(page, null, 1)}`);
       },
     }),

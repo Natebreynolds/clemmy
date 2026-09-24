@@ -79,3 +79,21 @@ test('review-specific references do not change tool schemas or stable guidance',
   assert.equal(judgeEvidenceReferences(other), 'Valid refs: other-current-result.');
   assert.doesNotMatch(JSON.stringify(judgeEvidenceTools(source)), /raw_json_text/);
 });
+
+test('column projection over tuple records checks every row without dragging unrelated cells into the verdict', async () => {
+  const value = { batches: [{ cells: Array.from({ length: 200 }, (_, i) => [
+    i === 199 ? 'target-date' : 'other-date', 'large unrelated cell '.repeat(1000), i,
+  ]) }] };
+  const source = { refKind: 'recording matrix', refs: () => ['matrix'],
+    resolve: (ref: string) => ref === 'matrix' ? { text: JSON.stringify(value), value } : undefined };
+  const query = (judgeEvidenceTools(source) as unknown as Invokable[]).find(t => t.name === 'query_evidence')!;
+  const found = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'matrix',
+    path: 'batches.0.cells', where_field: '0', equals: 'target-date', fields: ['0', '2'] })));
+  assert.match(found, /1 of 200 records/);
+  assert.match(found, /target-date/);
+  assert.match(found, /"sourceIndex": 199/);
+  assert.doesNotMatch(found, /large unrelated cell|clipped/);
+  const absent = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'matrix',
+    path: 'batches.0.cells', where_field: '0', equals: 'absent-date', fields: ['0'] })));
+  assert.match(absent, /0 of 200 records/);
+});

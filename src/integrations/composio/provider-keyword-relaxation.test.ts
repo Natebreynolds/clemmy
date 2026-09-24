@@ -288,7 +288,7 @@ test('the production broker keeps current web search inside the exact long-role 
   assert.deepEqual((found[0]?.inputParameters as { required?: string[] }).required, ['q']);
 });
 
-test('the production planning tool_search card resolves the exact long role to current web search', async () => {
+for (const providerOnly of [false, true]) test(`the production planning tool_search card resolves the exact long role to current web search${providerOnly ? ' with a provider-only surface' : ''}`, async () => {
   const role = 'search current web news about local LLM processing with dated source records';
   const deprecated = {
     slug: 'FIRECRAWL_DEEP_RESEARCH',
@@ -362,6 +362,7 @@ test('the production planning tool_search card resolves the exact long role to c
 
   const server = new McpServer({ name: 'northstar-production-search', version: '1' });
   toolSearch.registerToolSearchTool(server as never, {
+    ...(providerOnly ? { allowedNames: new Set<string>() } : {}),
     candidateSources: providerSources.buildAuthorizedToolSearchCandidateSources({
       reason: 'northstar production planning regression',
       authority: 'catalog',
@@ -389,20 +390,26 @@ test('the production planning tool_search card resolves the exact long role to c
   assert.equal(names.includes(deprecated.slug), false);
   assert.deepEqual(result.schemas?.[current.slug]?.required, ['q']);
   assert.equal(fuzzyCalls, 1, 'planning discovery pays one bounded fuzzy provider call');
-  // TWO exact calls, each with a distinct job, and neither redundant:
+  // Distinct jobs, with no redundant call for an empty cold-provider window:
   //   1. lifecycle hydration during search — resolves the successor slugs a
   //      deprecated row named, bounded to 4;
-  //   2. one batched materialization of the SELECTED window only.
+  //   2. one batched materialization only if the SELECTED window includes cold
+  //      provider rows. Native rows do not need a provider round trip.
   // The older single-call shape materialized every discovered row up front,
   // including the ones ranking never surfaced. Splitting them pays for exactly
   // what the page shows, and the successor hydrated in (1) must NOT reappear in
   // (2) — re-fetching a definition already in hand is the round-trip waste this
   // asserts against.
-  assert.equal(exactCalls, 2, 'lifecycle hydration and window materialization are one call each');
+  const coldNames = names.filter(name => distractors.some(row => row.slug === name));
+  if (providerOnly) assert.ok(coldNames.length > 0, 'the provider-only surface exercises cold-window materialization');
+  assert.equal(exactCalls, coldNames.length > 0 ? 2 : 1,
+    'one lifecycle hydration plus one materialization only when selected cold provider rows need it');
   assert.ok(exactBatches[0]!.length <= 4, 'lifecycle hydration stays bounded');
   assert.ok(exactBatches[0]!.includes(current.slug));
-  assert.equal(exactBatches[1]!.includes(current.slug), false,
-    'the already-hydrated successor is reused, never re-fetched');
+  if (coldNames.length > 0) {
+    assert.deepEqual([...exactBatches[1]!].sort(), [...coldNames].sort(),
+      'only selected cold rows are materialized; the hydrated successor and off-page rows are never re-fetched');
+  }
 });
 
 const LIFECYCLE_SCHEMA = {

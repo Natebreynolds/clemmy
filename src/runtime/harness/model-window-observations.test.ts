@@ -190,13 +190,15 @@ test('a wire that misses more than it hits stays non-caching however many hits i
   assert.equal(compactionBudgetForModel(id), 880_000, 'lossy layers still fork inside the real window');
   assert.equal(layer1CompactionBudgetForModel(id), 200_000, 'lossless Layer 1 is held to prefill cost');
 
-  // The same wire serving a cached prefix on most calls earns its window back.
+  // Cache support is learned independently from the working-context budget.
+  // A hit does not justify carrying the entire available window every turn.
   const steady = 'fixture-steadily-cached-brain';
   obs.recordCatalogWindow(steady, 880_000, 'https://fixture.example.test/v1');
   for (let i = 0; i < 40; i += 1) obs.recordCacheObservation(steady, 60_000, i % 10 === 0 ? 0 : 50_000);
   obs._resetModelWindowObservationCacheForTests();
   assert.equal(obs.effectivePromptCacheSupport(steady), true);
-  assert.equal(layer1CompactionBudgetForModel(steady), 880_000);
+  assert.equal(compactionBudgetForModel(steady), 880_000, 'model capacity remains available');
+  assert.equal(layer1CompactionBudgetForModel(steady), 200_000, 'working history stays bounded even on a cached wire');
 });
 
 test('observation recording never throws on junk', async () => {

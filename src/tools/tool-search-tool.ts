@@ -30,6 +30,7 @@ import { operationNamedInQuery, sameOperationName } from './operation-name-ident
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
 import { capabilityEffectIsCompatible, rememberedCapabilityEffect, requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
+import { rerankNamedCandidatesWithJev, RANK_TIMEOUT_MS } from '../runtime/jev/control-plane.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidates,
@@ -360,7 +361,7 @@ const DESCRIPTION = [
   'Read-only.',
 ].join(' ');
 
-interface ToolSearchMetadata {
+export interface ToolSearchMetadata {
   schema: unknown;
   description: string;
 }
@@ -967,6 +968,9 @@ export function registerToolSearchTool(
     dispatchCarrierForName?: (name: string) => ToolSearchDispatchCarrier;
     /** Scope-bound provider adapters searched behind this same visible door. */
     candidateSources?: readonly ToolSearchCandidateSource[];
+    /** Current host-built structural tool contracts. Presentation only: names
+     * still pass the same allowed catalog and inner execution authority. */
+    runtimeToolMetadata?: () => ReadonlyMap<string, ToolSearchMetadata>;
     /** Fresh-host planning only. The callback may return a capabilityRef only
      * after independently matching/materializing this metadata result against
      * the current host catalog. Candidate prose itself grants nothing. */
@@ -1058,7 +1062,27 @@ export function registerToolSearchTool(
       // disclosure callback can run. The result grants no capabilityRef; the
       // ordinary orchestrator lifecycle owns when their real schemas appear.
       const structuralControl = deferredPage ? null : hostStructuralPlanningControlLookup(query);
-      if (structuralControl) return textResult(JSON.stringify(structuralControl));
+      if (structuralControl) {
+        // When the host built these controls for this turn, hand back their
+        // complete current schemas as bounded handles: off the act route
+        // plan_task is schema-on-demand (not in the prefix), and a model that
+        // needs it must be able to reopen the exact contract from this answer.
+        const runtime = opts.runtimeToolMetadata?.();
+        const schemaHandles: Record<string, ToolSearchSchemaHandle> = {};
+        for (const row of structuralControl.results) {
+          const metadata = runtime?.get(row.name);
+          if (!metadata || metadata.schema === undefined) continue;
+          const handle = continuations.storeSchema(metadata.schema, continuationSessionId);
+          if (handle) schemaHandles[row.name] = handle;
+        }
+        return textResult(JSON.stringify(Object.keys(schemaHandles).length > 0
+          ? {
+              ...structuralControl,
+              schema_handles: schemaHandles,
+              hint: `${structuralControl.hint} These controls are callable now by name (or through call_tool); reopen a complete schema with tool_search cursor = schema_handles[name].cursor.`,
+            }
+          : structuralControl));
+      }
       let brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
       let skippedBroadDiscovery = false;
@@ -1069,7 +1093,10 @@ export function registerToolSearchTool(
       // capability and its schema. Natural-language discovery still ranks the
       // whole allowed catalog below.
       const requestedLimit = Math.min(limit ?? TOP_RESULTS, TOOL_SEARCH_WINDOW_RESULTS);
-      const metadataMap = await toolMetadataMap();
+      const metadataMap = new Map(await toolMetadataMap());
+      for (const [name, metadata] of opts.runtimeToolMetadata?.() ?? []) {
+        metadataMap.set(name, metadata);
+      }
       const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames }).map((entry) => {
         const metadata = metadataMap.get(entry.name);
         const properties = (metadata?.schema as { properties?: object } | undefined)?.properties;
@@ -1081,9 +1108,12 @@ export function registerToolSearchTool(
             ...Object.keys(properties ?? {})].join('\n'),
         };
       });
-      const exactEntry = deferredPage ? undefined : scopedCatalog
-        .find((entry) => queryExplicitlyNamesTool(query, entry.name));
-      const exactKnownButDenied = !deferredPage && !exactEntry && catalogEntries()
+      const exactEntries = deferredPage ? [] : scopedCatalog
+        .filter((entry) => queryExplicitlyNamesTool(query, entry.name));
+      // Only a singleton may collapse the result to one schema. Multiple
+      // explicit native identities must all survive the ordinary result path.
+      const exactEntry = exactEntries.length === 1 ? exactEntries[0] : undefined;
+      const exactKnownButDenied = !deferredPage && exactEntries.length === 0 && catalogEntries()
         .some((entry) => queryExplicitlyNamesTool(query, entry.name));
       // Only a structured tool-name selection receives the exact-hit shortcut.
       // Workflow-name similarity remains advisory ranking, never a substitute
@@ -1112,6 +1142,8 @@ export function registerToolSearchTool(
       // source fails, that failure is the headline, never a local tool that
       // happened to rank.
       const requestedOperationInQuery = operationNamedInQuery(query);
+      const requestedOperationOutsideCatalog = Boolean(requestedOperationInQuery
+        && !catalogEntries().some((entry) => sameOperationName(entry.name, requestedOperationInQuery)));
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -1120,7 +1152,7 @@ export function registerToolSearchTool(
         ? deferredPage.rows.filter((row) => row.sourceKind && row.carrier).map((row) => ({
             name: row.name, summary: row.summary, sourceKind: row.sourceKind!, carrier: row.carrier!,
           } as ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind }))
-        : exactNamedHit || exactKnownButDenied
+        : (exactEntries.length > 0 || exactKnownButDenied) && !requestedOperationOutsideCatalog
         ? []
         : await (async () => {
           const discoverFromSource = async (source: NonNullable<typeof opts.candidateSources>[number]) => {
@@ -1289,7 +1321,9 @@ export function registerToolSearchTool(
       const exactSourceHit = exactSourceMatches.length === 1
         ? exactSourceMatches[0]
         : undefined;
-      const selectedExactly = exactSourceHit ?? exactNamedHit;
+      const selectedExactly = exactSourceMatches.length + exactEntries.length === 1
+        ? exactSourceHit ?? (requestedOperationOutsideCatalog ? undefined : exactNamedHit)
+        : undefined;
       const requestedEffect = requestedCapabilityEffectScope(query);
       // Merge all scoped metadata onto one query-relevance scale. A source's
       // ordinal score is useful only as a tie-break, never as proof that its
@@ -1345,6 +1379,7 @@ export function registerToolSearchTool(
             // An explicitly expressed compound operation name precedes
             // descriptive coverage; acquisition/lifecycle priorities stay intact.
             || Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+            || Number(right.purposeLeadMatch) - Number(left.purposeLeadMatch)
             || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
             || right.score - left.score
             || right.sourceRank - left.sourceRank
@@ -1380,14 +1415,43 @@ export function registerToolSearchTool(
       }
       // Jev reranks fuzzy neighbors only. Exact-name and exact-id hits stay
       // first; a missing key or timeout leaves the lexical window unchanged.
-      if (!selectedExactly && rankedWindow.length > 1) {
+      if (!deferredPage && !selectedExactly && rankedWindow.length > 1) {
         const exactNames = new Set(rankedWindow
           .filter((row) => queryExplicitlyNamesTool(query, row.name)
             || (requestedOperationInQuery && sameOperationName(row.name, requestedOperationInQuery)))
           .map((row) => row.name));
         const leading = rankedWindow.filter((row) => exactNames.has(row.name));
         const fuzzy = rankedWindow.filter((row) => !exactNames.has(row.name));
-        rankedWindow = [...leading, ...fuzzy];
+        // Spend only the remaining broker allowance, never a second discovery
+        // deadline. The transport's minimum timeout is 250ms; below that keep
+        // the existing order. Exact selections and retained pages pay nothing.
+        if (leading.length === 0 && fuzzy.length > 1 && remainingBrokerMs() >= 250) {
+          const ranked = await rerankNamedCandidatesWithJev(query, fuzzy, {
+            label: (row) => 'oneLiner' in row ? row.oneLiner : row.summary,
+            sessionId: continuationSessionId,
+            timeoutMs: Math.min(RANK_TIMEOUT_MS, remainingBrokerMs()),
+          });
+          // Relevance cannot demote independently acquired reads or override
+          // the existing namespace, effect and replacement precedence. Jev
+          // orders candidates within those same host-defined evidence tiers.
+          const tier = (row: (typeof fuzzy)[number]): number[] => {
+            const facts = row as { acquiredLiveRead?: boolean; namespaceMatch?: boolean;
+              effectCompatible?: boolean; lifecycleSuccessor?: boolean };
+            return [Number(Boolean(facts.acquiredLiveRead)), Number(Boolean(facts.namespaceMatch)),
+              Number(Boolean(facts.effectCompatible)), Number(Boolean(facts.lifecycleSuccessor && facts.namespaceMatch))];
+          };
+          ranked.sort((left, right) => {
+            const a = tier(left), b = tier(right);
+            for (let index = 0; index < a.length; index++) {
+              const difference = b[index]! - a[index]!;
+              if (difference) return difference;
+            }
+            return 0;
+          });
+          rankedWindow = [...leading, ...ranked];
+        } else {
+          rankedWindow = [...leading, ...fuzzy];
+        }
       }
       // Only sources with an exact selected-candidate contract may defer a
       // durable page. Existing opaque live-read authority keeps its old path.
@@ -1782,8 +1846,7 @@ export function registerToolSearchTool(
         if (
           unavailable.length > 0
           && (sourceCandidates.length === 0 || namedOperationMissing)
-          && !exactNamedHit
-          && !exactKnownButDenied
+          && (requestedOperationOutsideCatalog || (!exactNamedHit && !exactKnownButDenied))
         ) {
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
           if (namedOperationMissing) {

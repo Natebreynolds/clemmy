@@ -24,6 +24,13 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-automation-partitions
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.AUTH_MODE = 'codex_oauth';
+process.env.BYO_PROVIDERS = JSON.stringify([{ id: 'partition-review', label: 'Recording partition reviewer',
+  baseURL: 'https://partition-review.invalid/v1', modelIds: ['partition-review-fixture'] }]);
+process.env.BYO_PROVIDER_PARTITION_REVIEW_API_KEY = 'fixture-only';
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+  { role: 'judge', modelId: 'partition-review-fixture', scope: 'durable', source: 'settings' },
+]);
+
 process.env.MODEL_ROUTING_MODE = 'off';
 process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.5';
 process.env.CLEMMY_TURN_ENGINE = 'host_v1';
@@ -369,7 +376,10 @@ test.after(() => {
 
 test('10,001 naturally reviewed partitions survive fresh-process restart, backpressure, retry, and occurrence dedupe', {
   timeout: 900_000,
-}, async () => {
+}, async (t) => {
+  const { requests: reviewRequests, restore } = support.installRecordingPartitionReview();
+  // Restore the pre-fixture transport even when a later assertion fails.
+  t.after(restore);
   assert.ok(support.PARTITION_RECORD_COUNT > topology.WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS);
   assert.equal(topology.WORK_TOPOLOGY_MAX_UNIVERSE_MEMBERS, 10_000);
   assert.equal(topology.WORK_TOPOLOGY_MAX_INLINE_MODEL_MEMBERS, 256);
@@ -525,6 +535,7 @@ test('10,001 naturally reviewed partitions survive fresh-process restart, backpr
   assert.equal(pilotRun.goalOutcome, 'satisfied', pilotRunBytes);
   assert.equal(pilotRun.goalValidation?.pass, true);
   assert.equal(pilotRun.goalValidation?.judgeFailedOpen, false);
+  assert.equal(reviewRequests.length, 1, 'the bounded pilot receives one real review through the recording transport');
   assert.deepEqual(pilotRun.goalValidation?.perCriterion?.map((criterion) => ({
     pass: criterion.pass,
     method: criterion.method,

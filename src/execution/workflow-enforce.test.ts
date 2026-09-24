@@ -10,6 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   checkWorkflowForWrite,
+  checkSendGate,
   checkRunnabilityConstraints,
   autoRepairWorkflowDefinition,
   prepareWorkflowForWrite,
@@ -79,6 +80,34 @@ test('checkWorkflowForWrite: enabled send workflow with allowSends=false is reje
   const result = checkWorkflowForWrite(offending);
   assert.equal(result.ok, false, 'ungated send is rejected with allowSends=false');
   assert.match(result.errors.join(' '), /requiresApproval|approval/i);
+});
+
+test('strict send policy uses the authored effect instead of prohibition prose', () => {
+  const definition = wf({ allowSends: false, steps: [{
+    id: 'preserve', sideEffect: 'write',
+    prompt: 'Read preservation.csv. Change only Alpha to 2. Preserve the header and Beta. Do not use external tools or send messages.',
+  }] });
+  assert.deepEqual(checkSendGate(definition), []);
+  assert.equal(checkWorkflowForWrite(definition).ok, true);
+  assert.equal(definition.allowSends, false, 'validation must retain the strict policy');
+});
+
+test('strict send policy checks each sending step, not an unrelated approval gate', () => {
+  const definition = wf({ allowSends: false, steps: [
+    { id: 'draft', sideEffect: 'write', requiresApproval: true, prompt: 'Save the draft.' },
+    { id: 'deliver', sideEffect: 'send', prompt: 'Perform the configured operation.' },
+  ] });
+  assert.equal(checkSendGate(definition).length, 1);
+  definition.steps[1].requiresApproval = true;
+  assert.deepEqual(checkSendGate(definition), []);
+});
+
+test('strict send policy cannot downgrade an exact send with read metadata or quiet prose', () => {
+  const definition = wf({ allowSends: false, steps: [{
+    id: 'deliver', sideEffect: 'read', prompt: 'Perform the configured operation.',
+    call: { tool: 'OUTLOOK_SEND_EMAIL', args: {} },
+  }] });
+  assert.equal(checkSendGate(definition).length, 1);
 });
 
 test('checkWorkflowForWrite: exact scheduled call authority sees the typed allowSends policy', () => {
@@ -469,11 +498,13 @@ test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
   assert.equal(repaired.steps[0].sideEffect, 'read'); // declared value preserved
 });
 
-test('checkWorkflowForWrite: validator sees declared sideEffect from typed definitions', () => {
+test('checkWorkflowForWrite: validator compares declared effect with structured operation', () => {
   const result = checkWorkflowForWrite(wf({
-    steps: [{ id: 'send', prompt: 'Send the email summary to Alex.', sideEffect: 'read' }],
+    enabled: false,
+    steps: [{ id: 'send', prompt: 'Perform the operation.', sideEffect: 'read', call: { tool: 'OUTLOOK_SEND_EMAIL', args: {} } }],
   }));
-  assert.equal(result.ok, true);
+  // This intentionally incomplete direct call also faces the independent
+  // exact-call validator. Here we pin propagation of its typed-effect warning.
   assert.ok(
     result.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)),
     result.warnings.join('\n'),

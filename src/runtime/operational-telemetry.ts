@@ -70,6 +70,7 @@ export const WORKSPACE_OPERATIONAL_EVENT_TYPES = [
 ] as const;
 
 export const MEMORY_OPERATIONAL_EVENT_TYPES = [
+  'memory_review_completed',
   'episodic_event_recorded',
   'semantic_candidate_extracted',
   'semantic_fact_upserted',

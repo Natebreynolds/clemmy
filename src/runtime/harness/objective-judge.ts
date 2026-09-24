@@ -1,4 +1,5 @@
 import { classifyModelError } from './resilient-model.js';
+import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
@@ -27,6 +28,10 @@ import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
  * owned this prompt was deleted in Phase 3 — the goal-contract store +
  * harness validation (goal-validate.ts) replaced it.
  */
+/** How long Jev may take before the configured reviewer is started alongside
+ * it. Below Jev's measured miss latency on this machine, above its hit median. */
+export const JEV_HEDGE_DELAY_MS = 1_000;
+
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
@@ -131,9 +136,12 @@ export interface ObjectiveJudgeVerdict {
     choice?: string;
     confidence?: number;
     replyMatchesReceipts?: number;
+    requirementCoverage?: 'satisfied' | 'missing' | 'uncertain';
     accepted: boolean;
     coverageComplete: boolean;
-  };
+      /** Whether the configured reviewer was started (false = the hedge saved it). */
+    reviewerStarted?: boolean;
+};
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -514,6 +522,12 @@ export interface SkillExecutionContext {
 export interface CompletionEvidenceRow {
   toolName: string;
   outcome: string;
+  /** A control-role write whose settled result is a proven host-local
+   * authoring commit (a workflow or Space definition on disk). Authoring IS
+   * the outcome of an authoring request; without this the whole class of
+   * "create a workflow" turns had no outcome evidence and Jev's INCOMPLETE
+   * was accepted against finished work (live 2026-09-22, "Invite digest"). */
+  authoringResult?: boolean;
   status?: string;
   contentComplete?: boolean;
   contentDisposition?: string;
@@ -547,6 +561,7 @@ function isCompleteRetainedProjection(row: CompletionEvidenceRow): boolean {
 function isNonOutcomeEvidence(row: CompletionEvidenceRow): boolean {
   if (row.contentDisposition === 'discovery_navigation') return true;
   if (isCompleteRetainedProjection(row)) return false;
+  if (row.authoringResult === true && isSucceededReceipt(row)) return false;
   return actionTopologyRoleFor(row.toolName) === 'control';
 }
 
@@ -884,8 +899,49 @@ export async function runRoutedJudgeAttempt<T>(
     ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
     : buildJudgeAgent(routing, instructions);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
-  const value = parse(result.finalOutput);
-  if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
+  let value = parse(result.finalOutput);
+  if (value === null) {
+    // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
+    // review of three drafts and never emitted the one verdict line; the
+    // review became "unreadable", failed open, and the owner was told the
+    // work stood unreviewed with nothing to read. A reviewer that has already
+    // reviewed can state its verdict from its own words: one bounded re-ask,
+    // without the evidence packet, before the failure is declared, and the
+    // head of what it wrote travels with the failure so the next reader is
+    // not guessing.
+    const prior = redactSensitiveText(String(result.finalOutput ?? '')).trim();
+    const head = prior.replace(/\s+/g, ' ').slice(0, 600);
+    if (prior) {
+      try {
+        const repairAgent = buildJudgeAgent(routing, instructions);
+        const repairPrompt = [
+            'You already reviewed a response and wrote the review below, but it did not contain the required verdict line.',
+            'Do not review again. From your own review, state the verdict now.',
+            '',
+            '[YOUR REVIEW]',
+            prior,
+            '[/YOUR REVIEW]',
+            '',
+            'Reply with EXACTLY ONE LINE and nothing else, in the verdict format your instructions require.',
+          ].join('\n');
+        // A missing verdict must not turn an incomplete review excerpt into
+        // completion authority. Preserve the whole review or decline repair.
+        const repairAdmission = completionJudgeContextAdmission(routing.modelId, instructions, repairPrompt);
+        if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
+        const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
+          repairAgent, repairPrompt, { maxTurns: 1 },
+        );
+        value = parse(repaired.finalOutput);
+      } catch (error) {
+        logDebugSafe(error);
+      }
+    }
+    if (value === null) {
+      throw new JudgeVerdictParseError(
+        head ? `judge output did not parse; it began: ${head.slice(0, 240)}` : 'judge output did not parse; the reviewer returned no text',
+      );
+    }
+  }
   return value;
 }
 
@@ -898,6 +954,7 @@ interface CompletionJudgeRun {
   /** The winning attempt's routing (primary routing when nothing won). */
   routing?: BoundaryJudgeRouting;
   unavailableReason?: string;
+  invalidDetail?: string;
 }
 
 /**
@@ -922,15 +979,22 @@ export async function runHedgedJudge<T>(
     timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
     evidence?: JudgeEvidenceSource;
   } = {},
-): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string }> {
+): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
     const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
     routing = resolveBoundaryJudge(opts.boundaryJudgeSelection);
     const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
-    const attempt = (r: BoundaryJudgeRouting) => () => runRoutedJudgeAttempt(
-      r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
+    // Every attempt is attributed to its lane so the usage log can rank judge
+    // spend per lane; the turn's own session/source attribution is preserved.
+    const inherited = modelUsageAttributionStorage.getStore();
+    const attempt = (r: BoundaryJudgeRouting) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
+      { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
+        ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}`, role: 'reviewer' },
+      () => runRoutedJudgeAttempt<T>(
+        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
+      ),
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -954,6 +1018,9 @@ export async function runHedgedJudge<T>(
         : raced.errors.some((e) => e instanceof JudgeVerdictParseError)
           ? 'invalid'
           : 'error';
+    const invalidDetail = failure === 'invalid'
+      ? raced.errors.find((e) => e instanceof JudgeVerdictParseError)?.message.replace(/^judge output did not parse;?\s*/, '').slice(0, 260)
+      : undefined;
     recordCompletionJudgeMetric(failure, startedAt, routing, lane);
     const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
     const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
@@ -963,12 +1030,12 @@ export async function runHedgedJudge<T>(
         : transportError instanceof Error
           ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
-    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}) };
+    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
   } catch (err) {
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
     return { value: null, failure: 'error', routing,
-      ...(opts.boundaryJudgeSelection && err instanceof Error ? { unavailableReason: err.message } : {}) };
+      ...(err instanceof Error ? { unavailableReason: redactSensitiveText(err.message).replace(/\s+/g, ' ').slice(0, 400) } : {}) };
   }
 }
 
@@ -1014,7 +1081,8 @@ async function runCompletionJudge(
       ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}) },
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing,
-    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}) };
+    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
+    ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
 }
 
 /** Swallow-with-trace: the judge lanes are fail-open/fail-strict by CONTRACT,
@@ -1125,7 +1193,8 @@ export async function judgeGoalCriteriaStrict(
   );
   if (!run.value) {
     throw new Error(
-      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
+      run.unavailableReason ?? (run.failure === 'timeout' ? 'judge timed out'
+        : run.failure === 'invalid' ? `judge output did not parse${run.invalidDetail ? `; ${run.invalidDetail}` : ''}` : 'judge unavailable'),
     );
   }
   return run.value;
@@ -1154,7 +1223,8 @@ export async function judgeObjectiveCompleteStrict(
   });
   if (!run.verdict) {
     throw new Error(
-      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
+      run.unavailableReason ?? (run.failure === 'timeout' ? 'judge timed out'
+        : run.failure === 'invalid' ? `judge output did not parse${run.invalidDetail ? `; ${run.invalidDetail}` : ''}` : 'judge unavailable'),
     );
   }
   return { done: run.verdict.done, reason: run.verdict.reason,
@@ -1179,10 +1249,16 @@ export async function judgeObjectiveComplete(
   // skips the 3–25s hedged chat-model judge. The configured judge remains the
   // backstop when confidence is low, Jev times out, or the key is absent.
   //
-  // Start both immediately. A serialized Jev await made every rejected fast
-  // path pay Jev's full latency before grok even started (live ~30ms gap after
-  // Jev returned). Overlap makes a Jev miss free on the wall clock; a Jev hit
-  // still returns without waiting for the Settings judge.
+  // Start Jev now; start the configured reviewer only if Jev has not answered
+  // within a short hedge delay. Fully serial made every rejected fast path pay
+  // Jev's whole latency before grok started; fully parallel (the previous
+  // shape) started grok on every turn and let it run to completion after Jev
+  // had already been accepted — a whole reviewer call and its tokens spent
+  // for a verdict nobody read (live 2026-09-22: Jev accepted at 988 ms while
+  // grok-4.3 ran on for seconds). The reviewer cannot be aborted mid-flight,
+  // so the only cost that can be avoided is the one not started. Measured
+  // Jev latency on this machine: 270–988 ms on hits, so a 1 s delay lets most
+  // hits settle without a reviewer and costs a miss at most 1 s of wall time.
   const coverage = assessCompletionEvidenceCoverage({
     objective,
     results: skillContext?.verifiedReadResults,
@@ -1207,7 +1283,13 @@ export async function judgeObjectiveComplete(
       return null;
     }
   })();
-  const judgePromise = startCompletionJudge(objective, assistantResponse, skillContext);
+  let judgePromise: Promise<CompletionJudgeRun> | null = null;
+  const startJudge = (): Promise<CompletionJudgeRun> => {
+    judgePromise ??= startCompletionJudge(objective, assistantResponse, skillContext);
+    return judgePromise;
+  };
+  const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
+  hedge.unref?.();
   let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
   /** Jev's own reading of THIS reply, kept past the try so the unreachable
    *  path below can still use it. Without this it was computed, recorded as
@@ -1215,6 +1297,7 @@ export async function judgeObjectiveComplete(
    *  left. */
   let jevSaid: { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null = null;
   const fast = await jevPromise;
+  clearTimeout(hedge);
   const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
   // Accept a Jev verdict only when coverage supports it. DONE without
   // receipts is not completion; BLOCKED without a failed attempt is not a
@@ -1236,7 +1319,10 @@ export async function judgeObjectiveComplete(
     ? {
         accepted: acceptJev,
         coverageComplete: coverage.complete,
+        // Whether the hedge saved the reviewer call, so the saving is countable.
+        reviewerStarted: judgePromise !== null,
         ...(fast.choice ? { choice: fast.choice } : {}),
+        ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
         ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
         ...(typeof fast.replyMatchesReceipts === 'number'
           ? { replyMatchesReceipts: fast.replyMatchesReceipts }
@@ -1255,7 +1341,7 @@ export async function judgeObjectiveComplete(
       ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
     };
   }
-  const run = await judgePromise;
+  const run = await startJudge();
   if (!run.verdict) {
     // NO REVIEWER IS NOT A REASON TO ACCEPT A PROMISE.
     //
@@ -1290,7 +1376,7 @@ export async function judgeObjectiveComplete(
       run.failure === 'timeout'
         ? 'The completion reviewer timed out; no review was completed.'
         : run.failure === 'invalid'
-          ? 'The completion reviewer returned an unreadable verdict; no review was completed.'
+          ? `The completion reviewer returned an unreadable verdict; no review was completed.${run.invalidDetail ? ` (${run.invalidDetail})` : ''}`
           : 'The completion reviewer was unavailable; no review was completed.';
     return { done: true, reason: why, failedOpen: true, ...(jevAttempt ? { jevAttempt } : {}) };
   }

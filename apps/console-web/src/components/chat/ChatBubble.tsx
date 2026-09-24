@@ -23,6 +23,7 @@ import {
   type PendingActionExecutionPresentation,
 } from '@/lib/pendingActions';
 import type { ChatMessage } from '@/lib/useChat';
+import { snoozeNeedsYou } from '@/lib/inbox';
 import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
 
 /** Inline spans within a line: **bold** and `code`; everything else is linkified
@@ -163,6 +164,9 @@ export function ChatBubble({
   const [resolvedDecision, setResolvedDecision] = useState<'approve' | 'reject' | null>(null);
   const [decisionBusy, setDecisionBusy] = useState<'approve' | 'reject' | null>(null);
   const [decisionError, setDecisionError] = useState<string | null>(null);
+  // "Not now" sets the decision aside — it stays pending in Needs you. It
+  // used to decline it for good; declining is its own button now.
+  const [setAside, setSetAside] = useState(false);
   const resolved = resolvedDecision !== null;
   // Execute-button truth (U3): a pending-action card's Execute fires the exact
   // stored call server-side and shows the DURABLE outcome — never a client-side
@@ -236,6 +240,20 @@ export function ChatBubble({
         : `Could not ${decision} this ${message.status === 'awaiting-plan' ? 'plan' : 'request'}.`);
     } finally {
       setDecisionBusy(null);
+    }
+  };
+
+  const snoozeKey = message.status === 'awaiting-plan'
+    ? (message.planProposalId ? `plan:${message.planProposalId}` : '')
+    : (message.approval?.approvalId ? `approval:${message.approval.approvalId}` : '');
+  const setAsideForLater = async () => {
+    if (resolved || decisionBusy) return;
+    setDecisionError(null);
+    try {
+      if (snoozeKey) await snoozeNeedsYou(snoozeKey);
+      setSetAside(true);
+    } catch (error) {
+      setDecisionError(error instanceof Error && error.message.trim() ? error.message.trim() : 'Couldn’t set this aside.');
     }
   };
 
@@ -402,6 +420,13 @@ export function ChatBubble({
                 <p className="mt-2.5 text-caption text-muted">
                   This is a record of what was asked. Answer it where it is live — in Needs you.
                 </p>
+              ) : setAside && !resolved ? (
+                <p className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-muted" role="status">
+                  Left for later — it’s waiting in Needs you.
+                  <button type="button" className="font-semibold text-primary hover:underline" onClick={() => setSetAside(false)}>
+                    Decide now
+                  </button>
+                </p>
               ) : (
               <div className="mt-2.5 flex items-center gap-2">
                 <Button
@@ -412,7 +437,10 @@ export function ChatBubble({
                   {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                   {pendingAction ? 'Execute queued action' : 'Approve'}
                 </Button>
-                <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> Not now</Button>
+                <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> Decline</Button>
+                {!resolved && exec.phase === 'idle' && (
+                  <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => { void setAsideForLater(); }}>Not now</Button>
+                )}
                 {/* Truth, not a latch: for a pending-action card the label reflects
                     the durable executor outcome; the plain approve/plan path keeps
                     the "Submitted" acknowledgement (its follow-up turn carries the

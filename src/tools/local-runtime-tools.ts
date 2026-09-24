@@ -51,6 +51,7 @@ import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
 import {
   registerToolSearchTool,
   type ToolSearchCandidateSource,
+  type ToolSearchMetadata,
   type ToolSearchPlanningDisclosureOutcome,
   type ToolSearchPlanningDisclosureCandidate,
   type ToolSearchPlanningDisclosureControl,
@@ -255,6 +256,7 @@ import {
   normalizeZodForCodexStrict as normalizeZodForResponses,
   normalizeShapeForCodexStrict as normalizeShapeForResponses,
   normalizeShapeForDeferredJson,
+  decodeProjectedOptionalNulls,
 } from '../runtime/schema-normalizer.js';
 export { normalizeZodForResponses, normalizeShapeForResponses };
 
@@ -269,7 +271,10 @@ function captureLocalTools(): CapturedLocalTool[] {
       parameters: z.ZodRawShape,
       handler: LocalToolHandler,
     ): void {
-      captured.push({ name, description, parameters, handler });
+      const originalParameters = z.object(parameters);
+      captured.push({ name, description, parameters,
+        handler: input => handler(decodeProjectedOptionalNulls(input, originalParameters) as Record<string, unknown>),
+      });
     },
   };
   const server = fakeServer as unknown as McpServer;
@@ -645,6 +650,7 @@ export function buildScopedLocalToolSearch(
   ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
     | Readonly<Record<string, string>>
     | ToolSearchPlanningDisclosureOutcome,
+  runtimeToolMetadata?: () => ReadonlyMap<string, ToolSearchMetadata>,
 ): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
@@ -664,6 +670,7 @@ export function buildScopedLocalToolSearch(
     ...(dispatchCarrierForName ? { dispatchCarrierForName } : {}),
     ...(candidateSources ? { candidateSources } : {}),
     ...(discloseForPlanning ? { discloseForPlanning } : {}),
+    ...(runtimeToolMetadata ? { runtimeToolMetadata } : {}),
   });
   const localTool = captured[0];
   if (!localTool) throw new Error('tool_search did not register');

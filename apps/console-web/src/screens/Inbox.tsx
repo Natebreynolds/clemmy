@@ -12,6 +12,7 @@ import { setWorkflowEnabled } from '@/lib/automate';
 import { usePoll } from '@/lib/poll';
 import { applyTidy, describeTidy } from '@/lib/tidy';
 import { cn } from '@/lib/cn';
+import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
@@ -22,18 +23,18 @@ import {
   listInboxQuestions, answerInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
-  approvalDecisionSuccessText, collapseAttentionRows, notifTone, notifFailed,
+  approvalDecisionSuccessText, attentionPill, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
 } from '@/lib/inbox';
 
-/** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
- *  — these are DECISIONS/blocks for the user, so they belong on the "Needs you"
- *  tab beside approvals, not buried under general notifications. */
+/** Decisions and blocks belong on "Needs you" beside approvals. The server
+ *  decides which those are (runtime/notifications.ts) and says so on every
+ *  row; a second rule here read titles and disagreed with it — "paused" and
+ *  "needs you" in a title counted on the desktop and nowhere else. */
 function needsAttentionNotif(n: NotificationRow): boolean {
-  return n.needsAttention === true
-    || /\bblocked\b|needs attention|needs input|needs you|paused|couldn['\u2019]t finish|action required/i.test(n.title || '');
+  return n.needsAttention === true;
 }
 
 type Tab = 'needs' | 'notifications';
@@ -96,6 +97,9 @@ export function Inbox() {
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
   const planProposals = usePoll(['plan-proposals'], listPlanProposals, 6000);
   const questions = usePoll(['inbox-questions'], listInboxQuestions, 5000);
+  // The one count (dashboard/needs-you.ts): the same total the sidebar and the
+  // phone show, plus rows no other feed carries.
+  const needsSummary = usePoll(['needs-you-summary'], getNeedsYouSummary, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
   const workspaceChooserRows = workspaceChoosers.data?.choosers ?? [];
@@ -109,14 +113,26 @@ export function Inbox() {
   const questionRows = questions.data?.questions ?? [];
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
-  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
+  // A carrier for a decision already on this list as a card is that decision.
+  const listedDecisionKeys = new Set([
+    ...approvalRows.map((row) => `approval:${row.approvalId}`),
+    ...planRows.map((row) => `plan:${row.id}`),
+    ...trustRows.map((row) => `trust:${row.id}`),
+    ...questionRows.map((row) => row.id),
+  ]);
+  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n)
+    && !(n.needsYouKey && listedDecisionKeys.has(n.needsYouKey)));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
-  const needsCount = workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
-  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
+  const unlistedRows = needsSummary.data?.unlisted ?? [];
+  // The badge is the server's total whenever it has answered: the sidebar and
+  // the phone show that same number. The local sum is only the fallback.
+  const needsCount = needsSummary.data?.total
+    ?? (workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length);
+  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -132,18 +148,19 @@ export function Inbox() {
   const hasRows = !queryUnavailable && (tab === 'needs' ? anyDecisionRows : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
-  const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
+  // Every decision moves the one count too, so the badge never lags the list.
+  const invalidate = (...keys: string[]) => [...keys, 'needs-you-summary'].forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
 
-  const onDecide = async (id: string, decision: 'approve' | 'reject') => {
+  const onDecide = async (id: string, decision: 'approve' | 'reject', note?: string) => {
     const row = approvalRows.find((a) => a.approvalId === id);
     if (!row || decisionStates[id]?.busy || bulkBusy) return;
     setDecisionStates((prev) => ({ ...prev, [id]: { busy: true, intent: decision } }));
     setDecisionNotice(null);
     try {
-      const result = await decideApproval(id, decision, { kind: row.kind });
+      const result = await decideApproval(id, decision, { kind: row.kind, ...(note ? { note } : {}) });
       const notice: DecisionNotice = {
         tone: 'success',
-        text: approvalDecisionSuccessText(row, decision, result),
+        text: approvalDecisionSuccessText(row, decision, result, note),
       };
       setDecisionStates((prev) => ({ ...prev, [id]: { busy: false, notice } }));
       setDecisionNotice(notice);
@@ -556,7 +573,7 @@ export function Inbox() {
                             <Check className="h-4 w-4" aria-hidden /> Approve {checkedCount}
                           </Button>
                           <Button size="sm" variant="secondary" disabled={bulkBusy} onClick={() => onBulkDecide('reject')}>
-                            <X className="h-4 w-4" aria-hidden /> Reject {checkedCount}
+                            <X className="h-4 w-4" aria-hidden /> Decline {checkedCount}
                           </Button>
                         </div>
                       </>
@@ -573,7 +590,7 @@ export function Inbox() {
                     onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
                 {agedApprovalRows.length > 0 && (
                   <div className="flex items-center gap-2 pt-2 text-caption text-muted">
@@ -590,7 +607,7 @@ export function Inbox() {
                     onToggleCheck={() => toggleChecked(a.approvalId)}
                     onSelect={() => setSelected(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
                 {trustRows.map((p) => (
                   <TrustProposalCard key={p.id} row={p}
@@ -615,8 +632,19 @@ export function Inbox() {
                     <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
                       title={n.title || n.body || 'Needs attention'}
                       meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
-                      tone={{ tone: 'warning', label: 'Needs attention' }} />
+                      tone={attentionPill(n)} />
                   )
+                ))}
+                {unlistedRows.map((item) => (
+                  <Link key={item.key}
+                    to={item.workflow ? `/automate?workflow=${encodeURIComponent(item.workflow)}` : '/home'}
+                    className="flex w-full items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-3 text-left transition-colors hover:bg-hover">
+                    <StatusPill tone="warning">{item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you'}</StatusPill>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-body text-fg">{item.title}</span>
+                      <span className="block truncate text-small text-muted">{item.detail}</span>
+                    </span>
+                  </Link>
                 ))}
               </>
             ))}
@@ -632,7 +660,9 @@ export function Inbox() {
 
         {/* Reading pane — only rendered when the tab has selectable rows. */}
         {hasRows && (
-          <div className="rounded-lg border border-border-raised bg-raised p-5">
+          // Sized to what it shows and kept in view while the list scrolls —
+          // stretched to the list's height it was an empty white slab.
+          <div className="self-start rounded-lg border border-border-raised bg-raised p-5 lg:sticky lg:top-4 lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto">
             {selApproval && (
               <ApprovalDetail
                 row={selApproval}
@@ -664,8 +694,9 @@ export function Inbox() {
               <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />
             ) : null}
             {!selApproval && !selPlan && !selNotif && (
-              <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
-                Select an item to see the details
+              <div className="flex min-h-40 flex-col items-center justify-center gap-1 text-center">
+                <p className="text-body font-medium text-fg">Pick something on the left</p>
+                <p className="text-small text-muted">You’ll see the details and what happens when you decide.</p>
               </div>
             )}
           </div>
@@ -684,7 +715,7 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
       className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
         selected ? 'border-primary bg-primary-tint' : 'border-border bg-surface hover:bg-hover', dim && 'opacity-60')}>
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
-      <span className="min-w-0 flex-1 truncate text-body text-fg">{title}</span>
+      <span className="min-w-0 flex-1 truncate text-body text-fg">{plainText(title, 200)}</span>
       {meta && <span className="shrink-0 text-caption text-faint">{meta}</span>}
     </button>
   );
@@ -803,21 +834,21 @@ function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }
           <ul className="mt-1 list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
           {row.sessionId ? (
             <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the exact conversation
+              Answer in the conversation
             </Link>
           ) : (
-            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Reject it and ask Clem to draft a new plan with your answers.</p>
+            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Decline it and ask Clem to draft a new plan with your answers.</p>
           )}
         </div>
       )}
       <div className="mt-2.5 flex gap-2">
         {!needsInput && (
           <Button size="sm" disabled={busy} onClick={onApprove}>
-            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve exact plan'}
+            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve plan'}
           </Button>
         )}
         <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
-          <X className="h-4 w-4" aria-hidden /> Reject
+          <X className="h-4 w-4" aria-hidden /> Decline
         </Button>
       </div>
     </div>
@@ -832,29 +863,44 @@ function PlanProposalDetail({ row, busy, onApprove, onReject }: {
 }) {
   const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
   const needsInput = questions.length > 0;
+  const steps = (row.plan.steps ?? []).filter((step) => (step.action || step.description)?.trim());
   return (
     <div>
       <h3 className="mb-3 text-h3 text-fg">{row.plan.objective || 'Proposed plan'}</h3>
-      <Field label="Original request"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
+      <Field label="You asked"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
       {row.context && <Field label="Context"><span className="whitespace-pre-wrap">{row.context}</span></Field>}
-      {row.sessionId && <Field label="Exact conversation"><span className="font-mono">{row.sessionId}</span></Field>}
       <Field label="Proposed">{relativeTime(row.proposedAt) || row.proposedAt}</Field>
-      <Field label="Plan"><Mono value={row.plan} /></Field>
+      {steps.length > 0 && (
+        <Field label="What she’ll do">
+          <ol className="list-decimal space-y-1.5 pl-5">
+            {steps.map((step, index) => <li key={step.id ?? index}>{step.action || step.description}</li>)}
+          </ol>
+        </Field>
+      )}
+      {row.sessionId && (
+        <Link className="mt-1 inline-block text-small font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
+          Open the conversation
+        </Link>
+      )}
+      <details className="mt-3 text-caption text-muted">
+        <summary className="cursor-pointer select-none hover:text-fg">Technical details</summary>
+        <div className="mt-2"><Mono value={row.plan} /></div>
+      </details>
       {needsInput && (
         <Field label="Answers needed">
           <ul className="list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
           {row.sessionId ? (
             <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the exact conversation
+              Answer in the conversation
             </Link>
           ) : (
-            <p className="mt-2 text-warning">No linked conversation is available. Reject this proposal and ask Clem for a new plan after supplying the answers.</p>
+            <p className="mt-2 text-warning">No linked conversation is available. Decline this proposal and ask Clem for a new plan after supplying the answers.</p>
           )}
         </Field>
       )}
       <div className="mt-4 flex gap-2">
         {!needsInput && <Button disabled={busy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve & continue'}</Button>}
-        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Decline</Button>
       </div>
     </div>
   );
@@ -925,10 +971,21 @@ function ApprovalCard({
 }: {
   row: ApprovalRow; selected: boolean; checked: boolean; onToggleCheck: () => void;
   decisionState?: RowDecisionState; disabled?: boolean;
-  onSelect: () => void; onApprove: () => void; onReject: () => void;
+  onSelect: () => void; onApprove: () => void; onReject: (note?: string) => void;
 }) {
   const queued = row.pendingAction;
   const busy = disabled || decisionState?.busy === true;
+  // The draft the reviewer is deciding on. Long drafts fold; the first lines
+  // are always visible so "what am I approving?" is answered on the card.
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const [draftOpen, setDraftOpen] = useState(false);
+  const draftIsLong = draft.length > 420;
+  const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 419)}…` : draft;
+  // "Request changes": decline THIS draft and say what to change. The note
+  // rides with the rejection and reaches the conversation that owns the run.
+  const [changing, setChanging] = useState(false);
+  const [changeNote, setChangeNote] = useState('');
+  const isWorkflowGate = row.tool === 'workflow_approval_gate';
   return (
     <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
       selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
@@ -948,18 +1005,60 @@ function ApprovalCard({
           {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}
         </div>
       )}
-      <div className="mt-2.5 flex gap-2">
+      {draft && (
+        <div className="mt-2 rounded border border-border bg-surface px-3 py-2" aria-label="What you are approving">
+          <p className="text-caption font-semibold uppercase tracking-wider text-faint">Draft</p>
+          <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-small text-fg">{shownDraft}</pre>
+          {draftIsLong && (
+            <button type="button" className="mt-1 text-caption font-medium text-primary hover:underline" onClick={() => setDraftOpen((open) => !open)}>
+              {draftOpen ? 'Show less' : 'Show the whole draft'}
+            </button>
+          )}
+        </div>
+      )}
+      <div className="mt-2.5 flex flex-wrap gap-2">
         <Button size="sm" disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
           {decisionState?.busy && decisionState.intent === 'approve'
             ? 'Approving…'
             : queued ? 'Approve & continue' : 'Approve'}
         </Button>
-        <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
+        {isWorkflowGate && (
+          <Button size="sm" variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
+            Request changes
+          </Button>
+        )}
+        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onReject()}>
           <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
         </Button>
       </div>
+      {isWorkflowGate && changing && (
+        <form
+          className="mt-2 flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!changeNote.trim()) return;
+            onReject(changeNote.trim());
+            setChanging(false);
+          }}
+        >
+          <textarea
+            value={changeNote}
+            onChange={(event) => setChangeNote(event.target.value)}
+            disabled={busy}
+            rows={3}
+            aria-label="What should change"
+            placeholder="What should change in this draft?"
+            className="w-full rounded-md border border-border bg-surface px-2.5 py-2 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
+          />
+          <div className="flex items-center gap-2">
+            <Button type="submit" size="sm" disabled={busy || !changeNote.trim()}>Send changes</Button>
+            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setChanging(false)}>Cancel</Button>
+            <span className="text-caption text-faint">This stops the current draft and hands your note back to Clem to revise.</span>
+          </div>
+        </form>
+      )}
       {decisionState?.notice && (
         <p
           role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}
@@ -1039,10 +1138,30 @@ function ApprovalDetail({
     <div>
       <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready for approval: ${queued.title}` : row.subject}</h3>
       {queued && <PendingActionDetail action={queued} />}
-      <Field label="Tool">{row.tool || '—'}</Field>
-      {row.sessionId && <Field label="From session">{row.sessionId}</Field>}
+      <Field label="Action">{row.presentation?.action || row.tool || '—'}</Field>
+      {row.presentation?.app && <Field label="App">{row.presentation.app}{row.presentation.operation ? ` · ${row.presentation.operation}` : ''}</Field>}
       <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>
-      <Field label="Details"><Mono value={row.args} /></Field>
+      {row.presentation && row.presentation.details.length > 0 ? (
+        <div className="mt-2 space-y-2" data-testid="approval-presentation">
+          {row.presentation.details.map((line) => (
+            line.long
+              ? (
+                <div key={line.label}>
+                  <div className="text-label text-fg">{line.label}</div>
+                  <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2 text-body text-fg">{line.value}</p>
+                </div>
+              )
+              : <Field key={line.label} label={line.label}>{line.value}</Field>
+          ))}
+        </div>
+      ) : (
+        <Field label="Details"><Mono value={row.args} /></Field>
+      )}
+      <details className="mt-2 text-caption text-muted">
+        <summary className="cursor-pointer">Technical details</summary>
+        <div className="mt-1 text-fg">Tool: {row.tool || '—'}{row.sessionId ? ` · session ${row.sessionId}` : ''}</div>
+        <Mono value={row.args} />
+      </details>
       <div className="mt-4 flex gap-2">
         <Button disabled={busy} onClick={onApprove}>
           {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
@@ -1052,7 +1171,7 @@ function ApprovalDetail({
         </Button>
         <Button variant="secondary" disabled={busy} onClick={onReject}>
           <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Rejecting…' : 'Reject'}
+          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
         </Button>
       </div>
       {decisionState?.notice && (

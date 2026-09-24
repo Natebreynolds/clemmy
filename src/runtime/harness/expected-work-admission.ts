@@ -22,7 +22,7 @@ import {
   hostArtifactContentDigest,
 } from './artifact-ledger.js';
 import { compileAtomicInputContentContract } from './atomic-input-content-contract.js';
-import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
+import { currentManifestOperationContract, currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { extractDuplicateIdentityKeys } from './grounding-gate.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
@@ -92,7 +92,7 @@ import {
 } from './host-capability-catalog-factory.js';
 import { proveFrozenMutationVerification } from './mutation-verification-proof.js';
 import { expectsHostLocalWorkspaceCompoundCommit } from './host-local-write-commit.js';
-import { proveNativeRevisionCommit } from './native-revision-commit-proof.js';
+import { proveNativeRevisionCommit, proveWorkflowDispatchCommit } from './native-revision-commit-proof.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
@@ -979,7 +979,7 @@ export function dischargedRequirementSettlements(
   requirementId: string,
 ): Array<{ logical_tool_call_id: string; universe_item_id: string | null }> {
   const rows = db.prepare(`
-    SELECT b.logical_tool_call_id, b.effect_kind, b.cardinality_kind,
+    SELECT b.logical_tool_call_id, b.tool_name, b.effect_kind, b.cardinality_kind,
            b.universe_id, b.universe_item_id, b.universe_selector_json,
            b.universe_member_digest, b.universe_member_count,
            b.evidence_mode, b.evidence_basis, b.schema_digest,
@@ -1000,6 +1000,7 @@ export function dischargedRequirementSettlements(
     requirementId,
   ) as Array<{
     logical_tool_call_id: string;
+    tool_name: string;
     effect_kind: RuntimeToolEffect;
     cardinality_kind: 'once' | 'each' | 'set';
     universe_id: string | null;
@@ -1040,6 +1041,10 @@ export function dischargedRequirementSettlements(
     // artifact write discharges only after a downstream exact-ID read, bound
     // to this same contract, proves the frozen content contract.
     if (row.effect_kind !== 'read') {
+      if (row.effect_kind === 'local_write' && proveWorkflowDispatchCommit({
+        ...contract.identity, acceptedTaskId: contract.acceptedTaskId, contractId: contract.contractId,
+        requirementId, logicalToolCallId: row.logical_tool_call_id,
+      }).status === 'verified') return true;
       if (row.effect_kind === 'local_write' && proveNativeRevisionCommit({
         sessionId: contract.identity.sessionId,
         sourceUserSeq: contract.identity.sourceUserSeq,
@@ -1071,7 +1076,18 @@ export function dischargedRequirementSettlements(
           sessionId: contract.identity.sessionId, sourceUserSeq: contract.identity.sourceUserSeq,
           acceptedTaskId: contract.acceptedTaskId, logicalToolCallId: row.logical_tool_call_id,
         });
-        if (redeemed.status === 'ok') return true;
+        // Absence of a frozen proof is not evidence that none was owed.
+        // A declared artifact creator still owes artifact proof even when a
+        // legacy/unsealed caller omitted its content-verification contract.
+        const selected = loadSealedNodeBinding(contract.identity.sessionId,
+          contract.identity.sourceUserSeq, requirementId);
+        const current = selected ? null : currentManifestOperationContract(row.tool_name);
+        const declaration = selected ?? current;
+        const semantics = selected?.operationSemantics ?? current?.semantics;
+        const artifactProofRequired = declaration?.destination?.posture === 'create_new'
+          || (declaration?.verification !== undefined && declaration?.verification !== null)
+          || semantics?.atomicInputContent !== undefined;
+        if (redeemed.status === 'ok' && !artifactProofRequired) return true;
       }
       return generatedArtifactWriteContentVerified({
         sessionId: contract.identity.sessionId,

@@ -61,6 +61,57 @@ test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
+for (const explicitlyNamed of [false, true]) test(`production orchestrator discovery returns its own worker packet schema (named=${explicitlyNamed})`, async () => {
+  const session = createSession({ kind: 'chat' });
+  const prompt = explicitlyNamed
+    ? 'Inspect the exact run_worker packet schema; do not start any workers.'
+    : 'Inspect the packet contract for delegating independent work; do not start any workers.';
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
+  const { EventEmitter } = await import('node:events');
+  const { hostRunRunner } = await import('../runtime/harness/host-turn-runner.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const { primePrimaryModelPlanningCatalog } = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
+  const { relaxJsonSchemaForDeferred } = await import('../runtime/schema-normalizer.js');
+  const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.ok(primed.ok);
+  if (!primed.ok) return;
+  let calls = 0;
+  const model = {
+    async getResponse() {
+      calls++;
+      return { responseId: `discovery-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: calls === 1
+          ? [{ type: 'function_call', callId: 'discover-worker-contract', name: 'tool_search', arguments: JSON.stringify({ query: 'run_worker', role_key: null, limit: 1, cursor: null, account_selection: null }) }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The worker contract was discovered; no worker was started.' }] }],
+      };
+    },
+    async *getStreamedResponse() {
+      const response = await this.getResponse();
+      yield { type: 'response_started' };
+      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
+    },
+  };
+  const agent = await withFlag('on', () => buildOrchestratorAgent({
+    sessionId: session.id, sourceUserSeq: source.seq, userInput: prompt, allowToolJit: true,
+    hostFreshPlanning: primed.planning, model: model as never,
+    mcpToolScope: { authority: 'none', reason: 'local discovery fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+  }));
+  const worker = agent.tools.find(tool => tool.name === 'run_worker');
+  assert.ok(worker && 'parameters' in worker);
+  const runner = new EventEmitter();
+  Object.assign(runner, { run() { throw new Error('Legacy runner must not run'); } });
+  const outcome = await withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
+    counter: new ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1`,
+  }, () => hostRunRunner(runner as never, agent, [{ type: 'message', role: 'user', content: prompt }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq } } as never));
+  const row = outcome.history.find((item: any) => item.type === 'function_call_result') as any;
+  assert.ok(row, JSON.stringify(outcome.history));
+  const result = JSON.parse(typeof row.output === 'string' ? row.output : row.output.text);
+  assert.deepEqual(result.schemas.run_worker, relaxJsonSchemaForDeferred(worker.parameters));
+  assert.equal(result.results[0]?.name, 'run_worker');
+  assert.equal(listEvents(session.id, { types: ['worker_started'] }).length, 0);
+});
+
 test('OFF (default): no call_tool, no catalog block, full discovery surface, no telemetry', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -116,6 +167,10 @@ test('ON: first-class = structural + hot set; non-hot discovery moves to the cat
   assert.doesNotMatch(catalog, /\bmemory_recall_all\b/, 'a first-class tool is not duplicated in the deferred catalog');
   assert.match(catalog, /\bmemory_recall\b/, 'specialized recall stays reachable through the deferred catalog');
   assert.doesNotMatch(catalog, /\bcron_list\b/, 'a CLI-only tool is never advertised on the chat catalog');
+  // Live 2026-09-24 (source 298961): the name of the memory door was in this
+  // index and the brain still spent a discovery frame asking how to save a
+  // preference. The block says a listed name is callable now.
+  assert.match(instr, /A name listed below is callable now|If you already know the exact name/, 'the catalog block tells the brain a listed name needs no search');
 
   // Telemetry records the split.
   const scope = listEvents(onSess.id, { types: ['tool_search_scope'] });

@@ -1,3 +1,4 @@
+import { interpretWorkflowTextResult, type WorkflowTextResultInterpretationV1 } from '../../memory/workflow-text-result-interpretation.js';
 /**
  * Pure provider-result interpretation.
  *
@@ -41,15 +42,16 @@ export type ProviderResultEvidenceViewV1 =
   | {
       version: 1;
       kind: 'provider_payload';
-      owner: 'root' | 'sealed_invoke_result' | 'mcp_structured_content' | 'mcp_text_json';
+      owner: 'root' | 'sealed_invoke_result' | 'mcp_structured_content' | 'mcp_text_json' | 'reviewed_text_lines';
       payload: unknown;
     }
   | {
       version: 1;
       kind: 'no_evidence';
-      owner: 'mcp' | 'sealed_invoke';
+      owner: 'mcp' | 'sealed_invoke' | 'reviewed_text_lines';
       reason: 'mcp_result_error' | 'mcp_payload_missing' | 'mcp_envelope_malformed'
-        | 'sealed_invoke_payload_missing' | 'sealed_invoke_envelope_malformed';
+        | 'sealed_invoke_payload_missing' | 'sealed_invoke_envelope_malformed'
+        | 'text_interpretation_failed';
     };
 
 export const LEGACY_ENVELOPE_LOG_ID_MAX_BYTES = 512;
@@ -408,6 +410,7 @@ function exactMcpResultPayload(value: unknown): ExactMcpResultPayload | null {
  */
 export function projectProviderResultEvidenceView(
   result: unknown,
+  interpretation?: WorkflowTextResultInterpretationV1,
 ): ProviderResultEvidenceViewV1 {
   const sealed = exactSealedInvokeResult(result);
   if (sealed.status === 'malformed') {
@@ -428,6 +431,19 @@ export function projectProviderResultEvidenceView(
   }
   const candidate = sealed.status === 'valid' ? sealed.payload : result;
   const mcp = exactMcpResultPayload(result);
+  if (interpretation !== undefined) {
+    const envelope = asRecord(candidate);
+    const text = typeof candidate === 'string' ? candidate
+      : mcp && !mcp.isError && !mcp.malformed && envelope
+        && !Object.hasOwn(envelope, 'structuredContent')
+        && Array.isArray(envelope.content) && envelope.content.length === 1
+        && asRecord(envelope.content[0])?.type === 'text'
+          ? asRecord(envelope.content[0])?.text : undefined;
+    const interpreted = interpretWorkflowTextResult(text, interpretation);
+    return interpreted.ok
+      ? { version: 1, kind: 'provider_payload', owner: 'reviewed_text_lines', payload: interpreted.payload }
+      : { version: 1, kind: 'no_evidence', owner: 'reviewed_text_lines', reason: 'text_interpretation_failed' };
+  }
   if (mcp) {
     if (mcp.isError) {
       return { version: 1, kind: 'no_evidence', owner: 'mcp', reason: 'mcp_result_error' };

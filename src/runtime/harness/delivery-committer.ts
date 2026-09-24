@@ -1,4 +1,5 @@
 import { redactSensitiveText } from '../security.js';
+import { workflowParentActivation } from './workflow-parent-activation.js';
 /**
  * The single durable foreground-delivery boundary.
  *
@@ -9,7 +10,7 @@ import { redactSensitiveText } from '../security.js';
  * into the user-facing terminal payload.
  */
 import { acceptedTaskMode } from './accepted-task-mode.js';
-import { appendEvent, finishRunAttempt } from './eventlog.js';
+import { appendEvent, finishRunAttempt, getKillRequest, getRunAttemptBySourceUserSeq } from './eventlog.js';
 import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
@@ -967,6 +968,16 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
         ? outcome
         : { ...outcome, presentation: { kind: 'blocked', text } };
     }
+    case 'cancelled': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      return text === outcome.presentation.text
+        ? outcome
+        : { ...outcome, presentation: { kind: 'stopped', text } };
+    }
     case 'failed': {
       const text = renderFailureWithRetainedWork({
         sessionId: outcome.identity.sessionId,
@@ -1000,6 +1011,18 @@ export function commitTurnOutcome(
   outcome: TurnOutcome,
   options: DeliveryCommitOptions = {},
 ): DeliveryCommitResult {
+  const parent = workflowParentActivation(outcome.identity.sessionId, outcome.identity.sourceUserSeq);
+  if (parent) {
+    if ((outcome.identity.attemptId && outcome.identity.attemptId !== parent.attemptId)
+      || (outcome.identity.runId && outcome.identity.runId !== parent.runId)) {
+      throw new InvalidTurnOutcomeError('Workflow parent terminal names a different executor.');
+    }
+    // Ordinary chat reductions may omit executor fields. Retain the durable
+    // original parent identity so its workflow group can acknowledge this
+    // terminal without mistaking it for the earlier child-only report.
+    outcome = { ...outcome, identity: { ...outcome.identity,
+      attemptId: parent.attemptId, runId: parent.runId } };
+  }
   const requested = presentationEventForOutcome(outcome);
   assertExactAcceptedSource(requested.identity);
   let effectiveOutcome = outcome;
@@ -1091,23 +1114,41 @@ export function commitTurnOutcome(
   // unresolved external crossing keeps the reconciliation copy unchanged.
   if (
     effectiveOutcome.status === 'blocked'
-    && effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT
+    // The runner may already have appended retained-work context. Its typed
+    // reason survives that rendering; presentation bytes are not identity.
+    && (effectiveOptions.metadata?.blockedReason === 'tool_effect_uncertain'
+      || effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
     && acceptedSourceHasZeroExternalEffectSurface(effectiveOutcome.identity)
   ) {
-    effectiveOutcome = {
-      ...effectiveOutcome,
-      // Nothing left the machine, so retrying is provably safe: the honest
-      // terminal is a resumable checkpoint, not a locked reconciliation door.
-      resumable: true,
-      presentation: { kind: 'blocked', text: HOST_LOCAL_FAILURE_BLOCKED_TEXT },
-    };
-    effectiveOptions = {
-      ...effectiveOptions,
-      metadata: {
-        ...(effectiveOptions.metadata ?? {}),
-        blockedReason: 'host_control_failure_no_external_effect',
-      },
-    };
+    const attempt = getRunAttemptBySourceUserSeq(
+      effectiveOutcome.identity.sessionId, effectiveOutcome.identity.sourceUserSeq,
+    );
+    const stopped = attempt !== null && getKillRequest(effectiveOutcome.identity.sessionId, {
+      attemptId: attempt.attemptId, runId: attempt.runId,
+    }) !== null;
+    if (stopped) {
+      effectiveOutcome = {
+        ...effectiveOutcome,
+        status: 'cancelled',
+        resumable: false,
+        presentation: { kind: 'stopped', text: 'Stopped as requested. Completed results are kept.' },
+      };
+      const { blockedReason: _reason, blockedDetail: _detail, ...metadata } = effectiveOptions.metadata ?? {};
+      effectiveOptions = { ...effectiveOptions, legacyReason: 'cancelled', metadata };
+    } else {
+      effectiveOutcome = {
+        ...effectiveOutcome,
+        resumable: true,
+        presentation: { kind: 'blocked', text: HOST_LOCAL_FAILURE_BLOCKED_TEXT },
+      };
+      effectiveOptions = {
+        ...effectiveOptions,
+        metadata: {
+          ...(effectiveOptions.metadata ?? {}),
+          blockedReason: 'host_control_failure_no_external_effect',
+        },
+      };
+    }
   }
   // A PLAN TURN'S DELIVERABLE IS A PLAN.
   //

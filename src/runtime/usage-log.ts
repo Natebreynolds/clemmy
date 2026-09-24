@@ -36,6 +36,9 @@ export type UsageKind =
   | 'embedding' | 'controller' | 'warmup' | 'other';
 
 export interface UsageEvent {
+  /** Failed requests with no reported usage have unknown cost, not certified zero. */
+  ok?: boolean;
+  failReason?: string;
   /** ISO-8601 timestamp when the model response finished. */
   at: string;
   /** Where the call came from: session ID, cron name, "embedding-backfill", etc. */
@@ -47,6 +50,11 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
+  /** Explicit request role (brain/worker/reviewer/router) and how it was
+   *  set (`explicit` call, attribution `scope`, `channel` convention, or
+   *  `unset`). Rollups group by this, never by model name or prompt size. */
+  role?: UsageRequestRole;
+  roleReason?: 'explicit' | 'scope' | 'channel' | 'unset';
   /**
    * DECLARED cache-accounting provenance, stamped by the model adapter that
    * owns the wire format — never guessed from magnitudes. 'inclusive':
@@ -297,6 +305,7 @@ export interface CanonicalUsage {
  * Pure.
  */
 export function canonicalCacheAccounting(event: {
+  ok?: boolean;
   cacheDialect?: CacheDialectProvenance;
   inputTokens?: number;
   cachedInputTokens?: number;
@@ -327,6 +336,13 @@ export function canonicalCacheAccounting(event: {
   });
   for (const value of [input, cached, output, reasoning, total]) {
     if (!Number.isFinite(value) || value < 0) return invalid();
+  }
+  // Timeout/error adapters retain a zero placeholder when the provider never
+  // reports usage. Keep the call visible, but never certify that placeholder
+  // as free work or include it in certified cache-efficiency denominators.
+  if (event.ok === false && input === 0 && cached === 0 && output === 0 && reasoning === 0 && total === 0) {
+    return { dialect, certified: false, invalid: false, promptTokens: 0,
+      cachedReadTokens: 0, uncachedInputTokens: 0, uncachedWorkTokens: 0, hitRate: 0 };
   }
   if (dialect === 'inclusive') {
     if (cached > input) return invalid(); // contradicts the declared dialect
@@ -401,10 +417,25 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
     : source;
 }
 
+/** Explicit request role for cost accounting. Set by the caller that knows
+ *  what the request IS; never inferred from model names or token sizes.
+ *  brain = the turn's foreground model; worker = a delegated child; reviewer =
+ *  judges, watchers, completion/goal reviews; router = Jev routing calls. */
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router';
+
 export interface ModelUsageAttributionContext {
+  /** Request-local estimates override ambient parent prompt measurements. */
+  promptComponents?: Record<string, number>;
   sessionId: string;
   sourceUserSeq: number;
   attemptId?: string;
+  /** Explicit role every model call inside this scope carries unless a
+   *  narrower scope or the recording call overrides it. */
+  role?: UsageRequestRole;
+  /** Call-site lane for rows the SDK emits without one (a judge lane such as
+   * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
+   * `unknown / other` with no lane, so nothing about them could be ranked. */
+  channel?: string;
 }
 
 /**
@@ -435,9 +466,21 @@ export function withModelUsageAttribution<T>(
   return modelUsageAttributionStorage.run(context, work);
 }
 
+/** Role from an explicit channel convention only (`judge:*`, `watcher*`,
+ *  `jev*`); anything else is left unset rather than guessed. */
+export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
+  const value = (channel ?? '').trim().toLowerCase();
+  if (!value) return undefined;
+  if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
+  if (value.startsWith('jev')) return 'router';
+  return undefined;
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
+  /** Explicit request role; wins over the attribution scope's role. */
+  role?: UsageRequestRole;
   model: string;
   /** Declared by the adapter that owns the wire format. Absent = 'unknown'
    *  (legacy): visible, uncertifiable, conservatively debited. */
@@ -506,7 +549,10 @@ export function recordModelUsage(args: {
   try {
     sessionRowKind = getSession(source)?.kind;
   } catch { /* classification falls back to channel/prefix evidence */ }
-  const resolution = resolveUsageKind(source, { channel: args.channel, sessionRowKind });
+  const channel = args.channel ?? attribution?.channel;
+  const resolution = resolveUsageKind(source, { channel, sessionRowKind });
+  const role = args.role ?? attribution?.role ?? usageRoleFromChannel(channel);
+  const roleReason: NonNullable<UsageEvent['roleReason']> = args.role ? 'explicit' : attribution?.role ? 'scope' : role ? 'channel' : 'unset';
   const canonical = canonicalCacheAccounting(args);
   const hasExactAcceptedSource = source !== 'unknown'
     && Number.isSafeInteger(sourceUserSeq)
@@ -548,11 +594,13 @@ export function recordModelUsage(args: {
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
-    channel: args.channel,
+    channel,
+    ...(role ? { role } : {}),
+    roleReason,
     ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
-    promptComponents: reconcilePromptComponents(args.promptComponents, args.inputTokens),
+    promptComponents: reconcilePromptComponents(attribution?.promptComponents ?? args.promptComponents, args.inputTokens),
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
     firstByteMs: args.firstByteMs,
@@ -913,12 +961,27 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
     frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
     brainFrames: 0, sideFrames: 0, sideInputTokens: 0, rebilledPrefixTokens: 0, appendedTokens: 0, prefixReuse: 0,
   };
-  const modelCounts = new Map<string, number>();
-  for (const ev of events) modelCounts.set(ev.model, (modelCounts.get(ev.model) ?? 0) + 1);
-  let brainModel = '';
-  for (const [model, count] of modelCounts) {
-    if (count > (modelCounts.get(brainModel) ?? 0)) brainModel = model;
+  // The brain is the model that carried the turn's prompt bytes, not the one
+  // called most often: a turn's Jev routing calls (a few hundred tokens each)
+  // can outnumber the brain frames, and picking by count then reported the
+  // whole turn as side traffic with prefixReuse 0 (live 2026-09-23, Together
+  // GLM brain with eight Jev calls beside eight brain frames).
+  const modelPromptTokens = new Map<string, number>();
+  for (const ev of events) {
+    const canonical = canonicalCacheAccounting(ev);
+    modelPromptTokens.set(
+      ev.model,
+      (modelPromptTokens.get(ev.model) ?? 0) + canonical.cachedReadTokens + canonical.uncachedInputTokens,
+    );
   }
+  let brainModel = '';
+  for (const [model, tokens] of modelPromptTokens) {
+    if (tokens > (modelPromptTokens.get(brainModel) ?? -1)) brainModel = model;
+  }
+  // Explicit roles win over any inference: when the rows carry them, a brain
+  // frame is a row whose role says brain, whatever model served it.
+  const roleCarrying = events.some((ev) => ev.role === 'brain');
+  const isBrainFrame = (ev: UsageEvent): boolean => (roleCarrying ? ev.role === 'brain' : ev.model === brainModel);
   let previousBrainPrompt: number | null = null;
   let reusable = 0;
   let reused = 0;
@@ -930,7 +993,7 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
     out.uncachedInputTokens += canonical.uncachedInputTokens;
     out.outputTokens += ev.outputTokens ?? 0;
     out.maxInputTokens = Math.max(out.maxInputTokens, ev.inputTokens ?? 0);
-    if (ev.model !== brainModel) {
+    if (!isBrainFrame(ev)) {
       out.sideFrames += 1;
       out.sideInputTokens += canonical.cachedReadTokens + canonical.uncachedInputTokens;
       continue;

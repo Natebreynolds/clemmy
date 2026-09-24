@@ -1119,7 +1119,7 @@ test('GATE: a legacy input-digest disclosure rebuilds full staged identity after
   if (!primed.ok) throw new Error(primed.reason);
   assert.deepEqual(
     primed.planning.capabilities.map((entry) => entry.id).sort(),
-    [staged.sourceRef, staged.destinationRef, 'cap:resolved:host_transform'].sort(),
+    [staged.sourceRef, staged.destinationRef].sort(),
   );
 
   const rawPlan = buildPlanTaskTool({ planning: primed.planning }) as unknown as Invokable;
@@ -1200,9 +1200,9 @@ test('GATE: an initially live selected Composio ref is revalidated after the fir
     assert.ok(catalogs.peekHostCapabilityCatalogFactory()?.get(staged.sourceRef));
     assert.ok(catalogs.peekHostCapabilityCatalogFactory()?.get(staged.destinationRef));
 
-    // A later accepted source receives these as its initial live planning
-    // card—there is no staged disclosure on this source to trigger the old
-    // selectedStaged-only refresh path.
+    // Publish these exact live definitions for the later accepted source before
+    // its initial model card. Process-wide catalog residency alone does not
+    // disclose capabilities to a different accepted request.
     const session = eventlog.createSession({
       id: `large-catalog-initial-live-${offset}-${mutation}`,
       kind: 'chat',
@@ -1228,6 +1228,16 @@ test('GATE: an initially live selected Composio ref is revalidated after the fir
     const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
     assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
     if (!primed.ok) throw new Error(primed.reason);
+    const refs = await semantic.disclosePrimaryModelPlanningCapabilities({
+      authority: primed.planning.authority,
+      candidates: [
+        { name: catalog.sourceSlug, carrier: 'work_call', sourceKind: 'authorized_composio', schema: SOURCE_SCHEMA },
+        { name: catalog.destinationSlug, carrier: 'work_call', sourceKind: 'authorized_composio', schema: DESTINATION_SCHEMA },
+      ],
+    });
+    assert.equal(refs[catalog.sourceSlug], staged.sourceRef);
+    assert.equal(refs[catalog.destinationSlug], staged.destinationRef);
+    primed.planning = semantic.snapshotPrimaryModelPlanningContext(primed.planning.authority)!;
     assert.ok(primed.planning.capabilities.some((entry) => entry.id === staged.sourceRef));
     assert.ok(primed.planning.capabilities.some((entry) => entry.id === staged.destinationRef));
 

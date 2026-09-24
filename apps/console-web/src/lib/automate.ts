@@ -209,10 +209,17 @@ export interface WorkflowStep {
   dependsOn?: string[];
   [k: string]: unknown;
 }
+export interface WorkflowCreationTestState {
+  runId: string;
+  status: 'running' | 'passed' | 'needs_review';
+  body?: string;
+  at?: string;
+}
 export interface WorkflowDetail {
   name: string;
   description?: string;
   enabled?: boolean;
+  creationTest?: WorkflowCreationTestState | null;
   trigger?: { schedule?: string; timezone?: string; manual?: boolean };
   /** Workflow-level model pins: brain runs the steps, worker runs fan-outs. */
   models?: { brain?: string; worker?: string } | null;
@@ -403,8 +410,16 @@ export const resumeWorkflowCapability = (name: string, runId: string) =>
     `/api/console/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/resume-capability`,
     {},
   );
+export interface SetWorkflowEnabledResult {
+  updated?: boolean;
+  enabled?: boolean;
+  /** A creation test was queued; the workflow stays off until it passes. */
+  verificationQueued?: boolean;
+  runId?: string;
+  message?: string;
+}
 export const setWorkflowEnabled = (name: string, enabled: boolean) =>
-  apiPost(`/api/console/workflows/${encodeURIComponent(name)}/set-enabled`, { enabled });
+  apiPost<SetWorkflowEnabledResult>(`/api/console/workflows/${encodeURIComponent(name)}/set-enabled`, { enabled });
 
 export const listCrons = () => apiGet<{ crons: CronRow[] }>('/api/console/crons');
 export const triggerCron = (jobName: string) =>

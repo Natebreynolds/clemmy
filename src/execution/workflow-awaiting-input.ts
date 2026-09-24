@@ -10,7 +10,6 @@ import {
 import { requestWorkflowRunDrainKick } from './workflow-origin-group.js';
 import { readWorkflowRunCancellation } from './workflow-run-cancellation.js';
 import {
-  readWorkflowRunRecord,
   readWorkflowRunRecordSnapshot,
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
@@ -156,7 +155,11 @@ export function findSoleAwaitingInputWorkflowRunForOrigin(
   for (const filePath of workflowRunFiles()) {
     let record: AwaitingInputWorkflowRecord | null = null;
     try {
-      record = readWorkflowRunRecord<AwaitingInputWorkflowRecord>(filePath);
+      // Inventory is not answer authority. Writers publish whole records by
+      // atomic rename; do not acquire/fsync a write lock for every historical
+      // run on each chat turn. queueWorkflowRunInputResolution locks and checks
+      // the exact run/question/step/origin again before accepting any answer.
+      record = readWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);
     } catch {
       continue;
     }

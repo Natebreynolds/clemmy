@@ -16,7 +16,8 @@ import {
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
 import type { HostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
-import type { IndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
+import { ensureFreshIndependentCapabilityObservation, type IndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { canonicalArgumentDigestOf } from '../runtime/harness/resolved-call-authority.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import {
@@ -913,9 +914,30 @@ type ExecuteWorkflowNodeReadInput = Parameters<typeof prepareWorkflowNodeRead>[0
 export async function executeWorkflowNodeRead(
   input: ExecuteWorkflowNodeReadInput,
 ): Promise<ExecuteWorkflowNodeReadResult> {
+  await ensureFreshObservationForPlan(input.plan);
   const prepared = prepareWorkflowNodeRead(input);
   if (!prepared.ok) return prepared;
   return executePreparedWorkflowNodeCall(input, prepared);
+}
+
+/** Refresh the crossing-time observation for an exact plan's binding when
+ * this process holds none or a stale one (a scheduled or background run's
+ * first crossing). Admission still decides; this only supplies. */
+async function ensureFreshObservationForPlan(plan: unknown): Promise<void> {
+  try {
+    const binding = (plan as { binding?: { manifestId?: unknown; capabilityId?: unknown } } | null)?.binding;
+    const manifestId = typeof binding?.manifestId === 'string' ? binding.manifestId : '';
+    if (!manifestId) return;
+    const manifest = peekCapabilityManifestStore()?.get(manifestId)?.manifest;
+    if (!manifest) return;
+    await ensureFreshIndependentCapabilityObservation({
+      operationId: manifest.operationId,
+      accountId: manifest.accountId,
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+    });
+  } catch { /* supply only */ }
 }
 
 /** Shared executor seam after provider-neutral preparation. The only installed
@@ -1102,7 +1124,7 @@ async function executePreparedWorkflowNodeCall(
     };
   }
 
-  const evidenceView = projectProviderResultEvidenceView(kernel.result);
+  const evidenceView = projectProviderResultEvidenceView(kernel.result, prepared.resolved.plan.resultProjection?.textInterpretation);
   const evidence = verifyWorkflowNodeInvocationEvidence(
     evidenceView.kind === 'provider_payload' ? evidenceView.payload : undefined,
     prepared.resolved.plan,

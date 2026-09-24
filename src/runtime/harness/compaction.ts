@@ -116,12 +116,38 @@ export function compactionBudgetForModel(modelId: string | undefined | null): nu
  * wire that has proven a real hit rate nothing moves.
  */
 export function layer1CompactionBudgetForModel(modelId: string | undefined | null): number {
+  // Absolute on EVERY wire (2026-09-24). Layer 1 is lossless — old results
+  // stay recallable by call id — and a cached prefix is not free: it still
+  // prefills (66–98 s per frame at 120k on Together GLM), costs a tenth of the
+  // price on every frame, and is re-billed in full on the first frame of every
+  // new turn once the provider's TTL lapses (three 111–118k first frames in one
+  // afternoon on the pilot session). Under the window-sized budget a 1M-window
+  // caching wire would never clip before 300k, so a 118k-token session kept
+  // re-sending 60-turn-old tool results forever. Between turns the one-time
+  // re-bill of clipping is paid once; every later frame is smaller.
   const window = compactionBudgetForModel(modelId);
-  try {
-    return effectivePromptCacheSupport(modelId) ? window : Math.min(window, DEFAULT_INPUT_BUDGET_TOKENS);
-  } catch {
-    return Math.min(window, DEFAULT_INPUT_BUDGET_TOKENS);
-  }
+  return Math.min(window, DEFAULT_INPUT_BUDGET_TOKENS);
+}
+
+/**
+ * Prior-turn reasoning is frame-chain state, not conversation history. A
+ * provider that replays reasoning needs it only inside the assistant → tool →
+ * assistant chain of the CURRENT turn, which the runner's own frames carry.
+ * Persisted across turns it is dead weight: on 2026-09-24 the pilot session's
+ * 886 KB history was 451 KB of the model's own earlier reasoning (36 items,
+ * the largest 53 KB), re-sent on every frame of every later turn. Layer 2
+ * already discarded reasoning when it summarized; it simply never fired on a
+ * 1M-window wire. Dropping it at the between-turn boundary is lossless for the
+ * conversation and needs no model call.
+ */
+export function dropPriorTurnReasoning(items: AgentInputItem[]): { nextItems: AgentInputItem[]; dropped: number } {
+  let dropped = 0;
+  const nextItems = items.filter((item) => {
+    const any = item as Record<string, unknown> & { type?: unknown };
+    if (any.type === 'reasoning') { dropped += 1; return false; }
+    return true;
+  });
+  return { nextItems: dropped > 0 ? nextItems : items, dropped };
 }
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
 const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
@@ -374,6 +400,9 @@ export interface CompactionResult {
   /** The budget Layer 1 was measured against (== budgetTokens unless the
    *  caller split them; see layer1CompactionBudgetForModel). */
   layer1BudgetTokens: number;
+  /** Prior-turn reasoning items removed at the between-turn boundary
+   *  (dropPriorTurnReasoning). Absent when none were present. */
+  reasoningDropped?: number;
 }
 
 function readDisableFlag(): CompactionOptions['disable'] {
@@ -1570,6 +1599,17 @@ export async function compactSessionIfNeeded(
 
   let nextItems = items;
 
+  // Layer 0 — prior-turn reasoning never rides into a new turn (lossless, no
+  // model call, no threshold: it is dead weight at any size).
+  const reasoning = dropPriorTurnReasoning(nextItems);
+  if (reasoning.dropped > 0) {
+    nextItems = reasoning.nextItems;
+    result.reasoningDropped = reasoning.dropped;
+    result.modified = true;
+    result.afterTokens = estimateInputTokens(nextItems);
+  }
+  const tokensForLayer1 = reasoning.dropped > 0 ? result.afterTokens : beforeTokens;
+
   // Layer 1 — fire on genuine token pressure, OR (chatty-turn backstop) on item
   // count BUT ONLY once we're partway to budget. The item-count clause used to
   // be unconditional, which clipped freshly-fetched tool outputs during a
@@ -1580,8 +1620,8 @@ export async function compactSessionIfNeeded(
   // context pressure or an explicit stage checkpoint can trigger compaction.
   const layer1Trigger =
     opts.forceLayer2
-    || beforeTokens > layer1Budget * l1Frac
-    || (items.length > itemThreshold && beforeTokens > layer1Budget * l1ItemMinFrac);
+    || tokensForLayer1 > layer1Budget * l1Frac
+    || (items.length > itemThreshold && tokensForLayer1 > layer1Budget * l1ItemMinFrac);
   if (layer1Trigger) {
     const clipped = clipOldToolResults(nextItems, retainTurns, opts, session.id);
     const collapsed = collapseOldCompletedToolPairs(nextItems, retainToolPairs, session.id);

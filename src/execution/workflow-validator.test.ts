@@ -939,61 +939,32 @@ test('binding warning: mixed Composio step may keep native MCP when family is al
   assert.ok(!result.warnings.some((w) => /drift onto a stale path/.test(w)), result.warnings.join('\n'));
 });
 
-test('sideEffect coherence: warns when declared class is weaker than the prompt', () => {
-  const readDeclaredSend = validateWorkflowDefinition({
-    name: 'side-effect-read-send',
-    description: 'Bad side effect declaration.',
-    enabled: true,
-    steps: [{ id: 'send', prompt: 'Send the email summary to Alex.', sideEffect: 'read' }],
-  });
-  assert.ok(readDeclaredSend.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)), readDeclaredSend.warnings.join('\n'));
-
-  const writeDeclaredSendSnake = validateWorkflowDefinition({
-    name: 'side-effect-write-send',
-    description: 'Snake case side effect declaration.',
-    enabled: true,
-    steps: [{ id: 'post', prompt: 'Publish the Instagram post for the firm.', side_effect: 'write' }],
-  });
-  assert.ok(writeDeclaredSendSnake.warnings.some((w) => /declares sideEffect: write/.test(w) && /SEND/.test(w)), writeDeclaredSendSnake.warnings.join('\n'));
-});
-
-test('sideEffect coherence: configured OWNER_NAME aliases identify direct sends', () => {
-  const originalOwnerName = process.env.OWNER_NAME;
-  process.env.OWNER_NAME = 'Jordan Kim';
-  try {
-    const result = validateWorkflowDefinition({
-      name: 'configured-owner-send',
-      description: 'Deliver a report to the configured user.',
-      enabled: true,
-      steps: [{ id: 'send', prompt: 'Email Jordan the completed report.', sideEffect: 'read' }],
-    });
-    assert.ok(
-      result.warnings.some((warning) => /declares sideEffect: read/.test(warning) && /SEND/.test(warning)),
-      result.warnings.join('\n'),
-    );
-  } finally {
-    if (originalOwnerName === undefined) delete process.env.OWNER_NAME;
-    else process.env.OWNER_NAME = originalOwnerName;
+test('sideEffect coherence: prohibited or quoted actions cannot override authored effects', () => {
+  for (const prompt of [
+    'Read preservation.csv. Change only Alpha to 2. Preserve the header and Beta. Do not use external tools or send messages.',
+    'Translate the sentence "Send the email summary to Alex" into French.',
+    'Summarize instructions that tell a user to publish a social post.',
+  ]) {
+    const result = validateWorkflowDefinition({ name: 'typed-effect', enabled: true,
+      steps: [{ id: 'work', prompt, sideEffect: 'write' }] });
+    assert.equal(result.warnings.some(w => /declares sideEffect/.test(w)), false, result.warnings.join('\n'));
   }
 });
 
-test('sideEffect coherence: clear imperative sends to external named recipients are SEND', () => {
-  for (const prompt of [
-    'Email Riley the completed report.',
-    'Email Riley Morgan the completed report.',
-    'Send Riley the completed report.',
-    'Message the completed report to Riley.',
-  ]) {
-    const result = validateWorkflowDefinition({
-      name: 'external-named-send',
-      description: 'Deliver a report to an external recipient.',
-      enabled: true,
-      steps: [{ id: 'send', prompt, sideEffect: 'read' }],
-    });
-    assert.ok(
-      result.warnings.some((warning) => /declares sideEffect: read/.test(warning) && /SEND/.test(warning)),
-      `${prompt}: ${result.warnings.join('\n')}`,
-    );
+test('sideEffect coherence: structured send evidence survives quiet prose and snake-case declarations', () => {
+  for (const declared of [{ sideEffect: 'read' }, { side_effect: 'write' }]) {
+    const result = validateWorkflowDefinition({ name: 'structured-effect', enabled: false,
+      steps: [{ id: 'deliver', prompt: 'Perform the operation.', ...declared,
+        call: { tool: 'OUTLOOK_SEND_EMAIL', args: {} } }] });
+    assert.ok(result.warnings.some(w => /structured call is classified as SEND/.test(w)), result.warnings.join('\n'));
+  }
+});
+
+test('sideEffect coherence: unspecified operations do not acquire effects from positive prose', () => {
+  for (const prompt of ['Send the email summary to Alex.', 'Publish the Instagram post.', 'Email Jordan the completed report.']) {
+    const result = validateWorkflowDefinition({ name: 'prose-effect', enabled: true,
+      steps: [{ id: 'work', prompt, sideEffect: 'read' }] });
+    assert.equal(result.warnings.some(w => /declares sideEffect/.test(w)), false);
   }
 });
 

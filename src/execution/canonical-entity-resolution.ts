@@ -441,6 +441,8 @@ export function createEntityObservation(input: EntityObservationInput): EntityOb
 }
 
 export interface EntityResolutionPolicy {
+  /** Reviewed field overrides; never applied to compound-only identity matches. */
+  readonly preferNewerAfterExactIdentity?: readonly string[];
   readonly policyId: string;
   readonly mergeThreshold: number;
   readonly distinctThreshold: number;
@@ -456,6 +458,8 @@ export interface EntityResolutionPolicy {
 }
 
 interface NormalizedPolicy {
+  /** Reviewed field overrides; never applied to compound-only identity matches. */
+  readonly preferNewerAfterExactIdentity?: readonly string[];
   readonly policyId: string;
   readonly policyDigest: string;
   readonly mergeThreshold: number;
@@ -469,6 +473,8 @@ interface NormalizedPolicy {
 }
 
 export interface EntityResolutionPolicySnapshot {
+  /** Reviewed field overrides; never applied to compound-only identity matches. */
+  readonly preferNewerAfterExactIdentity?: readonly string[];
   readonly policyId: string;
   readonly policyDigest: string;
   readonly mergeThreshold: number;
@@ -544,7 +550,15 @@ function normalizePolicy(policy: EntityResolutionPolicy): NormalizedPolicy {
     (policy.exclusiveIdentifierNamespaces ?? []).map((name) => exactNonBlank(name, 'exclusive identifier namespace')),
     (name) => name,
   );
+  const preferNewer = policy.preferNewerAfterExactIdentity;
+  if (preferNewer !== undefined && !Array.isArray(preferNewer)) {
+    contractError('invalid_resolution_policy', 'preferNewerAfterExactIdentity must be a field-name array.');
+  }
   const normalizedWithoutDigest = {
+    ...(preferNewer === undefined ? {} : { preferNewerAfterExactIdentity: sortedUnique(
+      preferNewer.map(name => safeMapKey(exactNonBlank(name, 'prefer-newer field'), 'prefer-newer field')),
+      name => name,
+    ) }),
     policyId,
     mergeThreshold,
     distinctThreshold,
@@ -711,10 +725,12 @@ function selectedEvidence(evidence: readonly CanonicalFieldEvidence[]): Canonica
   ))[0];
 }
 
-function canonicalField(name: string, evidence: readonly CanonicalFieldEvidence[]): CanonicalEntityField {
+function canonicalField(name: string, evidence: readonly CanonicalFieldEvidence[], preferNewer = false): CanonicalEntityField {
   const retained = sortedUnique(evidence, (entry) => entry.evidenceId);
-  const selected = selectedEvidence(retained);
-  const values = new Set(retained.map((entry) => stableJson(entry.value)));
+  const newestAt = preferNewer ? retained.reduce((latest, entry) => entry.observedAt > latest ? entry.observedAt : latest, '') : null;
+  const eligible = newestAt === null ? retained : retained.filter(entry => entry.observedAt === newestAt);
+  const selected = selectedEvidence(eligible);
+  const values = new Set(eligible.map((entry) => stableJson(entry.value)));
   return deepFreeze({
     name,
     selectedEvidenceId: selected.evidenceId,
@@ -974,7 +990,10 @@ function mergeRecord(
   for (const name of Object.keys(observation.fields).sort(compareCanonicalEntityText)) {
     const prior = fields.get(name);
     const evidence = fieldEvidence(observation, name);
-    const next = canonicalField(name, [...(prior?.evidence ?? []), evidence]);
+    const exactIdentity = candidates.some(candidate => candidate.canonicalId === record.canonicalId
+      && candidate.matchedExactIdentifiers.length > 0 && candidate.conflictingExactNamespaces.length === 0);
+    const preferNewer = exactIdentity && policy.preferNewerAfterExactIdentity?.includes(name) === true;
+    const next = canonicalField(name, [...(prior?.evidence ?? []), evidence], preferNewer);
     fields.set(name, next);
     changes.push({
       field: name,

@@ -565,20 +565,41 @@ test('an old discovery from another sourceUserSeq cannot replay into the current
     },
   });
   const request = 'Assemble the current cobalt constellation telemetry snapshot';
+  const currentEntries = [];
   for (let index = 0; index < 8; index += 1) {
-    registerDirect(factory, nativeMcpManifest({
+    currentEntries.push(registerDirect(factory, nativeMcpManifest({
       label: `cobalt-${index}`,
       operationId: `mcp__cobalt_${index}__read_constellation_telemetry`,
       purpose: 'assemble current cobalt constellation telemetry snapshot',
-    }));
+    })));
   }
   const current = acceptCurrentSource(session.id, request, 2);
   assert.notEqual(current.sourceUserSeq, oldSource.seq);
+  // The initial card no longer injects unrelated global catalog entries.
+  // Supply current-source discoveries as a positive control: the same replay
+  // boundary must admit these while excluding the old source's exact row.
+  eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'system',
+    type: 'capability_discovered', data: { sourceUserSeq: current.sourceUserSeq,
+      capabilities: currentEntries.map(entry => {
+        const manifest = entry.manifest!;
+        const currentDescriptor = semantic.hostDescriptorFromRegistered(entry)!;
+        return { kind: 'mcp', identifier: manifest.operationId, effectClass: 'read',
+          capabilityRef: manifest.manifestId, manifestDigest: currentDescriptor.manifestDigest,
+          accountIdentity: manifest.accountId, providerKind: manifest.providerKind,
+          descriptor: currentDescriptor, providerDefinition: {
+            version: 1, providerInputSchemaDigest: manifest.externalDefinition!.providerInputSchemaDigest,
+            definitionFingerprint: manifest.definitionFingerprint,
+            providerOperationVersion: manifest.operationVersion,
+            providerOutputSchemaDigest: manifest.externalDefinition!.providerOutputSchemaDigest!,
+            invokePortId: manifest.invokePortId, verificationContract: null,
+          } };
+      }),
+    } });
 
   const primed = await semantic.primePrimaryModelPlanningCatalog(current);
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
   if (!primed.ok) return;
-  assert.equal(primed.planning.capabilities.length, 8, 'the current live ranking saturates the ordinary card');
+  assert.equal(primed.planning.capabilities.length, 8, 'current-source discoveries populate the card, making old-source exclusion nonvacuous');
   assert.equal(
     primed.planning.capabilities.some((entry) => entry.id === target.manifestId),
     false,
@@ -586,8 +607,8 @@ test('an old discovery from another sourceUserSeq cannot replay into the current
   );
   assert.equal(
     eventlog.listEvents(session.id, { types: ['capability_discovered'] }).length,
-    1,
-    'the old row was not copied forward',
+    2,
+    'neither the old row nor the current row was copied forward',
   );
 });
 

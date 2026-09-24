@@ -31,6 +31,7 @@ const {
 } = await import('./identity-evolution.js');
 const { rememberFact, setFactPinned } = await import('./facts.js');
 const { openMemoryDb } = await import('./db.js');
+const { getNotification } = await import('../runtime/notifications.js');
 const { IDENTITY_FILE } = await import('./vault.js');
 
 /** Seed a pinned durable fact whose created_at lands at `when`, so the
@@ -111,6 +112,7 @@ test('approve applies curated text and preserves the auto section', () => {
   const [pending] = listIdentityProposals('pending');
   const result = approveIdentityProposal(pending.id);
   assert.equal(result.applied, true);
+  assert.equal(getNotification(`identity-proposal-${pending.id}`)?.read, true, 'resolved proposal must retire its unread review notification');
   const body = readFileSync(IDENTITY_FILE, 'utf-8');
   assert.match(body, /focused on their sales pipeline/);
   assert.match(body, /AUTO-GENERATED/);
@@ -150,6 +152,7 @@ test('staleness: manual curated edit after drafting supersedes the proposal', as
   const result = approveIdentityProposal(drafted.proposalId!);
   assert.equal(result.applied, false);
   assert.equal(result.reason, 'stale');
+  assert.equal(getNotification(`identity-proposal-${drafted.proposalId}`)?.read, true, 'superseded proposal is no longer actionable');
   assert.equal(result.proposal?.status, 'superseded');
   // The user's edit survives untouched.
   assert.equal(readFileSync(IDENTITY_FILE, 'utf-8'), edited);
@@ -165,6 +168,7 @@ test('reject resolves a pending proposal without writing', async () => {
   assert.equal(drafted.reason, 'drafted');
   const before = readFileSync(IDENTITY_FILE, 'utf-8');
   assert.equal(rejectIdentityProposal(drafted.proposalId!), true);
+  assert.equal(getNotification(`identity-proposal-${drafted.proposalId}`)?.read, true, 'declined proposal must stop asking');
   assert.equal(readFileSync(IDENTITY_FILE, 'utf-8'), before);
   assert.equal(listIdentityProposals('pending').length, 0);
   // Rejecting again is a no-op.

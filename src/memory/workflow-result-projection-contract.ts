@@ -1,3 +1,4 @@
+import { validWorkflowTextResultInterpretation, type WorkflowTextResultInterpretationV1 } from './workflow-text-result-interpretation.js';
 import { createHash } from 'node:crypto';
 
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
@@ -24,14 +25,15 @@ export type WorkflowCanonicalEntityNormalizerV1 =
   | 'unicode_nfkc'
   | 'numeric';
 
-export interface WorkflowCanonicalEntityFieldProjectionV1 {
+export type WorkflowCanonicalEntityHostFieldSource = 'workflow_run_id' | 'page_settled_at' | 'page_receipt_id';
+
+export type WorkflowCanonicalEntityFieldProjectionV1 = {
   field: string;
-  recordPath: string;
   type: WorkflowCanonicalEntityFieldTypeV1;
   required: boolean;
   sensitivity: 'public' | 'internal' | 'confidential' | 'restricted';
   confidence: number;
-}
+} & ({ recordPath: string; hostSource?: never } | { hostSource: WorkflowCanonicalEntityHostFieldSource; recordPath?: never });
 
 export interface WorkflowCanonicalEntityIdentityRuleProjectionV1 {
   ruleId: string;
@@ -62,6 +64,7 @@ export type WorkflowCanonicalEntityIdentityRuleProjectionV2 =
     };
 
 export interface WorkflowCanonicalEntityResolutionPolicyV1 {
+  preferNewerAfterExactIdentity?: string[];
   policyId: string;
   mergeThreshold: number;
   distinctThreshold: number;
@@ -78,6 +81,8 @@ export interface WorkflowCanonicalEntityResolutionPolicyV1 {
 export interface WorkflowCanonicalEntityResultProjectionV1 {
   version: typeof WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION;
   recordsPath: string;
+  /** Reviewed interpretation of retained text; absent preserves structured behavior. */
+  textInterpretation?: WorkflowTextResultInterpretationV1;
   fields: WorkflowCanonicalEntityFieldProjectionV1[];
   sourceRecord: {
     idPath: string;
@@ -91,7 +96,7 @@ export interface WorkflowCanonicalEntityResultProjectionV1 {
   /** Exact policy consumed by the canonical resolution engine. */
   resolutionPolicy: WorkflowCanonicalEntityResolutionPolicyV1;
   /** The current engine retains every evidence assertion and marks conflicting
-   * values. Other proposal merge modes remain unrepresented and fail closed. */
+   * values, except reviewed per-field prefer-newer overrides after exact identity. */
   fieldResolution: {
     kind: 'retain_all_evidence';
     selection: 'highest_confidence_then_newest';
@@ -260,7 +265,7 @@ export function parseWorkflowCanonicalEntityResultProjection(
     'version', 'recordsPath', 'fields', 'sourceRecord', 'entityKind',
     'identityRules', 'resolutionPolicy', 'fieldResolution', 'provenance',
     'partition', 'bounds', 'projectionDigest',
-  ])) return { ok: false, errors: ['Result projection must be a closed versioned object.'] };
+  ], ['textInterpretation'])) return { ok: false, errors: ['Result projection must be a closed versioned object.'] };
   if (canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION
     && canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION) {
     errors.push('Result projection version must be 1 or 2.');
@@ -275,14 +280,21 @@ export function parseWorkflowCanonicalEntityResultProjection(
     for (const [index, mapping] of canonical.fields.entries()) {
       const item = record(mapping);
       if (!item || !exactKeys(item, [
-        'field', 'recordPath', 'type', 'required', 'sensitivity', 'confidence',
-      ])) {
+        'field', 'type', 'required', 'sensitivity', 'confidence',
+      ], ['recordPath', 'hostSource'])) {
         errors.push(`fields[${index}] must be closed.`);
         continue;
       }
       if (!field(mapping.field) || names.has(mapping.field)) errors.push(`fields[${index}].field is invalid or duplicated.`);
       else names.add(mapping.field);
-      if (!path(mapping.recordPath)) errors.push(`fields[${index}].recordPath is invalid.`);
+      const hasRecord = Object.hasOwn(item, 'recordPath');
+      const hasHost = Object.hasOwn(item, 'hostSource');
+      if (hasRecord === hasHost) errors.push(`fields[${index}] requires exactly one recordPath or hostSource.`);
+      if (hasRecord && !path(mapping.recordPath)) errors.push(`fields[${index}].recordPath is invalid.`);
+      if (hasHost && (!['workflow_run_id', 'page_settled_at', 'page_receipt_id'].includes(String(mapping.hostSource))
+        || mapping.type !== (mapping.hostSource === 'page_settled_at' ? 'timestamp' : 'string'))) {
+        errors.push(`fields[${index}].hostSource or its type is invalid.`);
+      }
       if (!FIELD_TYPES.has(mapping.type)) errors.push(`fields[${index}].type is invalid.`);
       if (typeof mapping.required !== 'boolean') errors.push(`fields[${index}].required must be boolean.`);
       if (!SENSITIVITIES.has(mapping.sensitivity)) errors.push(`fields[${index}].sensitivity is invalid.`);
@@ -369,7 +381,7 @@ export function parseWorkflowCanonicalEntityResultProjection(
   const policy = record(canonical.resolutionPolicy);
   if (!policy || !exactKeys(policy, [
     'policyId', 'mergeThreshold', 'distinctThreshold', 'ambiguityMargin', 'weights',
-  ], ['exclusiveIdentifierNamespaces']) || !id(canonical.resolutionPolicy?.policyId)) {
+  ], ['exclusiveIdentifierNamespaces', 'preferNewerAfterExactIdentity']) || !id(canonical.resolutionPolicy?.policyId)) {
     errors.push('resolutionPolicy must be a closed exact policy.');
   } else {
     for (const key of ['mergeThreshold', 'distinctThreshold', 'ambiguityMargin'] as const) {
@@ -379,6 +391,12 @@ export function parseWorkflowCanonicalEntityResultProjection(
       && finiteNonNegative(canonical.resolutionPolicy.distinctThreshold)
       && canonical.resolutionPolicy.distinctThreshold >= canonical.resolutionPolicy.mergeThreshold) {
       errors.push('resolutionPolicy.distinctThreshold must be below mergeThreshold.');
+    }
+    const preferred = canonical.resolutionPolicy.preferNewerAfterExactIdentity;
+    if (preferred !== undefined && (!Array.isArray(preferred) || preferred.length > 512
+      || new Set(preferred).size !== preferred.length
+      || preferred.some(name => !field(name) || !names.has(name)))) {
+      errors.push('resolutionPolicy.preferNewerAfterExactIdentity must name unique projected fields.');
     }
     const weights = record(canonical.resolutionPolicy.weights);
     if (!weights || !exactKeys(weights, [
@@ -463,6 +481,34 @@ export function parseWorkflowCanonicalEntityResultProjection(
     if (positiveBound(bounds.maxPageBytes, MAX_PAGE_BYTES)
       && positiveBound(bounds.maxTotalBytes, MAX_TOTAL_BYTES)
       && bounds.maxPageBytes > bounds.maxTotalBytes) errors.push('maxPageBytes exceeds maxTotalBytes.');
+  }
+
+  if (canonical.textInterpretation !== undefined) {
+    const text = canonical.textInterpretation;
+    if (!validWorkflowTextResultInterpretation(text)) errors.push('textInterpretation must be a closed explicit bounded interpretation.');
+    else {
+      // Report independent mismatches together. A generic combined error makes
+      // authoring callers guess which invariant failed over repeated turns.
+      const field = JSON.stringify(text.field);
+      if (canonical.recordsPath !== 'records') errors.push('textInterpretation: recordsPath must equal "records" (the interpreted record collection, not the raw carrier envelope).');
+      if (canonical.bounds?.maxPages !== 1) errors.push('textInterpretation: bounds.maxPages must equal 1.');
+      if (text.maxSourceBytes > canonical.bounds?.maxPageBytes) errors.push('textInterpretation.maxSourceBytes must not exceed bounds.maxPageBytes.');
+      if (text.selection.maxRecords !== canonical.bounds?.maxRecords) errors.push('bounds.maxRecords must equal textInterpretation.selection.maxRecords.');
+      if (text.selection.maxRecords !== canonical.bounds?.maxRecordsPerPage) errors.push('bounds.maxRecordsPerPage must equal textInterpretation.selection.maxRecords.');
+      if (canonical.sourceRecord?.idPath !== text.field) errors.push(`sourceRecord.idPath must equal textInterpretation.field ${field}.`);
+      if (canonical.sourceRecord?.revisionPath !== undefined) errors.push('textInterpretation: sourceRecord.revisionPath must be omitted.');
+      if (canonical.sourceRecord?.observedAt?.kind !== 'page_settled_at') errors.push('textInterpretation: sourceRecord.observedAt.kind must equal "page_settled_at".');
+      if (!Array.isArray(canonical.fields)
+        || !canonical.fields.some(mapping => mapping.recordPath === text.field && mapping.required && mapping.type === 'string')) {
+        errors.push(`textInterpretation requires a required string field mapping with recordPath ${field}.`);
+      }
+      if (Array.isArray(canonical.fields)) canonical.fields.forEach((mapping, index) => {
+        if (mapping.hostSource === undefined) {
+          if (mapping.recordPath !== text.field) errors.push(`fields[${index}].recordPath must equal textInterpretation.field ${field}; other fields require explicit hostSource provenance.`);
+          if (mapping.type !== 'string') errors.push(`fields[${index}].type must equal "string" for an interpreted text field.`);
+        }
+      });
+    }
   }
 
   if (!DIGEST_RE.test(canonical.projectionDigest)) errors.push('projectionDigest must be sha256 hex.');

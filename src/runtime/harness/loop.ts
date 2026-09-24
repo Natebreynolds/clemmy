@@ -11,6 +11,7 @@ import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
+import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
 import { applySessionMountPrimers, composeSession } from './session-composition.js';
 import {
@@ -100,7 +101,7 @@ import {
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
 import { discoveryGovernor } from './discovery-governor.js';
-import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
+import { measureToolPromptSurface, recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
@@ -296,6 +297,7 @@ import {
   reopenAcceptedModelBatch,
 } from './accepted-model-batch-checkpoint.js';
 import { hostInteractiveConsentApprovalResumeKey } from './host-interactive-consent.js';
+import { listSourceApprovalCheckpoints } from './source-approval-checkpoints.js';
 import type { CapabilityRiskAttestationV1 } from './interactive-consent-policy.js';
 import {
   isHostTurnEngine,
@@ -2411,7 +2413,7 @@ function turnDurableMemoryCaptureEvidence(
       (event?.data as { queuedCandidateCount?: unknown } | undefined)?.queuedCandidateCount ?? 0,
     );
     if (!event || !Number.isFinite(queuedCandidateCount) || queuedCandidateCount <= 0) return null;
-    const redeemed = redeemDurableMemoryIntakeReceipt({
+    const redeemed = prepareDurableMemoryIntakeHostCompletion({
       sessionId,
       sourceUserSeq: Number(activeSourceUserSeq),
     });
@@ -3042,14 +3044,24 @@ export function recoverParkedApprovalSurfaces(
     SELECT id
       FROM sessions
      WHERE json_type(metadata_json, '$.__interrupt_state') = 'text'
+        OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.__source_approval_checkpoints') checkpoint
+          WHERE CASE WHEN json_valid(checkpoint.value) THEN json_type(checkpoint.value, '$.checkpoint') ELSE NULL END = 'object')
      ORDER BY updated_at ASC, id ASC
      LIMIT ?
   `).all(limit) as Array<{ id: string }>;
 
-  for (const candidate of parked) {
+  const candidates = parked.flatMap(candidate => {
+    const entries = listSourceApprovalCheckpoints(candidate.id);
+    const legacy = HarnessSession.load(candidate.id)?.loadInterruptState();
+    const sources: Array<{ id: string; sourceUserSeq?: number }> = entries.map(entry =>
+      ({ id: candidate.id, sourceUserSeq: entry.sourceUserSeq }));
+    if (legacy && !entries.some(entry => entry.checkpoint?.serialized === legacy)) sources.push(candidate);
+    return sources;
+  });
+  for (const candidate of candidates) {
     result.examined += 1;
     const session = HarnessSession.load(candidate.id);
-    const blob = session?.loadInterruptState();
+    const blob = session?.loadInterruptState(candidate.sourceUserSeq);
     if (!session || !blob) continue;
     if (!HostInterruptState.isHostState(blob)) {
       result.unsupported += 1;
@@ -4255,36 +4267,6 @@ function inFlightCompactionEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_INFLIGHT_COMPACTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-function estimateAgentToolPromptComponents(agent: Agent<any, any>): Record<string, number> {
-  let firstClass = 0;
-  let deferredIndex = 0;
-  for (const rawTool of agent.tools ?? []) {
-    const tool = rawTool as unknown as Record<string, unknown>;
-    try {
-      if (tool.deferLoading === true) {
-        deferredIndex += estimateTokens(JSON.stringify({
-          type: tool.type,
-          name: tool.name,
-          description: tool.description,
-        }));
-      } else {
-        firstClass += estimateTokens(JSON.stringify({
-          type: tool.type,
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters,
-          strict: tool.strict,
-        }));
-      }
-    } catch {
-      firstClass += 50;
-    }
-  }
-  return {
-    ...(firstClass > 0 ? { toolSchemas: firstClass } : {}),
-    ...(deferredIndex > 0 ? { deferredToolIndex: deferredIndex } : {}),
-  };
-}
 
 const CONTINUATION_INPUT =
   'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
@@ -4636,6 +4618,7 @@ export function finalizePreparedWorkflowDispatchForSource(
   sessionId: string,
   sourceUserSeq: number,
 ): FinalizedWorkflowRunDispatch | null {
+  if (workflowParentActivation(sessionId, sourceUserSeq)) return null;
   const receipts = finalizePreparedWorkflowDispatches(sessionId, sourceUserSeq);
   if (receipts.length === 0) return null;
   if (receipts.length !== 1) {
@@ -6141,6 +6124,9 @@ async function runConversationWithinRuntimeConfig(
       sessionId: options.sessionId,
       sourceUserSeq,
       ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+      // Explicit request role for accounting: a delegated worker child runs
+      // under a harness context that says so; everything else here is the brain.
+      role: harnessRunContextStorage.getStore()?.workerScope ? 'worker' : 'brain',
     },
     () => withTurnQueryVectorScope(async () => {
     let foregroundRelease: 'terminal' | 'transfer' | null = null;
@@ -6205,6 +6191,7 @@ async function runConversationWithinRuntimeConfig(
             query: String(options.semanticTaskInput ?? options.input ?? ''),
             sessionId: options.sessionId,
             sourceUserSeq,
+            mcpToolScope: options.mcpToolScope,
           });
           if (proven.text) {
             provenOperationText = proven.text;
@@ -6217,9 +6204,13 @@ async function runConversationWithinRuntimeConfig(
                 sourceUserSeq,
                 strategyId: proven.strategyId,
                 tools: proven.tools,
+                nativeTools: proven.nativeTools,
                 skipDiscoverySearch: proven.skipDiscoverySearch,
                 capabilityRefs: proven.capabilityRefs,
                 descriptors: proven.descriptors,
+                boundAccounts: proven.boundAccounts,
+                liveReads: proven.liveReads,
+                liveReadOutcomes: proven.liveReadOutcomes,
               },
             });
           }
@@ -6787,7 +6778,6 @@ async function runConversationCore(
       turnResult.turn,
       activeSourceUserSeq,
     );
-    const durableMemoryCaptureEvidence = durableMemoryCapture !== null;
     const durableMemoryConversationOnly = durableMemoryCapture?.conversationOnly === true;
 
     // A verified queue receipt transfers ownership to the durable workflow
@@ -7318,7 +7308,7 @@ async function runConversationCore(
     // an exact durable receipt finish without generic stall/completion judges.
     if (
       !decision
-      && (meaningfulToolEvidence || durableMemoryCaptureEvidence)
+      && (meaningfulToolEvidence || durableMemoryConversationOnly)
       && typeof turnResult.finalOutput === 'string'
     ) {
       const acknowledgement = turnResult.finalOutput.trim();
@@ -10156,7 +10146,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
   const turn = nextTurnNumber(row);
   let persistedRecoveryState: HostRecoveryState | undefined;
-  let adoptedCheckpointContinuation = false;
+  const workflowReplay = workflowParentActivation(options.sessionId, options.sourceUserSeq);
+  let adoptedCheckpointContinuation = Boolean(workflowReplay);
   let adoptedRecoveryState: HostRecoveryState | undefined;
   const recoveryBlob = session.loadRecoveryState();
   if (recoveryBlob) {
@@ -10729,7 +10720,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (Number.isFinite(last)) idleMs = Math.max(0, Date.now() - last);
   } catch { /* no idle signal → no idle trigger (byte-identical to before) */ }
   try {
-    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens, layer1BudgetTokens: turnLayer1BudgetTokens });
+    const { result, nextItems, forkRequest } = workflowReplay
+      ? { result: { modified: false }, nextItems: sessionItems, forkRequest: undefined }
+      : await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens, layer1BudgetTokens: turnLayer1BudgetTokens });
     compactedItems = nextItems;
     markTurnClock(options.sessionId, 'compaction_done');
     if (result.modified) {
@@ -11288,7 +11281,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const inFlightCompaction = createInFlightCompactionState();
   let archiveReferences: Map<string, ArchivedTaskMessageReference> | undefined;
   const archivedMessages = new Map<string, ArchivedTaskMessageReference>();
-  const toolPromptComponents = estimateAgentToolPromptComponents(options.agent);
+  const toolSurface = measureToolPromptSurface(options.agent.tools ?? []);
+  const toolPromptComponents = {
+    ...(toolSurface.measuredToolSchemaTokens > 0 ? { toolSchemas: toolSurface.measuredToolSchemaTokens } : {}),
+    ...(toolSurface.deferredToolIndexTokens > 0 ? { deferredToolIndex: toolSurface.deferredToolIndexTokens } : {}),
+  };
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
   }) => {
@@ -11437,7 +11434,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // prompt cost is paid once per step and ~100x per task, and the lever is
       // keeping the large part invariant rather than making everything small.
       // Observation only — this reads what is already being sent.
-      recordPromptComposition(options.sessionId, 'codex', summarizePromptComposition({
+      recordPromptComposition(options.sessionId, 'host', summarizePromptComposition({
+        toolNames: toolSurface.toolNames,
+        toolSchemaCosts: toolSurface.toolSchemaCosts,
         instructions: value.instructions ?? '',
         // The MEASURED costs. This call previously passed neither tools nor
         // history, so a wire carrying 9,198 tokens was recorded as 6,850 — the
@@ -11503,6 +11502,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         };
       }
       if (options.provenOperationText) {
+        promptComponents.provenOperation = estimateTokens(options.provenOperationText);
         modelData = {
           input: [
             ...modelData.input,
@@ -12131,6 +12131,38 @@ function pausedHostApprovalSource(state: HostInterruptState, sessionId: string):
   return identities[0]!.sourceUserSeq;
 }
 
+function loadApprovalPauseForCard(session: HarnessSession, approvalId?: string): string | null {
+  if (approvalId) {
+    const matches = listSourceApprovalCheckpoints(session.id).filter(entry => {
+      if (!entry.checkpoint || !HostInterruptState.isHostState(entry.checkpoint.serialized)) return false;
+      return selectedHostApprovalMatchesPause(HostInterruptState.fromString(entry.checkpoint.serialized), session.id, approvalId);
+    });
+    if (matches.length === 1) return session.loadInterruptState(matches[0]!.sourceUserSeq);
+    if (matches.length > 1) throw new Error('Approval card matches more than one parked source');
+  }
+  return session.loadInterruptState();
+}
+
+function selectedHostApprovalMatchesPause(
+  state: HostInterruptState,
+  sessionId: string,
+  approvalId: string | undefined,
+): boolean {
+  if (!approvalId || (!state.acceptedModelBatchRef && !state.pending.some(call => call.consentSubject))) return true;
+  const selected = approvalRegistry.get(approvalId);
+  if (!selected || selected.sessionId !== sessionId) return false;
+  // Identical arguments can belong to two distinct user requests. The durable
+  // consent identity also binds source, logical call, account, schema and risk.
+  return state.pending.filter(call => {
+    const resumeKey = state.approvalResumeKey(call);
+    // Pre-V7 native pauses keep their pre-existing unkeyed card contract;
+    // never apply that fallback to a new pause or an external consent subject.
+    const matchesIdentity = resumeKey !== undefined ? selected.resumeKey === resumeKey
+      : !state.nativeApprovalKeys && !call.consentSubject && selected.resumeKey === null;
+    return matchesIdentity && approvalAuthorityMatchesToolCall(selected, call.name, call.rawItem.arguments);
+  }).length === 1;
+}
+
 export async function resumePendingApproval(
   options: ResumePendingApprovalOptions,
 ): Promise<RunTurnResult> {
@@ -12146,7 +12178,7 @@ export async function resumePendingApproval(
   // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
   const turnStartedAtIso = new Date().toISOString();
 
-  const blob = session.loadInterruptState();
+  const blob = loadApprovalPauseForCard(session, options.approvalId);
   if (!blob) {
     // Session isn't paused — no RunState to resume (typically a daemon restart
     // dropped the interrupt blob). A registry approval row alone is NOT an
@@ -12192,10 +12224,6 @@ export async function resumePendingApproval(
   // same authority even when tool brackets are disabled.
   const resumeAgentScopeBinding = boundAgentMcpToolScope(options.agent);
 
-  if (isKillBeforeStart(options.sessionId, turn, session, resumeSourceUserSeq)) {
-    return { sessionId: options.sessionId, turn, status: 'killed' };
-  }
-
   let state;
   try {
     if (HostInterruptState.isHostState(blob)) {
@@ -12222,6 +12250,10 @@ export async function resumePendingApproval(
   }
 
   if (state instanceof HostInterruptState) {
+    if (!selectedHostApprovalMatchesPause(state, options.sessionId, options.approvalId)) {
+      return { sessionId: options.sessionId, turn, status: 'awaiting_approval',
+        error: 'The selected approval belongs to a different paused action; no decision was applied.' };
+    }
     try {
       resumeSourceUserSeq = pausedHostApprovalSource(state, options.sessionId) ?? resumeSourceUserSeq;
     } catch (error) {
@@ -12237,6 +12269,12 @@ export async function resumePendingApproval(
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'failed', error: message };
     }
+  }
+
+  // A control click or newer attempt is not the parked task. Restore the
+  // exact source before observing or consuming a source-scoped cancellation.
+  if (isKillBeforeStart(options.sessionId, turn, session, resumeSourceUserSeq)) {
+    return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
   // Resolve each interruption. The SDK's RunState exposes pending
@@ -12951,10 +12989,16 @@ export async function runConversationFromResume(opts: {
     // the parked source BEFORE constructing tools; doing this only inside
     // resumePendingApproval rebuilt an empty direct-reply agent and poisoned
     // the original root as "host surface changed after admission".
-    const blob = HarnessSession.load(opts.sessionId)?.loadInterruptState();
+    const parkedSession = HarnessSession.load(opts.sessionId);
+    const blob = parkedSession ? loadApprovalPauseForCard(parkedSession, opts.approvalId) : null;
     if (blob && HostInterruptState.isHostState(blob)) {
       try {
-        const originalSource = pausedHostApprovalSource(HostInterruptState.fromString(blob), opts.sessionId);
+        const pausedState = HostInterruptState.fromString(blob);
+        if (!selectedHostApprovalMatchesPause(pausedState, opts.sessionId, opts.approvalId)) {
+          return { sessionId: opts.sessionId, status: 'awaiting_approval', steps: 0, lastTurn: 0,
+            error: 'The selected approval belongs to a different paused action; no decision was applied.' };
+        }
+        const originalSource = pausedHostApprovalSource(pausedState, opts.sessionId);
         if (originalSource) {
           resumeAgentSourceUserSeq = originalSource;
           if (opts.buildAgent) {
@@ -13095,6 +13139,7 @@ export async function runConversationFromResume(opts: {
       sessionId: opts.sessionId,
       sourceUserSeq,
       ...(opts.runAttemptId ? { attemptId: opts.runAttemptId } : {}),
+      role: harnessRunContextStorage.getStore()?.workerScope ? 'worker' : 'brain',
     },
     async () => {
   try {

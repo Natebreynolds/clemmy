@@ -1,3 +1,4 @@
+import { SOURCE_APPROVAL_CHECKPOINTS_KEY, sourceApprovalSnapshotFromMetadata } from './source-approval-checkpoints.js';
 import { createHash } from 'node:crypto';
 import type { AgentInputItem } from '@openai/agents';
 import { openEventLog } from './eventlog.js';
@@ -124,6 +125,13 @@ function pendingHostInterruptCallIds(metadata: ItemRecord): string[] {
 }
 
 function sessionHasPendingApproval(db: HarnessDb, sessionId: string, metadata: ItemRecord): boolean {
+  const stored = metadata[SOURCE_APPROVAL_CHECKPOINTS_KEY];
+  if (stored != null) {
+    if (typeof stored !== 'object' || Array.isArray(stored)) return true;
+    try {
+      if (Object.keys(stored).some(key => sourceApprovalSnapshotFromMetadata(metadata, Number(key)).checkpoint !== null)) return true;
+    } catch { return true; } // unreadable ownership cannot authorize provider replay
+  }
   if (pendingHostInterruptCallIds(metadata).length > 0) return true;
   const row = db.prepare(`
     SELECT 1 FROM pending_approvals

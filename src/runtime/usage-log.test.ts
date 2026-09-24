@@ -382,3 +382,35 @@ test('usageEfficiencyForEvents: a brain frame that fails to reuse the previous p
   assert.equal(efficiency.appendedTokens, 10_000);
   assert.equal(efficiency.prefixReuse, Math.round(((20_000 + 18_000) / (20_000 + 25_000)) * 1000) / 1000);
 });
+
+test('a failed request without provider usage is counted as uncertified, never proven zero cost', () => {
+  const failed = ev({ cacheDialect: 'none', ok: false, failReason: 'timeout', inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+  assert.equal(canonicalCacheAccounting(failed).certified, false);
+  assert.equal(canonicalCacheAccounting(failed).invalid, false, 'a missing usage receipt is not malformed token arithmetic');
+  assert.equal(rollupUsage([failed]).uncertifiedCalls, 1);
+  assert.equal(rollupUsage([failed]).totalCalls, 1, 'failed attempts remain visible');
+  assert.equal(canonicalCacheAccounting({ ...failed, ok: true }).certified, true, 'a successful reported zero remains representable');
+  assert.equal(canonicalCacheAccounting({ ...failed, inputTokens: 10, totalTokens: 10 }).uncachedWorkTokens, 10, 'known failed-call usage is still charged');
+});
+
+test('usageEfficiencyForEvents: the brain is the model that carried the prompt bytes, not the most-called one', async () => {
+  const { usageEfficiencyForEvents } = await import('./usage-log.js');
+  const row = (model: string, input: number, cached: number) => ({
+    at: '2026-09-23T00:00:00Z', source: 'sess:1', kind: 'chat', model, cacheDialect: 'inclusive',
+    inputTokens: input, cachedInputTokens: cached, outputTokens: 10, totalTokens: input + 10,
+  });
+  // Live shape: eight tiny routing calls beside eight brain frames. By count
+  // the router "won" and the whole turn read as side traffic, prefixReuse 0.
+  const events = [
+    ...Array.from({ length: 8 }, () => row('router', 800, 0)),
+    row('brain', 48_000, 0),
+    row('brain', 49_500, 40_000),
+    row('brain', 50_500, 40_000),
+    row('brain', 51_500, 44_800),
+  ];
+  const efficiency = usageEfficiencyForEvents(events as never);
+  assert.equal(efficiency.brainFrames, 4);
+  assert.equal(efficiency.sideFrames, 8);
+  assert.equal(efficiency.sideInputTokens, 6_400);
+  assert.ok(efficiency.prefixReuse > 0.8, `brain frames reused the previous prompt: ${efficiency.prefixReuse}`);
+});

@@ -18,7 +18,7 @@ import {
   type AutomationOpportunityProposalStatus,
 } from '../execution/automation-opportunity-store.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 
 const PROPOSAL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const DIGEST_RE = /^[a-f0-9]{64}$/;
@@ -151,11 +151,11 @@ export function registerAutomationOpportunityTools(
       try {
         opportunity = parseOpportunityInput(opportunityInput);
       } catch (error) {
-        return textResult(JSON.stringify({
+        return invalidArgumentsTextResult(JSON.stringify({
           ok: false,
           code: 'invalid_opportunity',
           message: error instanceof Error ? error.message : String(error),
-        }), { isError: true });
+        }));
       }
       const proposalId = automationOpportunityProposalId({
         ...source,
@@ -207,11 +207,11 @@ export function registerAutomationOpportunityTools(
       try {
         opportunity = parseOpportunityInput(opportunityInput);
       } catch (error) {
-        return textResult(JSON.stringify({
+        return invalidArgumentsTextResult(JSON.stringify({
           ok: false,
           code: 'invalid_opportunity',
           message: error instanceof Error ? error.message : String(error),
-        }), { isError: true });
+        }));
       }
       const revised = reviseAutomationOpportunityProposal({
         proposalId: proposal_id,

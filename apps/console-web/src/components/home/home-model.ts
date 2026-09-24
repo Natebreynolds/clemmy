@@ -26,6 +26,25 @@ export interface HomeFeedItem extends CommandCenterItem {
   runId?: string;
   taskId?: string;
   targetRunId?: string;
+  /** Set on grouped workflow cards ("11 paused runs of …"). */
+  workflowName?: string;
+}
+
+/**
+ * Whether a parked run is already on the Needs-you pane. The Running pane
+ * leads with parked runs because some never reach the command centre, but a
+ * run that does was drawn twice on one Home ("daily-standup-email" under both
+ * headings, live 2026-09-22).
+ */
+export function parkedRunCoveredByNeedsYou(
+  entry: { runId?: string; sessionId?: string; headline?: string },
+  needsYou: readonly HomeFeedItem[],
+): boolean {
+  return needsYou.some((item) => (
+    (entry.runId && (item.runId === entry.runId || item.targetRunId === entry.runId))
+    || (entry.sessionId && item.targetSessionId === entry.sessionId)
+    || (item.kind === 'workflow-paused' && item.workflowName && item.workflowName === entry.headline)
+  ));
 }
 
 // ─── The shape of the window ───────────────────────────────────────────────
@@ -111,6 +130,18 @@ export function silentImmediatePanes(input: HomeQuietInput): HomePaneId[] {
   if (input.workRows === 0) silent.push('running');
   if (input.updates === 0 && input.attention === 0) silent.push('while_away');
   return silent;
+}
+
+/**
+ * Clem's work in one phrase for the Home's summary line, which links to the
+ * board. The board owns the cards and their states; Home only says whether
+ * anything is moving. What stopped on a person is already in Needs you, and
+ * a second count of stopped rows here disagreed with the board's own columns.
+ * The running count is the shared presenter's, so it never says "running"
+ * about a row nothing has happened to for hours.
+ */
+export function workLine(view: { running: number }): string {
+  return view.running > 0 ? `Clem’s work: ${view.running} running` : 'Clem’s work: nothing running';
 }
 
 export interface PresenceCounts {
@@ -368,6 +399,9 @@ export function projectSubtitle(space: SpaceRecord): string {
 export function plainText(input?: string | null, max = 400): string {
   if (!input) return '';
   return input
+    // A leading emoji is a status icon standing in for the pane's own ("📅
+    // Reply needed", "✅ …"); the row already draws one.
+    .replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '')
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]*)`/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')

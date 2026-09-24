@@ -19,6 +19,9 @@ import {
   type PreparedProviderConversation,
 } from './conversation-protocol-session.js';
 import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
+import { workflowParentActivation } from './workflow-parent-activation.js';
+import { SOURCE_APPROVAL_CHECKPOINTS_KEY, hostApprovalCheckpointSource, sourceApprovalSnapshotFromMetadata, readSourceApprovalCheckpoint,
+  listSourceApprovalCheckpoints, replaceSourceApprovalCheckpoint } from './source-approval-checkpoints.js';
 
 /**
  * HarnessSession — Clementine-owned conversation memory.
@@ -126,6 +129,26 @@ export interface RecordCompletedTurnResultInput extends RecordTurnResultInput {
 export class HarnessSession {
   private constructor(private row: SessionRow) {}
 
+  private selectedApprovalSource?: number;
+
+  private defaultStoredApprovalSource(): number | undefined {
+    const stored = this.row.metadata[SOURCE_APPROVAL_CHECKPOINTS_KEY];
+    if (stored == null) return undefined;
+    if (typeof stored !== 'object' || Array.isArray(stored)) throw new Error('Malformed source approval checkpoint index');
+    return Object.keys(stored).map(Number).sort((a, b) => b - a).find(source =>
+      sourceApprovalSnapshotFromMetadata(this.row.metadata, source).checkpoint !== null);
+  }
+
+  private projectSourceApproval(): void {
+    const remaining = listSourceApprovalCheckpoints(this.row.id).at(-1)?.checkpoint;
+    const db = openEventLog();
+    db.prepare(`UPDATE sessions SET metadata_json = json_remove(metadata_json,
+      '$.${META_INTERRUPT}', '$.${META_INTERRUPT_MCP_SCOPE}') WHERE id = ?`).run(this.row.id);
+    if (remaining) db.prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json,
+      '$.${META_INTERRUPT}', ?, '$.${META_INTERRUPT_MCP_SCOPE}', json(?)) WHERE id = ?`)
+      .run(remaining.serialized, JSON.stringify(remaining.mcpToolScope), this.row.id);
+  }
+
   static create(input: CreateSessionInput): HarnessSession {
     const row = createSession(input);
     appendEvent({
@@ -168,6 +191,8 @@ export class HarnessSession {
   }
 
   private conversation(): PersistedConversation {
+    const active = workflowParentActivation(this.row.id);
+    if (active) return active.conversation;
     const raw = this.row.metadata[META_CONVERSATION];
     if (!raw || typeof raw !== 'object') {
       return { items: [], lastResponseId: undefined, updatedAt: this.row.createdAt };
@@ -192,6 +217,9 @@ export class HarnessSession {
    * boundary cannot silently mutate non-provider session operations.
    */
   prepareProviderHistory(): PreparedProviderConversation {
+    const active = workflowParentActivation(this.row.id);
+    if (active) return { status: 'ready', disposition: 'ready', migration: 'none',
+      history: active.conversation.items, providerHistory: active.conversation.items };
     const prepared = preparePersistedSessionConversationProtocol({ sessionId: this.row.id });
     this.refresh();
     return prepared;
@@ -235,6 +263,8 @@ export class HarnessSession {
       lastResponseId: this.conversation().lastResponseId,
       updatedAt: new Date().toISOString(),
     };
+    const active = workflowParentActivation(this.row.id);
+    if (active) { active.conversation = snapshot; return; }
     // Compaction may await a model while other owners update this session.
     // Commit only our conversation field, preserving their newer metadata.
     const written = openEventLog().prepare(
@@ -302,8 +332,12 @@ export class HarnessSession {
       lastResponseId: input.lastResponseId,
       updatedAt: new Date().toISOString(),
     };
-    meta[META_CONVERSATION] = snapshot;
-    this.row = updateSession(this.row.id, { metadata: meta });
+    const active = workflowParentActivation(this.row.id);
+    if (active) active.conversation = snapshot;
+    else {
+      meta[META_CONVERSATION] = snapshot;
+      this.row = updateSession(this.row.id, { metadata: meta });
+    }
     appendEvent({
       sessionId: this.row.id,
       turn: input.turn,
@@ -340,7 +374,9 @@ export class HarnessSession {
     const commit = db.transaction(() => {
       // json_set preserves unrelated metadata written by concurrent owners;
       // writing a stale in-memory metadata object here would erase it.
-      db.prepare(
+      const active = workflowParentActivation(this.row.id);
+      if (active) active.conversation = snapshot;
+      else db.prepare(
         `UPDATE sessions
             SET metadata_json = json_set(metadata_json, '$.__conversation', json(?)),
                 updated_at = ?
@@ -392,18 +428,54 @@ export class HarnessSession {
     serialized: string,
     options: { mcpToolScope?: McpToolScope | null } = {},
   ): void {
-    const meta = { ...this.row.metadata };
-    meta[META_INTERRUPT] = serialized;
-    if (options.mcpToolScope && typeof options.mcpToolScope.reason === 'string') {
-      // Scopes are JSON-only records. Clone before storing so a caller cannot
-      // widen the persisted authority by mutating its live object after pause.
-      meta[META_INTERRUPT_MCP_SCOPE] = JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope;
-    } else {
-      // A new interrupt without a bound scope must never inherit an older
-      // interrupt's authority.
-      delete meta[META_INTERRUPT_MCP_SCOPE];
+    workflowParentActivation(this.row.id); // fences a resumed parent's stale lease
+    const sourceUserSeq = hostApprovalCheckpointSource(serialized, this.row.id);
+    if (sourceUserSeq !== undefined) {
+      const observed = sourceApprovalSnapshotFromMetadata(this.row.metadata, sourceUserSeq);
+      openEventLog().transaction(() => {
+        // Preserve a pre-upgrade host pause before installing another source.
+        const current = getSession(this.row.id)!;
+        const legacy = current.metadata[META_INTERRUPT];
+        const legacySource = typeof legacy === 'string' ? hostApprovalCheckpointSource(legacy, this.row.id) : undefined;
+        if (legacySource !== undefined && legacySource !== sourceUserSeq
+          && readSourceApprovalCheckpoint({ sessionId: this.row.id, sourceUserSeq: legacySource }).revision === null) {
+          const migrated = replaceSourceApprovalCheckpoint({ sessionId: this.row.id, sourceUserSeq: legacySource,
+            expectedRevision: null, checkpoint: { serialized: legacy as string,
+              mcpToolScope: (current.metadata[META_INTERRUPT_MCP_SCOPE] as McpToolScope | undefined) ?? null } });
+          if (!migrated.updated) throw new Error('Approval interrupt changed during migration');
+        }
+        const result = replaceSourceApprovalCheckpoint({ sessionId: this.row.id, sourceUserSeq,
+          expectedRevision: observed.revision,
+          checkpoint: { serialized, mcpToolScope: options.mcpToolScope ?? null } });
+        if (!result.updated) throw new Error('Approval interrupt changed before it could be saved');
+        this.projectSourceApproval();
+      }).immediate();
+      this.refresh();
+      this.selectedApprovalSource = sourceUserSeq;
+      appendEvent({ sessionId: this.row.id, turn: 0, role: 'system', type: 'run_paused',
+        data: { bytes: serialized.length, sourceUserSeq } });
+      return;
     }
-    this.row = updateSession(this.row.id, { metadata: meta });
+    const expected = this.row.metadata[META_INTERRUPT] ?? null;
+    const expectedScope = this.row.metadata[META_INTERRUPT_MCP_SCOPE];
+    const scope = options.mcpToolScope && typeof options.mcpToolScope.reason === 'string'
+      ? JSON.stringify(options.mcpToolScope) : null;
+    // Mutate only the parked state. A cached session row may predate another
+    // task's conversation, counters or metadata. Compare the old pause as well
+    // so an older activation cannot replace a newer approval's authority.
+    const updated = openEventLog().prepare(`UPDATE sessions SET metadata_json =
+      json_set(json_remove(metadata_json, '$.${META_INTERRUPT_MCP_SCOPE}'), '$.${META_INTERRUPT}', ?),
+      updated_at = ? WHERE id = ?
+      AND json_extract(metadata_json, '$.${META_INTERRUPT}') IS ?
+      AND json_extract(metadata_json, '$.${META_INTERRUPT_MCP_SCOPE}') IS ?`);
+    openEventLog().transaction(() => {
+      const result = updated.run(serialized, new Date().toISOString(), this.row.id, expected,
+        expectedScope == null ? null : JSON.stringify(expectedScope));
+      if (result.changes !== 1) throw new Error('Approval interrupt changed before it could be saved');
+      if (scope !== null) openEventLog().prepare(`UPDATE sessions SET metadata_json =
+        json_set(metadata_json, '$.${META_INTERRUPT_MCP_SCOPE}', json(?)) WHERE id = ?`).run(scope, this.row.id);
+    }).immediate();
+    this.refresh();
     appendEvent({
       sessionId: this.row.id,
       turn: 0,
@@ -413,13 +485,34 @@ export class HarnessSession {
     });
   }
 
-  loadInterruptState(): string | null {
+  loadInterruptState(sourceUserSeq?: number): string | null {
+    if (sourceUserSeq !== undefined) this.selectedApprovalSource = sourceUserSeq;
+    if (this.selectedApprovalSource !== undefined) {
+      const snapshot = sourceApprovalSnapshotFromMetadata(this.row.metadata, this.selectedApprovalSource);
+      if (snapshot.revision !== null) return snapshot.checkpoint?.serialized ?? null;
+      const legacy = this.row.metadata[META_INTERRUPT];
+      return typeof legacy === 'string'
+        && hostApprovalCheckpointSource(legacy, this.row.id) === this.selectedApprovalSource ? legacy : null;
+    }
     const raw = this.row.metadata[META_INTERRUPT];
-    return typeof raw === 'string' ? raw : null;
+    if (typeof raw === 'string') return raw;
+    const storedSource = this.defaultStoredApprovalSource();
+    return storedSource === undefined ? null
+      : sourceApprovalSnapshotFromMetadata(this.row.metadata, storedSource).checkpoint?.serialized ?? null;
   }
 
   /** Exact MCP scope captured beside the currently parked RunState. */
-  loadInterruptMcpToolScope(): McpToolScope | null {
+  loadInterruptMcpToolScope(sourceUserSeq?: number): McpToolScope | null {
+    if (sourceUserSeq !== undefined) this.selectedApprovalSource = sourceUserSeq;
+    if (this.selectedApprovalSource !== undefined) {
+      const snapshot = sourceApprovalSnapshotFromMetadata(this.row.metadata, this.selectedApprovalSource);
+      if (snapshot.revision !== null) return snapshot.checkpoint?.mcpToolScope ?? null;
+      if (!this.loadInterruptState(this.selectedApprovalSource)) return null;
+    }
+    if (typeof this.row.metadata[META_INTERRUPT] !== 'string') {
+      const storedSource = this.defaultStoredApprovalSource();
+      if (storedSource !== undefined) return sourceApprovalSnapshotFromMetadata(this.row.metadata, storedSource).checkpoint?.mcpToolScope ?? null;
+    }
     const raw = this.row.metadata[META_INTERRUPT_MCP_SCOPE];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const scope = raw as Partial<McpToolScope>;
@@ -434,13 +527,41 @@ export class HarnessSession {
   }
 
   clearInterruptState(options: { emitEvent?: boolean } = {}): void {
+    workflowParentActivation(this.row.id);
+    const legacy = this.row.metadata[META_INTERRUPT];
+    const sourceUserSeq = this.selectedApprovalSource ?? (typeof legacy === 'string'
+      ? hostApprovalCheckpointSource(legacy, this.row.id) : this.defaultStoredApprovalSource());
+    if (sourceUserSeq !== undefined) {
+      const observed = sourceApprovalSnapshotFromMetadata(this.row.metadata, sourceUserSeq);
+      if (observed.revision !== null) {
+        const changed = openEventLog().transaction(() => {
+          const result = replaceSourceApprovalCheckpoint({ sessionId: this.row.id, sourceUserSeq,
+            expectedRevision: observed.revision, checkpoint: null });
+          if (!result.updated) return false;
+          this.projectSourceApproval();
+          return true;
+        }).immediate();
+        if (!changed) return;
+        this.refresh();
+        if (observed.checkpoint && options.emitEvent !== false) appendEvent({ sessionId: this.row.id,
+          turn: 0, role: 'system', type: 'run_resumed', data: { sourceUserSeq } });
+        return;
+      }
+      if (!this.loadInterruptState(sourceUserSeq)) return;
+    }
     const hadInterrupt = META_INTERRUPT in this.row.metadata;
     const hadScope = META_INTERRUPT_MCP_SCOPE in this.row.metadata;
     if (!hadInterrupt && !hadScope) return;
-    const meta = { ...this.row.metadata };
-    delete meta[META_INTERRUPT];
-    delete meta[META_INTERRUPT_MCP_SCOPE];
-    this.row = updateSession(this.row.id, { metadata: meta });
+    const expected = this.row.metadata[META_INTERRUPT] ?? null;
+    const expectedScope = this.row.metadata[META_INTERRUPT_MCP_SCOPE];
+    const result = openEventLog().prepare(`UPDATE sessions SET metadata_json =
+      json_remove(metadata_json, '$.${META_INTERRUPT}', '$.${META_INTERRUPT_MCP_SCOPE}'), updated_at = ?
+      WHERE id = ? AND json_extract(metadata_json, '$.${META_INTERRUPT}') IS ?
+      AND json_extract(metadata_json, '$.${META_INTERRUPT_MCP_SCOPE}') IS ?`)
+      .run(new Date().toISOString(), this.row.id, expected,
+        expectedScope == null ? null : JSON.stringify(expectedScope));
+    if (result.changes !== 1) return;
+    this.refresh();
     if (!hadInterrupt || options.emitEvent === false) return;
     appendEvent({
       sessionId: this.row.id,
@@ -789,21 +910,26 @@ export class HarnessSession {
   }
 
   // ── Restart-recovery in-flight marker ──────────────────────────────
-  // Mirror of saveInterruptState's read-modify-write, but emits NO event
-  // (it's internal bookkeeping, not an audit signal). Set on runConversation
-  // entry, cleared in its finally — so a value surviving across a daemon
-  // restart means that run was killed mid-flight.
+  // The marker belongs to the foreground executor. A workflow-parent
+  // activation already owns its source-specific durable lease and must not
+  // replace or clear a newer foreground marker.
   setRunInFlight(at: string = new Date().toISOString()): void {
-    const meta = { ...this.row.metadata };
-    meta[META_RUNNING] = at;
-    this.row = updateSession(this.row.id, { metadata: meta });
+    if (workflowParentActivation(this.row.id)) return;
+    openEventLog().prepare(`UPDATE sessions SET metadata_json =
+      json_set(metadata_json, '$.${META_RUNNING}', ?), updated_at = ? WHERE id = ?`)
+      .run(at, new Date().toISOString(), this.row.id);
+    this.refresh();
   }
 
   clearRunInFlight(): void {
-    if (!(META_RUNNING in this.row.metadata)) return;
-    const meta = { ...this.row.metadata };
-    delete meta[META_RUNNING];
-    this.row = updateSession(this.row.id, { metadata: meta });
+    if (workflowParentActivation(this.row.id)) return;
+    const expected = this.row.metadata[META_RUNNING];
+    if (typeof expected !== 'string') return;
+    const result = openEventLog().prepare(`UPDATE sessions SET metadata_json =
+      json_remove(metadata_json, '$.${META_RUNNING}'), updated_at = ?
+      WHERE id = ? AND json_extract(metadata_json, '$.${META_RUNNING}') = ?`)
+      .run(new Date().toISOString(), this.row.id, expected);
+    if (result.changes === 1) this.refresh();
   }
 
   /** ISO timestamp a still-in-flight run started at, or null. */

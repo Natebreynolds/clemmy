@@ -146,7 +146,11 @@ async function defaultConfiguredLocalTool(
     if (schema) {
       return {
         name,
-        parameters: z.toJSONSchema(schema),
+        // Zod's JSON Schema result also carries non-enumerable Standard Schema
+        // runtime callbacks. Publish its JSON wire representation, not those
+        // callbacks, into canonical authority/review packets. Arguments retain
+        // their strict canonicalization and the original validator stays below.
+        parameters: JSON.parse(JSON.stringify(z.toJSONSchema(schema))),
         description: getLocalToolCatalog().find(tool => tool.name === name)?.description,
         workCallLocalDispatch: true,
         argumentSchema: schema,
@@ -242,6 +246,13 @@ function structurallyCarriesSafeMode(
         || !Object.hasOwn(properties, field)
         || !schemaAllowsExact(properties[field], null)
       ) return false;
+    }
+    const omittedEquivalent = new Set(predicate.omittedEquivalentToRequired ?? []);
+    if (omittedEquivalent.size !== (predicate.omittedEquivalentToRequired?.length ?? 0)) return false;
+    for (const field of omittedEquivalent) {
+      if (!Object.hasOwn(predicate.requiredEquals, field)
+        || !Object.hasOwn(properties, field)
+        || (Array.isArray(schema.required) && schema.required.includes(field))) return false;
     }
     for (const field of predicate.absentOrNull ?? []) {
       if (!Object.hasOwn(properties, field)) return false;
@@ -465,6 +476,9 @@ function normalizedSafeModePredicate(
               .filter(Boolean),
           )],
         }
+      : {}),
+    ...(predicate.omittedEquivalentToRequired
+      ? { omittedEquivalentToRequired: [...new Set(predicate.omittedEquivalentToRequired.map(field => field.trim()).filter(Boolean))] }
       : {}),
     ...(predicate.absentOrNull
       ? {
@@ -1068,7 +1082,9 @@ export function localPlanningArgumentsMatch(
   return predicates.some((predicate) => {
     const nullEquivalent = new Set(predicate.nullEquivalentToRequired ?? []);
     for (const [field, expected] of Object.entries(predicate.requiredEquals)) {
-      if (args[field] !== expected && !(args[field] === null && nullEquivalent.has(field))) return false;
+      if (args[field] !== expected
+        && !(args[field] === null && nullEquivalent.has(field))
+        && !(args[field] === undefined && predicate.omittedEquivalentToRequired?.includes(field))) return false;
     }
     for (const field of predicate.absentOrNull ?? []) {
       if (args[field] !== undefined && args[field] !== null) return false;

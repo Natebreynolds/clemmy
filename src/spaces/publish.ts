@@ -23,7 +23,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { isValidSpaceSlug, resolveInSpace, resolveSpaceDir, spaceStore } from './store.js';
-import { readData, appendAudit } from './data-store.js';
+import { readData, appendAudit, withSourceRecordAliases } from './data-store.js';
 import { injectWorkspaceBootstrap } from './view-html.js';
 import { clemViewDesignLayer } from './view-design-layer.js';
 
@@ -114,8 +114,9 @@ export function buildPublishSnapshot(slug: string): PublishSnapshotResult {
   const raw = readData(slug);
   const dataset = Object.create(null) as Record<string, unknown>;
   const rowsBySource: Record<string, number | null> = {};
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+  const aliased = withSourceRecordAliases(raw);
+  if (aliased && typeof aliased === 'object' && !Array.isArray(aliased)) {
+    for (const [key, value] of Object.entries(aliased as Record<string, unknown>)) {
       if (key.startsWith('_')) continue;
       dataset[key] = value;
       rowsBySource[key] = countRows(value);

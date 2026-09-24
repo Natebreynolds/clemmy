@@ -69,3 +69,23 @@ test('formatting is short and honest', () => {
   assert.equal(resetsInText(now - 1, now), 'resets now');
   assert.equal(resetsInText(now + 3 * 86_400_000, now), 'resets in 3d');
 });
+
+test('the top-bar chip says the busiest window in words and admits an old reading', async () => {
+  const { usageChipText, USAGE_READING_STALE_MS } = await import('./usage-presentation.js');
+  const now = Date.parse('2026-09-22T12:00:00Z');
+  const meter = {
+    id: 'codex', label: 'Codex',
+    windows: [{ id: 'week', label: 'week', usedPercent: 83, tone: 'warning' as const }],
+    capturedAt: now - 50 * 3_600_000,
+  };
+  assert.deepEqual(usageChipText(meter, now), { text: '83% of week · 2d old', stale: true });
+  assert.deepEqual(usageChipText({ ...meter, capturedAt: now - USAGE_READING_STALE_MS + 1 }, now), { text: '83% of week', stale: false });
+  const claude = {
+    id: 'claude', label: 'Claude', capturedAt: now,
+    windows: [
+      { id: 'five', label: '5h', usedPercent: 10, tone: 'ok' as const },
+      { id: 'week', label: 'week', usedPercent: 38, tone: 'ok' as const },
+    ],
+  };
+  assert.equal(usageChipText(claude, now).text, '38% of week');
+});

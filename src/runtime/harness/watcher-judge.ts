@@ -284,12 +284,19 @@ export function summarizeWorkerProgressForWatcher(sessionId: string, options: { 
 
 export interface WatcherVerdict {
   review?: { modelId: string; provider: string };
+  /** Who settled this advisory verdict: Jev's system-one when it read the
+   * trajectory as on track with high confidence, otherwise the configured
+   * watcher model. Recorded so the agreement measurement keeps running. */
+  decidedBy?: 'jev' | 'watcher';
   coverage?: { complete: true; portions: number; chars: number; sha256: string };
   onTrack: boolean;
   /** !onTrack → the specific goal-named thing being missed. */
   miss: string;
   /** !onTrack → the one-sentence corrective instruction to inject. */
   steer: string;
+  /** Jev's shadow reading of the same trajectory, recorded for agreement
+   * measurement only. `agrees` compares it with THIS verdict's onTrack. */
+  jevShadow?: { onTrack: boolean; confidence: number; model: string; durationMs: number; agrees: boolean };
 }
 
 export function parseWatcherVerdict(finalOutput: unknown): WatcherVerdict | null {
@@ -390,10 +397,65 @@ export function currentWatcherJudge(): WatcherJudgeFn {
  * metric lane). Returns null on ANY failure — a watcher that can't judge says
  * nothing (fail-open by silence, never by a fabricated steer).
  */
-export async function runWatcherJudge(input: WatcherJudgeInput): Promise<WatcherVerdict | null> {
+/** Jev settles an on-track window on its own above this confidence. Measured
+ * 2026-09-17→24 on the installed app: of 217 shadowed reviews, Jev agreed with
+ * the flagship watcher on 214; every one of the 138 windows the watcher called
+ * on track, Jev also called on track (mean confidence 0.91); the three
+ * disagreements were Jev on-track calls at confidence 0.33 while the watcher saw
+ * drift, all below this bar. On a three-worker fan-out the flagship watcher was
+ * five calls and ~100k uncached tokens to confirm on track five times. */
+export const JEV_TRAJECTORY_TRUST_MIN = 0.85;
+
+export interface WatcherJudgeDependencies {
+  jev?: typeof import('../jev/control-plane.js').tryJevTrajectoryVerdict;
+  hedgedJudge?: typeof import('./objective-judge.js').runHedgedJudge;
+}
+
+export async function runWatcherJudge(
+  input: WatcherJudgeInput,
+  deps: WatcherJudgeDependencies = {},
+): Promise<WatcherVerdict | null> {
   if (!input.objective.trim()) return null;
+  // Jev reads the same trajectory first: same inputs, its own short timeout,
+  // fail-open. A confident on-track reading settles the window without the
+  // flagship call; drift, low confidence or silence hands the window to the
+  // configured watcher exactly as before, with Jev's reading kept as the shadow
+  // so the agreement measurement continues on every escalated window.
+  const shadow = (async () => {
+    try {
+      const jev = deps.jev ?? (await import('../jev/control-plane.js')).tryJevTrajectoryVerdict;
+      return await jev({
+        objective: input.objective,
+        ...(input.successCriteria ? { successCriteria: input.successCriteria } : {}),
+        toolCallSummary: input.toolCallSummary,
+        latestAssistantNote: input.latestAssistantNote,
+        toolCallCount: input.toolCallCount,
+      });
+    } catch {
+      return null;
+    }
+  })();
+  const jevFirst = await shadow;
+  if (jevFirst && jevFirst.onTrack && jevFirst.confidence >= JEV_TRAJECTORY_TRUST_MIN) {
+    return {
+      onTrack: true,
+      miss: '',
+      steer: '',
+      decidedBy: 'jev',
+      review: { modelId: jevFirst.model, provider: 'jev' },
+      jevShadow: { ...jevFirst, agrees: true },
+    };
+  }
+  const withShadow = async (verdict: WatcherVerdict | null): Promise<WatcherVerdict | null> => {
+    if (!verdict) return verdict;
+    const jev = await shadow;
+    const decided: WatcherVerdict = { ...verdict, decidedBy: 'watcher' };
+    return jev ? { ...decided, jevShadow: { ...jev, agrees: jev.onTrack === verdict.onTrack } } : decided;
+  };
   try {
-    const { runHedgedJudge, completionJudgeContextAdmission } = await import('./objective-judge.js');
+    const objectiveJudge = await import('./objective-judge.js');
+    const runHedgedJudge = deps.hedgedJudge ?? objectiveJudge.runHedgedJudge;
+    const { completionJudgeContextAdmission } = objectiveJudge;
     const { resolveBoundaryJudge } = await import('./debate-model.js');
     const routing = resolveBoundaryJudge(input.boundaryJudgeSelection);
     const evidence = input.sourceEvidence;
@@ -422,10 +484,10 @@ export async function runWatcherJudge(input: WatcherJudgeInput): Promise<Watcher
         } : {}) };
       }
     }
-    return verdict && evidence !== undefined ? { ...verdict, coverage: {
+    return withShadow(verdict && evidence !== undefined ? { ...verdict, coverage: {
       complete: true, portions: prompts.length, chars: evidence.length,
       sha256: createHash('sha256').update(evidence).digest('hex'),
-    } } : verdict;
+    } } : verdict);
   } catch (error) {
     input.onUnavailable?.(error instanceof Error ? error.message : 'watcher_unknown_error');
     return null;

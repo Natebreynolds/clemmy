@@ -1,3 +1,5 @@
+import type { EventEmitter } from 'node:events';
+
 /**
  * U5 — desktop as a first-class loud notification destination.
  *
@@ -53,6 +55,23 @@ function safeInboxHref(value: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Convert router-relative Inbox links at the desktop boundary only. */
+export function desktopNotificationRoute(href: unknown): string | undefined {
+  const safe = safeInboxHref(href);
+  return safe ? `/console${safe}` : undefined;
+}
+
+/** Opening a decision is never settlement; failed navigation is never a read. */
+export async function openDesktopNotification(
+  item: DesktopPendingNotification,
+  navigate: (route: string) => Promise<boolean>,
+  markRead: (id: string) => Promise<unknown>,
+): Promise<void> {
+  const route = desktopNotificationRoute(item.href);
+  if (!route || !await navigate(route)) return;
+  if (item.markReadOnOpen !== false) await markRead(item.id);
 }
 
 /**
@@ -132,4 +151,32 @@ export function advanceWatermark(current: string, responseNow: string | undefine
   const prev = Date.parse(current);
   if (!Number.isFinite(prev)) return responseNow;
   return next >= prev ? responseNow : current;
+}
+
+
+/** Electron owns no strong JS reference for a newly shown notification. Keep
+ * its interaction handlers alive until settlement, with bounded shell memory. */
+export class DesktopNotificationRetention<T extends Pick<EventEmitter, 'once' | 'on'> & { close(): void }> {
+  private readonly active = new Set<T>();
+  constructor(private readonly capacity: number) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new RangeError('positive notification capacity required');
+  }
+  get size(): number { return this.active.size; }
+  has(notification: T): boolean { return this.active.has(notification); }
+  retain(notification: T): void {
+    if (this.active.has(notification)) return;
+    this.active.add(notification);
+    const release = () => { this.active.delete(notification); };
+    notification.once('click', release);
+    notification.on('close', (details?: { reason?: string }) => {
+      // Windows banner timeout leaves the notice actionable in Action Center.
+      if (details?.reason !== 'timedOut') release();
+    });
+    notification.once('failed', release);
+    while (this.active.size > this.capacity) {
+      const oldest = this.active.values().next().value!;
+      this.active.delete(oldest);
+      oldest.close();
+    }
+  }
 }

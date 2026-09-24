@@ -12,7 +12,9 @@ import {
   unwrapRuntimeEffectiveToolIdentity,
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
-import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { mirrorExternalSendToFirstPartySurfaces } from './external-send-mirror.js';
+import { registeredToolReadReuse, registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { readResourceRevision } from './read-resource-revision.js';
 import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -257,6 +259,9 @@ export function attachEventLogHooks(
   const callIdToCalledEventId = new Map<string, string>();
   const callIdToAccounting = new Map<string, ReturnType<typeof runtimeToolAccountingMetadata>>();
   const callIdToTopologyRole = new Map<string, ReturnType<typeof actionTopologyRoleForRuntimeCall>>();
+  // The SDK may omit arguments at end. Retain only send arguments from the
+  // admitted start, scoped by the same physical lifecycle as its accounting.
+  const callIdToSendArguments = new Map<string, string>();
   const activeToolCallKeys = new Set<string>();
   const closedToolCallKeys = new Set<string>();
   // The SDK can replay the exact same lifecycle notification. Object identity
@@ -410,6 +415,10 @@ export function attachEventLogHooks(
       callIdToCalledEventId.set(key, event.id);
       callIdToAccounting.set(key, accounting);
       callIdToTopologyRole.set(key, topologyRole);
+      if (accounting.effect === 'external_write' && accounting.reversibility === 'irreversible'
+        && typeof details?.toolCall?.arguments === 'string') {
+        callIdToSendArguments.set(key, details.toolCall.arguments);
+      }
       if (tool?.name === 'run_worker' && fanoutLedgerEnabled()) {
         callIdToWorkerItem.set(key, workerItemFromDetails(details));
       }
@@ -461,6 +470,8 @@ export function attachEventLogHooks(
       && callIdToAccounting.has(key)
       && callIdToTopologyRole.has(key),
     );
+    const admittedSendArguments = key ? callIdToSendArguments.get(key) : undefined;
+    if (key) callIdToSendArguments.delete(key);
     if (key) callIdToCalledEventId.delete(key);
     const accounting = (key ? callIdToAccounting.get(key) : undefined)
       ?? runtimeToolAccountingMetadata(tool?.name ?? '', details?.toolCall?.arguments);
@@ -498,23 +509,28 @@ export function attachEventLogHooks(
               }
             })();
     const sourceAttribution = currentSourceAttribution();
+    const replayToolName = typeof tool?.name === 'string' ? tool.name : '';
+    const replayReadIdentity = accounting.toolSlug ?? accounting.effectiveTool ?? '';
+    const replayReadArguments = unwrapRuntimeEffectiveToolIdentity(replayToolName, details?.toolCall?.arguments).args;
     const settledReadReplay = physicalAttemptAuthoritative
       && callId
       && parentEventId
-      && tool?.name === 'composio_execute_tool'
+      && replayToolName
+      && replayReadIdentity
+      && (replayToolName === 'composio_execute_tool'
+        || registeredToolReadReuse(replayReadIdentity) !== null)
       && accounting.effect === 'read'
       && typeof sourceAttribution.sourceUserSeq === 'number'
       && typeof sourceAttribution.runScopeId === 'string'
-      && typeof accounting.toolSlug === 'string'
       ? settledReadRepeatReplayDisposition({
           sessionId,
           replayCallId: callId,
           replayCalledEventId: parentEventId,
-          toolName: tool.name,
+          toolName: replayToolName,
           effect: accounting.effect,
           sourceUserSeq: sourceAttribution.sourceUserSeq,
           replayBehaviorScopeId: sourceAttribution.runScopeId,
-          toolSlug: accounting.toolSlug,
+          toolSlug: replayReadIdentity,
         })
       : null;
     // The SDK lifecycle sees the model-facing result, which can carry harness
@@ -635,6 +651,15 @@ export function attachEventLogHooks(
             replayedFromCallId: settledReadReplay.sourceCallId,
             replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
           } : {}),
+          // The revision of the resource this read observed, so a later
+          // identical read in the same request can prove nothing outside the
+          // request moved it before its settled bytes are reused.
+          ...(accounting.effect === 'read' && !settledReadReplay && replayReadIdentity
+            ? (() => {
+                const revision = readResourceRevision(replayReadIdentity, replayReadArguments);
+                return revision ? { resourceRevision: revision } : {};
+              })()
+            : {}),
           result: clipToolResult(
             resultStr,
             maxResultChars,
@@ -646,6 +671,19 @@ export function attachEventLogHooks(
       });
     } catch {
       // see onToolStart
+    }
+    // What Clem sent anywhere shows up on the first-party surfaces: one
+    // in-app item per successful irreversible external send, chat or step.
+    if (pairedAdmittedStart) {
+      mirrorExternalSendToFirstPartySurfaces({
+        sessionId,
+        callId,
+        sourceUserSeq: sourceAttribution.sourceUserSeq,
+        toolName: tool?.name ?? '',
+        accounting,
+        rawArgs: admittedSendArguments,
+        ok: toolOutputLooksSuccessful(resultStr),
+      });
     }
     if (
       returnedEvent

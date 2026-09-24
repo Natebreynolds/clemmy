@@ -107,6 +107,33 @@ test('registers as read-only tool_search with a query param', () => {
   assert.ok('role_key' in t.schema, 'schema exposes the opaque requirement role');
 });
 
+test('scoped discovery uses current runtime metadata without widening the allowed catalog', async () => {
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const metadata = new Map([
+    ['run_worker', { description: 'Exact foreground worker packet.', schema: {
+      type: 'object', properties: { item: { type: 'string', const: 'current-runtime' } },
+      required: ['item'], additionalProperties: false,
+    } }],
+    ['write_file', { description: 'Excluded tool', schema: { type: 'object', properties: {} } }],
+  ]);
+  const scoped = buildScopedLocalToolSearch(new Set(['run_worker']), 'call_tool', undefined,
+    undefined, undefined, () => metadata) as { invoke: (context: unknown, input: string) => Promise<unknown> };
+  const search = async (query: string) => JSON.parse(String(await scoped.invoke(
+    { context: {} }, JSON.stringify({ query, role_key: null, limit: 1, cursor: null, account_selection: null }),
+  )));
+  const first = await search('run_worker');
+  assert.equal(first.schemas.run_worker.properties.item.const, 'current-runtime');
+  metadata.set('run_worker', { description: 'Rebuilt foreground worker packet.', schema: {
+    type: 'object', properties: { item: { type: 'string', const: 'rebuilt-runtime' } },
+    required: ['item'], additionalProperties: false,
+  } });
+  const second = await search('run_worker');
+  assert.equal(second.schemas.run_worker.properties.item.const, 'rebuilt-runtime', 'read the turn-owned view at invocation, not module import');
+  const excluded = await search('write_file');
+  assert.equal(excluded.results.some((row: { name: string }) => row.name === 'write_file'), false);
+  assert.equal(excluded.schemas.write_file, undefined, 'metadata does not grant discovery authority');
+});
+
 test('echoes role_key without changing an exact-name result', async () => {
   const t = captureToolSearch(new Set(['workspace_roots']));
   const out = await runSearch(t.handler, 'workspace_roots', undefined, 'requirement-7');
@@ -1247,7 +1274,7 @@ test('first discovery preserves a proven ref when Composio fuzzy search and stag
         kind: 'authorized_external_mcp',
         search: async () => [{
           name: 'LIVE_MCP_SEARCH',
-          summary: 'A separately proven provider capability.',
+          summary: 'Read live provider records from the connected source.',
           schema: { type: 'object', properties: { query: { type: 'string' } } },
           carrier: 'work_call',
           score: 1000,
@@ -1596,5 +1623,64 @@ test('workflow input encoding instructions remain in the actual selected schema 
       }
       assert.ok(raw.content[0]!.text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
     }
+  }
+});
+
+
+test('ambiguous unified discovery uses Jev before selecting schemas, with exact-name and outage fallback', async () => {
+  const { _setTypesafeKeyForTests, _setSystemOneFetchForTests } = await import('../runtime/jev/client.js');
+  const schema = { type: 'object', properties: { record: { type: 'string' } }, required: ['record'], additionalProperties: false };
+  const sources: ToolSearchCandidateSource[] = [
+    { kind: 'authorized_external_mcp', search: async () => [
+      { name: 'atlas__lookup_record', summary: 'Inspect the current organization profile', schema, carrier: 'work_call' },
+      { name: 'atlas__lookup_archive', summary: 'Inspect organization details from the retained archive', schema, carrier: 'work_call' },
+    ] },
+    { kind: 'authorized_composio', search: async () => [
+      { name: 'PROFILE_RETRIEVE', summary: 'Retrieve an organization profile', schema, carrier: 'work_call' },
+    ] },
+  ];
+  let requests = 0;
+  let posted: Record<string, any> = {};
+  const query = 'Inspect the current organization details';
+  try {
+    _setTypesafeKeyForTests(null);
+    const baseline = await runSearch(captureToolSearch(new Set(['read_file']), true, sources).handler, query);
+    const winner = baseline.results.filter(row => row.name.startsWith('atlas__')).at(-1)!.name;
+    _setTypesafeKeyForTests('ts_test');
+    _setSystemOneFetchForTests(async (_url, init) => {
+      requests++;
+      posted = JSON.parse(String(init.body));
+      const probabilities = Object.fromEntries(Object.keys(posted.questions.which.criteria).map(name => [name, name === winner ? 1 : 0]));
+      return { status: 200, ok: true, text: async () => JSON.stringify({
+        model: 'jev-1.13.0', answers: { which: { type: 'choice', choice: winner, probabilities, confidence: 0.99 } },
+        usage: { input_tokens: 20, output_tokens: 2 },
+      }) };
+    });
+    const ranked = await runSearch(captureToolSearch(new Set(['read_file']), true, sources).handler, query);
+    assert.equal(requests, 1, 'one shared relevance decision for the unified catalog');
+    assert.equal(ranked.results[0]?.name, winner);
+    assert.deepEqual(new Set(ranked.results.map(row => row.name)), new Set(baseline.results.map(row => row.name)), 'ranking never removes discovery candidates');
+    assert.ok(ranked.schemas[winner], 'selected candidate includes its callable schema');
+    assert.equal(posted.state.request, query);
+    assert.equal(JSON.stringify(posted).includes('additionalProperties'), false, 'rank compact metadata, not full input schemas');
+    const namespaceSelected = await runSearch(captureToolSearch(new Set(['read_file']), true, sources).handler, 'Inspect the profile organization details');
+    assert.equal(namespaceSelected.results[0]?.name, 'PROFILE_RETRIEVE', 'Jev cannot override the existing explicit namespace precedence');
+    const pagedTool = captureToolSearch(new Set(['read_file']), true, sources);
+    const page = JSON.parse((await pagedTool.handler({ query, limit: 1 })).content[0]!.text);
+    assert.ok(page.next_cursor, 'fixture must actually produce a retained result page');
+    requests = 0;
+    const nextPage = JSON.parse((await pagedTool.handler({ query, cursor: page.next_cursor })).content[0]!.text);
+    assert.ok(nextPage.results.length > 0);
+    assert.equal(requests, 0, 'retained pages preserve the original ranking without a second Jev call');
+    requests = 0;
+    const exact = await runSearch(captureToolSearch(new Set(['read_file']), true, sources).handler, 'read_file');
+    assert.deepEqual(exact.results.map(row => row.name), ['read_file']);
+    assert.equal(requests, 0, 'an exact match never pays for Jev ranking');
+    _setSystemOneFetchForTests(async () => ({ status: 503, ok: false, text: async () => 'unavailable' }));
+    const fallback = await runSearch(captureToolSearch(new Set(['read_file']), true, sources).handler, query);
+    assert.deepEqual(fallback.results.map(row => row.name), baseline.results.map(row => row.name));
+  } finally {
+    _setTypesafeKeyForTests(undefined);
+    _setSystemOneFetchForTests(undefined);
   }
 });

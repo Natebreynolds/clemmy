@@ -312,7 +312,8 @@ async function runAcceptedPlannedWriteSource(input: {
           limit: 1,
         })];
       } else if (modelCall === 2) {
-        assert.ok(visibleTools.includes('plan_task'));
+        assert.equal(visibleTools.includes('plan_task'), false,
+          'deferred structural planning does not grow the stable model prefix');
         output = [functionCall(`${input.label}-plan`, 'plan_task', {
           preamble: 'I’ll apply the two ordered local mutations now.',
           draft: orderedLocalWritePlanDraft({

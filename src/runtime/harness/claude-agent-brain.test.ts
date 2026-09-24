@@ -3221,7 +3221,7 @@ test('full mode: schema-on-demand loads a bounded hot set without pruning permis
   assert.equal(scope?.data.reason, 'schema-on-demand-dispatch');
 });
 
-test('Workspace dock: schema-on-demand loads the common edit kernel and defers specialized schemas', async () => {
+test('Workspace dock: edit kernel stays first-class while authoring and specialized schemas remain discoverable', async () => {
   process.env.CLEMMY_TOOL_JIT = 'off';
   process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
@@ -3250,7 +3250,7 @@ test('Workspace dock: schema-on-demand loads the common edit kernel and defers s
   for (const common of ['space_get', 'space_get_view', 'space_edit_view']) {
     assert.ok(captured.mcpToolAllowlist.includes(common), `${common} stays first-class in a dock`);
   }
-  for (const specialized of ['space_get_runner', 'space_edit_runner', 'space_try_runner', 'space_history', 'space_diff', 'space_action_prepare', 'space_publish', 'space_save']) {
+  for (const specialized of ['space_save', 'space_get_runner', 'space_edit_runner', 'space_try_runner', 'space_history', 'space_diff', 'space_action_prepare', 'space_publish']) {
     assert.ok(captured.allowedLocalMcpTools.includes(specialized), `${specialized} remains permitted`);
     assert.ok(captured.localMcpToolUniverse.includes(specialized), `${specialized} remains call_tool-reachable`);
     assert.equal(captured.mcpToolAllowlist.includes(specialized), false, `${specialized} schema is deferred until needed`);

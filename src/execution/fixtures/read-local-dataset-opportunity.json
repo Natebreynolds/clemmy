@@ -1,0 +1,252 @@
+{
+  "budgets": {
+    "maxAttemptsPerPartition": 1,
+    "maxConcurrentPartitions": 1,
+    "maxOperationsPerRun": 2,
+    "maxPartitionsPerRun": 1,
+    "maxRecordsPerRun": 5,
+    "maxWallClockMinutesPerRun": 10,
+    "reserveOperations": 0
+  },
+  "capabilityRequirements": [
+    {
+      "constraints": [
+        "local-only",
+        "max 5 section records",
+        "new Space only \u2014 do not modify existing Spaces or workflows"
+      ],
+      "description": "Create and maintain one new, clearly named local acceptance Space holding the inventory snapshot.",
+      "id": "acceptance-space-write",
+      "minimumEffect": "local_write"
+    },
+    {
+      "constraints": [
+        "free metadata only \u2014 no paid data queries",
+        "no external sends",
+        "no provider settings changes",
+        "read-only"
+      ],
+      "description": "Read-only listing of the provider's documentation section inventory (free metadata only).",
+      "id": "doc-section-inventory-read",
+      "minimumEffect": "read"
+    }
+  ],
+  "dataset": {
+    "identity": {
+      "ambiguousMatch": "review_required",
+      "rules": [
+        {
+          "fields": [
+            "section_name"
+          ],
+          "id": "section-name",
+          "match": "exact",
+          "normalizers": [
+            "case_fold",
+            "trim"
+          ]
+        }
+      ]
+    },
+    "merge": {
+      "defaultConflict": "review_required",
+      "fieldPolicies": [
+        {
+          "field": "observed_at",
+          "onConflict": "prefer_newer"
+        },
+        {
+          "field": "run_ref",
+          "onConflict": "prefer_newer"
+        },
+        {
+          "field": "source_ref",
+          "onConflict": "prefer_newer"
+        }
+      ],
+      "mode": "field_policy_after_exact_identity",
+      "preserveSourceRecords": true
+    },
+    "provenance": {
+      "required": true,
+      "requiredReferences": [
+        "observed_at",
+        "run_ref",
+        "source_ref"
+      ],
+      "retainSourceSnapshots": true
+    },
+    "schema": {
+      "additionalFields": "reject",
+      "fields": [
+        {
+          "name": "observed_at",
+          "required": true,
+          "sensitivity": "public",
+          "type": "timestamp"
+        },
+        {
+          "name": "run_ref",
+          "required": true,
+          "sensitivity": "internal",
+          "type": "string"
+        },
+        {
+          "name": "section_name",
+          "required": true,
+          "sensitivity": "public",
+          "type": "string"
+        },
+        {
+          "name": "source_ref",
+          "required": true,
+          "sensitivity": "public",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "deliverables": [
+    {
+      "description": "Up to five documentation sections with name, source provenance, and observation time in the new acceptance Space.",
+      "evidence": [
+        "snapshot record list",
+        "Space revision id"
+      ],
+      "id": "inventory-snapshot",
+      "kind": "dataset_snapshot",
+      "required": true,
+      "successCriterionIds": [
+        "sc-bounded",
+        "sc-isolation",
+        "sc-provenance",
+        "sc-read-only"
+      ]
+    }
+  ],
+  "effectCeiling": {
+    "class": "local_write",
+    "maxOperationsPerRun": 2
+  },
+  "lifetime": {
+    "kind": "ongoing"
+  },
+  "missingInputs": [],
+  "objective": "Controlled framework acceptance test: use the enabled provider's free, read-only documentation section inventory to maintain a new, clearly named local acceptance Space ('Harness acceptance \u2014 documentation inventory 0923') holding up to five documentation sections with their names, source provenance, and observation time. Not a business integration repair.",
+  "partition": {
+    "checkpointEvery": 1,
+    "completion": {
+      "evidence": [
+        "acceptance Space dataset snapshot written with <=5 sections",
+        "documentation section inventory read completed"
+      ],
+      "kind": "terminal_evidence"
+    },
+    "mode": "single"
+  },
+  "phases": [
+    {
+      "capabilityRequirementIds": [
+        "doc-section-inventory-read"
+      ],
+      "dependsOn": [],
+      "effect": {
+        "approval": "not_required",
+        "class": "read",
+        "maxOperationsPerRun": 1
+      },
+      "id": "read-inventory",
+      "objective": "Read the documentation section inventory and select up to five sections, capturing name, source reference, and observation timestamp.",
+      "outputEvidence": [
+        "observed_at timestamp",
+        "section list with names",
+        "source_ref per section"
+      ],
+      "partitioned": false
+    },
+    {
+      "capabilityRequirementIds": [
+        "acceptance-space-write"
+      ],
+      "dependsOn": [
+        "read-inventory"
+      ],
+      "effect": {
+        "approval": "not_required",
+        "class": "local_write",
+        "maxOperationsPerRun": 1
+      },
+      "id": "write-space",
+      "objective": "Write the up-to-five section snapshot into the new acceptance Space, preserving provenance.",
+      "outputEvidence": [
+        "record count <= 5",
+        "Space revision id"
+      ],
+      "partitioned": false
+    }
+  ],
+  "pilot": {
+    "effectCeiling": {
+      "class": "local_write",
+      "maxOperationsPerRun": 2
+    },
+    "haltOnFailure": true,
+    "maxPartitions": 1,
+    "maxRecords": 5,
+    "required": true,
+    "successCriterionIds": [
+      "sc-bounded",
+      "sc-isolation",
+      "sc-provenance",
+      "sc-read-only"
+    ]
+  },
+  "rationale": "Exercises the durable opportunity \u2192 reviewed pilot \u2192 optional recurrence lifecycle end to end against a free metadata-only source, with a bounded local-only output and no paid queries, provider setting changes, external sends, or edits to existing Spaces or workflows.",
+  "recurrence": {
+    "activation": "requires_pilot_success_and_recurrence_consent",
+    "cadence": {
+      "every": 1,
+      "kind": "interval",
+      "unit": "day"
+    },
+    "catchUpPolicy": "skip",
+    "mode": "proposed",
+    "overlapPolicy": "skip"
+  },
+  "successCriteria": [
+    {
+      "description": "Between 1 and 5 section records written.",
+      "evidence": [
+        "record count"
+      ],
+      "id": "sc-bounded"
+    },
+    {
+      "description": "Only the new acceptance Space was written; no existing Space or workflow changed.",
+      "evidence": [
+        "Space revision id",
+        "workflow/space diff"
+      ],
+      "id": "sc-isolation"
+    },
+    {
+      "description": "Every record carries section_name, source_ref, run_ref, and observed_at.",
+      "evidence": [
+        "snapshot record list"
+      ],
+      "id": "sc-provenance"
+    },
+    {
+      "description": "Only the free read-only documentation inventory was called; no paid queries, provider setting changes, or external sends.",
+      "evidence": [
+        "run operation log"
+      ],
+      "id": "sc-read-only"
+    }
+  ],
+  "title": "Harness acceptance \u2014 documentation inventory 0923",
+  "trigger": {
+    "kind": "recurrence"
+  },
+  "version": 1
+}

@@ -167,7 +167,7 @@ test('a cited step is never re-bound to a guessed toolkit family', () => {
   // composio — the access the step's own prompt forbids.
   const cited = [{
     id: 'pull_pipeline',
-    prompt: 'Pull this week\'s closed-won pipeline from the Salesforce connector.',
+    prompt: 'Use Salesforce to pull this week\'s closed-won pipeline.',
     allowedTools: [OPERATION_ID],
   }];
   const citedResult = bindDiscussedToolkitsIntoSteps(
@@ -182,7 +182,7 @@ test('a cited step is never re-bound to a guessed toolkit family', () => {
   // the citation is what stopped it — not the prompt or the toolkit list.
   const uncited = [{
     id: 'pull_pipeline',
-    prompt: 'Pull this week\'s closed-won pipeline from the Salesforce connector.',
+    prompt: 'Use Salesforce to pull this week\'s closed-won pipeline.',
   }];
   const uncitedResult = bindDiscussedToolkitsIntoSteps(
     uncited as Parameters<typeof bindDiscussedToolkitsIntoSteps>[0],

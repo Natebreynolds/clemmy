@@ -663,7 +663,8 @@ test('manual refresh refuses a read-looking Composio source without a current re
     }));
     assert.equal(ref.status, 200);
     assert.equal(ref.body.results[0].ok, false);
-    assert.match(ref.body.results[0].error, /not provably read-only/i);
+    assert.match(ref.body.results[0].error, /exact read catalog preparation was refused/i);
+    assert.match(ref.body.results[0].error, /accepted_source_missing_or_changed/);
     assert.equal(providerBodies, 0);
     assert.equal(Object.hasOwn(ref.body.data, 'pull'), false);
     assert.equal(ref.body.data._meta.pull.ok, false);
@@ -988,4 +989,10 @@ test('every served view carries the framework design layer and helper kit ahead 
   assert.ok(kitAt < styleAt && styleAt < bridgeAt && bridgeAt < authoredAt, 'kit, then style, then bridge, all before the authored document');
   assert.match(html, /:root\[data-theme=dark\]/, 'dark tokens travel with the view');
   assert.ok(html.indexOf('data-theme') > 0, 'the theme handoff is read from the query string by the kit');
+});
+
+test('starter recipes answer on their own route, not as a Space id', async () => {
+  const res = await j(await fetch(`${base}/api/console/spaces/starters`));
+  assert.equal(res.status, 200, 'registered after /spaces/:id, "starters" was looked up as a Space and 404ed');
+  assert.ok(Array.isArray(res.body.starters));
 });

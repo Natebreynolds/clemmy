@@ -10,6 +10,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-quantifie
 const eventlog = await import('./eventlog.js');
 const {
   evaluateQuantifiedWorkManifestGate: evaluateGate,
+  evaluateQuantifiedWorkManifestGateWithArbitration: evaluateGateWithArbitration,
+  _setQuantifiedUniverseArbiterForTests,
 } = await import('./quantified-work-manifest.js');
 const { detectMultiItemIntent } = await import('./multi-item-intent.js');
 const { prepareWorkerManifest } = await import('./work-manifest.js');
@@ -856,4 +858,95 @@ test('a quantified batch above the run_worker schema cap routes to durable workf
     assert.match(decision.error ?? '', /workflow.*forEach/i);
     assert.match(decision.error ?? '', /subset/i);
   }
+});
+
+test('a number inside an item\'s evidence does not fix the contract when a model confirms the declared universe (chat only)', async (t) => {
+  t.after(() => _setQuantifiedUniverseArbiterForTests(null));
+  const text = 'Using the outbound skill, I need three separate cold prospect emails for review. Delegate one draft per prospect to a worker. Fixture prospects: (1) Dana Lee, Northwind Plumbing. (2) Priya Nair, Nair & Voss Injury Law. (3) Marcus Bell, Bell Family Dental, angle: 3.9 star rating with 40 reviews vs a competitor at 4.8 with 600. Do not send anything.';
+  const items = ['prospect-1-dana-lee', 'prospect-2-priya-nair', 'prospect-3-marcus-bell'];
+  const manifest = { id: 'prospects-0924', phase: 'draft', mode: 'declare' } as unknown as WorkerManifestDescriptor;
+  const asked: Array<{ detectedCount: number; declaredItems: readonly string[] }> = [];
+
+  // The synchronous gate still reads 40 from the text and refuses the three.
+  const chat = openTurn('arbitrate-chat', 'chat', text, { policyCount: 40 });
+  const sync = gate({ sessionId: chat, items, workManifest: manifest });
+  assert.equal(sync.ok, false);
+  assert.equal(sync.code, 'fixed_contract_mismatch');
+  assert.equal(sync.expectedCount, 40);
+
+  // A model confirms the declared three are the whole request: workers may start.
+  _setQuantifiedUniverseArbiterForTests(async (input) => { asked.push(input); return { ok: true, noul: 0.93 }; });
+  const confirmed = await evaluateGateWithArbitration({ sessionId: chat, sourceUserSeq: sourceSeqBySession.get(chat), items, workManifest: manifest });
+  assert.equal(confirmed.ok, true, JSON.stringify(confirmed));
+  assert.equal(confirmed.expectedCount, 3);
+  assert.deepEqual(confirmed.arbitrated, { detectedCount: 40, declaredCount: 3, noul: 0.93 });
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].detectedCount, 40);
+  assert.deepEqual(asked[0].declaredItems, items);
+  const recorded = eventlog.listEvents(chat, { types: ['guardrail_tripped'] }).filter((e) => e.data.kind === 'quantified_universe_arbitrated');
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].data.accepted, true);
+
+  // Unsure or unavailable keeps the refusal and says a model was asked.
+  const unsureChat = openTurn('arbitrate-chat-unsure', 'chat', text, { policyCount: 40 });
+  _setQuantifiedUniverseArbiterForTests(async () => ({ ok: true, noul: 0.4 }));
+  const unsure = await evaluateGateWithArbitration({ sessionId: unsureChat, sourceUserSeq: sourceSeqBySession.get(unsureChat), items, workManifest: manifest });
+  assert.equal(unsure.ok, false);
+  assert.match(unsure.error ?? '', /did not confirm it/);
+  _setQuantifiedUniverseArbiterForTests(async () => ({ ok: false }));
+  const down = await evaluateGateWithArbitration({ sessionId: unsureChat, sourceUserSeq: sourceSeqBySession.get(unsureChat), items, workManifest: manifest });
+  assert.equal(down.ok, false);
+  assert.match(down.error ?? '', /was unavailable/);
+
+  // An execution session never arbitrates: its universe must be durable.
+  const execution = openTurn('arbitrate-execution', 'execution', text, { policyCount: 40 });
+  let executionAsked = 0;
+  _setQuantifiedUniverseArbiterForTests(async () => { executionAsked += 1; return { ok: true, noul: 1 }; });
+  const hard = await evaluateGateWithArbitration({ sessionId: execution, sourceUserSeq: sourceSeqBySession.get(execution), items, workManifest: manifest });
+  assert.equal(hard.ok, false);
+  assert.equal(executionAsked, 0);
+});
+
+
+test('inline numbered worker targets outrank incidental counts inside their details', async () => {
+  const text = 'Draft three separate prospect emails. Delegate one per prospect in parallel. '
+    + 'Prospects: (1) Northstar Plumbing, outranked in local search; '
+    + '(2) Valley Legal, competitors advertise; '
+    + '(3) Riverside Dental, 3.9 stars with 40 reviews against 4.8 stars with 600 reviews. Do not send anything.';
+  const detected = detectMultiItemIntent(text);
+  assert.equal(detected.isMultiItem, true);
+  assert.equal(detected.itemCount, 3);
+  assert.equal(detected.exactMembers?.length, 3);
+  assert.match(detected.exactMembers![2], /40 reviews/);
+  const sentences = detectMultiItemIntent(text.replaceAll('; (', '. ('));
+  assert.equal(sentences.itemCount, 3, 'sentence-separated inline items retain the same universe');
+  assert.equal(sentences.exactMembers?.length, 3);
+  const sessionId = openTurn('inline-packets-preserved', 'chat', text, { policyCount: detected.itemCount });
+  // Each original packet can proceed separately: no forced conversion of
+  // distinct instructions into one shared packet to satisfy a false count.
+  for (const item of ['northstar', 'valley', 'riverside']) {
+    const result = await evaluateGateWithArbitration({ sessionId,
+      sourceUserSeq: sourceSeqBySession.get(sessionId), items: [item] });
+    assert.deepEqual(result, { ok: true, required: false });
+  }
+});
+
+test('inline enumeration keeps arbitrary cardinality and single-artifact boundaries', () => {
+  const members = Array.from({ length: 12 }, (_, index) => `(${index + 1}) target-${index + 1} with 40 reviews`).join('; ');
+  assert.equal(detectMultiItemIntent(`Audit each target in parallel: ${members}`).itemCount, 12);
+  const sections = detectMultiItemIntent('Create one report with sections: (1) Overview; (2) Evidence; (3) Recommendations');
+  assert.equal(sections.isMultiItem, false);
+  assert.equal(detectMultiItemIntent('Audit sources: (1) Alpha; (3) Beta; (4) Gamma').exactMembers, undefined);
+  assert.equal(detectMultiItemIntent('Compare the values (10) and (20) with (30).').exactMembers, undefined);
+});
+
+
+test('recorded three-prospect draft request keeps its three independent worker packets', () => {
+  const input = "Using the scorpion-outbound skill, I need three separate cold prospect emails for review. Delegate one draft per prospect to a worker, in parallel, then review all three against the skill checklist and present each with To, Subject, Body and word count. Fixture prospects: (1) Dana Lee, Northwind Plumbing, Portland OR, home services, angle: outranked for \"emergency plumber Portland\", no online booking. (2) Priya Nair, Nair & Voss Injury Law, Denver CO, legal, angle: competitors run Google Local Services Ads for \"car accident lawyer Denver\" and they do not. (3) Marcus Bell, Bell Family Dental, Tampa FL, healthcare, angle: 3.9 star rating with 40 reviews vs a competitor at 4.8 with 600. Do not send anything, do not touch any CRM, change nothing.";
+  const detected = detectMultiItemIntent(input);
+  assert.equal(detected.itemCount, 3);
+  assert.equal(detected.exactMembers?.length, 3);
+  assert.match(detected.exactMembers![0], /Dana Lee/);
+  assert.match(detected.exactMembers![1], /Priya Nair/);
+  assert.match(detected.exactMembers![2], /Marcus Bell/);
 });

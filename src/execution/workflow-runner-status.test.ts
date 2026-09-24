@@ -191,3 +191,42 @@ test('activity run writer exposes a first-class blocked terminal event', () => {
   assert.equal(blocked?.events.at(-1)?.type, 'blocked');
   assert.equal(blocked?.events.some((event) => event.type === 'completed' || event.type === 'failed'), false);
 });
+
+test('a workflow recovery owner retains its attempt until its exact terminal closes it', async () => {
+  resetEventLog();
+  const f = fixture('owned-recovery');
+  const { HarnessSession } = await import('../runtime/harness/session.js');
+  const leases = await import('../runtime/harness/dispatch-lease.js');
+  const { getPlanScope } = await import('../agents/plan-scope.js');
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  let owner!: { sourceUserSeq: number; attemptId: string };
+  let lease!: ReturnType<typeof leases.activateDispatchLease>;
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (input: { sourceUserSeq: number; runAttemptId: string }) => {
+      owner = { sourceUserSeq: input.sourceUserSeq, attemptId: input.runAttemptId };
+      const session = HarnessSession.load(f.sessionId)!;
+      assert.equal(session.claimContinuationOwner(owner), true);
+      lease = leases.activateDispatchLease({ sessionId: f.sessionId,
+        scopeId: f.sessionId + '::continuation', runAttemptId: owner.attemptId });
+      return { sessionId: f.sessionId, status: 'held', steps: 0, lastTurn: 1,
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' } };
+    }) as never,
+  });
+  await assert.rejects(executeStep(f.step, f.ctx), WorkflowHarnessHeldSignal);
+  assert.equal(getLatestRunAttempt(f.sessionId)?.finishedAt, null,
+    'returning a held result must not revoke its live continuation');
+  assert.equal(getPlanScope(f.sessionId)?.closedAt, undefined, 'authored execution scope survives the held consumer');
+  assert.equal(leases.isDispatchLeaseCurrent(lease), true,
+    'the next protected read still has a live parent');
+  const identity = { sessionId: f.sessionId, sourceUserSeq: owner.sourceUserSeq,
+    attemptId: owner.attemptId, turn: 1 };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Finished.' } });
+  assert.ok(getLatestRunAttempt(f.sessionId)?.finishedAt);
+  assert.ok(getPlanScope(f.sessionId)?.closedAt, 'the exact terminal releases its scope');
+  assert.equal(leases.isDispatchLeaseCurrent(lease), false,
+    'terminal completion still revokes continuation authority');
+});

@@ -439,3 +439,31 @@ test('command center keeps limit-exceeded harness sessions working until complet
     await h.close();
   }
 });
+
+test('Home names a carrier-wrapped approval by what it does, never by the carrier', async () => {
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const session = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop', metadata: { source: 'desktop' } });
+  const approval = approvalRegistry.register({
+    sessionId: session.id,
+    channel: 'desktop',
+    subject: 'Send Slack message',
+    tool: 'work_call',
+    args: {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE', arguments: { channel: 'D0TEST', text: 'hello' } }),
+    },
+  });
+  const h = await boot();
+  try {
+    const body = await (await fetch(`${h.url}/api/console/home/command-center`)).json() as {
+      needsYou: Array<{ approvalId?: string; title: string; meta: string }>;
+    };
+    const card = body.needsYou.find((item) => item.approvalId === approval.approvalId);
+    assert.ok(card, 'the pending approval reaches Home');
+    assert.equal(card.title, 'Approve: Send Slack message');
+    assert.doesNotMatch(`${card.title} ${card.meta}`, /work_call|composio|execute_tool|apr-/i);
+  } finally {
+    await h.close();
+    approvalRegistry.resolve(approval.approvalId, 'rejected', 'test');
+  }
+});

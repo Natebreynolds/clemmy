@@ -78,7 +78,6 @@ const {
   forEachItemOutputContract,
   forEachAggregateOutputContract,
   verifyForEachItemOutput,
-  inferredOutputContractAdvisory,
   sendAlreadyClaimed,
   stepExternalWriteAlreadyClaimed,
   stepSendAlreadyFired,
@@ -1962,6 +1961,8 @@ test('ambiguous capability gate requires exact account CAS, selects B, and dedup
     stepId: 'publish',
     capabilityId: 'cap:sheet:account-b',
     accountId: 'account-b',
+    // An ordinary parked run resumes as a run; a parked creation test says so.
+    mode: 'run',
   });
   const persisted = JSON.parse(readFileSync(filePath, 'utf-8')) as {
     status: string;
@@ -2513,58 +2514,9 @@ test('describeOutputShape: names the actual produced shape (so a contract failur
   assert.equal(describeOutputShape(null), 'null');
 });
 
-test('inferredOutputContractAdvisory: accepts legacy prose with concrete URL evidence', () => {
-  const note = inferredOutputContractAdvisory(
-    { id: 'publish', prompt: 'Build and publish the website page URL.' } as never,
-    'Published at https://example.com/landing',
-  );
-  assert.equal(note, null);
-});
-
-test('inferredOutputContractAdvisory: accepts legacy prose with an existing file path', () => {
-  const filePath = path.join(tmp, 'legacy-report.md');
-  writeFileSync(filePath, '# Report\n', 'utf-8');
-  const note = inferredOutputContractAdvisory(
-    { id: 'report', prompt: 'Create an HTML file and output the file path.' } as never,
-    `Saved to ${filePath}.`,
-  );
-  assert.equal(note, null);
-});
-
-test('inferredOutputContractAdvisory: flags a legacy deliverable step with no list evidence', () => {
-  const note = inferredOutputContractAdvisory(
-    { id: 'leads', prompt: 'Generate a list of weekly leads.' } as never,
-    'No leads found.',
-  );
-  assert.match(note ?? '', /non-empty list/);
-  assert.match(note ?? '', /produced string/);
-});
-
-test('a verified file briefing is not blocked by source-record vocabulary in a legacy prompt', () => {
-  const filePath = path.join(tmp, 'record-briefing.md');
-  writeFileSync(filePath, '# Briefing\nBudget: 237\n', 'utf-8');
-  const note = inferredOutputContractAdvisory(
-    { id: 'brief', prompt: 'Read the project record and follow its referenced sources. Create one Markdown briefing file and read the saved file back.' } as never,
-    { path: filePath, read_back_verified: true, budget: 237 },
-  );
-  assert.match(note ?? '', /non-empty list/); // The legacy heuristic confuses an input with an output.
-  const advisory = { kind: 'inferred_output_contract' as const };
-  assert.equal(workflowAdvisoryRequiresAttention(advisory), false);
-  assert.equal(workflowReportLaneForOutcome({ needsAttention: false, advisories: [advisory] }), 'done');
-  assert.equal(workflowReportLaneForOutcome({ needsAttention: true, advisories: [advisory] }), 'blocked');
-});
-
-test('inferredOutputContractAdvisory: explicit output contracts own their own enforcement path', () => {
-  const note = inferredOutputContractAdvisory(
-    {
-      id: 'leads',
-      prompt: 'Generate a list of weekly leads.',
-      output: { type: 'object', required_keys: ['items'], non_empty: ['items'] },
-    } as never,
-    { items: [] },
-  );
-  assert.equal(note, null);
-});
+// Legacy prose requirements are reviewed against actual run evidence in
+// workflow-objective-judge.test.ts. Word-derived shape advisories were removed
+// after they falsely rejected a verified file update in live acceptance.
 
 test('workflowAdvisoryRequiresAttention: confident quality misses are not clean success', () => {
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'target_missed' }), true);
@@ -5436,7 +5388,7 @@ test('workflow conversion: a plain step routes through the GATED harness loop wh
   }
 });
 
-test('executeStep: legacy plain deliverable step records inferred output-contract advisory', async () => {
+test('executeStep: legacy prose does not manufacture a non-empty output contract', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   process.env.WORKFLOW_USE_HARNESS = 'on';
   try {
@@ -5461,10 +5413,10 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
     const out = await executeStep(step, ctx);
     assert.equal(out, 'No leads found.');
     const advisory = qualityAdvisories.find((a) => a.kind === 'inferred_output_contract');
-    assert.match(advisory?.note ?? '', /non-empty list/);
+    assert.equal(advisory, undefined, 'semantic target review decides whether the reported empty result is supported');
     const event = readWorkflowEvents('legacy-deliverable-advisory', 'legacy-deliverable-1')
       .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'inferred_output_contract');
-    assert.equal(event?.stepId, 'lead_list');
+    assert.equal(event, undefined, 'no guessed shape is persisted as a factual quality failure');
   } finally {
     _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
@@ -8142,7 +8094,8 @@ test('a capability pause says what actually happened instead of "go reconnect"',
     ...base, message: 'The saved GOOGLESHEETS connection is missing or belongs to a different Composio user.',
   } as never);
   assert.match(reallyDead.title, /connect googlesheets/);
-  assert.match(reallyDead.detail, /Open Settings/, 'a real disconnection keeps its real cure');
+  assert.match(reallyDead.detail, /Connect page/, 'a real disconnection keeps its real cure');
+  assert.match(reallyDead.detail, /different Composio user/, 'a diagnostic that says something new stays');
 });
 
 // The owner's rule, 2026-09-11: "if a workflow doesn't fire, any subsequent one
@@ -8166,4 +8119,125 @@ test('a capability-blocked run gets one automatic retry, then waits for a person
   const firstBlip = { retryCount: 1 };
   assert.ok(firstBlip.retryCount <= WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT,
     'a single transient failure still recovers on its own');
+});
+
+test('a parked CREATION TEST resumes as a creation test when its account question is answered — never as a real run', async () => {
+  const { persistStepAccountBinding, capabilityBlockResumeStatus } = await import('./workflow-runner.js');
+  const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+  const runId = 'creation-test-account-choice';
+  const filePath = writeCapabilityBlockedRun(runId, new Date(Date.now() - 1_000).toISOString());
+  const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  const choices = workflowCapabilityAccountChoiceSet([
+    { capabilityId: 'cap:sheet:account-a', account: 'account-a' },
+    { capabilityId: 'cap:sheet:account-b', account: 'account-b' },
+  ]);
+  writeFileSync(filePath, JSON.stringify({
+    ...record,
+    activateAfterCreationTest: true,
+    capabilityBlock: {
+      ...(record.capabilityBlock as Record<string, unknown>),
+      reason: 'ambiguous-account',
+      message: 'Choose an exact Sheets account.',
+      accountChoiceSet: choices,
+      resumeStatus: 'creation_test',
+    },
+  }, null, 2), 'utf-8');
+  assert.equal(capabilityBlockResumeStatus({ resumeStatus: 'creation_test' }), 'creation_test');
+  assert.equal(capabilityBlockResumeStatus({}), 'running');
+
+  // Neither the timer nor a generic retry may turn the preview into a run.
+  assert.equal(reapCapabilityBlockedRuns(Date.now()), 0);
+  assert.equal(resumeCapabilityBlockedWorkflowRun(runId), false);
+  assert.equal(JSON.parse(readFileSync(filePath, 'utf-8')).status, 'blocked_capability');
+
+  const selected = resolveWorkflowCapabilityAccountChoice({
+    runId,
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    retryCount: 1,
+    choiceSetDigest: choices.digest,
+    capabilityId: 'cap:sheet:account-b',
+    accountId: 'account-b',
+    selectedBy: 'mobile-inbox:test',
+  });
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.equal(selected.status, 'selected');
+    assert.equal(selected.mode, 'creation_test');
+  }
+  const persisted = JSON.parse(readFileSync(filePath, 'utf-8')) as {
+    status: string; activateAfterCreationTest?: boolean;
+    capabilityBlock: { state: string; resumeStatus?: string; accountSelection?: Record<string, unknown> };
+  };
+  // THE pin: the resumed record is a creation test, mutations stay previewed.
+  assert.equal(persisted.status, 'creation_test');
+  assert.equal(persisted.activateAfterCreationTest, true, 'the activation preference survives the pause');
+  assert.equal(persisted.capabilityBlock.state, 'retrying');
+  assert.equal(persisted.capabilityBlock.resumeStatus, 'creation_test');
+  assert.equal(persisted.capabilityBlock.accountSelection?.accountId, 'account-b');
+
+  // A second tap is a no-op with the same mode, never a second resume.
+  const replay = resolveWorkflowCapabilityAccountChoice({
+    runId, stepId: 'publish', tool: 'GOOGLESHEETS_BATCH_UPDATE', retryCount: 1,
+    choiceSetDigest: choices.digest, capabilityId: 'cap:sheet:account-b', accountId: 'account-b',
+  });
+  assert.equal(replay.ok, true);
+  if (replay.ok) { assert.equal(replay.status, 'already_selected'); assert.equal(replay.mode, 'creation_test'); }
+
+  // The answer outlives the run: it lands on the definition step exactly,
+  // and only on a step whose call tool still matches.
+  writeWorkflow('account-binding-target', {
+    name: 'account-binding-target',
+    description: 'binding target',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'publish', prompt: 'publish', sideEffect: 'write', call: { tool: 'GOOGLESHEETS_BATCH_UPDATE', args: { rows: [] } } },
+      { id: 'other', prompt: 'other', sideEffect: 'read', call: { tool: 'GOOGLESHEETS_GET' } },
+    ],
+  });
+  const block = persisted.capabilityBlock as unknown as { stepId: string; tool: string; accountSelection: { capabilityId: string; accountId: string; choiceSetDigest: string; selectedAt: string; selectedBy: string } };
+  assert.equal(persistStepAccountBinding('account-binding-target', { stepId: 'publish', tool: 'GOOGLESHEETS_BATCH_UPDATE', accountSelection: block.accountSelection }), true);
+  const bound = readWorkflow('account-binding-target');
+  assert.equal(bound?.data.enabled, false, 'binding an account never enables a draft');
+  assert.equal(bound?.data.steps.find((s) => s.id === 'publish')?.call?.account?.accountId, 'account-b');
+  assert.equal(bound?.data.steps.find((s) => s.id === 'publish')?.call?.account?.choiceSetDigest, choices.digest);
+  assert.equal(bound?.data.steps.find((s) => s.id === 'other')?.call?.account, undefined);
+  // Idempotent: the same answer again changes nothing.
+  assert.equal(persistStepAccountBinding('account-binding-target', { stepId: 'publish', tool: 'GOOGLESHEETS_BATCH_UPDATE', accountSelection: block.accountSelection }), false);
+  // A step whose tool changed is not silently rebound.
+  assert.equal(persistStepAccountBinding('account-binding-target', { stepId: 'publish', tool: 'GOOGLESHEETS_APPEND', accountSelection: block.accountSelection }), false);
+  rmSync(filePath, { force: true });
+});
+
+test('a reviewer\'s change request is recorded on the parked run that owns the gate, and nowhere else', async () => {
+  const { recordWorkflowGateChangeRequest } = await import('./workflow-runner.js');
+  const runId = 'gate-change-request-run';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(filePath, JSON.stringify({
+    id: runId,
+    workflow: 'Review WF',
+    status: 'parked',
+    parked: { parkedAt: new Date().toISOString(), parkedSteps: [{ stepId: 'send_draft', kind: 'gate', approvalIds: ['apr-1'] }] },
+  }, null, 2), 'utf-8');
+  // Not a gate session → refused, nothing written.
+  assert.deepEqual(
+    recordWorkflowGateChangeRequest({ approvalId: 'apr-1', sessionId: 'sess-desktop-abc', note: 'shorter', by: 'desktop' }),
+    { ok: false, reason: 'not a workflow approval gate' },
+  );
+  // Wrong approval for this run → refused.
+  assert.equal(
+    recordWorkflowGateChangeRequest({ approvalId: 'apr-other', sessionId: `workflow-gate:${runId}:send_draft`, note: 'shorter', by: 'desktop' }).ok,
+    false,
+  );
+  const recorded = recordWorkflowGateChangeRequest({
+    approvalId: 'apr-1', sessionId: `workflow-gate:${runId}:send_draft`, note: '  Make it   shorter and warmer. ', by: 'mobile-inbox:dev1',
+  });
+  assert.deepEqual(recorded, { ok: true, runId, stepId: 'send_draft' });
+  const persisted = JSON.parse(readFileSync(filePath, 'utf-8')) as { parked: { changeRequest?: Record<string, unknown> } };
+  assert.equal(persisted.parked.changeRequest?.note, 'Make it shorter and warmer.');
+  assert.equal(persisted.parked.changeRequest?.stepId, 'send_draft');
+  assert.equal(persisted.parked.changeRequest?.requestedBy, 'mobile-inbox:dev1');
+  rmSync(filePath, { force: true });
 });

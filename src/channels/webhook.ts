@@ -22,6 +22,7 @@ import {
   WEBHOOK_SECRET_IS_STRONG,
   isLoopbackWebhookHost,
 } from '../config.js';
+import { needsYouKey, needsYouReferents, notificationNeedsYou } from '../dashboard/needs-you.js';
 import { DASHBOARD_CRON_RUNS_DIR, buildDashboardSnapshot, loadCronJobs, loadWorkflows, readDaemonState, readRecentJsonLines, readWorkflowRuns } from '../dashboard/state.js';
 // Added 2026-05-21: /api/runs/:id fallbacks for harness sessions and
 // workflow runs. The legacy run-store only knows about run-xxx IDs;
@@ -77,7 +78,6 @@ import {
 import {
   addNotification,
   getNotification,
-  isNeedsAttentionNotification,
   loadNotifications,
   listNotifications,
   listNotificationDestinations,
@@ -1819,7 +1819,10 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 300) : 50;
     const allNotifications = loadNotifications()
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    const actionable = allNotifications.filter((row) => !row.read && isNeedsAttentionNotification(row));
+    // The one needs-you definition (dashboard/needs-you.ts), so the desktop
+    // Needs you tab lists what the sidebar and the phone count.
+    const ref = needsYouReferents();
+    const actionable = allNotifications.filter((row) => !row.read && notificationNeedsYou(row, ref));
     const actionableIds = new Set(actionable.map((row) => row.id));
     const prioritized = [
       ...actionable,
@@ -1828,7 +1831,8 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     res.json({
       notifications: prioritized.map((notification) => ({
         ...notification,
-        needsAttention: isNeedsAttentionNotification(notification),
+        needsAttention: notificationNeedsYou(notification, ref),
+        needsYouKey: needsYouKey(notification, ref),
         workflowCapability: projectWorkflowCapabilityInboxGate(notification),
         workflowEnableGate: projectWorkflowEnableInboxGate(notification),
       })),

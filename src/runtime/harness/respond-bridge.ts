@@ -1420,6 +1420,13 @@ export async function respondViaHarness(
     maxSteps?: number;
   } = {},
 ): Promise<AssistantResponse> {
+  // Request-local offsets expose pre-routing work without another model call
+  // or an async boundary. Never add these observations to execution authority.
+  const preparationStartedAt = performance.now();
+  const preparationStages: Record<string, number> = {};
+  const markPreparation = (stage: string): void => {
+    preparationStages[stage] = Math.max(0, performance.now() - preparationStartedAt);
+  };
   const config = SURFACE_CONFIG[surface];
   const sessionId = request.sessionId;
   const acceptedSourceUserSeq = opts.sourceUserSeq ?? request.sourceUserSeq;
@@ -1488,6 +1495,7 @@ export async function respondViaHarness(
       source: `bridge:${surface}`,
     },
   }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
+  markPreparation('accepted_source_ready');
   const durableTaskMode = parseTaskMode(sourceUserEvent.data.taskMode);
   if (request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(durableTaskMode)) throw new Error('accepted task mode mismatch');
   request = { ...request, taskMode: durableTaskMode };
@@ -1512,6 +1520,7 @@ export async function respondViaHarness(
       surface,
     });
   }
+  markPreparation('clarification_checked');
   const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
     ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
     : undefined;
@@ -1520,6 +1529,7 @@ export async function respondViaHarness(
     ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
     typedClassification,
   });
+  markPreparation('continuity_resolved');
   // Keep the literal Q/B user item byte-exact. The exact durable packet and
   // admitted visible option may mint one transient system steer; caller-
   // supplied semantic context was stripped/rebuilt at the boundary above.
@@ -1656,6 +1666,7 @@ export async function respondViaHarness(
       );
     }
   }
+  markPreparation('material_source_resolved');
   // Fresh host turns deliberately skip the bridge's eager capability lookup:
   // accepted source -> context node -> capability_resolve node -> first model
   // step is the owned order. The old cutover left no replacement lookup at
@@ -1713,6 +1724,7 @@ export async function respondViaHarness(
   if (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine)) {
     await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
   }
+  markPreparation('graph_observed');
   // Advisory candidate resolution cannot commit source authority, so
   // failures while building the agent/tool surface remain restart-recoverable.
   preserveCurrentKillAndClearStale(sessionId, requestAttempt);
@@ -1839,6 +1851,12 @@ export async function respondViaHarness(
     // particular, a model-authored {"reply":"..."} envelope is still only a
     // proposal: retries, judges, and effect verification can replace it. The
     // terminal TurnOutcome committer publishes the authoritative presentation.
+    markPreparation('harness_dispatch_entered');
+    try {
+      appendEvent({ sessionId, turn: sourceUserEvent.turn, role: 'system', type: 'turn_phase_timings',
+        data: { sourceUserSeq: sourceUserEvent.seq, lane: 'respond_bridge',
+          stages: preparationStages, totalMs: preparationStages.harness_dispatch_entered } });
+    } catch { /* Diagnostics never change dispatch or completion behavior. */ }
     const result = await runConversationImpl({
       buildAgent,
       sessionId,
@@ -2299,10 +2317,18 @@ async function respondPreferHarnessOnce(
     );
   }
   let auth: { ok: boolean; reason?: string };
+  const runtimeConfigurationStartedAt = performance.now();
   try {
     auth = await configureImpl();
   } catch (err) {
     auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    try {
+      const source = durableSourceEventForRequest(request);
+      if (source) appendEvent({ sessionId: source.sessionId, turn: source.turn, role: 'system',
+        type: 'turn_phase_timings', data: { sourceUserSeq: source.seq, lane: 'runtime_configuration',
+          totalMs: Math.max(0, performance.now() - runtimeConfigurationStartedAt) } });
+    } catch { /* Diagnostics cannot change runtime admission. */ }
   }
   if (!auth.ok) {
     return await blockedPreRunResponse(

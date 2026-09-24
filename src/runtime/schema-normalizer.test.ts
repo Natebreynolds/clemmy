@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 import {
   compactAdvertisedJsonSchema,
+  projectTupleSchemasFor202012,
+  decodeProjectedOptionalNulls,
   materializeStrictNullableFields,
   normalizeZodForCodexStrict,
   normalizeZodForDeferredJson,
@@ -249,4 +251,57 @@ test('an empty array becomes null only when the schema rejects empty and accepts
   // A populated list is never touched.
   const populated = materializeStrictNullableFields({ source_record_ids: ['rec_1'] }, schema) as Record<string, unknown>;
   assert.deepEqual(populated.source_record_ids, ['rec_1']);
+});
+
+
+test('projected optional nulls decode against original semantics, including nested union branches', () => {
+  const schema = z.object({
+    required: z.string(),
+    clear: z.string().nullable().optional(),
+    options: z.array(z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('one'), authority: z.object({ id: z.string() }).optional() }),
+      z.object({ kind: z.literal('two'), authority: z.object({ id: z.string() }).nullable() }),
+    ])),
+    payload: z.record(z.string(), z.unknown()),
+    omitted: z.string().optional(),
+  });
+  const wire = { required: 'keep', clear: null, omitted: null,
+    options: [{ kind: 'one', authority: null }, { kind: 'two', authority: null }],
+    payload: { exact: null, nested: { exact: null } }, unknown: null };
+  const decoded = decodeProjectedOptionalNulls(wire, schema);
+  assert.deepEqual(decoded, { required: 'keep', clear: null,
+    options: [{ kind: 'one' }, { kind: 'two', authority: null }],
+    payload: wire.payload, unknown: null });
+  assert.equal(wire.omitted, null, 'the sealed wire arguments are never mutated');
+  assert.ok(schema.safeParse(decoded).success);
+  assert.deepEqual(decodeProjectedOptionalNulls({ required: null }, schema), { required: null },
+    'a required invalid value must not become omission or a default');
+  assert.deepEqual(decodeProjectedOptionalNulls({ required: 'bad', options: [{ kind: 'unknown', authority: null }] }, schema),
+    { required: 'bad', options: [{ kind: 'unknown', authority: null }] }, 'unknown branches are not repaired');
+});
+
+test('ambiguous optional/null unions keep the explicit value', () => {
+  const schema = z.union([z.object({ item: z.string().optional() }), z.object({ item: z.string().nullable() })]);
+  assert.deepEqual(decodeProjectedOptionalNulls({ item: null }, schema), { item: null });
+});
+
+
+test('tuple dialect projection preserves closed, open and typed tails without rewriting instance data', async () => {
+  const { Ajv2020 } = await import('ajv/dist/2020.js');
+  const { Ajv } = await import('ajv');
+  for (const tail of [undefined, false, { type: 'number' }]) {
+    const legacy = { type: 'object', properties: {
+      items: { type: 'array', items: [{ type: 'string' }], minItems: 1,
+        ...(tail === undefined ? {} : { additionalItems: tail }) },
+    }, required: ['items'], additionalProperties: false,
+    default: { items: ['do not rewrite this data'] } };
+    const modern = projectTupleSchemasFor202012(legacy);
+    const before = new Ajv({ strict: false }).compile(legacy);
+    const after = new Ajv2020({ strict: false }).compile(modern as object);
+    for (const items of [[], ['first'], [1], ['first', 2], ['first', 'second'], ['first', 2, 3]]) {
+      assert.equal(after({ items }), before({ items }), JSON.stringify({ tail, items }));
+    }
+    assert.deepEqual((modern as typeof legacy).default, legacy.default);
+    assert.deepEqual(projectTupleSchemasFor202012(modern), modern);
+  }
 });

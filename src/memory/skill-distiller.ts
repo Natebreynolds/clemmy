@@ -37,6 +37,7 @@ import {
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
+import { publishLearnedSkillOffer } from './skill-proactive-offer.js';
 import { consolidateFact } from './reflection.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
 
@@ -779,6 +780,10 @@ async function distillFromCalls(
     if (claim.status !== 'written' || !claim.name) return claim;
     const name = claim.name;
 
+    let proactiveOfferId: string | undefined;
+    try { proactiveOfferId = publishLearnedSkillOffer(name)?.id; }
+    catch { /* A discussion offer cannot fail a persisted skill. */ }
+
     try {
       addNotification({
         id: `skill-draft-${name}`,
@@ -787,7 +792,7 @@ async function distillFromCalls(
         body: `I distilled a reusable skill from a successful run: ${draft.description}. It's usable now (marked draft); approve or discard from the Skills panel.`,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { skillName: name, tier: 'draft', origin: context.origin.kind },
+        metadata: { skillName: name, tier: 'draft', origin: context.origin.kind, ...(proactiveOfferId ? { proactiveOfferId } : {}) },
       });
     } catch { /* suggestion is best-effort */ }
 

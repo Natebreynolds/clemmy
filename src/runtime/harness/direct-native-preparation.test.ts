@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { bindHostLocalCallPreparation, prepareDirectHostLocalCall } from './host-local-call-preparation.js';
-import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
+import { catalogEntries, resolveHotSet } from '../../agents/tool-catalog.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
@@ -13,14 +13,20 @@ const unavailablePlanning = { authority: {} } as Parameters<typeof bindHostLocal
 
 test('native schemas are stable product entries, independent of prompt wording', () => {
   for (const name of NATIVE_PRODUCT_AUTHORING_TOOLS) {
-    assert(TOOL_SEARCH_ALWAYS_LOADED.has(name));
+    assert(catalogEntries().some(entry => entry.name === name), 'native entry remains discoverable');
+    assert(resolveHotSet(undefined, name).has(name), 'explicit selection exposes the native schema');
+    assert(!catalogEntries({ allowedNames: new Set() }).some(entry => entry.name === name),
+      'discovery must respect the captured tool policy');
     const declaration = TOOL_REGISTRY.find(tool => tool.name === name);
     assert(declaration?.localPlanning);
     assert.equal(declaration.localPlanning.reversibility, 'reversible');
     assert.equal(declaration.localPlanning.destructive, false);
   }
   for (const name of ['workflow_run', 'workflow_run_status', 'workflow_get', 'space_get']) {
-    assert(TOOL_SEARCH_ALWAYS_LOADED.has(name));
+    assert(catalogEntries().some(entry => entry.name === name), 'native entry remains discoverable');
+    assert(resolveHotSet(undefined, name).has(name), 'explicit selection exposes the native schema');
+    assert(!catalogEntries({ allowedNames: new Set() }).some(entry => entry.name === name),
+      'discovery must respect the captured tool policy');
   }
 });
 

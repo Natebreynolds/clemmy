@@ -76,7 +76,15 @@ test('paired phone and desktop review and Execute either origin, preserving prin
       const source = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
         data: { text: 'Prepare this exact test plan.', taskMode: { version: 1, kind: 'plan' }, userId: principalId } });
       const artifact = plans.publishPlanRevision({ sessionId, principalId, sourceUserSeq: source.seq,
-        fullText: `Complete ${origin} plan.\n${'Preserved detail. '.repeat(1500)}Exact tail.`, readiness: 'ready' });
+        fullText: `Complete ${origin} plan.\n${'Preserved detail. '.repeat(1500)}Exact tail.`, readiness: 'ready',
+        // This fixture reviews a reasoning-only plan. Tool-bearing plans need
+        // actual prepared capability bindings; absence of preparation is not ready.
+        structuredPlan: {
+          steps: [{ id: 'review', action: 'Review the preserved plan details and report the result.',
+            effect: 'none', capabilityRef: null, staticArguments: {}, dynamicBindings: [],
+            dependsOn: [], subagentRole: null, verification: 'The reply describes the reviewed details.' }],
+          preparedBindings: [], preparationIssues: [],
+        } });
       const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
       return { sessionId, principalId, artifact, ref, taskMode: { version: 1 as const, kind: 'execute' as const, executeRef: ref } };
     };
@@ -116,6 +124,16 @@ test('paired phone and desktop review and Execute either origin, preserving prin
         await new Promise(resolve => setTimeout(resolve, 20));
       }
       assert.ok(log.getLatestRunAttemptByRunId(f.sessionId, firstBody.runId)?.finishedAt);
+      if (controlSurface === 'desktop') {
+        const timings = log.listEvents(f.sessionId, { types: ['turn_phase_timings'] })
+          .filter(event => event.data.lane === 'desktop_admission');
+        assert.equal(timings.length, 1);
+        assert.equal(timings[0]!.data.sourceUserSeq, source!.seq);
+        const phases = timings[0]!.data.phases as Array<{ phase: string; elapsedMs: number }>;
+        assert.deepEqual(phases.map(row => row.phase), ['source_recorded', 'executor_started', 'before_bridge']);
+        assert.ok(phases.every((row, index) => row.elapsedMs >= 0
+          && (index === 0 || row.elapsedMs >= phases[index - 1]!.elapsedMs)));
+      }
       log.closeEventLog();
       const callsBeforeReplay = brainCalls;
       for (const surface of ['desktop', 'mobile'] as const) {

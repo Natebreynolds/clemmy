@@ -364,6 +364,7 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
   ]));
 
   let primaryStep = 0;
+  let initialPlanSchema = false;
   let discoveredRoleKey: string | null = null;
   const scriptedModel = {
     async getResponse(rawRequest: unknown) {
@@ -373,10 +374,11 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
       primaryStep += 1;
       let output: unknown[];
       if (primaryStep === 1) {
+        initialPlanSchema = tools.includes(PLAN_CONTROL);
         assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery');
         discoveredRoleKey = serialized.match(/clause-\d+:[a-z_]+/i)?.[0] ?? null;
         output = [functionCall('discover-sheet-create', 'tool_search', {
-          query: 'create a new google sheet',
+          query: [CREATE_OPERATION, UPDATE_OPERATION, READ_OPERATION].join(' '),
           role_key: discoveredRoleKey,
           limit: 8,
         })];
@@ -391,7 +393,7 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
           'the create ref stays disclosed on this same turn');
         assert.match(serialized, new RegExp(UPDATE_REF.replace(/[:.]/g, '\\$&')),
           'the update ref is disclosed on the same bounded card');
-        assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), initialPlanSchema, 'discovery preserves the initial schema prefix');
         output = [functionCall('admit-two-op-plan', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {
@@ -606,6 +608,7 @@ test('two-op plan re-admitted on the same long-running daemon reuses current exa
   });
 
   let primaryStep = 0;
+  let initialPlanSchema = false;
   let discoveredRoleKey: string | null = null;
   const scriptedModel = {
     async getResponse(rawRequest: unknown) {
@@ -615,10 +618,11 @@ test('two-op plan re-admitted on the same long-running daemon reuses current exa
       primaryStep += 1;
       let output: unknown[];
       if (primaryStep === 1) {
+        initialPlanSchema = tools.includes(PLAN_CONTROL);
         assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery');
         discoveredRoleKey = serialized.match(/clause-\d+:[a-z_]+/i)?.[0] ?? null;
         output = [functionCall('discover-sheet-create-2', 'tool_search', {
-          query: 'create a new google sheet',
+          query: [CREATE_OPERATION, UPDATE_OPERATION, READ_OPERATION].join(' '),
           role_key: discoveredRoleKey,
           limit: 8,
         })];
@@ -629,7 +633,7 @@ test('two-op plan re-admitted on the same long-running daemon reuses current exa
           'the repeated bounded card republishes the sheet-update operation');
         assert.match(serialized, new RegExp(READ_OPERATION),
           'the repeated bounded card republishes the exact compatible verifier');
-        assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), initialPlanSchema, 'discovery preserves the initial schema prefix');
         output = [functionCall('admit-two-op-plan-2', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {

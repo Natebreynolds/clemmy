@@ -143,3 +143,16 @@ test('tokensFromAgentRun reads real Agents SDK and wire usage instead of reporti
     runContext: { usage: { requestUsageEntries: [{ inputTokens: 2954, outputTokens: 0 }] } },
   }), { inputTokens: 2954, outputTokens: 0 });
 });
+
+
+test('semantic usage preserves cached inputs across SDK detail rows without counting the aggregate twice', () => {
+  const usage = { inputTokens: 100, outputTokens: 10,
+    inputTokensDetails: [{ cached_tokens: 15 }, { cacheReadInputTokens: 25 }],
+    requestUsageEntries: [{ inputTokens: 100, outputTokens: 10, cachedInputTokens: 40 }] };
+  assert.deepEqual(tokensFromAgentRun({ state: { usage }, rawResponses: [{ usage }] }),
+    { inputTokens: 100, outputTokens: 10, cachedInputTokens: 40 });
+  assert.deepEqual(tokensFromAgentRun({ rawResponses: [
+    { usage: { input_tokens: 50, output_tokens: 5, prompt_tokens_details: { cached_tokens: 20 } } },
+    { usage: { inputTokens: 50, outputTokens: 5, inputTokensDetails: [{ cached_tokens: 20 }] } },
+  ] }), { inputTokens: 100, outputTokens: 10, cachedInputTokens: 40 });
+});

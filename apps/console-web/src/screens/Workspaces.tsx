@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Plus, Clock, Database, Zap, History, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Plus, Clock } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
@@ -28,11 +28,12 @@ function scheduleHint(space: SpaceRecord): string | null {
 
 function healthLabel(space: SpaceRecord): { tone: Tone; text: string } {
   const health = space.health;
-  if (!health) return { tone: 'neutral', text: 'health pending' };
-  if (health.issues.length > 0) return { tone: 'warning', text: `${health.issues.length} issue${health.issues.length === 1 ? '' : 's'}` };
-  if (health.freshness.state === 'fresh') return { tone: 'success', text: 'fresh' };
-  if (health.freshness.state === 'no_sources') return { tone: 'neutral', text: 'static' };
-  return { tone: 'warning', text: health.freshness.state.replace('_', ' ') };
+  if (!health) return { tone: 'neutral', text: 'Checking' };
+  if (health.issues.length > 0) return { tone: 'warning', text: health.issues.length === 1 ? 'Needs a look' : `${health.issues.length} things to check` };
+  if (health.freshness.state === 'fresh') return { tone: 'success', text: 'Up to date' };
+  if (health.freshness.state === 'no_sources') return { tone: 'neutral', text: 'Saved page' };
+  if (health.freshness.state === 'never_refreshed') return { tone: 'warning', text: 'Not refreshed yet' };
+  return { tone: 'warning', text: 'Out of date' };
 }
 
 function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen: () => void; building?: boolean }) {
@@ -70,38 +71,32 @@ function WorkspaceCard({ space, onOpen, building }: { space: SpaceRecord; onOpen
         <div className="flex items-center justify-between gap-2">
           <h3 className="truncate text-h3 text-fg">{space.title}</h3>
           {building
-            ? <StatusPill tone="live">Clementine is building</StatusPill>
-            : <StatusPill tone={healthStatus.tone}>{healthStatus.text}</StatusPill>}
+            ? <StatusPill tone="live" className="shrink-0 whitespace-nowrap">Clementine is building</StatusPill>
+            : (
+              <StatusPill
+                tone={healthStatus.tone}
+                className="shrink-0 whitespace-nowrap"
+                title={health && health.issues.length > 0 ? health.issues.join('\n') : undefined}
+              >
+                {healthStatus.text}
+              </StatusPill>
+            )}
         </div>
         <p className="text-caption text-faint">Updated {new Date(space.updatedAt).toLocaleDateString()}</p>
-        {health && (
-          <div className="mt-2 grid grid-cols-3 gap-2 text-caption text-muted">
-            <span className="inline-flex items-center gap-1 truncate">
-              <Database className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.counts.dataSources}
-            </span>
-            <span className="inline-flex items-center gap-1 truncate">
-              <Zap className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.counts.actions}
-            </span>
-            <span className="inline-flex items-center gap-1 truncate">
-              <History className="h-3.5 w-3.5 shrink-0" aria-hidden /> v{health.version}
-            </span>
-          </div>
+        {health && (health.counts.dataSources > 0 || health.counts.actions > 0) && (
+          <p className="mt-1 text-small text-muted">
+            {[
+              health.counts.dataSources > 0 ? `${health.counts.dataSources} source${health.counts.dataSources === 1 ? '' : 's'}` : '',
+              health.counts.actions > 0 ? `${health.counts.actions} action${health.counts.actions === 1 ? '' : 's'}` : '',
+            ].filter(Boolean).join(' · ')}
+          </p>
         )}
         {sched && (
           <p className="mt-1 inline-flex items-center gap-1.5 text-small text-muted">
             <Clock className="h-3.5 w-3.5" aria-hidden /> {sched}
           </p>
         )}
-        {health && health.issues.length > 0 && (
-          <p className="mt-1 inline-flex items-center gap-1.5 truncate text-caption text-warning">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.issues[0]}
-          </p>
-        )}
-        {health && health.issues.length === 0 && (
-          <p className="mt-1 inline-flex items-center gap-1.5 text-caption text-success">
-            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> View, data, and actions indexed
-          </p>
-        )}
+
       </div>
     </article>
   );
@@ -145,7 +140,12 @@ export function Workspaces() {
         </Button>
       }
     >
-      <SpacesIntro force={!spaces.isLoading && !spaces.isError && items.length === 0} onBuild={(buildPrompt) => { setPrefill(buildPrompt); setModalOpen(true); }} />
+      {/* The explainer is for someone with no Spaces yet. Above an owner's
+          own shelf it pushed the Spaces below the fold, and its dismissal
+          lived in localStorage, which the desktop wipes on relaunch. */}
+      {!spaces.isLoading && !spaces.isError && items.length === 0 && (
+        <SpacesIntro force onBuild={(buildPrompt) => { setPrefill(buildPrompt); setModalOpen(true); }} />
+      )}
       {spaces.isLoading ? (
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2].map((i) => (

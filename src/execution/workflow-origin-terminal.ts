@@ -1,7 +1,13 @@
-import { workflowOriginCompletionReviewRequired, reviewWorkflowOriginCompletion } from './workflow-origin-completion-review.js';
+import { workflowOriginCompletionReviewRequired, reviewWorkflowOriginCompletion, readWorkflowParentContinuation } from './workflow-origin-completion-review.js';
+import { readPendingWorkflowParentContinuation } from './workflow-parent-continuation.js';
+import { driveWorkflowParentContinuation } from './workflow-parent-driver.js';
+import { recoverAcceptedModelBatchForRestart } from '../runtime/harness/accepted-model-batch-checkpoint.js';
 import {
   listEvents,
+  appendEvent,
   getRunAttemptBySourceUserSeq,
+  getKillRequest,
+  openEventLog,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
 import {
@@ -54,7 +60,9 @@ export interface WorkflowOriginTerminalInput {
   reprojectRetainedWorkFromOrigin?: boolean;
 }
 
-export type ReviewWorkflowOriginTerminalOptions = EvaluateTerminalDeliveryOptions;
+export type ReviewWorkflowOriginTerminalOptions = EvaluateTerminalDeliveryOptions & {
+  activateWorkflowParent?: NonNullable<Parameters<typeof driveWorkflowParentContinuation>[2]>['activate'];
+};
 
 const MAX_ORIGIN_TERMINAL_CHARS = 1_800;
 const WORKFLOW_BLOCKED_DELIVERY_CONCERN =
@@ -277,7 +285,9 @@ export function workflowOriginTerminalNeedsAsyncJudge(
 ): boolean {
   const prepared = preparedWorkflowOriginTerminal(input);
   if (!prepared || workflowOriginTerminalRowExists(prepared)) return false;
-  return workflowOriginCompletionReviewRequired(input, prepared.text)
+  return Boolean(readPendingWorkflowParentContinuation(input, prepared.text)
+    || readWorkflowParentContinuation(input, prepared.text))
+    || workflowOriginCompletionReviewRequired(input, prepared.text)
     || Boolean(workflowOriginTerminalAssessment(prepared, input)?.deliveryGap);
 }
 
@@ -347,6 +357,41 @@ export function workflowOriginTerminalCommitMatches(input: {
   return false;
 }
 
+/** Settle a stopped, parked continuation without waking its model. An active
+ * owner or an unsettled tool batch must finish/reconcile through its own host.
+ * The transaction fences a concurrent recovery claim against this terminal. */
+function commitParkedParentCancellation(
+  input: WorkflowOriginTerminalInput,
+  prepared: PreparedWorkflowOriginTerminal,
+): DeliveryCommitResult | null {
+  return openEventLog().transaction(() => {
+    const attempt = getRunAttemptBySourceUserSeq(prepared.identity.sessionId, prepared.source.seq);
+    if (!attempt || attempt.status !== 'active' || attempt.finishedAt
+      || (attempt.leaseOwner && attempt.leaseExpiresAt && Date.parse(attempt.leaseExpiresAt) > Date.now())
+      || !getKillRequest(attempt.sessionId, { attemptId: attempt.attemptId, runId: attempt.runId })) return null;
+    const pending = readPendingWorkflowParentContinuation(input, prepared.text);
+    const candidate = pending ?? readWorkflowParentContinuation(input, prepared.text);
+    if (!candidate || attempt.attemptId !== candidate.attemptId) return null;
+    const recovery = recoverAcceptedModelBatchForRestart({ sessionId: attempt.sessionId,
+      sourceUserSeq: prepared.source.seq });
+    if (recovery.status !== 'ready') return null;
+    // Retain the exact negative-review/source-group lineage even when the
+    // user stops it before any executor claims it. This is not a tool grant.
+    // It lets report-back prove the original parent's cancellation on replay.
+    if (!pending) appendEvent({ sessionId: attempt.sessionId, turn: prepared.source.turn,
+      role: 'system', type: 'workflow_parent_continuation_requested', data: {
+        sourceUserSeq: prepared.source.seq, attemptId: attempt.attemptId,
+        sourceGroupId: candidate.child.sourceGroupId,
+        sourceGroupDigest: candidate.child.sourceGroupDigest,
+        evidenceDigest: candidate.evidenceDigest, verdictEventId: candidate.verdictEventId,
+      } });
+    return commitTurnOutcome(workflowTurnOutcome(
+      { ...prepared.identity, runId: attempt.runId ?? attempt.attemptId, attemptId: attempt.attemptId },
+      'cancelled', 'Stopped as requested. Completed results are kept.', prepared.evidenceRunIds,
+    ), { legacyReason: 'cancelled', metadata: { transport: 'workflow_report_back' } });
+  }).immediate();
+}
+
 /** Commit the workflow's checkpointed result as the one terminal owned by the
  * original human source. No synthetic input and no second model turn exist in
  * this path; retries converge through commitTurnOutcome's durable turn key. */
@@ -355,8 +400,12 @@ export function commitWorkflowOriginTerminal(
 ): DeliveryCommitResult | null {
   const prepared = preparedWorkflowOriginTerminal(input);
   if (!prepared) return null;
+  const cancelled = commitParkedParentCancellation(input, prepared);
+  if (cancelled) return cancelled;
   if (!workflowOriginTerminalRowExists(prepared)
-    && workflowOriginCompletionReviewRequired(input, prepared.text)) return null;
+    && (workflowOriginCompletionReviewRequired(input, prepared.text)
+      || readPendingWorkflowParentContinuation(input, prepared.text)
+      || readWorkflowParentContinuation(input, prepared.text))) return null;
   return commitTurnOutcome(workflowTurnOutcome(
     prepared.identity,
     prepared.renderedDetail ? workflowTerminalProposalOutcome(input.outcome) : 'failed',
@@ -378,11 +427,10 @@ export function commitWorkflowOriginTerminal(
   });
 }
 
-/** Assess then judge one workflow-origin terminal before publication. This
- * lane has no same-run continuation after the durable workflow checkpoint, so
- * all RESUME capabilities are false. The shared evaluator consequently refuses
- * RESUME and this function retains the current conservative committer fallback.
- * No workflow-specific model, provider, or transport is selected here. */
+/** Assess the joined result before publication. A current negative completion
+ * review with a durable parent checkpoint transfers to the original host.
+ * Legacy/no-checkpoint delivery-gap review keeps its conservative fallback and
+ * must not advertise an execution continuation it cannot actually perform. */
 export async function reviewAndCommitWorkflowOriginTerminal(
   input: WorkflowOriginTerminalInput,
   options: ReviewWorkflowOriginTerminalOptions = {},
@@ -391,16 +439,24 @@ export async function reviewAndCommitWorkflowOriginTerminal(
   if (!prepared) return null;
   const existing = existingWorkflowOriginTerminal(prepared);
   if (existing) return existing;
+  const cancelled = commitParkedParentCancellation(input, prepared);
+  if (cancelled) return cancelled;
   // A legacy or corrupt first-writer is still a durable winner. Let the shared
   // committer decode/fail it on the synchronous path; never spend a judge call
   // after publication already occurred.
   if (workflowOriginTerminalRowExists(prepared)) return commitWorkflowOriginTerminal(input);
+  if (readPendingWorkflowParentContinuation(input, prepared.text)) {
+    await driveWorkflowParentContinuation(input, prepared.text, { activate: options.activateWorkflowParent });
+    return existingWorkflowOriginTerminal(prepared);
+  }
   // Captured optional completion review belongs to the actual joined child
   // result and exact public reply, never the earlier queue acknowledgement.
   // Revalidation after await fences stale child bytes/objectives/terminals.
   const completion = await reviewWorkflowOriginCompletion(input, prepared.text);
   if (completion === 'stale') return null;
   if (completion === 'reviewed' || completion === 'unavailable') {
+    const resumed = await driveWorkflowParentContinuation(input, prepared.text, { activate: options.activateWorkflowParent });
+    if (resumed !== 'not_applicable') return existingWorkflowOriginTerminal(prepared);
     return commitWorkflowOriginTerminal(input);
   }
   const assessment = workflowOriginTerminalAssessment(prepared, input);

@@ -54,6 +54,7 @@ function dominantArrayLocation(value: unknown): DominantArrayLocation | null {
   if (!value || typeof value !== 'object') return null;
 
   let best: DominantArrayLocation | null = null;
+  const unfamiliar: DominantArrayLocation[] = [];
   const visit = (node: unknown, path: string, depth: number): void => {
     if (depth > 5 || !node || typeof node !== 'object' || Array.isArray(node)) return;
     const record = node as Record<string, unknown>;
@@ -66,13 +67,20 @@ function dominantArrayLocation(value: unknown): DominantArrayLocation | null {
     // Provider envelopes are commonly nested as data -> data. Walk bounded
     // object carriers, but never descend into record arrays or arbitrary depth.
     for (const [key, child] of Object.entries(record)) {
+      // A tool may name its collection anything. A single unfamiliar record
+      // array is unambiguous; multiple unfamiliar collections need an explicit
+      // projection rather than guessing from a provider-specific key list.
+      if (Array.isArray(child) && !DOMINANT_LIST_KEYS.includes(key)
+        && child.length > 0 && child.every(row => row !== null && typeof row === 'object' && !Array.isArray(row))) {
+        unfamiliar.push({ key, rows: child, path: path ? `${path}.${key}` : key });
+      }
       if (child && typeof child === 'object' && !Array.isArray(child)) {
         visit(child, path ? `${path}.${key}` : key, depth + 1);
       }
     }
   };
   visit(value, '', 0);
-  return best;
+  return best ?? (unfamiliar.length === 1 ? unfamiliar[0]! : null);
 }
 
 /** Find the dominant list inside a parsed tool result — a records/items/results
@@ -181,12 +189,58 @@ function discriminatingKeyOrder(records: readonly unknown[]): readonly string[] 
   // consumed the whole record budget and pushed `subject` (44 bytes) into the
   // shared tail — the same failure in a new order. Cost is the max across
   // siblings, so a key that is huge in any one record is treated as expensive.
+  //
+  // Spread is necessary but not sufficient. Live 2026-09-22, source 278624,
+  // "whats on my calendar tomorrow": `@odata.etag` differs on every record and
+  // is cheap, so it ranked first and every record arrived as an etag plus at
+  // most a subject — `start` and `end` were among 174 omitted keys, and the
+  // brain re-called the provider three times to learn the start times. A value
+  // that is an opaque token (a version tag, a hash, a base64 blob, a GUID)
+  // varies on every record BECAUSE it is opaque; that variation is not
+  // information a reader can use. Such keys keep their place only after every
+  // readable one. Still data-derived: decided from the value's shape across
+  // siblings, never from a provider field list.
+  const opaque = new Set<string>();
+  for (const [key, seen] of distinct) {
+    if (keyLooksLikeMetadata(key) || [...seen].every(valueLooksOpaque)) opaque.add(key);
+  }
   return [...distinct.entries()]
-    .map(([key, seen]) => ({ key, spread: seen.size, bytes: cost.get(key) ?? 0 }))
+    .map(([key, seen]) => ({ key, spread: seen.size, bytes: cost.get(key) ?? 0, opaque: opaque.has(key) ? 1 : 0 }))
     .sort((left, right) => (
-      right.spread - left.spread || left.bytes - right.bytes || left.key.localeCompare(right.key)
+      left.opaque - right.opaque
+      || right.spread - left.spread
+      || left.bytes - right.bytes
+      || left.key.localeCompare(right.key)
     ))
     .map(({ key }) => key);
+}
+
+/** Protocol/metadata keys carry no answer: OData/JSON-API annotations, etags,
+ * hypermedia links. Shape of the KEY, not a vendor list. */
+function keyLooksLikeMetadata(key: string): boolean {
+  return key.startsWith('@') || key.startsWith('_') || /(^|[._-])(etag|links?|self|href)$/i.test(key);
+}
+
+/** A serialized value that is one unbroken machine token. Readable text has
+ * spaces, punctuation or a recognisable structure (an ISO date, an email, a
+ * number, a short word); a version tag, hash, GUID or base64 blob does not. */
+function valueLooksOpaque(serialized: string): boolean {
+  if (!serialized.startsWith('"')) return false;
+  let value: string;
+  try { value = JSON.parse(serialized) as string; } catch { return false; }
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (text.length < 16 || /\s/.test(text)) return false;
+  // Structured-but-readable tokens a reader does use as-is.
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return false; // ISO date/time
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(text)) return false; // email
+  if (/^(https?:)?\/\//i.test(text)) return false; // url
+  // Weak-etag / quoted-token wrappers, then the token body.
+  const body = text.replace(/^W\//i, '').replace(/^"|"$/g, '');
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body)) return true; // GUID
+  if (/^[0-9a-f]{16,}$/i.test(body)) return true; // hex digest
+  // base64 / url-safe token: long, no vowels-and-spaces rhythm of prose.
+  return /^[A-Za-z0-9+/_=-]{16,}$/.test(body) && !/^[a-z]+$/i.test(body);
 }
 
 function projectionKeyPriority(key: string): number {
@@ -369,6 +423,7 @@ function compactJsonValue(
     ))
     .slice(0, MAX_STRUCTURED_PROJECTION_KEYS)
     .map(({ key }) => key);
+  const rankedKeys = keys;
   while (keys.length > 0) {
     const overhead = 2
       + Math.max(0, keys.length - 1)
@@ -376,8 +431,7 @@ function compactJsonValue(
     if (overhead + (keys.length * MIN_JSON_VALUE_CHARS) <= budget) break;
     keys = keys.slice(0, -1);
   }
-  stats.omittedObjectKeys += originalKeys.length - keys.length;
-  if (keys.length === 0) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
+  if (keys.length === 0) { stats.omittedObjectKeys += originalKeys.length; stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
   const overhead = 2
     + Math.max(0, keys.length - 1)
     + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
@@ -389,11 +443,40 @@ function compactJsonValue(
     ? allocateJsonBudgetsInOrder(sizes, budget - overhead)
     : allocateJsonBudgets(sizes, budget - overhead);
   const compact: Record<string, unknown> = {};
+  const fieldStats = new Map<string, StructuredProjectionStats>();
+  const projectField = (key: string, available: number): unknown => {
+    const local: StructuredProjectionStats = { clippedStrings: 0, omittedArrayItems: 0,
+      omittedObjectKeys: 0, omittedValues: 0 };
+    const entry = compactJsonValue(record[key], available, local, depth + 1);
+    fieldStats.set(key, local);
+    return entry;
+  };
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
-    const entry = compactJsonValue(record[key], budgets[index]!, stats, depth + 1);
-    if (entry === OMITTED_JSON_VALUE) stats.omittedObjectKeys += 1;
-    else compact[key] = entry;
+    const entry = projectField(key, budgets[index]!);
+    if (entry !== OMITTED_JSON_VALUE) compact[key] = entry;
+  }
+  // Initial allocations reserve key syntax even for fields that cannot fit.
+  // Reuse that unspent space for omitted fields in the same ranked order.
+  // Existing values stay intact; source values, the total budget and ranking
+  // are unchanged. A small nested scalar need not force another recall turn.
+  for (const key of rankedKeys) {
+    if (Object.hasOwn(compact, key)) continue;
+    const keyCost = JSON.stringify(key).length + 1 + (Object.keys(compact).length ? 1 : 0);
+    const available = budget - jsonChars(compact) - keyCost;
+    if (available <= 0) continue;
+    // Reclaimed syntax space should recover whole scalars or structured
+    // descendants, not expand an already-omitted large text/blob field.
+    if (typeof record[key] === 'string' && jsonChars(record[key]) > available) continue;
+    const entry = projectField(key, available);
+    if (entry !== OMITTED_JSON_VALUE) compact[key] = entry;
+  }
+  stats.omittedObjectKeys += originalKeys.length - Object.keys(compact).length;
+  for (const local of fieldStats.values()) {
+    stats.clippedStrings += local.clippedStrings;
+    stats.omittedArrayItems += local.omittedArrayItems;
+    stats.omittedObjectKeys += local.omittedObjectKeys;
+    stats.omittedValues += local.omittedValues;
   }
   return Object.keys(compact).length > 0 ? compact : OMITTED_JSON_VALUE;
 }

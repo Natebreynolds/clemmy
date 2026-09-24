@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/execution/automation-read-pilot-control-plane.test.ts */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -176,11 +176,28 @@ function approvedProposal(
   recurring = false,
   dataset = false,
   maxOperations = 1,
+  localOutput = false,
+  opportunityOverride?: AutomationOpportunityV1,
 ): AutomationOpportunityProposalRecordV1 {
+  const authored = opportunityOverride ? structuredClone(opportunityOverride) : opportunity(label, effect, recurring, dataset, maxOperations);
+  if (localOutput) {
+    authored.capabilityRequirements.push({ id: 'workspace-output', description: 'Persist the reviewed dataset in the chosen Workspace.', minimumEffect: 'local_write', constraints: ['Only the exact consented Workspace projection.'] });
+    authored.phases.push({ id: 'persist-result', objective: 'Persist the dataset with its provenance.', dependsOn: ['read-result'], capabilityRequirementIds: ['workspace-output'], effect: { class: 'local_write', approval: 'not_required', maxOperationsPerRun: 1 }, partitioned: false, outputEvidence: ['Exact Workspace projection head.'] });
+    authored.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
+    authored.pilot.effectCeiling = { class: 'local_write', maxOperationsPerRun: maxOperations + 1 };
+    authored.budgets.maxOperationsPerRun = maxOperations + 1;
+    authored.dataset!.schema.fields.push(
+      { name: 'run_ref', type: 'string', required: true, sensitivity: 'internal' },
+      { name: 'observed_at', type: 'timestamp', required: true, sensitivity: 'public' },
+      { name: 'source_ref', type: 'string', required: true, sensitivity: 'public' },
+    );
+    authored.dataset!.merge.mode = 'field_policy_after_exact_identity';
+    authored.dataset!.merge.fieldPolicies = [{ field: 'scope', onConflict: 'prefer_newer' }];
+  }
   const proposalId = unique(`proposal_${label}`);
   const created = opportunityStore.createAutomationOpportunityProposal({
     proposalId,
-    opportunity: opportunity(label, effect, recurring, dataset, maxOperations),
+    opportunity: authored,
     actorRef: `accepted-source:chat.${label}#1`,
   });
   assert.equal(created.ok, true, JSON.stringify(created));
@@ -221,6 +238,10 @@ interface BlankStateFixture {
 function blankStateFixture(label: string, options: {
   recurring?: boolean;
   dataset?: boolean;
+  localOutput?: boolean;
+  opportunityOverride?: AutomationOpportunityV1;
+  resultOverride?: unknown;
+  inputSchemaOverride?: Record<string, unknown>;
   pages?: number;
   paginationMode?: 'complete' | 'cycle' | 'budget';
 } = {}): BlankStateFixture {
@@ -232,6 +253,8 @@ function blankStateFixture(label: string, options: {
     options.recurring === true,
     options.dataset === true,
     pageCount,
+    options.localOutput === true,
+    options.opportunityOverride,
   );
   const chatId = unique(`chat.${label}`);
   eventlog.createSession({ id: chatId, kind: 'chat' });
@@ -269,7 +292,7 @@ function blankStateFixture(label: string, options: {
         accountId,
         effect: 'read',
         effectAttestation: 'carrier_declared',
-        inputSchema: {
+        inputSchema: options.inputSchemaOverride ?? {
           type: 'object',
           additionalProperties: false,
           properties: {
@@ -315,6 +338,7 @@ function blankStateFixture(label: string, options: {
                 bodies += 1;
                 payloads.push(structuredClone(payload));
                 const inputPayload = payload as { scope?: unknown; cursor?: unknown };
+                if (options.resultOverride !== undefined) return structuredClone(options.resultOverride);
                 if (pageCount === 1) {
                   return { records: [{ key: `record.${label}`, scope: inputPayload.scope }] };
                 }
@@ -354,8 +378,8 @@ function blankStateFixture(label: string, options: {
     approvalSessionId: chatId,
     originSessionId: chatId,
     contract: {
-      phaseId: 'read-result',
-      requirementId: 'bounded-read',
+      phaseId: options.opportunityOverride?.phases.find(phase => phase.effect.class === 'read')?.id ?? 'read-result',
+      requirementId: options.opportunityOverride?.capabilityRequirements.find(requirement => requirement.minimumEffect === 'read')?.id ?? 'bounded-read',
       workflowInputs: {
         scope: { type: 'string', required: true },
       },
@@ -411,6 +435,11 @@ function blankStateFixture(label: string, options: {
             fields: [
               { field: 'key', recordPath: 'key', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
               { field: 'scope', recordPath: 'scope', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+              ...(options.localOutput ? [
+                { field: 'run_ref', hostSource: 'workflow_run_id' as const, type: 'string' as const, required: true, sensitivity: 'internal' as const, confidence: 1 },
+                { field: 'observed_at', hostSource: 'page_settled_at' as const, type: 'timestamp' as const, required: true, sensitivity: 'public' as const, confidence: 1 },
+                { field: 'source_ref', hostSource: 'page_receipt_id' as const, type: 'string' as const, required: true, sensitivity: 'public' as const, confidence: 1 },
+              ] : []),
             ],
             sourceRecord: { idPath: 'key', observedAt: { kind: 'page_settled_at' } },
             entityKind: 'generic-record',
@@ -421,6 +450,7 @@ function blankStateFixture(label: string, options: {
               exactIdentifierNamespace: 'generic-key',
             }],
             resolutionPolicy: {
+              ...(options.localOutput ? { preferNewerAfterExactIdentity: ['scope'] } : {}),
               policyId: 'exact-generic-key',
               mergeThreshold: 10,
               distinctThreshold: 2,
@@ -544,6 +574,7 @@ function chatPilotRequest(
     expected_proposal_digest: fixture.input.expectedProposalDigest,
     acquisition_ref: acquisitionRef,
     contract: {
+      ...(fixture.input.contract.workspaceOutputPhaseId ? { workspace_output_phase_id: fixture.input.contract.workspaceOutputPhaseId } : {}),
       phase_id: fixture.input.contract.phaseId,
       requirement_id: fixture.input.contract.requirementId,
       workflow_inputs: fixture.input.contract.workflowInputs,
@@ -580,9 +611,16 @@ function chatPilotRequest(
         result_projection: {
           version: 1,
           records_path: projection.recordsPath,
+          ...(projection.textInterpretation ? { text_interpretation: {
+            version: projection.textInterpretation.version, kind: projection.textInterpretation.kind,
+            field: projection.textInterpretation.field, prefix: projection.textInterpretation.prefix,
+            whitespace: projection.textInterpretation.whitespace, blank_lines: projection.textInterpretation.blankLines,
+            max_source_bytes: projection.textInterpretation.maxSourceBytes, max_source_records: projection.textInterpretation.maxSourceRecords,
+            selection: { kind: projection.textInterpretation.selection.kind, max_records: projection.textInterpretation.selection.maxRecords },
+          } } : {}),
           fields: projection.fields.map((field) => ({
             field: field.field,
-            record_path: field.recordPath,
+            ...(field.hostSource ? { host_source: field.hostSource } : { record_path: field.recordPath }),
             type: field.type,
             required: field.required,
             sensitivity: field.sensitivity,
@@ -605,6 +643,7 @@ function chatPilotRequest(
             exact_identifier_namespace: rule.exactIdentifierNamespace,
           })),
           resolution_policy: {
+            ...(projection.resolutionPolicy.preferNewerAfterExactIdentity ? { prefer_newer_after_exact_identity: projection.resolutionPolicy.preferNewerAfterExactIdentity } : {}),
             policy_id: projection.resolutionPolicy.policyId,
             merge_threshold: projection.resolutionPolicy.mergeThreshold,
             distinct_threshold: projection.resolutionPolicy.distinctThreshold,
@@ -981,9 +1020,9 @@ test('Workspace creation approval converges across crash, rejection, expiry, can
   });
 });
 
-test('blank-home reviewed dataset chat pilot crosses three pages and publishes canonical truth before success', async () => {
+test('reviewed read plus local output crosses three pages and publishes canonical truth before success', async () => {
   const baselineRunFiles = runFiles().length;
-  const fixture = blankStateFixture('dataset', { dataset: true, pages: 3 });
+  const fixture = blankStateFixture('dataset', { dataset: true, pages: 3, localOutput: true });
   const surface = chatPilotSurface(fixture);
   assert.ok(fixture.workspaceCreation);
   assert.equal(spaces.spaceStore.get(fixture.workspaceCreation!.workspaceId), undefined);
@@ -1021,6 +1060,7 @@ test('blank-home reviewed dataset chat pilot crosses three pages and publishes c
   assert.equal(created.state, 'created');
   const workspaceSelection = created.projection.selection;
   fixture.input.contract.workspaceBindingSelection = workspaceSelection;
+  fixture.input.contract.workspaceOutputPhaseId = 'persist-result';
   assert.ok(spaces.spaceStore.get(workspaceSelection.workspaceId));
   const inventory = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_list')!(
     chatPilotAcquisitionListRequest(fixture),
@@ -1036,6 +1076,20 @@ test('blank-home reviewed dataset chat pilot crosses three pages and publishes c
   }]);
   assert.equal(inventory.selectionAuthority, 'none');
 
+  for (const fields of [[], ['key']]) {
+    const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+    ((invalid.contract as any).result_projection.resolution_policy).prefer_newer_after_exact_identity = fields;
+    const denied = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalid));
+    assert.equal(denied.ok, false, 'omitted or substituted merge policies cannot be compiled');
+    assert.equal(fixture.bodies(), 0);
+  }
+  for (const phaseBinding of [undefined, 'read-result', 'unrelated-output']) {
+    const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+    (invalid.contract as Record<string, unknown>).workspace_output_phase_id = phaseBinding;
+    const denied = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(invalid));
+    assert.equal(denied.ok, false, JSON.stringify(denied));
+    assert.equal(fixture.bodies(), 0);
+  }
   const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(
     chatPilotRequest(fixture, surface.acquisitionRef),
   ));
@@ -1124,6 +1178,26 @@ test('blank-home reviewed dataset chat pilot crosses three pages and publishes c
   assert.equal(head?.records.canonicalRecordsCreated, 2);
   assert.equal(head?.records.mergedObservations, 1);
   assert.equal(head?.quarantine.observationCount, 0);
+  const retainedPages = eventlog.openEventLog().prepare(`
+    SELECT page_receipt_id, settled_at FROM workflow_paginated_read_pages
+    WHERE activation_id IN (SELECT activation_id FROM workflow_paginated_read_activations WHERE run_id = ?)
+  `).all(queued.projection.runId) as Array<{ page_receipt_id: string; settled_at: string }>;
+  assert.equal(retainedPages.length, 3);
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId }).items;
+  assert.equal(recordIds.length, 2);
+  for (const id of recordIds) {
+    const canonical = entityStore.getCanonicalRecord(datasetId, id)!;
+    for (const evidence of canonical.fields.run_ref!.evidence) {
+      assert.equal(evidence.value, queued.projection.runId);
+      assert.equal(evidence.provenance.path, 'host:workflow_run_id');
+    }
+    for (const evidence of canonical.fields.observed_at!.evidence) {
+      assert.equal(evidence.value, evidence.observedAt);
+      assert.equal(evidence.provenance.path, 'host:page_settled_at');
+      assert.ok(retainedPages.some(page => page.settled_at === evidence.value));
+    }
+    assert.ok(canonical.fields.source_ref!.evidence.every(e => retainedPages.some(page => page.page_receipt_id === e.value && page.settled_at === e.observedAt) && e.provenance.path === 'host:page_receipt_id'));
+  }
   const firstHeadDigest = head?.headDigest;
 
   assert.deepEqual(
@@ -1475,4 +1549,410 @@ test('projection storage is versioned, idempotent, and contains no prose-derived
     assert.deepEqual(workflows.readWorkflow(workflowId)?.data.trigger, { manual: true });
     assert.equal(workflows.readWorkflow(workflowId)?.data.enabled, false);
   }
+});
+
+
+test('explicit text selection survives the chat tool into the exact separate pilot review without dispatch', async () => {
+  const fixture = blankStateFixture('text_review', { dataset: true });
+  const surface = chatPilotSurface(fixture);
+  const previous = fixture.input.contract.resultProjection!;
+  const { projectionDigest: _digest, ...base } = previous;
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'key', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [base.fields[0]!, { field: 'scope', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 }],
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.text-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  const invalid = chatPilotRequest(fixture, surface.acquisitionRef);
+  (invalid.contract as any).result_projection.text_interpretation.selection.max_records = 6;
+  const invalidResult = await surface.handlers.get('automation_read_pilot_request')!(invalid);
+  assert.equal(shared.isInvalidArgumentsTextResult(invalidResult), true, 'invalid contract remains repairable by the caller');
+  const denied = pilotToolJson(invalidResult);
+  assert.equal(denied.ok, false, 'selection drift is refused before review');
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  const approval = approvals.get(requested.approval.approvalId);
+  assert.deepEqual(approval?.args.resultProjection, fixture.input.contract.resultProjection);
+  assert.equal(fixture.bodies(), 0, 'authoring and requesting review cannot execute a text source');
+});
+
+
+test('original approved inventory contract executes 13 text records into five scoped records and replays once', async () => {
+  const recoveryBefore = runner.reconcileCanonicalEntityWorkspaceProjectionClaims();
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const raw = JSON.parse(readFileSync(new URL('./fixtures/documentation-inventory-mcp-result.json', import.meta.url), 'utf8'));
+  const fixture = blankStateFixture('original_text_inventory', { dataset: true, opportunityOverride: original, resultOverride: raw,
+    inputSchemaOverride: { type: 'object', properties: {}, $schema: 'http://json-schema.org/draft-07/schema#' },
+  });
+  fixture.input.contract.arguments = {};
+  fixture.input.contract.workflowInputs = {};
+  fixture.input.workflowInputs = {};
+  assert.deepEqual(fixture.proposal.opportunity, opportunities.parseAutomationOpportunity(original));
+  const surface = chatPilotSurface(fixture);
+  const { projectionDigest: _digest, ...base } = fixture.input.contract.resultProjection!;
+  fixture.input.contract.workspaceOutputPhaseId = 'write-space';
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'section_name', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [
+      { field: 'section_name', recordPath: 'section_name', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+    sourceRecord: { idPath: 'section_name', observedAt: { kind: 'page_settled_at' } },
+    identityRules: [{ ruleId: 'section-name', fields: ['section_name'], normalizers: ['case_fold', 'trim'], exactIdentifierNamespace: 'section-name' }],
+    resolutionPolicy: { ...base.resolutionPolicy, preferNewerAfterExactIdentity: ['observed_at', 'run_ref', 'source_ref'] },
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!({ ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' }));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.original-text-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  // A live model supplied raw MCP evidence paths and omitted the approved
+  // prefer-newer fields. Return both repairs in one refusal, before dispatch.
+  const invalidContract = chatPilotRequest(fixture, surface.acquisitionRef);
+  const invalidWire = invalidContract.contract as any;
+  invalidWire.evidence.required_paths = ['/content'];
+  invalidWire.completeness.evidence_paths = ['/content'];
+  delete invalidWire.result_projection.resolution_policy.prefer_newer_after_exact_identity;
+  const invalidPreviewResult = await surface.handlers.get('automation_read_pilot_request')!(invalidContract);
+  assert.equal(shared.isInvalidArgumentsTextResult(invalidPreviewResult), true, 'contract repair must remain admissible through host recovery');
+  const invalidPreview = pilotToolJson(invalidPreviewResult);
+  assert.equal(invalidPreview.ok, false);
+  assert.equal(invalidPreview.code, 'preview_blocked');
+  assert.match(invalidPreview.reason, /evidence.required_paths must include/);
+  assert.match(invalidPreview.reason, /completeness.evidence_paths must include/);
+  assert.match(invalidPreview.reason, /prefer_newer_after_exact_identity must match/);
+  assert.equal(fixture.bodies(), 0, 'invalid authoring never dispatches');
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  assert.equal(approvals.resolve(requested.approval.approvalId, 'approved', 'operator.original-text-pilot').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  const run = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${queued.projection.runId}.json`), 'utf8'));
+  assert.equal(run.terminalOutcome, 'succeeded', JSON.stringify(run));
+  assert.equal(fixture.bodies(), 1);
+  const head = workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(created.projection.selection.bindingId);
+  assert.ok(head);
+  assert.equal(head.records.canonicalRecordsCreated, 5);
+  assert.equal(head.coverage.observed, 5);
+  assert.deepEqual(head.selection && {
+    sourceRecords: head.selection.sourceRecords, selectedRecords: head.selection.selectedRecords,
+    omittedRecords: head.selection.omittedRecords, scope: head.selection.scope,
+  }, { sourceRecords: 13, selectedRecords: 5, omittedRecords: 8, scope: 'reviewed_selection' });
+  assert.equal(head.selection?.projectionDigest, fixture.input.contract.resultProjection.projectionDigest);
+  const retained = eventlog.openEventLog().prepare(`
+    SELECT h.raw_payload_json, h.raw_payload_sha256 FROM logical_call_settlements s
+    JOIN durable_result_handles h ON h.handle_id = s.result_handle_id
+    WHERE s.settlement_event_id = ?
+  `).get(head.selection!.sourceReceiptId) as { raw_payload_json: string; raw_payload_sha256: string };
+  assert.ok(retained);
+  assert.equal(head.selection!.sourceResultDigest, retained.raw_payload_sha256);
+  const retainedView = (await import('../runtime/harness/result-facts.js')).projectProviderResultEvidenceView(
+    JSON.parse(retained.raw_payload_json), fixture.input.contract.resultProjection.textInterpretation,
+  );
+  assert.equal(retainedView.kind, 'provider_payload');
+  if (retainedView.kind !== 'provider_payload') return;
+  assert.equal((retainedView.payload as { selection: { sourceRecords: number } }).selection.sourceRecords, 13);
+
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId: head.identity.datasetId }).items;
+  assert.equal(recordIds.length, 5);
+  for (const id of recordIds) {
+    const record = entityStore.getCanonicalRecord(head.identity.datasetId, id)!;
+    assert.deepEqual(Object.keys(record.fields).sort(), ['observed_at', 'run_ref', 'section_name', 'source_ref']);
+    assert.equal(record.fields.run_ref!.evidence[0]!.value, queued.projection.runId);
+    assert.equal(record.fields.source_ref!.evidence[0]!.value, head.selection!.sourceReceiptId);
+  }
+  assert.deepEqual(runner.reconcileCanonicalEntityWorkspaceProjectionClaims(), { eligible: recoveryBefore.eligible + 1, projected: 0, replayed: recoveryBefore.replayed + 1, blocked: 0, failed: 0 });
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  assert.equal(fixture.bodies(), 1);
+  assert.deepEqual(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(created.projection.selection.bindingId), head);
+});
+
+
+test('Workspace review accepts the exact output phase without granting read acquisition or execution', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const fixture = blankStateFixture('output_phase_review', { dataset: true, opportunityOverride: original });
+  const surface = chatPilotSurface(fixture);
+  const handler = surface.handlers.get('automation_read_pilot_workspace_create_request')!;
+  const request = { ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' };
+  const before = eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length;
+  const stale = await handler({ ...request, expected_proposal_revision: fixture.proposal.revision + 1 });
+  assert.equal(pilotToolJson(stale).code, 'proposal_stale');
+  assert.equal(shared.isInvalidArgumentsTextResult(stale), false, 'state drift is not mislabeled as an argument mismatch');
+  for (const mismatch of [
+    { phase_id: 'write-space', requirement_id: 'doc-section-inventory-read' },
+    { phase_id: 'read-inventory', requirement_id: 'acceptance-space-write' },
+    { phase_id: 'unrelated', requirement_id: 'acceptance-space-write' },
+  ]) {
+    const rejected = await handler({ ...request, ...mismatch });
+    assert.equal(pilotToolJson(rejected).ok, false);
+    assert.equal(shared.isInvalidArgumentsTextResult(rejected), true, 'a scope mismatch before dispatch remains repairable');
+  }
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, before);
+  const readInventory = await surface.handlers.get('automation_read_pilot_acquisition_list')!({ ...chatPilotAcquisitionListRequest(fixture), phase_id: request.phase_id, requirement_id: request.requirement_id });
+  assert.equal(pilotToolJson(readInventory).ok, false, 'output scope cannot select read acquisitions');
+  const staged = pilotToolJson(await handler(request));
+  assert.equal(staged.ok, true, JSON.stringify(staged));
+  assert.equal(staged.workspaceAuthority, 'pending_exact_human_approval');
+  assert.equal(staged.executionAuthority, 'none');
+  assert.equal(staged.scheduleAuthority, 'none');
+  assert.equal(fixture.bodies(), 0);
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, before + 1);
+});
+
+test('version-two authoring identifies missing outcome authority before closed-JSON serialization', async () => {
+  const fixture = blankStateFixture('missing_outcome_authority', { dataset: true });
+  const surface = chatPilotSurface(fixture);
+  const request = chatPilotRequest(fixture, surface.acquisitionRef);
+  const projection = (request.contract as any).result_projection;
+  projection.version = 2;
+  projection.identity_rules = projection.identity_rules.map((rule: any) => ({
+    kind: 'exact_identifier', rule_id: rule.rule_id, fields: rule.fields,
+    normalizers: rule.normalizers, namespace: rule.exact_identifier_namespace,
+  }));
+  const response = await surface.handlers.get('automation_read_pilot_request')!(request);
+  assert.equal(shared.isInvalidArgumentsTextResult(response), true);
+  const failure = pilotToolJson(response);
+  assert.equal(failure.code, 'pilot_contract_invalid');
+  assert.match(failure.reason, /result_projection.partition.outcome_authority is required for version 2/);
+  assert.doesNotMatch(failure.reason, /closed JSON domain/);
+  assert.equal(fixture.bodies(), 0);
+  assert.equal(eventlog.listEvents(fixture.chatId, { types: ['approval_requested'] }).length, 0);
+});
+
+test('Workspace inventory accepts the declared output scope and an exact destination filter', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const fixture = blankStateFixture('exact_workspace_inventory', { dataset: true, opportunityOverride: original });
+  const surface = chatPilotSurface(fixture);
+  const createdRequest = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!(chatWorkspaceCreationRequest(fixture)));
+  assert.equal(createdRequest.ok, true);
+  assert.equal(approvals.resolve(createdRequest.approval.approvalId, 'approved', 'operator.inventory').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(createdRequest.projection.projectionId);
+  assert.equal(created.ok, true);
+  if (!created.ok || !created.projection.selection) return;
+  const id = created.projection.selection.workspaceId;
+  const handler = surface.handlers.get('automation_read_pilot_workspace_list')!;
+  for (const scope of [
+    { phase_id: 'read-inventory', requirement_id: 'doc-section-inventory-read' },
+    { phase_id: 'write-space', requirement_id: 'acceptance-space-write' },
+  ]) {
+    const input = { ...chatPilotAcquisitionListRequest(fixture), ...scope, workspace_id: id };
+    const found = pilotToolJson(await handler(input));
+    assert.equal(found.ok, true, JSON.stringify(found));
+    assert.deepEqual(found.workspaces, [{ workspaceId: id, expectedWorkspaceRevision: created.projection.selection.expectedWorkspaceRevision, expectedWorkspaceDigest: created.projection.selection.expectedWorkspaceDigest }]);
+    assert.equal(found.selectionAuthority, 'none');
+    assert.deepEqual(pilotToolJson(await handler({ ...input, workspace_id: 'missing-exact-workspace' })).workspaces, []);
+  }
+  assert.equal(fixture.bodies(), 0);
+});
+
+// Live 2026-09-24 00:37Z (trigger-0a70cd32): the approved pilot run finished
+// needs-attention, its projection stayed `queued` forever, and every later
+// request for the same proposal got the same projection back with no new card.
+test('a queued projection whose run finished without proving the pilot re-opens with a fresh card', async () => {
+  const fixture = blankStateFixture('unproven');
+  const registered = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  if (!registered.ok) return;
+  assert.equal(approvals.resolve(registered.approval.approvalId, 'approved', 'human.unproven').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(registered.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  const runId = queued.projection.runId;
+
+  // The run is still live: the same request must NOT mint another card.
+  const stillLive = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(stillLive.ok, true, JSON.stringify(stillLive));
+  if (stillLive.ok) {
+    assert.equal(stillLive.cardCreated, false);
+    assert.equal(stillLive.projection.status, 'queued');
+  }
+
+  // The run terminates needing attention (the live shape): the projection is
+  // released, and the next exact request re-opens it with a new card.
+  const runFile = path.join(shared.WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const record = JSON.parse(readFileSync(runFile, 'utf8')) as Record<string, unknown>;
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(runFile, JSON.stringify({
+    ...record,
+    status: 'completed',
+    finishedAt: new Date().toISOString(),
+    needsAttention: true,
+    terminalOutcome: 'blocked',
+  }));
+  assert.equal(
+    control.automationReadPilotRunUnprovenReason({ status: 'completed', finishedAt: 'x', needsAttention: true }),
+    'the pilot run finished needing attention',
+  );
+  assert.equal(control.automationReadPilotRunUnprovenReason({ status: 'completed', finishedAt: 'x' }), null, 'a clean run proves the pilot');
+  assert.equal(control.automationReadPilotRunUnprovenReason({ status: 'running' }), null, 'an unfinished run releases nothing');
+
+  const reopened = await control.acquireAndRegisterAutomationReadPilotProjection({
+    ...fixture.input,
+    acquisition: fixture.acquisition,
+  });
+  assert.equal(reopened.ok, true, JSON.stringify(reopened));
+  if (!reopened.ok) return;
+  assert.equal(reopened.projection.projectionId, registered.projection.projectionId, 'same durable identity');
+  assert.equal(reopened.cardCreated, true, 'a fresh review card');
+  assert.notEqual(reopened.approval.approvalId, registered.approval.approvalId);
+  assert.equal(reopened.projection.status, 'approval_pending');
+  assert.equal(reopened.projection.runId ?? null, null);
+  assert.equal(reopened.projection.triggerReceiptId ?? null, null);
+
+  // The boot/timer reconciler releases a stuck row too, without a request.
+  assert.equal(approvals.resolve(reopened.approval.approvalId, 'approved', 'human.unproven').ok, true);
+  const requeued = control.reconcileAutomationReadPilotProjection(registered.projection.projectionId);
+  assert.equal(requeued.ok, true, JSON.stringify(requeued));
+  if (!requeued.ok || !requeued.projection.runId) return;
+  const secondRun = path.join(shared.WORKFLOW_RUNS_DIR, `${requeued.projection.runId}.json`);
+  const second = JSON.parse(readFileSync(secondRun, 'utf8')) as Record<string, unknown>;
+  writeFileSync(secondRun, JSON.stringify({ ...second, status: 'blocked', finishedAt: new Date().toISOString(), terminalOutcome: 'blocked' }));
+  const swept = control.reconcileAutomationReadPilotProjections({ limit: 50 });
+  assert.ok(swept.runUnproven >= 1, `the sweep released this projection (sweeps are global): ${JSON.stringify(swept)}`);
+  assert.equal(control.loadAutomationReadPilotProjection(registered.projection.projectionId)?.status, 'refused');
+});
+
+// Negative review then replay (owner ask 2026-09-24): the reviewed projection
+// lineage is produced BEFORE the goal judge. When the judge is negative the
+// dataset commit must stay unpublished, the projection must be released, the
+// re-request must mint a fresh card, and the second (clean) run must publish
+// its own dataset once and replay without duplicates.
+test('a negative goal review leaves the early dataset commit unpublished; the re-run publishes once and replays', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const raw = JSON.parse(readFileSync(new URL('./fixtures/documentation-inventory-mcp-result.json', import.meta.url), 'utf8'));
+  const fixture = blankStateFixture('negative_review_replay', { dataset: true, opportunityOverride: original, resultOverride: raw,
+    inputSchemaOverride: { type: 'object', properties: {}, $schema: 'http://json-schema.org/draft-07/schema#' },
+  });
+  fixture.input.contract.arguments = {};
+  fixture.input.contract.workflowInputs = {};
+  fixture.input.workflowInputs = {};
+  const surface = chatPilotSurface(fixture);
+  const { projectionDigest: _digest, ...base } = fixture.input.contract.resultProjection!;
+  fixture.input.contract.workspaceOutputPhaseId = 'write-space';
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'section_name', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 50, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [
+      { field: 'section_name', recordPath: 'section_name', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+    sourceRecord: { idPath: 'section_name', observedAt: { kind: 'page_settled_at' } },
+    identityRules: [{ ruleId: 'section-name', fields: ['section_name'], normalizers: ['case_fold', 'trim'], exactIdentifierNamespace: 'section-name' }],
+    resolutionPolicy: { ...base.resolutionPolicy, preferNewerAfterExactIdentity: ['observed_at', 'run_ref', 'source_ref'] },
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!({ ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' }));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.negative-review-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  const bindingId = created.projection.selection.bindingId;
+  const datasetsBefore = eventlog.openEventLog; // (canonical store is separate; counted via entityStore below)
+  void datasetsBefore;
+
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  assert.equal(approvals.resolve(requested.approval.approvalId, 'approved', 'operator.negative-review-pilot').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  const firstRunId = queued.projection.runId;
+
+  // 1. Negative judge. The judge must have been SHOWN the projection facts.
+  let judgeSawProjection = false;
+  let judgeCalls = 0;
+  let lastEvidence = '';
+  const negative = {
+    judge: async (_objective: string, evidenceText: string) => {
+      judgeCalls += 1; lastEvidence = evidenceText;
+      judgeSawProjection = /REVIEWED RESULT PROJECTION/.test(evidenceText) && /records projected: 5/.test(evidenceText);
+      return { done: false, reason: 'negative review under test' };
+    },
+    judgeCriteria: async (_objective: string, criteria: string[], evidenceText: string) => {
+      judgeCalls += 1; lastEvidence = evidenceText;
+      judgeSawProjection = /REVIEWED RESULT PROJECTION/.test(evidenceText) && /records projected: 5/.test(evidenceText);
+      return criteria.map((criterion) => ({ criterion, pass: false, note: 'negative review under test' }));
+    },
+  };
+  runner._setWorkflowRunGoalJudgeForTests(negative as never);
+  try {
+    await runner.processWorkflowRuns({} as ClementineAssistant);
+  } finally {
+    runner._setWorkflowRunGoalJudgeForTests(null);
+  }
+  assert.equal(judgeSawProjection, true, `the goal judge is shown the reviewed projection facts before it rules (calls=${judgeCalls}) evidence=${lastEvidence.slice(0, 1500)}`);
+  const firstRun = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${firstRunId}.json`), 'utf8'));
+  assert.equal(firstRun.needsAttention, true, JSON.stringify(firstRun).slice(0, 600));
+  assert.equal(firstRun.canonicalEntityWorkspaceProjectionClaim ?? null, null, 'a judged-negative run carries no publication claim');
+  assert.equal(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId), null, 'nothing published to the Space');
+  assert.equal(fixture.bodies(), 1);
+
+  // 2. Released and re-opened with a fresh card; the queued row was bound to the failed run.
+  const swept = control.reconcileAutomationReadPilotProjections({ limit: 100 });
+  assert.ok(swept.runUnproven >= 1, JSON.stringify(swept));
+  assert.equal(control.loadAutomationReadPilotProjection(requested.projection.projectionId)?.status, 'refused');
+  const reopened = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(reopened.ok, true, JSON.stringify(reopened));
+  assert.equal(reopened.projection.projectionId, requested.projection.projectionId, 'same durable identity');
+  assert.notEqual(reopened.approval.approvalId, requested.approval.approvalId, 'a fresh card');
+  assert.equal(approvals.resolve(reopened.approval.approvalId, 'approved', 'operator.negative-review-pilot-2').ok, true);
+  const requeued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(requeued.ok, true, JSON.stringify(requeued));
+  if (!requeued.ok || !requeued.projection.runId) return;
+  assert.notEqual(requeued.projection.runId, firstRunId);
+
+  // 3. Clean judge: the second run publishes its own dataset once.
+  runner._setWorkflowRunGoalJudgeForTests({
+    judge: async () => ({ done: true, reason: 'all criteria met under test' }),
+    judgeCriteria: async (_objective: string, criteria: string[]) => criteria.map((criterion) => ({ criterion, pass: true, note: 'met under test' })),
+  } as never);
+  try {
+    await runner.processWorkflowRuns({} as ClementineAssistant);
+  } finally {
+    runner._setWorkflowRunGoalJudgeForTests(null);
+  }
+  const secondRun = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${requeued.projection.runId}.json`), 'utf8'));
+  assert.equal(secondRun.terminalOutcome, 'succeeded', JSON.stringify(secondRun).slice(0, 600));
+  assert.match(JSON.stringify(secondRun), /Projected 5 documentation_section records into the .* Space/, 'the completion report names the projected records, never "nothing new"');
+  assert.equal(fixture.bodies(), 2, 'exactly one provider body per run');
+  const head = workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId);
+  assert.ok(head);
+  assert.equal(head.identity.runId, requeued.projection.runId, 'the Space head belongs to the clean run only');
+  assert.equal(head.records.canonicalRecordsCreated, 5);
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId: head.identity.datasetId }).items;
+  assert.equal(recordIds.length, 5);
+  for (const id of recordIds) {
+    const record = entityStore.getCanonicalRecord(head.identity.datasetId, id)!;
+    assert.equal(record.fields.run_ref!.evidence[0]!.value, requeued.projection.runId, 'no record cites the judged-negative run');
+  }
+  // 4. Replay: boot reconciliation and a second drain change nothing.
+  runner.reconcileCanonicalEntityWorkspaceProjectionClaims();
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  assert.equal(fixture.bodies(), 2);
+  assert.deepEqual(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId), head);
 });

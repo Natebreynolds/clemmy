@@ -254,7 +254,7 @@ export function BackgroundTasks() {
   return (
     <Page
       title="Running"
-      subtitle="Everything Clementine is working on — drag a waiting card to Running to approve it, drag to Done to cancel, click to watch live."
+      subtitle="Everything Clementine is working on. Open a card to watch it live; decisions wait for you in Needs you."
       actions={(
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" onClick={() => void board.refetch()}>Refresh</Button>

@@ -312,7 +312,9 @@ export function formatRecallableToolText(
       compactResult: text, settlementNonce: active.settlementNonce });
     if (exact instanceof TruncatedToolOutputResult) return JSON.stringify(exact);
     if (typeof exact === 'string' && exact !== text) {
-      if (text.length <= maxChars && hostAnnotations.length === 0) return text;
+      if ((options.maxChars === undefined || text.length <= maxChars) && hostAnnotations.length === 0) return text;
+      // Only an explicit smaller display request should re-render a verified
+      // projection; a second formatter's default must not reinterpret it.
       // Only after exact same-invocation redemption may a smaller rendering
       // inherit the previous host annotation envelope. Provider JSON alone
       // cannot authenticate its metadata or lend another call this receipt.

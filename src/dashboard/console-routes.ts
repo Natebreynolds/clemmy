@@ -129,6 +129,10 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
+import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
+import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
+import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
+import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
@@ -349,7 +353,7 @@ import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
-import { addNotification, getNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, getNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { applySessionMountPrimers, composeSessionFromStore } from '../runtime/harness/session-composition.js';
@@ -459,7 +463,7 @@ import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/to
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { modelRoleOptionCatalogSnapshot, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
 import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/harness/codex-rescue-settings.js';
-import { modelDiscoveryStatus } from '../runtime/harness/model-discovery.js';
+import { modelDiscoveryStatus, refreshModelDiscoveryNow } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces, getFusionHealthSnapshot } from '../runtime/harness/debate-model.js';
@@ -563,6 +567,7 @@ import {
   resumeCapabilityBlockedWorkflowRun,
   resumeMutationBlockedWorkflowRun,
   resolveWorkflowCapabilityAccountChoice,
+  recordWorkflowGateChangeRequest,
   resolveWorkflowCapabilityRetry,
 } from '../execution/workflow-runner.js';
 import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
@@ -882,6 +887,26 @@ function extractRuntimeApprovalArgs(approval: PendingApproval): Record<string, u
 function approvalSummaryFromArgs(args: Record<string, unknown> | undefined, fallback: string): string {
   const subject = pickApprovalString(args, ['subject', 'title', 'name']);
   return trimConsoleTitle(subject || fallback || 'Approval required', 180);
+}
+
+/**
+ * What an approval does, in words: one line for Home, the board and Needs
+ * you. A carrier (work_call, composio_execute_tool) is unwrapped first — its
+ * `name` is the inner tool's id, and live 2026-09-22 that id became the title
+ * ("Approve: composio_execute_tool") for a Slack send.
+ */
+function approvalHeadline(
+  tool: string | null | undefined,
+  args: Record<string, unknown> | undefined,
+  fallback: string,
+): string {
+  const call = unwrapApprovalCall(tool, args);
+  if (!call.unwrapped) return approvalSummaryFromArgs(args, fallback);
+  const inner = call.args && typeof call.args === 'object' && !Array.isArray(call.args)
+    ? call.args as Record<string, unknown>
+    : undefined;
+  const named = pickApprovalString(inner, ['subject', 'title']);
+  return trimConsoleTitle(named || presentApprovalForHumans({ tool, args }).action, 180);
 }
 
 function approvalReasonFromArgs(args: Record<string, unknown> | undefined): string {
@@ -5710,6 +5735,14 @@ export function registerConsoleRoutes(
         summary: describeWorkflowPlainEnglish(entry.data),
         proof,
         certification,
+        // The creation test as the page should show it: running for this
+        // exact definition, passed, or needs review with the daemon's report.
+        creationTest: workflowCreationTestState({
+          workflowName: entry.data.name,
+          // Run records carry the durable slug, never the display name.
+          pendingRunId: pendingWorkflowVerification(entry.name, entry.data) ?? null,
+          notifications: listNotifications(400),
+        }),
         // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
         // visual workflow view. Built server-side from the pure, unit-tested
         // buildWorkflowGraph so the browser just hands it to Cytoscape.
@@ -6409,7 +6442,7 @@ export function registerConsoleRoutes(
       return;
     }
     if (!dryRun && !targetStepId && entry.data.enabled === false) {
-      const verificationRunId = pendingWorkflowVerification(entry.data.name, entry.data);
+      const verificationRunId = pendingWorkflowVerification(entry.name, entry.data);
       if (!verificationRunId) {
         res.status(409).json({ status: 'disabled', error: 'workflow is disabled — approve it first' });
         return;
@@ -6711,6 +6744,18 @@ export function registerConsoleRoutes(
         failedItems: result.failedItems ?? [],
         ...(result.status === 'blocked_readiness' ? workflowReadinessBlockedBody(result.message, result.readiness) : {}),
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Kill old occurrences that never ran: the same rule the daemon applies on
+  // boot, on demand from the desktop or phone.
+  app.post('/api/console/workflows/dead-occurrences/sweep', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { sweepDeadOccurrences } = await import('../execution/workflow-dead-occurrences.js');
+      res.json(sweepDeadOccurrences({ source: 'desktop-dashboard' }));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -8753,6 +8798,65 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Watches: what each background watch is for, its last finding, its open
+  // items and its controls. The calendar watch is the first one on the
+  // heartbeat contract (calendar-watch.ts). "Check now" runs one tick.
+  app.get('/api/console/watches', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const [{ calendarWatchStatus }, { workflowSuggestionsStatus }] = await Promise.all([
+        import('../agents/calendar-watch-runtime.js'),
+        import('../agents/workflow-suggestions.js'),
+      ]);
+      res.json({ watches: [calendarWatchStatus(), workflowSuggestionsStatus()] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/watches/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
+    try {
+      const body = (req.body ?? {}) as { enabled?: unknown; cadenceMinutes?: unknown };
+      const patch = {
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+        ...(typeof body.cadenceMinutes === 'number' && Number.isFinite(body.cadenceMinutes) ? { cadenceMinutes: body.cadenceMinutes } : {}),
+      };
+      if (req.params.id === 'workflow-suggestions') {
+        const { setWorkflowSuggestionsPolicy, workflowSuggestionsStatus } = await import('../agents/workflow-suggestions.js');
+        setWorkflowSuggestionsPolicy(patch);
+        res.json({ watch: workflowSuggestionsStatus() });
+        return;
+      }
+      const { calendarWatchStatus, setCalendarWatchPolicy } = await import('../agents/calendar-watch-runtime.js');
+      setCalendarWatchPolicy(patch);
+      res.json({ watch: calendarWatchStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/watches/:id/tick', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
+    try {
+      if (req.params.id === 'workflow-suggestions') {
+        const { runWorkflowSuggestionsTick, workflowSuggestionsStatus } = await import('../agents/workflow-suggestions.js');
+        const tick = await runWorkflowSuggestionsTick({ source: 'manual', force: true });
+        res.json({ tick, watch: workflowSuggestionsStatus() });
+        return;
+      }
+      const { calendarWatchStatus, runCalendarWatchTick } = await import('../agents/calendar-watch-runtime.js');
+      const tick = await runCalendarWatchTick({ source: 'manual', force: true });
+      const { seenEvents, ...summary } = tick;
+      const includeEvents = req.query.events === '1';
+      res.json({ tick: includeEvents ? { ...summary, seenEvents } : summary, watch: calendarWatchStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Developer feature-flags panel: read the curated CLEMMY_* kill-switch snapshot.
   app.get('/api/console/settings/developer-flags', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -9848,8 +9952,8 @@ export function registerConsoleRoutes(
       const store = await getSecretStore();
       const live = req.query.live === '1' || req.query.live === 'true';
       const rows = await store.health({ passive: !live });
-      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; required: boolean; envVarName: string }>>(
-        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, required: d.required, envVarName: d.envVarName }; return acc; },
+      const descriptors = listSecretDescriptors().reduce<Record<string, { description: string; setupHint?: string; keyUrl?: string; required: boolean; envVarName: string }>>(
+        (acc, d) => { acc[d.name] = { description: d.description, setupHint: d.setupHint, keyUrl: d.keyUrl, required: d.required, envVarName: d.envVarName }; return acc; },
         {},
       );
       // Surface the Discord allow-list alongside the token so the hub can
@@ -11439,6 +11543,8 @@ export function registerConsoleRoutes(
           sourceKind: undefined as string | undefined,
           tool: r.tool,
           args: r.args,
+          // What will happen, where, through which app — never the carrier envelope.
+          presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject }),
           status: r.status,
           resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
@@ -11470,8 +11576,8 @@ export function registerConsoleRoutes(
           channelId: undefined as string | undefined,
           requestedAt: approval.createdAt,
           expiresAt: undefined as string | undefined,
-          subject: `Approve: ${summarizeApprovalAction(approval)}`,
-          summary: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          subject: `Approve: ${approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval))}`,
+          summary: approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval)),
           reason: approvalReasonFromArgs(args),
           preview: normalizeApprovalPreview(args?.preview),
           pendingAction: pendingActionApprovalViewFromArgs(args),
@@ -12132,8 +12238,11 @@ export function registerConsoleRoutes(
           title: run.title,
           column,
           status: needsAttention ? 'needs_attention' : run.status,
-          progressHint: run.outputPreview?.slice(0, 600)
-            || run.events[run.events.length - 1]?.message || '',
+          // Raw structured output (`[{"team":"A",…}]`) is data for the run
+          // drawer, not a sentence for the card.
+          progressHint: (run.outputPreview && !/^\s*[[{]/.test(run.outputPreview) ? run.outputPreview.slice(0, 600) : '')
+            || run.events[run.events.length - 1]?.message
+            || (run.outputPreview ? 'Finished with data — open it to see the results.' : ''),
           sessionId: run.sessionId,
           ageMs: ageMs((run as { startedAt?: string; createdAt?: string }).startedAt
             || (run as { createdAt?: string }).createdAt
@@ -12352,7 +12461,7 @@ export function registerConsoleRoutes(
           title: row.subject || 'Approval required',
           column: 'needs_you',
           status: 'awaiting_approval',
-          progressHint: approvalSummaryFromArgs(row.args ?? undefined, row.subject),
+          progressHint: approvalHeadline(row.tool, row.args ?? undefined, row.subject),
           sessionId: row.sessionId,
           ageMs: ageMs(row.requestedAt),
           updatedAt: row.requestedAt,
@@ -12388,10 +12497,10 @@ export function registerConsoleRoutes(
         cards.push({
           id: `approval:${approval.id}`,
           sourceKind: 'approval',
-          title: `Approve: ${summarizeApprovalAction(approval)}`,
+          title: `Approve: ${approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval))}`,
           column: 'needs_you',
           status: 'awaiting_approval',
-          progressHint: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          progressHint: approvalReasonFromArgs(args),
           sessionId: approval.sessionId,
           ageMs: ageMs(approval.createdAt),
           updatedAt: approval.createdAt,
@@ -13327,6 +13436,18 @@ export function registerConsoleRoutes(
       res.status(pendingActionPreflight.status).json({ error: pendingActionPreflight.reason });
       return;
     }
+    // "Request changes" = reject + what to change. The note lands on the
+    // parked run BEFORE the row resolves, so the stop report carries it back
+    // to the conversation that owns the draft. Best-effort: a note that
+    // cannot be recorded never blocks the decision itself.
+    const changeNote = decision === 'reject' && typeof (req.body as { note?: unknown })?.note === 'string'
+      ? (req.body as { note: string }).note
+      : '';
+    if (changeNote.trim()) {
+      try {
+        recordWorkflowGateChangeRequest({ approvalId: id, sessionId: existing.sessionId, note: changeNote, by: 'desktop-command-center' });
+      } catch { /* the decision still lands */ }
+    }
 
     // Map any approve-shaped decision to the audit-log "approved"
     // resolution. The `approve_with_edits` flavor still resolves the
@@ -13522,12 +13643,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const since = typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+      const ref = needsYouReferents();
       const items = listNotifications(50)
         .filter((n) => !n.silent && !n.read)
         .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
         .slice(0, 5)
         .map((n) => {
-          const needsAttention = isNeedsAttentionNotification(n);
+          const needsAttention = notificationNeedsYou(n, ref);
           return {
             id: n.id,
             title: n.title,
@@ -13600,6 +13722,87 @@ export function registerConsoleRoutes(
         return;
       }
       res.status(400).json({ error: `kind "${kind}" is not dismissable` });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // "Not now": the decision leaves Home for a while and stays pending in
+  // Needs you. It never approves or declines anything.
+  app.post('/api/console/home/needs-you/snooze', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!isValidSnoozeKey(key)) { res.status(400).json({ error: 'key must be approval:<id> or plan:<id>' }); return; }
+    const hours = typeof req.body?.hours === 'number' ? req.body.hours : DEFAULT_SNOOZE_HOURS;
+    try {
+      const until = await snoozeHomeItem(key, hours);
+      res.json({ ok: true, key, until });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // The one needs-you count and the rows no other feed carries — the Needs
+  // you tab's badge and its unlisted rows (dashboard/needs-you.ts). The
+  // sidebar reads the same total from the command centre.
+  app.get('/api/console/needs-you/summary', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const runtimeApprovalIds = assistant.getRuntime().listPendingApprovals().map((approval) => approval.id);
+      const summary = await summarizeNeedsYou({ runtimeApprovalIds });
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Today on Home: the calendar watch's last read of the next day, projected
+  // (dashboard/home-today.ts). No provider call and no model call.
+  app.get('/api/console/home/today', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { calendarWatchStatus, loadCalendarWatchState } = await import('../agents/calendar-watch-runtime.js');
+      const { projectHomeToday } = await import('./home-today.js');
+      const status = calendarWatchStatus();
+      res.json(projectHomeToday({
+        state: loadCalendarWatchState(),
+        connectedOperations: status.connectedOperations,
+        ...(status.nextTickAt ? { nextTickAt: status.nextTickAt } : {}),
+        nowMs: Date.now(),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Summaries of the Spaces on Home, from the same projection the phone uses
+  // (dashboard/home-space-summary.ts). Read-only; nothing is refreshed.
+  app.get('/api/console/home/space-summaries', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const raw = typeof req.query.ids === 'string' ? req.query.ids : '';
+      const ids = [...new Set(raw.split(',').map((id) => id.trim()).filter(Boolean))].slice(0, 32);
+      const { spaceStore, isValidSpaceSlug } = await import('../spaces/store.js');
+      const { readData } = await import('../spaces/data-store.js');
+      const { summarizeSpaceForHome } = await import('./home-space-summary.js');
+      const summaries = ids.flatMap((id) => {
+        if (!isValidSpaceSlug(id)) return [];
+        const record = spaceStore.get(id);
+        if (!record || record.status === 'archived') return [];
+        const health = spaceStore.health(id);
+        let data: unknown = null;
+        try { data = readData(id); } catch { data = null; }
+        return [summarizeSpaceForHome({
+          id,
+          title: record.title,
+          objective: record.contract?.objective ?? null,
+          lastRefreshedAt: record.lastRefreshedAt ?? null,
+          freshness: health?.freshness.state ?? 'unknown',
+          issues: health?.issues ?? [],
+          data,
+        })];
+      });
+      res.json({ summaries });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -13692,7 +13895,11 @@ export function registerConsoleRoutes(
         ...approvals.map((approval) => {
           const args = extractRuntimeApprovalArgs(approval);
           const task = backgroundTaskByApprovalId.get(approval.id);
-          const summary = approvalSummaryFromArgs(args, summarizeApprovalAction(approval));
+          // One presenter for every surface: the provider call behind any
+          // carrier, never the carrier's name (live 2026-09-22 Home showed
+          // "Approve: composioexecutetool · work_call" for a Slack send).
+          const presentation = presentApprovalForHumans({ tool: approval.toolName, args });
+          const summary = approvalHeadline(approval.toolName, args, summarizeApprovalAction(approval));
           const reason = approvalReasonFromArgs(args);
           const preview = normalizeApprovalPreview(args?.preview);
           const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
@@ -13700,10 +13907,12 @@ export function registerConsoleRoutes(
             kind: task ? 'background-approval' : 'approval',
             title: `Approve: ${summary}`,
             meta: [
-              task ? `background ${task.id}` : approval.toolName,
+              task ? 'from a background task' : presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
               previewMeta,
-            ].filter(Boolean).join(' · ') || `${approval.sessionId || approval.id}`,
+            ].filter(Boolean).join(' · '),
+            unwrapped: presentation.unwrapped,
+            snoozeKey: `approval:${approval.id}`,
             panel: 'approvals',
             urgency: 'high',
             approvalKind: 'runtime',
@@ -13714,15 +13923,20 @@ export function registerConsoleRoutes(
           const reason = approvalReasonFromArgs(approval.args ?? undefined);
           const preview = normalizeApprovalPreview(approval.args?.preview);
           const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
+          // The same words Needs you and the phone use: the request's own
+          // subject, else the unwrapped provider call. Never the carrier.
+          const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject });
+          const headline = approval.subject?.trim() || presentation.action;
           return {
             kind: 'harness-approval',
-            title: `Approve: ${approvalSummaryFromArgs(approval.args ?? undefined, approval.subject)}`,
+            title: `Approve: ${headline}`,
             meta: [
-              approval.approvalId,
-              approval.tool || approval.sessionId,
+              presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
               previewMeta,
             ].filter(Boolean).join(' · '),
+            unwrapped: presentation.unwrapped,
+            snoozeKey: `approval:${approval.approvalId}`,
             panel: 'approvals',
             urgency: 'high',
             approvalKind: 'harness',
@@ -13752,6 +13966,7 @@ export function registerConsoleRoutes(
           panel: 'settings',
           urgency: 'high',
           planProposalId: proposal.id,
+          snoozeKey: `plan:${proposal.id}`,
           dismissKind: 'plan',
           dismissId: proposal.id,
         })),
@@ -13782,6 +13997,26 @@ export function registerConsoleRoutes(
           panel: 'approvals',
           urgency: 'high',
         })),
+        // Runs paused after repeated restarts: one decision per workflow
+        // (dashboard/needs-you.ts `bootParkedWorkflows`, which the count reads).
+        ...bootParkedWorkflows(pendingWorkflowRuns).map((group) => {
+          const workflow = readWorkflow(group.workflowName);
+          const title = workflow?.data?.name ?? group.workflowName;
+          const n = group.runIds.length;
+          return {
+            kind: 'workflow-paused',
+            title: n === 1
+              ? `Paused after repeated restarts: ${title}`
+              : `${n} paused runs of ${title} after repeated restarts`,
+            meta: [group.oldest ? `oldest ${relAge(group.oldest)}` : '', 'resume or skip them'].filter(Boolean).join(' · '),
+            panel: 'workflows',
+            urgency: 'low',
+            actionKind: 'workflow-run',
+            workflowName: group.workflowName,
+            runId: group.runIds[0],
+            count: n,
+          };
+        }),
       ].map((item) => ({
         ...item,
         title: trimConsoleTitle(stripConsoleIds(item.title), 140),
@@ -13799,7 +14034,7 @@ export function registerConsoleRoutes(
             : undefined;
           const args = runtimeApproval ? extractRuntimeApprovalArgs(runtimeApproval) : undefined;
           const summary = runtimeApproval
-            ? approvalSummaryFromArgs(args, summarizeApprovalAction(runtimeApproval))
+            ? approvalHeadline(runtimeApproval.toolName, args, summarizeApprovalAction(runtimeApproval))
             : task.title;
           // Clean meta: a short check-in line (ids stripped) or a relative
           // age — never the raw bg-… id.
@@ -13921,9 +14156,6 @@ export function registerConsoleRoutes(
           .split('\n')
           .map((line) => line.trim())
           .find((line) => line && !line.startsWith('#') && !/^[{}\[\]\-=*`>|"',:]+$/.test(line)) || '';
-      // Shared with markNotificationGroupRead so dismiss clears exactly the
-      // set of notifications this feed would surface.
-      const isNeedsAttentionNotif = isNeedsAttentionNotification;
       // Collapse the generic "Workflow completed/needs attention: <name>"
       // echo when a richer notify_user report already covers the same run —
       // otherwise every run double-reports (the clutter the inbox must avoid).
@@ -13996,13 +14228,20 @@ export function registerConsoleRoutes(
         }
         return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       };
+      // The one needs-you definition (dashboard/needs-you.ts), shared with the
+      // Needs you tab and the phone so their lists and badges agree.
+      const needsYouRef = needsYouReferents();
       const notifNeedsYou = dedupeByWorkflow(
         // Unread only: a read needs-attention notification is one the user
         // has already seen/dismissed — leaving it here made stale "Workflow
         // needs attention" cards immortal on Home (clicking led to an empty
         // approvals tab; observed 2026-06-11).
-        inboxNotifs.filter((notification) => !notification.read && isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
-        6,
+        inboxNotifs.filter((notification) => !notification.read
+          && notificationNeedsYou(notification, needsYouRef)
+          && !isGenericWorkflowEcho(notification)
+          // A carrier for a decision already on this list is that decision.
+          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef))),
+        50,
       ).map((notification) => ({
         kind: 'workflow',
         title: trimConsoleTitle(stripConsoleIds(notification.title.replace(/^[⚠️️\s]+/, '')), 140),
@@ -14018,7 +14257,7 @@ export function registerConsoleRoutes(
         dismissId: notification.id,
       }));
       const notifRecent = dedupeByWorkflow(
-        inboxNotifs.filter((notification) => !isNeedsAttentionNotif(notification) && !isGenericWorkflowEcho(notification)),
+        inboxNotifs.filter((notification) => !notificationNeedsYou(notification, needsYouRef) && !isGenericWorkflowEcho(notification)),
         12,
       ).map((notification) => {
         const undelivered = !notification.deliveredAt && (Boolean(notification.deliveryError) || (notification.deliveryAttempts || 0) > 0);
@@ -14119,7 +14358,13 @@ export function registerConsoleRoutes(
       // sessions + workflow runs/executions only. Background tasks and
       // legacy channel runs have their own surfaces.
       const activeCount = workingNow.length;
-      const waitingCount = needsYouMerged.length;
+      // Every badge shows this number: the same summary the phone's pill reads.
+      const waitingCount = (await summarizeNeedsYou({ runtimeApprovalIds: approvals.map((approval) => approval.id), pendingRuns: pendingWorkflowRuns })).total;
+      const snoozes = activeHomeSnoozes();
+      const isSnoozed = (item: unknown): boolean => {
+        const key = (item as { snoozeKey?: unknown }).snoozeKey;
+        return typeof key === 'string' && snoozes.has(key);
+      };
       const currentObjective = workingNow[0]?.title
         ?? needsYouMerged[0]?.title
         ?? (memoryWarnings.length ? 'Memory needs attention before the graph is fully trustworthy.' : 'Standing by for the next useful task.');
@@ -14144,8 +14389,11 @@ export function registerConsoleRoutes(
           runningWorkflows: pendingWorkflowRuns.length,
           backgroundActive: activeBackgroundTasks.length,
           requiredSetupMissing: requiredMissing,
+          snoozed: needsYouMerged.filter(isSnoozed).length,
         },
-        needsYou: needsYouMerged,
+        // A snoozed decision ("Not now") leaves Home for a while but still
+        // needs you: it stays in `waiting` and in Needs you.
+        needsYou: needsYouMerged.filter((item) => !isSnoozed(item)),
         // workingNow was REMOVED from this payload. It was a second, parallel
         // answer to "what is running" with its own staleness heuristic, and no
         // client read it — the badge, drawer, /tasks, and mobile all read the
@@ -15235,6 +15483,8 @@ export function registerConsoleRoutes(
     try {
       const result = await loginWithNativeOAuth();
       if (result.ok) {
+        void refreshModelDiscoveryNow('openai'); // list what the subscription can run, now
+
         // Clear in-app confirmation (the button label flips for only ~2s and is
         // easy to miss). Also clears the 'codex-auth-revoked' alert's relevance.
         try {
@@ -15282,6 +15532,8 @@ export function registerConsoleRoutes(
     try {
       const result = await pollCodexDeviceLogin(loginId);
       if (result.status === 'complete') {
+        void refreshModelDiscoveryNow('openai');
+
         try {
           addNotification({
             id: `codex-reauth-success-${new Date().toISOString()}`,
@@ -15418,6 +15670,7 @@ export function registerConsoleRoutes(
       claudeLoginFlows.delete(flowId);
       resetHarnessRuntimeConfig(); // re-register the Claude provider on the next run
       resetClaudeModelCache(); // drop the cached (pre-login) token so the new grant takes effect immediately
+      void refreshModelDiscoveryNow('anthropic'); // the picker lists what this subscription can run, now
       res.json({ ok: true, snapshot: getClaudeAuthSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -15502,7 +15755,7 @@ export function registerConsoleRoutes(
           //      otherwise the "Codex" brain resolves to (and the router sends it to)
           //      the BYO endpoint, or codexSafePrimary pins it to the gpt-5.4 fallback
           //      forever. A valid gpt-5.x slot is left exactly as-is.
-          const wantedPrimary = /^gpt-5/i.test(brainModelId) ? brainModelId : '';
+          const wantedPrimary = brainModelId && resolveProvider(brainModelId) === 'codex' ? brainModelId : '';
           for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
             const cur = (getRuntimeEnv(key, '') || '').trim();
             const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
@@ -16523,6 +16776,11 @@ export function registerConsoleRoutes(
     // plan continuity, or background promotion). The receipt/run id makes this
     // exact-once across a lost 202 and daemon recovery; the attempt binding is
     // what lets /api/runs project only this turn instead of guessing by time.
+    const preparationStartedAt = performance.now();
+    const preparationMarks: Array<{ phase: string; elapsedMs: number }> = [];
+    const markPreparation = (phase: string) => preparationMarks.push({
+      phase, elapsedMs: Math.max(0, performance.now() - preparationStartedAt),
+    });
     let requestAcceptedUserEvent: HarnessEventRow | undefined;
     if (shouldSchedule && requestAttempt) {
       try {
@@ -16549,6 +16807,7 @@ export function registerConsoleRoutes(
           },
         }, { armRunInFlight: !acceptedApprovalDefersMarkerOwnership });
         requestAcceptedUserEvent = acceptedUserEvent;
+        markPreparation('source_recorded');
       } catch (err) {
         try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
         console.error('could not durably record the accepted chat turn:', err);
@@ -16784,6 +17043,7 @@ export function registerConsoleRoutes(
     };
 
     setImmediate(async () => {
+      markPreparation('executor_started');
       let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
       // HELD WORK KEEPS ITS OWNER. Set only when runConversation returned a
       // hold AND the durable recovery sidecar names this exact attempt, so the
@@ -16971,6 +17231,7 @@ export function registerConsoleRoutes(
         }
         if (!explicitTaskMode && !intent) {
           const continuityNotes: string[] = [];
+          markPreparation('before_continuity');
           const continuity = await routeOpenQuestionPlan({
             channel: 'desktop',
             input: turnInput,
@@ -16984,6 +17245,7 @@ export function registerConsoleRoutes(
               continuityNotes.push(message);
             },
           });
+          markPreparation('after_continuity');
           if (continuity.handled) {
             // Workflow-input continuity owns this accepted turn and has no
             // later brain response. Its deterministic note is therefore the
@@ -17183,6 +17445,15 @@ export function registerConsoleRoutes(
         // the "couldn't be structured" apology. The selected model still resolves
         // through RouterModelProvider, so Claude uses its subscription OAuth
         // adapter while sharing the host-owned turn/tool loop with Codex.
+        markPreparation('before_bridge');
+        try {
+          appendHarnessEvent({ sessionId, turn: requestAcceptedUserEvent.turn,
+            role: 'system', type: 'turn_phase_timings', data: {
+              sourceUserSeq: requestSourceUserSeq, lane: 'desktop_admission',
+              totalMs: Math.max(0, performance.now() - preparationStartedAt),
+              phases: preparationMarks,
+            } });
+        } catch { /* Diagnostics cannot change turn admission. */ }
         const response = await respondPreferHarness(
           'home',
           {

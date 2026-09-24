@@ -14,6 +14,7 @@ const review = await import('./automation-opportunity-review-control-plane.js');
 const opportunityStore = await import('./automation-opportunity-store.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
+const summaries = await import('../runtime/approval-summary.js');
 const opportunityTools = await import('../tools/automation-opportunity-tools.js');
 const reviewTools = await import('../tools/automation-opportunity-review-tools.js');
 const pilotTools = await import('../tools/automation-read-pilot-tools.js');
@@ -314,6 +315,24 @@ test('chat tool stages one card, exact human resolution approves, and the existi
   assert.equal(requested.recurrenceAuthority, 'none');
   assert.equal(approvalCardCount(sessionId), 1);
   assert.equal(workflowRunCount(), 0);
+  const pendingCard = approvals.listPending({ sessionId }).find((row) => row.approvalId === requested.approval.approvalId)!;
+  const preview = summaries.extractApprovalContentPreview(pendingCard.tool, pendingCard.args);
+  assert.ok(preview?.body?.includes(proposal.opportunity.objective), 'review exposes the exact objective');
+  assert.ok(preview.body.includes(proposal.opportunity.capabilityRequirements[0]!.description));
+  assert.ok(preview.body.includes('does not start a pilot'));
+  assert.equal(summaries.extractApprovalContentPreview(pendingCard.tool, {
+    ...pendingCard.args, proposalDigest: '0'.repeat(64),
+  })?.body, 'This proposal has changed or is unavailable. Request a fresh review before deciding.');
+  assert.equal(summaries.extractApprovalContentPreview(pendingCard.tool, pendingCard.args)?.body, preview.body);
+  for (const changed of [{ reviewedRevision: 999 }, { proposalId: 'automation_missing' }, { controlVersion: 2 }]) {
+    assert.match(summaries.extractApprovalContentPreview(pendingCard.tool, { ...pendingCard.args, ...changed })!.body!, /changed or is unavailable/);
+  }
+  const display = summaries.presentApproval(pendingCard);
+  assert.equal(display.approveLabel, 'Approve proposal');
+  assert.equal(display.detail, preview.body);
+  assert.equal(display.canPauseWorkflow, false);
+
+
 
   const replay = toolJson(await reviewSurface.handlers.get('automation_opportunity_review_request')!(requestPayload));
   assert.equal(replay.ok, true, JSON.stringify(replay));
@@ -354,6 +373,7 @@ test('chat tool stages one card, exact human resolution approves, and the existi
   const decisionRevision = opportunityStore.listAutomationOpportunityProposalRevisions(proposal.proposalId)[2]!;
   assert.match(decisionRevision.actorRef, /^automation-decision:[a-f0-9]{64}$/);
 
+  assert.match(summaries.extractApprovalContentPreview(pendingCard.tool, pendingCard.args)!.body!, /changed or is unavailable/, 'resolved proposals cannot masquerade as pending reviews');
   const terminalReplay = toolJson(await reviewSurface.handlers.get('automation_opportunity_review_request')!(requestPayload));
   assert.equal(terminalReplay.ok, true, JSON.stringify(terminalReplay));
   assert.equal(terminalReplay.projection.status, 'approved');

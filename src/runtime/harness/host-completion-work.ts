@@ -437,7 +437,7 @@ export function sourceSettledReadEvidence(input: {
   /** Parent completion can inspect already-settled writes. This is evidence,
    * never permission to execute again or proof of later scheduled effects. */
   includeWriteReceipts?: boolean;
-}): CompletionReadEvidence {
+}, sharedContent: Map<string, string> = new Map()): CompletionReadEvidence {
   try {
     const rows = openEventLog().prepare(`
       SELECT s.rowid AS settlementIndex, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
@@ -456,7 +456,27 @@ export function sourceSettledReadEvidence(input: {
     const results: CompletionReadEvidence['results'] = [];
     const blocks: string[] = [];
     const incremental = input.afterSettlementIndex !== undefined;
-    const seenContent = new Map<string, string>();
+    // A control-role write that committed a durable definition (workflow or
+    // Space) is marked on its tool_returned row by the tool edge. That commit
+    // is the outcome of an authoring request, so the review sees it as one.
+    const authoringResultSettled = (callId: string): boolean => {
+      try {
+        const returned = openEventLog().prepare(`SELECT json_extract(data_json, '$.successfulAuthoringResult') AS marker FROM events
+          WHERE session_id = ? AND type = 'tool_returned'
+            AND json_extract(data_json, '$.sourceUserSeq') = ?
+            AND (json_extract(data_json, '$.canonicalCallId') = ?
+              OR json_extract(data_json, '$.callId') = ?
+              OR json_extract(data_json, '$.logicalToolCallId') = ?)
+          ORDER BY seq DESC LIMIT 1`).get(input.sessionId, input.sourceUserSeq, callId, callId, callId) as { marker: unknown } | undefined;
+        return returned?.marker === 1 || returned?.marker === true;
+      } catch {
+        return false;
+      }
+    };
+    // One rendering owns one content dictionary across the exact parent and
+    // authenticated child scopes. Receipts and request scope remain per call;
+    // only identical payload bytes share their presentation, never authority.
+    const seenContent = sharedContent;
     const succeeded = (outcome: string): boolean => outcome === 'succeeded' || outcome === 'empty_result';
     // Discovery is scaffolding once a business read has answered; when nothing
     // else was read, what discovery found may itself be the answer.
@@ -466,8 +486,13 @@ export function sourceSettledReadEvidence(input: {
       if (!incremental && input.omitSuccessfulDiscovery && row.toolName === 'tool_search' && row.outcome === 'succeeded') continue;
       const evidenceKind = toolReadsRetainedOutput(row.toolName)
         ? 'retained_projection' as const : 'source_result' as const;
-      const base = { logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, evidenceKind };
-      const label = `${row.toolName} [logicalCall=${row.callId}, outcome=${row.outcome}${row.mutating ? ', write receipt' : ''}]`;
+      const authoringResult = Boolean(row.mutating) && succeeded(row.outcome) && authoringResultSettled(row.callId);
+      const base = {
+        logicalToolCallId: row.callId, toolName: row.toolName, outcome: row.outcome, evidenceKind,
+        ...(authoringResult ? { authoringResult: true } : {}),
+      };
+      const label = `${row.toolName} [logicalCall=${row.callId}, outcome=${row.outcome}${row.mutating ? (authoringResult ? ', authoring receipt' : ', write receipt') : ''}]`;
+      if (authoringResult) blocks.push('Authoring receipt: a durable definition (workflow or Space) was committed to disk and reopened; its body below reports the creation test and enabled state as settled. This IS the outcome of an authoring request; it does not prove any later scheduled run.');
       if (row.mutating) blocks.push('Write receipt: verifies only the settled operation and its returned result. Saving a timer, workflow, or queued action does NOT prove later execution or delivery. Inspect its exact request/result; never repeat the write to obtain evidence.');
       if (row.outcome !== 'succeeded' && row.outcome !== 'empty_result') {
         results.push({ ...base, status: 'not_succeeded' });
@@ -561,8 +586,12 @@ export function sourceSettledReadEvidence(input: {
       // distinct result; the final state alone cannot prove an intermediate
       // enable, edit, or recovery the user explicitly asked us to verify.
       // Identical bytes still appear once, with every call retaining its scope.
-      const duplicateOf = seenContent.get(value.rawPayloadSha256);
-      if (!seenContent.has(value.rawPayloadSha256)) seenContent.set(value.rawPayloadSha256, row.callId);
+      // A full retained page cannot be replaced by an earlier bounded source
+      // view, and discovery navigation cannot stand in for business data.
+      const presentationKey = `${value.rawPayloadSha256}:${evidenceKind}:${row.toolName === 'tool_search' ? 'discovery' : 'data'}`;
+      const duplicateOf = seenContent.get(presentationKey);
+      if (!seenContent.has(presentationKey)) seenContent.set(presentationKey,
+        `${row.callId} (session=${input.sessionId}, source=${input.sourceUserSeq})`);
       // A discovery that found nothing stays whole: that absence can be the
       // evidence for a reply saying no capability fits.
       // An advisory cursor already covered these schemas. Keep the receipt
@@ -622,7 +651,7 @@ export function sourceSettledReadEvidence(input: {
     let throughSettlementIndex = rows.at(-1)?.settlementIndex ?? input.afterSettlementIndex ?? 0;
     if (input.includeWorkerResults !== false) {
       for (const worker of sourceWorkerEvidenceScopes(input)) {
-        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false });
+        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false }, seenContent);
         evidenceAvailable = evidenceAvailable && evidence.evidenceAvailable;
         throughSettlementIndex = Math.max(throughSettlementIndex, evidence.throughSettlementIndex ?? 0);
         results.push(...evidence.results);

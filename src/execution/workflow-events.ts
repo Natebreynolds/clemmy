@@ -77,6 +77,7 @@ export type WorkflowEventKind =
   | 'attempt_record'      // STATE: a comparable per-attempt record (what was tried, what changed, what it cost)
   | 'step_advisory'       // step completed but a non-failing quality check flagged it (skill-execution miss)
   | 'step_skipped'        // step was a no-op (forEach over empty list, condition)
+  | 'step_invalidated'    // a reviewer asked for changes: this step's output is discarded and it runs again with the note
   | 'workflow_graph_created'         // graph snapshot compiled/created for the run
   | 'workflow_node_ready'            // graph node dependencies satisfied
   | 'workflow_node_started'          // graph node execution started
@@ -596,6 +597,15 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     }
     if ((ev.kind === 'step_failed' || ev.kind === 'step_blocked') && ev.stepId) {
       failedSteps.add(ev.stepId);
+    }
+    if (ev.kind === 'step_invalidated' && ev.stepId) {
+      // A reviewer's change request discards this step's output: it is no
+      // longer complete, and the run re-runs it with the note.
+      completedSteps.delete(ev.stepId);
+      completedStepArtifacts.delete(ev.stepId);
+      completedItems.delete(ev.stepId);
+      completedItemArtifacts.delete(ev.stepId);
+      failedSteps.delete(ev.stepId);
     }
     if ((ev.kind === 'step_completed' || ev.kind === 'step_skipped') && ev.stepId) {
       const output = ev.kind === 'step_skipped' && ev.output === undefined && ev.meta?.reason === 'forEach-empty'

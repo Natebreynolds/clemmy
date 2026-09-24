@@ -208,14 +208,31 @@ const HARNESS_SESSION_PAGE_SIZE = 500;
 /** Every harness row, unfiltered. The session table is paged through exactly
  *  once and the result is shared by everything that needs it in the same
  *  request — see listHarnessRowsForWorkflowRun for why that matters. */
-function listAllHarnessRows(): HarnessSessionRow[] {
+function listAllHarnessRows(options: { withoutConversationState?: boolean } = {}): HarnessSessionRow[] {
   const out: HarnessSessionRow[] = [];
   for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
-    const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
+    const page = listHarnessSessions({
+      limit: HARNESS_SESSION_PAGE_SIZE,
+      offset,
+      status: 'any',
+      withoutConversationState: options.withoutConversationState,
+    });
     out.push(...page);
     if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
   }
   return out;
+}
+
+/**
+ * The same rows without the model/recovery state in `metadata`, for the list
+ * a person reads. Live 2026-09-22 the full scan parsed 136 MB of session
+ * metadata per call (132 MB of it conversation state) and held the daemon's
+ * event loop for 12-26 s while the chat rail loaded. Read-only: these rows
+ * must never reach updateHarnessSession, which replaces metadata whole — the
+ * patch and delete paths keep reading full rows.
+ */
+function listAllHarnessRowsForDisplay(): HarnessSessionRow[] {
+  return listAllHarnessRows({ withoutConversationState: true });
 }
 
 function userFacingHarnessRows(all: HarnessSessionRow[]): HarnessSessionRow[] {
@@ -325,9 +342,27 @@ function summarizeWorkflowRun(representative: HarnessSessionRow, rows: HarnessSe
   };
 }
 
-function fillWorkflowRunStatus(summary: UnifiedRunSummary, readStatus: ReturnType<typeof createWorkflowRunStatusReader>): void {
+/** The snapshot's row for an id, indexed once per snapshot. A list build
+ *  already holds every row; re-reading one by id would parse its full
+ *  metadata (up to ~10 MB of conversation state) just to read a few keys. */
+const snapshotIndexes = new WeakMap<HarnessSessionRow[], Map<string, HarnessSessionRow>>();
+function snapshotRow(allRows: HarnessSessionRow[] | undefined, rawId: string): HarnessSessionRow | null {
+  if (!allRows) return getHarnessSession(rawId);
+  let index = snapshotIndexes.get(allRows);
+  if (!index) {
+    index = new Map(allRows.map((row) => [row.id, row]));
+    snapshotIndexes.set(allRows, index);
+  }
+  return index.get(rawId) ?? getHarnessSession(rawId);
+}
+
+function fillWorkflowRunStatus(
+  summary: UnifiedRunSummary,
+  readStatus: ReturnType<typeof createWorkflowRunStatusReader>,
+  allRows?: HarnessSessionRow[],
+): void {
   if (!summary.runSteps) return;
-  const row = getHarnessSession(summary.id.slice(HARNESS_PREFIX.length));
+  const row = snapshotRow(allRows, summary.id.slice(HARNESS_PREFIX.length));
   const runId = row ? workflowRunIdFor(row) : '';
   const projection = readStatus(runId);
   summary.status = projection.status;
@@ -348,7 +383,7 @@ interface HarnessSummaryCollection {
 }
 
 function collectHarnessSummaries(): HarnessSummaryCollection {
-  const allRows = listAllHarnessRows();
+  const allRows = listAllHarnessRowsForDisplay();
   const rows = userFacingHarnessRows(allRows);
   const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
@@ -429,7 +464,7 @@ function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit =
 
 function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: HarnessSessionRow[]): void {
   const rawId = summary.id.slice(HARNESS_PREFIX.length);
-  const row = getHarnessSession(rawId);
+  const row = snapshotRow(allRows, rawId);
   if (!row) {
     summary.preview = clip(harnessPreview(rawId), 140);
     return;
@@ -622,7 +657,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
       const last = publicTurns[publicTurns.length - 1];
       summary.preview = last ? clip(last.text, 140) : '';
     } else {
-      fillWorkflowRunStatus(summary, readRunStatus);
+      fillWorkflowRunStatus(summary, readRunStatus, harnessCollection.allRows);
       fillHarnessPreviewAndCount(summary, harnessCollection.allRows);
     }
   }

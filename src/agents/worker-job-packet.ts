@@ -16,7 +16,7 @@ export const WorkerManifestDescriptorSchema = z.object({
   id: z
     .string()
     .min(1)
-    .describe('Stable id of this logical work set across waves.'),
+    .describe('Stable work-set id across waves.'),
   contractVersion: z
     .string()
     .min(1),
@@ -58,33 +58,33 @@ export const WorkerToolInputSchema = z.object({
   objective: z
     .string()
     .min(8)
-    .describe('Objective for this fan-out, scoped to one item.'),
+    .describe('Objective for each item.'),
   item: z
     .string()
     .min(1)
-    .describe('The single item to process: id, name, domain, row, record, URL, or other concrete identifier.'),
+    .describe('Concrete item identifier.'),
   resolvedTools: z
     .string()
     .min(1)
-    .describe('Exact tool slugs/CLI commands/schemas the worker uses, or "none needed".'),
+    .describe('Exact tools/commands/schemas, or "none needed".'),
   externalMcpToolNames: ExternalMcpToolNamesSchema
     .nullable()
     .optional()
-    .describe('Typed exact external MCP lease (`server__tool`); null when none. Prose in resolvedTools never widens it.'),
+    .describe('Exact MCP lease (`server__tool`); null for none. Prose grants no authority.'),
   context: z
     .string()
     .min(1)
-    .describe('Every source fact the isolated worker needs.'),
+    .describe('Shared source facts.'),
   retainedResultIds: z.array(z.string().min(1)).max(32).nullable().optional()
-    .describe('Exact parent call IDs or result handles to share read-only with this worker. Query these with tool_output_query; do not copy full payloads into context.'),
+    .describe('Read-only parent call IDs/handles. Use tool_output_query; avoid copying payloads.'),
   instructions: z
     .string()
     .min(1)
-    .describe('Rules, approval scope, safety boundaries, style.'),
+    .describe('Rules, approval scope, boundaries, style.'),
   expectedOutput: z
     .string()
     .min(1)
-    .describe('Compact output shape to aggregate, incl. failure format.'),
+    .describe('Output shape and failure format.'),
   intent: z
     .string()
     .min(1)
@@ -95,11 +95,11 @@ export const WorkerToolInputSchema = z.object({
     .min(1)
     .nullable()
     .optional()
-    .describe('Exact model id; null uses routing (an unroutable id falls back, never refuses).'),
+    .describe('Model id; null or unroutable uses routing.'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()
-    .describe('Durable multi-wave binding of canonical items to per-item phases; null otherwise.'),
+    .describe('Multi-wave item/phase binding; otherwise null.'),
   expectedWork: z
     .object({
       requirementId: z
@@ -114,7 +114,7 @@ export const WorkerToolInputSchema = z.object({
     })
     .nullable()
     .optional()
-    .describe('Frozen-contract requirement each item discharges; the harness fills it when unambiguous.'),
+    .describe('Frozen requirement per item; inferred when unambiguous.'),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
@@ -133,24 +133,24 @@ export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
     item: z.string().min(1),
     context: z.string().min(1),
   })).max(256).nullable().optional()
-    .describe('Per-item facts; when supplied, exactly one entry per item. Keep context above shared-only. Each worker receives shared context plus its own entry, never sibling entries.'),
+    .describe('Exactly one facts entry per item, if supplied. Workers receive shared context plus their own entry only.'),
   // New live calls must state external authority explicitly. The base packet
   // remains optional for durable pre-upgrade packets recovered from disk.
   externalMcpToolNames: ExternalMcpToolNamesSchema
     .nullable()
-    .describe('Required typed exact external MCP lease (`server__tool`); [] or null for none.'),
+    .describe('Exact MCP lease (`server__tool`); [] or null for none.'),
   item: z
     .string()
     .min(1)
     .nullable()
     .optional()
-    .describe('One concrete item identifier; omit when passing `items`.'),
+    .describe('Item identifier; omit with `items`.'),
   items: z
     .array(z.string().min(1))
     .max(256)
     .nullable()
     .optional()
-    .describe('PREFERRED for 2+ items: the full list (up to 256), run as one pool.'),
+    .describe('Full batch, run as one pool; preferred for 2+ items.'),
 });
 
 export type WorkerToolCall = z.infer<typeof WorkerToolCallSchema>;

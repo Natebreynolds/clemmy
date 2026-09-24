@@ -341,6 +341,43 @@ export interface WorkflowStepCall {
    *  {{item[.path]}} / {{date}} templating (a value that is exactly one token
    *  resolves to the raw upstream value). */
   args?: Record<string, unknown>;
+  /**
+   * The exact connected account this step runs on, chosen by the owner when
+   * more than one account could perform `tool`. Content-addressed to the
+   * choice set it was picked from: the live compiler revalidates the pair AND
+   * the digest before every dispatch, so a changed account set asks again
+   * instead of silently retargeting. Without this, every creation test and
+   * every scheduled run re-asked the same question (live 2026-09-21, "Market
+   * Leader Outreach": the count climbed 11→13 across retries and no answer
+   * had anywhere to live). Serialized as `call.account`.
+   */
+  account?: WorkflowStepCallAccountBinding;
+}
+
+export interface WorkflowStepCallAccountBinding {
+  capabilityId: string;
+  accountId: string;
+  choiceSetDigest: string;
+  selectedAt?: string;
+  selectedBy?: string;
+}
+
+/** Parse a persisted `call.account`; malformed bindings are dropped so a
+ * corrupt file can never bind an account by accident. */
+export function parseWorkflowStepCallAccountBinding(value: unknown): WorkflowStepCallAccountBinding | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const capabilityId = typeof raw.capabilityId === 'string' ? raw.capabilityId.trim() : '';
+  const accountId = typeof raw.accountId === 'string' ? raw.accountId.trim() : '';
+  const choiceSetDigest = typeof raw.choiceSetDigest === 'string' ? raw.choiceSetDigest.trim() : '';
+  if (!capabilityId || !accountId || !/^[a-f0-9]{64}$/.test(choiceSetDigest)) return undefined;
+  return {
+    capabilityId,
+    accountId,
+    choiceSetDigest,
+    ...(typeof raw.selectedAt === 'string' && raw.selectedAt.trim() ? { selectedAt: raw.selectedAt.trim() } : {}),
+    ...(typeof raw.selectedBy === 'string' && raw.selectedBy.trim() ? { selectedBy: raw.selectedBy.trim().slice(0, 120) } : {}),
+  };
 }
 
 export interface WorkflowStepInputBinding {
@@ -837,9 +874,11 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         const c = step.call as Record<string, unknown>;
         const tool = typeof c.tool === 'string' ? c.tool.trim() : '';
         if (tool) {
+          const account = parseWorkflowStepCallAccountBinding(c.account);
           result.call = {
             tool,
             ...(c.args && typeof c.args === 'object' && !Array.isArray(c.args) ? { args: c.args as Record<string, unknown> } : {}),
+            ...(account ? { account } : {}),
           };
         }
       }
@@ -1146,7 +1185,13 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
         }
         out.deterministic = { runner };
       }
-      if (s.call?.tool) out.call = { tool: s.call.tool, ...(s.call.args ? { args: s.call.args } : {}) };
+      if (s.call?.tool) {
+        out.call = {
+          tool: s.call.tool,
+          ...(s.call.args ? { args: s.call.args } : {}),
+          ...(s.call.account ? { account: { ...s.call.account } } : {}),
+        };
+      }
       if (s.invocationPlan) out.invocation_plan = structuredClone(s.invocationPlan);
       if (s.codifiedFrom?.prompt) {
         out.codified_from = { prompt: s.codifiedFrom.prompt, ...(s.codifiedFrom.allowedTools ? { allowedTools: s.codifiedFrom.allowedTools } : {}) };

@@ -494,7 +494,8 @@ test('matrix rows 1 and 3: a cold two-page read stays in one graphless foregroun
       if (modelStep === 1) {
         assert.match(serialized, new RegExp(objective));
         assert.ok(tools.includes('tool_search'));
-        assert.equal(tools.includes('work_call'), false);
+        assert.equal(tools.includes('work_call'), true, 'generic carrier availability is not capability authority');
+        assert.deepEqual(liveFactory.snapshot(), [], 'no business capability is materialized before discovery');
         output = [functionCall(generated(seed, 'search_call'), 'tool_search', {
           // Natural discovery adds useful context that need not occur verbatim
           // in a tools/list description. It must not hide a connected reader.

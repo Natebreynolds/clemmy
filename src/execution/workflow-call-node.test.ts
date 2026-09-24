@@ -54,6 +54,33 @@ test('renderCallArgValue: a full-token value resolves to the RAW upstream value 
   assert.equal(renderCallArgValue('{{input.missing}}', INPUTS, OUTPUTS), '');
 });
 
+test('time tokens: {{now}}, {{now+24h}}, {{date+1d}} resolve at run time so a relative window is an exact call', () => {
+  // Live 2026-09-22: "read my calendar for the next 24 hours" was authored as
+  // a prompt step (43 s on the worker per run) because call args had no way
+  // to say "now" or "now plus a day".
+  const before = Date.now();
+  const now = renderCallArgValue('{{now}}', INPUTS, OUTPUTS) as string;
+  const plus24 = renderCallArgValue('{{now+24h}}', INPUTS, OUTPUTS) as string;
+  const minus90m = renderCallArgValue('{{ now-90m }}', INPUTS, OUTPUTS) as string;
+  const after = Date.now();
+  assert.match(now, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  assert.ok(Date.parse(now) >= before && Date.parse(now) <= after);
+  assert.equal(Date.parse(plus24) - Date.parse(now) >= 24 * 3_600_000 - 50, true);
+  assert.equal(Date.parse(now) - Date.parse(minus90m) >= 90 * 60_000 - 50, true);
+  const date = renderCallArgValue('{{date}}', INPUTS, OUTPUTS) as string;
+  const tomorrow = renderCallArgValue('{{date+1d}}', INPUTS, OUTPUTS) as string;
+  const lastWeek = renderCallArgValue('{{date-7d}}', INPUTS, OUTPUTS) as string;
+  assert.equal(date, new Date().toISOString().slice(0, 10));
+  assert.equal(Math.round((Date.parse(tomorrow) - Date.parse(date)) / 86_400_000), 1);
+  assert.equal(Math.round((Date.parse(date) - Date.parse(lastWeek)) / 86_400_000), 7);
+  // embedded in a string and nested in objects
+  const args = renderCallArgs({ window: { start: '{{now}}', end: '{{now+2d}}' }, note: 'from {{date}} on' }, INPUTS, OUTPUTS) as { window: { start: string; end: string }; note: string };
+  assert.ok(Date.parse(args.window.end) - Date.parse(args.window.start) >= 2 * 86_400_000 - 50);
+  assert.equal(args.note, `from ${date} on`);
+  // a malformed unit is not a token: left alone (no silent empty value)
+  assert.equal(renderCallArgValue('{{now+2w}}', INPUTS, OUTPUTS), '{{now+2w}}');
+});
+
 test('renderCallArgValue: an EMBEDDED token string-renders; non-strings pass through', () => {
   assert.equal(renderCallArgValue('to: {{input.url}} now', INPUTS, OUTPUTS), 'to: https://acme-co.example now');
   assert.equal(renderCallArgValue(50, INPUTS, OUTPUTS), 50);

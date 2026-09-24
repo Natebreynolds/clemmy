@@ -18,12 +18,12 @@ test.after(() => {
   rmSync(testHome, { recursive: true, force: true });
 });
 
-test('Future Commitments projects unavailable inbox/calendar watches as blocked with one prepared-read setup path', () => {
+test('Future Commitments projects the unavailable inbox watch as blocked with one prepared-read setup path, and the calendar watch as active', () => {
   const now = new Date('2026-08-30T18:00:00.000Z');
   const result = syncProspectiveIntentions(now);
   assert.equal(result.sources.monitor, 2);
 
-  for (const sourceId of ['inbox', 'calendar'] as const) {
+  for (const sourceId of ['inbox'] as const) {
     const monitor = prospective.getProspectiveIntention(`monitor:${sourceId}`);
     assert.ok(monitor, `${sourceId} monitor intention should be materialized`);
     assert.equal(monitor.status, 'blocked');
@@ -57,7 +57,18 @@ test('Future Commitments projects unavailable inbox/calendar watches as blocked 
     now,
   });
   assert.match(projected.text, /\[BLOCKED\].*Inbox watch is paused/i);
-  assert.match(projected.text, /\[BLOCKED\].*Calendar watch is paused/i);
-  assert.doesNotMatch(projected.text, /\[ACTIVE\].*(?:Inbox|Calendar) watch/i);
-  assert.doesNotMatch(projected.text, /while watching (?:inbox|calendar)/i);
+  assert.doesNotMatch(projected.text, /\[ACTIVE\].*Inbox watch/i);
+  assert.doesNotMatch(projected.text, /while watching inbox/i);
+
+  // The calendar watch runs on the prepared read path: an active, recurring
+  // state watch, never "paused" and never a manual setup cue.
+  const calendar = prospective.getProspectiveIntention('monitor:calendar')!;
+  assert.ok(calendar, 'calendar watch intention should be materialized');
+  assert.notEqual(calendar.status, 'blocked');
+  assert.equal(calendar.metadata?.availability, 'active');
+  assert.deepEqual(calendar.trigger, { kind: 'state', channel: 'calendar', intervalMs: 30 * 60_000 });
+  assert.equal(calendar.action.ref, 'calendar-watch');
+  assert.equal(calendar.recurring, true);
+  assert.match(projected.text, /Calendar watch: one item per meaningful change/i);
+  assert.doesNotMatch(projected.text, /\[BLOCKED\].*Calendar watch/i);
 });

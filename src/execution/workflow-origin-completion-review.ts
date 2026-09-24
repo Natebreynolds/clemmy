@@ -1,7 +1,8 @@
 /** Optional captured completion review at the existing all-child report-back
  * join. A queue ACK is never final evidence. No workflow is executed here. */
 import { createHash } from 'node:crypto';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents, getRunAttemptBySourceUserSeq } from '../runtime/harness/eventlog.js';
+import { readWorkflowParentCheckpoint } from './workflow-parent-checkpoint.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { withModelUsageAttribution } from '../runtime/usage-log.js';
 import {
@@ -34,12 +35,70 @@ function snapshot(input: WorkflowOriginTerminalInput, reply: string) {
       artifacts, reads })) };
 }
 
-function retainedVerdict(input: WorkflowOriginTerminalInput, key: string): boolean {
+function retainedVerdictEvent(input: WorkflowOriginTerminalInput, key: string) {
   const latest = listEvents(input.observer.originSessionId, { types: ['goal_alignment_judged'] }).filter((event) =>
     event.role === 'system' && event.data.sourceUserSeq === input.observer.sourceUserSeq
     && event.data.lane === 'host_v1' && event.data.kind === 'completion').at(-1);
   return latest?.data.workflowCompletionEvidenceDigest === key
-    && typeof latest.data.fulfills === 'boolean';
+    && typeof latest.data.fulfills === 'boolean' ? latest : null;
+}
+
+function retainedVerdict(input: WorkflowOriginTerminalInput, key: string): boolean {
+  return retainedVerdictEvent(input, key) !== null;
+}
+
+/** Read-only recovery preflight. A negative review is useful only against the
+ * exact still-current joined evidence and an unfinished original owner. This
+ * does not schedule a wake-up, grant effects, or suppress a terminal: the
+ * continuation driver must durably claim and revalidate it before execution. */
+export function readWorkflowParentContinuation(input: WorkflowOriginTerminalInput, reply: string) {
+  const current = snapshot(input, reply);
+  if (!current) return null;
+  const verdict = retainedVerdictEvent(input, current.key);
+  return verdict ? readWorkflowParentContinuationTrigger(input, reply, {
+    verdictEventId: verdict.id, evidenceDigest: current.key,
+  }) : null;
+}
+
+/** After claiming, parent actions may legitimately add evidence. Revalidate
+ * the immutable trigger's child/objective/reply bindings without requiring the
+ * parent's evidence inventory to remain frozen at its pre-recovery contents.
+ * Callers must separately prove they still own the original claim's lease. */
+export function readWorkflowParentContinuationTrigger(
+  input: WorkflowOriginTerminalInput,
+  reply: string,
+  trigger: { verdictEventId: string; evidenceDigest: string },
+) {
+  if ((input.outcome !== 'done' && input.outcome !== 'blocked') || terminalExists(input)) return null;
+  const policy = readCapturedCompletionPolicy(identityFor(input));
+  if (policy.status !== 'captured' || !policy.policy.enabled) return null;
+  const current = snapshot(input, reply);
+  if (!current) return null;
+  // A completed child's quality advisory is work for the original parent to
+  // resolve, not a loss of parent ownership. Do not resume through an actual
+  // paused, failed, or cancelled child: those require their own recovery.
+  if (input.outcome === 'blocked' && !current.child.allExecutionsCompleted) return null;
+  const verdict = listEvents(current.identity.sessionId, { types: ['goal_alignment_judged'] })
+    .find(event => event.id === trigger.verdictEventId && event.role === 'system'
+      && event.data.sourceUserSeq === current.identity.sourceUserSeq
+      && event.data.lane === 'host_v1' && event.data.kind === 'completion'
+      && event.data.workflowCompletionEvidenceDigest === trigger.evidenceDigest
+      && event.data.workflowSourceGroupId === current.child.sourceGroupId
+      && event.data.workflowSourceGroupDigest === current.child.sourceGroupDigest
+      && event.data.workflowExecutionDigest === current.child.digest
+      && event.data.objectiveDigest === digest(current.objective)
+      && event.data.replyDigest === digest(reply));
+  if (!verdict || verdict.data.fulfills !== false
+    || verdict.data.failedOpen === true || verdict.data.awaitingUser === true) return null;
+  const attempt = getRunAttemptBySourceUserSeq(current.identity.sessionId, current.identity.sourceUserSeq);
+  if (!attempt || attempt.status !== 'active' || attempt.finishedAt !== null) return null;
+  const checkpoint = readWorkflowParentCheckpoint({ ...current.identity,
+    sourceGroupId: current.child.sourceGroupId,
+    sourceGroupDigest: current.child.sourceGroupDigest });
+  if (!checkpoint) return null;
+  return { checkpoint, attemptId: attempt.attemptId, verdictEventId: verdict.id,
+    evidenceDigest: trigger.evidenceDigest, child: current.child,
+    reason: typeof verdict.data.reason === 'string' ? verdict.data.reason : '' };
 }
 
 function terminalExists(input: WorkflowOriginTerminalInput): boolean {
@@ -75,7 +134,7 @@ export async function reviewWorkflowOriginCompletion(
     // Do not inherit a child lease, attempt, worker scope or tool allowance.
     const noToolAllowance = new ToolCallsCounter(1);
     noToolAllowance.increment(); // valid counter, with zero remaining tool calls
-    verdict = await withModelUsageAttribution(identity, () => withHarnessRunContext({
+    verdict = await withModelUsageAttribution({ ...identity, role: 'reviewer' }, () => withHarnessRunContext({
       ...identity, counter: noToolAllowance,
     }, () => judge(before.objective, reply, {
       fullSourceEvidence: true,

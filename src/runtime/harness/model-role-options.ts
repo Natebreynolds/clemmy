@@ -148,6 +148,10 @@ function addSavedRoleModelsWhileCatalogUncertain(
 }
 
 function codexBrainModelChoices(): Array<{ id: string; label: string }> {
+  const live = discoveredModels().openai;
+  if (modelDiscoveryStatus().providers.openai.phase === 'ready' && live.length > 0) {
+    return live.map((model) => ({ id: model.id, label: model.label }));
+  }
   const models = [...MODEL_PRESETS];
   for (const id of [MODELS.fast, MODELS.primary, MODELS.deep, DEFAULT_CODEX_MODEL]) {
     try {
@@ -165,6 +169,10 @@ function codexBrainModelChoices(): Array<{ id: string; label: string }> {
 }
 
 function claudeBrainModelChoices(): Array<{ id: string; label: string }> {
+  const live = discoveredModels().anthropic;
+  if (modelDiscoveryStatus().providers.anthropic.phase === 'ready' && live.length > 0) {
+    return live.map((model) => ({ id: model.id, label: model.label }));
+  }
   const models = [...CLAUDE_MODEL_PRESETS];
   for (const id of [getClaudeBrainModel(), getDebateCheckerModel()]) {
     try {

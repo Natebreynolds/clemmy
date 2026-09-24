@@ -12,6 +12,7 @@ import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
+import { describeMissingRetainedOutputForSession } from '../runtime/harness/retained-output-redirect.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -123,6 +124,16 @@ export function normalizeFieldsInput(raw: unknown): string[] | undefined {
     return arr.length > 0 ? arr : undefined;
   }
   if (typeof raw === 'string' && raw.trim()) {
+    // String-only tool transports can serialize the documented array form.
+    // Decode only a nonempty string array; malformed input must not widen a
+    // projection into returning every field.
+    try {
+      const decoded: unknown = JSON.parse(raw);
+      if (Array.isArray(decoded) && decoded.length > 0
+        && decoded.every((field) => typeof field === 'string' && field.trim().length > 0)) {
+        return decoded.map((field: string) => field.trim());
+      }
+    } catch { /* the existing comma-separated spelling is also supported */ }
     const arr = raw.split(',').map((s) => s.trim()).filter(Boolean);
     return arr.length > 0 ? arr : undefined;
   }
@@ -210,9 +221,15 @@ export function registerRecallTools(server: McpServer): void {
             totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
         : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
       if (!row) {
-        return textResult(
-          `No tool output found for call_id "${callId}" in this session. Check the [clipped: ...] stub for the correct call_id, or proceed with the summary.`,
-        );
+        // A capability reference is not a result handle, and "not found" is
+        // not "empty": name what the id is, how to invoke it, and what this
+        // turn has actually retained (live 2026-09-21 source 277962).
+        return textResult(describeMissingRetainedOutputForSession({
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq,
+          requestedId: callId,
+          readerTool: 'recall_tool_result',
+        }));
       }
       if (row.truncatedAtWrite) {
         return textResult(
@@ -292,12 +309,21 @@ export function registerRecallTools(server: McpServer): void {
       const row = resolved.receipt ?? getToolOutput(ctx.sessionId, callId);
       if (!row) {
         const suggestion = nearestToolOutputCallId(callId, listToolOutputCallIds(ctx.sessionId));
-        return textResult(
-          suggestion
-            ? `No tool output found for call_id "${callId}". Did you mean "${suggestion}"? `
-              + 'Re-run this query with that exact id.'
-            : `No tool output found for call_id "${callId}" in this session.`,
-        );
+        if (suggestion) {
+          return textResult(
+            `No tool output found for call_id "${callId}". Did you mean "${suggestion}"? `
+              + 'Re-run this query with that exact id.',
+          );
+        }
+        // Not a typo of a real id. Say what the id IS (a capability reference
+        // that was never invoked, or an unknown id), the exact carrier call
+        // that produces a result, and which results this turn has retained.
+        return textResult(describeMissingRetainedOutputForSession({
+          sessionId: ctx.sessionId,
+          sourceUserSeq: ctx.sourceUserSeq,
+          requestedId: callId,
+          readerTool: 'tool_output_query',
+        }));
       }
       if (row.truncatedAtWrite) {
         return textResult(

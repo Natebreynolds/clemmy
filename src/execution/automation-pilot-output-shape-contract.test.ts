@@ -203,10 +203,13 @@ test('attested live output schema admits exact paginated entity paths without a 
   }), { ok: true });
 });
 
-test('missing or fingerprint-drifted output metadata fails closed', () => {
+test('absent metadata is explicitly conditional while fingerprint drift still refuses', () => {
   const missing = attestAutomationPilotOutputShape({ request: request(null), requestDigest: DIGEST });
-  assert.equal(missing.ok, false);
-  if (!missing.ok) assert.equal(missing.code, 'output_shape_unavailable');
+  assert.equal(missing.ok, true);
+  if (missing.ok) {
+    assert.equal(missing.receipt.source, 'conditional_text_interpretation');
+    assert.equal(validateAutomationPilotAuthoringOutputShape({ receipt: missing.receipt, result: result() }).ok, false, 'unknown schemas never admit invented provider paths');
+  }
 
   const drifted = request();
   drifted.acquisition.outputShape!.schemaFingerprint = 'c'.repeat(32);
@@ -260,4 +263,57 @@ test('unsupported schema composition is never treated as path proof', () => {
   const checked = validateAutomationPilotAuthoringOutputShape({ receipt: attested.receipt, result: result() });
   assert.equal(checked.ok, false);
   if (!checked.ok) assert.match(checked.reason, /unsupported schema composition/);
+});
+
+
+test('explicit host provenance maps without inventing provider output fields', () => {
+  const attested = attestAutomationPilotOutputShape({ request: request(), requestDigest: DIGEST });
+  assert.equal(attested.ok, true);
+  if (!attested.ok) return;
+  const candidate = result();
+  const previous = candidate.contract.resultProjection!;
+  const { projectionDigest: _digest, ...base } = previous;
+  candidate.contract.resultProjection = createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    fields: [...base.fields,
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+  });
+  assert.notEqual(candidate.contract.resultProjection.projectionDigest, previous.projectionDigest);
+  assert.deepEqual(validateAutomationPilotAuthoringOutputShape({ receipt: attested.receipt, result: candidate }), { ok: true });
+  const host = candidate.contract.resultProjection.fields.at(-1)!;
+  for (const invalid of [
+    { ...host, recordPath: 'spoofed' },
+    { ...host, hostSource: 'invented_source' },
+    { ...host, type: 'number' },
+    { ...host, hostSource: undefined },
+  ]) {
+    assert.throws(() => createWorkflowCanonicalEntityResultProjection({
+      ...base, fields: [invalid as typeof host],
+    }));
+  }
+});
+
+
+test('conditional text authoring validates generated fields and refuses unreviewed parsing changes', () => {
+  const attested = attestAutomationPilotOutputShape({ request: request(null), requestDigest: DIGEST });
+  assert.equal(attested.ok, true);
+  if (!attested.ok) return;
+  const authored = result();
+  const { projectionDigest: _digest, ...base } = authored.contract.resultProjection!;
+  authored.contract.resultProjection = createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    fields: base.fields.map(field => ({ ...field, recordPath: 'key' })),
+    sourceRecord: { idPath: 'key', observedAt: { kind: 'page_settled_at' } },
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'key', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 5 } },
+    bounds: { ...base.bounds, maxPages: 1, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  authored.contract.continuation = { kind: 'none' };
+  authored.contract.completeness = { kind: 'terminal_result', evidencePaths: ['records'] };
+  authored.contract.evidence = { requiredPaths: ['records'], nonEmptyPaths: ['records'], minItems: { records: 1 } };
+  assert.deepEqual(validateAutomationPilotAuthoringOutputShape({ receipt: attested.receipt, result: authored }), { ok: true });
+  authored.contract.resultProjection.textInterpretation!.prefix = '* ';
+  assert.equal(validateAutomationPilotAuthoringOutputShape({ receipt: attested.receipt, result: authored }).ok, false);
 });

@@ -11,6 +11,9 @@
  * consulted for execution authority.
  */
 import { createHash } from 'node:crypto';
+import path from 'node:path';
+import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { readWorkflowRunRecord } from './workflow-run-record.js';
 
 import type { WorkflowInputDef } from '../memory/workflow-store.js';
 import type {
@@ -95,6 +98,7 @@ export interface AutomationReadPilotTypedContractV1 {
   continuation?: WorkflowNodeContinuationContractV1;
   resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
+  workspaceOutputPhaseId?: string;
 }
 
 export interface RegisterAutomationReadPilotProjectionInputV1 {
@@ -178,6 +182,7 @@ export type RegisterAutomationReadPilotProjectionResult =
       ok: false;
       code: string;
       reason: string;
+      repairableArguments?: boolean;
       projection?: AutomationReadPilotProjectionV1;
     };
 
@@ -201,6 +206,9 @@ export interface ReconcileAutomationReadPilotProjectionsResult {
   alreadyQueued: number;
   refused: number;
   failed: number;
+  /** Queued projections whose run reached a terminal without proving the
+   * pilot, now released so the same proposal can be re-staged. */
+  runUnproven: number;
 }
 
 interface ProjectionSqlRow {
@@ -364,6 +372,101 @@ export function automationReadPilotCatalogIdentityDigest(
   }));
 }
 
+/** Refusal code of a queued projection released because its run finished
+ *  without proving the pilot. Such a projection re-opens on the next request
+ *  (see registerAutomationReadPilotProjection); every other refusal is final. */
+export const AUTOMATION_READ_PILOT_RUN_UNPROVEN = 'run_unproven' as const;
+
+/**
+ * Why a pilot run's terminal record does NOT prove the pilot, or null when it
+ * does (a clean completed run) or when the run has not finished yet.
+ *
+ * Live 2026-09-24 00:37Z (trigger-0a70cd32): the approved pilot run finished
+ * needs-attention, the projection stayed `queued` forever, and every later
+ * request for the same proposal was handed the same projection with no new
+ * card — the model then spent twelve minutes searching for a control that did
+ * not exist. A queued projection must have exactly one live run; a run that
+ * ended without proving the pilot releases it.
+ */
+export function automationReadPilotRunUnprovenReason(record: {
+  status?: string;
+  finishedAt?: string;
+  needsAttention?: boolean;
+  terminalOutcome?: string;
+} | null | undefined): string | null {
+  if (!record || typeof record.finishedAt !== 'string' || !record.finishedAt) return null;
+  if (record.needsAttention === true) return 'the pilot run finished needing attention';
+  if (record.terminalOutcome === 'blocked') return 'the pilot run finished blocked';
+  if (record.status && record.status !== 'completed') return `the pilot run finished ${record.status}`;
+  return null;
+}
+
+function pilotRunRecordFor(runId: string): {
+  status?: string;
+  finishedAt?: string;
+  needsAttention?: boolean;
+  terminalOutcome?: string;
+} | null {
+  try {
+    return readWorkflowRunRecord<{
+      status?: string;
+      finishedAt?: string;
+      needsAttention?: boolean;
+      terminalOutcome?: string;
+    }>(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  } catch {
+    return null;
+  }
+}
+
+/** Release one queued projection whose run finished without proving the
+ *  pilot. Idempotent; a projection that is not exactly queued on that run is
+ *  left alone. */
+export function releaseUnprovenAutomationReadPilotRun(input: {
+  runId: string;
+  reason: string;
+}): { released: boolean } {
+  const changes = database().prepare(`
+    UPDATE automation_read_pilot_projections
+       SET status = 'refused', refusal_code = ?, refusal_detail = ?, updated_at = ?
+     WHERE run_id = ? AND status = 'queued'
+  `).run(
+    AUTOMATION_READ_PILOT_RUN_UNPROVEN,
+    input.reason.slice(0, 8_192),
+    new Date().toISOString(),
+    input.runId,
+  ).changes;
+  return { released: changes === 1 };
+}
+
+function releaseIfRunUnproven(row: ProjectionSqlRow): ProjectionSqlRow {
+  if (row.status !== 'queued' || !row.run_id) return row;
+  const reason = automationReadPilotRunUnprovenReason(pilotRunRecordFor(row.run_id));
+  if (!reason) return row;
+  releaseUnprovenAutomationReadPilotRun({ runId: row.run_id, reason });
+  return database().prepare(
+    'SELECT * FROM automation_read_pilot_projections WHERE projection_id = ?',
+  ).get(row.projection_id) as ProjectionSqlRow;
+}
+
+/** Re-open a released projection for a fresh review card: same durable
+ *  identity and bytes, no approval, receipt or run. Only the typed
+ *  run-unproven release re-opens; any other refusal stays final. */
+function reopenReleasedProjection(row: ProjectionSqlRow): ProjectionSqlRow | null {
+  if (row.status !== 'refused' || row.refusal_code !== AUTOMATION_READ_PILOT_RUN_UNPROVEN) return null;
+  const db = database();
+  const changed = db.prepare(`
+    UPDATE automation_read_pilot_projections
+       SET status = 'registering', approval_id = NULL, trigger_receipt_id = NULL, run_id = NULL,
+           refusal_code = NULL, refusal_detail = NULL, updated_at = ?
+     WHERE projection_id = ? AND status = 'refused' AND refusal_code = ?
+  `).run(new Date().toISOString(), row.projection_id, AUTOMATION_READ_PILOT_RUN_UNPROVEN).changes;
+  if (changed !== 1) return null;
+  return db.prepare(
+    'SELECT * FROM automation_read_pilot_projections WHERE projection_id = ?',
+  ).get(row.projection_id) as ProjectionSqlRow;
+}
+
 function rowToProjection(row: ProjectionSqlRow): AutomationReadPilotProjectionV1 {
   return {
     version: CONTROL_PLANE_VERSION,
@@ -511,13 +614,17 @@ function typedContractIssue(input: {
   schema: ToolContract;
 }): string | null {
   const schema = input.schema.schema;
+  // JSON Schema permits omitted properties/required and does not require the
+  // provider to forbid extra keys. The pilot remains narrower: every bound
+  // argument below must have an explicit property and preserve its type.
+  const properties = schema.properties === undefined ? {} : schema.properties;
+  const required = schema.required === undefined ? [] : schema.required;
   if (
     schema.type !== 'object'
-    || schema.additionalProperties !== false
-    || !safeRecord(schema.properties)
-    || !Array.isArray(schema.required)
-    || !schema.required.every((key) => typeof key === 'string' && key.trim() === key)
-  ) return 'The live input schema is not a closed typed object contract.';
+    || !safeRecord(properties)
+    || !Array.isArray(required)
+    || !required.every((key) => typeof key === 'string' && key.trim() === key)
+  ) return 'The live input schema is not a typed object contract.';
 
   const continuation = input.contract.continuation ?? { kind: 'none' as const };
   if (
@@ -525,10 +632,9 @@ function typedContractIssue(input: {
     || (input.contract.completeness.kind === 'terminal_result' && continuation.kind !== 'none')
     || (input.contract.completeness.kind === 'finite_exhaustive' && continuation.kind !== 'cursor')
   ) return 'The typed pilot completeness and continuation contracts contradict one another.';
-  const propertyNames = new Set(Object.keys(schema.properties));
-  const requiredNames = new Set(schema.required as string[]);
+  const propertyNames = new Set(Object.keys(properties));
+  const requiredNames = new Set(required as string[]);
   const argumentNames = Object.keys(input.contract.arguments);
-  if (argumentNames.length === 0) return 'The typed pilot has no provider arguments.';
   if (argumentNames.some((key) => !propertyNames.has(key))) {
     return 'The typed pilot contains an argument absent from the exact live schema.';
   }
@@ -544,7 +650,7 @@ function typedContractIssue(input: {
     )) {
       return 'The control-plane pilot accepts only workflow-input and host-owned continuation-cursor argument sources.';
     }
-    const property = schema.properties[argumentName];
+    const property = properties[argumentName];
     const propertyType = schemaType(property);
     if (!propertyType || propertyType !== binding.type || binding.type !== 'string') {
       return `Argument "${argumentName}" does not preserve the exact live schema type.`;
@@ -626,14 +732,14 @@ function proposalIssue(input: {
   if (
     phase.effect.class !== 'read'
     || requirement.minimumEffect !== 'read'
-    || opportunity.effectCeiling.class !== 'read'
+    || (!target.workspaceOutputPhase && opportunity.effectCeiling.class !== 'read')
   ) return { code: 'capability_effect_unsafe', reason: 'Compute or write work cannot enter the one-read pilot.' };
   return null;
 }
 
 function prepareProjection(
   input: RegisterAutomationReadPilotProjectionInputV1,
-): PreparedProjection | { code: string; reason: string } {
+): PreparedProjection | { code: string; reason: string; repairableArguments?: boolean } {
   try {
     canonicalJson(input);
   } catch (error) {
@@ -693,6 +799,7 @@ function prepareProjection(
     }],
   };
   const readPilotContract: AutomationSingleReadPilotContractV1 = {
+    ...(input.contract.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.contract.workspaceOutputPhaseId } : {}),
     phaseId: input.contract.phaseId,
     requirementId: input.contract.requirementId,
     workflowInputs: structuredClone(input.contract.workflowInputs),
@@ -735,6 +842,12 @@ function prepareProjection(
     || !preview.pilotApprovalRequest
   ) return {
     code: 'preview_blocked',
+    // Typed preview failures occur before registration or execution. Preserve
+    // argument-repair semantics; never infer this from provider error prose.
+    repairableArguments: preview.issues.length > 0 && preview.issues.every((issue) =>
+      issue.code === 'workflow_dataset_contract_unrepresented'
+      || issue.code === 'workspace_binding_contract_unrepresented'
+      || issue.code === 'workflow_tool_kernel_binding_unrepresented'),
     reason: preview.issues.map((issue) => issue.message).join('; ')
       || 'The exact disabled pilot preview is not representable.',
   };
@@ -864,7 +977,7 @@ export function registerAutomationReadPilotProjection(
 ): RegisterAutomationReadPilotProjectionResult {
   const prepared = prepareProjection(input);
   if ('code' in prepared) return { ok: false, ...prepared };
-  const inserted = insertProjectionIntent({ prepared, request: input });
+  let inserted = insertProjectionIntent({ prepared, request: input });
   if ('code' in inserted) {
     return {
       ok: false,
@@ -873,6 +986,10 @@ export function registerAutomationReadPilotProjection(
       ...(inserted.row ? { projection: rowToProjection(inserted.row) } : {}),
     };
   }
+  // A queued projection whose run already finished without proving the pilot
+  // is released here, and a released projection re-opens for a fresh card.
+  inserted = releaseIfRunUnproven(inserted);
+  inserted = reopenReleasedProjection(inserted) ?? inserted;
   if (inserted.status === 'refused') {
     return {
       ok: false,
@@ -1509,7 +1626,27 @@ export function reconcileAutomationReadPilotProjections(input: {
     alreadyQueued: 0,
     refused: 0,
     failed: 0,
+    runUnproven: 0,
   };
+  const queuedRows = input.approvalId
+    ? database().prepare(`
+        SELECT * FROM automation_read_pilot_projections
+         WHERE approval_id = ? AND status = 'queued' AND run_id IS NOT NULL
+         ORDER BY updated_at ASC, projection_id ASC LIMIT ?
+      `).all(input.approvalId, limit) as ProjectionSqlRow[]
+    : database().prepare(`
+        SELECT * FROM automation_read_pilot_projections
+         WHERE status = 'queued' AND run_id IS NOT NULL
+         ORDER BY updated_at ASC, projection_id ASC LIMIT ?
+      `).all(limit) as ProjectionSqlRow[];
+  for (const row of queuedRows) {
+    try {
+      const released = releaseIfRunUnproven(row);
+      if (released.status !== 'queued') result.runUnproven += 1;
+    } catch {
+      result.failed += 1;
+    }
+  }
   for (const row of rows) {
     result.scanned += 1;
     try {

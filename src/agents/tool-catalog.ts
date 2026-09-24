@@ -97,16 +97,9 @@ function namesNamespace(tokens: string[], namespace?: string): boolean {
  * results — first-class on every lane, every turn, never behind a search.
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
-  // Native product operations are instruments Clem owns. Keep their schemas
-  // stable instead of guessing an operation from request words. Explicit Plan
-  // and reviewed Execute still apply their existing surface restrictions.
-  ...NATIVE_PRODUCT_AUTHORING_TOOLS,
-  'space_list',
-  'space_get',
-  'workflow_list',
-  'workflow_get',
-  'workflow_run',
-  'workflow_run_status',
+  // Native product tools remain catalog-visible and same-turn discoverable. Its
+  // large schemas join the hot set through exact selection, recall or session
+  // use; unrelated reads do not pay for all authoring definitions.
   // Local inspection is an acquisition primitive too. A names-only catalog
   // made list_files(directory) repeatedly arrive as list_files(path), costing
   // a refused call and another model step. Expose the actual small schemas.
@@ -151,19 +144,40 @@ export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
 
 /**
  * On a proven-operation skip the carrier already has the callable schema.
- * Keep ask/check-in. Recall/query tools stay off this surface until a
- * result has landed: first-class tool_output_query with nothing to query
- * became a dummy-query loop instead of the disclosed carrier
- * (live 2026-09-21 source 277962).
+ * Keep ask, discovery, and the two retained-output readers.
+ *
+ * tool_search STAYS. A remembered operation accelerates selection; it must
+ * not close the tool universe for the turn. The guidance says "search if
+ * these cannot fulfil the request" — that promise needs a reachable door.
+ *
+ * tool_output_query / recall_tool_result STAY. They were pulled from this
+ * surface after live 277962 (a cap:… ref sent to tool_output_query looped 13×);
+ * that defect is now answered at the source — the reader names the ref for
+ * what it is and hands back the carrier. Hiding the readers created the
+ * opposite dead end (live 2026-09-22 source 278624): every projected result
+ * ends with a recovery pointer to exactly these tools, the model searched for
+ * them twelve times, and re-called the provider three times to get the fields
+ * the projection had dropped. A surface that advertises a door must have it.
  */
 export const PROVEN_SKIP_KEEP_LOADED: ReadonlySet<string> = new Set([
   'ask_user_question',
+  'tool_search',
+  'tool_output_query',
+  'recall_tool_result',
+  // Live 282184: a proven calendar strategy matched "create a workflow…" and
+  // the thinned surface had no door to authoring. Neither call_tool (live
+  // 283712: the brain wrapped the proven read through it, 98 s vs 48 s) nor
+  // the authoring tools (live 284195: a plain calendar question started with
+  // workflow_create) belong on a proven surface. The fix is upstream: a
+  // strategy that covers only a sliver of the request no longer thins the
+  // surface at all (proven-operation.ts, strongMatch).
 ]);
 
 export function applyProvenSkipToHotSet(hot: Iterable<string>): Set<string> {
   const next = new Set<string>();
   for (const name of hot) {
-    if (TOOL_SEARCH_ALWAYS_LOADED.has(name) && !PROVEN_SKIP_KEEP_LOADED.has(name)) continue;
+    if ((TOOL_SEARCH_ALWAYS_LOADED.has(name) || NATIVE_PRODUCT_AUTHORING_TOOLS.has(name))
+      && !PROVEN_SKIP_KEEP_LOADED.has(name)) continue;
     next.add(name);
   }
   return next;
@@ -326,14 +340,20 @@ function lexicalTokens(text: string): string[] {
 /** Deterministic lexical fallback when embeddings are off/unhealthy: token overlap
  *  between the query and the tool's name+one-liner. Keeps tool_search useful (and
  *  its tests hermetic) without a live embedding endpoint. */
-function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: ReadonlyMap<string, number>): {
+function lexicalRelevance(queryTokens: string[], queryLead: string | undefined, e: CatalogEntry, weights: ReadonlyMap<string, number>): {
   score: number;
+  purposeLeadMatch: boolean;
   fullLexicalCoverage: boolean;
   completeCompoundNameMatch: boolean;
 } {
-  if (queryTokens.length === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  if (queryTokens.length === 0) return { score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false };
   const descriptionTokens = new Set(lexicalTokens(e.oneLiner));
   const nameTokens = new Set(lexicalTokens(e.name));
+  // Long descriptions also name prerequisites and alternative operations.
+  // Keep those searchable, but prefer evidence in the operation's own name
+  // and opening purpose over incidental matches later in its documentation.
+  const openingPurpose = e.oneLiner.split(/[.;\n]|\b(?:a|an|the)\b/i, 1)[0] ?? '';
+  const purposeTokens = new Set(lexicalTokens(openingPurpose));
   let covered = 0;
   let nameHits = 0;
   let queryWeight = 0;
@@ -343,7 +363,7 @@ function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: Reado
     if (nameTokens.has(q)) nameHits += weight;
     if (nameTokens.has(q) || descriptionTokens.has(q)) covered += weight;
   }
-  if (queryWeight === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  if (queryWeight === 0) return { score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false };
   // Coverage rewards the requested concepts; Dice similarity also accounts
   // for unrequested operation qualifiers. Merely adding more name tokens must
   // not make every reply/forward variant beat the matching base operation.
@@ -351,6 +371,10 @@ function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: Reado
   const nameSimilarity = 2 * nameHits / (queryWeight + nameWeight);
   return {
     score: (covered / queryWeight + nameSimilarity) / 2,
+    // Retain compound opening purposes such as "create, append, or overwrite".
+    // Later instructions about other operations remain searchable but do not
+    // turn those operations into this tool's purpose.
+    purposeLeadMatch: Boolean(queryLead && (purposeTokens.has(queryLead) || nameTokens.has(queryLead))),
     // A compound operation identifier explicitly present in ordinary word
     // order is stronger lexical evidence than incidental description words.
     // A single generic token (including a repeated-token name) is insufficient.
@@ -405,11 +429,12 @@ export function rankCatalogLexically(
 export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   query: string,
   entries: readonly T[],
-): Array<T & { score: number; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean; namespaceMatch: boolean }> {
+): Array<T & { score: number; purposeLeadMatch: boolean; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean; namespaceMatch: boolean }> {
   const q = (query ?? '').trim();
-  if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
+  if (!q) return entries.map((entry) => ({ ...entry, score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
   const querySequence = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   const queryTokens = [...new Set(lexicalTokens(q))];
+  const queryLead = lexicalTokens(q.replace(/^(?:\[[^\]]+\]\s*)+/, ''))[0];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.
@@ -422,9 +447,10 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
     token, Math.log(1 + (entries.length - count + 0.5) / (count + 0.5)),
   ]));
   return entries
-    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, entry, weights), namespaceMatch: namesNamespace(querySequence, entry.namespace) }))
+    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, queryLead, entry, weights), namespaceMatch: namesNamespace(querySequence, entry.namespace) }))
     .sort((left, right) => Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
       || Number(right.namespaceMatch) - Number(left.namespaceMatch)
+      || Number(right.purposeLeadMatch) - Number(left.purposeLeadMatch)
       || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
       || right.score - left.score || left.name.localeCompare(right.name));
 }

@@ -1,19 +1,21 @@
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
-import { workflowRunReadEvidence, summarizeWorkflowReadExecutions } from './workflow-read-evidence.js';
+import { validateWorkflowRunGoal, workflowGoalExecutionEvidence, workflowGoalValidationReceipt } from './workflow-goal-review.js';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
+import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { ExternalWritePreDispatchError } from '../runtime/harness/external-write-admission.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
 } from '../runtime/sandboxed-script.js';
 import pino from 'pino';
+import { actionBus } from '../runtime/action-bus.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
@@ -60,7 +62,12 @@ import {
 } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
+import { judgeRevisionApplied } from './revision-judge.js';
+import { noEffectStepReason, readPreDispatchRefusals } from './step-refusal-summary.js';
+import { renderReviewDraftForHumans, renderReviewValueForHumans } from './review-draft-render.js';
 import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
+import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
+import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
 import { recordAuthoredWorkflowWriteAuthority } from '../runtime/harness/authored-workflow-write-authority.js';
 import { HOST_TOOL_DISPOSITION_PROTOCOL } from '../runtime/harness/host-model-result-receipt.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
@@ -83,7 +90,7 @@ import {
   type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
-import { validateGoal, toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
+import { toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
 import {
   ensureWorkflowRunGoal,
   recordGoalValidation,
@@ -231,7 +238,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
-import { readWorkflowTargetEvidence } from './workflow-target-evidence.js';
+import { humanDecisionBlocks, readWorkflowTargetEvidence } from './workflow-target-evidence.js';
 import { captureWorkflowTargetReviewPolicy, type WorkflowTargetReviewPolicy } from './workflow-target-review-policy.js';
 import {
   runWatcherJudge,
@@ -242,7 +249,6 @@ import {
   type WatcherJudgeFn,
   type WatcherVerdict,
 } from '../runtime/harness/watcher-judge.js';
-import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import {
   launchIndependentAdvisoryJudges,
@@ -277,7 +283,9 @@ import {
 } from '../memory/workflow-node-invocation-plan.js';
 import {
   compileLiveCatalogWorkflowCallPlan,
-  ensureLiveReadCapabilityForOperation,
+  ensureLiveReadCapabilityForOperation, warmDurableProviderOperation,
+  isCapabilityNotRegisteredMessage,
+  workflowCapabilityAccountChoiceSet,
   type WorkflowCapabilityAccountCandidateV1,
   type WorkflowCapabilityAccountChoiceSetV1,
   type WorkflowCapabilityAccountSelectionV1,
@@ -835,10 +843,12 @@ export interface WorkflowRunGoalValidationV1 {
   judgeFailedOpen: boolean;
   perCriterion: Array<{
     criterion: string;
+    scope?: 'objective';
     pass: boolean;
     method: 'deterministic' | 'judge' | 'skipped';
     detail?: string;
   }>;
+  objectiveReview?: GoalValidationResult['perCriterion'][number];
   validatedAt: string;
 }
 
@@ -860,6 +870,9 @@ export interface QueuedRunRecord {
    *  dead weight for the schedule, not a person's pending approval, so the
    *  scheduler must not hold the next occurrence for it. */
   bootResumeParkedAt?: string;
+  /** Reviewer change requests this occurrence has absorbed: each re-ran the
+   *  drafting step(s) behind the gated step with the note and re-parked. */
+  revisions?: WorkflowRunRevision[];
   /** Optional review only; captured before execution and immutable on resume. */
   targetReviewPolicy?: WorkflowTargetReviewPolicy;
   inputs?: Record<string, string>;
@@ -946,6 +959,8 @@ export interface QueuedRunRecord {
    * identity, current binding revision, and clean completion receipt.
    */
   canonicalEntityWorkspaceProjectionClaim?: unknown;
+  /** Time of the immutable dataset receipt; whole-run completion follows goal review. */
+  canonicalEntityWorkspaceProjectionFinishedAt?: string;
   /** Exact closed read-authority root captured before step completion. This is
    * the restart bridge to the producer; it contains no provider/result body. */
   canonicalEntityWorkflowResultRoot?: CanonicalEntityWorkflowResultRootV1;
@@ -1135,9 +1150,240 @@ export interface ParkedStepRef {
   sessionId?: string;
 }
 
+export interface WorkflowRunRevision {
+  approvalId: string;
+  /** The gated step whose draft was declined. */
+  stepId: string;
+  /** The steps re-run with the note (the gated step's model-authored inputs). */
+  revisedStepIds: string[];
+  note: string;
+  requestedAt: string;
+  requestedBy: string;
+  appliedAt: string;
+  /** The judge's verdict on the revised output, before the gate asks again. */
+  verification?: {
+    verdict: 'applied' | 'not_applied' | 'unverified';
+    reason: string;
+    judge: string;
+    confidence?: number;
+    attempts: number;
+    at: string;
+  };
+}
+
+/** The model steps a gated step consumes: the ones a reviewer's note can
+ *  change. A call, transform or subgraph step has nothing to revise. */
+export function revisableUpstreamStepIds(
+  steps: ReadonlyArray<{ id: string; dependsOn?: string[]; prompt?: string; call?: unknown; transform?: unknown; subgraph?: unknown; deterministic?: unknown }>,
+  gatedStepId: string,
+): string[] {
+  const gated = steps.find((step) => step.id === gatedStepId);
+  if (!gated) return [];
+  return (gated.dependsOn ?? []).filter((dep) => {
+    const step = steps.find((candidate) => candidate.id === dep);
+    return Boolean(step && (step.prompt ?? '').trim() && !step.call && !step.transform && !step.subgraph && !step.deterministic);
+  });
+}
+
+/** The latest revision naming this step whose verdict is still open (no
+ *  verification yet, or one failed attempt). */
+export function pendingRevisionFor(runId: string, stepId: string): WorkflowRunRevision | null {
+  const revisions = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`))?.revisions ?? [];
+  const mine = revisions.filter((revision) => revision.revisedStepIds.includes(stepId));
+  const latest = mine[mine.length - 1];
+  if (!latest) return null;
+  const attempts = latest.verification?.attempts ?? 0;
+  if (latest.verification?.verdict === 'applied') return null;
+  if (attempts >= REVISION_JUDGE_MAX_ATTEMPTS) return null;
+  return latest;
+}
+
+export const REVISION_JUDGE_MAX_ATTEMPTS = 2;
+
+/** Record the judge's verdict on the latest revision naming this step. */
+export function recordRevisionVerification(
+  runId: string,
+  approvalId: string,
+  verification: { verdict: 'applied' | 'not_applied' | 'unverified'; reason: string; judge: string; confidence?: number },
+): void {
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current?.revisions) return;
+    writeRunRecord(filePath, {
+      ...current,
+      revisions: current.revisions.map((revision) => (revision.approvalId === approvalId
+        ? {
+            ...revision,
+            verification: {
+              ...verification,
+              attempts: (revision.verification?.attempts ?? 0) + 1,
+              at: new Date().toISOString(),
+            },
+          }
+        : revision)),
+    });
+  });
+}
+
+/** A revision's verification is written by the step lane under the record
+ *  lock; every later runner write spreads the in-memory run it loaded before
+ *  that. Keep the durable verification when the incoming revision has none
+ *  (live 2026-09-22: the gate subject carried the verdict while the record
+ *  said null). */
+export function mergeRevisionVerifications(
+  current: readonly WorkflowRunRevision[] | undefined,
+  next: readonly WorkflowRunRevision[] | undefined,
+): WorkflowRunRevision[] | undefined {
+  if (!next) return current ? [...current] : undefined;
+  if (!current || current.length === 0) return [...next];
+  const durable = new Map(current.map((revision) => [revision.approvalId, revision]));
+  return next.map((revision) => {
+    const prior = durable.get(revision.approvalId);
+    if (revision.verification || !prior?.verification) return revision;
+    return { ...revision, verification: prior.verification };
+  });
+}
+
+/** Lead-in for a step that is running again because a reviewer asked for
+ *  changes at the gate it feeds. */
+export function reviewerChangeLeadIn(revisions: readonly WorkflowRunRevision[] | undefined, stepId: string): string {
+  const mine = (revisions ?? []).filter((revision) => revision.revisedStepIds.includes(stepId));
+  if (mine.length === 0) return '';
+  const latest = mine[mine.length - 1];
+  return [
+    '',
+    '',
+    '=== REVIEWER REQUESTED CHANGES ===',
+    `The reviewer declined the previous output of this step at the approval gate and asked: "${latest.note}"`,
+    'Produce a revised output that applies this request exactly. Keep everything the reviewer did not mention as it was. Output the complete revised result, not only the changed part.',
+    '=== END REVIEWER REQUESTED CHANGES ===',
+  ].join('\n');
+}
+
 interface ParkedRunState {
   parkedSteps: ParkedStepRef[];
   parkedAt: string;
+  /** "Request changes": the reviewer declined the exact draft AND said what to
+   * change. Recorded before the approval row resolves, on the run itself, so
+   * a restart or another device cannot lose it. The stop report carries it
+   * back to the originating conversation bound to this run and step. */
+  changeRequest?: {
+    approvalId: string;
+    stepId: string;
+    note: string;
+    requestedAt: string;
+    requestedBy: string;
+  };
+}
+
+/**
+ * Record a reviewer's change request on the parked run that owns the gate
+ * approval. Pure bookkeeping: it neither resolves the approval nor resumes
+ * anything. Returns the exact run/step it landed on, or why it could not.
+ */
+export function recordWorkflowGateChangeRequest(input: {
+  approvalId: string;
+  sessionId: string;
+  note: string;
+  by: string;
+}): { ok: true; runId: string; stepId: string } | { ok: false; reason: string } {
+  const match = /^workflow-gate:([A-Za-z0-9_.:-]+):([^:]+)$/.exec(input.sessionId.trim());
+  if (!match) return { ok: false, reason: 'not a workflow approval gate' };
+  const runId = match[1]!;
+  const note = input.note.replace(/\s+/g, ' ').trim().slice(0, 2_000);
+  if (!note) return { ok: false, reason: 'empty note' };
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  return withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    if (!current || current.status !== 'parked' || !current.parked) {
+      return { ok: false, reason: 'the run is not parked on an approval' } as const;
+    }
+    const parkedStep = current.parked.parkedSteps.find((step) => step.approvalIds.includes(input.approvalId));
+    if (!parkedStep) return { ok: false, reason: 'the approval does not belong to this run' } as const;
+    writeRunRecord(filePath, {
+      ...current,
+      parked: {
+        ...current.parked,
+        changeRequest: {
+          approvalId: input.approvalId,
+          stepId: parkedStep.stepId,
+          note,
+          requestedAt: new Date().toISOString(),
+          requestedBy: input.by.replace(/\s+/g, ' ').trim().slice(0, 120) || 'user',
+        },
+      },
+    });
+    return { ok: true, runId, stepId: parkedStep.stepId } as const;
+  });
+}
+
+/** The reviewable material for a gate: the outputs the gated step consumes,
+ * bounded, so the card shows the actual draft rather than a step id. */
+function gateDraftExcerpt(step: WorkflowStepInput, ctx: StepExecutionContext, maxChars = 3_000): string {
+  const parts: string[] = [];
+  for (const dep of step.dependsOn ?? []) {
+    const value = ctx.stepOutputs[dep];
+    if (value === undefined || value === null) continue;
+    // The reviewer reads a draft, not JSON: structured output from the
+    // drafting step is rendered as numbered items with labelled lines.
+    const text = typeof value === 'string'
+      ? renderReviewDraftForHumans(value)
+      : renderReviewValueForHumans(value);
+    const clean = text.replace(/\r\n/g, '\n').trim();
+    if (!clean) continue;
+    parts.push((step.dependsOn ?? []).length > 1 ? `[${dep}]\n${clean}` : clean);
+  }
+  const joined = parts.join('\n\n');
+  return joined.length > maxChars ? `${joined.slice(0, maxChars - 1)}…` : joined;
+}
+
+/**
+ * The chat source a run was authored or dispatched from: the creation test's
+ * recorded source, else the origin session's latest accepted input. Used to
+ * route a multi-account operation the step does not name (see
+ * prepareWorkflowStepExternalCatalog.originSource).
+ */
+function workflowRunOriginSource(runId: string): { sessionId: string; sourceUserSeq: number } | null {
+  try {
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    if (!record) return null;
+    const creation = record.creationTestSource;
+    if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {
+      return { sessionId: creation.sessionId, sourceUserSeq: creation.sourceUserSeq };
+    }
+    const origin = typeof record.originSessionId === 'string' ? record.originSessionId.trim() : '';
+    if (origin) {
+      const latest = listHarnessEvents(origin, { types: ['user_input_received'], limit: 1, desc: true })[0];
+      if (latest) return { sessionId: origin, sourceUserSeq: latest.seq };
+    }
+    // A console or scheduled run has no conversation of its own. The
+    // conversation that authored the workflow still names its operating
+    // account: reuse the newest creation test's recorded source (live
+    // 2026-09-22: the creation test passed on the author's routed account,
+    // the first console run parked on the same operation as ambiguous).
+    return workflowCreationOriginSource(record.workflow);
+  } catch {
+    return null;
+  }
+}
+
+function workflowCreationOriginSource(workflowName: string): { sessionId: string; sourceUserSeq: number } | null {
+  try {
+    if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
+    const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse();
+    for (const file of files.slice(0, 400)) {
+      const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, file));
+      if (!record || record.workflow !== workflowName) continue;
+      const creation = record.creationTestSource;
+      if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {
+        return { sessionId: creation.sessionId, sourceUserSeq: creation.sourceUserSeq };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function readRunRecord(filePath: string): QueuedRunRecord | null {
@@ -1293,6 +1539,25 @@ export function catalogPreparationRefusalToCapabilityBlock(
         + 'No provider dispatch occurred; the run is parked and retried when the exact definition refreshes.',
     });
   }
+  // Several current accounts for one operation is a CHOICE, not a missing
+  // connection (live 2026-09-22: three Outlook connections, "connect outlook"
+  // on Home while Outlook was connected the whole time). Park under the
+  // account-choice reason with the exact choice set, which the console
+  // renders as "choose the account" and the resolver answers durably.
+  if (refusal.reason === 'ambiguous_current_manifest' && tool) {
+    const accountChoiceSet = currentAccountChoiceSetForOperation(tool);
+    if (accountChoiceSet && accountChoiceSet.candidates.length > 1) {
+      return new WorkflowCapabilityBlockedError({
+        stepId: step.id,
+        tool,
+        toolkit: exactSchemaToolkitLabel(tool),
+        reason: 'ambiguous-account',
+        message: `Step "${step.id}" names ${tool}, and ${accountChoiceSet.total} connected accounts can run it. `
+          + 'Choose the exact account this workflow should operate as; no provider dispatch occurred and the run resumes with your answer.',
+        accountChoiceSet,
+      });
+    }
+  }
   return new WorkflowCapabilityBlockedError({
     stepId: step.id,
     tool: tool || `(${refusal.reason})`,
@@ -1302,6 +1567,44 @@ export function catalogPreparationRefusalToCapabilityBlock(
       + 'Either the toolkit is not connected or the operation name is wrong. No provider dispatch occurred; '
       + 'the run is parked and retried when the capability appears, or fix the step\'s operation name.',
   });
+}
+
+/** The current durable manifests for one operation, as an exact choice set. */
+/** The exact account the run's origin conversation would use for a multi-
+ *  account operation, as a selection over the live choice set — or null. */
+async function routeBareCallAccountByOrigin(
+  runId: string,
+  operationId: string,
+  choiceSet: WorkflowCapabilityAccountChoiceSetV1,
+): Promise<WorkflowCapabilityAccountSelectionV1 | null> {
+  const origin = workflowRunOriginSource(runId);
+  if (!origin) return null;
+  try {
+    const { routeOriginAccountForOperation } = await import('./workflow-step-external-catalog.js');
+    const routed = await routeOriginAccountForOperation({ ...origin, operation: operationId });
+    if (!routed) return null;
+    const candidate = choiceSet.candidates.find((row) => row.accountId === routed);
+    if (!candidate) return null;
+    return { capabilityId: candidate.capabilityId, accountId: candidate.accountId, choiceSetDigest: choiceSet.digest };
+  } catch {
+    return null;
+  }
+}
+
+function currentAccountChoiceSetForOperation(operationId: string): WorkflowCapabilityAccountChoiceSetV1 | null {
+  try {
+    const store = peekCapabilityManifestStore();
+    if (!store) return null;
+    const wanted = operationId.trim().toUpperCase();
+    const identities = store.list().flatMap((entry) => {
+      const manifest = currentCapabilityManifest(entry.manifest);
+      if (!manifest || manifest.operationId.toUpperCase() !== wanted || !manifest.accountId) return [];
+      return [{ capabilityId: manifest.manifestId, account: manifest.accountId }];
+    });
+    return identities.length > 0 ? workflowCapabilityAccountChoiceSet(identities) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1595,6 +1898,9 @@ function finalizeCanonicalEntityWorkspaceProjection(
     status: record.status,
     terminalOutcome: record.terminalOutcome,
     finishedAt: record.finishedAt,
+    ...(record.canonicalEntityWorkspaceProjectionFinishedAt === undefined ? {} : {
+      projectionFinishedAt: record.canonicalEntityWorkspaceProjectionFinishedAt,
+    }),
     needsAttention: record.needsAttention,
     ...(Object.hasOwn(record, 'canonicalEntityWorkspaceProjectionClaim')
       ? { claim: record.canonicalEntityWorkspaceProjectionClaim }
@@ -1697,6 +2003,8 @@ function writeRunRecord(
       ...businessRecord
     } = record;
     let nextRecord: QueuedRunRecord = { ...(current ?? {} as QueuedRunRecord), ...businessRecord };
+    nextRecord.revisions = mergeRevisionVerifications(current?.revisions, nextRecord.revisions);
+    if (nextRecord.revisions === undefined) delete nextRecord.revisions;
     // An answered clarification is retained only while the same run is being
     // resumed. A later approval/capability park or terminal publication must
     // never expose that stale question as the run's current dependency.
@@ -2089,6 +2397,21 @@ export interface WorkflowCapabilityBlockState {
   };
   resumedAt?: string;
   resumeAuthorityConsumedAt?: string;
+  /**
+   * The status the run held when it parked, when that was not an ordinary
+   * run. A creation test that pauses on an account question must resume AS
+   * a creation test: readmitting it as `running` would turn the preview into
+   * a real run and dispatch the steps it had only previewed (the gap named at
+   * 641b1769). Absent = `running`.
+   */
+  resumeStatus?: 'creation_test';
+}
+
+/** The status a parked run returns to. */
+export function capabilityBlockResumeStatus(
+  block: Pick<WorkflowCapabilityBlockState, 'resumeStatus'> | undefined,
+): 'running' | 'creation_test' {
+  return block?.resumeStatus === 'creation_test' ? 'creation_test' : 'running';
 }
 
 export interface WorkflowMutationAmbiguityBlockState {
@@ -2431,6 +2754,24 @@ function projectContextValue(project: WorkflowStepProjectContext | undefined, ke
   return undefined;
 }
 
+// ── time tokens ─────────────────────────────────────────────────────────────
+// {{now}} is the run instant (ISO 8601, UTC); {{now+24h}} / {{now-90m}} /
+// {{now+2d}} shift it. {{date}} is today's UTC date; {{date+1d}} / {{date-7d}}
+// shift it. A relative window ("the next 24 hours") is therefore an exact
+// call: {{now}} .. {{now+24h}}, and a scheduled read never needs a model step
+// to compute its own dates.
+const TIME_TOKEN_RE = /\{\{\s*((?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}/g;
+const TIME_TOKEN_EXACT_RE = /^(now|date)(?:([+-])(\d{1,5})([mhd]))?$/;
+
+export function resolveTimeToken(token: string, at: Date = new Date()): string | null {
+  const m = TIME_TOKEN_EXACT_RE.exec(token.trim());
+  if (!m) return null;
+  const unitMs = m[4] === 'm' ? 60_000 : m[4] === 'h' ? 3_600_000 : m[4] === 'd' ? 86_400_000 : 0;
+  const delta = m[2] && m[3] ? (m[2] === '-' ? -1 : 1) * Number(m[3]) * unitMs : 0;
+  const shifted = new Date(at.getTime() + delta);
+  return m[1] === 'now' ? shifted.toISOString() : shifted.toISOString().slice(0, 10);
+}
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
@@ -2439,7 +2780,7 @@ function renderTemplate(
   project?: WorkflowStepProjectContext,
 ): string {
   return template
-    .replace(/\{\{date\}\}/g, new Date().toISOString().slice(0, 10))
+    .replace(TIME_TOKEN_RE, (_m, token: string) => resolveTimeToken(token) ?? '')
     .replace(/\{\{project\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => {
       const value = projectContextValue(project, key);
       return value === undefined || value === null ? '' : String(value);
@@ -2471,7 +2812,7 @@ function renderTemplate(
 // A call arg value that is EXACTLY one template token resolves to the RAW
 // upstream value (object/array preserved, so a whole step output can be handed
 // to a tool). An embedded token ("prefix {{input.x}}") renders as a string.
-const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|date)\s*\}\}\s*$/;
+const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|(?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}\s*$/;
 
 function pathGet(value: unknown, dotted: string): unknown {
   if (!dotted) return value;
@@ -2484,7 +2825,8 @@ function pathGet(value: unknown, dotted: string): unknown {
 }
 
 function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown, project?: WorkflowStepProjectContext): unknown {
-  if (token === 'date') return new Date().toISOString().slice(0, 10);
+  const time = resolveTimeToken(token);
+  if (time !== null) return time;
   if (token.startsWith('project.')) return projectContextValue(project, token.slice(8));
   if (token.startsWith('input.')) return inputs[token.slice(6)];
   if (token === 'item') return item;
@@ -3324,17 +3666,39 @@ async function executeWorkflowCallNode(
           + (reviewedLocal.detail ? `: ${reviewedLocal.detail}` : ''),
       });
     }
-    const persistedAccountSelection = (
+    const runLevelAccountSelection = (
       ctx.capabilityResume?.state === 'retrying'
       && ctx.capabilityResume.reason === 'ambiguous-account'
       && ctx.capabilityResume.stepId === step.id
       && ctx.capabilityResume.tool === call.tool
     ) ? ctx.capabilityResume.accountSelection : undefined;
+    // The owner's answer outlives one run: a binding saved on the definition
+    // step is the same exact (capability, account, choice-set digest) triple
+    // and is revalidated identically below. A fresh run-level choice wins.
+    const persistedAccountSelection = runLevelAccountSelection
+      ?? (step.call?.account
+        ? {
+            capabilityId: step.call.account.capabilityId,
+            accountId: step.call.account.accountId,
+            choiceSetDigest: step.call.account.choiceSetDigest,
+          }
+        : undefined);
     // A saved READ operation with no durable manifest yet (reviewed CLI or
     // configured MCP) is acquired through the same attested carrier path a
     // foreground disclosure uses, so a scheduled call step is never reported
     // "not connected" for an operation the host can serve. Supply only; the
     // compiler below still re-proves candidate, account and effect.
+    // A durable provider manifest is only callable after this process has
+    // observed the operation (schema lease, connected toolkits, per-account
+    // observation). Chat gets that from discovery; a call step proves it
+    // for itself, so a cold daemon never parks a saved step as not connected.
+    const warmed = await warmDurableProviderOperation(call.tool);
+    if (warmed.status === 'warmed' && warmed.observed === 0) {
+      logger.info(
+        { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, warmed },
+        'workflow call step provider observation',
+      );
+    }
     const acquisition = await ensureLiveReadCapabilityForOperation({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,
@@ -3348,7 +3712,7 @@ async function executeWorkflowCallNode(
         'workflow call step live read acquisition',
       );
     }
-    const compiled = compileLiveCatalogWorkflowCallPlan({
+    let compiled = compileLiveCatalogWorkflowCallPlan({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,
       operationId: call.tool,
@@ -3356,6 +3720,38 @@ async function executeWorkflowCallNode(
       expectedEffect: structuredCallSideEffectClass(step),
       ...(persistedAccountSelection ? { selectedAccount: persistedAccountSelection } : {}),
     });
+    // Several connected accounts and no saved choice: the host routes the
+    // account the way it routes the conversation that authored or asked for
+    // this run, re-proves the compile against that exact candidate, and saves
+    // the binding on the step so later runs start from it. Only when the
+    // policy cannot decide does the run park on the exact choice set.
+    if (!compiled.ok && compiled.recoverable && compiled.reason === 'ambiguous-account' && !persistedAccountSelection && compiled.accountChoiceSet) {
+      const routed = await routeBareCallAccountByOrigin(ctx.runId, call.tool, compiled.accountChoiceSet);
+      if (routed) {
+        const recompiled = compileLiveCatalogWorkflowCallPlan({
+          ownerId: ctx.workflowSlug,
+          nodeId: step.id,
+          operationId: call.tool,
+          args: renderedArgs,
+          expectedEffect: structuredCallSideEffectClass(step),
+          selectedAccount: routed,
+        });
+        if (recompiled.ok) {
+          compiled = recompiled;
+          try {
+            persistStepAccountBinding(ctx.workflowSlug, {
+              stepId: step.id,
+              tool: call.tool,
+              accountSelection: { ...routed, selectedAt: new Date().toISOString(), selectedBy: 'host-origin-routing' },
+            });
+          } catch { /* the routed choice already governs this run */ }
+          logger.info(
+            { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, accountId: routed.accountId },
+            'workflow call step account routed from the run origin',
+          );
+        }
+      }
+    }
     if (!compiled.ok) {
       if (compiled.recoverable) {
         throw new WorkflowCapabilityBlockedError({
@@ -4806,6 +5202,7 @@ function graphContextForInvocation(
 
 function exactWorkflowApprovalResume(input: {
   sessionId: string;
+  sourceUserSeq: number;
   observedApprovalIds: readonly string[];
 }): {
   approvalId: string;
@@ -4815,7 +5212,7 @@ function exactWorkflowApprovalResume(input: {
   // The conversation loop persists the pause through its own HarnessSession
   // instance. Reload here: the step owner's instance predates that write and
   // intentionally does not mutate itself behind the caller's back.
-  const blob = HarnessSession.load(input.sessionId)?.loadInterruptState() ?? null;
+  const blob = HarnessSession.load(input.sessionId)?.loadInterruptState(input.sourceUserSeq) ?? null;
   const allRows = approvalRegistry.listPending({ sessionId: input.sessionId, status: 'any' });
   let exactRows: approvalRegistry.PendingApprovalRow[];
   if (blob && HostInterruptState.isHostState(blob)) {
@@ -4986,6 +5383,8 @@ async function runStepViaHarness(
     attemptId: `attempt:workflow:${workflowRunId}:${randomUUID().slice(0, 12)}`,
   });
   let stepAttemptStatus: 'completed' | 'cancelled' | 'failed' | 'interrupted' = 'failed';
+  let heldByExactRecoveryOwner = false;
+  let acceptedStepSourceSeq: number | undefined;
   let graphSpecialistEvent: {
     item: string;
     role: string;
@@ -5107,7 +5506,8 @@ async function runStepViaHarness(
     // time-sensitive step can judge in its own words; the run itself is never
     // parked for a human (workflow-scheduled-lateness.ts).
     const latenessSpec = scheduledLatenessLeadInForRun(workflowRunId);
-    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}${latenessSpec}`;
+    const revisionSpec = reviewerChangeLeadIn(readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${workflowRunId}.json`))?.revisions, step.id);
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}${latenessSpec}${revisionSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
     // as a structured block AFTER the prose (never replacing it). This is
@@ -5150,6 +5550,7 @@ async function runStepViaHarness(
         attemptId: stepAttempt.attemptId,
       },
     });
+    acceptedStepSourceSeq = sourceUserEvent.seq;
     const stepExecutionSourceUserSeqs = new Set<number>([sourceUserEvent.seq]);
     // A prompt step may explicitly name exact provider operations and call
     // them directly without foreground tool_search. After a daemon restart the
@@ -5162,6 +5563,7 @@ async function runStepViaHarness(
     const preparedExternalCatalog = await prepareWorkflowStepExternalCatalogImpl({
       immutablePrompt: step.prompt,
       allowedTools,
+      ...(workflowRunOriginSource(workflowRunId) ? { originSource: workflowRunOriginSource(workflowRunId)! } : {}),
       acceptedSource: {
         sessionId: realSessionId,
         sourceUserSeq: sourceUserEvent.seq,
@@ -5584,6 +5986,7 @@ async function runStepViaHarness(
       // and a bare approval id can be copied; both are authority widening.
       const approvalResume = exactWorkflowApprovalResume({
         sessionId: realSessionId,
+        sourceUserSeq: sourceUserEvent.seq,
         observedApprovalIds: approvalIds,
       });
       const approvalResumeWallClockMs = remainingStepWallClockMs();
@@ -5624,7 +6027,13 @@ async function runStepViaHarness(
 
     const disposition = runConversationDisposition(result);
     switch (disposition.kind) {
-      case 'held':
+      case 'held': {
+        // Returning the consumer is not completion of the exact source. Its
+        // scheduled recovery still needs this attempt and execution scope.
+        const owner = session.continuationOwnerState({
+          sourceUserSeq: sourceUserEvent.seq, attemptId: stepAttempt.attemptId,
+        });
+        heldByExactRecoveryOwner = owner === 'ours' || owner === 'unreadable';
         throw new WorkflowHarnessHeldSignal({
           stepId: step.id,
           sessionId: realSessionId,
@@ -5633,6 +6042,7 @@ async function runStepViaHarness(
           hold: disposition.hold,
           recoveredContract: disposition.recoveredContract,
         });
+      }
       case 'dispatched':
         // An async dispatch receipt is not the workflow step's deliverable.
         // Recovery owns the exact source until it publishes a durable terminal.
@@ -5883,17 +6293,31 @@ async function runStepViaHarness(
         });
       } catch { /* specialist visibility is best-effort */ }
     }
-    unregisterActiveAttempt();
-    try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
-    // The submission-time contract dies with the step session (a later chat
-    // turn on a reused session must never be gated).
-    clearStepContract(realSessionId);
-    // Belt + suspenders: clear the heartbeat gate in finally so a throw
-    // mid-resume doesn't leave the heartbeat permanently suppressed
-    // for the rest of the workflow run.
-    clearWorkflowRunPausedForApproval(workflowRunId);
-    closePlanScope(realSessionId, 'workflow-step-finished');
-    clearSessionWorkerModelOverride(realSessionId);
+    const releaseStepScope = (): void => {
+      unregisterActiveAttempt();
+      // A newer activation must not lose its scope when the old one settles.
+      if (acceptedStepSourceSeq !== undefined && session.continuationOwnerState({
+        sourceUserSeq: acceptedStepSourceSeq, attemptId: stepAttempt.attemptId,
+      }) === 'other') return;
+      clearStepContract(realSessionId);
+      clearWorkflowRunPausedForApproval(workflowRunId);
+      closePlanScope(realSessionId, 'workflow-step-finished');
+      clearSessionWorkerModelOverride(realSessionId);
+    };
+    if (heldByExactRecoveryOwner) {
+      // Keep cancellation and the authored scope alive with the exact source.
+      // Its typed terminal owns settlement; do not finish its attempt here.
+      const unsubscribe = actionBus.subscribe(event => {
+        if (event.kind !== 'harness.event' || event.sessionId !== realSessionId
+          || event.event.type !== 'conversation_completed'
+          || event.event.data.sourceUserSeq !== acceptedStepSourceSeq) return;
+        unsubscribe();
+        releaseStepScope();
+      });
+    } else {
+      releaseStepScope();
+      try { finishRunAttempt(stepAttempt, stepAttemptStatus); } catch { /* control telemetry must not mask step outcome */ }
+    }
     // MEASURE (2026-09-01): the step's own efficiency from the usage rows its
     // host session wrote — frames, cache-hit share, tokens, largest prompt —
     // on the run's event log and in the daemon log, so "smarter and faster"
@@ -5934,10 +6358,17 @@ async function awaitDeclarativeStepApproval(
   const gateSessionId = `workflow-gate:${ctx.runId}:${step.id}`;
   const startedAt = Date.now();
 
+  // A rejection that carried a change request was consumed by a revision:
+  // the step is asking again with a new draft, so that old answer is not
+  // this gate's verdict.
+  const consumedApprovalIds = new Set(
+    (readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${ctx.runId}.json`))?.revisions ?? []).map((revision) => revision.approvalId),
+  );
   const settledResolution = (): string | undefined =>
     approvalRegistry
       .listPending({ sessionId: gateSessionId, status: 'any' })
-      .find((r) => r.resolution)?.resolution ?? undefined;
+      .filter((r) => r.resolution && !consumedApprovalIds.has(r.approvalId))
+      .sort((a, b) => (b.resolvedAt ?? b.requestedAt).localeCompare(a.resolvedAt ?? a.requestedAt))[0]?.resolution ?? undefined;
 
   // Already resolved on a prior pass (resume) — honor it without re-prompting.
   const prior = settledResolution();
@@ -5993,11 +6424,42 @@ async function awaitDeclarativeStepApproval(
   const pending = approvalRegistry.listPending({ sessionId: gateSessionId, status: 'pending' });
   let row = pending[0];
   if (!row) {
-    const subject = (step.approvalPreview && step.approvalPreview.trim())
+    // The preview may name the draft it gates ({{steps.draft.output}}); render
+    // it with the same template engine the call args use, so the card says
+    // what will actually go out, not the template.
+    const renderedPreview = step.approvalPreview && step.approvalPreview.trim()
+      ? renderTemplate(step.approvalPreview.trim(), ctx.inputs, ctx.stepOutputs).trim()
+      : '';
+    const baseSubject = renderedPreview
       // Legibility (#1): show WHAT the step will do, not just its id — so the
       // approver (gated) or the audit stream (unattended/yolo) sees the real
       // action. Flows to the dashboard card, the notification, and Discord/Slack.
       || `Approve "${ctx.workflow.name}" step "${step.id}": ${describeWorkflowStepAction(step)}`;
+    // Asking again after a change request: say whether the note was applied.
+    const latestRevision = (readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${ctx.runId}.json`))?.revisions ?? [])
+      .filter((revision) => revision.stepId === step.id).at(-1);
+    const revisionLine = latestRevision
+      ? (latestRevision.verification?.verdict === 'applied'
+        ? `Revised per your note ("${latestRevision.note}"); the check confirmed it was applied. `
+        : latestRevision.verification?.verdict === 'not_applied'
+          ? `Revised after your note ("${latestRevision.note}"), but the check says the note was NOT fully applied — read it closely. `
+          : `Revised after your note ("${latestRevision.note}"); the check could not confirm it was applied. `)
+      : '';
+    const subject = `${revisionLine}${baseSubject}`;
+    // The reviewer inspects the DRAFT, not a step id: the outputs this step
+    // consumes ride on the approval row (desktop content preview, mobile
+    // "Review details", command-center sample) bounded and never re-fetched.
+    const draft = gateDraftExcerpt(step, ctx);
+    const gateArgs: Record<string, unknown> = {
+      workflow: ctx.workflow.name,
+      runId: ctx.runId,
+      stepId: step.id,
+      action: describeWorkflowStepAction(step),
+      ...(draft ? { body: draft } : {}),
+      ...(draft
+        ? { preview: { samples: [{ label: 'Draft', value: draft.slice(0, 180) }] } }
+        : {}),
+    };
     // The approvals table has `session_id REFERENCES sessions(id)` with
     // foreign_keys=ON, so a gate approval can only be registered once a
     // sessions row exists for the gate id. The declarative gate uses its
@@ -6025,6 +6487,7 @@ async function awaitDeclarativeStepApproval(
       sessionId: gateSessionId,
       subject,
       tool: 'workflow_approval_gate',
+      args: gateArgs,
       ttlMs: WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS,
     });
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
@@ -6037,7 +6500,7 @@ async function awaitDeclarativeStepApproval(
         id: `approval-${row.approvalId}`,
         kind: 'approval',
         title: `Workflow ${ctx.workflow.name} · ${step.id} needs approval`,
-        body: `**${subject}**\n\nApprove to let the workflow continue, or reject to stop it — reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`. The run is parked on \`${step.id}\` until you respond.`,
+        body: `**${subject}**${draft ? `\n\n${draft.length > 1_200 ? `${draft.slice(0, 1_199)}…` : draft}` : ''}\n\nApprove to let the workflow continue, request changes with a note, or reject to stop it — reply \`approve ${row.approvalId}\` / \`reject ${row.approvalId}\`. The run is parked on \`${step.id}\` until you respond.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { approvalId: row.approvalId, workflowName: ctx.workflow.name, stepId: step.id, gate: true },
@@ -6235,9 +6698,12 @@ export function stepHasLoopProbe(step: WorkflowStepInput): boolean {
  */
 export const CONTRACT_REPAIR_MAX_ATTEMPTS = 2;
 
-export function stepContractRepairEnabled(step: WorkflowStepInput): boolean {
+export function stepContractRepairEnabled(step: WorkflowStepInput, runId?: string): boolean {
   if (step.loopUntil) return false;
-  if (!step.output) return false;
+  // A step re-running for a reviewer's change request gets the same one
+  // evidence-fed repair attempt when the revision judge says the note was
+  // not applied, contract or no contract.
+  if (!step.output && !(runId && pendingRevisionFor(runId, step.id))) return false;
   if (step.forEach || step.deterministic) return false;
   if (step.call?.tool) return false;
   return true;
@@ -6684,11 +7150,11 @@ async function runStepVerifiedAttempt(
   // Transient-retry wraps EXECUTION only. Verification is deterministic and
   // never transient-retried. Park/cancel signals propagate immediately (they
   // are not "retryable").
-  const runOnce = (
+  const runOnce = async (
     attemptStep: WorkflowStepInput,
     attemptContext: StepExecutionContext = ctx,
-  ): Promise<unknown> =>
-    runWithStepRetry(() => executeStep(attemptStep, attemptContext), {
+  ): Promise<unknown> => {
+    const output = await runWithStepRetry(() => executeStep(attemptStep, attemptContext), {
       budget,
       backoffBaseMs: RETRY_BACKOFF_BASE_MS,
       isRetryable: (err) =>
@@ -6714,6 +7180,14 @@ async function runStepVerifiedAttempt(
       },
       afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
     });
+    // A step re-running for a reviewer's change request, whichever lane ran
+    // it: before the gate asks the human again, the host checks that the
+    // note was applied. Not applied → the completion is invalidated and the
+    // contract loop re-runs this attempt with the judge's finding as
+    // evidence; still not applied → the card says so.
+    await verifyPendingRevisionOrRetry(attemptContext, attemptStep, output);
+    return output;
+  };
 
   // Goal-contract Phase 2: contract loop wraps the transient-retry wrapper —
   // each contract attempt gets its own transient budget.
@@ -6728,7 +7202,7 @@ async function runStepVerifiedAttempt(
   // Steps with neither loop nor contract run exactly once, byte-identical to
   // the pre-loopUntil behavior.
   if (!stepLoopUntilEnabled(step)) {
-    if (!stepContractRepairEnabled(step)) return runOnce(step);
+    if (!stepContractRepairEnabled(step, ctx.runId)) return runOnce(step);
     return runWithContractLoop(runOnce, step, {
       ...contractLoopOptions(step, ctx),
       maxAttempts: CONTRACT_REPAIR_MAX_ATTEMPTS,
@@ -7208,139 +7682,6 @@ function finalizeOrDeferStepOutput(
     );
   }
   return finalized;
-}
-
-function collectStringLeaves(value: unknown, into: string[] = [], depth = 0): string[] {
-  if (into.length >= 64 || depth > 6) return into;
-  if (typeof value === 'string') {
-    into.push(value);
-    return into;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectStringLeaves(item, into, depth + 1);
-    return into;
-  }
-  if (value && typeof value === 'object') {
-    for (const item of Object.values(value as Record<string, unknown>)) collectStringLeaves(item, into, depth + 1);
-  }
-  return into;
-}
-
-function hasHttpUrl(value: unknown): boolean {
-  const urls = new Set<string>();
-  collectHttpUrls(value, urls, 0);
-  return urls.size > 0;
-}
-
-function normalizePathCandidate(candidate: string): string {
-  return candidate
-    .trim()
-    .replace(/^["'`([{<]+/, '')
-    .replace(/["'`.,;:)\]}>]+$/, '');
-}
-
-function pathCandidateExists(candidate: string): boolean {
-  const cleaned = normalizePathCandidate(candidate);
-  if (!cleaned || /^https?:\/\//i.test(cleaned)) return false;
-  const candidates = path.isAbsolute(cleaned)
-    ? [cleaned]
-    : [cleaned, path.resolve(process.cwd(), cleaned)];
-  return candidates.some((p) => existsSync(p));
-}
-
-function hasExistingPath(value: unknown): boolean {
-  const pathLike =
-    /(?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[^\s"'<>]+|[A-Za-z0-9_.-]+\.(?:html?|md|pdf|csv|tsx?|jsx?|json|txt|docx?|xlsx?|pptx?|png|jpe?g|webp|gif|zip)/gi;
-  for (const text of collectStringLeaves(value)) {
-    if (pathCandidateExists(text)) return true;
-    for (const match of text.matchAll(pathLike)) {
-      if (pathCandidateExists(match[0])) return true;
-    }
-  }
-  return false;
-}
-
-function hasNonEmptyArrayDeep(value: unknown, depth = 0): boolean {
-  if (depth > 6) return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (value && typeof value === 'object') {
-    return Object.values(value as Record<string, unknown>).some((item) => hasNonEmptyArrayDeep(item, depth + 1));
-  }
-  return false;
-}
-
-function hasTextList(value: unknown): boolean {
-  if (typeof value !== 'string') return false;
-  const text = value.trim();
-  if (!text) return false;
-  if (/^\s*(?:[-*]|\d+[.)])\s+\S+/m.test(text)) return true;
-  if (/^\s*\|.+\|\s*$/m.test(text)) return true;
-  return false;
-}
-
-function hasNonEmptyListEvidence(value: unknown): boolean {
-  return hasNonEmptyArrayDeep(value) || collectStringLeaves(value).some(hasTextList);
-}
-
-/**
- * Legacy deliverable guard: workflows authored before explicit `output`
- * contracts can still promise "produce a URL/file/list" in prose. Infer that
- * concrete shape and surface a needs-attention advisory when the completed step
- * output has no matching evidence. This is intentionally softer than declared
- * contracts: it accepts legacy prose that contains a real URL, existing file
- * path, or text list instead of requiring an object shape the prompt never saw.
- */
-export function inferredOutputContractAdvisory(step: WorkflowStepInput, output: unknown): string | null {
-  if (step.output || step.transform || step.deterministic || step.forEach) return null;
-  const contract = inferOutputContractFromPrompt(step.prompt ?? '');
-  if (!contract) return null;
-  const bound = coerceOutputForContract(output, contract);
-  if (isBlockedStepOutput(bound)) return null;
-  if (verifyStepOutput(contract, bound).ok) return null;
-
-  const problems: string[] = [];
-  const expectedUrl = (contract.verify?.url_present?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('url');
-  const expectedPath = (contract.verify?.path_exists?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('path');
-  const expectedItems =
-    Object.keys(contract.min_items ?? {}).length > 0 ||
-    (contract.non_empty ?? []).includes('items') ||
-    (contract.required_keys ?? []).includes('items');
-  const expectedResult = (contract.required_keys ?? []).includes('result');
-
-  if (expectedUrl && !hasHttpUrl(bound)) {
-    problems.push('expected a URL deliverable, but no http(s) URL was found');
-  }
-  if (expectedPath && !hasExistingPath(bound)) {
-    problems.push('expected a file deliverable, but no existing file path was found');
-  }
-  if (expectedItems && !hasNonEmptyListEvidence(bound)) {
-    problems.push('expected a non-empty list/rows deliverable, but no non-empty list was found');
-  }
-  if (expectedResult && isEmptyValue(bound)) {
-    problems.push('expected a non-empty deliverable result, but output was empty');
-  }
-  if (problems.length === 0) return null;
-
-  return `step "${step.id}" looked like it should produce a concrete deliverable, but output did not satisfy inferred checks: ${problems.join('; ')} — produced ${describeOutputShape(bound)}. Add an explicit output contract to make this hard-enforced, or adjust the step/output.`;
-}
-
-function noteInferredOutputContractAdvisory(
-  step: WorkflowStepInput,
-  output: unknown,
-  ctx: StepExecutionContext,
-): void {
-  const note = inferredOutputContractAdvisory(step, output);
-  if (!note) return;
-  ctx.qualityAdvisories.push({
-    stepId: step.id,
-    kind: 'inferred_output_contract',
-    note,
-  });
-  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-    kind: 'step_advisory',
-    stepId: step.id,
-    meta: { reason: 'inferred_output_contract', note },
-  });
 }
 
 /**
@@ -8492,8 +8833,44 @@ export async function executeStep(
     modelRoute: workflowModelRouteMeta(stepRoute),
   };
   const finalized = finalizeOrDeferStepOutput(ctx, step, output, completionMeta);
-  noteInferredOutputContractAdvisory(step, finalized, ctx);
   return finalized;
+}
+
+async function verifyPendingRevisionOrRetry(ctx: StepExecutionContext, step: WorkflowStepInput, output: unknown): Promise<void> {
+  const revision = pendingRevisionFor(ctx.runId, step.id);
+  if (!revision) return;
+  let previous: string | undefined;
+  try {
+    const body = approvalRegistry.get(revision.approvalId)?.args?.body;
+    previous = typeof body === 'string' ? body : undefined;
+  } catch { previous = undefined; }
+  const verdict = await judgeRevisionApplied({ note: revision.note, previous, revised: output, sessionId: `workflow:${ctx.runId}:${step.id}` });
+  recordRevisionVerification(ctx.runId, revision.approvalId, {
+    verdict: verdict.verdict, reason: verdict.reason, judge: verdict.judge, ...(verdict.confidence !== undefined ? { confidence: verdict.confidence } : {}),
+  });
+  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+    kind: 'step_advisory',
+    stepId: step.id,
+    meta: { reason: 'revision_check', verdict: verdict.verdict, judge: verdict.judge, confidence: verdict.confidence ?? null, durationMs: verdict.durationMs, approvalId: revision.approvalId },
+  });
+  const attemptsSoFar = (revision.verification?.attempts ?? 0) + 1;
+  if (verdict.verdict === 'not_applied' && attemptsSoFar < REVISION_JUDGE_MAX_ATTEMPTS) {
+    const problem = `The reviewer's change request was not applied: ${verdict.reason}. The reviewer asked: "${revision.note}". Apply exactly that, and leave everything the reviewer did not mention as it was.`;
+    // The lane may already have published this attempt's completion; the
+    // invalidation keeps the event history and the resume state truthful.
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_invalidated',
+      stepId: step.id,
+      meta: { reason: 'revision_not_applied', approvalId: revision.approvalId, judge: verdict.judge },
+    });
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_failed',
+      stepId: step.id,
+      error: problem,
+      meta: { reason: 'output_contract', problems: [problem], revisionCheck: true },
+    });
+    throw new WorkflowContractViolationError(problem, step.id, [problem], 'output_contract');
+  }
 }
 
 /**
@@ -8510,6 +8887,14 @@ export async function executeStep(
  *  replaces the trajectory-check call so tests exercise steer injection and
  *  silence deterministically without a live judge. */
 let workflowWatcherOverride: WatcherJudgeFn | null = null;
+/** Test seam: the pinned-goal judge the run-level goal review consults. */
+let workflowRunGoalJudgeForTests: NonNullable<Parameters<typeof validateWorkflowRunGoal>[1]> | null = null;
+export function _setWorkflowRunGoalJudgeForTests(
+  deps: NonNullable<Parameters<typeof validateWorkflowRunGoal>[1]> | null,
+): void {
+  workflowRunGoalJudgeForTests = deps;
+}
+
 export function _setWorkflowWatcherForTests(fn: WatcherJudgeFn | null): void {
   workflowWatcherOverride = fn;
 }
@@ -9232,7 +9617,13 @@ export function settlementGuardedStepOutput(input: {
   output: unknown;
 }): unknown {
   if (isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
-    return phantomBlockedOutput(input.step);
+    // The true reason: a refused write is not "no tool was called".
+    const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
+    const cls = stepSideEffectClass(input.step);
+    return {
+      blocked: true,
+      reason: noEffectStepReason({ stepId: input.step.id, effectClass: cls === 'send' ? 'send' : 'write', refusals }),
+    };
   }
   const businessTools = (input.toolUses ?? [])
     .map((tool) => (typeof tool === 'string' ? (tool.split('__').at(-1) ?? tool) : ''))
@@ -11373,7 +11764,7 @@ function readmitCapabilityBlockedRun(
     ) return null;
     return writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      status: capabilityBlockResumeStatus(currentBlock),
       capabilityBlock: {
         ...currentBlock,
         state: 'retrying',
@@ -11381,7 +11772,11 @@ function readmitCapabilityBlockedRun(
       },
     }).record;
   });
-  if (!resumedRecord || isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  if (
+    !resumedRecord
+    || isTerminalRunRecord(resumedRecord)
+    || resumedRecord.status !== capabilityBlockResumeStatus(resumedRecord.capabilityBlock)
+  ) return false;
   try {
     markWorkflowCapabilityNotificationsSettled(run.id, {
       capabilityResolutionStatus: 'readmitted',
@@ -11439,6 +11834,8 @@ export type ResolveWorkflowCapabilityAccountChoiceResult =
       stepId: string;
       capabilityId: string;
       accountId: string;
+      /** What the answer resumed: an ordinary run, or the creation test. */
+      mode: 'run' | 'creation_test';
     }
   | {
       ok: false;
@@ -11488,6 +11885,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     const sameSelection = block.accountSelection?.capabilityId === input.capabilityId
       && block.accountSelection.accountId === input.accountId
       && block.accountSelection.choiceSetDigest === input.choiceSetDigest;
+    const resumeStatus = capabilityBlockResumeStatus(block);
     if (
       sameCoordinates
       && sameSelection
@@ -11500,6 +11898,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
         stepId: input.stepId,
         capabilityId: input.capabilityId,
         accountId: input.accountId,
+        mode: resumeStatus === 'creation_test' ? 'creation_test' : 'run',
       };
     }
     if (
@@ -11536,7 +11935,9 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     const selectedBy = input.selectedBy?.replace(/\s+/g, ' ').trim().slice(0, 120) || 'user';
     const written = writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      // A parked creation test resumes AS a creation test; only an ordinary
+      // run resumes as running. Never promote a preview into execution here.
+      status: resumeStatus,
       capabilityBlock: {
         ...block,
         state: 'retrying',
@@ -11551,7 +11952,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
       },
     }).record;
     if (
-      written.status !== 'running'
+      written.status !== resumeStatus
       || written.capabilityBlock?.state !== 'retrying'
       || written.capabilityBlock.accountSelection?.capabilityId !== selected.capabilityId
       || written.capabilityBlock.accountSelection.accountId !== selected.accountId
@@ -11577,8 +11978,11 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
     try {
       addRunEvent(runId, {
         type: 'run_resumed',
+        // Activity status describes the activity, which is running either way.
         status: 'running',
-        message: `Account ${selected.accountId} selected for ${block.stepId}; resuming the same run.`,
+        message: resumeStatus === 'creation_test'
+          ? `Account ${selected.accountId} selected for ${block.stepId}; re-running the creation test with it (mutations stay previewed).`
+          : `Account ${selected.accountId} selected for ${block.stepId}; resuming the same run.`,
         data: {
           workflow: current.workflow,
           workflowSlug: admitted.snapshot.workflowSlug,
@@ -11596,6 +12000,7 @@ export function resolveWorkflowCapabilityAccountChoice(input: {
       stepId: block.stepId,
       capabilityId: selected.capabilityId,
       accountId: selected.accountId,
+      mode: resumeStatus === 'creation_test' ? 'creation_test' : 'run',
     };
   });
   if (result.ok) {
@@ -11651,7 +12056,8 @@ export function resolveWorkflowCapabilityRetry(input: {
     const sameCoordinates = block.stepId === stepId
       && block.tool === tool
       && block.retryCount === input.retryCount;
-    if (sameCoordinates && current.status === 'running' && (block.state === 'retrying' || block.state === 'consumed')) {
+    const resumeStatus = capabilityBlockResumeStatus(block);
+    if (sameCoordinates && current.status === resumeStatus && (block.state === 'retrying' || block.state === 'consumed')) {
       return { ok: true, status: 'already_resumed', runId, stepId } as const;
     }
     if (!sameCoordinates) {
@@ -11689,11 +12095,11 @@ export function resolveWorkflowCapabilityRetry(input: {
     }
     const written = writeRunRecord(filePath, {
       ...current,
-      status: 'running',
+      status: resumeStatus,
       capabilityBlock: { ...block, state: 'retrying', resumedAt },
     }).record;
     if (
-      written.status !== 'running'
+      written.status !== resumeStatus
       || written.capabilityBlock?.stepId !== stepId
       || written.capabilityBlock.tool !== tool
       || written.capabilityBlock.retryCount !== input.retryCount
@@ -11974,6 +12380,78 @@ export function reapResolvedParkedRuns(): void {
     // that may cross the side-effect boundary; every other decision stops the
     // occurrence without disabling its recurring schedule.
     const stopped = rows.find((row) => row?.resolution !== 'approved');
+    // "Request changes" with a note is a revision, not a stop: the drafting
+    // step(s) behind the gated step run again with the note and the gate
+    // asks again with the new draft. Live 2026-09-22: the note cancelled the
+    // whole occurrence and told the user to re-run in chat.
+    if (stopped && stopped.resolution === 'rejected'
+      && run.parked.changeRequest?.approvalId === stopped.approvalId
+      && !(run.revisions ?? []).some((revision) => revision.approvalId === stopped.approvalId)) {
+      const changeRequest = run.parked.changeRequest;
+      const snapshotSteps = ((run.workflowDefinitionSnapshot as { definition?: { steps?: unknown } } | undefined)?.definition?.steps ?? []) as Array<{ id: string; dependsOn?: string[]; prompt?: string; call?: unknown; transform?: unknown; subgraph?: unknown; deterministic?: unknown }>;
+      const revisedStepIds = revisableUpstreamStepIds(snapshotSteps, changeRequest.stepId);
+      if (revisedStepIds.length > 0 && (run.revisions?.length ?? 0) < 5) {
+        const appliedAt = new Date().toISOString();
+        // The run's own step events live under the durable slug; the resume
+        // reads that directory, so the invalidation must land there too
+        // (live: written under the display name, the step was never re-run).
+        const eventWorkflowDir = run.workflowSlug ?? run.workflow;
+        for (const stepId of revisedStepIds) {
+          try {
+            appendWorkflowEvent(eventWorkflowDir, run.id, {
+              kind: 'step_invalidated',
+              stepId,
+              meta: { approvalId: stopped.approvalId, gatedStepId: changeRequest.stepId, note: changeRequest.note },
+            });
+          } catch { /* the record below still carries the revision */ }
+        }
+        clearWorkflowRunPausedForApproval(run.id);
+        // Merge onto the record as it is NOW: a step may have written its
+        // own facts (a judge's verdict) since this scan read `run`.
+        const currentRun = readRunRecord(filePath) ?? run;
+        const revisedRecord = writeRunRecord(filePath, {
+          ...currentRun,
+          status: 'running',
+          revisions: [
+            ...(currentRun.revisions ?? []),
+            {
+              approvalId: stopped.approvalId,
+              stepId: changeRequest.stepId,
+              revisedStepIds,
+              note: changeRequest.note,
+              requestedAt: changeRequest.requestedAt,
+              requestedBy: changeRequest.requestedBy,
+              appliedAt,
+            },
+          ],
+        }).record;
+        if (isTerminalRunRecord(revisedRecord)) continue;
+        try {
+          addRunEvent(run.id, {
+            type: 'run_resumed',
+            status: 'running',
+            message: `Revising "${revisedStepIds.join('", "')}" with your note; the review will ask again with the new draft.`,
+            data: { workflow: run.workflow, gatedStepId: changeRequest.stepId, revisedStepIds, approvalId: stopped.approvalId },
+          });
+        } catch { /* run-events is best-effort */ }
+        try {
+          addNotification({
+            id: `workflow-revision-${run.id}-${stopped.approvalId}`,
+            kind: 'workflow',
+            title: `Revising the draft: ${run.workflow}`,
+            body: `Got your note on "${changeRequest.stepId}": "${changeRequest.note}". I'm redoing ${revisedStepIds.join(', ')} with it and will ask you to review the new draft.`,
+            createdAt: appliedAt,
+            read: false,
+            metadata: { workflow: run.workflow, runId: run.id, stepId: changeRequest.stepId, inboxOnly: true, source: 'workflow-revision' },
+          });
+        } catch { /* best-effort */ }
+        logger.info(
+          { workflow: run.workflow, runId: run.id, approvalId: stopped.approvalId, revisedStepIds },
+          'Parked workflow occurrence revising after a change request',
+        );
+        continue;
+      }
+    }
     if (stopped) {
       const decision = stopped.resolution === 'rejected'
         ? 'declined by the user'
@@ -11982,7 +12460,13 @@ export function reapResolvedParkedRuns(): void {
           : stopped.resolution === 'cancelled_by_system'
             ? 'closed by Clementine because its owning session ended'
             : 'cancelled by the user';
-      const reason = `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
+      const changeRequest = stopped.resolution === 'rejected'
+        && run.parked.changeRequest?.approvalId === stopped.approvalId
+        ? run.parked.changeRequest
+        : undefined;
+      const reason = changeRequest
+        ? `You asked for changes to step "${changeRequest.stepId}" of "${run.workflow}": "${changeRequest.note}". This occurrence stopped before the protected step ran; everything completed before it stands and nothing was sent. Ask me to revise that draft with your note and run it again.`
+        : `Workflow occurrence stopped because its approval was ${decision}. The protected action was not performed; steps completed before the approval stand, and any remaining steps were skipped.`;
 
       // Approval rejection is a cancellation producer too. Publish through
       // the one shared cancellation boundary before mutating SDK/activity
@@ -11991,7 +12475,7 @@ export function reapResolvedParkedRuns(): void {
       const cancellation = cancelWorkflowRunAtBoundary({
         runId: run.id,
         reason,
-        source: `approval-${stopped.resolution ?? 'not-approved'}`,
+        source: changeRequest ? 'approval-changes-requested' : `approval-${stopped.resolution ?? 'not-approved'}`,
       });
       if (cancellation.status !== 'cancelled' && cancellation.status !== 'already_cancelled') continue;
       const stoppedRecord = cancellation.run as QueuedRunRecord;
@@ -12037,7 +12521,9 @@ export function reapResolvedParkedRuns(): void {
     // stale flag that silences the resumed run's heartbeats. Covers every
     // park path (declarative gate throws before its own finally can clear).
     clearWorkflowRunPausedForApproval(run.id);
-    const resumedRecord = writeRunRecord(filePath, { ...run, status: 'running' }).record;
+    // Same merge: the record on disk may carry facts written after the scan
+    // (live: a revision verdict was overwritten by this stale spread).
+    const resumedRecord = writeRunRecord(filePath, { ...(readRunRecord(filePath) ?? run), status: 'running' }).record;
     if (isTerminalRunRecord(resumedRecord)) continue;
     try {
       addRunEvent(run.id, {
@@ -13202,10 +13688,102 @@ export interface CreationTestStepResult {
    */
   status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice';
   detail?: string;
+  /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
+   * creation test can PARK on it like any run instead of only describing it. */
+  block?: WorkflowCapabilityBlockedError;
 }
 export interface CreationTestResult {
   pass: boolean;
   steps: CreationTestStepResult[];
+}
+
+/** A step id as a person reads it in Clem's reply: `read_calendar` →
+ *  "Read calendar". The id itself stays on the definition. */
+export function creationTestStepName(stepId: string): string {
+  const words = stepId.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').trim().toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : stepId;
+}
+
+/** "in about 10 minutes" / "at 4:30 PM"; '' when there is no real time.
+ *  Live 2026-09-22 a missing retry time printed as 1970-01-01T00:00:00.000Z
+ *  in Clem's reply. */
+export function capabilityRetryPhrase(retryAt: string | null | undefined, nowMs = Date.now()): string {
+  const at = retryAt ? Date.parse(retryAt) : NaN;
+  if (!Number.isFinite(at) || at <= nowMs) return '';
+  const minutes = Math.round((at - nowMs) / 60_000);
+  if (minutes <= 1) return 'in a minute';
+  if (minutes <= 90) return `in about ${minutes} minutes`;
+  return `at ${new Date(at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+}
+
+function capabilityAppName(toolkit: string): string {
+  const name = toolkit.trim();
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : 'the app';
+}
+
+/** One line per creation-test step, shared by the parked report and the
+ *  terminal. Words, not emoji: this is read in Clem's own reply. */
+export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
+  return steps.map((s) => {
+    const name = creationTestStepName(s.stepId);
+    if (s.status === 'ok') return `- ${name} — returned data`;
+    // The one answerable thing leads with the question itself, indented so
+    // the enumerated choices stay readable inside the step list.
+    if (s.status === 'needs_choice') {
+      return [`- ${name} — needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
+    }
+    if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it`;
+    // Unverifiable is honest, not alarming: it names WHY the check could
+    // not run so the report never implies a broken step.
+    if (s.status === 'unverifiable') return `- ${name} — not checked: ${s.detail ?? 'it verifies a change the test only previewed'}`;
+    const word = s.status === 'empty' ? 'returned nothing' : s.status === 'failed' ? 'failed' : 'hit an error';
+    return `- ${name} — ${word}${s.detail ? `: ${s.detail}` : ''}`;
+  });
+}
+
+/**
+ * Save a human account choice on the definition step it answered. Returns
+ * true when the saved workflow changed. Exact by construction: the step must
+ * still exist with the same call tool, and the binding carries the choice-set
+ * digest the compiler revalidates on every dispatch. `enabled` is untouched —
+ * this narrows an already-admitted operation to one of its own current
+ * accounts; it grants nothing new.
+ */
+export function persistStepAccountBinding(
+  workflowSlug: string,
+  block: Pick<WorkflowCapabilityBlockState, 'stepId' | 'tool' | 'accountSelection'>,
+): boolean {
+  const selection = block.accountSelection;
+  if (!selection) return false;
+  const entry = readWorkflow(workflowSlug);
+  if (!entry) return false;
+  const steps = entry.data.steps ?? [];
+  const index = steps.findIndex((step) => step.id === block.stepId && step.call?.tool === block.tool);
+  if (index < 0) return false;
+  const current = steps[index]!.call!;
+  if (
+    current.account
+    && current.account.capabilityId === selection.capabilityId
+    && current.account.accountId === selection.accountId
+    && current.account.choiceSetDigest === selection.choiceSetDigest
+  ) return false;
+  const next = steps.map((step, position) => (position === index
+    ? {
+        ...step,
+        call: {
+          ...current,
+          account: {
+            capabilityId: selection.capabilityId,
+            accountId: selection.accountId,
+            choiceSetDigest: selection.choiceSetDigest,
+            selectedAt: selection.selectedAt,
+            selectedBy: selection.selectedBy,
+          },
+        },
+      }
+    : step));
+  writeWorkflowAndSyncTriggers(workflowSlug, { ...entry.data, steps: next });
+  return true;
 }
 
 /** Verdict for a read-only step's output: did it actually return data? */
@@ -13279,6 +13857,7 @@ export async function runCreationTest(
   runId: string,
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
+  options: { capabilityResume?: WorkflowCapabilityBlockState } = {},
 ): Promise<CreationTestResult> {
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
@@ -13359,6 +13938,9 @@ export async function runCreationTest(
             workflow, workflowSlug, runId, inputs, stepOutputs,
             assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
             creationTest: true,
+            // An answered account question resumes THIS test with the exact
+            // selection, mutations still previewed.
+            ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
           });
           stepOutputs[step.id] = out;
           results.push(creationTestVerdict(step.id, out));
@@ -13372,6 +13954,7 @@ export async function runCreationTest(
               stepId: step.id,
               status: 'needs_choice',
               detail: creationTestCapabilityQuestion(workflow.name, err),
+              block: err,
             });
           } else {
             stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
@@ -13758,6 +14341,28 @@ export function resolveWorkflowDefinitionForRun(
  * main execution heartbeat (exact-schema preflight) and from the execution
  * catch (gateway/auth/boundary refusal), so every such refusal has the same
  * durable same-run recovery semantics. */
+/** The name a person knows a connection by, keyed by its connection id. A
+ * choice must be answerable: live 2026-09-09 an owner was asked to pick
+ * between three ca_… ids for their own mailboxes. Never throws. */
+function connectedAccountLabelsByConnectionId(): Map<string, string> {
+  const labels = new Map<string, string>();
+  try {
+    for (const connection of peekConnectedToolkits()) {
+      const id = String(connection.connectionId ?? '').trim();
+      if (!id) continue;
+      const label = [
+        connection.accountLabel,
+        connection.alias,
+        connection.accountEmail,
+        connection.accountName,
+        connection.wordId,
+      ].map((value) => String(value ?? '').trim()).find(Boolean);
+      if (label && !labels.has(id)) labels.set(id, label);
+    }
+  } catch { /* labels are presentation only */ }
+  return labels;
+}
+
 export function workflowCapabilityNotificationPresentation(
   workflowName: string,
   block: WorkflowCapabilityBlockState,
@@ -13777,7 +14382,12 @@ export function workflowCapabilityNotificationPresentation(
   const accountChoiceBlock = block.reason === 'ambiguous-account'
     ? block.accountChoiceSet
     : undefined;
-  const accountChoices = accountChoiceBlock?.candidates ?? [];
+  const creationTest = block.resumeStatus === 'creation_test';
+  const labelsByAccount = connectedAccountLabelsByConnectionId();
+  const accountChoices = (accountChoiceBlock?.candidates ?? []).map((candidate) => ({
+    ...candidate,
+    label: labelsByAccount.get(candidate.accountId) ?? candidate.accountId,
+  }));
   const resolution = accountChoiceBlock
     ? {
         kind: 'choose_account' as const,
@@ -13804,43 +14414,58 @@ export function workflowCapabilityNotificationPresentation(
     ? [
         `Which ${block.toolkit} account should I use for step "${block.stepId}"?`,
         ...accountChoices.map((candidate, index) => (
-          `${index + 1}. ${candidate.accountId} (capability ${candidate.capabilityId})`
+          candidate.label !== candidate.accountId
+            ? `${index + 1}. ${candidate.label} (account ${candidate.accountId})`
+            : `${index + 1}. ${candidate.accountId} (capability ${candidate.capabilityId})`
         )),
         accountChoiceBlock.truncated
           ? `Only ${accountChoices.length} of ${accountChoiceBlock.total} exact account bindings are shown; connect fewer accounts or choose one of these.`
           : '',
-        'Choose the exact account ID in Needs You. I will save that choice and resume this same run.',
+        creationTest
+          ? 'Choose the account in Needs You. I will save it on that step, re-run the creation test with it (mutations stay previewed), and enable the workflow if it passes.'
+          : 'Choose the account in Needs you. I will save that choice and resume this same run.',
       ].filter(Boolean).join('\n')
     : '';
+  const app = capabilityAppName(block.toolkit);
+  const retry = capabilityRetryPhrase(block.retryAt);
   const detail = [
     accountChoiceBlock
-      ? `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
+      ? creationTest
+        ? `I paused the creation test of "${workflowName}" at step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
+        : `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
       : exactSchemaBlock
         ? `I paused "${workflowName}" at step "${block.stepId}" because the exact action schema could not be proven at the provider boundary.`
         : couldNotCheck
           ? `I paused "${workflowName}" at step "${block.stepId}" because I could not reach ${block.toolkit} to verify it before running. This is not a sign your connection is broken.`
           : needsAccountChoice
             ? `I paused "${workflowName}" at step "${block.stepId}" because the step did not say which ${block.toolkit} account to use. Your connection is fine.`
-            : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
-    block.message,
-    `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
+            : `I paused "${workflowName}" at step "${creationTestStepName(block.stepId)}" because ${app} isn't connected right now.`,
+    // The engine's "nothing can run <operation id>" diagnostic only restates
+    // the sentence above with an operation id; it stays on the block for Clem
+    // and the logs. Every other message says something the person needs.
+    isCapabilityNotRegisteredMessage(block.message) ? '' : block.message,
+    creationTest
+      ? `Nothing ran for real — a creation test only previews changes. No ${app} call was made.`
+      : `Everything before this step is kept. No ${app} call was made, so this same run can pick up where it stopped.`,
     accountChoiceBlock
       ? choiceQuestion
       : exactSchemaBlock
-        ? `Open Needs You to retry this exact metadata gate now, or I will retry safely after ${block.retryAt}; recovery performs no broader discovery or business action.`
+        ? `Retry it from Needs you${retry ? `, or I'll try again ${retry}` : ''}. Retrying only re-checks this action; it doesn't run anything else.`
         : couldNotCheck
-          ? `Nothing to do — I retry this automatically after ${block.retryAt}. Reconnecting ${block.toolkit} would not change it; if this keeps repeating, the provider is having trouble, not your account.`
+          ? `Nothing to do — I'll try again ${retry || 'shortly'}. Reconnecting ${app} wouldn't change it; if this keeps happening, ${app} is having trouble, not your account.`
           : needsAccountChoice
-            ? `Pick the ${block.toolkit} account for this step in Needs You and I will resume this same run. Reconnecting ${block.toolkit} will not help — the connection is not the problem.`
-            : `Open Settings → Connections and connect ${block.toolkit}, then return to Needs You to retry this exact gate. It will also retry safely after ${block.retryAt}.`,
-  ].join('\n\n');
+            ? `Pick the ${app} account for this step in Needs you and I'll resume this same run. Reconnecting ${app} won't help — the connection is fine.`
+            : `Connect ${app} on the Connect page, then retry from Needs you${retry ? ` — I'll also try again ${retry}` : ''}.`,
+  ].filter(Boolean).join('\n\n');
   return {
     exactSchemaBlock,
     accountChoiceBlock,
     choiceQuestion,
     detail,
     title: accountChoiceBlock
-      ? `Workflow needs you — choose an account for ${block.toolkit}`
+      ? creationTest
+        ? `Workflow setup needs you — choose an account for ${block.toolkit}`
+        : `Workflow needs you — choose an account for ${block.toolkit}`
       : exactSchemaBlock
         ? 'Workflow paused — exact action metadata unavailable'
         : couldNotCheck
@@ -13898,6 +14523,8 @@ function parkWorkflowCapabilityBlockedRun(input: {
   run: QueuedRunRecord;
   workflow: WorkflowCatalogEntry;
   error: WorkflowCapabilityBlockedError;
+  /** Set when the parked run was a creation test; it resumes as one. */
+  resumeStatus?: 'creation_test';
 }): void {
   const { filePath, run, workflow, error } = input;
   const blockedAtMs = Date.now();
@@ -13916,6 +14543,7 @@ function parkWorkflowCapabilityBlockedRun(input: {
     provenNoDispatch: true,
     state: 'blocked',
     ...(error.accountChoiceSet ? { accountChoiceSet: error.accountChoiceSet } : {}),
+    ...(input.resumeStatus ? { resumeStatus: input.resumeStatus } : {}),
   };
   const blockedRecord = writeRunRecord(filePath, {
     ...run,
@@ -13960,7 +14588,13 @@ function parkWorkflowCapabilityBlockedRun(input: {
   // Preflight schema refusal occurs before the ordinary activity start. The
   // upsert is also safe for an already-running workflow caught at the gateway.
   try {
-    startWorkflowActivityRun(run, workflow.data.name, `Running workflow "${workflow.data.name}"`);
+    startWorkflowActivityRun(
+      run,
+      workflow.data.name,
+      input.resumeStatus === 'creation_test'
+        ? `Creation-testing workflow "${workflow.data.name}"`
+        : `Running workflow "${workflow.data.name}"`,
+    );
     finishRun(run.id, {
       status: 'awaiting_input',
       message: accountChoiceBlock
@@ -13988,8 +14622,8 @@ function parkWorkflowCapabilityBlockedRun(input: {
         nextAction: accountChoiceBlock
           ? choiceQuestion
           : exactSchemaBlock
-            ? `Tell me to retry exact metadata for run ${run.id}; completed work stays preserved.`
-            : `Connect ${error.toolkit} in Settings → Connections, then tell me to retry run ${run.id}; completed work stays preserved.`,
+            ? 'Retry it from Needs you; everything before this step is kept.'
+            : `Connect ${capabilityAppName(error.toolkit)} on the Connect page, then retry it from Needs you; everything before this step is kept.`,
         resolution,
         retryAt,
         provenNoDispatch: true,
@@ -14180,11 +14814,55 @@ async function processOneRunFile(
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
         ...(run.inputs ?? {}),
       });
+      const creationTestResume = run.capabilityBlock?.state === 'retrying'
+        && run.capabilityBlock.provenNoDispatch === true
+        ? run.capabilityBlock
+        : undefined;
       let result: CreationTestResult;
       try {
-        result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant);
+        result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant, {
+          ...(creationTestResume ? { capabilityResume: creationTestResume } : {}),
+        });
       } catch (err) {
         result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
+      }
+      // An unanswered account question is a PAUSE of this creation test, not
+      // its verdict. Park exactly like a run does — same durable gate, same
+      // Needs You card on desktop/mobile, same chat tool — and resume as a
+      // creation test when answered, so the previewed mutations stay
+      // previewed. Steps that failed on their own are named alongside the
+      // question so one answer is never mistaken for "everything else passed".
+      const choiceStep = result.steps.find((entry) => (
+        entry.status === 'needs_choice'
+        && entry.block?.reason === 'ambiguous-account'
+        && Boolean(entry.block.accountChoiceSet)
+      ));
+      if (choiceStep?.block) {
+        const independentProblems = result.steps.filter((entry) => (
+          entry.status === 'error' || entry.status === 'failed' || entry.status === 'empty'
+        ));
+        const message = [
+          `Creation test of "${workflow.data.name}" paused at step "${choiceStep.stepId}".`,
+          creationTestStepLines(result.steps).join('\n'),
+          independentProblems.length > 0
+            ? `Independent of that question, ${independentProblems.length} step${independentProblems.length === 1 ? '' : 's'} failed on ${independentProblems.length === 1 ? 'its' : 'their'} own (${independentProblems.map((entry) => entry.stepId).join(', ')}) and will still need fixing after you answer.`
+            : '',
+        ].filter(Boolean).join('\n\n');
+        parkWorkflowCapabilityBlockedRun({
+          filePath,
+          run,
+          workflow,
+          error: new WorkflowCapabilityBlockedError({
+            stepId: choiceStep.block.stepId,
+            tool: choiceStep.block.tool,
+            toolkit: choiceStep.block.toolkit,
+            reason: choiceStep.block.reason,
+            message,
+            ...(choiceStep.block.accountChoiceSet ? { accountChoiceSet: choiceStep.block.accountChoiceSet } : {}),
+          }),
+          resumeStatus: 'creation_test',
+        });
+        return;
       }
       let activationCompatible = true;
       let activationBlockedReason = '';
@@ -14253,33 +14931,21 @@ async function processOneRunFile(
           if (requeued.status === 'queued' && requeued.id) autoRetestRunId = requeued.id;
         } catch { /* self-heal is additive — fall back to the manual message */ }
       }
-      const lines = result.steps.map((s) => {
-        if (s.status === 'ok') return `- ${s.stepId}: ✅ returned data`;
-        // The one answerable thing leads with the question itself, indented so
-        // the enumerated choices stay readable inside the step list.
-        if (s.status === 'needs_choice') {
-          return [`- ${s.stepId}: ❓ needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
-        }
-        if (s.status === 'previewed') return `- ${s.stepId}: ⏭️ previewed (mutating step — not run)`;
-        // Unverifiable is honest, not alarming: it names WHY the check could
-        // not run so the report never implies a broken step.
-        if (s.status === 'unverifiable') return `- ${s.stepId}: 🔍 not checked — ${s.detail ?? 'verifies a previewed mutation'}`;
-        return `- ${s.stepId}: ⚠️ ${s.status}${s.detail ? ` — ${s.detail}` : ''}`;
-      });
+      const lines = creationTestStepLines(result.steps);
       const body = creationReady
         ? activateAfterCreationTest
-          ? `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. I've ENABLED it.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run). It'll run on its schedule / when you trigger it.`
-          : `✅ Creation test passed for "${workflow.data.name}" — read-only steps returned real data. It remains DISABLED as requested.\n\n${lines.join('\n')}\n\nMutating steps were previewed (not run).`
+          ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.`
+          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.`
         : result.pass
           ? autoRetestRunId
-            ? `🔁 Creation test passed, but ${activationBlockedReason} — so that pass no longer covers what's saved. Re-testing the newer version now (run ${autoRetestRunId}); ${activateAfterCreationTest ? "it'll auto-enable here on pass" : 'it will remain disabled'}.\n\n${lines.join('\n')}`
-            : `⚠️ Creation test passed for the admitted version of "${workflow.data.name}", but I left the current workflow unchanged because ${activationBlockedReason}. Run a fresh creation test for the newer version before enabling it.\n\n${lines.join('\n')}`
+            ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
+            : `The creation test passed for the version I checked, but I left "${workflow.data.name}" as it was because ${activationBlockedReason}. Run a fresh creation test on the newer version before turning it on.\n\n${lines.join('\n')}`
         : result.steps.some((s) => s.status === 'needs_choice')
           // NOT a broken workflow — one unanswered question. Everything else
           // that stopped is downstream of it. Ask for the answer and say what
           // happens next, so answering is the whole of the owner's part.
-          ? `"${workflow.data.name}" is ready except for one thing I can't decide for you — left DISABLED until it's settled.\n\n${lines.join('\n')}\n\nAnswer that and I'll bind it to the step, re-run the creation test, and enable it if it passes.`
-          : `⚠️ Creation test for "${workflow.data.name}" found issues — left DISABLED so it won't run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rebind them and re-test. If you'd rather run it as it stands, say so and I'll enable it.`;
+          ? `"${workflow.data.name}" is ready except for one thing I can't decide for you, so it stays off until you answer.\n\n${lines.join('\n')}\n\nAnswer that and I'll save it on the step, test again, and turn it on if it passes.`
+          : `The creation test for "${workflow.data.name}" found problems, so it stays off rather than run broken.\n\n${lines.join('\n')}\n\nTell me to fix the flagged steps and I'll rework and re-test them. If you'd rather run it as it is, say so and I'll turn it on.`;
       const report = {
         workflowName: workflow.data.name,
         outcome: creationReady ? 'done' as const : 'blocked' as const,
@@ -14287,10 +14953,25 @@ async function processOneRunFile(
       };
       const terminalRecord = writeRunRecord(
         filePath,
-        { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' },
+        {
+          ...run,
+          status: 'creation_test',
+          finishedAt: new Date().toISOString(),
+          output: result.pass ? 'creation test passed' : 'creation test found issues',
+          ...(run.capabilityBlock ? { capabilityBlock: { ...run.capabilityBlock, state: 'consumed' as const } } : {}),
+        },
         report,
       );
       if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
+      // The owner's account answer outlives this test: save it on the step so
+      // the next test and every scheduled run start from it instead of
+      // asking again. Best-effort and exact — same step id, same tool, and the
+      // compiler still revalidates the choice-set digest before any dispatch.
+      if (creationTestResume?.accountSelection) {
+        try {
+          persistStepAccountBinding(workflow.name, creationTestResume);
+        } catch { /* the run's own selection already governed this test */ }
+      }
       startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
       // Only the process that published this creation-test terminal may enable
       // the draft or clear its failure history. A cancellation/other terminal
@@ -14343,6 +15024,14 @@ async function processOneRunFile(
           activationCompatible,
           definitionHash: definitionResolution.snapshot?.definitionHash ?? null,
           codeRevision: definitionResolution.snapshot?.codeRevision ?? null,
+          // The per-step verdicts, structured, so the authoring tool that
+          // awaits this test can hand the brain the flagged step's authorable
+          // shape and the exact repair call instead of prose to re-parse.
+          steps: result.steps.map((s) => ({
+            stepId: s.stepId,
+            status: s.status,
+            ...(s.detail ? { detail: s.detail.slice(0, 600) } : {}),
+          })),
         },
       });
       markRunNotified(filePath);
@@ -15046,39 +15735,112 @@ async function processOneRunFile(
         && blockedSteps.length === 0
         ? declaredRunGoal
         : null;
+      // JUDGE VIEW OF THE REVIEWED PROJECTION. A reviewed read run's
+      // deliverable is the host-produced projection of its retained read into
+      // the bound Space; the model never writes those records. The goal judge
+      // was shown only the step's opaque retained handle, so it could not see
+      // the records it was asked to verify. Live 2026-09-24 00:37Z
+      // (trigger-0a70cd32, the first approved documentation-inventory pilot):
+      // the read settled with structured evidence, the judge scored 1/5 with
+      // "no records list or count shown", and the run needed attention.
+      // Produce the lineage first (idempotent, replay-safe) and put its facts
+      // in the judge's evidence. The terminal publication gate below is
+      // unchanged: the projection still publishes only when the run needs no
+      // attention. A lineage that cannot be produced blocks the run exactly as
+      // the terminal did before.
+      const readProjectionAdmission = definitionResolution.workflowReadPilotAdmission
+        ?? definitionResolution.workflowRecurringReadAdmission;
+      const reviewedResultProjection = readProjectionAdmission?.resultProjection;
+      let reviewedProjectionLineage: Extract<
+        ReturnType<typeof produceCanonicalEntityWorkflowLineage>,
+        { status: 'ready' | 'replayed' }
+      > | null = null;
+      let reviewedProjectionEvidence = '';
+      let reviewedProjectionSummary = '';
+      if (reviewedResultProjection && blockedSteps.length === 0) {
+        const projectionStep = executionSteps.find(
+          (candidate) => candidate.id === readProjectionAdmission.nodeId,
+        );
+        const parsedProjectionPlan = parseWorkflowNodeInvocationPlan(projectionStep?.invocationPlan);
+        const retainedRun = readRunRecord(filePath);
+        if (
+          !projectionStep
+          || !parsedProjectionPlan.ok
+          || !parsedProjectionPlan.plan.resultProjection
+          || !retainedRun?.canonicalEntityWorkflowResultRoot
+          || typeof retainedRun.startedAt !== 'string'
+        ) {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: 'canonical_entity_result_lineage_unavailable: the successful read cannot publish without its exact reviewed plan, retained authority root, and run start receipt',
+          });
+        }
+        const produced = produceCanonicalEntityWorkflowLineage({
+          version: 1,
+          root: retainedRun.canonicalEntityWorkflowResultRoot,
+          invocationPlan: projectionStep.invocationPlan,
+          startedAt: retainedRun.startedAt,
+          proposedFinishedAt: new Date().toISOString(),
+        });
+        if (produced.status === 'blocked' || produced.status === 'not_applicable') {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: produced.status === 'blocked'
+              ? `canonical_entity_result_projection_blocked:${produced.code}: ${produced.reason}`
+              : 'canonical_entity_result_projection_unrepresented: the reviewed dataset plan did not produce an exact projection contract',
+          });
+        }
+        reviewedProjectionLineage = produced;
+        const projection = parsedProjectionPlan.plan.resultProjection;
+        const root = retainedRun.canonicalEntityWorkflowResultRoot as { workspaceBinding?: { binding?: { workspaceId?: unknown } } };
+        const workspaceId = typeof root.workspaceBinding?.binding?.workspaceId === 'string'
+          ? root.workspaceBinding.binding.workspaceId
+          : '(bound Space)';
+        const fields = Array.isArray(projection.fields)
+          ? projection.fields.map((field) => `${field.field}${field.required ? '' : '?'}`)
+          : [];
+        reviewedProjectionEvidence = [
+          'REVIEWED RESULT PROJECTION (host-produced from the retained read under the approved contract; not model output):',
+          `- target Space: ${workspaceId}; entity kind: ${projection.entityKind}; dataset ${produced.datasetId}`,
+          `- records projected: ${produced.observationCount} (contract allows at most ${projection.bounds.maxRecords}); pages: ${produced.pageCount}`,
+          `- every projected record carries the contract fields ${fields.join(', ')}; the host fills the provenance fields from the settled read, and a record missing a required field cannot be projected`,
+          '- write scope: only this bound Space receives these records; the run performed no other write',
+          `- publication: the host publishes this exact projection as the run's terminal record once the run completes without needing attention (lineage ${produced.status})`,
+        ].join('\n');
+        reviewedProjectionSummary = `Projected ${produced.observationCount} ${projection.entityKind} record${produced.observationCount === 1 ? '' : 's'} into the ${workspaceId} Space, each with ${fields.join(', ')}, from the settled read (run ${run.id}).`;
+      }
       let goalVerdict: GoalValidationResult | null = null;
       let goalValidation: WorkflowRunGoalValidationV1 | null = null;
       let goalDecision: GoalRunDecision | null = null;
       let goalFeedbackNext = '';
       let goalRequeueId: string | undefined;
       if (runGoal) {
-        const readEvidence = workflowRunReadEvidence(run.id);
-        const readExecutions = summarizeWorkflowReadExecutions(readEvidence);
-        goalVerdict = await validateGoal({
+        const executionEvidence = workflowGoalExecutionEvidence(readWorkflowTargetEvidence(run.id), workflow.data);
+        goalVerdict = await validateWorkflowRunGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
-          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), readExecutions].filter(Boolean).join("\n\n"),
+          // The goal reviewer reads its own evidence text, not the target
+          // judge's. A person's decision on a review gate belongs in both:
+          // live 2026-09-22 the owner approved the draft on the card, the
+          // gated save ran four seconds later, and this reviewer scored the
+          // run 4/5 for "saved without your review" because it never saw the
+          // approval.
+          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), reviewedProjectionEvidence, humanDecisionBlocks(run.id).join('\n'), executionEvidence.summary].filter(Boolean).join("\n\n"),
           // Structured outputs unlock the required-keys deterministic class —
           // key-presence criteria are checked in code, never by the judge
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).
           stepOutputs: publicRawStepOutputs,
-          readEvidence,
-        });
+          readEvidence: executionEvidence.evidence,
+        }, workflowRunGoalJudgeForTests ?? {});
         const goalValidatedAt = new Date().toISOString();
-        goalValidation = {
-          version: 1,
+        goalValidation = workflowGoalValidationReceipt({
           objective: runGoal.objective,
-          successCriteria: [...runGoal.successCriteria],
-          pass: goalVerdict.pass,
-          judgeFailedOpen: goalVerdict.judgeFailedOpen === true,
-          perCriterion: goalVerdict.perCriterion.map((criterion) => ({
-            criterion: criterion.criterion,
-            pass: criterion.pass,
-            method: criterion.method,
-            ...(criterion.detail !== undefined ? { detail: criterion.detail } : {}),
-          })),
+          successCriteria: runGoal.successCriteria,
+          verdict: goalVerdict,
           validatedAt: goalValidatedAt,
-        };
+        });
         // Verdict door (T3-B4): one canonical audit row per judge decision.
         appendWorkflowEvent(workflow.name, run.id, {
           kind: 'verdict_recorded',
@@ -15419,51 +16181,15 @@ async function processOneRunFile(
         : '';
 
       throwIfWorkflowRunCancelled(run.id);
-      let terminalFinishedAt = new Date().toISOString();
+      const terminalFinishedAt = new Date().toISOString();
+      let canonicalEntityWorkspaceProjectionFinishedAt: string | undefined;
       let canonicalEntityWorkspaceProjectionClaim: unknown;
-      const readProjectionAdmission = definitionResolution.workflowReadPilotAdmission
-        ?? definitionResolution.workflowRecurringReadAdmission;
-      const reviewedResultProjection = readProjectionAdmission?.resultProjection;
-      if (!needsAttention && !goalRepursuing && reviewedResultProjection) {
-        const projectionStep = executionSteps.find(
-          (candidate) => candidate.id === readProjectionAdmission.nodeId,
-        );
-        const parsedProjectionPlan = parseWorkflowNodeInvocationPlan(projectionStep?.invocationPlan);
-        const retainedRun = readRunRecord(filePath);
-        if (
-          !projectionStep
-          || !parsedProjectionPlan.ok
-          || !parsedProjectionPlan.plan.resultProjection
-          || !retainedRun?.canonicalEntityWorkflowResultRoot
-          || typeof retainedRun.startedAt !== 'string'
-        ) {
-          throw new WorkflowHarnessBlockedSignal({
-            stepId: readProjectionAdmission.nodeId,
-            sessionId: readProjectionAdmission.workflowSessionId,
-            reason: 'canonical_entity_result_lineage_unavailable: the successful read cannot publish without its exact reviewed plan, retained authority root, and run start receipt',
-          });
-        }
-        const produced = produceCanonicalEntityWorkflowLineage({
-          version: 1,
-          root: retainedRun.canonicalEntityWorkflowResultRoot,
-          invocationPlan: projectionStep.invocationPlan,
-          startedAt: retainedRun.startedAt,
-          proposedFinishedAt: terminalFinishedAt,
-        });
-        if (produced.status === 'blocked' || produced.status === 'not_applicable') {
-          throw new WorkflowHarnessBlockedSignal({
-            stepId: readProjectionAdmission.nodeId,
-            sessionId: readProjectionAdmission.workflowSessionId,
-            reason: produced.status === 'blocked'
-              ? `canonical_entity_result_projection_blocked:${produced.code}: ${produced.reason}`
-              : 'canonical_entity_result_projection_unrepresented: the reviewed dataset plan did not produce an exact projection contract',
-          });
-        }
-        // On a post-receipt restart the retained completed receipt owns the
-        // timestamp, so the terminal projection is byte-stable and cannot
-        // conflict with its own lineage claim.
-        terminalFinishedAt = produced.finishedAt;
-        canonicalEntityWorkspaceProjectionClaim = produced.claim;
+      // The dataset receipt predates goal review. Keep its immutable timestamp
+      // for exact projection replay, but never backdate the whole run's terminal:
+      // recurrence requires the judge receipt to precede run completion.
+      if (!needsAttention && !goalRepursuing && reviewedProjectionLineage) {
+        canonicalEntityWorkspaceProjectionFinishedAt = reviewedProjectionLineage.finishedAt;
+        canonicalEntityWorkspaceProjectionClaim = reviewedProjectionLineage.claim;
       }
       const terminalProjection: QueuedRunRecord = {
         ...run,
@@ -15485,7 +16211,7 @@ async function processOneRunFile(
         stepOutputs: runRecordStepOutputs,
         output: finalOutput,
         ...(canonicalEntityWorkspaceProjectionClaim
-          ? { canonicalEntityWorkspaceProjectionClaim }
+          ? { canonicalEntityWorkspaceProjectionClaim, canonicalEntityWorkspaceProjectionFinishedAt }
           : {}),
         ...(needsAttention
           ? { needsAttention: true, blockedSteps, proposedFixId: proposedFix?.id ?? null }
@@ -15633,7 +16359,7 @@ async function processOneRunFile(
       const goalSummary = goalMissed && goalMissAdvisoryOnly
           ? `\n\n🎯 Pinned goal review — the work above was delivered; the judge could not evidence every criterion:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nReview if the gap matters, or adjust the goal.`
           : goalMissed
-          ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
+          ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Inspect the existing results and reconcile any completed writes before deciding how to address the gaps.`
           : '';
       // Wave 2.2 (structured run summary): emit "succeeded because X + artifacts
       // (files/URLs/counts)" at completion. The structured `run_summary` event is
@@ -15660,9 +16386,15 @@ async function processOneRunFile(
         ...runArtifacts.urls,
       ].filter(Boolean);
       const producedLine = producedItems.length > 0 ? `\n\n📦 Produced: ${producedItems.join(' · ')}` : '';
+      // A reviewed read run's deliverable is its Space projection; say so in
+      // the report, or a clean run reads as "nothing new" (live 2026-09-24
+      // 01:36Z: five records projected, report said "routine read … nothing new").
+      const projectionLine = reviewedProjectionSummary && !needsAttention
+        ? `\n\n📚 ${reviewedProjectionSummary}`
+        : '';
       const successBody = isCompiledProjectRun
         ? baseSuccessBody
-        : `${baseSuccessBody}${producedLine}${failureSummary}${goalSummary}`;
+        : `${baseSuccessBody}${producedLine}${projectionLine}${failureSummary}${goalSummary}`;
       // Non-failing quality advisories (skill-execution misses + target-miss):
       // appended to whichever body we send so the deliverable is ALWAYS shown,
       // with a clear "review this" heads-up after it. Never replaces the body.
@@ -16524,6 +17256,14 @@ export function parkRunsExceedingBootResumeCap(
       withWorkflowRunRecordLock(filePath, () => {
         const record = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
         if (!record || isTerminalRunRecord(record)) return;
+        // A parked run is a decision waiting for a person (capability choice,
+        // or this cap already stopped it). Boot never resumes it, never counts
+        // it again and never re-raises its card: counting it each launch turned
+        // one paused occurrence into hundreds of "restarts" on the record.
+        if (record.status === 'parked') {
+          parked.add(run.runId);
+          return;
+        }
         // Progress since we last counted means this run is not looping — it is
         // simply long-lived across restarts. Start its budget over.
         const mark = run.lastEventAt ?? null;

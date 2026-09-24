@@ -1,3 +1,4 @@
+import { selectAutomaticReadPilotTarget } from '../execution/automation-pilot-target.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
@@ -22,7 +23,7 @@ import {
   type ResolveConfiguredReadPilotAcquisitionResult,
 } from '../execution/automation-read-pilot-production-acquisition.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 
 const DIGEST_RE = /^[a-f0-9]{64}$/;
 const EXACT_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
@@ -95,17 +96,28 @@ const currentIdentityRuleSchema = z.discriminatedUnion('kind', [
   }).strict(),
 ]);
 
+const projectionFieldBase = z.object({
+  field: z.string().regex(EXACT_KEY_RE),
+  type: z.enum(['string', 'number', 'boolean', 'timestamp', 'object', 'array']),
+  required: z.boolean(),
+  sensitivity: z.enum(['public', 'internal', 'confidential', 'restricted']),
+  confidence: z.number().min(0).max(1),
+});
 const resultProjectionSchema = z.object({
   version: z.union([z.literal(1), z.literal(2)]),
   records_path: z.string().trim().min(1).max(512),
-  fields: z.array(z.object({
-    field: z.string().regex(EXACT_KEY_RE),
-    record_path: z.string().trim().min(1).max(512),
-    type: z.enum(['string', 'number', 'boolean', 'timestamp', 'object', 'array']),
-    required: z.boolean(),
-    sensitivity: z.enum(['public', 'internal', 'confidential', 'restricted']),
-    confidence: z.number().min(0).max(1),
-  }).strict()).min(1).max(512),
+  text_interpretation: z.object({
+    version: z.literal(1), kind: z.literal('text_lines'),
+    field: z.string().regex(EXACT_KEY_RE), prefix: z.string(),
+    whitespace: z.enum(['trim', 'preserve']), blank_lines: z.enum(['skip', 'reject']),
+    max_source_bytes: z.number().int().positive(), max_source_records: z.number().int().positive(),
+    selection: z.object({ kind: z.literal('first'), max_records: z.number().int().positive() }).strict(),
+  }).strict().optional(),
+  fields: z.array(z.union([
+    projectionFieldBase.extend({ record_path: z.string().trim().min(1).max(512) }).strict(),
+    projectionFieldBase.extend({ host_source: z.enum(['workflow_run_id', 'page_settled_at', 'page_receipt_id'])
+      .describe('Verified execution provenance; never read from provider data.') }).strict(),
+  ])).min(1).max(512),
   source_record: z.object({
     id_path: z.string().trim().min(1).max(512),
     revision_path: z.string().trim().min(1).max(512).optional(),
@@ -120,6 +132,7 @@ const resultProjectionSchema = z.object({
     currentIdentityRuleSchema,
   ])).min(1).max(64),
   resolution_policy: z.object({
+    prefer_newer_after_exact_identity: z.array(z.string().regex(EXACT_KEY_RE)).max(512).optional(),
     policy_id: z.string().regex(EXACT_REF_RE),
     merge_threshold: z.number().nonnegative(),
     distinct_threshold: z.number().nonnegative(),
@@ -199,6 +212,7 @@ const resultProjectionSchema = z.object({
 });
 
 const typedContractSchema = z.object({
+  workspace_output_phase_id: z.string().regex(EXACT_REF_RE).optional().describe('Exact local dataset-output phase represented by the separately approved Workspace projection; required when the proposal includes that phase.'),
   phase_id: z.string().regex(EXACT_REF_RE),
   requirement_id: z.string().regex(EXACT_REF_RE),
   workflow_inputs: z.record(z.string().regex(EXACT_KEY_RE), stringWorkflowInputSchema),
@@ -275,10 +289,11 @@ function acquisitionScope(input: {
   expectedProposalDigest: string;
   phaseId: string;
   requirementId: string;
-}): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
+}, purpose: 'acquisition' | 'workspace' = 'acquisition'): { ok: true; scope: AutomationReadPilotAcquisitionScopeV1 } | {
   ok: false;
   code: string;
   reason: string;
+  repairableArguments?: true;
 } {
   const proposal = loadAutomationOpportunityProposal(input.proposalId);
   if (!proposal) return { ok: false, code: 'proposal_missing', reason: 'The exact automation proposal was not found.' };
@@ -289,24 +304,21 @@ function acquisitionScope(input: {
   if (proposal.status !== 'approved') {
     return { ok: false, code: 'proposal_not_approved', reason: 'The proposal has not completed its separate user-owned review decision.' };
   }
-  const phase = proposal.opportunity.phases[0];
-  const requirement = proposal.opportunity.capabilityRequirements[0];
-  if (
-    proposal.opportunity.phases.length !== 1
-    || proposal.opportunity.capabilityRequirements.length !== 1
-    || !phase
-    || !requirement
-    || phase.id !== input.phaseId
-    || requirement.id !== input.requirementId
-    || phase.capabilityRequirementIds.length !== 1
-    || phase.capabilityRequirementIds[0] !== requirement.id
-    || phase.effect.class !== 'read'
-    || requirement.minimumEffect !== 'read'
-    || proposal.opportunity.effectCeiling.class !== 'read'
-  ) return {
-    ok: false,
-    code: 'pilot_requirement_unsupported',
-    reason: 'Acquisition-reference issuance requires the exact single read phase and requirement.',
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) return { ok: false, code: 'pilot_requirement_unsupported', reason: target.reason };
+  const { phase, requirement } = target;
+  // Workspace review may name its exact declared local output, but any
+  // acquisition scope returned remains bound to the selected source read.
+  // This grants no output execution: creation still needs its separate card.
+  const output = purpose === 'workspace' ? target.workspaceOutputPhase : undefined;
+  const matchesOutput = output?.id === input.phaseId
+    && output.capabilityRequirementIds.length === 1
+    && output.capabilityRequirementIds[0] === input.requirementId;
+  if (!matchesOutput && (phase.id !== input.phaseId || requirement.id !== input.requirementId)) return {
+    ok: false, code: 'pilot_requirement_unsupported', repairableArguments: true,
+    reason: purpose === 'workspace'
+      ? 'Workspace operations must name the selected read phase and requirement or the exact declared Workspace output phase and requirement.'
+      : 'Acquisition references bind the selected read phase and requirement; Workspace output is bound separately in the pilot contract.',
   };
   return {
     ok: true,
@@ -324,11 +336,21 @@ function acquisitionScope(input: {
 
 function internalContract(input: z.infer<typeof typedContractSchema>): AutomationReadPilotTypedContractV1 {
   const projection = input.result_projection;
+  if (projection?.version === 2 && !projection.partition.outcome_authority) {
+    throw new Error('result_projection.partition.outcome_authority is required for version 2; supply the explicit workflow_read_aggregate terminal-state contract.');
+  }
   const projectionBase = projection ? {
     recordsPath: projection.records_path,
+    ...(projection.text_interpretation ? { textInterpretation: {
+      version: projection.text_interpretation.version, kind: projection.text_interpretation.kind,
+      field: projection.text_interpretation.field, prefix: projection.text_interpretation.prefix,
+      whitespace: projection.text_interpretation.whitespace, blankLines: projection.text_interpretation.blank_lines,
+      maxSourceBytes: projection.text_interpretation.max_source_bytes, maxSourceRecords: projection.text_interpretation.max_source_records,
+      selection: { kind: projection.text_interpretation.selection.kind, maxRecords: projection.text_interpretation.selection.max_records },
+    } } : {}),
     fields: projection.fields.map((field) => ({
       field: field.field,
-      recordPath: field.record_path,
+      ...('host_source' in field ? { hostSource: field.host_source } : { recordPath: field.record_path }),
       type: field.type,
       required: field.required,
       sensitivity: field.sensitivity,
@@ -345,6 +367,7 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
     },
     entityKind: projection.entity_kind,
     resolutionPolicy: {
+      ...(projection.resolution_policy.prefer_newer_after_exact_identity ? { preferNewerAfterExactIdentity: [...projection.resolution_policy.prefer_newer_after_exact_identity] } : {}),
       policyId: projection.resolution_policy.policy_id,
       mergeThreshold: projection.resolution_policy.merge_threshold,
       distinctThreshold: projection.resolution_policy.distinct_threshold,
@@ -447,6 +470,7 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
         })
     : undefined;
   return {
+    ...(input.workspace_output_phase_id ? { workspaceOutputPhaseId: input.workspace_output_phase_id } : {}),
     phaseId: input.phase_id,
     requirementId: input.requirement_id,
     workflowInputs: structuredClone(input.workflow_inputs),
@@ -550,8 +574,13 @@ export function registerAutomationReadPilotTools(
         expectedProposalDigest: expected_proposal_digest,
         phaseId: phase_id,
         requirementId: requirement_id,
-      });
-      if (!scoped.ok) return errorResult(scoped.code, scoped.reason);
+      }, 'workspace');
+      if (!scoped.ok) {
+        if (scoped.repairableArguments) {
+          return invalidArgumentsTextResult(JSON.stringify({ ok: false, code: scoped.code, reason: scoped.reason }));
+        }
+        return errorResult(scoped.code, scoped.reason);
+      }
       const proposal = loadAutomationOpportunityProposal(proposal_id);
       if (!proposal?.opportunity.dataset) {
         return errorResult('workspace_creation_not_applicable', 'The exact approved proposal has no dataset contract.');
@@ -600,13 +629,14 @@ export function registerAutomationReadPilotTools(
 
   server.tool(
     'automation_read_pilot_workspace_list',
-    'List exact current Workspace revisions that a separately approved dataset pilot may name on its formal human approval card. Inventory grants no binding, workflow, schedule, or execution authority and never selects by name or list order.',
+    'List exact current Workspace revisions that a separately approved dataset pilot may name on its formal human approval card. Pass workspace_id when the destination is known to return only its exact revision and digest. Inventory grants no binding, workflow, schedule, or execution authority and never selects by name or list order.',
     {
       proposal_id: z.string().regex(EXACT_REF_RE),
       expected_proposal_revision: z.number().int().positive(),
       expected_proposal_digest: z.string().regex(DIGEST_RE),
       phase_id: z.string().regex(EXACT_REF_RE),
       requirement_id: z.string().regex(EXACT_REF_RE),
+      workspace_id: z.string().min(2).max(63).optional().describe('Exact Workspace ID; no fuzzy matching or fallback to other Workspaces.'),
     },
     async ({
       proposal_id,
@@ -614,6 +644,7 @@ export function registerAutomationReadPilotTools(
       expected_proposal_digest,
       phase_id,
       requirement_id,
+      workspace_id,
     }) => {
       const source = acceptedSource(options.acceptedSource);
       if (!source) return errorResult('accepted_source_required', 'An exact accepted chat source must own Workspace inventory.');
@@ -624,13 +655,18 @@ export function registerAutomationReadPilotTools(
         expectedProposalDigest: expected_proposal_digest,
         phaseId: phase_id,
         requirementId: requirement_id,
-      });
-      if (!scoped.ok) return errorResult(scoped.code, scoped.reason);
+      }, 'workspace');
+      if (!scoped.ok) {
+        if (scoped.repairableArguments) return invalidArgumentsTextResult(JSON.stringify({ ok: false, code: scoped.code, reason: scoped.reason }));
+        return errorResult(scoped.code, scoped.reason);
+      }
       const proposal = loadAutomationOpportunityProposal(proposal_id);
       if (!proposal?.opportunity.dataset) {
         return errorResult('workspace_binding_not_applicable', 'The exact approved proposal has no dataset contract.');
       }
-      const workspaces = spaceStore.list().map((workspace) => ({
+      const exact = workspace_id ? spaceStore.get(workspace_id) : undefined;
+      const candidates = workspace_id ? (exact ? [exact] : []) : spaceStore.list();
+      const workspaces = candidates.map((workspace) => ({
         workspaceId: workspace.id,
         expectedWorkspaceRevision: workspace.version,
         expectedWorkspaceDigest: canonicalEntityWorkspaceSelectionDigest(workspace),
@@ -749,6 +785,15 @@ export function registerAutomationReadPilotTools(
       }
       if (!resolved.ok) return errorResult(resolved.code, resolved.reason);
 
+      let typedContract: AutomationReadPilotTypedContractV1;
+      try {
+        typedContract = internalContract(contract);
+      } catch (error) {
+        return invalidArgumentsTextResult(JSON.stringify({
+          ok: false, code: 'pilot_contract_invalid',
+          reason: error instanceof Error ? error.message : String(error),
+        }));
+      }
       const requested = await acquireAndRegisterAutomationReadPilotProjection({
         proposalId: proposal_id,
         expectedProposalRevision: expected_proposal_revision,
@@ -756,10 +801,17 @@ export function registerAutomationReadPilotTools(
         approvalSessionId: source.sessionId,
         originSessionId: source.sessionId,
         acquisition: resolved.acquisition,
-        contract: internalContract(contract),
+        contract: typedContract,
         workflowInputs: structuredClone(workflow_inputs),
       });
-      if (!requested.ok) return errorResult(requested.code, requested.reason);
+      if (!requested.ok) {
+        if (requested.repairableArguments) {
+          return invalidArgumentsTextResult(JSON.stringify({
+            ok: false, code: requested.code, reason: requested.reason,
+          }));
+        }
+        return errorResult(requested.code, requested.reason);
+      }
       const executionAuthority = requested.projection.status === 'queued'
         ? 'queued_one_shot_pilot'
         : requested.projection.status === 'queueing'

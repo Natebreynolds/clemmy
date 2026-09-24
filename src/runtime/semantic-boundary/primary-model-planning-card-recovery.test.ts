@@ -49,6 +49,9 @@ function registerRead(input: {
     providerVersion: '1',
     operationVersion: '1',
     definitionFingerprint: fingerprint,
+    externalDefinition: { version: 1, providerInputSchemaDigest: sha256(`input:${input.slug}`),
+      providerOutputSchemaObserved: true, providerOutputSchemaDigest: sha256(`output:${input.slug}`),
+      semanticName: input.slug, behaviorHints: { readOnly: true, destructive: false, idempotent: true, openWorld: false } },
     effect: 'read',
     accountId: 'host:runtime',
     idempotency: { required: false, policy: 'none' },
@@ -76,6 +79,19 @@ function registerRead(input: {
   };
   input.factory.register(entry);
   return entry;
+}
+
+function discloseRegisteredRead(source: { sessionId: string; seq: number; turn: number }, entry: ReturnType<typeof registerRead>) {
+  const descriptor = semantic.hostDescriptorFromRegistered(entry);
+  assert.ok(descriptor);
+  eventlog.appendEvent({ sessionId: source.sessionId, turn: source.turn, role: 'system', type: 'capability_discovered',
+    data: { sourceUserSeq: source.seq, capabilities: [{ identifier: entry.toolName, capabilityRef: entry.capabilityId,
+      providerKind: entry.providerKind, accountIdentity: descriptor.accountScope, manifestDigest: descriptor.manifestDigest,
+      descriptor, effectClass: 'read', providerDefinition: { version: 1,
+        providerInputSchemaDigest: entry.manifest.externalDefinition!.providerInputSchemaDigest,
+        providerOutputSchemaDigest: entry.manifest.externalDefinition!.providerOutputSchemaDigest,
+        definitionFingerprint: entry.manifest.definitionFingerprint, providerOperationVersion: entry.manifest.operationVersion,
+        invokePortId: entry.manifest.invokePortId, verificationContract: null, operationSemantics: entry.manifest.operationSemantics ?? null } }] } });
 }
 
 function freshSource(label: string, turn = 1) {
@@ -108,8 +124,9 @@ after(() => {
 
 test('same-source recovery reopens the exact initial card after new live capabilities appear', async () => {
   const factory = resetFixture();
-  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const disclosed = registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
   const { session, source } = freshSource('stable');
+  discloseRegisteredRead(source, disclosed);
 
   const first = await semantic.primePrimaryModelPlanningCatalog({
     sessionId: session.id,
@@ -231,7 +248,7 @@ test('a one-byte A continuation freezes and ranks against the durable parent Q/A
   for (const prefix of ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG', 'HHH', 'III']) {
     registerRead({ factory, slug: `${prefix}_GENERIC_LOOKUP`, purpose: 'generic unrelated records' });
   }
-  registerRead({
+  const relevant = registerRead({
     factory,
     slug: 'ZZZ_LOCAL_LLM_NEWS',
     purpose: 'top recent news about local LLM processing',
@@ -245,6 +262,7 @@ test('a one-byte A continuation freezes and ranks against the durable parent Q/A
     type: 'user_input_received',
     data: { text: parentText },
   });
+  discloseRegisteredRead(parent, relevant);
   continuityStore.createTaskContinuityPacket({
     sessionId: session.id,
     originatingSourceUserSeq: parent.seq,
@@ -277,7 +295,7 @@ test('a one-byte A continuation freezes and ranks against the durable parent Q/A
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
   if (!primed.ok || !enriched.taskContinuation) return;
   assert.ok(primed.planning.capabilities.some((entry) => entry.id === 'cap:resolved:zzz_local_llm_news'),
-    'the parent task—not the literal one-byte answer—drives bounded retrieval ranking');
+    'the affirmed parent disclosure remains available without loading unrelated global capabilities');
   const snapshot = eventlog.listEvents(session.id, { types: [SNAPSHOT_TYPE] })
     .find((event) => event.data.sourceUserSeq === answer.seq);
   assert.ok(snapshot);
@@ -292,8 +310,9 @@ test('a progressed source without a snapshot installs its card late, exactly onc
   // refusing to prime a source that progressed before any card existed made
   // every legacy/in-flight source unresumable. Late install is the outcome.
   const factory = resetFixture();
-  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const disclosed = registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
   const { session, source } = freshSource('missing');
+  discloseRegisteredRead(source, disclosed);
   eventlog.appendEvent({
     sessionId: session.id,
     turn: source.turn,
@@ -380,8 +399,9 @@ test('content-consistent corruption and a foreign source snapshot both fail clos
 
 test('same-id current manifest drift cannot be hidden behind the stored card digest', async () => {
   const factory = resetFixture();
-  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const disclosed = registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
   const { session, source } = freshSource('drift');
+  discloseRegisteredRead(source, disclosed);
   const first = await semantic.primePrimaryModelPlanningCatalog({
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -780,7 +800,7 @@ test('a plain later source in the same session does not inherit an earlier discl
   const primed = await semantic.primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: later.seq });
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
   if (!primed.ok) return;
-  assert.equal(primed.planning.capabilities.length, 8, 'the live ranking saturates the card');
+  assert.equal(primed.planning.capabilities.length, 0, 'a new source does not preload the global inventory');
   assert.equal(primed.planning.capabilities.some((entry) => entry.id === ref), false, 'the target is withheld');
   assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], []);
   assert.deepEqual(stagedForSource(primed.planning, { sessionId: session.id, sourceUserSeq: later.seq }, ref), [],
@@ -879,4 +899,27 @@ test('an inherited parent row whose manifest digest drifted is dropped like an o
   assert.deepEqual([...(primed.planning.inheritedSourceUserSeqs ?? [])], [parent.seq]);
   assert.deepEqual(stagedForSource(primed.planning, identity, ref), [],
     'a drifted inherited row is re-proven against the current catalog and dropped');
+});
+
+
+test('one current-source disclosure does not refill a cold card from the global inventory', async () => {
+  const factory = resetFixture();
+  const selected = registerRead({ factory, slug: 'SELECTED_READER', purpose: 'read the requested source' });
+  registerRead({ factory, slug: 'UNRELATED_READER', purpose: 'read unrelated records' });
+  const { session, source } = freshSource('disclosure-no-global-fill');
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  const initial = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(initial.ok);
+  if (!initial.ok) return;
+  assert.deepEqual(initial.planning.capabilities, []);
+  discloseRegisteredRead(source, selected);
+  const resumed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(resumed.ok);
+  if (!resumed.ok) return;
+  assert.deepEqual(resumed.planning.capabilities.map(row => row.id), [selected.capabilityId]);
+  assert.deepEqual(initial.planning.capabilities, [], 'discovery does not rewrite the immutable initial snapshot');
+  eventlog.closeEventLog();
+  const reopened = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(reopened.ok);
+  if (reopened.ok) assert.deepEqual(reopened.planning.capabilities, resumed.planning.capabilities);
 });

@@ -392,7 +392,7 @@ export function resolveCarriedHostControl(
  */
 export type OffSurfaceDirectCarry = {
   carrierName: 'call_tool' | 'work_call';
-  carrierArgs: { name: string; args_json: string };
+  carrierArgs: { name: string; args_json: string; requirement_id?: string };
 };
 
 export function resolveOffSurfaceDirectCarry(input: {

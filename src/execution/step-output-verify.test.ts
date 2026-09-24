@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { coerceOutputForContract, verifyStepOutput } from './step-output-verify.js';
 
 test('a structured result satisfies a string contract as rendered text', () => {
@@ -135,4 +138,32 @@ test('an explicit blocked envelope stays structured with no contract or a string
   }
   assert.equal(coerceOutputForContract('Example: {"blocked":true}', undefined), 'Example: {"blocked":true}');
   assert.equal(coerceOutputForContract('{"blocked":false}', undefined), '{"blocked":false}');
+});
+
+test('a committed local-file receipt that names its path satisfies the natural save contract', () => {
+  // Live 2026-09-22, "Handoff review fixture": the write_file call step
+  // returned the host receipt envelope (artifactId, handle, contentDigest,
+  // receipt, result), the authored contract asked for `path` and checked it
+  // exists, and a write that had physically succeeded was reported failed.
+  // The committed path is a fact of the receipt and must be on it.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-save-contract-'));
+  const target = path.join(dir, 'summary.txt');
+  writeFileSync(target, 'three\nlines\nhere\n', 'utf8');
+  const envelope = {
+    artifactId: 'artifact:local-file:abc',
+    handle: 'lfr:abc',
+    contentDigest: 'd'.repeat(64),
+    receipt: '[exact-output-receipt:v1 nonce=x sha256=y]',
+    path: target,
+    result: `Committed file at ${target} (18 chars).`,
+  };
+  const contract = {
+    type: 'object' as const,
+    required_keys: ['path'],
+    non_empty: ['path'],
+    verify: { path_exists: ['path'], url_present: [] },
+  };
+  const verdict = verifyStepOutput(contract, envelope);
+  assert.equal(verdict.ok, true, verdict.ok ? '' : verdict.problems.join('; '));
+  rmSync(dir, { recursive: true, force: true });
 });

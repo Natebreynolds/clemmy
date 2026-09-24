@@ -533,3 +533,68 @@ test('omitted nullable recovery fills nested records without guessing required f
     assert.equal(recoverOmittedNullableFields({ ...error, toolInvocation: { input: JSON.stringify(value) } }, parameters), null);
   }
 });
+
+
+test('deferred opportunity creation decodes transport-only nested null without granting execution', async () => {
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const propose = getLocalDeferredDispatchTools().find(candidate => candidate.name === 'automation_opportunity_propose');
+  assert.ok(propose && propose.type === 'function');
+  const opportunity = JSON.parse(readFileSync(new URL('./fixtures/opportunity-single-null-optional.json', import.meta.url), 'utf8'));
+  const output = await harnessRunContextStorage.run({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }, () =>
+    propose.invoke(new RunContext({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }), JSON.stringify({
+      proposal_key: 'nested-optional', opportunity,
+    })));
+  assert.ok(!(output instanceof HostLocalExecutionFailureResult), String(output));
+  const result = JSON.parse(String(output));
+  assert.equal(result.ok, true, String(output));
+  assert.equal(result.executionAuthority, 'none');
+  assert.equal(result.nextBoundary, 'user_review');
+  assert.equal(Object.hasOwn(result.proposal.opportunity.partition, 'outcomeAuthority'), false);
+  opportunity.trigger = { kind: 'manual' };
+  const invalid = await harnessRunContextStorage.run({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }, () =>
+    propose.invoke(new RunContext({ sessionId: 'optional-wire-proposal', sourceUserSeq: 1 }), JSON.stringify({
+      proposal_key: 'invalid-recurrence', opportunity,
+    })));
+  assert.ok(invalid instanceof InvalidArgumentsPreDispatchResult, "proposal validation must allow argument repair before any write");
+  assert.match(String(invalid), /recurrence proposal requires the recurrence trigger/);
+
+});
+
+
+test('promoted native opportunity schema is valid on the actual Claude wire', async () => {
+  const { applyClaudeEnvelope } = await import('../runtime/harness/claude-model.js');
+  const { Ajv2020 } = await import('ajv/dist/2020.js');
+  const tool = getLocalRuntimeTools().find(candidate => candidate.name === 'automation_opportunity_propose');
+  assert.ok(tool && tool.type === 'function');
+  const envelope = applyClaudeEnvelope({ body: JSON.stringify({
+    model: 'fixture-model', messages: [{ role: 'user', content: 'fixture' }],
+    tools: [{ name: tool.name, input_schema: tool.parameters }],
+  }) }, 'fixture-token');
+  const schema = JSON.parse(String(envelope.body)).tools[0].input_schema;
+  const ajv = new Ajv2020({ strict: false });
+  assert.equal(ajv.validateSchema(schema), true, JSON.stringify(ajv.errors));
+});
+
+test('the structural control lookup hands back schema handles when the host built the controls this turn', async () => {
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const { RunContext } = await import('@openai/agents');
+  const planSchema = { type: 'object', properties: { preamble: { type: 'string' }, draft: { type: 'object' } }, required: ['preamble', 'draft'], additionalProperties: false };
+  const search = buildScopedLocalToolSearch(
+    new Set(['space_save', 'workflow_run']),
+    'call_tool',
+    undefined,
+    [],
+    undefined,
+    () => new Map([['plan_task', { schema: planSchema, description: 'Admit and freeze one action plan.' }]]),
+  );
+  const context = new RunContext({ sessionId: 'structural-lookup-handles' });
+  const output = await search.invoke(context, JSON.stringify({ query: 'plan_task schema', role_key: null, limit: 5 }));
+  const payload = JSON.parse(String(output)) as { kind?: string; schema_handles?: Record<string, { cursor?: string }>; hint?: string };
+  assert.equal(payload.kind, 'host_structural_control_lookup_v1');
+  assert.ok(payload.schema_handles?.plan_task?.cursor, 'plan_task schema is reopenable from the lookup');
+  assert.equal(payload.schema_handles?.work_call, undefined, 'only controls the host built this turn get handles');
+  assert.match(String(payload.hint), /callable now by name/);
+  assert.ok(Buffer.byteLength(String(output), 'utf8') <= 2_048, 'handles keep the structural answer bounded');
+  const reopened = await search.invoke(context, JSON.stringify({ query: 'plan_task schema', role_key: null, limit: 5, cursor: payload.schema_handles!.plan_task!.cursor }));
+  assert.match(String(reopened), /"preamble"/, 'the handle redeems the complete current schema');
+});

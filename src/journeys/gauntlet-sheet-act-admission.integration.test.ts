@@ -307,8 +307,7 @@ test('S1 prompt: prep-frozen turn still admits and dispatches the same-turn-disc
           'foreground discovery returns the sheet operation');
         assert.match(serialized, /cap:resolved:googlesheets_create_spreadsheet/,
           'the exact disclosed write ref reaches the model');
-        assert.ok(tools.includes(PLAN_CONTROL),
-          'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), false, 'deferred planning remains callable without permanent schema growth');
         output = [functionCall('admit-gauntlet-sheet', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {
@@ -586,8 +585,7 @@ test('read surface: an exact disclosed read is admitted through the business car
       } else if (step === 2) {
         assert.match(serialized, new RegExp(DRIVE_OPERATION),
           'foreground discovery returns and proves the drive read');
-        assert.ok(tools.includes(PLAN_CONTROL),
-          'the exact disclosure makes plan_task reachable');
+        assert.equal(tools.includes(PLAN_CONTROL), false, 'deferred planning remains callable without permanent schema growth');
         output = [functionCall('admit-gauntlet-drive-read', PLAN_CONTROL, {
           preamble: 'I’ll check Google Drive for the existing Gauntlet Sheet.',
           draft: {

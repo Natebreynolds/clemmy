@@ -17,6 +17,9 @@ export function CleanupCard() {
   const all = (allPlan.data as { counts: TidyCounts } | undefined)?.counts;
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmAll, setConfirmAll] = useState(false);
+  // "Clear all" on one row reaches today's items too (a decision still in
+  // play, a run that just stopped), so it asks once, like "everything" does.
+  const [confirmRow, setConfirmRow] = useState<TidyClass | null>(null);
   const [outcome, setOutcome] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
   const sum = (c?: TidyCounts) => (c ? c.updates + c.staleAsks + c.stuckRuns + c.oldConversations : 0);
 
@@ -24,6 +27,7 @@ export function CleanupCard() {
     setBusy(key);
     setOutcome(null);
     setConfirmAll(false);
+    setConfirmRow(null);
     try {
       const { result } = await applyTidy(classes, scope);
       setOutcome({ tone: 'ok', text: describeTidy(result) });
@@ -51,9 +55,18 @@ export function CleanupCard() {
                 <Button variant="secondary" size="sm" disabled={s === 0 || busy !== null} onClick={() => void run([row.id], 'stale', `${row.id}:stale`)}>
                   {busy === `${row.id}:stale` ? 'Clearing…' : `Clear stale${s > 0 ? ` (${s})` : ''}`}
                 </Button>
-                <Button variant="secondary" size="sm" disabled={a === 0 || busy !== null} onClick={() => void run([row.id], 'all', `${row.id}:all`)}>
-                  {busy === `${row.id}:all` ? 'Clearing…' : `Clear all${a > 0 ? ` (${a})` : ''}`}
-                </Button>
+                {confirmRow === row.id ? (
+                  <>
+                    <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => void run([row.id], 'all', `${row.id}:all`)}>
+                      {busy === `${row.id}:all` ? 'Clearing…' : `Yes, clear ${a}`}
+                    </Button>
+                    <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => setConfirmRow(null)}>Keep</Button>
+                  </>
+                ) : (
+                  <Button variant="secondary" size="sm" disabled={a === 0 || busy !== null} onClick={() => setConfirmRow(row.id)}>
+                    {`Clear all${a > 0 ? ` (${a})` : ''}`}
+                  </Button>
+                )}
               </div>
             </li>
           );
@@ -64,7 +77,7 @@ export function CleanupCard() {
           {outcome
             ? outcome.text
             : confirmAll
-              ? `This clears every item above — ${sum(all)} in total, including today's. Nothing is deleted.`
+              ? `This clears every item above — ${sum(all)} in total, including today's. Updates are marked read, open asks are declined, stuck runs are stopped and old chats are archived; nothing is deleted.`
               : stale && all
                 ? (sum(all) === 0 ? 'Nothing to clear right now.' : 'Counts refresh every minute.')
                 : 'Checking…'}
@@ -81,7 +94,7 @@ export function CleanupCard() {
               <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => setConfirmAll(false)}>Keep</Button>
             </>
           ) : (
-            <Button variant="primary" size="sm" disabled={sum(all) === 0 || busy !== null} onClick={() => setConfirmAll(true)}>
+            <Button variant="secondary" size="sm" disabled={sum(all) === 0 || busy !== null} onClick={() => setConfirmAll(true)}>
               Clear everything{sum(all) > 0 ? ` (${sum(all)})` : ''}
             </Button>
           )}

@@ -21,7 +21,7 @@ import { WorkflowHowItWorks } from '@/components/automate/WorkflowDrawer';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { getWorkflow, runWorkflow } from '@/lib/automate';
 import { humanizeCron } from '@/lib/cron';
-import { certificationTone } from '@/lib/workflowCertification';
+import { certificationTone, sentenceCaseLabel } from '@/lib/workflowCertification';
 import { workflowBuildFromMessages, type WorkflowBuildState, type WorkflowDraft } from '@/lib/workflow-build';
 import { cn } from '@/lib/cn';
 
@@ -170,7 +170,7 @@ export function AutomateCreate() {
         <div className="relative flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
           <h2 className="truncate text-h3 text-fg">{build.draft?.name || wf?.name || 'New workflow'}</h2>
           <StatusPill tone={pill.tone}>{pill.label}</StatusPill>
-          {cert && build.state === 'written' && <StatusPill tone={certificationTone(cert.state)}>{cert.label}</StatusPill>}
+          {cert && build.state === 'written' && <StatusPill tone={certificationTone(cert.state)}>{sentenceCaseLabel(cert.label)}</StatusPill>}
           {live && <span aria-hidden className="absolute inset-x-0 bottom-0 h-0.5 animate-pulse bg-primary/70" />}
           <div className="ml-auto flex items-center gap-1.5">
             {wf && (
@@ -203,7 +203,7 @@ export function AutomateCreate() {
               </div>
               {cert && (
                 <section className={cn('rounded-md border px-4 py-3', cert.canRun ? 'border-success/30 bg-success-tint' : 'border-warning/30 bg-warning-tint')}>
-                  <p className="text-small font-semibold text-fg">{cert.label}</p>
+                  <p className="text-small font-semibold text-fg">{sentenceCaseLabel(cert.label)}</p>
                   {cert.summary && <p className="text-small text-muted">{cert.summary}</p>}
                 </section>
               )}

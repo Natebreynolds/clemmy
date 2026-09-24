@@ -1,7 +1,6 @@
 import { judgeObjectiveComplete, JUDGE_RESPONSE_MAX_CHARS, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from '../runtime/harness/objective-judge.js';
 import { withJudgeTimeout } from '../runtime/harness/judge-family.js';
 import type { WorkflowDefinition, WorkflowStepOutputContract } from '../memory/workflow-store.js';
-import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import type { WorkflowTargetEvidence } from './workflow-target-evidence.js';
 import type { WorkflowTargetReviewPolicy } from './workflow-target-review-policy.js';
 
@@ -119,9 +118,9 @@ export function buildWorkflowObjective(
 
 function appendContractCriteria(out: string[], step: LegacyGoalStep): void {
   const id = step.id || 'unnamed';
-  const c = step.output && Object.keys(step.output).length > 0
-    ? step.output
-    : inferOutputContractFromPrompt(step.prompt ?? '');
+  // Only an authored schema can require a particular representation. The
+  // semantic reviewer receives the full step prompt and actual run evidence.
+  const c = step.output;
   if (!c || Object.keys(c).length === 0) return;
   if (c.required_keys?.length) {
     out.push(`Step "${id}" output includes required keys: ${c.required_keys.join(', ')}.`);
@@ -258,7 +257,7 @@ export async function judgeWorkflowTarget(
     ...((opts.goal?.successCriteria?.length ?? 0) > 0
       ? [
           '',
-          'Success criteria inferred from the workflow contract and deliverable hints:',
+          'Success criteria from authored workflow contracts:',
           ...opts.goal!.successCriteria.map((c, i) => `${i + 1}. ${c}`),
         ]
       : []),
@@ -273,6 +272,7 @@ export async function judgeWorkflowTarget(
   try {
     const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
+      ...(evidence?.results ? { verifiedReadResults: evidence.results } : {}),
       ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),
       ...(opts.reviewPolicy?.status === 'captured' ? { boundaryJudgeSelection: opts.reviewPolicy.judgeSelection } : {}),
     } : undefined));

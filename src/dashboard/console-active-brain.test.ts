@@ -381,3 +381,16 @@ test('active-brain PATCH with sessionId re-pins THAT session; without sessionId 
     }
   }
 });
+
+test('a newer Codex generation selection persists the exact requested model', async () => {
+  const harness = await boot();
+  try {
+    process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.4';
+    const result = await patchActiveBrain(harness.url, { brain: 'codex_oauth', modelId: 'gpt-6-sol' });
+    assert.equal(result.response.status, 200, result.body.error);
+    assert.equal(process.env.OPENAI_MODEL_PRIMARY, 'gpt-6-sol');
+    assert.equal(persistedEnvValue('OPENAI_MODEL_PRIMARY'), 'gpt-6-sol');
+  } finally {
+    await harness.close();
+  }
+});

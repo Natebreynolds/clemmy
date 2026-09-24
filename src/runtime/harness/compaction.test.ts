@@ -319,7 +319,7 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
   // registry did, which is how a test keeps a measurable error alive. The
   // genuinely non-caching wires stay, and the 2026-09-01 first-byte timeout
   // they protect is untouched.
-  for (const id of ['glm-5.2', 'gpt-5.6', 'kimi-k3']) {
+  for (const id of ['glm-5.2', 'kimi-k3']) {
     assert.equal(inFlightPromptCacheScale(id), 1, `${id} caches nothing — stay absolute`);
     assert.deepEqual(inFlightCompactionThresholds(() => undefined, id), {
       resultTriggerTokens: 32_000,
@@ -329,6 +329,17 @@ test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire
       checkpointed: false,
     }, `${id} must keep the absolute thresholds byte-identically`);
   }
+
+  // Automatic caching keeps the absolute budget but freezes checkpoint
+  // prefixes. It does not need explicit provider cache markers to benefit.
+  assert.equal(inFlightPromptCacheScale('gpt-5.6'), 1);
+  assert.deepEqual(inFlightCompactionThresholds(() => undefined, 'gpt-5.6'), {
+    resultTriggerTokens: 32_000,
+    retainedResultBudgetTokens: 20_000,
+    minRetainPairs: 3,
+    maxRetainPairs: 8,
+    checkpointed: true,
+  });
 
   // Sonnet 5 caches from 2048 tokens on a 1M window. Collapsing its prefix
   // rewrites what the provider already cached: live 2026-09-03 the collapse
@@ -694,7 +705,7 @@ test('summarizeOlderMessages — preserves compaction summaries instead of re-su
     const items = [
       userMessage('original request'),
       collapsedToolSummary,
-      assistantMessage('The draft still needs final review.'),
+      assistantMessage('The draft still needs final review. ' + 'The review remains pending and no final delivery has occurred. '.repeat(20)),
       priorLayer2Summary,
       userMessage('also check latency before shipping'),
       assistantMessage('recent answer kept in tail'),
@@ -987,22 +998,20 @@ test('compactionBudgetForModel: budget tracks the ROUTED model window, never a f
   assert.equal(compactionBudgetForModel(undefined), resolveModelCapability(undefined).contextWindow);
 });
 
-test('layer1CompactionBudgetForModel: lossless Layer 1 is absolute on a wire without a cached prefix, the window on one with', async () => {
+test('layer1CompactionBudgetForModel: lossless Layer 1 is absolute on every wire; Layers 2/3 keep the window', async () => {
   // Layer 1 clips and collapses OLD tool results that stay recallable by call
-  // id, so it only ever answers "what does the next prefill cost" — and that
-  // is absolute bytes unless the wire serves a cached prefix in practice. The
-  // mid-turn thresholds already make exactly this split (2026-09-01); between
-  // turns the window governed every layer, so on the Codex OAuth wire (880k
-  // window, ~37% cache reads) a 67k-token history never compacted at all.
+  // id. A cached prefix is not free — it still prefills, costs a tenth on every
+  // frame and is re-billed in full on each new turn after the provider TTL —
+  // so the caching exemption (2026-09-15) let a 1M-window Together session
+  // carry a 118k history with 60-turn-old results forever (live 2026-09-24).
   const { layer1CompactionBudgetForModel, compactionBudgetForModel } = await import('./compaction.js');
-  // Seeded non-caching, large window: Layer 1 at the historical absolute.
   assert.equal(layer1CompactionBudgetForModel('gpt-5.6-sol'), 200_000);
   assert.equal(layer1CompactionBudgetForModel('kimi-k3'), 200_000);
   // Layers 2/3 keep the real window — the 2026-08-05 pin above is untouched.
   assert.equal(compactionBudgetForModel('gpt-5.6-sol'), 880_000);
-  // Seeded caching: the prefix is never rewritten for nothing.
-  assert.equal(layer1CompactionBudgetForModel('claude-sonnet-5'), 1_000_000);
-  assert.equal(layer1CompactionBudgetForModel('claude-opus-4-8'), 1_000_000);
+  // Caching wires too: lossless clipping between turns is paid once.
+  assert.equal(layer1CompactionBudgetForModel('claude-sonnet-5'), 200_000);
+  assert.equal(layer1CompactionBudgetForModel('claude-opus-4-8'), 200_000);
   // A window below the absolute is still the honest ceiling.
   assert.equal(layer1CompactionBudgetForModel('glm-4.7'), 200_000);
   assert.ok(layer1CompactionBudgetForModel('totally-unknown-model') <= 200_000);
@@ -1094,7 +1103,9 @@ test('capSummarizerInput: the Layer-2 summarizer can never be fed more than its 
 test('pressure collapse keeps parallel and sequential identical-result frames valid and retains the newest pair', async () => {
   const { inspectConversationProtocol } = await import('./conversation-protocol.js');
   const session = createSession({ id: 'dedup-parallel-frame', kind: 'chat' });
-  const payload = `IDENTICAL::${'p'.repeat(400)}`;
+  // The archived-pair ledger must actually be smaller than the raw result;
+  // pressure alone must never force a token-expanding replacement.
+  const payload = `IDENTICAL::${'p'.repeat(4000)}`;
   for (const callId of ['par-a', 'par-b']) {
     writeToolOutput({ sessionId: session.id, callId, tool: 'tool_search', output: payload });
   }
@@ -1143,6 +1154,33 @@ test('pressure collapse keeps parallel and sequential identical-result frames va
   assert.equal(inspectConversationProtocol(seqCollapsed.nextItems).status, 'valid');
 });
 
+test('compaction refuses replacements that expand the prompt even under pressure', async () => {
+  const session = createSession({ kind: 'chat' });
+  const items = [userMessage('Read twice.')];
+  for (const id of ['small-a', 'small-b']) {
+    writeToolOutput({ sessionId: session.id, callId: id, tool: 'test.read', output: 'ok' });
+    items.push(toolCall(id, 'test.read', '{}'), toolResult(id, 'ok'));
+  }
+  const result = compactInFlightToolContext(items, session.id, {
+    resultTriggerTokens: 1, retainedResultBudgetTokens: 1, minRetainPairs: 1, maxRetainPairs: 1,
+  });
+  assert.equal(result.applied, false);
+  assert.deepEqual(result.nextItems, items);
+
+  _setCompactionSummarizerForTests(async () => ({
+    summary: 'A verbose replacement that adds unnecessary words. '.repeat(30), modelUsed: 'test-summarizer',
+  }));
+  try {
+    const summary = await summarizeOlderMessages([
+      userMessage('Keep the constraint.'), assistantMessage('Noted.'), assistantMessage('Still pending.'),
+      userMessage('Continue.'), assistantMessage('Ready.'),
+    ], session.id, 2);
+    assert.equal(summary.applied, false);
+    assert.equal(summary.error, 'summary_not_smaller');
+    assert.equal(summary.mutatedItems, undefined);
+  } finally { _setCompactionSummarizerForTests(null); }
+});
+
 test('Layer 2 preserves complete tool arguments and results outside its prose summarization', async () => {
   resetEventLog();
   const session = HarnessSession.create({ kind: 'chat', title: 'complete summarizer context' });
@@ -1157,7 +1195,7 @@ test('Layer 2 preserves complete tool arguments and results outside its prose su
     const result = await summarizeOlderMessages([
       userMessage('Review the full result before continuing.'), assistantMessage('I will inspect it.'),
       toolCall('call_complete_input', 'test.read', argumentsJson), toolResult('call_complete_input', resultText),
-      assistantMessage('The review is pending.'), userMessage('Continue later.'), assistantMessage('Ready.'),
+      assistantMessage('The review is pending. ' + 'The complete returned record still requires review before delivery. '.repeat(20)), userMessage('Continue later.'), assistantMessage('Ready.'),
     ], session.id, 2);
     assert.equal(result.applied, true);
     const keptCall = result.mutatedItems?.find(item => (item as { type?: string }).type === 'function_call') as { arguments?: string };
@@ -1166,4 +1204,33 @@ test('Layer 2 preserves complete tool arguments and results outside its prose su
     assert.equal(keptResult.output?.text, resultText);
     assert.ok(!received.includes('TOOL_CALL'), 'exact tool state is retained rather than sent through prose compression');
   } finally { _setCompactionSummarizerForTests(null); }
+});
+
+
+test('compactSessionIfNeeded — prior-turn reasoning is dropped at the between-turn boundary, at any size, without a model call', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'reasoning boundary test' });
+  const items: AgentInputItem[] = [
+    userMessage('first ask'),
+    { type: 'reasoning', content: [], rawContent: [{ type: 'reasoning_text', text: 'private scratch '.repeat(400) }] } as unknown as AgentInputItem,
+    toolCall('call_r1', 'read_file', '{"path":"a"}'),
+    toolResult('call_r1', 'small result'),
+    { type: 'reasoning', content: [], rawContent: [{ type: 'reasoning_text', text: 'more scratch '.repeat(400) }] } as unknown as AgentInputItem,
+    { role: 'assistant', content: 'done' } as AgentInputItem,
+  ];
+  session.updateConversationSnapshot(items);
+  // Far below every threshold: only Layer 0 acts.
+  const { result, nextItems } = await compactSessionIfNeeded(session, structuredClone(items), {
+    disable: 'layer1_only', inputBudgetTokens: 880_000, layer1ItemThreshold: 1_000,
+  });
+  assert.equal(result.reasoningDropped, 2);
+  assert.equal(result.modified, true);
+  assert.equal(result.layer1.applied, false, 'nothing else moved');
+  assert.deepEqual(nextItems.map((item) => (item as { type?: string; role?: string }).type ?? (item as { role?: string }).role),
+    ['user', 'function_call', 'function_call_result', 'assistant']);
+  assert.ok(result.afterTokens < result.beforeTokens);
+  // With no reasoning present the pass reports nothing and returns the same array.
+  const clean = await compactSessionIfNeeded(session, nextItems, { disable: 'layer1_only', inputBudgetTokens: 880_000, layer1ItemThreshold: 1_000 });
+  assert.equal(clean.result.reasoningDropped, undefined);
+  assert.equal(clean.result.modified, false);
 });

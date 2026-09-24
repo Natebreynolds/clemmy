@@ -43,6 +43,7 @@ export interface ConfiguredBrainSemanticComplete {
     modelIdentity: string;
     inputTokens: number;
     outputTokens: number;
+    cachedInputTokens?: number;
     latencyMs: number;
     /** The model adapter already persisted usage and debited the run budget. */
     usageRecorded?: boolean;
@@ -125,6 +126,7 @@ async function completeStructured(input: {
   modelIdentity: string;
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
   latencyMs: number;
   usageRecorded?: boolean;
 }> {
@@ -176,6 +178,7 @@ async function completeStructured(input: {
       modelIdentity: role.modelId,
       inputTokens: tokens.inputTokens,
       outputTokens: tokens.outputTokens,
+      cachedInputTokens: tokens.cachedInputTokens,
       latencyMs,
       usageRecorded,
     };
@@ -191,6 +194,7 @@ async function completeStructured(input: {
     modelIdentity: role.modelId,
     inputTokens: tokens.inputTokens,
     outputTokens: tokens.outputTokens,
+    cachedInputTokens: tokens.cachedInputTokens,
     latencyMs,
     usageRecorded,
   };
@@ -206,7 +210,13 @@ function readUsageNumber(record: Record<string, unknown>, ...keys: string[]): nu
   return 0;
 }
 
-function extractUsage(value: unknown): { inputTokens: number; outputTokens: number } {
+/** Keep absent cache evidence absent, and never count aggregate and detail rows twice. */
+function sumCachedUsage(...values: Array<number | undefined>): { cachedInputTokens?: number } {
+  const cachedInputTokens = values.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+  return cachedInputTokens > 0 ? { cachedInputTokens } : {};
+}
+
+function extractUsage(value: unknown): { inputTokens: number; outputTokens: number; cachedInputTokens?: number } {
   if (!value || typeof value !== 'object') return { inputTokens: 0, outputTokens: 0 };
   if (Array.isArray(value)) {
     return value.reduce(
@@ -215,6 +225,7 @@ function extractUsage(value: unknown): { inputTokens: number; outputTokens: numb
         return {
           inputTokens: sum.inputTokens + next.inputTokens,
           outputTokens: sum.outputTokens + next.outputTokens,
+          ...sumCachedUsage(sum.cachedInputTokens, next.cachedInputTokens),
         };
       },
       { inputTokens: 0, outputTokens: 0 },
@@ -243,11 +254,17 @@ function extractUsage(value: unknown): { inputTokens: number; outputTokens: numb
     'responseTokens',
     'response_tokens',
   ) || nested.outputTokens || entries.outputTokens;
-  return { inputTokens, outputTokens };
+  const details = record.inputTokensDetails ?? record.input_tokens_details ?? record.prompt_tokens_details;
+  const detailRows = Array.isArray(details) ? details : [details];
+  const cachedInputTokens = readUsageNumber(record, 'cachedInputTokens', 'cacheReadInputTokens', 'cache_read_input_tokens')
+    || detailRows.reduce<number>((sum, row) => sum + (row && typeof row === 'object'
+      ? readUsageNumber(row as Record<string, unknown>, 'cached_tokens', 'cachedTokens', 'cacheReadInputTokens', 'cache_read_input_tokens') : 0), 0)
+    || nested.cachedInputTokens || entries.cachedInputTokens || 0;
+  return { inputTokens, outputTokens, ...sumCachedUsage(cachedInputTokens) };
 }
 
 /** Walk Agents SDK RunResult / Usage / rawResponses without double-counting. */
-export function tokensFromAgentRun(result: unknown): { inputTokens: number; outputTokens: number } {
+export function tokensFromAgentRun(result: unknown): { inputTokens: number; outputTokens: number; cachedInputTokens?: number } {
   const empty = { inputTokens: 0, outputTokens: 0 };
   if (!result || typeof result !== 'object') return empty;
   const root = result as Record<string, unknown>;
@@ -273,11 +290,12 @@ export function tokensFromAgentRun(result: unknown): { inputTokens: number; outp
   if (aggregated.inputTokens + aggregated.outputTokens > 0) return aggregated;
   const responses = [root.rawResponses, state?.rawResponses, runContext?.rawResponses, context?.rawResponses];
   return responses.reduce(
-    (sum: { inputTokens: number; outputTokens: number }, group): { inputTokens: number; outputTokens: number } => {
+    (sum: { inputTokens: number; outputTokens: number; cachedInputTokens?: number }, group): { inputTokens: number; outputTokens: number; cachedInputTokens?: number } => {
       const next = extractUsage(group);
       return {
         inputTokens: sum.inputTokens + next.inputTokens,
         outputTokens: sum.outputTokens + next.outputTokens,
+        ...sumCachedUsage(sum.cachedInputTokens, next.cachedInputTokens),
       };
     },
     empty,
@@ -290,6 +308,7 @@ function recordSemanticModelUsage(input: {
   modelIdentity: string;
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
   latencyMs: number;
   usageRecorded?: boolean;
 }): void {
@@ -304,6 +323,7 @@ function recordSemanticModelUsage(input: {
     cacheDialect: 'inclusive',
     inputTokens: input.inputTokens,
     outputTokens: input.outputTokens,
+    cachedInputTokens: input.cachedInputTokens,
     totalTokens: input.inputTokens + input.outputTokens,
     durationMs: input.latencyMs,
   });
@@ -320,6 +340,7 @@ export async function completeViaConfiguredBrain(input: {
   modelIdentity: string;
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
   latencyMs: number;
   usageRecorded?: boolean;
 }> {
@@ -408,6 +429,7 @@ export function configuredBrainSemanticPort(
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
+        cachedInputTokens: result.cachedInputTokens,
         latencyMs: result.latencyMs || (Date.now() - started),
       });
       return {
@@ -443,6 +465,7 @@ export function configuredBrainSemanticPort(
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
+        cachedInputTokens: result.cachedInputTokens,
         latencyMs: result.latencyMs || (Date.now() - started),
       });
       return {
@@ -480,6 +503,7 @@ export function configuredBrainSemanticPort(
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
+        cachedInputTokens: result.cachedInputTokens,
         latencyMs: result.latencyMs || (Date.now() - started),
       });
       return {

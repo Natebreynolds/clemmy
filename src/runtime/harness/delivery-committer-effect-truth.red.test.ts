@@ -30,7 +30,8 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-effect-truth\n', 'utf8');
 
-const { appendEvent, createSession, listEvents, closeEventLog } = await import('./eventlog.js');
+const eventlog = await import('./eventlog.js');
+const { appendEvent, createSession, listEvents, closeEventLog } = eventlog;
 const {
   commitTurnOutcome,
   HOST_LOCAL_FAILURE_BLOCKED_TEXT,
@@ -131,6 +132,9 @@ test('a zero-external-dispatch turn can never render the may-have-begun copy', (
 
 test('a turn with a genuinely unresolved external write keeps the reconciliation copy', () => {
   const source = acceptedSource('sess-effect-truth-uncertain-write');
+  const attempt = eventlog.beginRunAttempt(source.sessionId, { runId: 'uncertain-stop' });
+  eventlog.bindRunAttemptSourceUserEvent(attempt, source.sourceUserSeq);
+  eventlog.requestKill(source.sessionId, 'test user stop', { attemptId: attempt.attemptId });
   // A provider crossing whose fate is unknown — the one case the copy is FOR.
   const started = dispatch.beginPhysicalDispatch({
     identity: {
@@ -153,8 +157,51 @@ test('a turn with a genuinely unresolved external write keeps the reconciliation
     outcome: 'unknown',
   }).status, 'inserted');
 
-  commitTurnOutcome(uncertainBlockedOutcome(source));
+  const outcome = uncertainBlockedOutcome(source);
+  outcome.presentation.text += '\n\nRetained work (durable checkpoint):\nExternal write state: unknown.';
+  commitTurnOutcome(outcome, { metadata: { blockedReason: 'tool_effect_uncertain' } });
   const text = committedText(source.sessionId);
   assert.match(text, /reconcil/i,
     'a real unresolved external write keeps the reconciliation-required terminal');
+});
+
+
+test('host reason survives retained-work rendering before effect-truth correction', () => {
+  const source = acceptedSource('sess-effect-truth-rendered-host-read');
+  const outcome = uncertainBlockedOutcome(source);
+  // Production blockedOutcome renders retained-work details before the
+  // committer receives it, so an exact prose comparison misses this shape.
+  outcome.presentation.text += '\n\nRetained work (durable checkpoint):\nExternal write state: no settled external-write attempt is recorded.';
+  commitTurnOutcome(outcome, { metadata: { blockedReason: 'tool_effect_uncertain' } });
+  const text = committedText(source.sessionId);
+  assert.doesNotMatch(text, /may have begun|must be reconciled/i);
+  assert.equal(text, HOST_LOCAL_FAILURE_BLOCKED_TEXT);
+  const terminal = listEvents(source.sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal(terminal.data.blockedReason, 'host_control_failure_no_external_effect');
+});
+
+
+test('an exact stopped attempt publishes cancelled rather than a host failure', () => {
+  const source = acceptedSource('sess-effect-truth-exact-stop');
+  const attempt = eventlog.beginRunAttempt(source.sessionId, { runId: 'run-exact-stop' });
+  eventlog.bindRunAttemptSourceUserEvent(attempt, source.sourceUserSeq);
+  eventlog.requestKill(source.sessionId, 'test user stop', { attemptId: attempt.attemptId });
+  const outcome = uncertainBlockedOutcome(source);
+  commitTurnOutcome(outcome, { legacyReason: 'blocked', metadata: { blockedReason: 'tool_effect_uncertain' } });
+  const terminal = listEvents(source.sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal((terminal.data.turnOutcome as { status: string }).status, 'cancelled');
+  assert.equal(terminal.data.reason, 'cancelled');
+  assert.equal(terminal.data.blockedReason, undefined);
+  assert.match(committedText(source.sessionId), /stopped as requested/i);
+});
+
+test('a stop for a different accepted source cannot relabel this host failure', () => {
+  const source = acceptedSource('sess-effect-truth-stale-stop');
+  const prior = eventlog.beginRunAttempt(source.sessionId, { runId: 'prior-stop' });
+  eventlog.requestKill(source.sessionId, 'old stop', { attemptId: prior.attemptId });
+  const current = eventlog.beginRunAttempt(source.sessionId, { runId: 'current-failure' });
+  eventlog.bindRunAttemptSourceUserEvent(current, source.sourceUserSeq);
+  commitTurnOutcome(uncertainBlockedOutcome(source), { metadata: { blockedReason: 'tool_effect_uncertain' } });
+  const terminal = listEvents(source.sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal((terminal.data.turnOutcome as { status: string }).status, 'blocked');
 });

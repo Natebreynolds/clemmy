@@ -296,6 +296,31 @@ test('registry semantics admit reversible local writes generically and refuse un
   assert.equal(future.ok, true, future.ok ? '' : future.reason);
   if (future.ok) assert.equal(future.definition.capabilityRef, 'cap:local:future_reversible_write:reversible');
 
+  // Omission is a separate declared runtime default, never inferred from null.
+  for (const declaredDefault of [false, true]) {
+    for (const required of [false, true]) {
+      const result = local.deriveLocalPlanningDefinition({
+        declaration: {
+          ...futureDeclaration,
+          localPlanning: {
+            ...futureDeclaration.localPlanning!, reversibility: 'create_only',
+            safeMode: { id: 'create', requiredEquals: { mode: 'create' },
+              ...(declaredDefault ? { omittedEquivalentToRequired: ['mode'] } : {}) },
+          },
+        },
+        carrier: 'work_call',
+        schema: { type: 'object', properties: { mode: { type: 'string', enum: ['create', 'overwrite'] } },
+          required: required ? ['mode'] : [], additionalProperties: false },
+      });
+      assert.equal(result.ok, !(declaredDefault && required));
+      if (result.ok) {
+        assert.equal(local.localPlanningArgumentsMatch(result.definition, {}), declaredDefault);
+        assert.equal(local.localPlanningArgumentsMatch(result.definition, { mode: null }), false);
+        assert.equal(local.localPlanningArgumentsMatch(result.definition, { mode: 'overwrite' }), false);
+      }
+    }
+  }
+
   const undeclaredRuntimeDefault = local.deriveLocalPlanningDefinition({
     declaration: {
       ...futureDeclaration,

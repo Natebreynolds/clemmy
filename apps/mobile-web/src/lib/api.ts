@@ -372,6 +372,9 @@ export interface ApprovalRow {
   subject: string;
   tool: string | null;
   args: unknown;
+  presentation?: { action: string; app?: string; operation?: string; details: Array<{ label: string; value: string; long: boolean }>; unwrapped: boolean };
+  /** The draft being approved; shown on the card before the buttons. */
+  contentPreview?: { body?: string; imageUrl?: string };
   status: 'pending' | 'resolved' | 'expired' | 'cancelled';
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';
@@ -395,9 +398,12 @@ export async function approveApproval(id: string, modifiedArgs?: string): Promis
     method: 'POST',
   });
 }
-export async function rejectApproval(id: string): Promise<unknown> {
+export async function rejectApproval(id: string, note?: string): Promise<unknown> {
   return api(`/m/api/approvals/${encodeURIComponent(id)}/reject`, {
     method: 'POST',
+    // A note turns a bare rejection into "request changes"; the Mac records
+    // it on the parked run before the row resolves.
+    ...(note?.trim() ? { body: JSON.stringify({ note: note.trim() }), headers: { 'content-type': 'application/json' } } : {}),
   });
 }
 
@@ -411,6 +417,9 @@ export interface InboxNotification {
   createdAt: string;
   read: boolean;
   needsAttention: boolean;
+  /** Server-owned grouping identity (dashboard/needs-you.ts). Older daemons
+   *  omit it; the row then stands alone. */
+  needsYouKey?: string;
   deliveredAt: string | null;
   deliveryError: string | null;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
@@ -470,6 +479,18 @@ export interface InboxSummary {
   trustProposals: number;
   notificationNeedsYou: number;
   unreadUpdates: number;
+  stoppedWorkflows?: number;
+  checkInProposals?: number;
+  /** Items in `needsYou` no Inbox feed has a row for; the Inbox renders them. */
+  unlisted?: InboxUnlistedItem[];
+}
+
+export interface InboxUnlistedItem {
+  key: string;
+  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
+  title: string;
+  detail: string;
+  workflow?: string;
 }
 
 export interface InboxQuestion {

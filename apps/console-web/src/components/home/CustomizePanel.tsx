@@ -24,13 +24,17 @@ import { ALL_NAV, PRIMARY_NAV, type NavDest } from '@/lib/nav';
 import {
   DEFAULT_HOME_PANE_ORDER,
   DEFAULT_HOME_PREFERENCES,
+  RETIRED_HOME_PANES,
   useHomePreferences,
+  useSaveHomePreferences,
+  type HomeLiveStatus,
   type HomeLanding,
   type HomePaneId,
   type HomePreferences,
   type QuickAction,
 } from '@/lib/home-prefs';
 import { cn } from '@/lib/cn';
+import { SpacesOnHome, StylePicker } from './CustomizeSpaces';
 import { CustomizeSection } from './CustomizeSection';
 import { CustomizeSortableRow } from './CustomizeSortableRow';
 import { CustomizeQuickActionForm } from './CustomizeQuickActionForm';
@@ -49,16 +53,25 @@ export function openCustomizeHome() {
 const PANE_LABELS: Record<HomePaneId, string> = {
   quick_actions: 'Quick actions',
   needs_you: 'Needs you',
+  today: 'Today',
   running: 'Running',
-  while_away: 'While you were away',
+  while_away: 'What came back',
   made: 'Made',
-  projects: 'Spaces',
+  projects: 'More Spaces',
   workstate: 'Working together card',
 };
 
 const ALL_PANE_IDS: HomePaneId[] = [...DEFAULT_HOME_PANE_ORDER, 'workstate'];
 const PANE_ID_SET = new Set<string>(ALL_PANE_IDS);
 const isPaneId = (id: string): id is HomePaneId => PANE_ID_SET.has(id);
+
+// ── Live status ────────────────────────────────────────────────────────────
+
+const LIVE_STATUS_OPTIONS: { value: HomeLiveStatus; label: string; hint: string }[] = [
+  { value: 'animated', label: 'Animated', hint: 'Moves while Clem works' },
+  { value: 'still', label: 'Still', hint: 'Same words, no motion' },
+  { value: 'off', label: 'Off', hint: 'The sidebar’s Running count only' },
+];
 
 // ── Landing ────────────────────────────────────────────────────────────────
 
@@ -141,7 +154,7 @@ function normalizeNav(nav: Nav): Nav {
 function normalizePreferences(p: HomePreferences): HomePreferences {
   const seen = new Set<string>();
   const order = [...p.panes.order, ...ALL_PANE_IDS].filter((id) => {
-    if (seen.has(id)) return false;
+    if (seen.has(id) || RETIRED_HOME_PANES.has(id)) return false;
     seen.add(id);
     return true;
   });
@@ -218,6 +231,9 @@ function CustomizeSheet({ onClose }: { onClose: () => void }) {
   const sheetRef = useRef<HTMLElement>(null);
   const prefs = useHomePreferences();
   const saver = useCustomizeSaver();
+  // Each Space's summary-or-full is also switched from its tile on Home, so
+  // it is read and written live here rather than through this panel's draft.
+  const saveLive = useSaveHomePreferences();
 
   const ready = !prefs.isPlaceholderData && !!prefs.data;
   const [draft, setDraft] = useState<HomePreferences | null>(() => (ready && prefs.data ? normalizePreferences(prefs.data) : null));
@@ -445,6 +461,40 @@ function CustomizeSheet({ onClose }: { onClose: () => void }) {
             <CustomizeSkeleton />
           ) : (
             <>
+              <CustomizeSection label="Style">
+                <StylePicker value={draft.style ?? 'dashboard'} onChange={(style) => commit({ style })} />
+              </CustomizeSection>
+
+              <CustomizeSection label="Clem’s live status" hint="The band under your greeting while Clem works">
+                <div role="radiogroup" aria-label="Clem’s live status" className="flex flex-col [&>label:first-child]:border-t-0">
+                  {LIVE_STATUS_OPTIONS.map((o) => (
+                    <label key={o.value} className="flex min-h-9 cursor-pointer items-center gap-2.5 border-t border-border px-3 text-small text-fg transition-colors duration-fast hover:bg-hover">
+                      <input
+                        type="radio"
+                        name={`${titleId}-live-status`}
+                        value={o.value}
+                        checked={(draft.liveStatus ?? 'animated') === o.value}
+                        onChange={() => commit({ liveStatus: o.value })}
+                        className="peer sr-only"
+                      />
+                      <span
+                        aria-hidden
+                        className="h-4 w-4 shrink-0 rounded-full border-2 border-border-strong transition-[border-color,box-shadow] duration-fast peer-checked:border-primary peer-checked:shadow-[inset_0_0_0_3px_var(--bg-surface),inset_0_0_0_8px_var(--primary)] peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-surface"
+                      />
+                      <span className="min-w-0 flex-1 truncate">{o.label}</span>
+                      <span className="shrink-0 text-caption text-faint">{o.hint}</span>
+                    </label>
+                  ))}
+                </div>
+              </CustomizeSection>
+
+              <CustomizeSection label="Spaces on Home" hint="How each shows, its size and its place">
+                <SpacesOnHome
+                  views={prefs.data?.spaceViews ?? {}}
+                  onView={(spaceId, view) => saveLive.mutate({ spaceViews: { ...(prefs.data?.spaceViews ?? {}), [spaceId]: view } })}
+                />
+              </CustomizeSection>
+
               <CustomizeSection label="Panes" hint="Drag to reorder · switch to show">
                 <DndContext
                   sensors={sensors}

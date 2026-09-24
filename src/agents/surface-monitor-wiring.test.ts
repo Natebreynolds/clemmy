@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { scoreMessage, type UnreadMessage } from './inbox-monitor.js';
-import { scoreEvent, type CalEvent } from './calendar-monitor.js';
+import { DEFAULT_CALENDAR_WATCH_CONFIG, detectCalendarChanges, type CalEvent } from './calendar-watch.js';
 
 const msg = (subject: string, preview: string, fromAddress = 'alice@acme.example', fromName = 'Alice'): UnreadMessage =>
   ({ id: 'm1', subject, fromName, fromAddress, receivedAt: '', preview });
@@ -52,21 +52,27 @@ test('every scored message carries a triage decision now (no flag gate)', () => 
 const NOW = 1_000_000_000_000;
 const ev = (o: Partial<CalEvent>): CalEvent =>
   ({ id: 'e1', subject: 'Meeting', startMs: NOW + 3_600_000, endMs: NOW + 7_200_000, isAllDay: false, isCancelled: false, showAs: 'busy', myResponse: 'accepted', attendeeCount: 2, ...o });
+const changes = (events: CalEvent[]) => detectCalendarChanges({
+  operationId: 'outlook_get_calendar_view', accountId: 'ca_1', accountLabel: 'alex@corp.example',
+  previous: undefined, current: events, nowMs: NOW, config: DEFAULT_CALENDAR_WATCH_CONFIG,
+});
 
 test('calendar TRUE POSITIVE: a double-book surfaces (conflict)', () => {
   const a = ev({ id: 'a', startMs: NOW + 3_600_000, endMs: NOW + 7_200_000 });
   const b = ev({ id: 'b', startMs: NOW + 5_400_000, endMs: NOW + 9_000_000 });
-  const s = scoreEvent(a, [a, b], NOW);
-  assert.equal(s.needsYou, true);
-  assert.ok(s.reasons.includes('overlaps another event'));
+  const out = changes([a, b]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.kind, 'conflict');
+  assert.equal(out[0]!.signal, 'high');
+  assert.ok(out[0]!.reasons.includes('overlaps another event'));
 });
 
 test('calendar TRUE POSITIVE: an unanswered invite surfaces', () => {
   const a = ev({ myResponse: 'notResponded', attendeeCount: 3 });
-  assert.equal(scoreEvent(a, [a], NOW).needsYou, true);
+  assert.deepEqual(changes([a]).map((c) => c.kind), ['invite_unanswered']);
 });
 
 test('calendar: a solo accepted event with no signal stays silent', () => {
   const a = ev({ myResponse: 'accepted', attendeeCount: 1, startMs: NOW + 86_400_000, endMs: NOW + 90_000_000 });
-  assert.equal(scoreEvent(a, [a], NOW).needsYou, false);
+  assert.deepEqual(changes([a]), []);
 });

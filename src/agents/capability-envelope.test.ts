@@ -203,3 +203,12 @@ test('turn-state tools follow every fixed-byte tool, each group in its own order
   ]);
   assert.deepEqual(ordered.map((tool) => tool.name), ['ask', 'worker', 'search', 'planner', 'carrier']);
 });
+
+test('source-bound hint prose preserves the stable contract of a deferred tool', () => {
+  const base = { name: 'native_reader', description: 'Read the saved definition.', parameters: { type: 'object' } };
+  const promoted = { ...base, contractDescription: base.description, description: base.description + '\nCurrent planning ref: source-a' };
+  assert.equal(toolSchemaFingerprint(promoted), toolSchemaFingerprint(base));
+  assert.equal(toolSchemaFingerprint({ ...promoted, description: base.description + '\nCurrent planning ref: source-b' }), toolSchemaFingerprint(base));
+  assert.notEqual(toolSchemaFingerprint({ ...promoted, contractDescription: 'Read a different definition.' }), toolSchemaFingerprint(base));
+  assert.notEqual(toolSchemaFingerprint({ ...promoted, parameters: { type: 'string' } }), toolSchemaFingerprint(base));
+});

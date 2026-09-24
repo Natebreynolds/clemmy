@@ -15,7 +15,12 @@ import {
   warmModelDiscovery,
   _setDiscoveredModelsForTest,
   _setModelDiscoverersForTest,
+  _setCodexSubscriptionForTest,
   claudeSdkModelDiscoveryOptions,
+  filterCodexCatalogModels,
+  refreshModelDiscoveryNow,
+  startModelDiscoveryHeartbeat,
+  discoveredModels,
 } from './model-discovery.js';
 import { resolveProvider } from './model-wire-registry.js';
 
@@ -170,5 +175,60 @@ test('a degraded refresh retains last-known models instead of erasing the catalo
     if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
     _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
+});
+
+test('the Codex backend catalog lists visible models in its own priority order and hides review-only rows', () => {
+  const picked = filterCodexCatalogModels([
+    { slug: 'codex-auto-review', visibility: 'hide', priority: 43 },
+    { slug: 'gpt-5.5', visibility: 'list', priority: 12 },
+    { slug: 'gpt-reserve', visibility: 'hide', priority: 3 },
+    { slug: 'gpt-6-astra', visibility: 'list', priority: 1 },
+    { slug: 'gpt-5.6-sol', visibility: 'list', priority: 4 },
+    { slug: '', visibility: 'list' },
+  ]);
+  assert.deepEqual(picked.map((m) => m.id), ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.5']);
+  assert.equal(picked[0]!.label, 'GPT 6 Astra');
+});
+
+test('a Codex SUBSCRIPTION with no API key still gets an OpenAI catalog, and a sign-in refreshes it at once', async () => {
+  _setDiscoveredModelsForTest({ anthropic: [], openai: [] }, 'ready'); // fresh cache: nothing would refresh on its own
+  let calls = 0;
+  _setModelDiscoverersForTest({
+    anthropic: async () => [],
+    openai: async () => { calls += 1; return [{ id: 'gpt-6-astra', label: 'GPT 6 Astra' }]; },
+  });
+  _setCodexSubscriptionForTest(() => ({ accessToken: 'sub-token', accountId: 'acct-1' }));
+  try {
+    assert.equal(discoveredModels().openai.length, 0, 'a fresh lease is not re-read on a picker visit');
+    await refreshModelDiscoveryNow('openai');
+    assert.equal(calls, 1, 'the sign-in refreshed the provider immediately');
+    assert.deepEqual(discoveredModels().openai.map((m) => m.id), ['gpt-6-astra']);
+    assert.equal(modelDiscoveryStatus().providers.openai.phase, 'ready');
+  } finally {
+    _setCodexSubscriptionForTest(null);
+    _setModelDiscoverersForTest(null);
+    _setDiscoveredModelsForTest(null);
+  }
+});
+
+test('the heartbeat re-reads a stale catalog between picker visits', async () => {
+  _setDiscoveredModelsForTest(null); // idle: stale by definition
+  let calls = 0;
+  _setModelDiscoverersForTest({
+    anthropic: async () => [],
+    openai: async () => { calls += 1; return [{ id: 'gpt-6-sol', label: 'GPT 6 Sol' }]; },
+  });
+  _setCodexSubscriptionForTest(() => ({ accessToken: 'sub-token', accountId: 'acct-1' }));
+  const stop = startModelDiscoveryHeartbeat(10);
+  try {
+    const started = Date.now();
+    while (calls === 0 && Date.now() - started < 2_000) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(calls >= 1, 'the timer read the catalog without a picker visit');
+  } finally {
+    stop();
+    _setCodexSubscriptionForTest(null);
+    _setModelDiscoverersForTest(null);
+    _setDiscoveredModelsForTest(null);
   }
 });

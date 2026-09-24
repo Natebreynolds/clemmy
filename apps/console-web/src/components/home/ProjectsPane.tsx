@@ -33,10 +33,10 @@ export function ProjectsPane({
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
         id={headingId}
-        label="Spaces"
+        label="More Spaces"
         aside={
           <Link to="/workspaces" className="rounded-sm font-semibold text-primary hover:underline">
-            All projects
+            All Spaces
           </Link>
         }
       />
@@ -84,7 +84,7 @@ export function ProjectsPane({
               })}
           {!loading && tiles.length === 0 && (
             <p className="flex items-center text-small text-faint sm:col-span-2 lg:col-span-3">
-              No projects yet — start one and Clementine keeps it live.
+              Nothing else yet — start a Space and Clementine keeps it live.
             </p>
           )}
           <Link
@@ -96,7 +96,7 @@ export function ProjectsPane({
           >
             <span className="inline-flex items-center gap-2">
               <Plus className="h-4 w-4" aria-hidden />
-              New project
+              New Space
             </span>
           </Link>
         </div>

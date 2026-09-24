@@ -108,8 +108,85 @@ function adapter(runtime: ReturnType<typeof generatedRuntime>) {
   return registry.createProductionMcpLiveReadAcquisitionAdapter({
     serverName: runtime.server,
     runtime: runtime.runtime,
+    semanticNomination: async () => [],
   });
 }
+
+test('pilot natural-language objective can nominate an attested documentation read without executing it', async () => {
+  const objective = "Read-only listing of the provider's documentation section inventory (free metadata only).";
+  const runtime = generatedRuntime({ objective, server: 'dataforseo', tools: [{
+    name: 'dataforseo__docs_list_sections',
+    description: 'Return available DataForSEO API documentation section names',
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  }] });
+  let decisions = 0;
+  const candidate = registry.createProductionMcpLiveReadAcquisitionAdapter({
+    serverName: runtime.server, runtime: runtime.runtime,
+    semanticNomination: async (query, rows) => {
+      decisions += 1;
+      assert.equal(query, objective);
+      assert.equal(rows.length, 1);
+      assert.match(rows[0]!.description, /documentation section names/);
+      return [rows[0]!.name];
+    },
+  });
+  const result = await candidate.nominate({ requirementId: 'doc-section-inventory-read', objective, effect: 'read' });
+  assert.equal(result.status, 'nominated');
+  if (result.status === 'nominated') {
+    assert.equal(result.nominations.length, 1);
+    assert.equal(result.nominations[0]!.identity.reference.identifier, 'dataforseo__docs_list_sections');
+  }
+  assert.equal(decisions, 1);
+  assert.equal(runtime.counts.call, 0);
+});
+
+test('unavailable semantic nomination is not reported as a missing capability', async () => {
+  const runtime = generatedRuntime({ objective: 'available documentation sections' });
+  const candidate = registry.createProductionMcpLiveReadAcquisitionAdapter({
+    serverName: runtime.server, runtime: runtime.runtime,
+    semanticNomination: async () => null,
+  });
+  const result = await candidate.nominate(requirement('documentation inventory with provenance'));
+  assert.equal(result.status, 'unavailable');
+  assert.equal(runtime.counts.call, 0);
+});
+
+test('exact current operation lookup never pays for semantic nomination', async () => {
+  const runtime = generatedRuntime({ objective: 'available documentation sections' });
+  const operation = (runtime.state.tools as ToolState[])[0]!.name;
+  const candidate = registry.createProductionMcpLiveReadAcquisitionAdapter({
+    serverName: runtime.server, runtime: runtime.runtime,
+    semanticNomination: async () => { assert.fail('exact identity must bypass semantic decision'); },
+  });
+  const result = await candidate.nominate({ requirementId: 'exact-read', objective: operation, effect: 'read' });
+  assert.equal(result.status, 'nominated');
+  assert.equal(runtime.counts.call, 0);
+});
+
+test('semantic nominations preserve ambiguity and never admit a write as a read', async () => {
+  resetAuthoritySurfaces();
+  const runtime = generatedRuntime({ objective: 'documentation sections' });
+  runtime.state.tools = [
+    readTool({ server: runtime.server, name: 'first', objective: 'documentation sections' }),
+    readTool({ server: runtime.server, name: 'second', objective: 'documentation sections' }),
+    { name: `${runtime.server}__write`, description: 'Modify documentation', inputSchema: { type: 'object' },
+      annotations: { readOnlyHint: false, destructiveHint: true } },
+  ];
+  const candidate = registry.createProductionMcpLiveReadAcquisitionAdapter({
+    serverName: runtime.server, runtime: runtime.runtime,
+    semanticNomination: async (_query, rows) => {
+      assert.equal(rows.length, 2);
+      return rows.map(row => row.name);
+    },
+  });
+  const acquisition = registry.createProductionLiveReadAcquisitionRegistry({ configuredAdapters: () => [candidate] });
+  const result = await acquisition.acquire(requirement('free documentation inventory'));
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') assert.equal(result.reason, 'ambiguous');
+  assert.equal(runtime.counts.call, 0);
+  assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.snapshot().length, 0);
+});
 
 function resetAuthoritySurfaces(options: { durable?: boolean } = {}) {
   const factory = catalogs.createHostCapabilityCatalogFactory();

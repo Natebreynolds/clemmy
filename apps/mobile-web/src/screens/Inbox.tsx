@@ -3,6 +3,7 @@ import {
   answerInboxQuestion,
   cancelWorkflowRunById,
   getInboxNotification,
+  getInboxSummary,
   listApprovals,
   listInboxNotifications,
   listInboxQuestions,
@@ -18,6 +19,7 @@ import {
   type InboxNotification,
   type InboxQuestion,
   type InboxTrustProposal,
+  type InboxUnlistedItem,
   type PlanProposalRow,
   type WorkspaceDestinationChooser,
   type WorkflowCapabilityAccountChoice,
@@ -34,8 +36,7 @@ import {
   notificationLabel,
   notificationRunTarget,
   trustScopeSummary,
-  updatesClearScope,
-} from '../lib/inbox-presentation';
+  updatesClearScope, notificationTitle, needsYouCardLabel } from '../lib/inbox-presentation';
 import { inboxNeedsCountKnown, mergeInboxLastGood, type InboxLastGood } from '../lib/inbox-last-good';
 import { stoppableWorkflowRunIds } from '../lib/running-tasks';
 import { useScreenData } from '../lib/use-screen-data';
@@ -65,6 +66,9 @@ interface InboxData {
    * one asserts the run is live.
    */
   stoppableRunIds: string[] | null;
+  /** Needs-you items no feed has a row for (dashboard/needs-you.ts), so this
+   *  list and the header's number are the same set. */
+  unlisted: InboxUnlistedItem[];
 }
 
 type InboxPart<T> = { ok: true; value: T } | { ok: false; error: unknown };
@@ -112,11 +116,12 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // one fact where a remembered value would be the defect. It keeps its own
   // slot so a stale snapshot can never leak into the decision sets above.
   const lastStoppableRunIds = useRef<string[] | null>(null);
+  const lastUnlisted = useRef<InboxUnlistedItem[]>([]);
   const load = useCallback(async (): Promise<InboxData> => {
     const exactNotification = initialNotificationId
       ? getInboxNotification(initialNotificationId)
       : Promise.resolve(null);
-    const [approvals, plans, choosers, questions, trusts, notifications, exact, workingNow] = await Promise.all([
+    const [approvals, plans, choosers, questions, trusts, notifications, exact, workingNow, summary] = await Promise.all([
       loadInboxPart(listApprovals()),
       loadInboxPart(listPlanProposals()),
       loadInboxPart(listWorkspaceDestinationChoosers()),
@@ -129,7 +134,9 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       // daemon's own Working Now projection instead of a flag stamped when
       // the notification was written.
       loadInboxPart(listWorkingNow()),
+      loadInboxPart(getInboxSummary()),
     ]);
+    if (summary.ok) lastUnlisted.current = summary.value.unlisted ?? [];
     if (workingNow.ok) {
       lastStoppableRunIds.current = [...stoppableWorkflowRunIds(workingNow.value.entries)];
     }
@@ -190,6 +197,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       needsCountKnown: inboxNeedsCountKnown(lastGood.current),
       updatesKnown: lastGood.current.notifications !== undefined,
       stoppableRunIds: lastStoppableRunIds.current,
+      unlisted: lastUnlisted.current,
     };
   }, [initialNotificationId]);
   const { data, loading, refreshing, error, offline, refresh } = useScreenData(load, { intervalMs: 6_000, resourceKey: initialNotificationId ?? 'inbox' });
@@ -232,15 +240,25 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const planIds = useMemo(() => new Set(plans.map((row) => row.id)), [plans]);
   const trustIds = useMemo(() => new Set(trustProposals.map((row) => row.id)), [trustProposals]);
 
+  // The server's identity for a row names the decision it is about (a chat
+  // run's report is its pending approval), so a card already on screen is
+  // never listed twice under another name.
+  const listedDecisionKeys = useMemo(() => new Set([
+    ...[...approvalIds].map((id) => `approval:${id}`),
+    ...[...planIds].map((id) => `plan:${id}`),
+    ...[...trustIds].map((id) => `trust:${id}`),
+  ]), [approvalIds, planIds, trustIds]);
+
   const stillNeedsUser = useCallback((row: InboxNotification) => {
     if (row.read || !row.needsAttention) return false;
+    if (row.needsYouKey && listedDecisionKeys.has(row.needsYouKey)) return false;
     if (row.context.actionItemId && questionIds.has(row.context.actionItemId)) return false;
     if (row.context.approvalId && approvalIds.has(row.context.approvalId)) return false;
     if (notificationIsRepresentedByApprovals(row, approvalIds)) return false;
     if (row.context.planProposalId && planIds.has(row.context.planProposalId)) return false;
     if (row.context.trustProposalId && trustIds.has(row.context.trustProposalId)) return false;
     return true;
-  }, [approvalIds, planIds, questionIds, trustIds]);
+  }, [approvalIds, listedDecisionKeys, planIds, questionIds, trustIds]);
 
   const notificationNeeds = useMemo(
     () => collapseAttentionNotifications(notifications.filter(stillNeedsUser)),
@@ -250,7 +268,8 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // The count ON THIS SCREEN counts the rows on this screen — including the
   // ones this phone just dismissed, which are gone from the list. A tab badge
   // that outran its own rows would be a count exceeding what its screen shows.
-  const needsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + notificationNeeds.length;
+  const unlisted = data?.unlisted ?? [];
+  const needsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + notificationNeeds.length + unlisted.length;
 
   // The count PUBLISHED TO THE SHELL is a different claim, so it is a different
   // number: the shell keeps it as its last authoritative summary and shows it
@@ -262,7 +281,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     () => collapseAttentionNotifications((data?.notifications ?? []).filter(stillNeedsUser)).length,
     [data?.notifications, stillNeedsUser],
   );
-  const confirmedNeedsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + confirmedNotificationNeeds;
+  const confirmedNeedsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + confirmedNotificationNeeds + unlisted.length;
   const resolvedQuestionItems = new Set(
     notifications
       .filter((row) => !row.needsAttention && row.context.actionItemId?.match(/^(checkin|task|workflow):/))
@@ -566,6 +585,19 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             onReply={(sessionId, draft) => onReply(sessionId || null, draft)}
           />
 
+          {unlisted.map((item) => (
+            <article key={item.key} class="inbox-card inbox-attention-card">
+              <CardMeta label={item.kind === 'workflow_binding' ? 'Flow · stopped' : item.kind === 'workflow_paused' ? 'Flow · paused' : 'Needs you'} urgent />
+              <h2>{item.title}</h2>
+              <p class="inbox-card-body">{item.detail}</p>
+              {item.workflow ? (
+                <div class="inbox-card-actions">
+                  <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Flows</button>
+                </div>
+              ) : null}
+            </article>
+          ))}
+
           {notificationNeeds.map(({ row, earlier }) => {
             // The run this row is ABOUT (see notificationRunTarget) — the same
             // destination the push for this same notification lands on.
@@ -586,8 +618,8 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 class="inbox-card inbox-attention-card"
                 tabIndex={-1}
               >
-                <CardMeta label="Update · needs you" at={row.createdAt} urgent />
-                <h2>{row.title || 'I need your attention'}</h2>
+                <CardMeta label={needsYouCardLabel(row)} at={row.createdAt} urgent />
+                <h2>{notificationTitle(row.title) || 'I need your attention'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {earlier > 0 ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
                 <div class="inbox-card-actions">
@@ -731,7 +763,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 tabIndex={-1}
               >
                 <CardMeta label={notificationLabel(row)} at={row.createdAt} unread={!row.read} />
-                <h2>{row.title || 'Update from Clem'}</h2>
+                <h2>{notificationTitle(row.title) || 'Update from Clem'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
                 {!row.read || runTarget ? (
@@ -1154,11 +1186,13 @@ function CheckGlyph() {
 
 function CardMeta({ label, at, urgent, unread }: {
   label: string;
-  at: string | number;
+  /** Omitted for a standing item (a workflow waiting on a binding) that has no
+   *  moment of its own. */
+  at?: string | number;
   urgent?: boolean;
   unread?: boolean;
 }) {
-  const date = new Date(at);
+  const date = new Date(at ?? NaN);
   const valid = Number.isFinite(date.getTime());
   const full = valid ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date) : '';
   return (
@@ -1168,7 +1202,7 @@ function CardMeta({ label, at, urgent, unread }: {
         {urgent ? <span class="sr-only">Urgent. </span> : null}
         {label}
       </span>
-      <time dateTime={valid ? date.toISOString() : undefined} title={full}>{relativeTime(at)}</time>
+      {at !== undefined ? <time dateTime={valid ? date.toISOString() : undefined} title={full}>{relativeTime(at)}</time> : null}
     </div>
   );
 }

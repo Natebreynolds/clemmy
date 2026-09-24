@@ -1204,6 +1204,29 @@ test('latest run attempt follows a reusable session across terminal turns', () =
   assert.equal(latest?.sourceUserSeq, null);
 });
 
+test('malformed or unrelated workflow notices do not preserve stale foreground attempts', () => {
+  for (const variant of ['malformed', 'wrong-parent', 'wrong-turn', 'wrong-source', 'assistant-role', 'ambiguous'] as const) {
+    resetEventLog();
+    const session = createSession({ kind: 'chat', channel: 'desktop' });
+    const first = beginRunAttempt(session.id, { runId: `old-${variant}` });
+    const source = recordRunAttemptUserInput(first, { turn: 1, role: 'user', data: { text: 'Original work.' } });
+    const sourceGroupId = `workflow-origin-group-v1:${'a'.repeat(64)}`;
+    const sourceGroupDigest = 'b'.repeat(64);
+    const data = { version: 2, kind: 'workflow_run_group', status: 'dispatched', sourceUserSeq: source.seq,
+      sourceGroupId, sourceGroupDigest, runIds: ['child-one'], replyTargetDigest: 'c'.repeat(64),
+      dispatchKey: `workflow_source_group:${sourceGroupId}:${sourceGroupDigest}` };
+    for (let i = 0; i < (variant === 'ambiguous' ? 2 : 1); i++) appendEvent({
+      sessionId: session.id, turn: variant === 'wrong-turn' ? 2 : 1,
+      role: variant === 'assistant-role' ? 'assistant' : 'system', type: 'async_work_dispatched',
+      parentEventId: variant === 'wrong-parent' ? 'unrelated-source' : source.id,
+      data: variant === 'malformed' ? { sourceUserSeq: source.seq }
+        : variant === 'wrong-source' ? { ...data, sourceUserSeq: source.seq + 1 } : data,
+    });
+    claimRunAttemptLease({ sessionId: session.id, runId: `new-${variant}`, ownerId: 'new-owner', leaseMs: 1000 });
+    assert.equal(getLatestRunAttemptByRunId(session.id, `old-${variant}`)?.status, 'superseded', variant);
+  }
+});
+
 test('latest run attempts are projected for many sessions in one deterministic batch', () => {
   resetEventLog();
   const firstSession = createSession({ kind: 'chat' });
@@ -1620,6 +1643,34 @@ test('listSessions has deterministic tie ordering for offset pagination', () => 
     listSessions({ limit: 2, offset: 4 }).map((session) => session.id),
     ['tie-page-000'],
   );
+});
+
+test('session listing materializes metadata only for the requested page', () => {
+  resetEventLog();
+  const db = openEventLog();
+  for (let i = 0; i < 20; i++) {
+    createSession({ id: `materialize-${String(i).padStart(3, '0')}`, kind: 'chat',
+      metadata: { marker: i, state: 'x'.repeat(4096) } });
+  }
+  db.prepare('UPDATE sessions SET updated_at = ?').run('2026-09-23T00:00:00.000Z');
+  let materializations = 0;
+  db.function('count_metadata_materialization', (value: unknown) => {
+    materializations++;
+    return value as string;
+  });
+  const columns = (db.prepare('PRAGMA main.table_info(sessions)').all() as Array<{ name: string }>).map(column =>
+    column.name === 'metadata_json' ? 'count_metadata_materialization(metadata_json) AS metadata_json' : `"${column.name}"`);
+  // A transparent test view measures payload evaluation, not elapsed time or
+  // SQL spelling. Production reads the real table with the same row identity.
+  db.exec(`CREATE TEMP VIEW sessions AS SELECT rowid AS rowid, ${columns.join(', ')} FROM main.sessions`);
+  try {
+    const page = listSessions({ limit: 2, offset: 3 });
+    assert.deepEqual(page.map(row => row.id), ['materialize-016', 'materialize-015']);
+    assert.deepEqual(page.map(row => row.metadata.marker), [16, 15]);
+    assert.equal(materializations, 2, 'off-page conversation payloads must not enter the sort');
+  } finally {
+    db.exec('DROP VIEW temp.sessions');
+  }
 });
 
 test('kill switch is sticky until cleared', () => {

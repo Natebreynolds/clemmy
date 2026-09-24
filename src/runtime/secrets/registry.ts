@@ -79,6 +79,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'OPENAI_API_KEY',
     required: false, // codex_oauth path can substitute for some workloads
     setupHint: 'Get one at https://platform.openai.com/api-keys. Starts with sk-.',
+    keyUrl: 'https://platform.openai.com/api-keys',
     validate: (value) => probeBearer('https://api.openai.com/v1/models', value, 'bearer'),
   },
   {
@@ -87,6 +88,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'DISCORD_BOT_TOKEN',
     required: false,
     setupHint: 'Create a bot at https://discord.com/developers/applications and copy its token.',
+    keyUrl: 'https://discord.com/developers/applications',
   },
   {
     name: 'slack_bot_token',
@@ -109,6 +111,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'COMPOSIO_API_KEY',
     required: false,
     setupHint: 'Sign up at https://composio.dev and create an API key.',
+    keyUrl: 'https://app.composio.dev/developers',
     validate: (value) => probeBearer('https://backend.composio.dev/api/v3/connected_accounts?limit=1', value, 'x-api-key'),
   },
   {
@@ -117,6 +120,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'RECALL_API_KEY',
     required: false,
     setupHint: 'Sign up at https://www.recall.ai and create an API key for Desktop Recording SDK uploads.',
+    keyUrl: 'https://www.recall.ai',
   },
   {
     name: 'browser_use_api_key',
@@ -124,6 +128,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'BROWSER_USE_API_KEY',
     required: false,
     setupHint: 'Create one at https://cloud.browser-use.com/new-api-key. Local Chrome Browser Harness does not require this.',
+    keyUrl: 'https://cloud.browser-use.com/new-api-key',
   },
   {
     name: 'typesafe_api_key',
@@ -131,6 +136,7 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'TYPESAFE_API_KEY',
     required: false,
     setupHint: 'Create one at https://console.typesafe.ai/keys. Clem uses POST https://api.typesafe.ai/v1/systemone, not chat completions.',
+    keyUrl: 'https://console.typesafe.ai/keys',
     validate: (value) => probeTypesafeApiKey(value),
   },
   {

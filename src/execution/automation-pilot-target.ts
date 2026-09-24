@@ -9,6 +9,7 @@ export type AutomaticReadPilotTargetV1 =
       ok: true;
       phase: AutomationOpportunityPhaseV1;
       requirement: AutomationCapabilityRequirementV1;
+      workspaceOutputPhase?: AutomationOpportunityPhaseV1;
     }
   | { ok: false; reason: string };
 
@@ -24,6 +25,26 @@ export type AutomaticReadPilotTargetV1 =
 export function selectAutomaticReadPilotTarget(
   opportunity: AutomationOpportunityV1,
 ): AutomaticReadPilotTargetV1 {
+  // Dataset output is represented by the separately consented host Workspace
+  // projection, never by executing a second arbitrary tool. Selection alone
+  // grants nothing: the compiler must bind this exact phase explicitly.
+  if (opportunity.partition.mode === 'single' && opportunity.dataset
+    && opportunity.phases.length === 2 && opportunity.capabilityRequirements.length === 2
+    && opportunity.effectCeiling.class === 'local_write'
+    && opportunity.pilot.effectCeiling.class === 'local_write') {
+    const phase = opportunity.phases.find(p => p.effect.class === 'read' && !p.partitioned && p.dependsOn.length === 0);
+    const output = opportunity.phases.find(p => p.effect.class === 'local_write' && !p.partitioned);
+    const requirement = phase?.capabilityRequirementIds.length === 1
+      ? opportunity.capabilityRequirements.find(r => r.id === phase.capabilityRequirementIds[0]) : undefined;
+    const outputRequirement = output?.capabilityRequirementIds.length === 1
+      ? opportunity.capabilityRequirements.find(r => r.id === output.capabilityRequirementIds[0]) : undefined;
+    if (phase && output && requirement?.minimumEffect === 'read'
+      && outputRequirement?.minimumEffect === 'local_write'
+      && output.dependsOn.length === 1 && output.dependsOn[0] === phase.id) {
+      return { ok: true, phase, requirement, workspaceOutputPhase: output };
+    }
+    return { ok: false, reason: 'A dataset pilot needs one exact root read and one dependent local output bound separately to the Workspace projection.' };
+  }
   const sourcePhases = opportunity.phases.filter((phase) => !phase.partitioned);
   if (sourcePhases.length !== 1) {
     return { ok: false, reason: 'Automatic pilot advancement requires exactly one unpartitioned source phase.' };

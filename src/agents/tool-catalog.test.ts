@@ -104,10 +104,22 @@ test('a proven skip drops acquisition-kernel schemas except ask', () => {
   assert.equal(thinned.has('workspace_roots'), false);
   assert.equal(thinned.has('list_files'), false);
   assert.equal(thinned.has('read_file'), false);
-  assert.equal(thinned.has('tool_search'), false);
-  assert.equal(thinned.has('tool_output_query'), false);
-  assert.equal(thinned.has('recall_tool_result'), false);
+  // Discovery is the one door that must survive a remembered operation: if
+  // the proven op cannot fulfil the request, the model needs a way to widen
+  // in the same turn instead of looping on ask/query.
+  assert.equal(thinned.has('tool_search'), true);
+  // Every projected result points at these two readers for the fields it
+  // dropped; a surface that names them must keep them callable.
+  assert.equal(thinned.has('tool_output_query'), true);
+  assert.equal(thinned.has('recall_tool_result'), true);
   assert.equal(thinned.has('check_in'), false);
+  // Live 284195: with the authoring tools kept through a proven skip, a plain
+  // calendar question started with workflow_create. A proven surface carries
+  // no authoring door; a weak strategy match no longer thins the surface at
+  // all (proven-operation.ts).
+  const withDoors = applyProvenSkipToHotSet(new Set([...hot, 'workflow_create', 'space_save']));
+  assert.equal(withDoors.has('workflow_create'), false);
+  assert.equal(withDoors.has('space_save'), false);
   for (const name of PROVEN_SKIP_KEEP_LOADED) {
     if (hot.has(name)) assert.ok(thinned.has(name), `${name} stays callable after a proven skip`);
   }
@@ -323,6 +335,34 @@ test('lexical coverage remains advisory and cannot distinguish cross-tool prose 
   assert.ok(ranked.every((row) => row.fullLexicalCoverage),
     'this metric does not claim to understand which clause describes the operation');
   assert.equal(ranked.length, 2, 'ranking never removes a capability from discovery');
+});
+
+test('an operation purpose outranks a neighbor mentioning it as a prerequisite or alternative', () => {
+  for (const [query, target, purpose, neighbor, neighborPurpose] of [
+    ['read client record', 'ENTITY_LOOKUP', 'Read client record.', 'CLIENT_RECORD_EDIT',
+      'Edit a client record. Read client record first with ENTITY_LOOKUP; create a replacement only after review.'],
+    ['create client record', 'ENTITY_INSERT', 'Create client record.', 'CLIENT_RECORD_EXPORT',
+      'Export archived client record snapshots. To create client record use ENTITY_INSERT instead.'],
+  ] as const) {
+    const entries = [{ name: target, oneLiner: purpose }, { name: neighbor, oneLiner: neighborPurpose }];
+    for (const ordered of [entries, [...entries].reverse()]) {
+      const ranked = rankCatalogEntriesLexically(query, ordered);
+      assert.equal(ranked[0].name, target, query);
+      assert.equal(ranked.length, 2, 'ranking retains the alternative; it grants no authority');
+    }
+  }
+});
+
+test('a compound opening purpose keeps the requested object ahead of a different destination', () => {
+  const entries = [
+    { name: 'ARTIFACT_WRITE', oneLiner: 'Create, append to, or overwrite a local file.' },
+    { name: 'TABLE_APPEND', oneLiner: 'Append rows to a table.' },
+  ];
+  for (const ordered of [entries, [...entries].reverse()]) {
+    const ranked = rankCatalogEntriesLexically('append to a local file', ordered);
+    assert.equal(ranked[0].name, 'ARTIFACT_WRITE');
+    assert.equal(ranked.length, 2);
+  }
 });
 
 

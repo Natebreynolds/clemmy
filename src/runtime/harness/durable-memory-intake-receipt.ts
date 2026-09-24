@@ -283,7 +283,9 @@ function deriveExactEvidence(input: {
     if (!message) return { status: 'conflict', reason: 'accepted user source has no display text' };
     const normalizedMessage = normalizeMessage(message);
     const graphInputHash = expected.graph.source?.inputHash;
-    let captureMessage = digest(normalizedMessage) === graphInputHash
+    // The graph hashes accepted text before memory whitespace normalization.
+    // Bind those original bytes first, then verify the normalized intake below.
+    let captureMessage = digest(message.trim()) === graphInputHash
       ? normalizedMessage
       : '';
     let candidates = captureMessage

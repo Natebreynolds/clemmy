@@ -115,6 +115,8 @@ import {
 } from './notch-click-helper.js';
 import {
   advanceWatermark,
+  DesktopNotificationRetention,
+  openDesktopNotification,
   parseDesktopPendingResponse,
   planDesktopToasts,
   type DesktopPendingNotification,
@@ -2419,6 +2421,24 @@ let desktopNotificationPollInFlight = false;
 // Init to app-start time so a restart doesn't replay the backlog.
 let desktopNotificationSince = new Date().toISOString();
 const desktopNotifiedIds = new Set<string>();
+const desktopNotificationRetention = new DesktopNotificationRetention<Notification>(DESKTOP_NOTIFICATION_SEEN_CAP);
+
+function observeDesktopNotification(notification: Notification, id: string): void {
+  const record = (event: string, error?: string) => {
+    try {
+      appendFileSync(LOG_FILE, JSON.stringify({
+        component: 'desktop-notify', event, id, at: new Date().toISOString(),
+        ...(error ? { error: redactSensitiveText(error).slice(0, 500) } : {}),
+      }) + '\n');
+    } catch { /* Diagnostics must not prevent delivery or navigation. */ }
+  };
+  desktopNotificationRetention.retain(notification);
+  notification.on('show', () => record('shown'));
+  notification.on('click', () => record('clicked'));
+  notification.on('close', () => record('closed'));
+  notification.on('failed', (_event, error) => record('failed', error));
+  record('created');
+}
 
 function rememberDesktopNotifiedId(id: string): void {
   desktopNotifiedIds.add(id);
@@ -2433,39 +2453,54 @@ function rememberDesktopNotifiedId(id: string): void {
   }
 }
 
-function focusDesktopNotificationRoute(href: string | undefined): void {
-  if (!href || !/^\/inbox(?:[?#]|$)/.test(href)) return;
+async function focusDesktopNotificationRoute(route: string): Promise<boolean> {
   const win = mainWindow;
-  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return false;
+  const contents = win.webContents;
+  if (contents.isLoadingMainFrame()) {
+    const loaded = await new Promise<boolean>((resolve) => {
+      const finish = (ok: boolean) => {
+        clearTimeout(timer);
+        contents.removeListener('did-finish-load', ready);
+        contents.removeListener('destroyed', gone);
+        resolve(ok);
+      };
+      const ready = () => finish(true);
+      const gone = () => finish(false);
+      const timer = setTimeout(() => finish(false), 15_000);
+      contents.once('did-finish-load', ready);
+      contents.once('destroyed', gone);
+    });
+    if (!loaded) return false;
+  }
+  if (win.isDestroyed() || contents.isDestroyed()) return false;
+  if (!isTrustedDashboardMediaUrl(contents.getURL(), dashboardOrigins())) return false;
   const script = `(() => {
-    const next = ${JSON.stringify(href)};
+    const next = ${JSON.stringify(route)};
+    const origins = ${JSON.stringify([...dashboardOrigins()])};
+    if (!origins.includes(window.location.origin)) return false;
     window.history.pushState(null, '', next);
     window.dispatchEvent(new PopStateEvent('popstate'));
+    return window.location.pathname + window.location.search + window.location.hash === next;
   })()`;
-  const navigate = () => {
-    void win.webContents.executeJavaScript(script).catch(() => { /* best-effort focus */ });
-  };
-  if (win.webContents.isLoadingMainFrame()) win.webContents.once('did-finish-load', navigate);
-  else navigate();
+  try { return await contents.executeJavaScript(script) === true; }
+  catch { return false; }
 }
 
 function showDesktopNotificationToast(item: DesktopPendingNotification): void {
   if (!Notification.isSupported()) return;
   const notification = new Notification({
+    id: item.id,
     title: item.title || 'Clementine',
     body: item.body || '',
     silent: false,
   });
+  observeDesktopNotification(notification, item.id);
   notification.on('click', () => {
     revealMainWindow();
-    focusDesktopNotificationRoute(item.href);
-    // An actionable toast remains unread until its exact decision authority
-    // resolves it. Merely opening the Inbox can never consume a capability
-    // choice or leave an indefinitely blocked run without its chooser.
-    if (item.markReadOnOpen !== false) {
-      postDaemonJson(`/api/console/notifications/${encodeURIComponent(item.id)}/read`, {})
-        .catch(() => { /* best-effort */ });
-    }
+    void openDesktopNotification(item, focusDesktopNotificationRoute, (id) =>
+      postDaemonJson(`/api/console/notifications/${encodeURIComponent(id)}/read`, {}),
+    ).catch(() => { /* Leave unread when navigation or acknowledgement fails. */ });
   });
   notification.show();
 }
@@ -2477,6 +2512,7 @@ function showDesktopNotificationSummaryToast(count: number): void {
     body: `${count} more update${count === 1 ? '' : 's'} — open Clementine`,
     silent: false,
   });
+  observeDesktopNotification(notification, 'summary');
   notification.on('click', () => { revealMainWindow(); });
   notification.show();
 }

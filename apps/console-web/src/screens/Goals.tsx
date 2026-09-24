@@ -15,6 +15,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
+import { humanizeCron } from '@/lib/cron';
 import {
   createGoal, createGoalFromDraft, dismissGoalDraft, draftGoal, expireGoal, listGoalDrafts, listGoals, parkGoal, satisfyGoal, setGoalSelfDrive, unparkGoal,
   type GoalDraftRecord, type GoalFilter, type GoalSummary,
@@ -67,7 +68,7 @@ function commitmentSourceLabel(source: ProspectiveIntentionSummary['sourceKind']
 function commitmentTriggerLabel(item: ProspectiveIntentionSummary): string {
   const trigger = item.trigger;
   if (trigger.kind === 'time') return `At ${shortDate(trigger.at)}`;
-  if (trigger.kind === 'cron') return `Schedule ${trigger.expression}${trigger.timezone ? ` · ${trigger.timezone}` : ''}`;
+  if (trigger.kind === 'cron') return humanizeCron(trigger.expression, trigger.timezone ?? undefined) || 'On a schedule';
   if (trigger.kind === 'event') return `When ${trigger.eventType} arrives`;
   if (trigger.kind === 'webhook') return `When /${trigger.path.replace(/^\/+/, '')} receives a webhook`;
   if (trigger.kind === 'state') return `Watching ${trigger.channel}`;

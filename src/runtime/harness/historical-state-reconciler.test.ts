@@ -43,8 +43,8 @@ const digest = (value: string): string => createHash('sha256').update(value).dig
 
 type TerminalKind = 'done' | 'failed' | 'uncertain' | 'cancelled' | 'needs_input';
 
-function graphTask(text = 'Read the durable records.') {
-  const session = eventlog.createSession({
+function graphTask(text = 'Read the durable records.', existingSessionId?: string) {
+  const session = existingSessionId ? eventlog.getSession(existingSessionId)! : eventlog.createSession({
     id: `historical-reconcile-${++serial}`,
     kind: 'chat',
   });
@@ -652,4 +652,43 @@ test('post-close terminal and child tampering revoke the historical verifier exc
     reasonTask.sessionId,
     reasonTask.sourceUserSeq,
   ).status, 'conflict');
+});
+
+test('historical cleanup retires proven source pauses but preserves an older unproven task', async () => {
+  const store = await import('./source-approval-checkpoints.js');
+  const save = (identity: { sessionId: string; sourceUserSeq: number }) => store.replaceSourceApprovalCheckpoint({
+    ...identity, expectedRevision: null, checkpoint: { mcpToolScope: null,
+      serialized: JSON.stringify({ __clemHostInterrupt: 6, pending: [],
+        acceptedModelBatchRef: { ...identity, batchId: 'historical-fixture', batchOrdinal: 1 } }) },
+  });
+  const clean = graphTask('Completed source checkpoint cleanup.');
+  rawTerminal(clean, 'done');
+  markTerminalSession(clean);
+  const saved = save(clean);
+  if (!saved.updated) throw new Error('fixture save failed');
+  eventlog.openEventLog().prepare(`UPDATE sessions SET metadata_json = json_remove(metadata_json,
+    '$.__interrupt_state', '$.__interrupt_mcp_scope') WHERE id = ?`).run(clean.sessionId);
+  reconciler.reconcileHistoricalCallAuthorityRootPage({ pageSize: 64 });
+  reconciler.reconcileHistoricalInterruptPage({ pageSize: 64, inspectExternalOwnership: () => ({ status: 'clear' }) });
+  const retired = store.readSourceApprovalCheckpoint(clean);
+  assert.equal(retired.checkpoint, null, 'cleanup removes replay bytes as well as the compatibility projection');
+  assert.notEqual(retired.revision, saved.snapshot.revision, 'cleanup retains a fresh anti-resurrection tombstone');
+  assert.equal(store.replaceSourceApprovalCheckpoint({ ...clean,
+    expectedRevision: saved.snapshot.revision, checkpoint: saved.snapshot.checkpoint }).updated, false);
+
+  const session = eventlog.createSession({ kind: 'chat' });
+  const older = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Older parked task without a terminal.' } });
+  const latest = graphTask('The newer task completed.', session.id);
+  rawTerminal(latest, 'done');
+  markTerminalSession(latest);
+  const identity = { sessionId: session.id, sourceUserSeq: older.seq };
+  save(identity);
+  reconciler.reconcileHistoricalCallAuthorityRootPage({ pageSize: 64 });
+  const before = eventlog.getSession(session.id)!.metadata;
+  const result = reconciler.reconcileHistoricalInterruptPage({ pageSize: 64,
+    inspectExternalOwnership: () => ({ status: 'clear' }) });
+  assert.equal(result.heldReasons.source_approval_terminal_not_proven, 1);
+  assert.deepEqual(eventlog.getSession(session.id)!.metadata, before,
+    'a newer terminal does not erase or hide an older parked source');
 });

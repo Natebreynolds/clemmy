@@ -51,7 +51,7 @@ import {
 } from './turn-outcome.js';
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import {
-  ambiguousOpenSlotTargetFromLastInterpretation,
+  unresolvedOpenSlotTargetFromLastInterpretation,
   readPersistedSemanticInterpretation,
   taskRelationFromLastInterpretation,
   typedClassificationFromLastInterpretation,
@@ -152,11 +152,13 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
   const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
   if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
   const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
-  if (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined) return null;
-  const ambiguous = ambiguousOpenSlotTargetFromLastInterpretation(
+  const unresolved = unresolvedOpenSlotTargetFromLastInterpretation(
     input.sessionId,
     input.sourceUserSeq,
   );
+  const continuing = unresolved !== null
+    && taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq) === 'continue_goal';
+  if (!continuing && (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined)) return null;
   // The host could not READ the answer at all (the projection was rejected or
   // never persisted). That is not the user's fault and never a reason to park
   // the session: the open question is re-asked so the next answer stays
@@ -167,13 +169,13 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
   const openSlot = current.packet.pause.slot;
   if (
     !openSlot
-    || (!ambiguous && !unreadable)
+    || (!unresolved && !unreadable)
     || (
-      ambiguous
-      && ambiguous.target !== null
+      unresolved
+      && unresolved.target !== null
       && (
-        ambiguous.target.goalId !== openSlot.goalId
-        || ambiguous.target.baseRevision !== openSlot.revision
+        unresolved.target.goalId !== openSlot.goalId
+        || unresolved.target.baseRevision !== openSlot.revision
       )
     )
   ) return null;

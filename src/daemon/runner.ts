@@ -26,7 +26,7 @@ import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, ge
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
-import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
+import { startModelDiscoveryHeartbeat, warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks, listBackgroundTasks } from '../execution/background-tasks.js';
@@ -2108,11 +2108,13 @@ export async function startDaemon(
       },
     });
   }
-  // The old ambient inbox/calendar implementations call the raw provider
-  // client and have no accepted logical/physical read authority. Keep their
-  // user settings intact, but do not schedule them until they are migrated to
-  // the prepared terminal path. This warning is explicit readiness truth, not
-  // a fabricated claim that monitoring is active.
+  // The old ambient inbox implementation calls the raw provider client and
+  // has no accepted logical/physical read authority. Keep its user settings
+  // intact, but do not schedule it until it is migrated to the prepared
+  // terminal path. This warning is explicit readiness truth, not a fabricated
+  // claim that monitoring is active. The calendar watch was migrated: it reads
+  // through the prepared workflow read path and is armed below, after the
+  // typed execution runtime installs the live catalog.
   const configuredAmbientComposioMonitors: AmbientComposioMonitorPolicy[] = (() => {
     try {
       const policy = getProactivityPolicySnapshot().policy;
@@ -2121,11 +2123,6 @@ export async function startDaemon(
           monitor: 'inbox' as const,
           intervalMinutes: policy.inboxWatchMinutes,
           maxItems: policy.inboxWatchMax,
-        }] : []),
-        ...(policy.enabled && policy.calendarWatchEnabled ? [{
-          monitor: 'calendar' as const,
-          intervalMinutes: policy.calendarWatchMinutes,
-          maxItems: policy.calendarWatchMax,
         }] : []),
       ];
     } catch {
@@ -2163,6 +2160,7 @@ export async function startDaemon(
     },
     'Model catalog discovery initialized',
   );
+  startModelDiscoveryHeartbeat();
   // BYO catalog warm (fire-and-forget): providers that publish context_length
   // on /v1/models (Together, Moonshot) get their windows recorded as durable
   // observations at startup, so window budgeting runs on provider evidence
@@ -2716,6 +2714,15 @@ export async function startDaemon(
       { err: err instanceof Error ? err.message : String(err) },
       'Legacy scheduled readiness hold boot reconciliation failed closed',
     );
+  }
+  try {
+    const { sweepDeadOccurrences } = await import('../execution/workflow-dead-occurrences.js');
+    const dead = sweepDeadOccurrences({ source: 'boot' });
+    if (dead.cancelled > 0 || dead.failed > 0) {
+      logger.warn(dead, 'Cancelled dead occurrences on boot — never worked, superseded by a newer occurrence');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Dead occurrence sweep failed closed');
   }
   // Notification hygiene on boot: stale unread approval/execution cards
   // (dead runs) flip to read; >30d records purge. Clears the "Needs you"
@@ -3330,6 +3337,27 @@ export async function startDaemon(
     setImmediate(drainWorkflowRunsTick);
     const workflowRunTimer = setInterval(drainWorkflowRunsTick, 15_000);
     workflowRunTimer.unref?.();
+  }
+
+  // Calendar watch heartbeat: a minute-level check that ticks on the policy
+  // cadence, reads every connected calendar through the prepared read path,
+  // diffs deterministically, and asks Jev only about low-signal changes. It
+  // has its own switch (calendarWatchEnabled) and respects quiet hours.
+  try {
+    const { calendarWatchPolicy, startCalendarWatchHeartbeat } = await import('../agents/calendar-watch-runtime.js');
+    const watchPolicy = calendarWatchPolicy();
+    startCalendarWatchHeartbeat();
+    // Workflow suggestions ride the same contract: a cadence, a deterministic
+    // look at the host's own proven-strategy record, one plan-proposal card
+    // when a request keeps repeating, nothing on a quiet tick.
+    const { startWorkflowSuggestionsHeartbeat } = await import('../agents/workflow-suggestions.js');
+    startWorkflowSuggestionsHeartbeat();
+    logger.info(
+      { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
+      watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',
+    );
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Calendar watch heartbeat failed to arm');
   }
 
   // RELEASE BOUNDARY: listeners must not accept a fresh mutation while the

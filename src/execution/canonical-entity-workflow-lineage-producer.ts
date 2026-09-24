@@ -1,3 +1,4 @@
+import { validWorkflowTextSelectionReceipt, type WorkflowTextSelectionReceiptV1 } from '../memory/workflow-text-result-interpretation.js';
 import {
   canonicalEntityJson,
   canonicalEntitySha256,
@@ -99,6 +100,7 @@ export type ProduceCanonicalEntityWorkflowLineageResultV1 =
     };
 
 interface PreparedPage {
+  selection?: WorkflowTextSelectionReceiptV1;
   page: VerifiedWorkflowReadPageV1;
   observations: EntityObservationInput[];
   observationIds: string[];
@@ -191,7 +193,7 @@ function shapeCovered(value: unknown, node: PathNode): boolean {
 
 function recordShape(projection: WorkflowCanonicalEntityResultProjection): PathNode {
   const root: PathNode = { terminal: false, children: new Map() };
-  for (const mapping of projection.fields) addPath(root, mapping.recordPath);
+  for (const mapping of projection.fields) if (mapping.recordPath !== undefined) addPath(root, mapping.recordPath);
   addPath(root, projection.sourceRecord.idPath);
   if (projection.sourceRecord.revisionPath) addPath(root, projection.sourceRecord.revisionPath);
   if (projection.sourceRecord.observedAt.kind === 'record_path') {
@@ -251,6 +253,7 @@ function prepareObservation(input: {
   record: Record<string, unknown>;
   page: VerifiedWorkflowReadPageV1;
   activationDigest: string;
+  runId: string;
 }): EntityObservationInput | null {
   const recordId = sourceIdentity(valueAtPath(input.record, input.projection.sourceRecord.idPath));
   if (!recordId) return null;
@@ -271,7 +274,10 @@ function prepareObservation(input: {
   const fields: Record<string, EntityObservationInput['fields'][string]> = {};
   const values = new Map<string, unknown>();
   for (const mapping of input.projection.fields) {
-    const value = valueAtPath(input.record, mapping.recordPath);
+    const value = mapping.hostSource === 'workflow_run_id' ? input.runId
+      : mapping.hostSource === 'page_settled_at' ? input.page.settledAt
+      : mapping.hostSource === 'page_receipt_id' ? input.page.pageReceiptId
+      : valueAtPath(input.record, mapping.recordPath!);
     if (value === undefined) {
       if (mapping.required) return null;
       continue;
@@ -281,7 +287,7 @@ function prepareObservation(input: {
     values.set(mapping.field, value);
     fields[mapping.field] = {
       value,
-      provenance: { sourceId, recordId, path: mapping.recordPath },
+      provenance: { sourceId, recordId, path: mapping.hostSource ? `host:${mapping.hostSource}` : mapping.recordPath! },
       confidence: mapping.confidence,
       observedAt,
     };
@@ -335,6 +341,7 @@ function prepareObservation(input: {
 function preparePages(input: {
   redeemed: VerifiedClosedWorkflowReadResultV1 | VerifiedFailedWorkflowReadResultV1;
   projection: WorkflowCanonicalEntityResultProjection;
+  runId: string;
 }): PreparedPage[] | null {
   const shape = recordShape(input.projection);
   let totalBytes = 0;
@@ -344,12 +351,20 @@ function preparePages(input: {
     totalBytes += page.rawByteCount;
     if (page.rawByteCount > input.projection.bounds.maxPageBytes
       || totalBytes > input.projection.bounds.maxTotalBytes) return null;
-    const evidenceView = projectProviderResultEvidenceView(page.rawPayload);
+    const evidenceView = projectProviderResultEvidenceView(page.rawPayload, input.projection.textInterpretation);
     if (evidenceView.kind !== 'provider_payload') return null;
     const records = valueAtPath(evidenceView.payload, input.projection.recordsPath);
     if (!Array.isArray(records)
-      || records.length !== page.itemCount
+      || (!input.projection.textInterpretation && records.length !== page.itemCount)
       || records.length > input.projection.bounds.maxRecordsPerPage) return null;
+    let selection: WorkflowTextSelectionReceiptV1 | undefined;
+    if (input.projection.textInterpretation) {
+      const selected = valueAtPath(evidenceView.payload, 'selection');
+      const receipt = { ...(selected as object), version: 1, sourceReceiptId: page.pageReceiptId,
+        sourceResultDigest: page.settledResultDigest, projectionDigest: input.projection.projectionDigest };
+      if (!validWorkflowTextSelectionReceipt(receipt) || receipt.selectedRecords !== records.length) return null;
+      selection = receipt;
+    }
     totalRecords += records.length;
     if (totalRecords > input.projection.bounds.maxRecords) return null;
     const observations: EntityObservationInput[] = [];
@@ -366,6 +381,7 @@ function preparePages(input: {
         record: recordValue as Record<string, unknown>,
         page,
         activationDigest: input.redeemed.activationDigest,
+        runId: input.runId,
       });
       if (!observation) return null;
       observations.push(observation);
@@ -376,7 +392,7 @@ function preparePages(input: {
         recordOrdinal,
       })}`);
     }
-    pages.push({ page, observations, observationIds, coverageItemIds });
+    pages.push({ page, observations, observationIds, coverageItemIds, ...(selection ? { selection } : {}) });
   }
   return pages;
 }
@@ -483,8 +499,9 @@ export function produceCanonicalEntityWorkflowLineage(input: {
       : redeemed.pages.at(-1)?.exhausted !== true
         || redeemed.pages.slice(0, -1).some((page) => page.exhausted))
   ) return block('result_projection_bounds_exceeded', 'closed read page count or exhaustion contradicts the reviewed projection');
-  const pages = preparePages({ redeemed, projection });
+  const pages = preparePages({ redeemed, projection, runId: input.root.lineage.runId });
   if (!pages) return block('result_records_invalid', 'retained page records violate the reviewed path, closed shape, type, identity, or byte bounds');
+  const selection = pages[0]?.selection;
   const observationCount = pages.reduce((total, page) => total + page.observations.length, 0);
   const datasetId = `canonical-dataset:${canonicalEntitySha256({
     version: 1,
@@ -605,6 +622,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
     activationDigest: redeemed.activationDigest,
     aggregateReceiptDigest: redeemed.aggregateReceiptDigest ?? null,
     terminalOutcome: failedOutcome ? 'failed' : 'completed',
+    ...(selection ? { selection } : {}),
     datasetAuthority: {
       contractDigest: dataset.contractDigest,
       resolutionRevision: dataset.resolutionRevision,
@@ -617,6 +635,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   if (retained) {
     const retainedFinishedAt = terminalAt(retained.request);
     if (!retainedFinishedAt
+      || canonicalEntityJson(retained.request.selection ?? null) !== canonicalEntityJson(selection ?? null)
       || retained.request.expectedBindingDigest !== binding.digest
       || canonicalEntityJson(retained.request.terminalOutcomeAuthority ?? null)
         !== canonicalEntityJson(terminalOutcomeAuthority ?? null)
@@ -663,6 +682,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   const terminalPartitionState = failedOutcome ? 'failed' as const : 'completed' as const;
   const request: CanonicalEntityWorkflowProjectionRequestV1 = {
     version: 1,
+    ...(selection ? { selection } : {}),
     identity,
     expectedBindingDigest: binding.digest,
     expectedDatasetAuthority: {

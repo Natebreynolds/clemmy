@@ -127,6 +127,8 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   return {
     settings: settings.data,
     loading: settings.isLoading,
+    /** A re-read of the saved settings is in flight (after a change). */
+    fetching: settings.isFetching,
     mr,
     claudeAuth,
     busy, saved, error, claudeSignInFor,

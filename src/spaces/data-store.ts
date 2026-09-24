@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { resolveInSpace } from './store.js';
 import { withWorkspaceSnapshotRead } from './workspace-snapshot.js';
+import { locateWorkspaceRecords } from './workspace-data-digest.js';
 
 /** Hard cap so a runaway poll loop can't fill the disk. */
 export const MAX_DATA_BYTES = 5 * 1024 * 1024;
@@ -64,6 +65,39 @@ export function readData(slug: string): unknown {
     return {};
   }
   });
+}
+
+/**
+ * The dataset as a VIEW should see it: every source also exposes its record
+ * list as `records`, located the same way the design-layer kit's `clem.rows`
+ * locates it (through a `{complete, result}` read envelope, then the first
+ * record-shaped array under a known key). A view that reads its own paths
+ * (`src.value`, `src.data.value`, `src.records`) instead of `clem.rows` then
+ * still finds the rows. Live 2026-09-22 (Daily Brief): two sources with real
+ * records stored under `result.data.value`, a hand-rolled `rows()` helper in
+ * the view, and a board that said "No meetings on the calendar for today".
+ * `_meta` and sources that are already arrays are untouched.
+ */
+export function withSourceRecordAliases(data: unknown): unknown {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    if (key.startsWith('_') || !value || typeof value !== 'object' || Array.isArray(value)) {
+      out[key] = value;
+      continue;
+    }
+    const source = value as Record<string, unknown>;
+    if (Array.isArray(source.records)) { out[key] = value; continue; }
+    let located: { records: unknown[]; path: string } | null = null;
+    try { located = locateWorkspaceRecords(value as Parameters<typeof locateWorkspaceRecords>[0]); } catch { located = null; }
+    out[key] = located && located.path ? { ...source, records: located.records } : value;
+  }
+  return out;
+}
+
+/** The dataset for a view or its bridge: `readData` plus record aliases. */
+export function readViewData(slug: string): unknown {
+  return withSourceRecordAliases(readData(slug));
 }
 
 export interface WriteDataResult { ok: true; bytes: number }

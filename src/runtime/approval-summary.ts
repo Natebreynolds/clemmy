@@ -1,3 +1,4 @@
+import { automationReviewPreview } from './automation-review-preview.js';
 import type { PendingApproval } from '../types.js';
 import type { PendingApprovalRow } from './harness/approval-registry.js';
 import { listEvents as listHarnessEvents } from './harness/eventlog.js';
@@ -226,6 +227,17 @@ export function presentApproval(
   context: ApprovalPresentationContext = {},
 ): ApprovalPresentation {
   const args = row.args ?? {};
+  if (row.tool === 'automation_opportunity_review_decision') {
+    return {
+      title: 'Review automation proposal',
+      detail: automationReviewPreview(args),
+      approveLabel: 'Approve proposal',
+      editLabel: 'Review proposal',
+      rejectLabel: 'Reject proposal',
+      canPauseWorkflow: false,
+    };
+  }
+
   const slug = pickString(args, ['tool_slug', 'slug']);
   const inner = nestedArgs(args);
   const normalized = `${row.tool ?? ''} ${slug}`.toUpperCase();
@@ -360,10 +372,23 @@ function looksLikeImageUrl(s: string): boolean {
   return /^\/?[\w./-]+\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(t); // local path
 }
 
+/** A field is draft text when any word of its name is a body word:
+ *  `markdown_text`, `messageBody` and `text` all qualify. Matching words, not
+ *  whole keys, keeps this free of per-provider field lists. */
+function fieldWords(key: string): string[] {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** Identifier-shaped fields (`post_id`, `message_url`, `status_code`) are
+ *  never the draft, whatever else their name says. */
+const NOT_BODY_WORDS = new Set(['id', 'ids', 'url', 'urls', 'uri', 'urn', 'key', 'token', 'type', 'code', 'hash', 'ts']);
+
 function pickLongestString(record: Record<string, unknown>, keys: string[]): string {
+  const bodyWords = new Set(keys);
   let best = '';
-  for (const key of keys) {
-    const v = record[key];
+  for (const [key, v] of Object.entries(record)) {
+    const words = fieldWords(key);
+    if (!words.some((word) => bodyWords.has(word)) || words.some((word) => NOT_BODY_WORDS.has(word))) continue;
     if (typeof v === 'string' && v.trim().length > best.length) best = v;
   }
   return best.trim();
@@ -386,14 +411,25 @@ export function extractApprovalContentPreview(
   args: Record<string, unknown> | null | undefined,
 ): ApprovalContentPreview | undefined {
   try {
+    if (_tool === 'automation_opportunity_review_decision') return { body: automationReviewPreview(args) };
     if (!args || typeof args !== 'object') return undefined;
-    // composio_execute_tool nests the real fields under `arguments` (string|object).
+    // Carriers nest the real fields: composio_execute_tool under `arguments`,
+    // work_call under `args_json` (which may itself be a composio call). Peel
+    // until the provider's own fields — live 2026-09-22 a Slack send wrapped
+    // in work_call showed no draft on either surface.
+    const asRecord = (value: unknown): Record<string, unknown> | null => {
+      if (typeof value === 'string') {
+        try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null; } catch { return null; }
+      }
+      return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+    };
     let inner: Record<string, unknown> = args;
-    const nested = (args as Record<string, unknown>).arguments;
-    if (typeof nested === 'string') {
-      try { const p = JSON.parse(nested); if (p && typeof p === 'object') inner = p as Record<string, unknown>; } catch { /* keep args */ }
-    } else if (nested && typeof nested === 'object') {
-      inner = nested as Record<string, unknown>;
+    for (let depth = 0; depth < 4; depth++) {
+      const next = asRecord(inner.args_json)
+        ?? (typeof inner.name === 'string' ? asRecord(inner.args) : null)
+        ?? asRecord(inner.arguments);
+      if (!next) break;
+      inner = next;
     }
     const rawBody = pickLongestString(inner, CONTENT_BODY_KEYS);
     const imageUrl = pickImageUrl(inner, CONTENT_IMAGE_KEYS);

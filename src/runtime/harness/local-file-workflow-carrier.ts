@@ -27,6 +27,12 @@ export async function executeReviewedLocalFile(
     handle: facts.handle,
     contentDigest: facts.contentDigest,
     receipt: facts.receipt,
+    // The committed file's path is a fact of this receipt. Without it an
+    // authored contract such as `required_keys: [path]` / `verify.path_exists`
+    // — the natural shape for "save the summary to <path>" — failed a write
+    // that had physically succeeded (live 2026-09-22, "Handoff review
+    // fixture": file on disk, run reported failed for a missing "path").
+    path: args.path,
     // Stable payload for both original execution and receipt-only recovery.
     result: `Committed file at ${args.path} (${args.content.length} chars).\n${facts.receipt}`,
   };

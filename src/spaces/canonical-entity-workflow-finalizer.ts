@@ -1,3 +1,4 @@
+import { validWorkflowTextSelectionReceipt, type WorkflowTextSelectionReceiptV1 } from '../memory/workflow-text-result-interpretation.js';
 import {
   canonicalEntityJson,
   canonicalEntitySha256,
@@ -110,6 +111,8 @@ export interface FinalizeCanonicalEntityWorkflowCompletionInputV1 {
   status?: string;
   terminalOutcome?: WorkflowTerminalOutcome;
   finishedAt?: string;
+  /** Immutable dataset receipt time, when goal review completed afterward. */
+  projectionFinishedAt?: string;
   needsAttention?: boolean;
   claim?: unknown;
 }
@@ -159,6 +162,7 @@ export type FinalizeCanonicalEntityWorkflowCompletionResultV1 =
       headDigest: string;
       projectionDigest: string;
       coverage: {
+        selection?: WorkflowTextSelectionReceiptV1;
         status: 'complete' | 'partial' | 'unknown';
         complete: boolean;
         observedPartitions: number;
@@ -322,11 +326,12 @@ function validResolvedReceipt(
     || !exactKeys(receipt.request, [
       'version', 'identity', 'expectedBindingDigest', 'expectedDatasetAuthority',
       'runReceipts', 'partitionReceipts', 'batchLineage', 'coveragePosition',
-    ], ['expectedHeadDigest', 'terminalOutcomeAuthority'])
+    ], ['expectedHeadDigest', 'terminalOutcomeAuthority', 'selection'])
     || receipt.request.version !== 1
     || !validIdentity(receipt.request.identity)
     || canonicalEntityJson(receipt.request.identity) !== canonicalEntityJson(claim.identity)
     || receipt.request.expectedBindingDigest !== claim.bindingDigest) return false;
+  if (receipt.request.selection !== undefined && !validWorkflowTextSelectionReceipt(receipt.request.selection)) return false;
   const terminalAuthority = receipt.request.terminalOutcomeAuthority;
   if (claim.version === 1 && terminalAuthority !== undefined) return false;
   if (claim.version === 2 && (
@@ -475,11 +480,16 @@ export function finalizeCanonicalEntityWorkflowCompletion(
   if (!validResolvedReceipt(resolved.receipt, claim)) {
     return block(input, 'canonical_entity_lineage_receipt_invalid', identity.bindingId);
   }
+  const projectionFinishedAt = input.projectionFinishedAt ?? input.finishedAt!;
+  if (!exactIso(projectionFinishedAt)
+    || Date.parse(projectionFinishedAt) > Date.parse(input.finishedAt!)) {
+    return block(input, 'workflow_completion_receipt_missing', identity.bindingId);
+  }
   const terminalStatus = failedProjection ? 'failed' : 'completed';
   if (!hasExactTerminalReceipt(
     resolved.receipt.request,
     identity,
-    input.finishedAt!,
+    projectionFinishedAt,
     terminalStatus,
   )) {
     return block(input, 'workflow_completion_receipt_missing', identity.bindingId);
@@ -503,6 +513,7 @@ export function finalizeCanonicalEntityWorkflowCompletion(
     partitionReceipts: source.partitionReceipts,
     batchLineage: source.batchLineage,
     coveragePosition: source.coveragePosition,
+    ...(source.selection ? { selection: source.selection } : {}),
     ...(source.expectedHeadDigest !== undefined
       ? { expectedHeadDigest: source.expectedHeadDigest }
       : {}),
@@ -522,6 +533,7 @@ export function finalizeCanonicalEntityWorkflowCompletion(
     headDigest: projected.headDigest,
     projectionDigest: projected.projectionDigest,
     coverage: {
+      ...(projected.head.selection ? { selection: projected.head.selection } : {}),
       status: coverage.status,
       complete: coverage.status === 'complete',
       observedPartitions: coverage.observedPartitions,

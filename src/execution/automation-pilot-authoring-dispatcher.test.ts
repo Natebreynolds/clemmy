@@ -409,19 +409,31 @@ test('one constrained no-tools authoring dispatch reaches the existing full pilo
   assert.equal(authored.live.businessInvokes(), 0);
 });
 
-test('absent output schema visibly blocks before any model call or business sample', async () => {
+test('absent output schema allows only conditional reviewed text authoring without a business sample', async () => {
   const authored = await authoringStage('missing-output', false);
   let calls = 0;
   const dispatched = await dispatcher.reconcileAutomationPilotAuthoringDispatch({
     advancementId: authored.projection.advancementId,
-    port: { async author() { calls += 1; return {}; } },
+    port: { async author(input) {
+      calls += 1;
+      assert.equal(input.outputShape.source, 'conditional_text_interpretation');
+      assert.match(input.prompt, /conditional, not proof/);
+      const result = candidate(input.request, input.requestDigest);
+      const { projectionDigest: _digest, ...base } = result.contract.resultProjection;
+      result.contract.resultProjection = projections.createWorkflowCanonicalEntityResultProjection({
+        ...base,
+        fields: base.fields.map(field => ({ ...field, recordPath: 'key' })),
+        textInterpretation: { version: 1, kind: 'text_lines', field: 'key', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 100, selection: { kind: 'first', maxRecords: 10 } },
+      });
+      return result;
+    } },
   });
   assert.equal(dispatched.ok, true, JSON.stringify(dispatched));
-  if (dispatched.ok) assert.equal(dispatched.state, 'blocked');
-  const blocked = advancement.loadAutomationPilotAdvancement(authored.projection.advancementId)!;
-  assert.equal(blocked.stage, 'blocked');
-  assert.equal(blocked.blocked?.code, 'output_shape_unavailable');
-  assert.equal(calls, 0);
+  if (dispatched.ok) assert.equal(dispatched.state, 'submitted');
+  assert.equal(calls, 1);
+  const stagedPilot = await advancement.reconcileAutomationPilotAdvancement(authored.projection.advancementId, { acquisition: authored.live.acquisition });
+  assert.equal(stagedPilot.ok, true, JSON.stringify(stagedPilot));
+  if (stagedPilot.ok) assert.equal(stagedPilot.projection.stage, 'pilot_approval_pending');
   assert.equal(authored.live.businessInvokes(), 0);
 });
 

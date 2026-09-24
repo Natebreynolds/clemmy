@@ -97,3 +97,27 @@ test('the boot reconcile actually filters the resume list on the cap', () => {
   assert.match(body, /pending\.filter\(\(p\) => !parked\.has\(p\.runId\)\)/,
     'the parked runs must be removed from the set that gets resumed');
 });
+
+test('a run already parked is a decision for a person: never counted again, never re-raised', async () => {
+  const { listNotifications } = await import('../runtime/notifications.js');
+  // Live 2026-09-22: ten parked occurrences of one workflow carried
+  // bootResumeCount up to 446 — every launch re-counted, re-parked and
+  // re-raised runs the cap had already stopped days earlier.
+  seedRun('already-parked', { status: 'parked', bootResumeParkedAt: '2026-09-17T15:03:00.000Z', bootResumeCount: 4, error: 'Paused after 4 automatic restarts.' });
+  seedRun('capability-parked', { status: 'parked', parked: { reason: 'ambiguous-account' } });
+  let parked = new Set<string>();
+  for (let i = 0; i < 5; i++) {
+    parked = parkRunsExceedingBootResumeCap([
+      { runId: 'already-parked', workflowName: 'demo' },
+      { runId: 'capability-parked', workflowName: 'demo' },
+    ]);
+  }
+  assert.ok(parked.has('already-parked'), 'a cap-parked run stays out of the resume set');
+  assert.ok(parked.has('capability-parked'), 'a capability-parked run is waiting for a choice, not a restart');
+  assert.equal(readRun('already-parked').bootResumeCount, 4, 'the count on the record is what the user was told');
+  assert.equal(readRun('already-parked').error, 'Paused after 4 automatic restarts.');
+  assert.equal(readRun('capability-parked').bootResumeParkedAt, undefined, 'a choice park is never relabelled as a restart loop');
+  assert.equal(readRun('capability-parked').bootResumeCount, undefined);
+  const raised = listNotifications().filter((n) => n.id === 'workflow-boot-resume-cap-already-parked' || n.id === 'workflow-boot-resume-cap-capability-parked');
+  assert.equal(raised.length, 0, 'no card is raised for a run that was already parked');
+});

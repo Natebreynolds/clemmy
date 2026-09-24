@@ -464,8 +464,7 @@ test('S1-residue: stale process-wide catalog residue must not sink a same-turn-d
           'foreground discovery returns the sheet operation');
         assert.match(serialized, /cap:resolved:googlesheets_create_spreadsheet/,
           'the exact disclosed write ref reaches the model');
-        assert.ok(tools.includes(PLAN_CONTROL),
-          'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), false, 'deferred planning remains callable without permanent schema growth');
         output = [functionCall('admit-gauntlet-residue-sheet', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {
@@ -787,8 +786,7 @@ test('S2-residue-survives: registering the selected write must not evict unrelat
           'foreground discovery returns the sheet operation');
         assert.match(serialized, new RegExp(survivesCapabilityId),
           'the exact disclosed write ref reaches the model');
-        assert.ok(tools.includes(PLAN_CONTROL),
-          'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), false, 'deferred planning remains callable without permanent schema growth');
         output = [functionCall('admit-gauntlet-residue-sheet-survives', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {
@@ -1110,7 +1108,7 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
         })];
       } else if (turn1Step === 2) {
         assert.match(serialized, new RegExp(LIVE_PUBLISHED_OPERATION), 'foreground discovery returns the sheet operation');
-        assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
+        assert.equal(tools.includes(PLAN_CONTROL), false, 'deferred planning remains callable without permanent schema growth');
         output = [functionCall('admit-live-published-turn1', PLAN_CONTROL, {
           preamble: PREAMBLE,
           draft: {

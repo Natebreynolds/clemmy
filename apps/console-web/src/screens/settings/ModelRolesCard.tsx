@@ -23,6 +23,8 @@ const JUDGE_LANE_LABEL: Record<string, string> = {
   output_grounding: 'Numeric grounding',
   certify: 'Batch certify',
   watcher: 'Watcher',
+  calendar_watch: 'Calendar watch',
+  revision: 'Revision check',
 };
 
 function formatJudgeDuration(ms: number | undefined): string {
@@ -120,32 +122,28 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const onRemoveIntent = (whenIntent: string) => r.run(`intent-rm-${whenIntent}`, () => patchModelRole({ role: 'worker', whenIntent, clear: true }));
 
   const row = (label: string, hint: string, control: React.ReactNode, note?: React.ReactNode) => (
-    <div className="grid grid-cols-[1fr_auto] items-center gap-4 border-t border-border px-4 py-3 first:border-t-0">
+    // One control column for every role, so Brain, Workers and Judge line up
+    // (an `auto` column sized each row to its own select).
+    <div className="grid grid-cols-1 items-center gap-2 border-t border-border px-4 py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)] sm:gap-4">
       <div className="min-w-0">
         <div className="text-body font-semibold text-fg">{label}</div>
         <div className="text-small text-muted">{hint}</div>
         {note}
       </div>
-      <div className="flex min-w-0 max-w-[60%] items-center gap-2">{control}</div>
+      <div className="flex min-w-0 items-center gap-2 sm:justify-end [&>select]:w-full">{control}</div>
     </div>
   );
-  const inactive = (role: 'brain' | 'worker' | 'judge') => mr.roles[role].inactiveBinding && (
+  // Warn only when something else answers. The live brain binding is
+  // "inactive" whenever the active-brain switch owns the choice — even when
+  // both name the same model, which read "Saved grok-4.6 is unavailable" over
+  // a grok-4.6 brain.
+  const inactive = (role: 'brain' | 'worker' | 'judge') => mr.roles[role].inactiveBinding
+    && mr.roles[role].inactiveBinding?.modelId !== mr.roles[role].modelId && (
     <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={mr.roles[role].inactiveBinding?.reason}>
       <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-      <span className="truncate">Saved {mr.roles[role].inactiveBinding?.modelId} is unavailable; using the default.</span>
+      <span className="min-w-0">Saved {mr.roles[role].inactiveBinding?.modelId} isn’t available, so {mr.roles[role].modelId} answers instead.</span>
     </div>
   );
-  const seg = (value: string, options: Array<[string, string]>, onPick: (v: string) => void, disabled: boolean) => (
-    <div role="group" className="inline-flex rounded-full bg-subtle p-0.5">
-      {options.map(([v, label]) => (
-        <button key={v} type="button" disabled={disabled} aria-pressed={value === v} onClick={() => onPick(v)}
-          className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', value === v ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}>
-          {label}
-        </button>
-      ))}
-    </div>
-  );
-
   return (
     <div>
       <div className="overflow-hidden rounded-lg border border-border bg-surface">
@@ -184,15 +182,6 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is the same model as the brain, so a second opinion adds little.</div>
             )}
           </>)}
-        {row('Second opinion', 'A different family re-checks consequential work',
-          // "Off" sat directly beneath the Judge row and read as "the judge is
-          // off" — the owner said so. It never meant that: the judge always
-          // runs, this only decides whether a SECOND family re-checks it.
-          // Naming the state after what still happens removes the ambiguity
-          // without moving anything.
-          seg(fusionWhen, [['off', 'Judge only'], ['high', 'Consequential'], ['all', 'Everything']], (v) => void onFusion(v as 'off' | 'high' | 'all'), busy === 'fusion'),
-          fusion?.active ? <div className="mt-1 text-caption text-success">Active now.</div>
-            : secondOpinionOn ? <div className="mt-1 text-caption text-warning">Configured but inactive — the judge is not available yet.</div> : null)}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
@@ -244,6 +233,15 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               </div>
             </div>
             <CompletionReviewControl />
+            {/* Second opinion no longer has a control of its own: the judge and
+                the fast checker cover what it re-checked. Anyone who still has
+                it on keeps a way to turn it off. */}
+            {secondOpinionOn && (
+              <div className="flex flex-wrap items-center gap-2 text-caption text-muted">
+                <span>Second opinion is on: a second model family re-checks {fusionWhen === 'all' ? 'everything' : 'consequential work'}.</span>
+                <button type="button" className="rounded-md border border-border px-2 py-0.5 text-caption text-fg hover:border-primary disabled:opacity-50" disabled={busy === 'fusion'} onClick={() => void onFusion('off')}>Turn off</button>
+              </div>
+            )}
             {boundedFusionAttempts > 0 && (
               <p className="text-caption text-muted">Recent second opinions: {fusion?.health?.accepted ?? 0} accepted unchanged · {fusion?.health?.corrected ?? 0} corrected · {fusion?.health?.safeFallbacks ?? 0} safely kept the draft.</p>
             )}

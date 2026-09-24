@@ -493,3 +493,27 @@ test('stream event kinds rank the most telling frame, and nothing is not livenes
   assert.equal(claudeStreamEventKind('   '), null, 'no frame is not liveness');
   assert.equal(claudeStreamEventKind('half a chunk with no frame yet'), null);
 });
+
+
+test('Claude wire preserves tuple contracts in the required schema dialect', async () => {
+  const { Ajv2020 } = await import('ajv/dist/2020.js');
+  const tuple = { type: 'array', items: [{ const: 'completed' }, { const: 'failed' }],
+    additionalItems: false, minItems: 2 };
+  const schema = { type: 'object', properties: { states: tuple }, required: ['states'],
+    additionalProperties: false, examples: [{ items: ['payload data'] }] };
+  for (const custom of [false, true]) {
+    const tool = { name: 'fixture', description: 'tuple fixture', input_schema: schema };
+    const envelope = applyClaudeEnvelope({ body: JSON.stringify({ model: 'fixture-model',
+      messages: [{ role: 'user', content: 'test' }], tools: [custom ? { custom: tool } : tool] }) }, 'fixture-token');
+    const body = JSON.parse(String(envelope.body));
+    const actual = (custom ? body.tools[0].custom : body.tools[0]).input_schema;
+    const ajv = new Ajv2020({ strict: false });
+    assert.equal(ajv.validateSchema(actual), true, JSON.stringify(ajv.errors));
+    const valid = ajv.compile(actual);
+    for (const states of [['completed', 'failed']]) assert.equal(valid({ states }), true);
+    for (const states of [[], ['completed'], ['failed', 'completed'], ['completed', 'failed', 'extra']]) {
+      assert.equal(valid({ states }), false, JSON.stringify(states));
+    }
+    assert.deepEqual(actual.examples, schema.examples, 'instance examples are data, not schemas');
+  }
+});

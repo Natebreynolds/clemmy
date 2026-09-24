@@ -127,12 +127,14 @@ export function Decisions({ approvals, plans, workspaceChoosers, onResolved, onR
           acting={acting === row.approvalId}
           disabled={acting !== null}
           onReply={onReply}
-          onAct={(action) => run(
+          onAct={(action, note) => run(
             row.approvalId,
-            () => action === 'approve' ? approveApproval(row.approvalId) : rejectApproval(row.approvalId),
+            () => action === 'approve' ? approveApproval(row.approvalId) : rejectApproval(row.approvalId, note),
             action === 'approve'
               ? 'Approval recorded. Clem can continue when the exact task is ready.'
-              : 'Rejected. Clem will not perform that action.',
+              : note
+                ? 'Changes requested. Clem has your note and will revise before anything goes out.'
+                : 'Rejected. Clem will not perform that action.',
             action === 'approve'
               ? 'The approval could not be applied from this card. I refreshed its current status.'
               : 'The rejection could not be applied from this card. I refreshed its current status.',
@@ -179,7 +181,7 @@ function WorkspaceChooserCard({ chooser, index, acting, disabled, onChoose }: {
   );
 }
 
-type Act = (action: 'approve' | 'reject') => void;
+type Act = (action: 'approve' | 'reject', note?: string) => void;
 
 function PlanCard({ row, index, acting, disabled, onAct, onReply }: {
   row: PlanProposalRow;
@@ -259,7 +261,17 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
   onReply?: DecisionsProps['onReply'];
 }) {
   const [open, setOpen] = useState(false);
-  const details = approvalDetails(row);
+  // The server already unwrapped the carrier into the provider's own fields.
+  const details = row.presentation && row.presentation.details.length > 0 ? row.presentation.details : approvalDetails(row);
+  const isWorkflowGate = row.tool === 'workflow_approval_gate';
+  const [changing, setChanging] = useState(false);
+  const [changeNote, setChangeNote] = useState('');
+  // The words being approved, before the buttons: the first lines always,
+  // the rest one tap away.
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const [draftOpen, setDraftOpen] = useState(false);
+  const draftIsLong = draft.length > 320;
+  const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 319)}…` : draft;
   return (
     <article id={`inbox-approval:${row.approvalId}`} class="card card-approval rise" style={{ '--i': index }} tabIndex={-1}>
       <header class="card-head">
@@ -274,6 +286,17 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
       <h2 class="card-title">{approvalQuestion(row.subject)}</h2>
       {row.resourceFingerprint?.warning ? (
         <p class="card-warn">{row.resourceFingerprint.warning}</p>
+      ) : null}
+      {draft ? (
+        <figure class="approval-draft" aria-label="What you are approving">
+          <figcaption>Draft</figcaption>
+          <p>{shownDraft}</p>
+          {draftIsLong ? (
+            <button type="button" class="link-btn" aria-expanded={draftOpen} onClick={() => setDraftOpen(!draftOpen)}>
+              {draftOpen ? 'Show less' : 'Show the whole draft'}
+            </button>
+          ) : null}
+        </figure>
       ) : null}
       {details.length > 0 ? (
         <>
@@ -299,6 +322,31 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
         </>
       ) : null}
       <p class="approval-response-hint">Approve it, reject it, or tell me what you want changed.</p>
+      {isWorkflowGate && changing ? (
+        <form
+          class="inbox-answer"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!changeNote.trim()) return;
+            onAct('reject', changeNote.trim());
+            setChanging(false);
+          }}
+        >
+          <textarea
+            value={changeNote}
+            onInput={(event) => setChangeNote((event.target as HTMLTextAreaElement).value)}
+            disabled={disabled}
+            rows={3}
+            aria-label="What should change"
+            placeholder="What should change in this draft?"
+          />
+          <div class="card-actions">
+            <button type="submit" class="btn-approve" disabled={disabled || !changeNote.trim()}>Send changes</button>
+            <button type="button" class="btn-reply" disabled={disabled} onClick={() => setChanging(false)}>Cancel</button>
+          </div>
+          <p class="card-note">This stops the current draft and hands your note back to Clem to revise.</p>
+        </form>
+      ) : null}
       <footer class="card-actions">
         <button
           type="button"
@@ -309,6 +357,18 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
         >
           {acting ? 'Continuing…' : 'Yes, do it'}
         </button>
+        {isWorkflowGate ? (
+          <button
+            type="button"
+            class="btn-reply"
+            aria-expanded={changing}
+            aria-label={`Request changes to: ${row.subject}`}
+            disabled={disabled}
+            onClick={() => setChanging(!changing)}
+          >
+            Request changes
+          </button>
+        ) : null}
         <button
           type="button"
           class="btn-reject"

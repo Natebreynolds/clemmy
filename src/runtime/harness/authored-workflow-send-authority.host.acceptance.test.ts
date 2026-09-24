@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -38,6 +38,12 @@ const brackets = await import('./brackets.js');
 const capabilityEnvelopes = await import('../../agents/capability-envelope.js');
 const planScopes = await import('../../agents/plan-scope.js');
 const authorityAdapter = await import('./authored-workflow-write-authority.js');
+// These authority fixtures use a recording reviewer; never invoke paid models.
+test.beforeEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(async () => ({
+  verdict: 'compatible', reason: 'Recording reviewer accepts the fixture proposal.', proposalDigest: 'fixture-review',
+})));
+test.afterEach(() => authorityAdapter._setWorkflowMutationReviewerForTests(null));
+
 const callAuthority = await import('./accepted-turn-call-authority.js');
 const hostBindings = await import('./host-call-capability-binding.js');
 const logicalContracts = await import('./logical-call-contract.js');
@@ -101,6 +107,7 @@ function installOperation(input: {
   capabilityId: string;
   accountId: string;
   schema: Record<string, unknown>;
+  readOnly?: boolean;
 }) {
   composioSchemas.rememberToolSchema(
     input.operationId,
@@ -124,9 +131,9 @@ function installOperation(input: {
       version: 1,
       providerInputSchemaDigest,
       semanticName: input.operationId,
-      behaviorHints: { readOnly: false, destructive: false, idempotent: null, openWorld: false },
+      behaviorHints: { readOnly: input.readOnly === true, destructive: false, idempotent: null, openWorld: false },
     },
-    effect: 'external_write',
+    effect: input.readOnly ? 'read' : 'external_write',
     destination: { family: 'external_message', posture: 'named_existing' },
     accountId: input.accountId,
     idempotency: { required: true, policy: 'key_before_dispatch' },
@@ -168,7 +175,9 @@ function installOperation(input: {
   portBodies[input.operationId] = 0;
   const invoke = async () => {
     portBodies[input.operationId] = (portBodies[input.operationId] ?? 0) + 1;
-    return { successful: true, data: { id: `msg-${portBodies[input.operationId]}`, delivered: true } };
+    return input.readOnly
+      ? { successful: true, data: { records: Array.from({ length: 100 }, (_, id) => ({ id, text: 'retained'.repeat(10) })) } }
+      : { successful: true, data: { id: `msg-${portBodies[input.operationId]}`, delivered: true } };
   };
   const entry = productionAdapters.registeredCapabilityFromManifest({
     manifest,
@@ -183,7 +192,10 @@ function installOperation(input: {
   });
   assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
     productionPorts.productionPortIdentityFromManifest(manifest),
-    { invoke: invoke as never },
+    { invoke: invoke as never, ...(input.readOnly ? {
+      admitPreparation: () => {}, prepareInvocation: async () => ({ fixture: input.operationId }),
+      invokeWithPreparation: async (_proof: unknown, work: () => Promise<unknown>) => work(),
+    } : {}) },
   ), { ok: true });
   return { manifest, entry, providerInputSchemaDigest };
 }
@@ -207,11 +219,16 @@ const DELETE = installOperation({
   accountId: 'account:workflow:messages-owner',
   schema: DELETE_SCHEMA,
 });
+const READ = installOperation({
+  operationId: 'FIXTURE_RECORDS_FETCH', capabilityId: 'cap:workflow:records-fetch',
+  accountId: 'account:workflow:messages-owner', readOnly: true,
+  schema: { type: 'object', properties: { page: { type: 'integer' } }, required: ['page'], additionalProperties: false },
+});
 manifestStores.installCapabilityManifestStore(
-  manifestStores.createCapabilityManifestStore([SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest], { durable: true }),
+  manifestStores.createCapabilityManifestStore([SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest, READ.manifest], { durable: true }),
 );
 catalogs.installHostCapabilityCatalogFactory(
-  catalogs.createHostCapabilityCatalogFactory([SEND.entry, FOREIGN_SEND.entry, DELETE.entry]),
+  catalogs.createHostCapabilityCatalogFactory([SEND.entry, FOREIGN_SEND.entry, DELETE.entry, READ.entry]),
 );
 const sendIdentity = catalogs.canonicalCatalogIdentityOf(SEND.entry)!;
 const foreignIdentity = catalogs.canonicalCatalogIdentityOf(FOREIGN_SEND.entry)!;
@@ -767,4 +784,165 @@ test('the step PlanScope never auto-approves the send by itself: the exact recei
   const scope = planScopes.getPlanScope(fixture.session.id);
   assert.ok(scope);
   assert.equal('allowAnySend' in (scope as object), false, 'the TTL-wide send flag no longer exists');
+});
+
+
+test('constraint rejection repairs the proposal without dispatch or spending the authored send', async () => {
+  const fixture = createSendStepFixture({ prompt: `Send the standup using ${SEND.manifest.operationId}. Preserve the authored subject.` });
+  const before = portBodies[SEND.manifest.operationId]!;
+  const reviewed: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
+    assert.match(input.instructions, /Preserve the authored subject/);
+    assert.equal(input.tool, SEND.manifest.operationId.toLowerCase());
+    reviewed.push(String(input.args.subject));
+    return { verdict: input.args.subject === 'WRONG' ? 'conflict' : 'compatible',
+      reason: input.args.subject === 'WRONG' ? 'Restore the authored subject.' : 'The subject matches.',
+      proposalDigest: 'recording-review' };
+  });
+  try {
+    const carrier = carrierTool();
+    const model = stubModel([
+      [sendCall('constraint-bad', SEND.manifest.operationId, { ...SEND_ARGS, subject: 'WRONG' })],
+      [sendCall('constraint-corrected')],
+      [textMsg('corrected send completed')],
+    ]);
+    const agent = { model, tools: [carrier.tool] };
+    bindSurface(fixture, agent, [carrier.tool]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.deepEqual(reviewed, ['WRONG', SEND_ARGS.subject], JSON.stringify(outcome.history));
+    assert.equal(portBodies[SEND.manifest.operationId], before + 1);
+    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['constraint-corrected']);
+    assert.deepEqual(dispositionMarkers(outcome.history), [{ disposition: 'refused_pre_dispatch', retry: 'replan' }]);
+    assert.match(JSON.stringify(outcome.history), /repair_arguments/);
+    assert.deepEqual(pendingApprovals(fixture), []);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+for (const failure of ['uncertain', 'outage'] as const) {
+  test(`constraint review ${failure} never falls through to an authored send grant`, async () => {
+    const fixture = createSendStepFixture({});
+    const before = portBodies[SEND.manifest.operationId]!;
+    let reviewed = 0;
+    authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+      reviewed++;
+      if (failure === 'outage') throw new Error('recording reviewer offline');
+      return { verdict: 'uncertain', reason: 'A required destination observation is missing.', proposalDigest: 'fixture-review' };
+    });
+    try {
+      const carrier = carrierTool();
+      const model = stubModel([[sendCall(`review-${failure}`)], [textMsg('Write could not be verified.')]]);
+      const agent = { model, tools: [carrier.tool] };
+      bindSurface(fixture, agent, [carrier.tool]);
+      const outcome = await runProductionHost(fixture, agent);
+      assert.equal(reviewed, 1);
+      assert.equal(portBodies[SEND.manifest.operationId], before);
+      assert.deepEqual(nonRefusedSettlements(fixture), []);
+      assert.deepEqual(pendingApprovals(fixture), []);
+      assert.match(JSON.stringify(outcome.history), /workflow_write_constraints_un/);
+    } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+  });
+}
+
+
+test('a positive constraint verdict cannot revive a workflow stopped while review was running', async () => {
+  const fixture = createSendStepFixture({});
+  const before = portBodies[SEND.manifest.operationId]!;
+  let reviewed = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviewed++;
+    const run = JSON.parse(readFileSync(fixture.runFile, 'utf8'));
+    writeFileSync(fixture.runFile, JSON.stringify({ ...run, status: 'cancelled' }));
+    return { verdict: 'compatible', reason: 'The proposal was compatible before cancellation.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const carrier = carrierTool();
+    const model = stubModel([[sendCall('stopped-during-review')], [textMsg('Stopped.')]]);
+    const agent = { model, tools: [carrier.tool] };
+    bindSurface(fixture, agent, [carrier.tool]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(reviewed, 1);
+    assert.equal(portBodies[SEND.manifest.operationId], before);
+    assert.deepEqual(nonRefusedSettlements(fixture), []);
+    assert.match(JSON.stringify(outcome.history), /workflow_write_authority_changed_during_review/);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+test('a nested work_call cannot replace a constraint refusal with its preparation consent', async () => {
+  const fixture = createSendStepFixture({});
+  const before = portBodies[SEND.manifest.operationId]!;
+  let reviewed = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviewed++;
+    return { verdict: 'conflict', reason: 'The proposed message violates the saved rule.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const { buildWorkCall } = await import('../../tools/work-call.js');
+    const carrier = brackets.wrapToolForHarness(buildWorkCall({
+      reachableBuiltinNames: new Set(['composio_execute_tool']), firstClassNames: new Set(),
+      requireHostPlan: true, hostPlanningReady: () => true,
+    }) as never);
+    const model = stubModel([
+      [{ type: 'function_call', callId: 'nested-constraint-conflict', name: 'work_call', status: 'completed',
+        arguments: JSON.stringify({ name: 'composio_execute_tool', args_json: JSON.stringify({
+          tool_slug: SEND.manifest.operationId, connected_account_id: SEND.manifest.accountId,
+          arguments: JSON.stringify(SEND_ARGS),
+        }) }) }],
+      [textMsg('The message was not sent.')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    bindSurface(fixture, agent, [carrier]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(reviewed, 1, JSON.stringify(outcome.history));
+    assert.equal(portBodies[SEND.manifest.operationId], before);
+    assert.deepEqual(nonRefusedSettlements(fixture), []);
+    assert.match(JSON.stringify(outcome.history), /workflow_write_constraint_conflict/);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+test('a refused authored mutation can gather missing evidence through a proven read carrier and is reviewed again', async () => {
+  const readIdentity = catalogs.canonicalCatalogIdentityOf(READ.entry)!;
+  const fixture = createSendStepFixture({ identities: [sendIdentity, readIdentity],
+    prompt: `Read ${READ.manifest.operationId}, verify the destination, then send the approved standup with ${SEND.manifest.operationId}.` });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const readBefore = portBodies[READ.manifest.operationId]!;
+  const writeBefore = portBodies[SEND.manifest.operationId]!;
+  const reviews: number[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    const reads = portBodies[READ.manifest.operationId]! - readBefore;
+    reviews.push(reads);
+    return { verdict: reads >= 2 ? 'compatible' : 'conflict',
+      reason: 'A fresh destination read is required.', proposalDigest: 'fixture-review' };
+  });
+  const carrier = brackets.wrapToolForHarness({ type: 'function', name: 'composio_execute_tool',
+    description: 'Invoke an exact catalog operation.',
+    parameters: { type: 'object', properties: { tool_slug: { type: 'string' }, arguments: { type: 'string' } },
+      required: ['tool_slug', 'arguments'] }, needsApproval: async () => false,
+    invoke: async () => { throw new Error('Only the bound production port may execute.'); },
+  });
+  const call = (id: string, op: string, args: object) => toolCall(id, carrier.name,
+    { tool_slug: op, arguments: JSON.stringify(args) });
+  const model = stubModel([
+    [call('first-evidence', READ.manifest.operationId, { page: 1 })],
+    [call('unverified-write', SEND.manifest.operationId, SEND_ARGS)],
+    [call('missing-evidence', READ.manifest.operationId, { page: 2 })],
+    [call('verified-write', SEND.manifest.operationId, SEND_ARGS)],
+    [textMsg('Completed with verified evidence.')],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindSurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
+  assert.equal(portBodies[READ.manifest.operationId]! - readBefore, 2, JSON.stringify(outcome));
+  assert.equal(portBodies[SEND.manifest.operationId]! - writeBefore, 1, JSON.stringify(outcome));
+  assert.deepEqual(reviews, [1, 2]);
+  assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id),
+    ['first-evidence', 'missing-evidence', 'verified-write']);
+  const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+  const full = readWorkflowTargetEvidence(fixture.workflowRunId);
+  const compact = readWorkflowTargetEvidence(fixture.workflowRunId, { compactResults: true });
+  assert.ok(compact.summary.length < full.summary.length / 2,
+    'the mutation review gets an index instead of repeated inline record dumps');
+  const ref = compact.results?.find(row => row.logicalToolCallId === 'missing-evidence')?.resultHandleId;
+  assert.ok(ref);
+  const retained = compact.evidence?.resolve(ref!)?.value as { data: { records: unknown[] } };
+  assert.equal(retained.data.records.length, 100, 'every record remains available for exact queries');
 });

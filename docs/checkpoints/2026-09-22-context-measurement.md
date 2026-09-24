@@ -1,0 +1,7 @@
+# Context measurement before further reductions
+
+The installed d631668f6 registry audit for a fresh workflow-list request exposes 24 tools, 72,747 serialized bytes. workflow_create=18,194; workflow_update=18,098; space_save=13,585: together 68.6%. This is a registry/hot-set observation, not a captured provider request or a measured token saving. Actual provider receipts remain token authority. Native authoring stays first-class.
+
+The live Opus source 286060 prompt-composition row incorrectly labels the common host loop as codex and reports zero tool schemas beside 26,111 estimated schema tokens. The host loop now labels its own lane host and supplies the actual advertised tool names. The same schema projection/estimator exposes per-tool estimated tokens and UTF-8 bytes, separately from deferred index descriptions, without storing the parameter payloads or changing tool definitions. Budget totals retain the existing projection and fallback. Nine focused tests and typecheck passed; installed acceptance is pending.
+
+Next verify this telemetry in the installed app during the next controlled workflow test, then choose reductions from actual dominant schema/description costs and validate native creation/update/Space authoring after each change. Never equate estimated prompt bytes with provider-billed tokens, or trade away native first-class capability to manufacture a smaller prompt. Jev critical-path overhead and broad release gates remain open.

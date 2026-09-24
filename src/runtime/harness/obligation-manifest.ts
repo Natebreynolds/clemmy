@@ -1,3 +1,4 @@
+import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
 import { supersededReviewedFileCalls } from './reviewed-file-correction.js';
 /**
@@ -70,7 +71,7 @@ export interface ObligationManifestNode {
   operationId: string;
   operationMode: OperationEvidenceMode;
   contentCommitMode?: 'documented_atomic_input';
-  writeEvidenceMode?: 'provider_acknowledgement_v1';
+  writeEvidenceMode?: 'provider_acknowledgement_v1' | 'host_workflow_dispatch_v1';
   /** Frozen structured-deliverable contract copied from the exact executable
    * graph node. Optional for legacy/non-collection nodes. */
   cardinality?: number;
@@ -381,7 +382,9 @@ export function compileObligationManifest(input: {
       && effectKind === 'external_write' && !hasSourceRead && !contentCommitMode
       && !sealed.verification && evidenceContract.mode === 'create'
       && !evidenceContract.requiresStaleReconciliation;
-    const obligations: EvidenceObligation[] = acknowledgement
+    const hostDispatch = effectKind === 'local_write' && sealed?.effect === 'local_write'
+      && sealed.logicalToolName === operation.resolvedTool && declaresWorkflowDispatchReceipt(operation.resolvedTool);
+    const obligations: EvidenceObligation[] = (acknowledgement || hostDispatch)
       ? ['commit_effect', 'execution_terminal']
       : attachEvidenceObligations({
       effect: effectKind,
@@ -404,7 +407,8 @@ export function compileObligationManifest(input: {
       operationId: operation.operationId,
       operationMode: evidenceContract.mode,
       ...(contentCommitMode ? { contentCommitMode } : {}),
-      ...(acknowledgement ? { writeEvidenceMode: 'provider_acknowledgement_v1' as const } : {}),
+      ...(acknowledgement ? { writeEvidenceMode: 'provider_acknowledgement_v1' as const }
+        : hostDispatch ? { writeEvidenceMode: 'host_workflow_dispatch_v1' as const } : {}),
       ...(Number.isSafeInteger(executableNode.cardinality)
         && (executableNode.cardinality ?? 0) > 0
         ? { cardinality: executableNode.cardinality }

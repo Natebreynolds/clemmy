@@ -209,12 +209,27 @@ function accessNegativeBefore(positions: number[], index: number, text: string):
   const negative = nearestBefore(positions, index, text);
   if (negative < 0) return negative;
   const span = text.slice(negative, index);
+  // A copular category contrast describes the task/actor; it does not revoke
+  // connector access ("this is a framework test, not an integration repair").
+  // Keep negative access predicates authoritative, including inside a contrast.
+  const prefix = text.slice(clauseStart(text, negative), negative);
+  const accessPredicate = /\b(?:use|using|call|calling|access|accessing|query|querying|invoke|invoking|connect|connecting|read|reading|touch|touching|search|searching)\b/i;
+  if (/^not\s+(?:a|an)\s/i.test(span)
+    && /\b(?:is|are|was|were)\b/i.test(prefix)
+    && !accessPredicate.test(span)) return -1;
+
   // A retained execution report is evidence, not an access instruction.
   // "Never dispatched ... Provider attempts" must not ban that provider now.
   if (/^(?:never|not)\s+(?:(?:previously|already)\s+)?(?:dispatched|executed|called|used|queried|connected|received|returned)\b/i.test(span)) return -1;
   // "does not forbid reading MCP tools" negates a prohibition, not access.
   if (/^(?:not|do\s+not|don't|dont|never)\s+(?:forbid|prohibit|prevent|restrict|block)\b/i.test(span)) return -1;
-  const preservesConfiguration = /\b(?:changes?\s+to|changing|reconfigur(?:e|ing)|modifying|modify|migrat(?:e|ing)|repair(?:ing)?)\b/i.test(span);
+  // "No connector settings have changed" reports configuration state; the
+  // connector noun precedes the predicate, unlike "no changes to X".
+  const clauseTail = text.slice(negative).split(/[.!?;\n]/, 1)[0] ?? '';
+  if (/^no\s/i.test(span)
+    && /\b(?:settings|configuration)\s+(?:have|has|had|were|was|are|is)\s+(?:been\s+)?(?:changed|modified|reconfigured|updated)\b/i.test(clauseTail)
+    && !accessPredicate.test(clauseTail)) return -1;
+  const preservesConfiguration = /\b(?:changes?\s+to|change|changing|reconfigur(?:e|ing)|modifying|modify|migrat(?:e|ing)|repair(?:ing)?)\b/i.test(span);
   // A later access verb is a separate prohibition: "do not change or use X".
   const alsoRefusesAccess = /\b(?:use|using|call|calling|access|accessing|query|querying|invoke|invoking|connect|connecting)\b/i.test(span);
   return preservesConfiguration && !alsoRefusesAccess ? -1 : negative;
@@ -324,6 +339,7 @@ export function compileMcpAccessConstraint(
     // they just permitted, so decline to compile and let the caller's ordinary
     // routing decide — a constraint we cannot read is not a constraint we get
     // to invent.
+    if (exceptions.length > 0 && deny.size > 0) return { mode: 'deny_set', allow: [], deny: [...deny].sort() };
     if (exceptions.length > 0) return { mode: 'none', allow: [], deny: [] };
     return { mode: 'deny_all', allow: [], deny: [] };
   }

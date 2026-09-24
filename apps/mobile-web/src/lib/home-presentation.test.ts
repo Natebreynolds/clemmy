@@ -339,10 +339,10 @@ test('the remainder counts every class in the pane, never just the stalled ones'
 // ─── the header row ─────────────────────────────────────────────────────────
 
 test('the header carries a signal only for what the screen cannot show itself', () => {
-  // Home leads with the answer and lists the work, so both shortcuts are noise
-  // there — which leaves identity, place, and connection.
+  // Home leads with the answer, so the pill is noise there; it no longer lists
+  // Clem's work (Activity owns it), so the work chip is Home's door to it.
   const home = phoneHeaderChrome({ tab: 'home', needsYouSignal: true });
-  assert.deepEqual(home, { needsPill: false, workChip: false });
+  assert.deepEqual(home, { needsPill: false, workChip: true });
 
   // Needs you shows its own list; Activity shows its own runs.
   assert.equal(phoneHeaderChrome({ tab: 'inbox', needsYouSignal: true }).needsPill, false);
@@ -393,30 +393,11 @@ test('there is ONE definition of running in the app, and Home reads it', () => {
     'unfinished is a class the presenter names, not a subtraction');
 });
 
-test('the work pane is derived, capped, and its remainder has a door', () => {
+test('Home draws no work pane: Activity owns the rows, the lead and the header chip lead there', () => {
   const home = read('../screens/Home.tsx');
-  assert.match(home, /const workPane = homeWorkPane\(\{/);
-  assert.match(home, /max: MAX_WORK_ROWS,/);
-  assert.match(home, /running: \(\) => \(workPane\.show \?/, 'an empty pane is never mounted');
-  assert.match(home, /pane-head">\{workPane\.title\}<\/h2>/, 'the heading is derived');
-  assert.doesNotMatch(home, /pane-head">Running<\/h2>/,
-    'so a pane of blocked runs cannot be headed "Running"');
-  assert.match(home, /\.slice\(0, workPane\.shown\)/, 'the 21-row list is capped like every other');
-  assert.match(home, /\{workRows\.map\(/, 'and the capped rows are what render');
-  assert.doesNotMatch(home, /\{workingView\.entries\.map\(/, 'never the uncapped projection');
-  assert.match(home, /\{workPane\.moreLabel \?/);
-  assert.match(home, /<span>\{workPane\.moreLabel\}<\/span>/,
-    'the remainder is named against Activity, which renders all of it');
-});
-
-test('the rows under the heading speak the same tense the heading does', () => {
-  const home = read('../screens/Home.tsx');
-  assert.match(home, /\{runStatusLabel\(presented\)\}/,
-    'a stalled run says it stopped, instead of printing the phase word it died on');
-  assert.doesNotMatch(home, /waiting \? lifecycleLabel\(entry\.lifecycle\)/,
-    'the row no longer prints "Running" under a heading reading "Still open"');
-  assert.match(home, /const waiting = presented\.membership === 'needs_you';/,
-    'and the warn accent means a person is the blocker, not merely not-live');
+  assert.match(home, /running: \(\) => null,/, 'a stored running pane renders nothing');
+  assert.doesNotMatch(home, /RunningRow|workRows|homeWorkPane\(/);
+  assert.doesNotMatch(home, /\{workingView\.entries\.map\(/, 'no run rows on Home at all');
 });
 
 test('the lead is fed the demand the Inbox count cannot see, and how old that count is', () => {
@@ -426,7 +407,7 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
     'a run parked on a question reaches the lead, so it cannot answer over that row');
   assert.match(home, /countLive: needsYouCountLive,/);
   assert.match(home, /countAge: needsYouCountAge,/);
-  assert.match(home, /workPaneShown: paneSet\.has\('running'\) && workPane\.show,/);
+  assert.match(home, /workPaneShown: false,/, 'with no pane, the lead itself offers Activity');
   assert.match(home, /\{lead\.asOf \? <p class="home-lead-asof">\{lead\.asOf\}<\/p> : null\}/,
     'and the age is actually rendered');
   assert.match(home, /<div class="home-lead-say" aria-live="polite">/,

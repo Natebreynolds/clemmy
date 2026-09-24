@@ -655,6 +655,7 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'resolvedTools',
     'externalMcpToolNames',
     'context',
+    'retainedResultIds',
     'instructions',
     'expectedOutput',
     'intent',
@@ -664,6 +665,7 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     // requirement so workers bind instead of concluding a capability is
     // missing (nullable; strict mode keeps it in required).
     'expectedWork',
+    'itemContexts',
     'items',
   ]);
   assert.equal(runWorker.parameters?.additionalProperties, false);
@@ -1416,106 +1418,88 @@ test('a Plan delegates Claude investigation through the host with inherited high
   }
 });
 
-test('fresh-host run_worker is enabled and invokes a worker before any plan is compiled', async () => {
+test('fresh-host run_worker invokes a host-owned child before any plan is compiled', async (t) => {
   resetEventLog();
-  const session = createSession({ kind: 'chat', title: 'claude sdk worker route' });
-  const prev: Record<string, string | undefined> = {
-    AUTH_MODE: process.env.AUTH_MODE,
-    CLEMMY_CLAUDE_AGENT_SDK_WORKER: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER,
-    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
-  };
-  let captured: any;
+  const session = createSession({ kind: 'chat', title: 'fresh host worker route' });
+  const sourcePath = path.join(TMP_HOME, 'worker-source.txt');
+  const nonce = 'HOST-WORKER-READ-0922';
+  writeFileSync(sourcePath, nonce);
+  const prevAuth = process.env.AUTH_MODE;
+  let modelCalls = 0;
+  const requests: string[] = [];
   try {
     process.env.AUTH_MODE = 'claude_oauth';
-    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER = 'on';
-    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
-    setClaudeAgentSdkWorkerRunForTest(async (options) => {
-      captured = options;
-      return {
-        text: 'sdk worker used skill',
-        sessionId: 'sdk-worker-session',
-        model: 'claude-sonnet-4-6',
-        toolUses: ['mcp__clementine-local__skill_read'],
-      };
+    setClaudeAgentSdkWorkerRunForTest(async () => {
+      assert.fail('fresh host delegation must not enter the legacy SDK worker');
     });
-
-    const acceptedText = 'Design one report section using the taste skill.';
+    const model: import('@openai/agents').Model = {
+      async getResponse(request) {
+        requests.push(JSON.stringify(request));
+        modelCalls += 1;
+        return {
+          responseId: `fresh-worker-${modelCalls}`, usage: new Usage(),
+          output: modelCalls === 1
+            ? [{ type: 'function_call', callId: 'worker-local-read', name: 'read_file',
+                arguments: JSON.stringify({ path: sourcePath, offset: null, limit: null }) }]
+            : [{ type: 'message', role: 'assistant', status: 'completed',
+                content: [{ type: 'output_text', text: nonce, providerData: {} }] }],
+        } as unknown as import('@openai/agents').ModelResponse;
+      },
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      },
+    };
+    t.mock.method(RouterModelProvider.prototype, 'getModel', () => model);
+    const acceptedText = 'Read the supplied local fixture and return its text.';
     const anchor = anchorAcceptedTask(session.id, acceptedText);
     const { actionExpectedWorkRequired } = await import('../runtime/harness/expected-work-admission.js');
-    assert.equal(actionExpectedWorkRequired({
-      sessionId: session.id,
-      sourceUserSeq: anchor.sourceUserSeq,
-    }), false, 'fresh accepted input has no compiled expected-work contract');
+    assert.equal(actionExpectedWorkRequired({ sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq }), false);
     const agent = await buildOrchestratorAgent({
-      sessionId: session.id,
-      sourceUserSeq: anchor.sourceUserSeq,
-      userInput: acceptedText,
-      acceptedRoute: 'act',
-      hostFreshPlanning: freshPlanningFixture(session.id, anchor.sourceUserSeq),
-      allowedToolNames: ['run_worker', 'skill_read'],
-      mcpToolScope: {
-        authority: 'none',
-        reason: 'local worker preparation needs no external capabilities',
-        allowedServerSlugs: [],
-        toolPatterns: [],
-        maxTools: 0,
-      },
+      sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq, userInput: acceptedText,
+      acceptedRoute: 'act', hostFreshPlanning: freshPlanningFixture(session.id, anchor.sourceUserSeq),
+      allowedToolNames: ['run_worker', 'read_file'],
+      mcpToolScope: { authority: 'none', reason: 'local fixture only', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
     });
-    // Use the SDK's filtered surface: agent.tools alone includes tools hidden
-    // by isEnabled, which is why the original route-only test missed this wall.
     const runContext = new RunContext({ sessionId: session.id });
-    const enabledTools = await agent.getAllTools(runContext);
-    const runWorker = enabledTools.find((t) => t.name === 'run_worker') as {
-      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    const runWorker = (await agent.getAllTools(runContext)).find(tool => tool.name === 'run_worker') as {
+      invoke: (context: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
-    assert.ok(runWorker, 'local delegation must be enabled before plan_task');
-
-    const packet = {
-      objective: 'Design one report section using the taste skill.',
-      item: 'report hero',
-      resolvedTools: 'skill_read',
-      externalMcpToolNames: null,
-      context: 'Use the installed taste skill.',
-      instructions: 'Call skill_read before writing the design.',
-      expectedOutput: 'One compact design direction.',
-      intent: 'design',
-    };
+    assert.ok(runWorker, 'delegation must be enabled before plan_task');
+    const packet = { objective: acceptedText, item: 'local fixture', resolvedTools: 'read_file',
+      externalMcpToolNames: null, context: sourcePath, instructions: 'Read the local file.',
+      expectedOutput: 'The exact file text.', intent: 'research' };
     const input = JSON.stringify(packet);
-    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
-      runContext,
-      input,
-      { toolCall: { name: 'run_worker', callId: 'call_worker_claude_design', arguments: input } },
-    ));
-
-    assert.equal(result, 'sdk worker used skill');
-    assert.equal(captured.modelId.startsWith('claude-'), true);
-    assert.match(captured.prompt, /WORKER JOB PACKET/);
-    assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
-    assert.equal(captured.sessionId, session.id);
-    assert.equal(captured.sourceUserSeq, anchor.sourceUserSeq);
-    assert.equal(captured.workerScope, true, 'delegation retains worker effect restrictions');
-    assert.ok(captured.maxTurns > 0 && Number.isFinite(captured.maxTurns));
-    assert.equal(captured.nativeMcpToolScope, null, 'enabling delegation retains the denied external scope');
+    const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(runContext, input,
+      { toolCall: { name: 'run_worker', callId: 'fresh-host-worker', arguments: input } }));
+    assert.equal(result, nonce);
+    assert.equal(modelCalls, 2);
+    assert.match(requests[1]!, new RegExp(nonce), 'the actual tool result reaches the child');
     const routed = listEvents(session.id, { types: ['worker_model_routed'] });
-    const sdkEvent = routed.find((event) => (event.data as { transport?: string }).transport === 'claude_agent_sdk_worker');
-    assert.ok(sdkEvent, 'expected SDK worker telemetry event');
-    assert.deepEqual((sdkEvent.data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
+    assert.ok(routed.some(event => event.data.transport === 'host_harness'));
+    assert.equal(routed.some(event => event.data.transport === 'claude_agent_sdk_worker'), false);
+    const { openEventLog, getSession } = await import('../runtime/harness/eventlog.js');
+    const children = openEventLog().prepare("SELECT id FROM sessions WHERE json_extract(metadata_json, '$.parentSessionId') = ?")
+      .all(session.id) as Array<{ id: string }>;
+    assert.equal(children.length, 1);
+    const childId = children[0]!.id;
+    assert.notEqual(childId, session.id);
+    assert.equal(getSession(childId)?.metadata?.workerScope, true);
+    const childSource = listEvents(childId, { types: ['user_input_received'] })[0]!;
+    assert.equal((childSource.data.delegatedWorker as { parentSourceUserSeq: number }).parentSourceUserSeq, anchor.sourceUserSeq);
+    const settlements = openEventLog().prepare('SELECT outcome_kind FROM logical_call_settlements WHERE session_id = ? AND logical_tool_call_id = ?')
+      .all(childId, 'worker-local-read') as Array<{ outcome_kind: string }>;
+    assert.deepEqual(settlements, [{ outcome_kind: 'succeeded' }]);
     const results = listEvents(session.id, { types: ['worker_result'] });
     assert.equal(results.length, 1);
-    assert.equal((results[0].data as { item?: string }).item, 'report hero');
-    assert.equal((results[0].data as { ok?: boolean }).ok, true);
-    assert.equal((results[0].data as { model?: string }).model, 'claude-sonnet-4-6');
-    assert.deepEqual((results[0].data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
-    assert.equal(actionExpectedWorkRequired({
-      sessionId: session.id,
-      sourceUserSeq: anchor.sourceUserSeq,
-    }), false, 'delegation must not manufacture a planning contract');
+    assert.equal(results[0]!.data.ok, true);
+    assert.equal(actionExpectedWorkRequired({ sessionId: session.id, sourceUserSeq: anchor.sourceUserSeq }), false,
+      'delegation must not manufacture a parent planning contract');
   } finally {
     setClaudeAgentSdkWorkerRunForTest(null);
-    for (const [key, value] of Object.entries(prev)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+    if (prevAuth === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = prevAuth;
   }
 });
 
@@ -3617,5 +3601,32 @@ test('worker failures claim zero dispatch only when the batch proves no body sta
     assert.match(String(result), /Work may have started/);
     assert.match(String(result), /do not replay unresolved work/);
     assert.doesNotMatch(String(result), /NOT started|No item was dispatched/);
+  }
+});
+
+test('fresh-host account warmup respects resolved external authority and preserves cold external readiness', async () => {
+  const client = await import('../integrations/composio/client.js');
+  client.__test__.setComposioApiKeyOverride('controlled-fixture-key');
+  try {
+    for (const authority of ['none', 'catalog'] as const) {
+      let refreshes = 0;
+      client.__test__.setConnectedAccountsLoader(async () => { refreshes += 1; return []; });
+      resetEventLog();
+      const session = createSession({ kind: 'chat' });
+      const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+        data: { text: 'Inspect the configured capability.' } });
+      await buildOrchestratorAgent({
+        sessionId: session.id, sourceUserSeq: source.seq, userInput: 'Inspect the configured capability.',
+        acceptedRoute: 'act', hostFreshPlanning: freshPlanningFixture(session.id, source.seq),
+        mcpToolScope: { authority, reason: 'Controlled resolved authority', allowedServerSlugs: [],
+          maxTools: authority === 'none' ? 0 : 10, allowAll: authority === 'catalog' },
+      });
+      assert.equal(refreshes, authority === 'none' ? 0 : 1,
+        'only a turn allowed external capability may await connected-account inventory');
+      if (authority === 'catalog') assert.notEqual(client.peekCurrentConnectedToolkits(), null);
+    }
+  } finally {
+    client.__test__.setConnectedAccountsLoader(null);
+    client.__test__.setComposioApiKeyOverride(null);
   }
 });

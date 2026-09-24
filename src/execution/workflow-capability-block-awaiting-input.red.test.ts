@@ -179,14 +179,16 @@ test('disconnected/auth block is a Needs You item with one concrete connect-and-
     toolkit: 'alpha',
     retryCount: 1,
   });
-  assert.match(runRecord.pendingInput.nextAction, /Settings → Connections/i);
-  assert.match(runRecord.pendingInput.nextAction, /retry run capability-blocked-digest-run/i);
+  assert.match(runRecord.pendingInput.nextAction, /Connect page/i);
+  assert.match(runRecord.pendingInput.nextAction, /retry it from Needs you/i);
+  assert.doesNotMatch(runRecord.pendingInput.nextAction, /capability-blocked-digest-run/,
+    'a person reads this line; the run id lives on the typed dependency');
 
   const notification = getNotification(`workflow-${RUN_ID}-capability-alpha`);
   assert.ok(notification);
   assert.equal(isNeedsAttentionNotification(notification), true);
   assert.match(notification.title, /Workflow needs you/i);
-  assert.match(notification.body, /Settings → Connections/i);
+  assert.match(notification.body, /Connect page/i);
   assert.deepEqual(notification.metadata?.resolution, runRecord.pendingInput.resolution);
 });
 
@@ -244,7 +246,7 @@ test('ambiguous account block asks one visible bounded question and cannot timer
   assert.deepEqual(runRecord.pendingInput.resolution, {
     kind: 'choose_account',
     actionTool: 'workflow_capability_resolve',
-    accountCandidates: choices.candidates,
+    accountCandidates: choices.candidates.map(candidate => ({ ...candidate, label: candidate.accountId })),
     choiceSetDigest: choices.digest,
     choiceTotal: 2,
     choicesTruncated: false,
@@ -258,7 +260,7 @@ test('ambiguous account block asks one visible bounded question and cannot timer
   assert.ok(notification);
   assert.equal(isNeedsAttentionNotification(notification), true);
   assert.match(notification.title, /Workflow needs you — choose an account for alpha/i);
-  assert.match(notification.body, /Choose the exact account ID in Needs You/i);
+  assert.match(notification.body, /Choose the account in Needs you\. I will save that choice and resume this same run\./i);
   assert.deepEqual(notification.metadata?.resolution, runRecord.pendingInput.resolution);
 });
 

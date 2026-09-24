@@ -253,11 +253,11 @@ test('the Claude lane receives the same turn-bound candidates as the Codex lane'
   assert.ok(resolved.candidates.some((c) => c.identifier === CALENDAR_SLUG), 'no candidate to deliver');
 
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
-  const seen: Array<{ tools: string[] | undefined; systemAppend: string }> = [];
+  const seen: Array<{ tools: string[] | undefined; systemAppend: string; turnContext: string }> = [];
   setClaudeAgentSdkBrainRunForTest((async (options: {
-    allowedLocalMcpTools?: string[]; systemAppend?: string;
+    allowedLocalMcpTools?: string[]; systemAppend?: string; turnContext?: string;
   }) => {
-    seen.push({ tools: options.allowedLocalMcpTools, systemAppend: options.systemAppend ?? '' });
+    seen.push({ tools: options.allowedLocalMcpTools, systemAppend: options.systemAppend ?? '', turnContext: options.turnContext ?? '' });
     return {
       text: 'ok', sessionId: 'sess-claude-lane', model: 'claude-test',
       toolUses: [], successfulToolUses: [],
@@ -275,9 +275,10 @@ test('the Claude lane receives the same turn-bound candidates as the Codex lane'
   }
 
   assert.equal(seen.length, 1, 'the Claude transport was never invoked');
-  assert.match(seen[0]!.systemAppend, new RegExp(CALENDAR_SLUG),
+  assert.match(seen[0]!.turnContext, new RegExp(CALENDAR_SLUG),
     'the Claude lane never saw the advisory candidate card');
-  assert.doesNotMatch(seen[0]!.systemAppend, /timeMin|2026-08/,
+  assert.doesNotMatch(seen[0]!.systemAppend, new RegExp(CALENDAR_SLUG), 'the current candidate must not churn the stable prefix');
+  assert.doesNotMatch(seen[0]!.turnContext, /timeMin|2026-08/,
     'the candidate card leaked prior invocation arguments into the Claude lane');
   if (seen[0]!.tools) {
     assert.ok(seen[0]!.tools.includes('composio_execute_tool'),

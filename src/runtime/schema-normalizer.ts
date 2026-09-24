@@ -518,3 +518,83 @@ export function relaxJsonSchemaForDeferred(schemaValue: unknown): unknown {
   }
   return out;
 }
+
+/** Decode nulls introduced by the model-facing optional-field projection.
+ * Only the original schema may establish omission semantics. Explicit nullable
+ * values, required fields, opaque payloads and unknown properties stay intact.
+ * Ambiguous unions are left alone rather than guessing a branch's semantics. */
+export function decodeProjectedOptionalNulls(value: unknown, schema: z.ZodTypeAny): unknown {
+  const def = (schema as unknown as { _def: {
+    type?: string; innerType?: z.ZodTypeAny; element?: z.ZodTypeAny;
+    valueType?: z.ZodTypeAny; options?: z.ZodTypeAny[];
+  } })._def;
+  if (def.type === 'optional' && def.innerType) {
+    if (value === null && !def.innerType.safeParse(null).success) return undefined;
+    return decodeProjectedOptionalNulls(value, def.innerType);
+  }
+  if ((def.type === 'nullable' || def.type === 'default') && def.innerType) {
+    return value == null ? value : decodeProjectedOptionalNulls(value, def.innerType);
+  }
+  if (def.type === 'union' && def.options) {
+    const candidates = def.options.flatMap(option => {
+      const decoded = decodeProjectedOptionalNulls(value, option);
+      return option.safeParse(decoded).success ? [decoded] : [];
+    });
+    if (candidates.length > 0 && candidates.every(candidate => JSON.stringify(candidate) === JSON.stringify(candidates[0]))) {
+      return candidates[0];
+    }
+    return value;
+  }
+  if (Array.isArray(value) && def.type === 'array' && def.element) {
+    return value.map(item => decodeProjectedOptionalNulls(item, def.element!));
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  if (def.type !== 'object' && def.type !== 'record') return value;
+  const shape = def.type === 'object' ? (schema as z.ZodObject).shape : undefined;
+  const out: Record<string, unknown> = { ...value };
+  for (const [key, item] of Object.entries(value)) {
+    const field = shape && Object.hasOwn(shape, key) ? shape[key]
+      : def.type === 'record' ? def.valueType : undefined;
+    if (!field) continue;
+    const decoded = decodeProjectedOptionalNulls(item, field);
+    if (item === null && decoded === undefined) delete out[key];
+    else out[key] = decoded;
+  }
+  return out;
+}
+
+/** Project legacy tuple keywords for a wire that requires draft 2020-12.
+ * Walk schema positions only: instance defaults/examples and property names
+ * such as `items` are data. Omitted additionalItems continues to allow a tail. */
+export function projectTupleSchemasFor202012(schemaValue: unknown): unknown {
+  function visit(value: unknown): unknown {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    const source = value as Record<string, unknown>;
+    const out = { ...source };
+    for (const key of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']) {
+      const map = source[key];
+      if (map && typeof map === 'object' && !Array.isArray(map)) {
+        out[key] = Object.fromEntries(Object.entries(map).map(([name, child]) => [name, visit(child)]));
+      }
+    }
+    for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+      if (Array.isArray(source[key])) out[key] = source[key].map(visit);
+    }
+    for (const key of ['items', 'additionalItems', 'additionalProperties', 'unevaluatedProperties',
+      'unevaluatedItems', 'contains', 'propertyNames', 'not', 'if', 'then', 'else']) {
+      if (key in source) out[key] = visit(source[key]);
+    }
+    if (Array.isArray(source.items)) {
+      out.prefixItems = source.items.map(visit);
+      if ('additionalItems' in source) out.items = visit(source.additionalItems);
+      else delete out.items;
+      delete out.additionalItems;
+    }
+    return out;
+  }
+  const projected = visit(schemaValue);
+  if (!projected || typeof projected !== 'object' || Array.isArray(projected)) return projected;
+  // The endpoint selects the dialect; do not carry an obsolete root declaration.
+  const { $schema: _dialect, ...schema } = projected as Record<string, unknown>;
+  return schema;
+}

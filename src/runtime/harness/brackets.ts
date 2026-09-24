@@ -23,7 +23,7 @@ import {
   isTerminalPhysicalDispatchOwner,
 } from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
-import { formatRecallableToolText, explicitLocalReadPreviewBudget } from './tool-output-format.js';
+import { formatRecallableToolText, explicitLocalReadPreviewBudget, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -666,6 +666,13 @@ export function timeoutForTool(toolName: string): number {
   // worst case well below it.
   if (toolName === 'run_batch') {
     return DEFAULT_TIMEOUTS_MS.shell;
+  }
+  // Workflow authoring waits for the creation test it starts (real read steps
+  // against the connected tools plus model steps: 66 s live, 2026-09-22),
+  // exactly the external-work shape this bucket exists for. The default 60 s
+  // budget would kill the tool while its own test is still running.
+  if (toolName === 'workflow_create' || toolName === 'workflow_update' || toolName === 'workflow_reshape') {
+    return DEFAULT_TIMEOUTS_MS.externalApi;
   }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
@@ -3058,6 +3065,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             data: settledReadRepeatReplayMarker({
               replayCallId: callId,
               replayCalledEventId: replay.currentCalledEventId,
+              replayTool: tool.name,
               sourceCallId: replay.sourceCallId,
               sourceUserSeq: ctx.sourceUserSeq as number,
               toolSlug: replay.toolSlug,
@@ -4840,7 +4848,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
-        }, () => formatRecallableToolText(value, { maxChars: explicitLocalReadPreviewBudget(tool.name, parsedInput), hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
+        }, () => formatRecallableToolText(value, {
+          // Nested results cross a compact carrier next. Apply that same
+          // budget while the child's exact receipt is still in scope, so the
+          // carrier never has to digest already-projected JSON as new raw data.
+          maxChars: explicitLocalReadPreviewBudget(tool.name, parsedInput)
+            ?? (ctx?.nestedDispatch ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS : undefined),
+          hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
           const result = await invokePromise;

@@ -106,6 +106,7 @@ export function createIsolatedRunnerProgressTracker(startedAt = Date.now()) {
   let lastProgress = 'process launch';
   let lastProgressAt = startedAt;
   let nextTapOrdinal = null;
+  let pendingFileResult = null;
 
   return {
     observe(line, at = Date.now(), { allowTap = true } = {}) {
@@ -114,6 +115,7 @@ export function createIsolatedRunnerProgressTracker(startedAt = Date.now()) {
         currentFile = owningFile;
         lastProgress = `file boundary ${owningFile}`;
         lastProgressAt = at;
+        if (allowTap) pendingFileResult = owningFile;
         return true;
       }
 
@@ -125,12 +127,18 @@ export function createIsolatedRunnerProgressTracker(startedAt = Date.now()) {
         return false;
       }
 
-      const result = line.match(/^(?:ok|not ok) ([1-9]\d*) - .*$/);
+      const result = line.match(/^(?:ok|not ok) ([1-9]\d*) - (.*)$/);
       if (!result || nextTapOrdinal === null) return false;
       const ordinal = Number(result[1]);
-      if (ordinal !== nextTapOrdinal) return false;
+      // A file with no registered tests can be reported with its file index
+      // instead of the global assertion index. It still consumes one global
+      // result. Accept that exception only when paired with the exact file
+      // boundary, then resume the ordered sequence; arbitrary gaps remain
+      // ineligible watchdog progress.
+      if (ordinal !== nextTapOrdinal && result[2] !== pendingFileResult) return false;
 
       nextTapOrdinal += 1;
+      pendingFileResult = null;
       lastProgress = `TAP test ${ordinal} completed`;
       lastProgressAt = at;
       return true;

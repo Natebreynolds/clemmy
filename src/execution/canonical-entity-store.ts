@@ -444,6 +444,7 @@ function loadPolicySnapshot(
     'defaultExactIdentifierMatch', 'exactIdentifierMatches',
     'defaultCompoundSignalMatch', 'compoundSignalMatches',
     'exclusiveIdentifierNamespaces',
+    ...(Object.hasOwn(policy, 'preferNewerAfterExactIdentity') ? ['preferNewerAfterExactIdentity'] : []),
   ], `policy ${policyDigest}`);
   const content = {
     policyId: policy.policyId,
@@ -455,6 +456,7 @@ function loadPolicySnapshot(
     defaultCompoundSignalMatch: policy.defaultCompoundSignalMatch,
     compoundSignalMatches: policy.compoundSignalMatches,
     exclusiveIdentifierNamespaces: policy.exclusiveIdentifierNamespaces,
+    ...(policy.preferNewerAfterExactIdentity === undefined ? {} : { preferNewerAfterExactIdentity: policy.preferNewerAfterExactIdentity }),
   };
   const expectedDigest = prefixedHash('entity-resolution-policy:v1', content);
   if (row.policy_id !== policy.policyId || row.policy_digest !== policy.policyDigest
@@ -477,6 +479,7 @@ function policyInput(snapshot: EntityResolutionPolicySnapshot): EntityResolution
       compoundSignalMatches: snapshot.compoundSignalMatches,
     },
     exclusiveIdentifierNamespaces: snapshot.exclusiveIdentifierNamespaces,
+    ...(snapshot.preferNewerAfterExactIdentity === undefined ? {} : { preferNewerAfterExactIdentity: snapshot.preferNewerAfterExactIdentity }),
   };
 }
 

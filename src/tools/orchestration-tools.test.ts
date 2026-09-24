@@ -542,6 +542,52 @@ test('workflow_create accepts durable resources separately from run inputs and w
   assert.match(text, /Inputs:\n  \(none\)/);
 });
 
+test('workflow_get full view shows the authorable shape of a gated call step in one read', async () => {
+  // Live 2026-09-22: a brain authoring a review-gated workflow read the
+  // example fixture five times and never saw its call args or approval flag.
+  const result = await workflowCreate()({
+    name: 'gated-call-wf',
+    description: 'Draft then save after review.',
+    steps: [
+      { id: 'draft', prompt: 'Draft three lines.', sideEffect: 'read' },
+      {
+        id: 'save',
+        dependsOn: ['draft'],
+        call: { tool: 'write_file', args: { path: '/tmp/gated-call-wf.txt', content: '{{steps.draft.output}}', mode: 'overwrite' } },
+        requiresApproval: true,
+        approvalPreview: 'Review the draft before it is saved.',
+        sideEffect: 'write',
+      },
+    ],
+  });
+  assert.match(resultText(result), /Created workflow "gated-call-wf"/);
+  const text = resultText(await workflowGet()({ name: 'gated-call-wf' }));
+  assert.match(text, /save \(depends on: draft\)/);
+  assert.match(text, /call: \{"tool":"write_file","args":\{"path":"\/tmp\/gated-call-wf\.txt"/);
+  assert.match(text, /requiresApproval: true approvalPreview: "Review the draft before it is saved\."/);
+  // A call step has no prompt; the view no longer prints an empty numbered prompt for it.
+  assert.doesNotMatch(text, /call: \{"tool":"write_file"[^\n]*\n(?:[^\n]*\n){0,3}\s+prompt:\n\s+1\t\n/);
+  // The prompt step keeps its line-numbered prompt.
+  assert.match(text, /draft\n[\s\S]*prompt:\n\s+1\tDraft three lines\./);
+});
+
+test('workflow_get full readback exposes the saved enabled state without a second metadata call', async () => {
+  for (const enabled of [true, false]) {
+    writeWorkflow('lifecycle-state-readback', {
+      name: 'Lifecycle State Readback', description: 'Controlled lifecycle readback', enabled,
+      trigger: { manual: true },
+      steps: [{ id: 'compute', transform: { version: 1, expression: { op: 'literal', value: 323 } }, sideEffect: 'read' }],
+    } as never);
+    for (const section of [undefined, 'full']) {
+      const text = resultText(await workflowGet()({name: 'Lifecycle State Readback', ...(section ? { section } : {})}));
+      assert.match(text, new RegExp(`^Enabled: ${enabled}$`, 'm'));
+      assert.match(text, /transform:/, 'definition and state are available in the same read');
+    }
+    const metadata = resultText(await workflowGet()({ name: 'Lifecycle State Readback', section: 'metadata' }));
+    assert.match(metadata, new RegExp(`"enabled": ${enabled}`));
+  }
+});
+
 test('workflow_get metadata section is structurally selectable and omits large step prompts', async () => {
   const promptSentinel = 'FULL-PROMPT-MUST-NOT-ENTER-METADATA';
   writeWorkflow('bounded-metadata-read', {
@@ -947,6 +993,38 @@ test('workflow_set_enabled requires smoke inputs before approving external-read 
   assert.equal(readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).length, 1);
 });
 
+test('workflow_edit_step patch fixes one call argument on a disabled draft without the step graph', async () => {
+  writeWorkflow('digest-check', {
+    name: 'Digest check',
+    description: 'read then summarize',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'read_digest', prompt: '', call: { tool: 'read_file', args: { path: '/x/digets.txt' } }, output: { type: 'object' }, sideEffect: 'read' },
+      { id: 'summarize', prompt: 'Summarize it.', dependsOn: ['read_digest'], sideEffect: 'read' },
+    ],
+  } as never);
+
+  const bad = await workflowEditStep()({ name: 'Digest check', step_id: 'read_digest', patch: '[1,2]' });
+  assert.match(resultText(bad), /patch must be JSON object text/);
+  const neither = await workflowEditStep()({ name: 'Digest check', step_id: 'read_digest' });
+  assert.match(resultText(neither), /Provide either patch/);
+
+  const fixed = await workflowEditStep()({
+    name: 'Digest check',
+    step_id: 'read_digest',
+    patch: JSON.stringify({ call: { tool: 'read_file', args_json: JSON.stringify({ path: '/x/digest.txt' }) } }),
+  });
+  const text = resultText(fixed);
+  assert.match(text, /Updated "Digest check" step "read_digest" \(call\)/);
+  assert.match(text, /Revert with revertStepEdit\("wfedit-/);
+  const saved = readWorkflow('digest-check')!.data;
+  assert.deepEqual((saved.steps[0] as unknown as { call: { args: unknown } }).call.args, { path: '/x/digest.txt' });
+  assert.equal(saved.steps[1].prompt, 'Summarize it.');
+  assert.equal(saved.enabled, false, 'a disabled draft stays disabled; enabling runs the test');
+  assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/, 'no creation test is queued for a disabled draft');
+});
+
 test('workflow_contract_proposals reports upgrades without mutating workflow files', async () => {
   writeWorkflow('legacy-contract-wf', {
     name: 'legacy-contract-wf',
@@ -1010,21 +1088,38 @@ test('workflow_create persists step intent for intent-routed worker models', asy
 });
 
 test('workflow_create persists workflow and step local project bindings', async () => {
-  const result = await workflowCreate()({
-    name: 'project-bound-wf',
-    description: 'Work across local repos.',
-    project: 'clementine-next',
-    steps: [
-      { id: 'inspect', prompt: 'Inspect {{project.path}}.' },
-      { id: 'patch_other', prompt: 'Patch the sibling repo.', project: 'sibling-app', dependsOn: ['inspect'] },
-    ],
-  });
+  const { updateEnvKey, removeEnvKey, listWorkspaceProjects } = await import('./shared.js');
+  const previousRoots = process.env.WORKSPACE_DIRS;
+  const roots = path.join(TMP_HOME, 'workspace-fixture');
+  for (const name of ['clementine-next', 'sibling-app']) {
+    const dir = path.join(roots, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+  }
+  updateEnvKey('WORKSPACE_DIRS', roots);
+  try {
+    assert.deepEqual(listWorkspaceProjects().map(project => project.name), ['clementine-next', 'sibling-app']);
+    const result = await workflowCreate()({
+      name: 'project-bound-wf',
+      description: 'Work across local repos.',
+      project: 'clementine-next',
+      steps: [
+        { id: 'inspect', prompt: 'Inspect {{project.path}}.' },
+        { id: 'patch_other', prompt: 'Patch the sibling repo.', project: 'sibling-app', dependsOn: ['inspect'] },
+      ],
+    });
 
-  assert.match(resultText(result), /Created workflow "project-bound-wf"/);
-  const saved = readWorkflow('project-bound-wf')!.data;
-  assert.equal(saved.project, 'clementine-next');
-  assert.equal(saved.steps[0].project, undefined);
-  assert.equal(saved.steps[1].project, 'sibling-app');
+    assert.match(resultText(result), /Created workflow "project-bound-wf"/);
+    const saved = readWorkflow('project-bound-wf')!.data;
+    assert.equal(saved.project, 'clementine-next');
+    assert.equal(saved.steps[0].project, undefined);
+    assert.equal(saved.steps[1].project, 'sibling-app');
+  } finally {
+    if (previousRoots === undefined) removeEnvKey('WORKSPACE_DIRS');
+    else updateEnvKey('WORKSPACE_DIRS', previousRoots);
+    const { clearWorkspaceProjectCache } = await import('./shared.js');
+    clearWorkspaceProjectCache();
+  }
 });
 
 test('workflow_create portable_models strips exact model pins and keeps intents', async () => {
@@ -1773,6 +1868,22 @@ test('a compatible declared operation can receive an optional retrieval candidat
   assert.deepEqual(steps, before);
 });
 
+test('remembered candidates respect exact authored scope without treating discovery as permission', () => {
+  const choice: ToolChoiceRecord = { intent: 'salesforce.query.soql', description: 'Run a Salesforce SOQL query',
+    choice: { kind: 'composio', identifier: 'SALESFORCE_RUN_SOQL_QUERY', testedAt: '2026-06-01T00:00:00Z' },
+    fallbacks: [], body: '', filePath: '/tmp/scoped-candidate.md' };
+  for (const [allowedTools, expected] of [
+    [['read_file', 'write_file'], 0], [['tool_search', 'call_tool'], 0],
+    [['OTHER_READ_OPERATION'], 0], [['SALESFORCE_RUN_SOQL_QUERY'], 1],
+    [['composio_execute_tool'], 1], [['composio_*'], 1], [['*'], 1], [[], 1],
+  ] as Array<[string[], number]>) {
+    const steps = [{ id: 'find', prompt: 'Query Salesforce with a SOQL query for prospects.', sideEffect: 'read' as const, allowedTools }];
+    const before = structuredClone(steps);
+    assert.equal(bindStepsToToolChoices(steps, { choices: [choice] }).advisories.length, expected, JSON.stringify(allowedTools));
+    assert.deepEqual(steps, before);
+  }
+});
+
 test('explicit calls, embedded bindings and skills retain their authored authority', () => {
   for (const step of [
     { id: 'find', prompt: 'Query Salesforce: run `sf data query --json --query "SELECT Id FROM Account"`.', sideEffect: 'read' as const, allowedTools: ['run_shell_command'] },
@@ -2392,4 +2503,19 @@ test('renderWorkflowRunsOverview shows a turn-held run as active, in English', (
   assert.match(out, /weekly-review/, 'the held run is listed at all');
   assert.match(out, /starting when this turn ends/i, 'and reads as English');
   assert.doesNotMatch(out, /awaiting_chat_dispatch_seal/, 'never a bare enum');
+});
+
+test('workflow list supplies exact count and queryable names without prose extraction', async () => {
+  resetState();
+  writeAuditWorkflow();
+  const handler = handlers.get('workflow_list')!;
+  const names = JSON.parse((await handler({ detail: 'names' })).content[0].text);
+  assert.deepEqual(names, { total: 1, workflows: [{ name: 'proposal-audit-brief' }] });
+  const summary = JSON.parse((await handler({})).content[0].text);
+  assert.equal(summary.total, 1);
+  assert.equal(summary.workflows[0].stepCount, 1);
+  assert.equal(summary.workflows[0].description, 'Generate an audit brief from a URL.');
+  assert.deepEqual(summary.workflows[0].trigger, { manual: true });
+  resetState();
+  assert.deepEqual(JSON.parse((await handler({})).content[0].text), { total: 0, workflows: [] });
 });

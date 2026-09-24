@@ -8,7 +8,7 @@ import {
   type WorkflowNodeInvocationPlanV1,
   type WorkflowNodeInvocationValueTypeV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import { currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
+import { currentCapabilityManifest, type CapabilityManifestV1 } from '../runtime/harness/capability-manifest.js';
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import {
   canonicalCatalogIdentityOf,
@@ -23,6 +23,15 @@ const EXACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
 
 /** Normalize caller-owned labels into the exact identity alphabet accepted by
  * the durable workflow activation tables. */
+
+/** The engine's own "nothing can run this operation" diagnostic. It names an
+ *  operation id, so a person-facing report shows its own sentence instead;
+ *  readers recognise it here rather than re-spelling the text. */
+export const CAPABILITY_NOT_REGISTERED_PREFIX = 'No current capability is registered for';
+export function isCapabilityNotRegisteredMessage(message: string | undefined | null): boolean {
+  return typeof message === 'string' && message.startsWith(CAPABILITY_NOT_REGISTERED_PREFIX);
+}
+
 export function exactWorkflowCallIdOrDigest(value: string): string {
   const trimmed = value.trim();
   if (EXACT_ID_RE.test(trimmed)) return trimmed;
@@ -181,21 +190,124 @@ function currentOperationCandidates(
  * saved slug or arguments, and every matching account is refreshed so the
  * compiler's existing ambiguity refusal remains intact.
  */
-function revalidateCurrentOperationCatalog(operationId: string): void {
+export type OperationCatalogRevalidation = {
+  durableManifests: number;
+  registered: number;
+  refused: Array<{ manifestId: string; reason: string }>;
+  error?: string;
+};
+
+function revalidateCurrentOperationCatalog(operationId: string): OperationCatalogRevalidation {
   const store = peekCapabilityManifestStore();
   const adapter = peekProductionCapabilityAdapter();
-  if (!store || !adapter) return;
+  if (!store || !adapter) return { durableManifests: 0, registered: 0, refused: [], error: 'no manifest store or adapter installed' };
   const manifestIds = store.list().flatMap((entry) => {
     const manifest = currentCapabilityManifest(entry.manifest);
     return manifest?.operationId === operationId ? [manifest.manifestId] : [];
   });
-  if (manifestIds.length === 0) return;
+  if (manifestIds.length === 0) return { durableManifests: 0, registered: 0, refused: [] };
   try {
-    adapter.refresh(new Set(manifestIds));
-  } catch {
+    const result = adapter.refresh(new Set(manifestIds));
+    return { durableManifests: manifestIds.length, registered: result.registered, refused: result.refused };
+  } catch (error) {
     // Revalidation is supply, never authority. The ordinary zero-candidate
     // result below remains the fail-closed outcome when refresh is unavailable.
+    return { durableManifests: manifestIds.length, registered: 0, refused: [], error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Why a saved operation with durable manifests still has no current
+ *  candidate — the refresh's own refusal reasons, so a parked run names the
+ *  cause (live 2026-09-22: a cold daemon parked an exact calendar step as
+ *  "not connected" while two current manifests sat in the store). */
+export function describeOperationCatalogRevalidation(revalidation: OperationCatalogRevalidation): string {
+  if (revalidation.error) return `revalidation failed: ${revalidation.error}`;
+  if (revalidation.durableManifests === 0) return 'no durable manifest for this operation';
+  const reasons = [...new Set(revalidation.refused.map((entry) => entry.reason))];
+  return `${revalidation.durableManifests} durable manifest(s), ${revalidation.registered} registered`
+    + (reasons.length > 0 ? `, refused: ${reasons.join(', ')}` : '');
+}
+
+/**
+ * Prove a saved provider operation in THIS process before the compiler asks
+ * for a current candidate.
+ *
+ * A durable manifest becomes a live candidate only once the attested
+ * transport has observed the operation for its account in the running
+ * daemon: a provider schema seen within its 30-minute lease, the connected
+ * toolkits enumerated, and one independent observation per account (60 s
+ * freshness). Chat does all of that as a side effect of discovery and the
+ * calendar watch does it for itself; a call step never did, so a freshly
+ * restarted daemon parked an exact calendar step as "not connected" while
+ * two current manifests sat in the store (live 2026-09-22, creation test of
+ * an authored workflow eight minutes after a launch). Supply, never
+ * authority: the compiler below still re-proves candidate, account and
+ * effect from the same refresh it always ran.
+ */
+export type DurableProviderOperationWarmDeps = {
+  listDurableManifests: (operationId: string) => Array<Pick<CapabilityManifestV1, 'accountId' | 'definitionFingerprint' | 'providerVersion' | 'operationVersion'>>;
+  ensureSchema: (operationId: string) => Promise<string | undefined>;
+  listToolkits: () => Promise<unknown>;
+  observe: (input: { operationId: string; accountId: string; definitionFingerprint: string; providerVersion: string; operationVersion: string }) => Promise<unknown>;
+};
+
+const defaultWarmDeps: DurableProviderOperationWarmDeps = {
+  listDurableManifests: (operationId) => (peekCapabilityManifestStore()?.list() ?? []).flatMap((entry) => {
+    const manifest = currentCapabilityManifest(entry.manifest);
+    return manifest && manifest.operationId === operationId && manifest.providerKind === 'composio' ? [manifest] : [];
+  }),
+  ensureSchema: async (operationId) => {
+    const { ensureLiveComposioSchemaFingerprint } = await import('../tools/composio-schema-cache.js');
+    return ensureLiveComposioSchemaFingerprint(operationId);
+  },
+  listToolkits: async () => {
+    const { listConnectedToolkits } = await import('../integrations/composio/client.js');
+    return listConnectedToolkits();
+  },
+  observe: async (input) => {
+    const { refreshIndependentCapabilityObservation } = await import('../runtime/harness/independent-capability-observation.js');
+    return refreshIndependentCapabilityObservation(input);
+  },
+};
+
+export async function warmDurableProviderOperation(
+  operationId: string,
+  deps: DurableProviderOperationWarmDeps = defaultWarmDeps,
+): Promise<{ status: 'present' | 'no_durable_manifest' | 'warmed'; manifests: number; observed: number; notes: string[] }> {
+  const factory = peekHostCapabilityCatalogFactory();
+  if (factory && currentOperationCandidates(factory, operationId).length > 0) {
+    return { status: 'present', manifests: 0, observed: 0, notes: [] };
+  }
+  const manifests = deps.listDurableManifests(operationId);
+  if (manifests.length === 0) return { status: 'no_durable_manifest', manifests: 0, observed: 0, notes: [] };
+  const notes: string[] = [];
+  try {
+    if (!(await deps.ensureSchema(operationId))) notes.push('live provider schema unavailable for this operation');
+  } catch (error) {
+    notes.push(`live provider schema refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try { await deps.listToolkits(); } catch (error) {
+    notes.push(`connected toolkits unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let observed = 0;
+  for (const manifest of manifests) {
+    const accountId = manifest.accountId?.trim();
+    if (!accountId) continue;
+    try {
+      const result = await deps.observe({
+        operationId,
+        accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+      });
+      if (result) observed += 1;
+      else notes.push(`${accountId}: not observed`);
+    } catch (error) {
+      notes.push(`${accountId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { status: 'warmed', manifests: manifests.length, observed, notes };
 }
 
 /**
@@ -302,8 +414,9 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
   }
 
   let candidates = currentOperationCandidates(factory, input.operationId);
+  let revalidation: OperationCatalogRevalidation | undefined;
   if (candidates.length === 0) {
-    revalidateCurrentOperationCatalog(input.operationId);
+    revalidation = revalidateCurrentOperationCatalog(input.operationId);
     candidates = currentOperationCandidates(factory, input.operationId);
   }
   if (candidates.length === 0) {
@@ -311,7 +424,8 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
       ok: false,
       recoverable: true,
       reason: 'not-connected',
-      message: `No current capability is registered for "${input.operationId}". Connect it, then retry.`,
+      message: `${CAPABILITY_NOT_REGISTERED_PREFIX} "${input.operationId}". Connect it, then retry.`
+        + (revalidation ? ` (${describeOperationCatalogRevalidation(revalidation)})` : ''),
     };
   }
 

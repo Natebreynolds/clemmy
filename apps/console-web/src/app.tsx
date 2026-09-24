@@ -2,6 +2,7 @@ import { Component, lazy, Suspense, useEffect, useState, type ComponentType, typ
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
+import { Skeleton } from './components/ui/Skeleton';
 import { Chat } from './screens/Chat';
 import { Home } from './screens/Home';
 import { useHomePreferences } from './lib/home-prefs';
@@ -98,11 +99,28 @@ class DeferredScreenBoundary extends Component<{ children: ReactNode; resetKey?:
   }
 }
 
+/** A screen's shape while its code arrives: the Page gutters, a title, and a
+ *  few rows. Space is reserved, so nothing jumps when the screen paints. */
+function ScreenSkeleton() {
+  return (
+    <div className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-8 sm:py-8" role="status">
+      <span className="sr-only">Loading</span>
+      <Skeleton className="h-9 w-48" />
+      <Skeleton className="mt-3 h-5 w-80 max-w-full" />
+      <div className="mt-8 space-y-3">
+        <Skeleton className="h-16 w-full" />
+        <Skeleton className="h-16 w-full" />
+        <Skeleton className="h-16 w-full" />
+      </div>
+    </div>
+  );
+}
+
 function DeferredScreen({ children }: { children: ReactNode }) {
   const location = useLocation();
   return (
     <DeferredScreenBoundary resetKey={location.pathname}>
-      <Suspense fallback={<div className="flex min-h-48 items-center justify-center text-body text-fg-muted">Loading…</div>}>
+      <Suspense fallback={<ScreenSkeleton />}>
         {children}
       </Suspense>
     </DeferredScreenBoundary>

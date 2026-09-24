@@ -301,3 +301,11 @@ test('describeJsonShape outlines keys, arrays, and the record path', async () =>
   assert.match(shape, /data: object \{value\}/);
   assert.match(shape, /→ the records live at data\.value\[\*\] \(fields: subject, start\)/);
 });
+
+
+test('unfamiliar record collections unwrap only when structurally unambiguous', () => {
+  const rows = [{ id: 'a' }, { id: 'b' }];
+  assert.deepEqual(resolveDominantArray({ total: 2, payload: { arbitrary: rows } }), { rows, path: 'payload.arbitrary' });
+  assert.equal(resolveDominantArray({ alpha: rows, beta: [{ id: 'c' }] }), null);
+  assert.equal(resolveDominantArray({ tags: ['a', 'b'] }), null);
+});

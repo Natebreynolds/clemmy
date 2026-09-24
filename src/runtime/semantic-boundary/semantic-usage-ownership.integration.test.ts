@@ -49,9 +49,9 @@ for (const adapterRecords of [false, true]) {
     assert.equal(calls, 1);
     const usage = readUsageEventsForDate().filter(row => row.source === session.id);
     assert.equal(usage.length, 1, 'the semantic wrapper cannot append a second debit for the same adapter response');
-    assert.equal(getSessionTokensUsed(session.id), 110, 'only actual uncached input plus output reaches the budget');
+    assert.equal(getSessionTokensUsed(session.id), 70, 'only actual uncached input plus output reaches the budget');
+    assert.equal(usage[0]!.cachedInputTokens, 40, 'retain provider cache evidence rather than an anonymous aggregate');
     if (adapterRecords) {
-      assert.equal(usage[0]!.cachedInputTokens, 40, 'retain provider cache evidence rather than an anonymous aggregate');
       assert.equal(usage[0]!.responseId, 'semantic-usage-true');
     }
   });

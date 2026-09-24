@@ -308,7 +308,10 @@ for (const stalled of [false, true]) test(`discovery recovery keeps the proven s
         assert.ok(surface.includes('tool_search'));
       } else if (modelCalls === 2) {
         assert.ok(surface.includes('tool_search'));
-        assert.ok(surface.includes('plan_task'), 'the citable path enables exact plan admission');
+        assert.ok(surface.includes('call_tool'), 'discovered controls retain their dispatch carrier');
+        assert.equal(surface.includes('plan_task'), false,
+          'ordinary discovery keeps planning schema on demand');
+        assert.deepEqual(surface, surfaces[0], 'discovery must not grow the stable tool prefix');
       } else {
         assert.ok(surface.includes('tool_search'),
           'a no-gain lookup cannot hide discovery needed to pivot to another requirement');
@@ -522,6 +525,9 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
     userInput: prompt,
     sessionId: session.id,
     sourceUserSeq: source.seq,
+    // This pin exercises missing-write graph repair, not schema acquisition.
+    // Act's production surface supplies the graph schema from its first frame.
+    acceptedRoute: 'act',
     hostFreshPlanning: primed.planning,
     allowedToolNames: ['read_file', 'write_file', 'tool_search'],
     allowToolJit: true,
@@ -630,6 +636,7 @@ test('an empty-card missing-write recovery exposes one search, then newly disclo
     userInput: prompt,
     sessionId: session.id,
     sourceUserSeq: source.seq,
+    acceptedRoute: 'act',
     hostFreshPlanning: primed.planning,
     allowedToolNames: ['user_profile_read', 'write_file', 'tool_search'],
     allowToolJit: true,

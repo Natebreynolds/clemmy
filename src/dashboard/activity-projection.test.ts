@@ -767,3 +767,24 @@ test('an unfinished chat attempt nobody has leased for half an hour reads stale,
   });
   assert.equal(fresh.liveness, 'unknown', 'a just-started attempt gets its grace before a lease is claimed');
 });
+
+test('a run the boot-resume cap parked projects as paused with its own reason — never as awaiting approval', () => {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = 'act-restart-cap-parked';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'Standup Email',
+    status: 'parked',
+    createdAt: '2026-09-11T15:00:14.585Z',
+    startedAt: '2026-09-11T15:00:24.963Z',
+    bootResumeCount: 422,
+    bootResumeMark: '2026-09-11T15:12:54.170Z',
+    bootResumeParkedAt: '2026-09-22T04:53:33.391Z',
+    error: "Paused after 422 automatic restarts. Clementine stopped re-running this so a restart loop could not repeat its work. Resume it when you're ready.",
+  }), 'utf-8');
+  const entry = entryFor(projectActivitySnapshot().entries, `workflow:${runId}`);
+  assert.equal(entry.lifecycle, 'paused_budget', 'a restart-cap park is paused, not awaiting an approval that does not exist');
+  assert.match(String(entry.detail ?? ''), /Paused after 422 automatic restarts/);
+  assert.notEqual(entry.lifecycle, 'awaiting_approval');
+  rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
+});

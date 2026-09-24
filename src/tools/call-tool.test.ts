@@ -424,7 +424,7 @@ test('unknown deferred arguments are rejected instead of silently stripped befor
   );
   assert.match(
     out.guidance,
-    /Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary/i,
+    /Action runners require per-invocation approval/i,
     'the direct stale-schema correction carries the exact current action-runner contract',
   );
   assert.ok(!getHotSet('sess-stale-workspace-schema').includes('space_save'), 'unknown fields must prevent dispatch and promotion');
@@ -681,6 +681,7 @@ test('deferred workflow schemas accept lean nested steps and materialize strict 
   assert.deepEqual(materialized.steps[0].call, {
     tool: 'PROOF_READ',
     args: null,
+    args_json: null,
   });
 });
 

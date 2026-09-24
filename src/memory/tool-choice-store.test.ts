@@ -469,10 +469,8 @@ test('P1-E: renderToolChoicesForContext promotes the objective-relevant choice (
   const ranked = renderToolChoicesForContext(12, undefined, objective);
   assert.ok(ranked.includes('★ salesforce.accounts.query_owner_owned_non_priority_account'), 'the relevant Salesforce choice is starred');
   assert.ok(!ranked.includes('★ airtable.create.base'), 'the unrelated Airtable choice is NOT starred');
-  assert.ok(
-    ranked.indexOf('salesforce.accounts.query_owner_owned_non_priority_account') < ranked.indexOf('airtable.create.base'),
-    'the relevant (older) choice is promoted above the newer irrelevant one',
-  );
+  assert.ok(!ranked.includes('airtable.create.base'),
+    'objective-scoped recall excludes the unrelated newer write instead of spending context on it');
 
   // No objective → pure recency, byte-identical behavior: no stars, newer first.
   const recencyOnly = renderToolChoicesForContext(12);

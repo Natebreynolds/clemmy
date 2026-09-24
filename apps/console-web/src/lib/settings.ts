@@ -46,6 +46,11 @@ export interface BudgetSettings {
 
 export interface Policy {
   enabled?: boolean;
+  /** Calendar watch: its own switch, independent of `enabled` (read-only watch). */
+  calendarWatchEnabled?: boolean;
+  calendarWatchMinutes?: number;
+  workflowSuggestionsEnabled?: boolean;
+  workflowSuggestionsMinutes?: number;
   mode?: 'watch' | 'balanced' | 'hands_on';
   autoApproveScope?: 'strict' | 'balanced' | 'workspace' | 'yolo';
   checkInMinutes?: number;
@@ -361,3 +366,60 @@ export interface FusionSettings {
 }
 export const patchFusion = (p: { mode: FusionMode; judge?: 'claude' | 'codex'; strategy?: FusionStrategy }) =>
   patch<{ fusion: FusionSettings }>('/api/console/settings/fusion', p);
+
+// ── Watches (background heartbeats on a contract) ───────────────────────────
+export interface WatchItem {
+  key: string;
+  kind: 'cancelled' | 'removed' | 'conflict' | 'invite_unanswered' | 'moved' | 'starting_soon' | 'suggestion';
+  signal: 'high' | 'low';
+  subject: string;
+  eventStartMs: number;
+  eventEndMs: number;
+  notificationId?: string;
+  createdAt: string;
+  acknowledgedAt?: string;
+  retiredAt?: string;
+  retiredReason?: string;
+}
+export interface WatchFinding {
+  tickId: string;
+  at: string;
+  source: string;
+  durationMs: number;
+  accounts: number;
+  events: number;
+  changes: number;
+  produced: number;
+  vetoed: number;
+  retired: number;
+  quiet: boolean;
+  readFailures: number;
+  summary: string;
+}
+export interface WatchStatus {
+  id: string;
+  title: string;
+  purpose: string;
+  enabled: boolean;
+  cadenceMinutes: number;
+  quietHoursActive: boolean;
+  connectedOperations: string[];
+  running: boolean;
+  lastTickAt?: string;
+  nextTickAt?: string;
+  snapshotAt?: string;
+  lastFinding?: WatchFinding;
+  lastError?: { at: string; reason: string };
+  metrics: {
+    ticks: number; quietTicks: number; changedTicks: number; reads: number; readFailures: number;
+    modelCalls: number; modelVetoes: number; modelFailures: number;
+    itemsProduced: number; itemsAcknowledged: number; itemsRetired: number; duplicatesSuppressed: number;
+  };
+  openItems: WatchItem[];
+  recentlyRetired: WatchItem[];
+}
+export const getWatches = () => apiGet<{ watches: WatchStatus[] }>('/api/console/watches');
+export const patchWatch = (id: string, p: { enabled?: boolean; cadenceMinutes?: number }) =>
+  patch<{ watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}`, p);
+export const tickWatch = (id: string) =>
+  apiPost<{ tick: WatchFinding & { judged: number; duplicatesSuppressed: number }; watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}/tick`, {});

@@ -106,6 +106,13 @@ export interface WorkflowCardStatus {
  * certification-not-ready > last-run trouble > running. Everything else lives
  * in the drawer's Readiness panel, not on the card.
  */
+/** The server writes certification states for Clem in capitals ("READY TO
+ *  ENABLE"); a pill a person reads says "Ready to enable". */
+export function sentenceCaseLabel(label: string): string {
+  const lower = label.trim().toLowerCase();
+  return lower ? lower.charAt(0).toUpperCase() + lower.slice(1) : label;
+}
+
 export function workflowCardStatus(w: {
   health?: { status: string; issues: Array<{ stepId: string }> };
   certification?: WorkflowCertification | null;
@@ -124,7 +131,7 @@ export function workflowCardStatus(w: {
   }
   const cert = w.certification;
   if (cert && !cert.canRun) {
-    return { tone: certificationTone(cert.state), label: cert.label, detail: cert.summary };
+    return { tone: certificationTone(cert.state), label: sentenceCaseLabel(cert.label), detail: cert.summary };
   }
   const outcome = (w.lastRunOutcome ?? '').toLowerCase();
   if (outcome === 'failed') return { tone: 'danger', label: 'Last run failed', aboutLastRun: true };

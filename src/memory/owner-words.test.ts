@@ -143,10 +143,24 @@ test('the owner-words repair retires only facts it proves were captured from hos
     sourceEventId: 'user-source:999999',
     candidates: [{ kind: 'project', content: orphanText, reason: 'explicit remember request' }],
   });
-  await promote([...leakQueued.candidateIds, ...(ownerQueued.queuedCandidateIds ?? []), ...orphanQueued.candidateIds]);
-  const leakedFact = factIdFor(leakQueued.candidateIds[0]!);
+  // Seed the historical defect, not a new capture through today's owner-word
+  // boundary (which correctly refuses both host text and unverifiable sources).
+  // Keep the original candidate/episode/source linkage for the repair to prove.
+  const historicalFact = (candidateId: number): number => {
+    const db = memory.openMemoryDb();
+    const row = db.prepare('SELECT kind, text FROM memory_reflection_candidates WHERE id = ?')
+      .get(candidateId) as { kind: Parameters<typeof facts.rememberFact>[0]['kind']; text: string };
+    assert.ok(row);
+    const fact = facts.rememberFact({ kind: row.kind, content: row.text });
+    const changed = db.prepare("UPDATE memory_reflection_candidates SET status = 'promoted', resulting_fact_id = ? WHERE id = ?")
+      .run(fact.id, candidateId);
+    assert.equal(changed.changes, 1);
+    return fact.id;
+  };
+  const leakedFact = historicalFact(leakQueued.candidateIds[0]!);
+  const orphanFact = historicalFact(orphanQueued.candidateIds[0]!);
+  await promote(ownerQueued.queuedCandidateIds ?? []);
   const ownerFact = factIdFor(ownerQueued.queuedCandidateIds![0]!);
-  const orphanFact = factIdFor(orphanQueued.candidateIds[0]!);
 
   const preview = repair.retireAutoCaptureFactsOutsideOwnerWords({ dryRun: true });
   assert.deepEqual(preview.retired.map((entry) => entry.factId), [leakedFact]);

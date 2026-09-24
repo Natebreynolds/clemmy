@@ -28,6 +28,25 @@ const {
 
 type RecallHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 
+test('JSON-encoded field arrays query exact retained fields without widening the projection', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'encoded-fields', tool: 'work_call',
+    output: JSON.stringify({ data: { value: [{ subject: 'Example', start: '09:30', privateNote: 'must stay hidden' }] } }) });
+  const query = captureToolOutputQueryHandler();
+  for (const fields of [['subject', 'start'], '["subject","start"]', 'subject,start']) {
+    const result = await withHarnessRunContext({ sessionId: session.id, turn: 1, toolCalls: new ToolCallsCounter(10) },
+      () => query({ call_id: 'encoded-fields', fields }));
+    assert.match(result.content[0].text, /Example/);
+    assert.match(result.content[0].text, /09:30/);
+    assert.doesNotMatch(result.content[0].text, /privateNote|must stay hidden|None of/);
+  }
+  for (const fields of ['[]', '["subject",null]', '["subject"']) {
+    const result = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => query({ call_id: 'encoded-fields', fields }));
+    assert.doesNotMatch(result.content[0].text, /must stay hidden/);
+  }
+});
+
 test('queries of a recall call recover the original data, not the JSON example in its preamble', async () => {
   const session = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: session.id, callId: 'original-cli', tool: 'work_call', output: JSON.stringify({
@@ -542,4 +561,45 @@ test('MCP record queries decode one owner and never select a conflicting or fail
     const text = await run(callId, envelope, ['path']);
     assert.match(text, /None of/); assert.doesNotMatch(text, /"path": "\/exact"/, 'do not promote failed, ambiguous or merely similar transport bytes');
   }
+});
+
+test('tool_output_query given a capability reference redirects to the carrier and lists real results — never a bare "not found" (live 277962)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'call-real-1', tool: 'work_call', output: JSON.stringify({ items: [{ subject: 'Standup' }] }) });
+  // A reader's own miss is retained too; it must not be listed back as data.
+  writeToolOutput({ sessionId: session.id, callId: 'call-miss-1', tool: 'tool_output_query', output: 'No tool output found for call_id "x" in this session.' });
+  const query = captureToolOutputQueryHandler();
+  const ref = 'cap:resolved:outlook_get_calendar_view:definition:890911f634558ec9c128fad4';
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => query({ call_id: ref, fields: [], limit: 1, offset: 0, filter_field: 'dummy', filter_contains: 'dummy', filter_equals: 'dummy' }));
+  const text = result.content[0].text;
+  assert.match(text, /CAPABILITY reference, not a result handle/);
+  // No live catalog in this test → the honest door is discovery.
+  assert.match(text, /tool_search/);
+  assert.match(text, /call-real-1 \(work_call/);
+  assert.doesNotMatch(text, /call-miss-1/);
+  assert.doesNotMatch(text, /^No tool output found/);
+
+  const recall = captureRecallHandler();
+  const recalled = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 60_000) },
+    () => recall({ call_id: ref }));
+  assert.match(recalled.content[0].text, /CAPABILITY reference, not a result handle/);
+});
+
+test('query projects records from an unfamiliar single-array envelope without paging raw output', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const rows = Array.from({ length: 114 }, (_, i) => ({ name: `Fixture ${i}`, details: 'x'.repeat(300) }));
+  writeToolOutput({ sessionId: sess.id, callId: 'unknown-envelope', tool: 'fixture_list',
+    output: JSON.stringify({ total: rows.length, arbitraryCollection: rows }) });
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'unknown-envelope', fields: ['name'], limit: 200 }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /114 total from arbitraryCollection/);
+  assert.match(text, /Fixture 113/);
+  assert.doesNotMatch(text, /details|None of/);
 });

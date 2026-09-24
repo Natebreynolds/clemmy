@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import type { MCPServer, Model, ModelRequest } from '@openai/agents';
 import type { ManagedMcpServer } from '../types.js';
 
@@ -12,6 +12,16 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-pilot-production-conv
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.OPENAI_AGENTS_DISABLE_TRACING = '1';
+// Exercise the real review runner/parser without provider quota or live credentials.
+process.env.BYO_PROVIDERS = JSON.stringify([{
+  id: 'pilot-review', label: 'Recording pilot reviewer',
+  baseURL: 'https://pilot-review.invalid/v1', modelIds: ['pilot-review-fixture'],
+}]);
+process.env.BYO_PROVIDER_PILOT_REVIEW_API_KEY = 'fixture-only';
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+  { role: 'judge', modelId: 'pilot-review-fixture', scope: 'durable', source: 'settings' },
+]);
 
 const convergence = await import('./automation-pilot-production-convergence.js');
 const dispatcher = await import('./automation-pilot-authoring-dispatcher.js');
@@ -69,7 +79,7 @@ function opportunity(label: string) {
       description: `retrieve exact ${label} records`,
       minimumEffect: 'read',
       constraints: ['Return a bounded records collection.'],
-    }],
+    }, { id: 'local-output', description: 'Save the reviewed dataset into the selected Workspace.', minimumEffect: 'local_write', constraints: ['Exact Workspace projection only.'] }],
     phases: [{
       id: 'read-result',
       objective: 'Retrieve the exact bounded records.',
@@ -78,8 +88,8 @@ function opportunity(label: string) {
       effect: { class: 'read', approval: 'not_required', maxOperationsPerRun: 1 },
       partitioned: false,
       outputEvidence: ['The records collection is non-empty.'],
-    }],
-    effectCeiling: { class: 'read', maxOperationsPerRun: 1 },
+    }, { id: 'save-result', objective: 'Save the dataset with provenance.', dependsOn: ['read-result'], capabilityRequirementIds: ['local-output'], effect: { class: 'local_write', approval: 'not_required', maxOperationsPerRun: 1 }, partitioned: false, outputEvidence: ['Exact Workspace projection head.'] }],
+    effectCeiling: { class: 'local_write', maxOperationsPerRun: 2 },
     dataset: {
       schema: {
         fields: [
@@ -122,7 +132,7 @@ function opportunity(label: string) {
       required: true,
       maxPartitions: 1,
       maxRecords: 10,
-      effectCeiling: { class: 'read', maxOperationsPerRun: 1 },
+      effectCeiling: { class: 'local_write', maxOperationsPerRun: 2 },
       successCriterionIds: ['complete'],
       haltOnFailure: true,
     },
@@ -132,7 +142,7 @@ function opportunity(label: string) {
       maxAttemptsPerPartition: 1,
       maxPartitionsPerRun: 1,
       maxRecordsPerRun: 10,
-      maxOperationsPerRun: 1,
+      maxOperationsPerRun: 2,
       reserveOperations: 0,
     },
   });
@@ -142,6 +152,7 @@ function exactCandidate(prompt: string) {
   const projected = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2)) as {
     request: {
       requestId: string;
+      workspaceOutputPhaseId?: string;
       requirement: { phaseId: string; requirementId: string };
       workspaceSelection: Parameters<typeof projections.createWorkflowCanonicalEntityResultProjection>[0] extends never
         ? never
@@ -154,6 +165,7 @@ function exactCandidate(prompt: string) {
     requestId: projected.request.requestId,
     requestDigest: projected.requestDigest,
     contract: {
+      workspaceOutputPhaseId: projected.request.workspaceOutputPhaseId,
       phaseId: projected.request.requirement.phaseId,
       requirementId: projected.request.requirement.requirementId,
       workflowInputs: { scope: { type: 'string', required: true } },
@@ -257,6 +269,7 @@ async function waitUntil(predicate: () => boolean, detail: string): Promise<void
 }
 
 test.after(() => {
+  mock.restoreAll();
   for (const workspace of spaces.spaceStore.list(true)) spaces.spaceStore.remove(workspace.id);
   catalogs.installHostCapabilityCatalogFactory(null);
   manifestStores.installCapabilityManifestStore(null);
@@ -269,6 +282,25 @@ test.after(() => {
 
 test('approved proposal advances without another chat turn through exact chooser, live metadata, constrained authoring, and full pilot card', async () => {
   const label = generated('nationwide');
+  const reviewRequests: Array<Record<string, unknown>> = [];
+  mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init);
+    assert.equal(request.url, 'https://pilot-review.invalid/v1/chat/completions',
+      'the isolated pilot must never reach a real provider');
+    const body = await request.json() as Record<string, unknown>;
+    reviewRequests.push(body);
+    assert.equal(body.model, 'pilot-review-fixture');
+    assert.match(JSON.stringify(body.messages), /Complete the full workflow objective, including its constraints/);
+    assert.match(JSON.stringify(body.messages), new RegExp(label));
+    assert.match(JSON.stringify(body.tools), /open_evidence/);
+    assert.match(JSON.stringify(body.messages), /workflow_execution/);
+    return new Response(JSON.stringify({
+      id: 'pilot-review-recording', object: 'chat.completion', created: 1,
+      model: 'pilot-review-fixture',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'DONE: recording reviewer accepts the bounded read fixture' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
   const serverName = generated('source');
   const toolName = `${serverName}__${generated('records')}`;
   const counts = { list: 0, call: 0, model: [] as ModelRequest[] };
@@ -437,6 +469,7 @@ test('approved proposal advances without another chat turn through exact chooser
     goalValidation?: {
       pass?: boolean;
       judgeFailedOpen?: boolean;
+      objectiveReview?: { pass?: boolean; method?: string; scope?: string };
       perCriterion?: Array<{ pass?: boolean; method?: string; detail?: string }>;
     };
     stepOutputs?: Record<string, unknown>;
@@ -458,8 +491,15 @@ test('approved proposal advances without another chat turn through exact chooser
     }, null, 2),
   );
   assert.equal(terminal.terminalOutcome, 'succeeded', runBytes);
+  assert.ok(Date.parse((terminal as { finishedAt: string }).finishedAt)
+    >= Date.parse((terminal.goalValidation as { validatedAt: string }).validatedAt),
+  'whole-run completion cannot precede the goal review that made it successful');
   assert.equal(terminal.goalValidation?.pass, true);
   assert.equal(terminal.goalValidation?.judgeFailedOpen, false);
+  assert.equal(reviewRequests.length, 1, 'whole-objective review uses one recorded provider request');
+  assert.equal(terminal.goalValidation?.objectiveReview?.pass, true);
+  assert.equal(terminal.goalValidation?.objectiveReview?.scope, 'objective');
+  assert.equal(terminal.goalValidation?.objectiveReview?.method, 'judge');
   assert.deepEqual(
     terminal.goalValidation?.perCriterion?.map((criterion) => ({
       pass: criterion.pass,

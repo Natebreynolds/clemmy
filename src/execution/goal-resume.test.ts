@@ -25,9 +25,9 @@ import assert from 'node:assert/strict';
 
 const {
   surfacePlan, approvePlanProposal, getPlanProposal, getActiveGoalForSession,
-  enableGoalSelfDrive, touchGoalActivity,
+  enableGoalSelfDrive, touchGoalActivity, parkGoal, satisfyGoal, disableGoalSelfDrive,
 } = await import('../agents/plan-proposals.js');
-const { evaluateGoalResumptions, selectReorientObservations } = await import('./goal-resume.js');
+const { evaluateGoalResumptions, selectReorientObservations, runScheduledGoalResume } = await import('./goal-resume.js');
 import type { GoalResumeDeps } from './goal-resume.js';
 import type { NotificationRecord } from '../runtime/notifications.js';
 
@@ -70,6 +70,7 @@ function makeDeps(over: Partial<GoalResumeDeps> & { nowMs?: number } = {}): Goal
   } = {
     now: () => over.nowMs ?? Date.now() + 60 * 60 * 1000, // default: an hour ahead so the goal is due
     sessionIdleMs: over.sessionIdleMs ?? (() => 5 * 60 * 1000), // idle 5 min
+    hasActiveRun: over.hasActiveRun,
     hasPendingApproval: over.hasPendingApproval ?? (() => false),
     fireResume: over.fireResume ?? ((goal, directive) => { fires.push(goal.id); captured.push(directive); }),
     escalate: over.escalate ?? ((goal, reason) => { escalations.push({ id: goal.id, reason }); }),
@@ -305,4 +306,103 @@ test('re-orient: a throwing observation reader never blocks the resume (best-eff
   const r = evaluateGoalResumptions(deps);
   assert.equal(r.fired, goal.id, 'resume still fires despite a reader error');
   assert.ok(!deps.captured[0].includes('What changed'));
+});
+
+
+test('a goal paused during eligibility must not be scheduled or fired', () => {
+  const { goal } = makeSelfDrivingGoal();
+  const deps = makeDeps({ sessionIdleMs: () => { parkGoal(goal.id, 'blocker', 'owner paused'); return 300_000; } });
+  assert.equal(evaluateGoalResumptions(deps).fired, null);
+  assert.equal(getPlanProposal(goal.id)!.resumeCount ?? 0, 0);
+});
+
+test('a completed goal discovered during eligibility cannot start a stale resume', () => {
+  const { goal } = makeSelfDrivingGoal();
+  const deps = makeDeps({ sessionIdleMs: () => { satisfyGoal(goal.id); return 300_000; } });
+  assert.equal(evaluateGoalResumptions(deps).fired, null);
+  assert.equal(deps.fires.length, 0);
+});
+
+
+test('a held execution defers a due heartbeat even when event history looks idle', () => {
+  const { goal } = makeSelfDrivingGoal();
+  const deps = makeDeps({ hasActiveRun: () => true });
+  assert.equal(evaluateGoalResumptions(deps).fired, null);
+  assert.equal(getPlanProposal(goal.id)!.resumeCount ?? 0, 0);
+});
+
+for (const transition of ['pause', 'complete', 'disable'] as const) {
+  test(`goal ${transition} during asynchronous setup prevents execution`, async () => {
+    const { goal } = makeSelfDrivingGoal();
+    let calls = 0;
+    const fired = await runScheduledGoalResume(goal, async () => {
+      if (transition === 'pause') parkGoal(goal.id, 'blocker');
+      if (transition === 'complete') satisfyGoal(goal.id);
+      if (transition === 'disable') disableGoalSelfDrive(goal.id);
+      return async () => { calls++; };
+    }, () => false);
+    assert.equal(fired, false);
+    assert.equal(calls, 0);
+  });
+}
+
+test('overlapping resumes share one session reservation through execution and release it afterward', async () => {
+  const { goal } = makeSelfDrivingGoal();
+  let release!: () => void;
+  let started!: () => void;
+  const running = new Promise<void>(resolve => { started = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  const first = runScheduledGoalResume(goal, async () => async () => { calls++; started(); await held; }, () => false);
+  await running;
+  const second = await runScheduledGoalResume(goal, async () => async () => { calls++; }, () => false);
+  assert.equal(second, false);
+  const tick = evaluateGoalResumptions(makeDeps());
+  assert.equal(tick.fired, null, 'another heartbeat must not consume a resume slot');
+  assert.equal(getPlanProposal(goal.id)!.resumeCount ?? 0, 0);
+  release();
+  assert.equal(await first, true);
+  assert.equal(calls, 1);
+  assert.equal(await runScheduledGoalResume(goal, async () => async () => { calls++; }, () => false), true);
+});
+
+test('failed setup releases the reservation and execution receives fresh goal progress', async () => {
+  const { goal } = makeSelfDrivingGoal();
+  await assert.rejects(runScheduledGoalResume(goal, async () => { throw new Error('setup failed'); }, () => false), /setup failed/);
+  let ledger: string[] = [];
+  assert.equal(await runScheduledGoalResume(goal, async () => {
+    touchGoalActivity(goal.id, 'Finished the first milestone');
+    return async current => { ledger = current.progressLedger ?? []; };
+  }, () => false), true);
+  assert.ok(ledger.some(line => line.includes('Finished the first milestone')));
+});
+
+test('a session becoming busy during setup does not start a competing resume', async () => {
+  const { goal } = makeSelfDrivingGoal();
+  let busy = false;
+  assert.equal(await runScheduledGoalResume(goal, async () => {
+    busy = true;
+    return async () => { assert.fail('must not execute'); };
+  }, () => busy), false);
+});
+
+
+test('current calendar watch findings inform a matching goal on the next resume', () => {
+  const now = Date.now();
+  const findings = selectReorientObservations([
+    obsNotif({ title: 'Meridian meeting moved to tomorrow', source: 'calendar-watch', atMs: now - 1000 }),
+    obsNotif({ title: 'Unrelated appointment changed', source: 'calendar-watch', atMs: now - 1000 }),
+  ], 'Prepare the Meridian meeting', now - 60_000, now);
+  assert.deepEqual(findings, ['Meridian meeting moved to tomorrow']);
+});
+
+
+test('a running final budget slot is not parked before it can settle', () => {
+  const { goal } = makeSelfDrivingGoal({ maxResumes: 1, resumeEveryMs: 1 });
+  const now = Date.now() + 60_000;
+  assert.equal(evaluateGoalResumptions(makeDeps({ nowMs: now })).fired, goal.id);
+  const deps = makeDeps({ nowMs: now + 60_000, hasActiveRun: () => true });
+  assert.deepEqual(evaluateGoalResumptions(deps).parked, []);
+  assert.equal(getPlanProposal(goal.id)!.parked, undefined);
+  assert.equal(deps.escalations.length, 0);
 });

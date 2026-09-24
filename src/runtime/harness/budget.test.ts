@@ -159,7 +159,10 @@ test('getEffectiveContextLimit: invalid env override is ignored (falls back to t
   const prev = process.env.CLEMMY_MODEL_CONTEXT_LIMIT_GPT_5_4;
   process.env.CLEMMY_MODEL_CONTEXT_LIMIT_GPT_5_4 = 'not-a-number';
   try {
-    assert.equal(getEffectiveContextLimit('gpt-5.4'), 200_000);
+    // No env override in force: the shared window authority answers, never
+    // the invalid override (the registry/observed window may exceed the table).
+    assert.ok(getEffectiveContextLimit('gpt-5.4') >= modelContextLimit('gpt-5.4'));
+    assert.notEqual(getEffectiveContextLimit('gpt-5.4'), NaN);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_MODEL_CONTEXT_LIMIT_GPT_5_4;
     else process.env.CLEMMY_MODEL_CONTEXT_LIMIT_GPT_5_4 = prev;
@@ -228,22 +231,24 @@ test('predictTurnCost: env override wins over both default and explicit', () => 
 // ─── checkBudget ──────────────────────────────────────────────────
 
 test('checkBudget: well-under threshold returns ok', () => {
+  const limit = Math.max(getEffectiveContextLimit('gpt-5.4'), MINIMUM_CONTEXT_FLOOR);
   const result = checkBudget({ predictedTokens: 10_000, modelId: 'gpt-5.4' });
-  // 10000 / max(200000, 64000) = 5% → ok
   assert.equal(result.status, 'ok');
-  assert.equal(result.effectiveLimit, 200_000);
+  assert.equal(result.effectiveLimit, limit, 'the preflight measures against the same window authority as compaction');
   assert.ok(result.fractionUsed < 0.1);
 });
 
 test('checkBudget: above warn threshold returns warn', () => {
-  const result = checkBudget({ predictedTokens: 160_000, modelId: 'gpt-5.4' });
-  // 160000 / 200000 = 80% → above 75% warn, below 85% block
+  const limit = Math.max(getEffectiveContextLimit('gpt-5.4'), MINIMUM_CONTEXT_FLOOR);
+  const result = checkBudget({ predictedTokens: Math.round(limit * 0.8), modelId: 'gpt-5.4' });
+  // 80% → above 75% warn, below 85% block
   assert.equal(result.status, 'warn');
 });
 
 test('checkBudget: above block threshold returns block', () => {
-  const result = checkBudget({ predictedTokens: 190_000, modelId: 'gpt-5.4' });
-  // 190000 / 200000 = 95% → block
+  const limit = Math.max(getEffectiveContextLimit('gpt-5.4'), MINIMUM_CONTEXT_FLOOR);
+  const result = checkBudget({ predictedTokens: Math.round(limit * 0.95), modelId: 'gpt-5.4' });
+  // 95% → block
   assert.equal(result.status, 'block');
 });
 
@@ -254,20 +259,20 @@ test('checkBudget: small-context model uses FLOOR not raw limit', () => {
     predictedTokens: MINIMUM_CONTEXT_FLOOR / 2, // 32K
     modelId: 'gpt-5.4-nano', // 64K limit
   });
-  // effectiveLimit = max(64000, 64000) = 64000
-  // 32000 / 64000 = 50% → ok
+  // effectiveLimit = max(limit, floor); a small model never measures below the floor
   assert.equal(result.status, 'ok');
-  assert.equal(result.effectiveLimit, MINIMUM_CONTEXT_FLOOR);
+  assert.equal(result.effectiveLimit, Math.max(getEffectiveContextLimit('gpt-5.4-nano'), MINIMUM_CONTEXT_FLOOR));
 });
 
 test('checkBudget: custom thresholds accepted', () => {
+  const limit = Math.max(getEffectiveContextLimit('gpt-5.4'), MINIMUM_CONTEXT_FLOOR);
   const result = checkBudget({
-    predictedTokens: 100_000,
+    predictedTokens: Math.round(limit * 0.5),
     modelId: 'gpt-5.4',
     warnFraction: 0.4,
     blockFraction: 0.6,
   });
-  // 100000 / 200000 = 50% → above 40% warn, below 60% block
+  // 50% → above 40% warn, below 60% block
   assert.equal(result.status, 'warn');
   assert.equal(result.warnFraction, 0.4);
   assert.equal(result.blockFraction, 0.6);
@@ -288,8 +293,8 @@ test('checkBudget: rejects out-of-range warnFraction', () => {
 });
 
 test('checkBudget: result.reason is human-readable and includes percentage', () => {
-  const result = checkBudget({ predictedTokens: 100_000, modelId: 'gpt-5.4' });
-  // 100000 / 200000 = 50%
+  const limit = Math.max(getEffectiveContextLimit('gpt-5.4'), MINIMUM_CONTEXT_FLOOR);
+  const result = checkBudget({ predictedTokens: Math.round(limit * 0.5), modelId: 'gpt-5.4' });
   assert.match(result.reason, /50%/);
 });
 
@@ -372,4 +377,19 @@ test('two known registry gaps stay visible until the registry is fixed', async (
   // one blind risks overrunning the provider or halving a working brain.
   assert.equal(modelContextLimit('zai-org/glm-5.2'), 1_000_000, 'GAP 3: budget side of the GLM-5.2 conflict');
   assert.equal(resolveModelCapability('zai-org/glm-5.2').contextWindow, 512_000, 'GAP 3: wire side of the GLM-5.2 conflict');
+});
+
+
+test('getEffectiveContextLimit: the observed window is the one authority the preflight and compaction share', async () => {
+  const { getEffectiveContextLimit } = await import('./budget.js');
+  const observations = await import('./model-window-observations.js');
+  const id = 'vendor-x/observed-window-model';
+  // Unknown id: the static table's conservative default.
+  const before = getEffectiveContextLimit(id);
+  assert.equal(before, modelContextLimit(id));
+  // A provider catalog observation changes what the preflight measures against.
+  observations.recordCatalogWindow(id, 1_048_575, 'test-catalog');
+  observations._resetModelWindowObservationCacheForTests();
+  assert.equal(getEffectiveContextLimit(id), observations.effectiveContextWindow(id));
+  assert.ok(getEffectiveContextLimit(id) > before);
 });

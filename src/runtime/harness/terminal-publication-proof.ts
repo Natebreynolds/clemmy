@@ -1,3 +1,4 @@
+import { proveWorkflowDispatchCommitWithPorts } from './workflow-dispatch-commit.js';
 /**
  * Cycle-free final proof verifier for accepted-task terminal publication.
  *
@@ -12,6 +13,9 @@
  * fails closed until its own normalized host receipt reaches this boundary.
  */
 import { createHash } from 'node:crypto';
+import { proveNativeRevisionCommitWithPorts, type RevisionProofInput } from './native-revision-proof-core.js';
+import { validateContractValue } from './expected-work-contract-value.js';
+import { canonicalWorkTopologyJson } from '../graph/work-topology.js';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
 import {
@@ -1068,6 +1072,7 @@ function exactSealedNodeAuthority(input: {
   nodeId: string;
   expectedEffect: string;
   expectedBindingDigest?: string;
+  logicalToolCallId?: string;
 }): { ok: true; binding: SealedNodeBinding; logicalToolCallId: string }
   | { ok: false; reason: string } {
   const rows = input.db.prepare(`
@@ -1081,11 +1086,14 @@ function exactSealedNodeAuthority(input: {
        AND b.requirement_id = n.node_id
      WHERE n.session_id = ? AND n.source_user_seq = ?
        AND n.node_id = ? AND b.contract_id = ?
+       AND (? IS NULL OR b.logical_tool_call_id = ?)
   `).all(
     input.sessionId,
     input.sourceUserSeq,
     input.nodeId,
     input.contractId,
+    input.logicalToolCallId ?? null,
+    input.logicalToolCallId ?? null,
   ) as Array<{
     binding_json: string;
     binding_digest: string;
@@ -1123,6 +1131,47 @@ function exactSealedNodeAuthority(input: {
     binding: binding as unknown as SealedNodeBinding,
     logicalToolCallId: row.logical_tool_call_id,
   };
+}
+
+/** Verify native artifact identity lineage using only this publication transaction. */
+function nativeProofPortsInTransaction(db: Database.Database): import('./native-revision-proof-core.js').NativeRevisionProofPorts {
+  return {
+    db,
+    loadContract(identity) {
+      const row = db.prepare(`SELECT * FROM accepted_task_work_contracts WHERE session_id=? AND source_user_seq=?`)
+        .get(identity.sessionId, identity.sourceUserSeq) as Record<string, unknown> | undefined;
+      const authority = db.prepare(`SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?`)
+        .get(identity.sessionId, identity.sourceUserSeq) as Record<string, unknown> | undefined;
+      if (!row || !authority || authority.state === 'conflict') return null;
+      let parsed: unknown;
+      try { parsed = JSON.parse(String(row.contract_json)); } catch { return null; }
+      const contract = validateContractValue(parsed);
+      if (!contract || row.contract_json !== canonicalWorkTopologyJson(contract)
+        || row.contract_version !== contract.version || row.contract_id !== contract.contractId
+        || row.session_id !== contract.identity.sessionId || row.source_user_seq !== contract.identity.sourceUserSeq
+        || row.planner_source !== contract.plannerSource || row.operation_count !== contract.operations.length
+        || row.universe_count !== contract.universes.length || authority.work_contract_id !== contract.contractId) return null;
+      for (const [column, value] of Object.entries({ accepted_task_id: contract.acceptedTaskId,
+        graph_event_id: contract.graphEventId, graph_id: contract.graphId, graph_hash: contract.graphHash })) {
+        if (row[column] !== value || authority[column] !== value) return null;
+      }
+      return contract;
+    },
+    loadSelection(identity) {
+      const result = exactSealedNodeAuthority({ db, ...identity, nodeId: identity.requirementId, expectedEffect: 'local_write' });
+      return result.ok && result.logicalToolCallId === identity.logicalToolCallId ? result.binding : null;
+    },
+    redeem(identity) {
+      const result = exactSuccessfulResult({ db, ...identity });
+      return result.ok ? { status: 'ok', value: { executionSite: result.row.dispatch_execution_site ?? '',
+        outcomeKind: result.row.outcome_kind, toolName: result.row.logical_tool_name, rawPayload: result.raw } }
+        : { status: 'unavailable', reason: result.reason };
+    },
+  };
+}
+function nativeIdentityDerivationInTransaction(db: Database.Database, input: RevisionProofInput): boolean {
+  const proof = proveNativeRevisionCommitWithPorts(input, nativeProofPortsInTransaction(db));
+  return proof.status === 'verified' && proof.identityLineageVerified;
 }
 
 function createdPayload(raw: unknown): {
@@ -1496,6 +1545,7 @@ function verifyHostSealedWriteReceipt(input: {
       && input.transition.physical_dispatch_id !== receipt.physical_dispatch_id)
     || !digest64(receipt.intended_digest)
     || (input.node.contentCommitMode === 'documented_atomic_input'
+      || input.node.writeEvidenceMode === 'host_workflow_dispatch_v1'
       ? receipt.observed_digest !== null
       : receipt.observed_digest !== receipt.intended_digest)
   ) return { ok: false, status: 'conflict', reason: 'write transition and receipt identity disagree' };
@@ -1560,6 +1610,25 @@ function verifyHostSealedWriteReceipt(input: {
     logicalToolCallId: receipt.logical_tool_call_id,
   });
   if (!createResult.ok) return { ok: false, status: 'conflict', reason: createResult.reason };
+  if (input.node.writeEvidenceMode === 'host_workflow_dispatch_v1') {
+    const bound = input.db.prepare(`SELECT contract_id,requirement_id FROM expected_work_call_bindings
+      WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+      .get(input.sessionId,input.sourceUserSeq,input.acceptedTaskId,receipt.logical_tool_call_id) as
+      { contract_id: string; requirement_id: string } | undefined;
+    if (!bound || input.obligation !== 'commit_effect' || receipt.kind !== 'commit'
+      || input.node.effectKind !== 'local_write' || input.node.obligations.length !== 2
+      || !input.node.obligations.includes('execution_terminal')) {
+      return { ok: false, status: 'conflict', reason: 'workflow dispatch obligation is not exact' };
+    }
+    const proof = proveWorkflowDispatchCommitWithPorts({ ...input,
+      contractId: bound.contract_id, requirementId: bound.requirement_id,
+      logicalToolCallId: receipt.logical_tool_call_id,
+    }, nativeProofPortsInTransaction(input.db));
+    return proof.status === 'verified' && receipt.created_id === proof.runId
+      && receipt.handle === `workflow-run:${proof.runId}` && receipt.provider_receipt === proof.receiptDigest
+      && receipt.intended_digest === proof.preparationDigest && receipt.observed_digest === null
+      ? { ok: true } : { ok: false, status: 'conflict', reason: 'workflow dispatch preparation no longer redeems' };
+  }
   const frozenMutation = verifyFrozenMutationWriteReceipt({
     db: input.db,
     sessionId: input.sessionId,
@@ -1597,6 +1666,14 @@ function verifyHostSealedWriteReceipt(input: {
       };
     }
     if (receipt.kind === 'derivation') {
+      const workBinding = input.db.prepare(`SELECT contract_id, requirement_id FROM expected_work_call_bindings
+        WHERE session_id=? AND source_user_seq=? AND accepted_task_id=? AND logical_tool_call_id=?`)
+        .get(input.sessionId, input.sourceUserSeq, input.acceptedTaskId, receipt.logical_tool_call_id) as
+        { contract_id: string; requirement_id: string } | undefined;
+      if (input.node.cardinality === undefined && !input.node.structuredCollectionLocator
+        && workBinding?.requirement_id === input.node.operationId
+        && nativeIdentityDerivationInTransaction(input.db, { ...input, contractId: workBinding.contract_id,
+          requirementId: workBinding.requirement_id, logicalToolCallId: receipt.logical_tool_call_id })) return { ok: true };
       const derivation = proveHostLocalWriteDerivation({
         db: input.db,
         sessionId: input.sessionId,

@@ -1,3 +1,4 @@
+import { withWorkflowDispatchCommit } from '../runtime/harness/workflow-dispatch-commit.js';
 import { workflowProjectCreationErrors } from '../execution/workflow-project-preflight.js';
 import { requestsToolkitUse } from './workflow-toolkit-intent.js';
 import { randomBytes } from 'node:crypto';
@@ -23,7 +24,7 @@ import {
 } from '../memory/workflow-store.js';
 import { workflowExecutionSurfaceChanged, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
-import { applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
+import { applyStepPatch, applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
 import { validateCronExpression, getNextRun } from '../shared/cron.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
@@ -77,6 +78,8 @@ import {
 import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
 import {
+  awaitWorkflowCreationTestSettlement,
+  type WorkflowCreationTestSettlement,
   queueWorkflowCreationTest,
   requeueWorkflowFailedItemsFromRun,
 } from './workflow-run-queue.js';
@@ -451,7 +454,14 @@ export function bindStepsToToolChoices(
     const effect = step.sideEffect === 'read' ? 'read' : 'write';
     let matches: StepToolChoiceMatch[];
     try { matches = matchToolChoicesForStep(step.prompt, { choices: opts.choices }); } catch { continue; }
-    const top = matches.find((m) => !m.alreadyBound && m.effectClass === effect);
+    const scope = step.allowedTools?.map(name => name.trim()) ?? [];
+    const unrestricted = scope.length === 0 || scope.some(name => !name || name === '*' || name === '**');
+    // Retrieval cannot widen the authored operation family. Discovery/control
+    // carriers alone are not evidence that a remembered operation is allowed.
+    const scopeAllows = (match: StepToolChoiceMatch): boolean => unrestricted
+      || [match.identifier, ...match.family].some(name => scope.some(entry =>
+        entry.endsWith('*') ? name.startsWith(entry.slice(0, -1)) : name === entry));
+    const top = matches.find((m) => !m.alreadyBound && m.effectClass === effect && scopeAllows(m));
     if (!top) continue;
     advisories.push(
       `Optional discovery candidate for step \`${step.id ?? '?'}\`: remembered ${top.kind} \`${neutralizeTemplatePlaceholders(top.command)}\`. Confirm that it serves the authored step and inspect its current argument and account contract before selecting it.`,
@@ -896,23 +906,17 @@ function listWorkflowFiles(): WorkflowEntry[] {
 export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_list',
-    'List all workflows with description, steps, and trigger metadata.',
-    {},
-    async () => {
+    'List saved workflows as structured records with an exact total. Use detail="names" when only names/count are needed; summary includes descriptions, steps and trigger metadata. Does not execute workflows.',
+    { detail: z.enum(['names', 'summary']).optional().describe('names returns only names and total; summary (default) includes workflow metadata.') },
+    async ({ detail }) => {
       const workflows = listWorkflowFiles();
-      if (workflows.length === 0) return textResult('No workflows found.');
-      return textResult(
-        workflows
-          .map(({ data }) => {
-            // Plain-English one-liner (name — when · N steps · pauses for approval),
-            // then the description so the user can pick the right one at a glance.
-            const summary = describeWorkflowOneLine(data);
-            const enabled = data.enabled ? '' : ' [disabled]';
-            const desc = data.description ? `\n  ${data.description}` : '';
-            return `**${summary}**${enabled}${desc}`;
-          })
-          .join('\n\n'),
-      );
+      const records = workflows.map(({ data }) => detail === 'names'
+        ? { name: data.name }
+        : { name: data.name, enabled: data.enabled, description: data.description ?? '',
+          summary: describeWorkflowOneLine(data), stepCount: data.steps.length, trigger: data.trigger });
+      // Keep the result queryable: prose forced models to recall and extract
+      // an already-known collection merely to count it or select its names.
+      return textResult(JSON.stringify({ total: records.length, workflows: records }), { maxChars: 40_000 });
     },
   );
 
@@ -1082,7 +1086,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     'workflow_create',
     "Create a reusable workflow from the step graph you author. Saved goals apply to EVERY future run: express correctness against current inputs, not today's example answer. Verify example-specific expected values after the current run. "
       + "For absolute-path file work, omit project unless the user selected a verified configured workspace. A file's parent directory is not a project binding. "
-      + "Choose the executor for each job: exact known tool/arguments use `call`; parsing, filtering, counts, sums and data shaping use `transform`; use a model prompt for reasoning that those executors cannot express. Do not turn deterministic arithmetic into a model step. Transforms are closed v1 JSON expressions; their schema lists the operations. Raw script runners are legacy and refused. "
+      + "Choose the executor for each job: exact known tool/arguments use `call`; parsing, filtering, counts, sums and data shaping use `transform`; use a model prompt for reasoning that those executors cannot express. An operation this turn already proved or discovered (its id and args are in the PROVEN OPERATION note or the tool_search result) IS known: author it as `call` with that exact operation id, literal args and time tokens ({{now}}, {{now+24h}}, {{date}}), not as a prompt step that re-describes the read; the host binds the account. Do not turn deterministic arithmetic into a model step. Transforms are closed v1 JSON expressions; their schema lists the operations. Raw script runners are legacy and refused. "
       + "Keep meaningful steps and declare sideEffect (read/write/send), dependsOn for required upstream data, and output contracts for downstream consumers. `inputs` binds tool arguments from input.<key> or steps.<id>.output.<path>. Upstream outputs also arrive in STEP CONTEXT. Independent branches can run concurrently; forEach handles collections. Heavy read-only analysis can use subgraph read_parallel_v1 with 2–6 result-only specialists; keep fetches and effects separate. "
       + "Enabling provides one-time workflow consent; requiresApproval can pause irreversible actions. Sends never auto-retry; interrupted writes/sends need reconciliation. Declare loopSafe only for genuinely idempotent writes. A saved goal is checked at completion; max_attempts bounds re-pursuit and irreversible effects prevent replay. "
       + "Create directly under a new name; duplicates leave the existing workflow unchanged. Use workflow_list for discovery/comparison and workflow_get before updates. The host validates your graph and never invents missing business steps.",
@@ -1105,10 +1109,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
         transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal(value), get(from input.<key> | steps.<id>.output[.<path>] | item[.<path>] inside map), jsonParse(value), jsonStringify(value), object(fields:[{key,value}]), array(items), count(value), map(value,each), sort(value,by:[{column,direction:"asc"|"desc"}]), unique(value,keys:[column]), select(value,where?,columns?,limit?), aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount); rename with object/map if needed. No code, shell, network, files, tools, or ambient clock. Declare sideEffect:"read" and dependsOn for every referenced upstream step.'),
         call: z.object({
-          tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file), not capabilityRef.'),
-          args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. {{input.x}} templates resolve at execution.'),
-          args: z.record(z.string(), z.unknown()).optional().describe('Legacy args; prefer args_json. Templates: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}}. A sole template preserves the raw object/array.'),
-        }).optional().describe('No model: invoke known tool/args. Use prompt for selection/ambiguity. read_file JSON content: steps.<id>.output.data.content; parse it. Composio retains {successful,data,...}; bind/verify data.records. forEach permits read calls only.'),
+          tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file) or the exact provider operation id this turn proved or discovered (the UPPER_SNAKE id from the PROVEN OPERATION note or the tool_search result); never a cap:… capabilityRef.'),
+          args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. Templates resolve at run time: {{input.x}}, {{steps.<id>.output[.path]}}, {{now}}, {{now+24h}}, {{now-2h}}, {{date}}, {{date+1d}} — a relative window such as "the next 24 hours" is {{now}}..{{now+24h}}.'),
+          args: z.record(z.string(), z.unknown()).optional().describe('Legacy args; prefer args_json. Templates: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{now}}, {{now+24h}}, {{date}}, {{date+1d}}. A sole template preserves the raw object/array.'),
+        }).optional().describe('No model: invoke known tool/args. The host binds which connected account runs a provider call (the same routing as this conversation) and re-proves it every run; use prompt only for reasoning a closed call cannot express. read_file JSON content: steps.<id>.output.data.content; parse it. Composio retains {successful, data, ...}; bind/verify data.records. forEach permits read calls only.'),
         allowedTools: z.array(z.string()).optional().describe('Allowed discovered tool names, not capabilityRef/variantId. Args select mode; omit to inherit workflow scope.'),
         usesSkill: z.string().optional().describe('Installed skills/ directory name. Prefer one reusable skill to many prompt steps.'),
         requiresApproval: z.boolean().optional(),
@@ -1125,7 +1129,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_timezone: z.string().optional().describe('IANA schedule timezone, e.g. America/Los_Angeles. Set for user-local times.'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug for token-gated POST /api/hooks/workflows/<path>. Fires on incoming webhooks.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('Fire on matching internal events (Composio, watcher, workflow). Prefer events over cron polling for arrivals.'),
-      inputs: z.string().optional().describe('JSON text mapping workflow input names to {type?,default?,description?}, e.g. {"text":{"type":"string"}}. Distinct from steps[].inputs bindings. Event fields bind matching names; "payload" receives the whole event.'),
+      inputs: z.string().optional().describe('Workflow-level input schema as a JSON-encoded string, not the structured steps[].inputs binding object. Map input names to metadata {type?,default?,description?}. Example JSON text: {"text":{"type":"string","description":"Text supplied at runtime to summarize"}}. Event fields bind matching names; "payload" receives the whole event.'),
       resources: z.string().optional().describe('JSON durable bindings, e.g. {"lead_sheet":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<id>"}} or {"calendar":{"kind":"workspace","id":"<slug>"}}. Fixed accounts, folders, channels, repos, CLIs and endpoints belong here, not run inputs.'),
       test_inputs: z.string().optional().describe('JSON concrete non-secret smoke-test inputs, e.g. {"url":"https://example.com"}. Required for external reads without input defaults; otherwise stays disabled pending verification.'),
       synthesis_prompt: z.string().optional(),
@@ -1279,6 +1283,27 @@ export function registerOrchestrationTools(server: McpServer): void {
           originSessionId: getToolOutputContext()?.sessionId,
           activateAfterCreationTest: enabled !== false,
         });
+        // The creation test is part of authoring: wait for it (bounded) so this
+        // receipt reports the settled outcome and the enabled state, instead of
+        // a promise the brain then polls for frame after frame.
+        const settled = queued.id
+          ? await awaitWorkflowCreationTestSettlement(queued.id, name)
+          : null;
+        if (settled) {
+          const headline = settled.pass
+            ? (settled.enabled
+              ? `Created workflow "${name}" — creation test PASSED and it is ENABLED.`
+              : `Created workflow "${name}" — creation test PASSED; it stays DISABLED${enabled === false ? ' as requested' : ` (${settled.activationCompatible ? 'not enabled' : 'the saved definition changed during the test; re-test before enabling'})`}.`)
+            : `Created workflow "${name}" — creation test FOUND ISSUES, so it stays DISABLED.`;
+          return textResult(withWorkflowCommit(
+            dirName,
+            `${headline} Here's what it will do:\n\n${describeWorkflowPlainEnglish(readWorkflow(dirName)?.data ?? created.savedDef)}\n\n`
+            + `${appendDataSources(created.savedDef)}`
+            + `${appendVisualContract(created.executionPlan)}`
+            + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+            + `${renderCreationTestSettlementReceipt(settled, readWorkflow(dirName)?.data ?? created.savedDef, name)}${advisoryTail}`,
+          ));
+        }
         return textResult(withWorkflowCommit(
           dirName,
           `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
@@ -1491,7 +1516,8 @@ export function registerOrchestrationTools(server: McpServer): void {
             : admitted.message,
         );
       }
-      return textResult(admitted.message);
+      return textResult(admitted.ok && admitted.chatDispatchPreparation
+        ? withWorkflowDispatchCommit(admitted.message, admitted.chatDispatchPreparation) : admitted.message);
     },
   );
 
@@ -1645,14 +1671,34 @@ export function registerOrchestrationTools(server: McpServer): void {
             + (specialist.maxTurns !== undefined ? ` maxTurns=${specialist.maxTurns}` : ''),
           `      prompt: ${JSON.stringify(specialist.prompt)}`,
         ]) ?? [];
+        // The AUTHORABLE shape of a non-prompt step, exactly as workflow_create
+        // takes it. Live 2026-09-22: the full view showed a call step as
+        // "allowed tools: … · side-effect: write" over an empty prompt, so a
+        // brain reading an example workflow re-read the same step five times
+        // (section=full, step=<id>, section=metadata) and still never saw the
+        // call args or the approval flag it wanted to copy.
+        const callLine = stp.call
+          ? `    call: ${JSON.stringify({ tool: stp.call.tool, ...(stp.call.args ? { args: stp.call.args } : {}) })}`
+          : '';
+        const approvalLine = stp.requiresApproval
+          ? `    requiresApproval: true${stp.approvalPreview ? ` approvalPreview: ${JSON.stringify(stp.approvalPreview)}` : ''}`
+          : '';
+        const inputsLine = stp.inputs && Object.keys(stp.inputs).length > 0 ? `    inputs: ${JSON.stringify(stp.inputs)}` : '';
+        const outputLine = stp.output ? `    output: ${JSON.stringify(stp.output)}` : '';
+        const loopLine = stp.loopSafe ? '    loopSafe: true' : '';
+        const hasPrompt = (stp.prompt ?? '').trim().length > 0;
         return [
           `  ${stp.id}${deps}${project}${model}${forEach}${subgraph}${det}`,
           sourcesLine,
           runnerLine,
+          callLine,
+          approvalLine,
+          inputsLine,
+          outputLine,
+          loopLine,
           transformLine,
           ...specialistLines,
-          '    prompt:',
-          numbered,
+          ...(hasPrompt ? ['    prompt:', numbered] : (stp.call || stp.transform || stp.deterministic ? [] : ['    prompt:', numbered])),
         ].filter(Boolean).join('\n');
       };
       // step=<id> targeting: when a workflow is large, read just one step in full.
@@ -1704,6 +1750,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult([
         describeWorkflowPlainEnglish(w),
         `Open workflow: ${workflowConsoleUrl(w.name)}`,
+        `Enabled: ${w.enabled}`,
         '',
         '— technical detail —',
         `File: ${path.relative(path.dirname(entry.dir), entry.filePath)}`,
@@ -1782,9 +1829,26 @@ export function registerOrchestrationTools(server: McpServer): void {
             ));
           }
           const queued = queueWorkflowCreationTest(entry.name, enableVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
+          const repairsTail = prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : '';
+          // Enabling IS the creation test. Wait for it (bounded, inside a
+          // draining daemon) so the answer to "turn it on" is ON, or exactly
+          // what still needs the user — never "verifying…" followed by a
+          // notification the user has to come back and ask about.
+          const settled = queued.id
+            ? await awaitWorkflowCreationTestSettlement(queued.id, entry.name)
+            : null;
+          if (settled) {
+            const headline = settled.pass
+              ? (settled.enabled
+                ? `Workflow "${name}" passed its creation test and is now ENABLED.`
+                : `Workflow "${name}" passed its creation test but stays DISABLED (${settled.activationCompatible ? 'not enabled' : 'the saved definition changed during the test; enable it again to re-test'}).`)
+              : `Workflow "${name}" was NOT enabled — its creation test found issues. Fix them, then enable it again.`;
+            return textResult(withWorkflowCommit(entry.name,
+              `${headline}${repairsTail}\n\n${renderCreationTestSettlementReceipt(settled, readWorkflow(entry.name)?.data ?? prep.def, name)}`,
+            ));
+          }
           return textResult(withWorkflowCommit(entry.name,
-            `Verifying "${name}" before it goes live — ${queued.message}`
-              + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
+            `Verifying "${name}" before it goes live — ${queued.message}${repairsTail}`,
           ));
         }
         writeWorkflowAndSyncTriggers(entry.name, prep.def);
@@ -1829,10 +1893,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
         transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal, get, jsonParse, jsonStringify, object, array, count, map, sort, unique, select, aggregate(value,groupBy:[column],metrics:[{fn:"count"|"sum"|"avg"|"min"|"max",column?}]). Metrics use fn, not op; count needs no column. Output keys are count or <fn>_<column> (for example sum_amount). No code or effect access. Declare sideEffect:"read" and dependsOn for referenced upstream steps.'),
         call: z.object({
-          tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file), not capabilityRef.'),
-          args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. {{input.x}} templates resolve at execution.'),
-          args: z.record(z.string(), z.unknown()).optional().describe('Legacy args; prefer args_json. Templates: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}}. A sole template preserves the raw object/array.'),
-        }).optional().describe('No model: invoke known tool/args. Use prompt for selection/ambiguity. read_file JSON content: steps.<id>.output.data.content; parse it. Composio retains {successful,data,...}; bind/verify data.records. forEach permits read calls only.'),
+          tool: z.string().min(1).describe('Exact discovered tool name (e.g. read_file) or the exact provider operation id this turn proved or discovered (the UPPER_SNAKE id from the PROVEN OPERATION note or the tool_search result); never a cap:… capabilityRef.'),
+          args_json: z.string().optional().describe('Preferred JSON-object text; preserves nested types. Omit args. Templates resolve at run time: {{input.x}}, {{steps.<id>.output[.path]}}, {{now}}, {{now+24h}}, {{now-2h}}, {{date}}, {{date+1d}} — a relative window such as "the next 24 hours" is {{now}}..{{now+24h}}.'),
+          args: z.record(z.string(), z.unknown()).optional().describe('Legacy args; prefer args_json. Templates: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{now}}, {{now+24h}}, {{date}}, {{date+1d}}. A sole template preserves the raw object/array.'),
+        }).optional().describe('No model: invoke known tool/args. The host binds which connected account runs a provider call (the same routing as this conversation) and re-proves it every run; use prompt only for reasoning a closed call cannot express. read_file JSON content: steps.<id>.output.data.content; parse it. Composio retains {successful, data, ...}; bind/verify data.records. forEach permits read calls only.'),
         allowedTools: z.array(z.string()).optional().describe('Allowed discovered tool names, not capabilityRef/variantId. Args select mode; omit to inherit workflow scope.'),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
@@ -2034,9 +2098,17 @@ export function registerOrchestrationTools(server: McpServer): void {
               ? { detail: 'Its own test needs an input before it can re-check itself.' }
               : {}),
           });
-          reSmoke = updateVerification.missing.length > 0
-            ? { message: renderMissingSmokeInputs(entry.name, updateVerification.missing) }
-            : queueWorkflowCreationTest(entry.name, updateVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
+          if (updateVerification.missing.length > 0) {
+            reSmoke = { message: renderMissingSmokeInputs(entry.name, updateVerification.missing) };
+          } else {
+            const queued = queueWorkflowCreationTest(entry.name, updateVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
+            // An update to a live workflow is done when its re-test has
+            // settled, not when it was queued: wait (bounded) and report.
+            const settled = queued.id ? await awaitWorkflowCreationTestSettlement(queued.id, entry.name) : null;
+            reSmoke = settled
+              ? { message: renderCreationTestSettlementReceipt(settled, readWorkflow(entry.name)?.data ?? savedNext, entry.data.name || entry.name) }
+              : queued;
+          }
         }
       }
       if (!reSmoke && updatePrep.status !== 'readiness_gaps') writeWorkflowAndSyncTriggers(entry.name, savedNext);
@@ -2097,17 +2169,31 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_edit_step',
     [
-      "Make a TARGETED, reversible edit to ONE step's prompt in an existing workflow — the FAST, grounded way to change a step's logic (fix a data source, add a missing instruction, change a tool).",
-      'Provide step_id + {find, replace}: `find` must appear VERBATIM in that step\'s current prompt — call workflow_get("<name>", step:"<step_id>") FIRST to read the exact current text (it is line-numbered; the "<n>\\t" prefix is NOT part of the prompt). It snapshots the prior definition (revert with workflow_revert_step) and re-validates before saving.',
-      "Prefer this over workflow_update for a single-step change: it cannot clobber sibling steps or trip whole-array validation, and a blind edit (you did not read the real step) fails with a precise hint instead of silently mis-editing.",
+      "Make a TARGETED, reversible edit to ONE step of an existing workflow — the FAST, grounded way to fix a step (a wrong call argument, a data source, a missing instruction, an output contract, an approval flag).",
+      'Two shapes. `patch`: JSON object text with ONLY the step fields to change — call.tool/call.args_json, prompt, dependsOn, allowedTools, requiresApproval, approvalPreview, inputs, output, sideEffect, forEach, usesSkill, model — merged into the step; `null` removes a field; the id never changes. `find` + `replace`: `find` must appear VERBATIM in the step\'s current prompt (workflow_get shows it line-numbered; the "<n>\\t" prefix is NOT part of the prompt).',
+      "Either shape snapshots the prior definition (revert with workflow_revert_step) and re-validates before saving. Prefer this over workflow_update for a single-step change: it cannot clobber sibling steps or trip whole-graph validation. When the workflow is enabled and the edit changes what runs, the host re-runs the creation test and reports the settled result here; a disabled workflow is tested when you enable it.",
     ].join('\n'),
     {
       name: z.string().min(1).describe('Workflow name.'),
       step_id: z.string().min(1).describe('The step to edit.'),
-      find: z.string().min(1).max(8000).describe('Exact substring currently in the step prompt to replace (copy VERBATIM from workflow_get).'),
-      replace: z.string().max(8000).describe('Replacement text (may be empty to delete the found text).'),
+      patch: z.string().optional().describe('JSON object text of ONLY the step fields to change, e.g. {"call":{"tool":"read_file","args_json":"{\\"path\\":\\"/exact/file.txt\\"}"}} or {"prompt":"…"} or {"requiresApproval":true,"approvalPreview":"…"}. null removes a field.'),
+      find: z.string().max(8000).optional().describe('Exact substring currently in the step prompt to replace (copy VERBATIM from workflow_get). Use with replace; omit when sending patch.'),
+      replace: z.string().max(8000).optional().describe('Replacement text (may be empty to delete the found text).'),
     },
-    async ({ name, step_id, find, replace }) => {
+    async ({ name, step_id, patch, find, replace }) => {
+      const patchProvided = typeof patch === 'string' && patch.trim().length > 0;
+      let parsedPatch: Record<string, unknown> | null = null;
+      if (patchProvided) {
+        try {
+          const parsed: unknown = JSON.parse(patch);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+          parsedPatch = parsed as Record<string, unknown>;
+        } catch {
+          return textResult('patch must be JSON object text naming the step fields to change, e.g. {"call":{"tool":"read_file","args_json":"{\\"path\\":\\"…\\"}"}}.');
+        }
+      } else if (!find || replace === undefined) {
+        return textResult('Provide either patch (JSON of the step fields to change) or find + replace for a verbatim prompt snippet.');
+      }
       const all = listWorkflowFiles();
       let entry = all.find((w) => w.data.name === name);
       if (!entry) {
@@ -2133,9 +2219,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         ? message
         : message.replaceAll(`"${workflowSlug}"`, `"${displayName}"`);
       await warmExactScheduledSendSchemaAuthorityForWrite(before);
-      const result = applyStepPromptEdit(workflowSlug, step_id, find, replace, {
-        description: `workflow_edit_step ${step_id}`,
-      });
+      const result = parsedPatch
+        ? applyStepPatch(workflowSlug, step_id, parsedPatch, { description: `workflow_edit_step ${step_id} patch` })
+        : applyStepPromptEdit(workflowSlug, step_id, find as string, replace as string, {
+          description: `workflow_edit_step ${step_id}`,
+        });
       const resultMessage = displayMessage(result.message);
       if (!result.ok) {
         // Structured, NON-silent failure (change #4): the user AND the model see
@@ -2165,13 +2253,17 @@ export function registerOrchestrationTools(server: McpServer): void {
             displayName,
             cause: 'edit_needs_verification',
           });
-          reSmokeMsg = missingSmokeInputs.length > 0
-            ? `\n\n${renderMissingSmokeInputs(workflowSlug, missingSmokeInputs)}`
-            : `\n\n${displayMessage(queueWorkflowCreationTest(
-                workflowSlug,
-                testInputs,
-                { originSessionId: getToolOutputContext()?.sessionId },
-              ).message)}`;
+          if (missingSmokeInputs.length > 0) {
+            reSmokeMsg = `\n\n${renderMissingSmokeInputs(workflowSlug, missingSmokeInputs)}`;
+          } else {
+            const queued = queueWorkflowCreationTest(workflowSlug, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+            // The edit is not done until the host has watched the edited
+            // workflow run: wait for the re-test (bounded) and report it here.
+            const settled = queued.id ? await awaitWorkflowCreationTestSettlement(queued.id, workflowSlug) : null;
+            reSmokeMsg = settled
+              ? `\n\n${renderCreationTestSettlementReceipt(settled, readWorkflow(workflowSlug)?.data ?? updated, displayName)}`
+              : `\n\n${displayMessage(queued.message)}`;
+          }
         }
       }
       addNotification({
@@ -2336,10 +2428,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       });
       if (!resolved.ok) return textResult(`${resolved.message} Nothing was dispatched.`);
       requestWorkflowRunDrainKick([run_id]);
+      const creationTest = resolved.mode === 'creation_test';
       return textResult(
         resolved.status === 'already_selected'
           ? `Account ${resolved.accountId} was already saved for step ${resolved.stepId}; run ${resolved.runId} remains on its same-run resume path. No duplicate dispatch was authorized.`
-          : `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed run ${resolved.runId}. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
+          : creationTest
+            ? `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed the creation test as run ${resolved.runId} — mutations stay previewed; it enables on a pass. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`
+            : `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed run ${resolved.runId}. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
       );
     },
   );
@@ -2417,7 +2512,7 @@ export function registerOrchestrationTools(server: McpServer): void {
                 ].join('\n')
               : [
                   `Needs You: step ${String(capabilityBlock?.stepId ?? '?')}, tool ${String(capabilityBlock?.tool ?? '?')}, reason ${String(capabilityBlock?.reason ?? '?')}.`,
-                  `No provider dispatch occurred; completed work is preserved. ${capabilityBlock?.reason === 'exact_schema_refresh_unavailable' || capabilityBlock?.reason === 'exact_schema_boundary_mismatch' ? 'Ask the user whether to retry exact metadata now' : `Connect ${String(capabilityBlock?.toolkit ?? 'the account')} in Settings → Connections`}, then call workflow_capability_resolve with action="retry", run_id="${run_id}", step_id="${String(capabilityBlock?.stepId ?? '')}", tool="${String(capabilityBlock?.tool ?? '')}", and retry_count=${String(capabilityBlock?.retryCount ?? '')}. Automatic safe retry remains scheduled for ${String(capabilityBlock?.retryAt ?? 'later')}.`,
+                  `No provider dispatch occurred; completed work is preserved. ${capabilityBlock?.reason === 'exact_schema_refresh_unavailable' || capabilityBlock?.reason === 'exact_schema_boundary_mismatch' ? 'Ask the user whether to retry exact metadata now' : `Ask the user to connect ${String(capabilityBlock?.toolkit ?? 'the account')} on the Connect page`}, then call workflow_capability_resolve with action="retry", run_id="${run_id}", step_id="${String(capabilityBlock?.stepId ?? '')}", tool="${String(capabilityBlock?.tool ?? '')}", and retry_count=${String(capabilityBlock?.retryCount ?? '')}. Automatic safe retry remains scheduled for ${String(capabilityBlock?.retryAt ?? 'later')}.`,
                 ].join(' ')
             : '';
           // The one status whose resolution requires the model to STOP calling
@@ -2518,4 +2613,68 @@ export function registerOrchestrationTools(server: McpServer): void {
     },
   );
 
+}
+
+// ─── creation-test settlement receipt ─────────────────────────────────────────
+
+const CREATION_TEST_STEP_OK = new Set(['ok', 'previewed', 'unverifiable']);
+
+/** The step as the author may resend it: only authorable fields, the prompt
+ *  clipped, the host's own bindings (call.account) left out. */
+export function authorableStepShape(step: WorkflowDefinition['steps'][number]): Record<string, unknown> {
+  const raw = step as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  const prompt = typeof raw.prompt === 'string' ? raw.prompt : '';
+  if (prompt.trim()) out.prompt = prompt.length > 400 ? `${prompt.slice(0, 400)}…` : prompt;
+  if (raw.call && typeof raw.call === 'object') {
+    const { account: _account, ...call } = raw.call as Record<string, unknown>;
+    out.call = call;
+  }
+  for (const key of ['transform', 'dependsOn', 'allowedTools', 'requiresApproval', 'approvalPreview', 'inputs', 'output', 'sideEffect', 'forEach', 'usesSkill', 'model'] as const) {
+    const value = raw[key];
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * What an authoring tool returns once the creation test it started has
+ * settled: the test's own report, and for every flagged step its current
+ * authorable shape plus the exact one-call repair — so fixing a workflow is a
+ * patch, a re-test and an enable, never a re-read of the definition and a
+ * resend of the whole graph.
+ */
+export function renderCreationTestSettlementReceipt(
+  settled: WorkflowCreationTestSettlement,
+  def: WorkflowDefinition | undefined,
+  displayName: string,
+): string {
+  const lines = [
+    `Creation test (run ${settled.runId}, settled after ${Math.round(settled.waitedMs / 1000)} s):`,
+    settled.body.trim(),
+  ];
+  if (settled.pass) return lines.join('\n');
+  const flagged = settled.steps.filter((row) => !CREATION_TEST_STEP_OK.has(row.status));
+  const choices = flagged.filter((row) => row.status === 'needs_choice');
+  const broken = flagged.filter((row) => row.status !== 'needs_choice');
+  if (broken.length > 0) {
+    lines.push('', 'Flagged steps as currently saved (authorable fields only):');
+    for (const row of broken) {
+      const step = def?.steps.find((s) => s.id === row.stepId);
+      lines.push(step
+        ? `- ${row.stepId}: ${JSON.stringify(authorableStepShape(step))}`
+        : `- ${row.stepId}: (no longer in the definition)`);
+    }
+    lines.push(
+      '',
+      `To fix a flagged step: workflow_edit_step name="${displayName}" step_id="<id>" patch='<JSON object with ONLY the fields to change>' — for example patch='{"call":{"tool":"read_file","args_json":"{\\"path\\":\\"/exact/file.txt\\"}"}}' or patch='{"prompt":"…"}'. The patch is validated and snapshotted for revert; no workflow_get and no full-graph workflow_update is needed.`,
+      `Then workflow_set_enabled name="${displayName}" enabled=true runs the creation test again and enables it on pass; the result comes back in that same call.`,
+    );
+  }
+  if (choices.length > 0) {
+    lines.push('', 'A step is waiting on an account choice: answer it as the test asks and the host binds it and re-tests.');
+  }
+  return lines.join('\n');
 }

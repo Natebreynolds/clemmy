@@ -172,6 +172,8 @@ export const EVENT_TYPES = [
   // This freezes the complete ordered set of prepared members before any run
   // can become executable. Prepared-only groups remain held across restarts.
   'async_work_dispatch_batch_closed',
+  'workflow_parent_checkpoint',
+  'workflow_parent_continuation_requested',
   // Typed nonterminal boundary: an exact workflow_run tool receipt handed
   // continuing ownership to the background workflow daemon. The foreground
   // model/transport may release, but this accepted logical intent remains
@@ -798,9 +800,30 @@ export interface ListSessionsOptions {
   /** `false` hides archived sessions (a list a person reads); undefined keeps
    *  every row (internal readers). */
   archived?: boolean;
+  /** Read-only lists: leave the model/recovery state out of `metadata`. It is
+   *  ~97% of the table's bytes (live 2026-09-22: 132 of 136 MB across 2,780
+   *  rows) and no list reads it. updateSession REPLACES metadata, so a row read
+   *  this way must never be written back. */
+  withoutConversationState?: boolean;
   limit?: number;
   offset?: number;
 }
+
+/** Per-session model and recovery state: megabytes on a long chat, and only
+ *  the runner that resumes the session reads it. */
+const SESSION_STATE_METADATA_PATHS = [
+  '$.__conversation',
+  '$.__host_recovery_state',
+  '$.__interrupt_state',
+  '$.__source_approval_checkpoints',
+  '$.__host_recovery_mcp_scope',
+] as const;
+
+const SESSION_COLUMNS_WITHOUT_STATE = `id, kind, channel, user_id, created_at, updated_at, status, title,
+  objective, token_budget, tokens_used, current_plan_id,
+  CASE WHEN json_valid(metadata_json)
+    THEN json_remove(metadata_json, ${SESSION_STATE_METADATA_PATHS.map((p) => `'${p}'`).join(', ')})
+    ELSE metadata_json END AS metadata_json`;
 
 let cached: Database.Database | null = null;
 
@@ -1210,6 +1233,13 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   sql += ' LIMIT ? OFFSET ?';
   params.push(limit);
   params.push(offset);
+  // Select row identities before carrying conversation payloads into a sorter.
+  // Full-state callers need the selected metadata, not every off-page blob.
+  // Keep filters and pagination in the inner query and reapply the stable
+  // ordering outside; the returned rows and metadata contract are unchanged.
+  sql = `SELECT ${options.withoutConversationState ? SESSION_COLUMNS_WITHOUT_STATE : '*'} FROM sessions
+    WHERE rowid IN (${sql.replace('SELECT * FROM sessions', 'SELECT rowid FROM sessions')})
+    ORDER BY updated_at DESC, id DESC`;
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
   return rows.map(rowToSession);
 }
@@ -4713,7 +4743,37 @@ export function getRunAttemptSourceUserEvent(
   return row ? rowToEvent(row) : null;
 }
 
-/** Register the one live attempt that a reusable session is currently serving. */
+/** A durable workflow handoff is no longer an abandoned foreground marker.
+ * Preserve its original attempt when another foreground request starts. This
+ * is only a retirement fence: resumption still verifies the cross-store group,
+ * checkpoint, current definitions and effect ledger before any execution. */
+function hasWorkflowHandoff(db: Database.Database, sessionId: string, sourceUserSeq: number | null): boolean {
+  if (!sourceUserSeq) return false;
+  const rows = db.prepare(`SELECT dispatch.* FROM events AS dispatch
+    JOIN events AS source ON source.seq = ? AND source.session_id = dispatch.session_id
+    WHERE dispatch.session_id = ? AND dispatch.type = 'async_work_dispatched'
+      AND dispatch.role = 'system' AND dispatch.parent_event_id = source.id
+      AND dispatch.turn = source.turn AND source.type = 'user_input_received' AND source.role = 'user'
+      AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+      AND json_extract(dispatch.data_json, '$.sourceUserSeq') = ?
+    ORDER BY dispatch.seq LIMIT 2`).all(sourceUserSeq, sessionId, sourceUserSeq) as RawEventRow[];
+  if (rows.length !== 1) return false;
+  try { return publicAsyncWorkDispatchedData(JSON.parse(rows[0]!.data_json))?.sourceUserSeq === sourceUserSeq; }
+  catch { return false; }
+}
+
+function supersedeForegroundAttempts(db: Database.Database, sessionId: string, now: string, exceptAttemptId?: string): void {
+  const rows = db.prepare(`SELECT attempt_id, source_user_seq FROM run_attempts
+    WHERE session_id = ? AND finished_at IS NULL`).all(sessionId) as Array<{ attempt_id: string; source_user_seq: number | null }>;
+  const retire = db.prepare(`UPDATE run_attempts SET finished_at = ?, status = 'superseded', lease_expires_at = NULL
+    WHERE session_id = ? AND attempt_id = ? AND finished_at IS NULL`);
+  for (const row of rows) {
+    if (row.attempt_id === exceptAttemptId || hasWorkflowHandoff(db, sessionId, row.source_user_seq)) continue;
+    retire.run(now, sessionId, row.attempt_id);
+  }
+}
+
+/** Register the foreground attempt without retiring transferred workflow owners. */
 export function beginRunAttempt(
   sessionId: string,
   input: { runId?: string | null; attemptId?: string } = {},
@@ -4772,14 +4832,9 @@ export function beginRunAttempt(
     if (current?.run_id !== null && current?.run_id !== undefined && runId !== null && current.run_id !== runId) {
       throw new Error(`run attempt ${attemptId} is already bound to run ${current.run_id}`);
     }
-    // A single chat session is serialized. If a caller starts a new attempt
-    // after a process-level error left the previous row active, retire the old
-    // marker so a stale stop can never target the fresh work.
-    db.prepare(
-      `UPDATE run_attempts
-          SET finished_at = COALESCE(finished_at, ?), status = 'superseded'
-        WHERE session_id = ? AND finished_at IS NULL AND attempt_id != ?`,
-    ).run(startedAt, sessionId, attemptId);
+    // Foreground requests supersede stale foreground markers. A source
+    // handed to a durable workflow keeps its own attempt and stop scope.
+    supersedeForegroundAttempts(db, sessionId, startedAt, attemptId);
     db.prepare(
       `INSERT INTO run_attempts
          (attempt_id, session_id, run_id, started_at, finished_at, status)
@@ -5348,6 +5403,11 @@ export function claimRunAttemptLease(input: {
       }
     }
 
+    if (latest && !latest.finished_at && hasWorkflowHandoff(db, sessionId, latest.source_user_seq)) {
+      return { attempt: { sessionId, attemptId: latest.attempt_id, runId: latest.run_id, startedAt: latest.started_at },
+        claimed: false, reason: 'active', interruptedAttemptId: null };
+    }
+
     let interruptedAttemptId: string | null = null;
     if (latest && !latest.finished_at) {
       const leaseExpiry = latest.lease_expires_at ? Date.parse(latest.lease_expires_at) : Number.NaN;
@@ -5371,13 +5431,9 @@ export function claimRunAttemptLease(input: {
     const baseExists = Boolean(db.prepare('SELECT 1 FROM run_attempts WHERE attempt_id = ?').get(baseAttemptId));
     const attemptId = baseExists ? `${baseAttemptId}:${randomUUID().slice(0, 8)}` : baseAttemptId;
 
-    // Keep the session serialization contract from beginRunAttempt: a newer
-    // request retires any unrelated unfinished marker before it becomes live.
-    db.prepare(
-      `UPDATE run_attempts
-          SET finished_at = COALESCE(finished_at, ?), status = 'superseded', lease_expires_at = NULL
-        WHERE session_id = ? AND finished_at IS NULL`,
-    ).run(now, sessionId);
+    // Match beginRunAttempt: retire stale foreground markers while keeping
+    // each workflow handoff under its original source and attempt.
+    supersedeForegroundAttempts(db, sessionId, now);
     db.prepare(
       `INSERT INTO run_attempts
          (attempt_id, session_id, run_id, started_at, finished_at, status,
@@ -6963,6 +7019,59 @@ export function listToolOutputCallIds(sessionId: string, limit = 60): string[] {
   return rows.map((row) => row.call_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
 }
 
+export interface RetainedToolOutputSummary {
+  callId: string;
+  tool: string | null;
+  contentBytes: number;
+  createdAt: string;
+}
+
+/**
+ * What this turn has ACTUALLY retained, newest first. When the model asks a
+ * parked-output reader for an id that was never a result, the honest answer
+ * names the results that do exist — scoped to the accepted source when the
+ * logical call ledger knows it — instead of a bare "not found" that reads as
+ * "empty data". Session-wide when the source is unknown; empty when nothing
+ * has been retrieved yet, which is itself the fact the model needs.
+ */
+export function listRetainedToolOutputs(
+  sessionId: string,
+  options: { sourceUserSeq?: number; limit?: number } = {},
+): RetainedToolOutputSummary[] {
+  const db = openEventLog();
+  const limit = Math.max(1, Math.min(60, Math.floor(options.limit ?? 12)));
+  const source = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq as number
+    : null;
+  const rows = (source !== null
+    ? db.prepare(
+      `SELECT o.call_id, o.tool, o.content_bytes, o.created_at
+         FROM tool_outputs o
+         INNER JOIN logical_tool_calls c
+           ON c.session_id = o.session_id AND c.logical_tool_call_id = o.call_id
+        WHERE o.session_id = ? AND c.source_user_seq = ?
+        ORDER BY o.created_at DESC, o.call_id ASC
+        LIMIT ?`,
+    ).all(sessionId, source, limit)
+    : db.prepare(
+      `SELECT call_id, tool, content_bytes, created_at
+         FROM tool_outputs
+        WHERE session_id = ?
+        ORDER BY created_at DESC, call_id ASC
+        LIMIT ?`,
+    ).all(sessionId, limit)) as Array<{
+      call_id: string; tool: string | null; content_bytes: number; created_at: string;
+    }>;
+  return rows
+    .filter((row) => typeof row.call_id === 'string' && row.call_id.length > 0)
+    .map((row) => ({
+      callId: row.call_id,
+      tool: typeof row.tool === 'string' && row.tool ? row.tool : null,
+      contentBytes: Number.isFinite(row.content_bytes) ? row.content_bytes : 0,
+      createdAt: row.created_at,
+    }));
+}
+
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
   return db.transaction(() => readCanonicalOutput(db, sessionId, callId))();
@@ -8059,7 +8168,7 @@ function carrierMirrorInvocationOutput(
   const carrierRows = rows.filter((row) => row.tool === occurrence.tool);
   let innerRows = rows.filter((row) => row.tool === effectiveTool);
   // Live 2026-09-21 source 272188: work_call stores effectiveTool as the
-  // operation (OUTLOOK_GET_CALENDAR_VIEW) while the transport-mirror
+  // provider operation while the transport-mirror
   // invocation is composio_execute_tool. That is still one carrier dispatch.
   if (innerRows.length !== 1 && carrierRows.length === 1) {
     const gateway = rows.filter((row) => row.tool === 'composio_execute_tool');

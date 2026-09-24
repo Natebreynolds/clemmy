@@ -7,17 +7,63 @@ const {
 } = await import('./client.js');
 const {
   filterPrimerHitsWithJev,
+  nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   rerankNamedCandidatesWithJev,
   selectProvenRunStrategyWithJev,
   tryJevCompletionVerdict,
   tryJevGroundingVerdict,
   tryJevOutputGroundingVerdict,
+  tryJevTrajectoryVerdict,
 } = await import('./control-plane.js');
 
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+});
+
+test('read nomination preserves accounts, ambiguity and unavailable outcomes', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let choice = 'candidate_0';
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      which: { type: 'choice', choice, confidence: 0.9, probabilities: { [choice]: 0.9 } },
+    }, usage: { input_tokens: 40, output_tokens: 4 } }),
+  }));
+  const rows = [
+    { name: 'a', operationId: 'list', description: 'List documentation' },
+    { name: 'b', operationId: 'list', description: 'List documentation' },
+    { name: 'c', operationId: 'fetch', description: 'Read a page' },
+  ];
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), ['a', 'b']);
+  choice = 'ambiguous';
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), ['a', 'b', 'c']);
+  choice = 'none';
+  assert.deepEqual(await nominateReadCapabilitiesWithJev('List available documentation', rows), []);
+  for (choice of ['uncertain', 'candidate_99']) {
+    assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
+  }
+  _setTypesafeKeyForTests(null);
+  assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
+});
+
+test('candidate and primer routing preserve late request constraints and retain fallback on rejection', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 413, ok: false, text: async () => 'request rejected' };
+  });
+  const query = 'Background on the requested research. '.repeat(35)
+    + '\nOnly read existing records. Do not send email or create a workflow.\n'
+    + 'Preserve the exact search string: "two  spaces".';
+  const candidates = [{ name: 'read_records' }, { name: 'send_email' }];
+  const hits = [{ title: 'Research preference', snippet: 'Read existing records', score: 0.8 }];
+  assert.deepEqual(await rerankNamedCandidatesWithJev(query, candidates), candidates);
+  assert.deepEqual(await filterPrimerHitsWithJev(query, hits), hits);
+  assert.deepEqual(await prepareSharedEvidenceDecisionsWithJev(query, { candidates, hits }), { candidates, hits });
+  assert.equal(posted.length, 3);
+  for (const request of posted) assert.equal(request.state.request, query);
 });
 
 test('rerankNamedCandidatesWithJev reorders by Choice probabilities', async () => {
@@ -230,6 +276,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
       text: async () => JSON.stringify({
         model: 'jev-1.13.0',
         answers: {
+          requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
           verdict: {
             type: 'choice',
             choice: 'done',
@@ -264,6 +311,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
       answers: {
+        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
         verdict: {
           type: 'choice',
           choice: 'incomplete',
@@ -294,6 +342,7 @@ test('tryJevCompletionVerdict returns a typed verdict only when confidence is hi
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
       answers: {
+        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
         verdict: {
           type: 'choice',
           choice: 'done',
@@ -330,4 +379,99 @@ test('tryJevOutputGroundingVerdict returns a typed rollup only when confidence i
     [{ excerpt: 'traffic +18 percent' }],
   );
   assert.equal(ok?.verdict, 'grounded');
+});
+
+
+test('tryJevTrajectoryVerdict returns a typed on_track/drift reading and fails open on anything else', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({
+    status: 200, ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: { verdict: { type: 'choice', choice: 'drift', probabilities: { on_track: 0.2, drift: 0.8 }, confidence: 0.77 } },
+      usage: { input_tokens: 40, output_tokens: 3 },
+    }),
+  }));
+  const drift = await tryJevTrajectoryVerdict({
+    objective: 'list tomorrow\'s calendar', toolCallSummary: 'tool_search ×12 for tool_output_query',
+    latestAssistantNote: 'Searching for the query tool again.', toolCallCount: 13,
+  });
+  assert.equal(drift?.onTrack, false);
+  assert.equal(drift?.confidence, 0.77);
+  assert.equal(drift?.model, 'jev-1.13.0');
+
+  _setSystemOneFetchForTests(async () => ({ status: 500, ok: false, text: async () => 'nope' }));
+  assert.equal(await tryJevTrajectoryVerdict({
+    objective: 'x', toolCallSummary: '', latestAssistantNote: '', toolCallCount: 1,
+  }), null, 'a Jev miss changes nothing');
+});
+
+test('completion review preserves the complete source objective, final receipt and reply bytes', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 503, ok: false, text: async () => 'unavailable' };
+  });
+  const objective = 'Retained requirement. '.repeat(90) + '\nThen disable the workflow.';
+  const response = 'Verified result. '.repeat(450) + '\nWorkflow disabled: false is the saved enabled value.';
+  const verifiedReads = 'Earlier successful receipt. '.repeat(180) + '\nFINAL READ: enabled=false';
+  const evidence = 'Earlier settled work. '.repeat(150) + '\nLAST WRITE: enabled=false';
+  const outcomes = Array.from({ length: 16 }, (_, index) => ({
+    toolName: `operation_${index}`, outcome: 'succeeded', contentComplete: true,
+  }));
+  assert.equal(await tryJevCompletionVerdict(objective, response, {
+    verifiedReads, toolCallSummary: evidence, coverage: { complete: true, outcomeEvidence: outcomes },
+  }), null, 'transport unavailability still falls back to the existing reviewer');
+  assert.equal(posted.state.objective, objective);
+  assert.equal(posted.state.response, response);
+  assert.equal(posted.state.verifiedReads, verifiedReads);
+  assert.equal(posted.state.evidence, evidence);
+  assert.deepEqual(posted.state.coverage.outcomeEvidence, outcomes);
+});
+
+test('valid receipts and a done vote do not certify missing or uncertain requested work', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  for (const choice of ['missing', 'uncertain', 'satisfied']) {
+    _setSystemOneFetchForTests(async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      assert.equal(payload.questions.requirements.type, 'choice');
+      assert.match(payload.questions.requirements.instructions, /does not prove all requested work/);
+      return { status: 200, ok: true, text: async () => JSON.stringify({
+        model: 'jev-1.13.0', answers: {
+          verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.9 },
+          requirements: { type: 'choice', choice, probabilities: { satisfied: choice === 'satisfied' ? 0.9 : 0.05,
+            missing: choice === 'missing' ? 0.9 : 0.05, uncertain: choice === 'uncertain' ? 0.9 : 0.05 }, confidence: 0.9 },
+          matches: { type: 'noul', noul: 0.95 },
+        }, usage: { input_tokens: 40, output_tokens: 6 },
+      }) };
+    });
+    const result = await tryJevCompletionVerdict(
+      'Save a tracked plan before writing, then create, run and disable the fixture.',
+      choice === 'satisfied' ? 'The saved plan and all requested steps are verified.'
+        : 'The workflow returned 323 and is disabled. I never saved the requested plan.',
+      { coverage: { complete: true, outcomeEvidence: [{ toolName: 'workflow_set_enabled', outcome: 'succeeded' }] } },
+    );
+    if (choice === 'satisfied') assert.equal(result?.done, true);
+    else if (choice === 'missing') assert.equal(result?.done, false, 'preserve the negative finding for reviewer fallback');
+    else assert.equal(result, null, 'uncertain coverage must defer to the reviewer');
+  }
+});
+
+ test('completion sends an identical embedded read block once without dropping distinct evidence', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 503, ok: false, text: async () => 'unavailable' };
+  });
+  const reads = 'VERIFIED RECEIPT: current enabled=false; source=exact';
+  const evidence = 'Write receipt.\n' + reads + '\nPending approval remains pending.';
+  await tryJevCompletionVerdict('Inspect status', 'Disabled', { verifiedReads: reads, toolCallSummary: evidence });
+  assert.equal(posted.state.evidence, evidence);
+  assert.equal(posted.state.verifiedReads, undefined);
+  assert.equal(posted.state.verifiedReadsIncludedIn, 'evidence');
+  await tryJevCompletionVerdict('Inspect status', 'Disabled', { verifiedReads: reads + ' distinct tail', toolCallSummary: evidence });
+  assert.equal(posted.state.verifiedReads, reads + ' distinct tail');
+  assert.equal(posted.state.evidence, evidence);
 });

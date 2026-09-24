@@ -1,3 +1,4 @@
+import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
 /**
  * Restart recovery for in-flight CHAT runs.
  *
@@ -560,6 +561,13 @@ export function releaseRunInFlightAfterWorkflowTransfer(
     if (!active || active.sealed.sourceGroupId !== sourceGroupId) return false;
     const db = openEventLog();
     return db.transaction(() => {
+      // A fast child can complete and reacquire its parent before the
+      // departing foreground finally runs. That new activation owns both the
+      // lease and coarse marker; the old HTTP executor may clear neither.
+      const owner = ownerAttemptId ? db.prepare(`SELECT lease_owner FROM run_attempts
+        WHERE session_id = ? AND attempt_id = ? AND source_user_seq = ? AND finished_at IS NULL`)
+        .get(sessionId, ownerAttemptId, sourceUserSeq) as { lease_owner: string | null } | undefined : undefined;
+      if (owner?.lease_owner?.startsWith(WORKFLOW_PARENT_LEASE_PREFIX)) return false;
       const cleared = clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
       if (ownerAttemptId) {
         // The workflow group owns execution now. Keep the logical attempt

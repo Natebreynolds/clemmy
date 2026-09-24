@@ -10,6 +10,7 @@ import {
   type HostCapabilityDescriptorV1,
   type TurnSemanticProposalV1,
   boundedSemanticObjective,
+  capabilityProducesArtifactFor,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
@@ -940,6 +941,44 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
  * (where that surface owns delivery), and activation. It never invokes a
  * model, provider, or business tool. Carrier-owned delivery remains explicitly
  * held for the ordinary channel resumer that can reconstruct its exact target. */
+/**
+ * Commit the one honest terminal for a preparation whose retry window passed
+ * with nothing dispatched. Idempotent by construction: the eventlog refuses a
+ * second logical terminal for the same accepted source, and the recovery
+ * candidate query excludes any source that has one. Never throws.
+ */
+async function terminalizeExpiredPlanTaskPreparation(
+  candidate: { sessionId: string; sourceUserSeq: number },
+  reason: string,
+): Promise<void> {
+  try {
+    const source = listEvents(candidate.sessionId, {
+      sinceSeq: candidate.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === candidate.sourceUserSeq);
+    if (!source) return;
+    const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+    const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+    const identity = { sessionId: candidate.sessionId, turn: source.turn, sourceUserSeq: candidate.sourceUserSeq };
+    commitTurnOutcome({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'needs_input',
+      resumable: true,
+      needs: { kind: 'continue' },
+      presentation: {
+        kind: 'continue',
+        text: 'I stopped setting this up: Clementine restarted while it was being prepared and the retry window has passed. Nothing was sent or changed. Say continue if you still want it and I will start again from your request.',
+      },
+    }, {
+      legacyReason: `plan_preparation_expired: ${reason}`.slice(0, 400),
+      metadata: { steps: 0 },
+    });
+  } catch { /* a competing terminal or a store hiccup leaves the next tick to say it */ }
+}
+
 export async function recoverPendingPlanTaskBindingSealPreparations(input: {
   limit?: number;
 } = {}): Promise<{
@@ -981,7 +1020,16 @@ export async function recoverPendingPlanTaskBindingSealPreparations(input: {
     const preparation = await recoverPlanTaskBindingSealPreparation(candidate);
     if (preparation.status === 'held' || preparation.status === 'expired') {
       if (preparation.status === 'held') summary.held += 1;
-      else summary.expired += 1;
+      else {
+        summary.expired += 1;
+        // An expired preparation with no terminal is re-claimed by every tick
+        // forever (live 2026-09-22: one source re-logged as `expired` every
+        // 16 s for hours). The fresh-turn owner that would "report it
+        // factually" is long gone, so report it here, once, as the honest
+        // typed terminal the candidate query already excludes. Nothing ran;
+        // `continue` takes it from there.
+        await terminalizeExpiredPlanTaskPreparation(candidate, preparation.reason);
+      }
       summary.records.push({
         ...candidate,
         preparation: preparation.status,
@@ -1227,7 +1275,7 @@ function undisclosedRefRepairInstruction(
  * postures out of the English error prose, which could recommend the rejected
  * ref, name the wrong family, or disagree with recoveryTool.
  */
-function destinationMismatchRepair(input: {
+export function destinationMismatchRepair(input: {
   reason: string;
   draft: Pick<z.infer<typeof FreshActionPlanDraftSchema>, 'destination' | 'bindings'>;
   capabilities: readonly HostCapabilityDescriptorV1[];
@@ -1240,6 +1288,24 @@ function destinationMismatchRepair(input: {
     ...(entry.destinationPosture ? [entry.destinationPosture] : []),
     ...(entry.destinationPostures ?? []),
   ]);
+  const bound = input.draft.bindings.flatMap((binding) => {
+    const descriptor = byId.get(binding.capabilityRef);
+    return descriptor ? [{ binding, descriptor }] : [];
+  });
+  const lineage = sink.posture === 'create_new' ? bound.flatMap((consumer) => {
+    if (consumer.descriptor.deliverableKind !== sink.family
+      || !posturesOf(consumer.descriptor).has('named_existing')
+      || posturesOf(consumer.descriptor).has('create_new')) return [];
+    return bound.filter((producer) => producer.binding.operationId !== consumer.binding.operationId
+      && capabilityProducesArtifactFor(producer.descriptor, consumer.descriptor))
+      .map((producer) => `${consumer.binding.operationId} can consume the artifact created by ${producer.binding.operationId}`);
+  }) : [];
+  if (lineage.length > 0) {
+    return `The shown capabilities already cover creation and later artifact operations: ${lineage.join('; ')}. `
+      + 'If those later operations target that created artifact, declare the creator in both their dataFrom and dependsOn, then call plan_task again. '
+      + 'An ordering dependency alone does not establish artifact lineage. Preserve the requested destination; do not remove it to bypass this check. '
+      + 'If they target a different artifact, retain that distinction and discover a compatible operation only if needed.';
+  }
   // The refs this draft actually cited for the sink's family — those are the
   // ones that failed, and must never be recommended back.
   const citedForFamily = new Set(

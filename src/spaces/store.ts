@@ -923,6 +923,8 @@ export interface SpaceSnapshot {
   record: SpaceRecord;
   manifest: string;
   view: string;
+  /** Manifest-only Spaces are readable, but do not have saved view bytes. */
+  viewMissing?: true;
   data: string;
   revision: string;
 }
@@ -931,10 +933,18 @@ function readSpaceSnapshotUnlocked(slug: string): SpaceSnapshot | undefined {
   const record = readManifest(slug);
   if (!record) return undefined;
   const manifest = readFileSync(manifestPath(slug), 'utf8');
-  const view = readFileSync(resolveInSpace(slug, record.viewEntry), 'utf8');
+  let view: string;
+  let viewMissing: true | undefined;
+  try { view = readFileSync(resolveInSpace(slug, record.viewEntry), 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    view = '';
+    viewMissing = true;
+  }
   const dataFile = resolveInSpace(slug, 'data.json');
   const data = existsSync(dataFile) ? readFileSync(dataFile, 'utf8') : '{}';
-  return { record, manifest, view, data, revision: workspaceSnapshotRevision({ manifest, view, data }) };
+  const parts = { manifest, view, data, ...(viewMissing ? { viewMissing } : {}) };
+  return { record, ...parts, revision: workspaceSnapshotRevision(parts) };
 }
 
 export class WorkspaceStaticUpdateError extends Error {
@@ -957,6 +967,7 @@ export interface StaticSpaceDocumentUpdateResult { record: SpaceRecord; commitRe
 
 function replaceStaticSpaceDocumentUnlocked(input: ReplaceStaticSpaceDocumentInput): StaticSpaceDocumentUpdateResult {
   const before = readSpaceSnapshotUnlocked(input.id);
+  if (before?.viewMissing) throw new WorkspaceStaticUpdateError('invalid_document', 'The Workspace has no saved view; a static document replacement requires existing view bytes. Nothing was changed.');
   if (!before || before.record.status !== 'active' || before.record.contentMode !== 'static_snapshot'
     || !existsSync(resolveInSpace(input.id, 'data.json'))
     || before.record.dataSources.length !== 0 || (input.dataSources?.length ?? 0) !== 0

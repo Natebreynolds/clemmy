@@ -23,8 +23,7 @@ import {
   type SpaceRecord,
 } from '../spaces/store.js';
 import {
-  readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit,
-} from '../spaces/data-store.js';
+  readData, MAX_DATA_BYTES, appendNote, listNotes, appendAudit, listAudit, readViewData } from '../spaces/data-store.js';
 import {
   bootstrapWorkspaceObservationHistory,
   commitWorkspaceObservationBatch,
@@ -304,7 +303,7 @@ function workspaceViewCsp(req: Request, slug: string): string | null {
 const CLEM_VIEW_DATA_SEED = (slug: string): string => {
   let json: string | undefined;
   try {
-    json = JSON.stringify(readData(slug));
+    json = JSON.stringify(readViewData(slug));
   } catch { /* an unserializable dataset simply does not seed */ }
   if (typeof json !== 'string') return '';
   // Same rule as the static snapshot: HTML parses classic-script contents
@@ -492,6 +491,23 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     res.status(201).json({ space: rec });
   });
 
+  // ---- Starter recipes: the "start from a recipe" activation list ---------
+  // Runtime-filtered against the user's actually-connected toolkits (never a
+  // hardcoded vendor list); connection-free recipes are always present.
+  // Registered before /spaces/:id — after it, "starters" was read as a Space
+  // id and every call answered 404 (the Spaces page said starters "couldn't
+  // be loaded just now").
+  app.get('/api/console/spaces/starters', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    let slugs: string[] = [];
+    // A failed lookup is not "nothing connected": say which one it was, so a
+    // surface can offer the connection-free starters without claiming the rest
+    // need connecting.
+    let connectionsKnown = true;
+    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { connectionsKnown = false; }
+    res.json({ starters: availableStarterRecipes(slugs), connectionsKnown });
+  });
+
   app.get('/api/console/spaces/:id', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
@@ -633,7 +649,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
     if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
-    res.json({ data: readData(slug) });
+    res.json({ data: readViewData(slug) });
   });
 
   app.put('/api/console/spaces/:id/data', async (req, res) => {
@@ -932,16 +948,6 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     writeFileSync(canonical, snapshot, 'utf-8');
     appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
     res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
-  });
-
-  // ---- Starter recipes: the "start from a recipe" activation list ---------
-  // Runtime-filtered against the user's actually-connected toolkits (never a
-  // hardcoded vendor list); connection-free recipes are always present.
-  app.get('/api/console/spaces/starters', async (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    let slugs: string[] = [];
-    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { /* offline → connection-free only */ }
-    res.json({ starters: availableStarterRecipes(slugs) });
   });
 
   // ---- Publish: export a static share-ready snapshot ----------------------

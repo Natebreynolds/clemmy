@@ -282,3 +282,10 @@ test('the Inbox clears optimistically, asks once, and puts a refused row back', 
   assert.match(inbox, /useState<ReadonlySet<string>>\(\(\) => new Set\(\)\)/);
   assert.match(inbox, /reading\.has\(row\.id\)/);
 });
+
+test('a notification title drops a leading emoji status icon', async () => {
+  const { notificationTitle } = await import('./inbox-presentation.js');
+  assert.equal(notificationTitle('📅 Reply needed: Pipeline review'), 'Reply needed: Pipeline review');
+  assert.equal(notificationTitle('⚠️ Workflow needs attention: Digest'), 'Workflow needs attention: Digest');
+  assert.equal(notificationTitle('Plain title'), 'Plain title');
+});

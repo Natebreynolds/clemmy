@@ -10,6 +10,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getSettings, patchPolicy, type Policy } from '@/lib/settings';
 import { listSendTrust, addSendTrust, revokeSendTrust } from '@/lib/settings';
+import { getWatches, patchWatch, tickWatch, type WatchStatus } from '@/lib/settings';
 
 /**
  * Trusted send recipients — the ONE bounded way to cut approval clicks toward
@@ -89,6 +90,99 @@ function ToggleRow({ label, desc, checked, onChange }: { label: string; desc: st
   );
 }
 
+function ago(iso?: string): string {
+  if (!iso) return 'never';
+  const mins = Math.round((Date.now() - Date.parse(iso)) / 60_000);
+  if (!Number.isFinite(mins)) return iso;
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+const WATCH_KIND_LABEL: Record<string, string> = {
+  cancelled: 'Cancelled',
+  removed: 'Removed',
+  conflict: 'Double-booked',
+  invite_unanswered: 'Reply needed',
+  moved: 'Moved',
+  starting_soon: 'Starting soon',
+  suggestion: 'Workflow suggestion',
+};
+
+/**
+ * Watches — background heartbeats on a contract: read on a cadence, detect
+ * changes deterministically, raise ONE item per meaningful change, and let
+ * Jev veto only the low-signal ones. This card answers "what is it for, when
+ * did it last look, what did it find, what is open" and offers the controls.
+ */
+function WatchesPanel() {
+  const qc = useQueryClient();
+  const watches = usePoll(['watches'], getWatches, 30_000);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [lastTick, setLastTick] = useState<string | null>(null);
+  const refresh = () => { void qc.invalidateQueries({ queryKey: ['watches'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); };
+  const toggle = async (w: WatchStatus, enabled: boolean) => {
+    setBusy(w.id);
+    try { await patchWatch(w.id, { enabled }); refresh(); } finally { setBusy(null); }
+  };
+  const checkNow = async (w: WatchStatus) => {
+    setBusy(w.id);
+    try {
+      const r = await tickWatch(w.id);
+      setLastTick(r.tick.summary);
+      refresh();
+    } catch (e) {
+      setLastTick(e instanceof Error ? e.message : String(e));
+    } finally { setBusy(null); }
+  };
+  const list = watches.data?.watches ?? [];
+  return (
+    <>
+      <h3 className="mb-2 mt-4 text-h3 text-fg">Watches</h3>
+      <p className="mb-2 text-caption text-muted">A watch reads on a cadence, notices what changed, and raises one item per change that needs you. It runs whether or not proactive work is on, and it never acts on your behalf.</p>
+      {watches.isLoading && list.length === 0 ? <Skeleton className="h-16 w-full" /> : list.map((w) => (
+        <div key={w.id} className="border-t border-border py-3 first:border-t-0" data-testid={`watch-${w.id}`}>
+          <div className="flex items-center gap-3">
+            <div className="flex-1">
+              <div className="text-body font-medium text-fg">{w.title}</div>
+              <div className="text-caption text-muted">{w.purpose}</div>
+            </div>
+            <Switch checked={w.enabled} onChange={(v) => { void toggle(w, v); }} label={w.title} />
+          </div>
+          <div className="mt-2 grid gap-1 text-caption text-muted sm:grid-cols-2">
+            <div>Every {w.cadenceMinutes} min{w.quietHoursActive ? ' · quiet hours now' : ''}{w.id === 'calendar' && w.connectedOperations.length === 0 ? ' · no calendar connected' : ''}</div>
+            <div>Last check: {ago(w.lastTickAt)}{w.running ? ' · checking…' : ''}</div>
+            <div className="sm:col-span-2">
+              Last finding: {w.lastFinding ? w.lastFinding.summary : 'none yet'}
+              {w.lastError ? <span className="text-danger"> · {w.lastError.reason}</span> : null}
+            </div>
+            <div className="sm:col-span-2">
+              {w.metrics.ticks} checks · {w.metrics.quietTicks} quiet · {w.metrics.itemsProduced} items · {w.metrics.itemsAcknowledged} seen by you · {w.metrics.itemsRetired} resolved on their own · {w.metrics.modelCalls} Jev calls ({w.metrics.modelVetoes} judged routine) · {w.metrics.duplicatesSuppressed} duplicates held back
+            </div>
+          </div>
+          {w.openItems.length > 0 && (
+            <ul className="mt-2 space-y-1 text-caption text-fg">
+              {w.openItems.slice(0, 6).map((item) => (
+                <li key={item.key}>
+                  <span className="font-medium">{WATCH_KIND_LABEL[item.kind] ?? item.kind}:</span> {item.subject}
+                  {item.acknowledgedAt ? <span className="text-muted"> · seen</span> : null}
+                </li>
+              ))}
+              {w.openItems.length > 6 && <li className="text-muted">+{w.openItems.length - 6} more</li>}
+            </ul>
+          )}
+          <div className="mt-2 flex items-center gap-3">
+            <Button variant="secondary" onClick={() => { void checkNow(w); }} disabled={busy === w.id}>{busy === w.id ? 'Checking…' : 'Check now'}</Button>
+            {lastTick && <span className="text-caption text-muted">{lastTick}</span>}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 export function AutonomyForm() {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
@@ -157,6 +251,8 @@ export function AutonomyForm() {
           )}
 
           <SendTrustPanel />
+
+          <WatchesPanel />
 
           <h3 className="mb-2 mt-4 text-h3 text-fg">What Clementine is allowed to do</h3>
           <ToggleRow label="Use connected apps" desc="Gmail, Calendar, Slack, etc." checked={!!form.allowComposioActions} onChange={(v) => set('allowComposioActions', v)} />

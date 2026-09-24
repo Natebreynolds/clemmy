@@ -151,6 +151,23 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
   return rows;
 }
 
+/** A notification title as the card shows it: a leading emoji is a status
+ *  icon ("📅 Reply needed", "⚠️ Workflow …") and the card already says what
+ *  kind of row it is. */
+export function notificationTitle(title: string | null | undefined): string {
+  return (title ?? '').replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '').trim();
+}
+
+/** What a needs-you card is about, from its server key: the same words the
+ *  desktop's pills use ("Reply", "Stopped", "Your answer"). */
+export function needsYouCardLabel(row: Pick<InboxNotification, 'needsYouKey'>): string {
+  const key = row.needsYouKey ?? '';
+  if (key.startsWith('calendar:')) return 'Meeting · reply needed';
+  if (key.startsWith('flow:')) return 'Flow · stopped';
+  if (/^(session|task|checkin|workflow):/.test(key)) return 'Clem · your answer';
+  return 'Update · needs you';
+}
+
 export function notificationLabel(row: Pick<InboxNotification, 'kind' | 'needsAttention' | 'read'>): string {
   if (row.needsAttention && !row.read) return 'Clem needs you';
   switch (row.kind) {
@@ -188,10 +205,11 @@ export function notificationRunTarget(
 
 export function notificationDedupeKey(row: InboxNotification): string {
   // A title or workflow name is presentation, not identity: one workflow can
-  // have two unrelated blockers with the same generic title. Until a durable
-  // server-owned issue key exists, the exact notification id is the only safe
-  // collapse/dismiss boundary.
-  return `notification:${row.id}`;
+  // have two unrelated blockers with the same generic title. The server now
+  // owns the identity (dashboard/needs-you.ts `needsYouKey`: a stopped
+  // workflow, a calendar item, a chat run) and counts by it; a daemon that
+  // does not send one leaves each row on its own.
+  return row.needsYouKey ?? `notification:${row.id}`;
 }
 
 export function trustScopeSummary(scope: {

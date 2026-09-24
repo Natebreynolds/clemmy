@@ -783,7 +783,10 @@ export function claimResumableApproval(
       row: rowToPublic(claimed),
     };
   });
-  return claim();
+  // Acquire the writer reservation before reading. Competing resume processes
+  // must wait, then observe the consumed grant; deferred read-to-write upgrades
+  // can instead throw SQLITE_BUSY_SNAPSHOT after both read the same approval.
+  return claim.immediate();
 }
 
 /**
@@ -830,7 +833,10 @@ export function claimApprovedUnconsumedForSession(
       .get(current.approvalId) as ApprovalSqlRow;
     return rowToPublic(claimed);
   });
-  return claim();
+  // Acquire the writer reservation before reading. Competing resume processes
+  // must wait, then observe the consumed grant; deferred read-to-write upgrades
+  // can instead throw SQLITE_BUSY_SNAPSHOT after both read the same approval.
+  return claim.immediate();
 }
 
 /**
@@ -922,7 +928,7 @@ export function claimApprovedResendConsent(
       `).run(new Date().toISOString(), row.approval_id).changes;
       return changes === 1;
     });
-    return claim();
+    return claim.immediate();
   } catch {
     // Fail toward the duplicate wall.
     return false;

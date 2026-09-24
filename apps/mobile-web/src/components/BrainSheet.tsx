@@ -121,7 +121,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
                 <div class="brain-current-meta">{settings.brain.provider} · {sessionId ? 'answers your next message' : 'answers new conversations'}</div>
               </div>
             </div>
-            {settings.brain.inactiveBinding ? (
+            {settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
               <p class="warning brain-honesty">
                 Saved {settings.brain.inactiveBinding.modelId} is unavailable — {settings.brain.modelId} answers instead.
               </p>

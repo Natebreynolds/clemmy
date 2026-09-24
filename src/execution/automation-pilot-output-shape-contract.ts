@@ -1,7 +1,9 @@
+import { parseWorkflowCanonicalEntityResultProjection } from '../memory/workflow-result-projection-contract.js';
 /**
  * Provider-neutral admission for an automatic pilot's interpretation of live
  * read output bytes. The model may propose paths, but only exact paths proven
- * by a carrier-declared or host-reviewed output schema survive. No business
+ * by declared/reviewed schemas, or an explicit conditional text interpretation
+ * validated at execution, survive. No business
  * invocation, catalog name, description, example, or prior result is accepted
  * as substitute authority.
  */
@@ -29,7 +31,7 @@ export interface AutomationPilotOutputShapeReceiptV1 {
   capabilityId: string;
   capabilityIdentityDigest: string;
   definitionFingerprint: string;
-  source: 'carrier_declared' | 'host_reviewed';
+  source: 'carrier_declared' | 'host_reviewed' | 'conditional_text_interpretation';
   schemaFingerprint: string;
   schema: Record<string, unknown>;
   receiptDigest: string;
@@ -90,16 +92,16 @@ export function attestAutomationPilotOutputShape(input: {
   if (!DIGEST_RE.test(input.requestDigest)) {
     return { ok: false, code: 'authoring_request_digest_invalid', reason: 'The exact authoring request digest is malformed.' };
   }
-  const shape = input.request.acquisition.outputShape;
-  if (!shape) {
-    return {
-      ok: false,
-      code: 'output_shape_unavailable',
-      reason: 'The exact live read definition does not declare a reviewed output schema; no business call was sampled.',
-    };
-  }
+  // This records a conditional host interpretation, never a provider guarantee.
+  // No read is sampled until the separate exact pilot approval is resolved.
+  const shape: Pick<AutomationPilotOutputShapeReceiptV1, 'source' | 'schema' | 'schemaFingerprint'> = input.request.acquisition.outputShape ?? {
+    source: 'conditional_text_interpretation',
+    schema: { type: 'string' },
+    schemaFingerprint: fingerprintSchema({ type: 'string' }),
+  };
   if (
-    (shape.source !== 'carrier_declared' && shape.source !== 'host_reviewed')
+    (shape.source !== 'carrier_declared' && shape.source !== 'host_reviewed'
+      && !(shape.source === 'conditional_text_interpretation' && input.request.acquisition.outputShape === undefined))
     || !SCHEMA_FINGERPRINT_RE.test(shape.schemaFingerprint)
     || !plainRecord(shape.schema)
   ) {
@@ -253,7 +255,33 @@ function resultShapeIssue(input: {
     || result.requestId !== receipt.requestId
     || result.requestDigest !== receipt.requestDigest
   ) return 'The authoring result and output-shape receipt do not share exact request lineage.';
-  const root = receipt.schema;
+  const projectionContract = result.contract.resultProjection;
+  let root = receipt.schema;
+  if (receipt.source === 'conditional_text_interpretation' && !projectionContract?.textInterpretation) {
+    return 'Absent provider schema requires an explicit reviewed conditional text interpretation; invented provider record paths are not evidence.';
+  }
+  if (projectionContract?.textInterpretation) {
+    const parsed = parseWorkflowCanonicalEntityResultProjection(projectionContract);
+    if (!parsed.ok) return `Invalid conditional projection: ${parsed.errors.join(' ')}`;
+    if (receipt.schema.type !== 'string'
+      || (result.contract.continuation?.kind ?? 'none') !== 'none'
+      || result.contract.completeness.kind !== 'terminal_result') {
+      return 'Text interpretation requires a single terminal text result, not structured or paginated source authority.';
+    }
+    const text = projectionContract.textInterpretation;
+    root = {
+      type: 'object', additionalProperties: false,
+      required: ['records', 'selection'],
+      properties: {
+        records: { type: 'array', maxItems: text.selection.maxRecords,
+          items: { type: 'object', additionalProperties: false, required: [text.field], properties: { [text.field]: { type: 'string' } } } },
+        selection: { type: 'object', additionalProperties: false,
+          required: ['kind', 'scope', 'sourceRecords', 'selectedRecords', 'omittedRecords'],
+          properties: { kind: { type: 'string', const: 'reviewed_first_records' }, scope: { type: 'string', const: 'reviewed_selection' },
+            sourceRecords: { type: 'integer' }, selectedRecords: { type: 'integer' }, omittedRecords: { type: 'integer' } } },
+      },
+    };
+  }
   const evidence = result.contract.evidence;
   for (const path of evidence.requiredPaths) {
     const resolved = nodeAtPath({ root, path, requirePresent: true });
@@ -309,6 +337,8 @@ function resultShapeIssue(input: {
   }
   const projection = result.contract.resultProjection;
   if (!projection) return null;
+  const parsedProjection = parseWorkflowCanonicalEntityResultProjection(projection);
+  if (!parsedProjection.ok) return `Invalid result projection: ${parsedProjection.errors.join(' ')}`;
   if (
     !evidence.requiredPaths.includes(projection.recordsPath)
     || !evidence.nonEmptyPaths.includes(projection.recordsPath)
@@ -328,6 +358,7 @@ function resultShapeIssue(input: {
   }
   const fieldByName = new Map(projection.fields.map((field) => [field.field, field]));
   for (const field of projection.fields) {
+    if (field.hostSource !== undefined) continue; // Validated host evidence is not provider schema.
     const issue = requireTypes({
       root: item,
       path: field.recordPath,
@@ -393,8 +424,10 @@ export function automationPilotAuthoringPrompt(input: {
   return [
     'Author one typed read-pilot contract candidate as strict JSON.',
     'Do not call tools. Do not choose a provider, account, Workspace, schedule, recurrence, or approval outcome.',
-    'Use only the exact approved proposal, selected Workspace bytes, input schema, and attested output schema below.',
-    'Never invent a path. For a dataset, map canonical entity fields only to explicitly declared record-item paths.',
+    'Use only the exact approved proposal, selected Workspace bytes, input schema, and output-shape receipt below.',
+    'Never invent provider paths. Dataset fields may use a declared recordPath or an explicit hostSource: workflow_run_id, page_settled_at, page_receipt_id. Host fields come from verified execution receipts.',
+    'conditional_text_interpretation means the provider has no declared output schema. You may propose the supported explicit text-lines interpretation for separate review; it is conditional, not proof of source shape. The host validates every source line at execution and refuses mismatches.',
+    'Text interpretation is one terminal result with recordsPath records, sourceRecord.idPath equal to its text field, page_settled_at observation time, and selected record bounds equal to selection.maxRecords. It cannot claim exhaustive source coverage or invent additional parsed fields.',
     'For pagination, use finite_exhaustive plus one host-owned optional continuation_cursor only when exact next-cursor and boolean exhausted paths exist.',
     'Return exactly {version:1,requestId,requestDigest,contract,workflowInputs}.',
     canonicalJson({
@@ -405,6 +438,7 @@ export function automationPilotAuthoringPrompt(input: {
         proposal: input.request.proposal,
         acceptedSource: input.request.acceptedSource,
         requirement: input.request.requirement,
+        ...(input.request.workspaceOutputPhaseId ? { workspaceOutputPhaseId: input.request.workspaceOutputPhaseId } : {}),
         ...(input.request.workspaceSelection
           ? { workspaceSelection: input.request.workspaceSelection }
           : {}),
@@ -418,6 +452,12 @@ export function automationPilotAuthoringPrompt(input: {
       },
       requestDigest: input.requestDigest,
       outputShapeReceipt: input.receipt,
+      ...(input.receipt.schema.type === 'string' ? { supportedTextInterpretation: {
+        version: 1, kind: 'text_lines', field: 'exact source string field identifier', prefix: 'literal per-line prefix; empty is allowed',
+        whitespace: ['trim', 'preserve'], blankLines: ['skip', 'reject'],
+        maxSourceBytes: 'positive integer no larger than maxPageBytes', maxSourceRecords: 'positive integer',
+        selection: { kind: 'first', maxRecords: 'positive integer equal to reviewed maxRecords and maxRecordsPerPage; no larger than maxSourceRecords' },
+      } } : {}),
     }),
   ].join('\n\n');
 }

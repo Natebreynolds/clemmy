@@ -605,3 +605,410 @@ test('a real Space read → write → read plan keeps both reads selected and ex
   assert.deepEqual(spaceStore.snapshot(slug), after, 'publication preserves the exact title/data/view generation');
   await new Promise<void>(resolve => setImmediate(resolve));
 });
+
+// Live source287511: enabling an authored workflow changed its revision and
+// erased the create step's completion; enable then failed its own data lineage
+// proof. This uses production discovery, planning, writes and dependency proof.
+for (const repair of ['none', 'plan', 'definition'] as const) test(`a created workflow remains completed after its planned enable revision and database reopen (repair=${repair})`, async t => {
+  const repairedPlan = repair === 'plan';
+  const repairedDefinition = repair === 'definition';
+  const watcher = await import('./watcher-judge.js');
+  const oldWatcher = process.env.CLEMMY_WATCHER_JUDGE;
+  const oldInterval = process.env.CLEMMY_WATCHER_INTERVAL_TOOLS;
+  process.env.CLEMMY_WATCHER_JUDGE = repairedPlan ? 'on' : 'off';
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '12';
+  watcher._setWatcherJudgeForTests(async () => ({ onTrack: false, miss: 'No tracked plan saved.', steer: 'STALE_PLAN_REPAIR_SENTINEL' }));
+  t.after(() => { watcher._setWatcherJudgeForTests(null);
+    if (oldWatcher === undefined) delete process.env.CLEMMY_WATCHER_JUDGE; else process.env.CLEMMY_WATCHER_JUDGE = oldWatcher;
+    if (oldInterval === undefined) delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS; else process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = oldInterval;
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const name = `native-planned-lifecycle-${repair}`;
+  const session = eventlog.createSession({ kind: 'chat' });
+  const objective = `Create manual-only workflow ${name}, enable it, verify, then disable and verify again. Do not run it.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const plan = { preamble: 'Create, enable, then verify the saved workflow.', draft: {
+    criteria: ['A manual-only workflow is created, enabled and read back without running.'], cardinality: null,
+    destination: { posture: 'create_new', family: 'workflow', handleRequired: true },
+    topology: { version: 1, operations: [
+      { id: 'create', effect: 'local_write', coverage: null, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'enable', effect: 'local_write', coverage: null, dependsOn: ['create'], dataFrom: ['create'], cardinality: { kind: 'once' } },
+      { id: 'verify', effect: 'read', coverage: 'single', dependsOn: ['enable'], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'disable', effect: 'local_write', coverage: null, dependsOn: ['create', 'verify'], dataFrom: ['create'], cardinality: { kind: 'once' } },
+      { id: 'verify_disabled', effect: 'read', coverage: 'single', dependsOn: ['disable'], dataFrom: [], cardinality: { kind: 'once' } },
+    ], universes: [] },
+    bindings: [
+      { operationId: 'create', role: 'create', capabilityRef: 'cap:local:workflow_create:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'enable', role: 'enable', capabilityRef: 'cap:local:workflow_set_enabled:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'verify', role: 'readback', capabilityRef: 'cap:local:workflow_get:read', evidence: ['tool_result'] },
+      { operationId: 'disable', role: 'disable', capabilityRef: 'cap:local:workflow_set_enabled:reversible', evidence: ['local_commit_receipt'] },
+      { operationId: 'verify_disabled', role: 'readback', capabilityRef: 'cap:local:workflow_get:read', evidence: ['tool_result'] },
+    ], deliverables: [{ id: 'workflow', kind: 'workflow' }], evidenceRequirements: ['local_commit_receipt', 'tool_result'],
+  } };
+  const selected = (id: string, requirement_id: string, toolName: string, args: unknown) => toolCall(id, 'work_call', {
+    requirement_id, name: toolName, args_json: JSON.stringify(args),
+  });
+  const model = stubModel([
+    [toolCall('lifecycle-discover-create', 'tool_search', { query: 'workflow_create', limit: 5 })],
+    [toolCall('lifecycle-discover-enable', 'tool_search', { query: 'workflow_set_enabled', limit: 5 })],
+    [toolCall('lifecycle-discover-read', 'tool_search', { query: 'workflow_get', limit: 5 })],
+    ...(repairedPlan ? [[toolCall('lifecycle-rejected-plan', 'plan_task', { ...plan, draft: { ...plan.draft, topology: { ...plan.draft.topology, operations: plan.draft.topology.operations.map(op => ({ ...op, dataFrom: [] })) } } })]] : []),
+    [toolCall('lifecycle-plan', 'plan_task', plan)],
+    ...(repairedDefinition ? [[selected('lifecycle-invalid-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false, steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'aggregate', value: { op: 'literal', value: [{ n: 323 }] }, groupBy: [], metrics: [{ fn: 'sum', column: 'n' }] } }), sideEffect: 'read' }] })]] : []),
+    [selected('lifecycle-create', 'create', 'workflow_create', { name, description: 'Controlled manual fixture', enabled: false,
+      steps: [{ id: 'result', transform: JSON.stringify({ version: 1, expression: { op: 'literal', value: { product: 323 } } }), sideEffect: 'read' }] })],
+    [selected('lifecycle-enable', 'enable', 'workflow_set_enabled', { name, enabled: true })],
+    [selected('lifecycle-verify', 'verify', 'workflow_get', { name, section: 'metadata' })],
+    [selected('lifecycle-disable', 'disable', 'workflow_set_enabled', { name, enabled: false })],
+    [selected('lifecycle-verify-disabled', 'verify_disabled', 'workflow_get', { name, section: 'metadata' })],
+    [textMessage('The saved workflow is disabled.')],
+  ]);
+  const agent = await buildOrchestratorAgent({ ...identity, userInput: objective, hostFreshPlanning: primed.planning,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'], allowToolJit: true,
+    mcpToolScope: { authority: 'none', reason: 'Native lifecycle fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 }, model: model as never });
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(12), behaviorScopeId: `${session.id}::source:${source.seq}` },
+    () => hostRunRunner(throwingRunner() as never, agent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never, { maxTurns: 12, hostTurnEngine: 'host_v1', context: identity } as never));
+  const history = (result as { history: unknown[] }).history;
+  if (repairedPlan) {
+    assert.match(historyResult(history, 'lifecycle-rejected-plan'), /plan_not_admitted/);
+    const reviews = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] }).filter(e => e.data.kind === 'trajectory_review');
+    assert.ok(reviews.some(e => e.data.phase === 'discarded' && e.data.reason === 'accepted_plan_changed'), JSON.stringify(reviews));
+    assert.equal(reviews.filter(e => e.data.phase === 'delivered').length, 0);
+    assert.ok(model.requests().every(request => !request.inputTail.includes('STALE_PLAN_REPAIR_SENTINEL')),
+      'the repaired plan cannot receive advice about its failed predecessor');
+  }
+  if (repairedDefinition) assert.match(historyResult(history, 'lifecycle-invalid-create'), /Invalid workflow transform/);
+  assert.match(historyResult(history, 'lifecycle-create'), /Created workflow/);
+  assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
+  const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
+  const lines = () => expectedWorkPlanLines(identity).map(row => ({ id: row.requirementId, state: row.state }));
+  const { plannedNativeDirectCarry } = await import('./planned-native-direct-carry.js');
+  assert.equal(plannedNativeDirectCarry({ ...identity, authoredName: 'workflow_set_enabled', authoredArgs: { name, enabled: true }, authoredArgumentsJson: JSON.stringify({name,enabled:true}) }), null, 'multiple selected operations using the same native tool require explicit requirement identity');
+  assert.deepEqual(lines(), [
+    { id: 'create', state: 'satisfied' }, { id: 'disable', state: 'satisfied' }, { id: 'enable', state: 'satisfied' }, { id: 'verify', state: 'satisfied' }, { id: 'verify_disabled', state: 'satisfied' },
+  ]);
+  assert.match(historyResult(history, 'lifecycle-verify'), /"enabled": true/);
+  assert.match(historyResult(history, 'lifecycle-verify-disabled'), /"enabled": false/);
+  const receiptPath = path.join(nativeReadHome, 'vault/00-System/workflows', name, 'SKILL.md');
+  const bytes = readFileSync(receiptPath);
+  try {
+    writeFileSync(receiptPath, Buffer.concat([bytes, Buffer.from('\n# Unrelated drift\n')]));
+    assert.ok(lines().filter(row => ['create', 'enable', 'disable'].includes(row.id)).every(row => row.state !== 'satisfied'),
+      'an unexplained final revision invalidates the predecessor chain');
+  } finally { writeFileSync(receiptPath, bytes); }
+  eventlog.closeEventLog();
+  assert.ok(lines().every(row => row.state === 'satisfied'), 'completion proof survives durable reopen without replay');
+  const terminal = terminalPreparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: 'The workflow was created, enabled, read back, disabled and verified disabled. It was not run.' });
+  assert.equal(terminal.status, 'ready', `completed lifecycle must also pass terminal proof: ${JSON.stringify(terminal)}`);
+  const state = obligationStore.loadManifestState(session.id, source.seq);
+  const expected = resolutionLedger.expectedTaskFor(session.id, source.seq);
+  assert.equal(state.status, 'ok'); assert.equal(expected.status, 'ok');
+  if (state.status !== 'ok' || expected.status !== 'ok') throw new Error('missing lifecycle terminal authority');
+  const db = eventlog.openEventLog();
+  const workContract = (await import('./expected-work-contract.js')).loadExpectedWorkContract(session.id, source.seq);
+  if (workContract.status !== 'ok') throw new Error('missing exact lifecycle work contract');
+  const verifyTerminal = () => terminalProof.verifyAcceptedTaskTerminalProofInTransaction({ db, ...identity,
+    acceptedTaskId: workContract.contract.acceptedTaskId, manifest: state.manifest });
+  assert.deepEqual(verifyTerminal(), { ok: true });
+  if (repairedDefinition) {
+    // A failed attempt may disappear from lineage only when its no-effect
+    // classification is exact. Uncertainty must not be hidden by later success.
+    db.exec('SAVEPOINT uncertain_definition_predecessor');
+    try {
+      const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='logical_call_settlements'").all() as Array<{name:string}>;
+      for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      db.prepare(`UPDATE logical_call_settlements SET outcome_kind='uncertain_write',requires_reconciliation=1
+        WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id='lifecycle-invalid-create'`).run(session.id,source.seq);
+      assert.equal(verifyTerminal().ok, false, 'an uncertain predecessor cannot be erased by a later successful definition');
+    } finally { db.exec('ROLLBACK TO uncertain_definition_predecessor'); db.exec('RELEASE uncertain_definition_predecessor'); }
+    assert.deepEqual(verifyTerminal(), { ok: true });
+  }
+  for (const id of ['enable', 'disable']) {
+    assert.ok(state.manifest.nodes.find(node => node.operationId === id)?.obligations.includes('derivation_from_current_source'),
+      'identity proof satisfies the existing obligation; the obligation is not removed');
+  }
+  try {
+    writeFileSync(receiptPath, Buffer.concat([bytes, Buffer.from('\n# Drift after evidence issuance\n')]));
+    assert.equal(verifyTerminal().ok, false, 'issued identity evidence must recheck current successor bytes');
+  } finally { writeFileSync(receiptPath, bytes); }
+  assert.deepEqual(verifyTerminal(), { ok: true });
+  // Counterexamples after receipt issuance must be caught by the transaction's
+  // own verifier, not merely by the earlier runtime preparation.
+  const corruptions = [
+    { table: 'accepted_task_work_contracts', set: "operation_count=operation_count+1" },
+    { table: 'accepted_task_authority', set: "work_contract_id='unrelated-contract'" },
+    { table: 'expected_work_call_bindings', set: "argument_digest='" + '0'.repeat(64) + "'", extra: " AND requirement_id='enable'" },
+  ];
+  for (const corruption of corruptions) {
+    db.exec('SAVEPOINT native_identity_terminal_counterexample');
+    try {
+      const triggers = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?")
+        .all(corruption.table) as Array<{ name: string }>;
+      for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      db.prepare(`UPDATE ${corruption.table} SET ${corruption.set} WHERE session_id=? AND source_user_seq=?${corruption.extra ?? ''}`)
+        .run(session.id, source.seq);
+      assert.equal(verifyTerminal().ok, false, `terminal must reject changed ${corruption.table}`);
+    } finally {
+      db.exec('ROLLBACK TO native_identity_terminal_counterexample');
+      db.exec('RELEASE native_identity_terminal_counterexample');
+    }
+    assert.deepEqual(verifyTerminal(), { ok: true }, 'restoring authority recovers without replay');
+  }
+  const committed = delivery.commitTurnOutcome({ version: 2, id: turnOutcomes.turnOutcomeId(identity), identity,
+    status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Created, enabled, then disabled and verified.' } });
+  assert.equal(committed.presentation.status, 'done');
+  assert.equal(model.calls(), repair !== 'none' ? 11 : 10, 'terminal proof adds no model round');
+  assert.equal((db.prepare(`SELECT count(*) AS n FROM logical_call_settlements
+    WHERE session_id=? AND source_user_seq=? AND mutating=1 AND outcome_kind='succeeded'`).get(session.id, source.seq) as { n: number }).n, 3,
+    'receipt verification and publication must not replay any mutation');
+
+  const strategies = await import('../../memory/run-strategy-store.js');
+  const learned = strategies.listVerifiedRunStrategies().find(row =>
+    row.learningReceipt?.sourceId === `${session.id}:${source.seq}`);
+  assert.ok(learned, 'a verified native lifecycle must teach a reusable strategy');
+  assert.deepEqual(learned.toolsUsed, ['workflow_create', 'workflow_set_enabled', 'workflow_get']);
+  const beforeReplay = learned.uses;
+  const replay = (await import('./host-run-strategy-learning.js')).learnHostRunStrategyForAcceptedTask(identity);
+  assert.equal(replay.status, 'replayed');
+  assert.equal(strategies.listVerifiedRunStrategies().find(row => row.id === learned.id)?.uses, beforeReplay);
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_strategy_learned'] })
+    .filter(row => row.data.sourceUserSeq === source.seq).length, 1);
+
+  const warm = eventlog.createSession({ kind: 'chat' });
+  const warmSource = eventlog.appendEvent({ sessionId: warm.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: objective } });
+  const warmIdentity = { sessionId: warm.id, sourceUserSeq: warmSource.seq, turn: 1 };
+  const prepared = await (await import('../jev/proven-operation.js')).prepareProvenOperationForRequest({
+    query: objective, ...warmIdentity,
+  });
+  assert.equal(prepared.strategyId, learned.id);
+  assert.deepEqual(prepared.nativeTools, learned.toolsUsed);
+  assert.equal(prepared.skipDiscoverySearch, false, 'native recall must preserve fallback discovery');
+  assert.doesNotMatch(prepared.text ?? '', /workflow_create schema:/,
+    'registry descriptions must not masquerade as complete argument schemas');
+  eventlog.appendEvent({ sessionId: warm.id, turn: 0, role: 'system', type: 'proven_operation_selected',
+    data: { ...prepared, sourceUserSeq: warmSource.seq } });
+  const warmPlanning = await semantic.primePrimaryModelPlanningCatalog(warmIdentity);
+  assert.ok(warmPlanning.ok);
+  if (!warmPlanning.ok) throw new Error(warmPlanning.reason);
+  const warmModel = stubModel([[toolCall('warm-plan', 'plan_task', plan)], [textMessage('Plan saved; no effects executed.')]]);
+  const warmAgent = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    mcpToolScope: { authority: 'none', reason: 'Native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: warmModel as never });
+  for (const name of learned.toolsUsed) {
+    const tool = warmAgent.tools.find(row => row.name === name);
+    assert.ok(tool, `${name} must be present before the first model request`);
+    assert.match(tool.description ?? '', /capabilityRef=cap:local:/,
+      `${name} must carry its current validated planning ref without another search`);
+    assert.ok('parameters' in tool && JSON.stringify(tool.parameters).includes('name'), 'complete configured schema');
+  }
+  assert.ok(warmAgent.tools.some(row => row.name === 'tool_search'));
+  const envelopeModule = await import('../../agents/capability-envelope.js');
+  const originalEnvelope = envelopeModule.boundAgentCapabilityEnvelope(warmAgent);
+  const plannedWarm = await brackets.withHarnessRunContext({ ...warmIdentity,
+    counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${warm.id}::source:${warmSource.seq}` },
+    () => hostRunRunner(throwingRunner() as never, warmAgent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never,
+      { maxTurns: 3, hostTurnEngine: 'host_v1', context: warmIdentity } as never));
+  assert.equal(JSON.parse(historyResult(plannedWarm.history as unknown[], 'warm-plan')).ok, true);
+  const resumedPlanning = await semantic.primePrimaryModelPlanningCatalog(warmIdentity);
+  assert.ok(resumedPlanning.ok);
+  if (!resumedPlanning.ok) throw new Error(resumedPlanning.reason);
+  const resumedWarm = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: resumedPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    mcpToolScope: { authority: 'none', reason: 'Native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: stubModel([[textMessage('Rebuild only')]]) as never });
+  assert.ok(!resumedWarm.tools.some(row => row.name === 'workflow_get'), 'selected read moves behind the plan carrier');
+  assert.equal(envelopeModule.boundAgentCapabilityEnvelope(resumedWarm)?.envelopeDigest,
+    originalEnvelope?.envelopeDigest, 'planning hint presentation must not change the admitted callable universe on resume');
+
+  const restricted = await buildOrchestratorAgent({ ...warmIdentity, userInput: objective,
+    hostFreshPlanning: warmPlanning.planning, allowToolJit: true,
+    allowedToolNames: ['workflow_create', 'workflow_set_enabled', 'workflow_get', 'tool_search'],
+    excludeToolNames: ['workflow_set_enabled'],
+    mcpToolScope: { authority: 'none', reason: 'Restricted native learned surface', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: stubModel([[textMessage('Surface check only')]]) as never });
+  assert.ok(!restricted.tools.some(row => row.name === 'workflow_set_enabled'),
+    'learned hints cannot restore a policy-excluded tool');
+  assert.equal((db.prepare('SELECT count(*) AS n FROM logical_call_settlements WHERE session_id=? AND logical_tool_call_id != ?')
+    .get(warm.id, 'warm-plan') as { n: number }).n, 0, 'only the explicitly invoked plan may settle; learning and rebuild execute no business work');
+});
+
+for (const toolJit of [true, false]) for (const directCall of ['work_call', 'direct', 'call_tool'] as const) test(`plan-selected workflow dispatch retains its requirement through terminal (JIT ${toolJit}, direct ${directCall})`, async () => {
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const { writeWorkflow } = await import('../../memory/workflow-store.js');
+  const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+  const name = `native-planned-dispatch-${toolJit}-${directCall}`;
+  writeWorkflow(name, { name, description: 'Controlled dispatch fixture', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'product', transform: { version: 1, expression: { op: 'literal', value: { product: 323 } } }, sideEffect: 'read' }] } as never);
+  const session = eventlog.createSession({ kind: 'chat' });
+  const objective = `Save a tracked plan, run ${name} once, verify its result, then disable it.`;
+  const replyTarget = { type: 'origin_chat' } as const;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: objective, originReplyTarget: replyTarget, originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTarget) } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `native-planned-dispatch-parent-${toolJit}-${directCall}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: source.data }, { existingEventSeq: source.seq, armRunInFlight: true });
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const plan = { preamble: 'Run once and verify before disabling.', draft: {
+    criteria: ['The named workflow runs once and is then disabled.'], cardinality: null, destination: null,
+    topology: { version: 1, universes: [], operations: [
+      { id: 'run_once', effect: 'local_write', coverage: null, dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'verify_run', effect: 'read', coverage: 'single', dependsOn: ['run_once'], dataFrom: [], cardinality: { kind: 'once' } },
+      { id: 'disable', effect: 'local_write', coverage: null, dependsOn: ['verify_run'], dataFrom: [], cardinality: { kind: 'once' } },
+    ] }, bindings: [
+      { operationId: 'run_once', role: 'run', capabilityRef: 'cap:local:workflow_run:reversible', evidence: ['tool_result'] },
+      { operationId: 'verify_run', role: 'readback', capabilityRef: 'cap:local:workflow_run_status:read', evidence: ['tool_result'] },
+      { operationId: 'disable', role: 'disable', capabilityRef: 'cap:local:workflow_set_enabled:reversible', evidence: ['local_commit_receipt'] },
+    ], deliverables: [], evidenceRequirements: ['tool_result', 'local_commit_receipt'],
+  } };
+  eventlog.appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'proven_operation_selected',
+    data: { sourceUserSeq: source.seq, tools: ['workflow_run', 'workflow_run_status', 'workflow_set_enabled'],
+      nativeTools: ['workflow_run', 'workflow_run_status', 'workflow_set_enabled'], skipDiscoverySearch: false } });
+  const host = await import('./host-turn-runner.js');
+  host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
+  const responseFrames = [
+    ...(!toolJit ? ['workflow_run', 'workflow_run_status', 'workflow_set_enabled'].map((name, index) =>
+      [toolCall(`dispatch-discover-${index}`, 'tool_search', { query: name, limit: 5 })]) : []),
+    [toolCall('dispatch-plan', 'plan_task', plan)],
+    [toolCall('dispatch-resolve-selected', 'tool_search', { query: 'workflow_run', limit: 5 })],
+    [directCall === 'direct' ? toolCall('dispatch-selected-run', 'workflow_run', { name, inputs: '{}' }) : directCall === 'call_tool' ? toolCall('dispatch-selected-run', 'call_tool', { name: 'workflow_run', args_json: JSON.stringify({name,inputs:'{}'}) }) : toolCall('dispatch-selected-run', 'work_call', { requirement_id: 'run_once', name: 'workflow_run', args_json: JSON.stringify({ name, inputs: '{}' }) })],
+    [textMessage('The workflow is starting; verification and disable remain pending.')],
+  ];
+  const model = stubModel(responseFrames);
+  const agent = await buildOrchestratorAgent({ ...identity, userInput: objective, hostFreshPlanning: primed.planning,
+    allowedToolNames: ['workflow_run', 'workflow_run_status', 'workflow_set_enabled', 'tool_search'], allowToolJit: toolJit,
+    mcpToolScope: { authority: 'none', reason: 'Local planned dispatch fixture', allowedServerSlugs: [], maxTools: 0 }, model: model as never });
+  const lifecycleRunner = throwingRunner();
+  const { attachEventLogHooks } = await import('./hooks.js');
+  const detachLifecycle = attachEventLogHooks(lifecycleRunner, { getSessionId: () => session.id });
+  const outcome = await brackets.withHarnessRunContext({ ...identity, runAttemptId: attempt.attemptId,
+    counter: new brackets.ToolCallsCounter(9), behaviorScopeId: `${session.id}::source:${source.seq}` },
+    () => hostRunRunner(lifecycleRunner as never, agent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never,
+      { maxTurns: toolJit ? 4 : 7, hostTurnEngine: 'host_v1', context: identity } as never));
+  detachLifecycle();
+  const dispatchEvents = eventlog.listEvents(session.id, { types: ['tool_called', 'tool_returned'] })
+    .filter(row => row.data.accounting === 'top_level' && row.data.callId === 'dispatch-selected-run');
+  assert.equal(dispatchEvents.length, 2);
+  for (const row of dispatchEvents) assert.equal(row.data.effectiveTool, 'workflow_run', 'carrier accounting must describe the operation, never a workflow name');
+  const authoredCall = (outcome.history as Array<{type?: string; callId?: string; name?: string; arguments?: string}>)
+    .find(row => row.type === 'function_call' && row.callId === 'dispatch-selected-run');
+  assert.equal(authoredCall?.name, directCall === 'direct' ? 'workflow_run' : directCall);
+  if (directCall === 'direct') assert.deepEqual(JSON.parse(authoredCall!.arguments!), {name, inputs:'{}'});
+  assert.equal(JSON.parse(historyResult(outcome.history as unknown[], 'dispatch-plan')).ok, true, historyResult(outcome.history as unknown[], 'dispatch-plan'));
+  const discovered = JSON.parse(historyResult(outcome.history as unknown[], 'dispatch-resolve-selected'));
+  assert.equal(discovered.results.find((row: { name: string }) => row.name === 'workflow_run')?.carrier, 'work_call', JSON.stringify(discovered));
+  const output = historyResult(outcome.history as unknown[], 'dispatch-selected-run');
+  assert.match(output, /Prepared|Queued/, output);
+  const bindings = eventlog.openEventLog().prepare(`SELECT requirement_id FROM expected_work_call_bindings
+    WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`).all(session.id,source.seq,'dispatch-selected-run');
+  assert.deepEqual(bindings, [{ requirement_id: 'run_once' }]);
+  const prepared = eventlog.listEvents(session.id, { types: ['async_work_dispatch_prepared'] });
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0]!.data.sourceUserSeq, source.seq);
+  assert.equal((await import('./expected-work-admission.js')).expectedWorkPlanLines(identity)
+    .find(row => row.requirementId === 'run_once')?.state, 'satisfied', 'the exact dispatch receipt must discharge invocation, without claiming child completion');
+
+  const { loadExpectedWorkContract } = await import('./expected-work-contract.js');
+  const contract = loadExpectedWorkContract(session.id, source.seq);
+  assert.equal(contract.status, 'ok');
+  if (contract.status !== 'ok') throw new Error('missing saved dispatch plan');
+  const proofInput = { ...identity, acceptedTaskId: contract.contract.acceptedTaskId,
+    contractId: contract.contract.contractId, requirementId: 'run_once', logicalToolCallId: 'dispatch-selected-run' };
+  const { proveWorkflowDispatchCommit } = await import('./native-revision-commit-proof.js');
+  assert.equal(proveWorkflowDispatchCommit(proofInput).status, 'verified');
+  for (const wrong of [{ sourceUserSeq: source.seq + 1 }, { requirementId: 'disable' },
+    { logicalToolCallId: 'dispatch-plan' }, { contractId: 'wrong-contract' }]) {
+    assert.equal(proveWorkflowDispatchCommit({ ...proofInput, ...wrong }).status, 'unverified');
+  }
+  const dispatches = eventlog.listEvents(session.id, { types: ['async_work_dispatched'] });
+  assert.equal(dispatches.length, 1);
+  const runId = String(prepared[0]!.data.runId);
+  const queue = await import('../../tools/workflow-run-queue.js');
+  const records = await import('../../execution/workflow-run-record.js');
+  const report = await import('../../execution/workflow-run-report-back.js');
+  const completion = await import('../../execution/workflow-origin-completion-review.js');
+  const terminal = await import('../../execution/workflow-origin-terminal.js');
+  const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
+  const { runConversation } = await import('./loop.js');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const queued = records.readWorkflowRunRecord<Record<string, unknown>>(file)!;
+  const observer = queue.readWorkflowRunOriginRecords(runId).find(row => row.version === 2);
+  assert.ok(observer && observer.version === 2);
+  const detail = 'Product: 323';
+  const input = { observer, runId, evidenceRunIds: [runId], outcome: 'done' as const, detail };
+  assert.equal(report.readWorkflowOriginCompletionEvidence(input), null, 'dispatch proof is not child completion proof');
+  records.withWorkflowRunRecordLock(file, () => records.writeWorkflowRunRecordDurablyUnlocked(file, {
+    ...queued, status: 'completed', finishedAt: new Date().toISOString(), stepsTotal: 1, stepsCompleted: 1,
+    stepOutputs: { product: { product: 323 } }, output: detail,
+  }));
+  assert.equal(report.checkpointWorkflowRunReportBack(file, { workflowName: name, outcome: 'done', detail }), true);
+  responseFrames.push(
+    [toolCall('dispatch-verify', 'work_call', { requirement_id: 'verify_run', name: 'workflow_run_status', args_json: JSON.stringify({ run_id: runId }) })],
+    [toolCall('dispatch-disable', 'work_call', { requirement_id: 'disable', name: 'workflow_set_enabled', args_json: JSON.stringify({ name, enabled: false }) })],
+    [textMessage('The verified product is 323. The saved workflow is disabled.')],
+  );
+  completion._setWorkflowOriginCompletionJudgeForTests(async () => ({ done: false, reason: 'The post-run disable still belongs to the parent.' }));
+  host._setHostObjectiveJudgeForTests(async () => ({ done: true, reason: 'Controlled fixture reviewer; terminal proof remains authoritative.' }));
+  try {
+    eventlog.closeEventLog();
+    const committed = await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
+      activateWorkflowParent: options => runConversation({ ...options, buildAgent: async resumedIdentity => {
+        const rebuilt = await options.buildAgent!(resumedIdentity);
+        rebuilt.model = model as never;
+        return rebuilt;
+      } }),
+    });
+    assert.equal(committed?.presentation.status, 'done', JSON.stringify(eventlog.listEvents(session.id,
+      { types: ['tool_returned', 'restart_recovery_decision', 'conversation_completed'] }).map(row => row.data)));
+    assert.equal((await import('../../memory/workflow-store.js')).readWorkflow(name)?.data.enabled, false);
+    assert.equal(model.calls(), toolJit ? 7 : 10, 'resume continues the saved plan without redispatch');
+    assert.equal(eventlog.listEvents(session.id, { types: ['async_work_dispatch_prepared'] }).length, 1);
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+    assert.ok((await import('./expected-work-admission.js')).expectedWorkPlanLines(identity).every(row => row.state === 'satisfied'));
+    const manifest = obligationStore.loadManifestState(session.id, source.seq);
+    assert.equal(manifest.status, 'ok');
+    if (manifest.status !== 'ok') throw new Error('missing final manifest');
+    assert.deepEqual(terminalProof.verifyAcceptedTaskTerminalProofInTransaction({ db: eventlog.openEventLog(),
+      ...identity, acceptedTaskId: contract.contract.acceptedTaskId, manifest: manifest.manifest }), { ok: true });
+    const db = eventlog.openEventLog();
+    db.exec('SAVEPOINT dispatch_receipt_corruption');
+    try {
+      for (const trigger of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='events'").all() as Array<{ name: string }>) {
+        db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      }
+      db.prepare(`UPDATE events SET data_json=json_set(data_json,'$.runId','wrong-run') WHERE seq=?`).run(prepared[0]!.seq);
+      assert.equal(proveWorkflowDispatchCommit(proofInput).status, 'unverified');
+      assert.equal(terminalProof.verifyAcceptedTaskTerminalProofInTransaction({ db,
+        ...identity, acceptedTaskId: contract.contract.acceptedTaskId, manifest: manifest.manifest }).ok, false,
+        'published receipt cannot replace its changed queue preparation authority');
+    } finally {
+      db.exec('ROLLBACK TO dispatch_receipt_corruption');
+      db.exec('RELEASE dispatch_receipt_corruption');
+    }
+    assert.equal(proveWorkflowDispatchCommit(proofInput).status, 'verified');
+    await terminal.reviewAndCommitWorkflowOriginTerminal(input, {
+      activateWorkflowParent: async () => { throw new Error('terminal replay must not reactivate the parent'); },
+    });
+    assert.equal(model.calls(), toolJit ? 7 : 10);
+    assert.equal(eventlog.listEvents(session.id, { types: ['async_work_dispatch_prepared'] }).length, 1);
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+
+  } finally {
+    completion._setWorkflowOriginCompletionJudgeForTests(null);
+    host._setHostObjectiveJudgeForTests(null);
+  }
+});

@@ -108,7 +108,8 @@ test('an explicit allowlist cannot advertise denied or phantom deferred readers'
   const f = await fixture('normal', { allowedToolNames: ['tool_search', 'workflow_get', 'workflow_create'] });
   assert.equal(f.block, '', 'the only allowed read is already first-class');
   assert.deepEqual(f.names, []);
-  assert.deepEqual(f.authoringNames, ['workflow_create'], 'the authoring index obeys the same explicit allowlist');
+  assert.deepEqual(f.authoringNames, [], 'explicitly selected controls need no duplicate deferred index');
+  assert.ok(f.agent.tools.some(tool => tool.name === 'workflow_create'));
   assert.ok(f.agent.tools.some(tool => tool.name === 'workflow_get'));
   assert.equal(f.agent.tools.some(tool => tool.name === 'space_get_view'), false);
 });
@@ -128,4 +129,35 @@ test('the advertised exact native schema lookup reaches no connector candidate s
   assert.deepEqual(result.schemas.workflow_get.required, ['name']);
   assert.equal(result.schemas.workflow_get.additionalProperties, false);
   assert.ok(result.schemas.workflow_get.properties.section);
+});
+
+
+test('a cold listing request keeps native authoring discoverable without loading its large schemas', async () => {
+  const f = await fixture('normal', { userInput: 'List my saved workflows. Do not create or modify anything.' });
+  for (const name of ['workflow_create', 'workflow_update', 'space_save']) {
+    assert.equal(f.agent.tools.some(tool => tool.name === name), false, `${name} adds an unrelated full schema`);
+    assert.ok(f.authoringNames.includes(name), `${name} must remain visible in the native catalog`);
+    assert.ok(boundAgentCapabilityEnvelope(f.agent)!.capabilities.some(cap => cap.name === name), `${name} must remain reachable`);
+  }
+  assert.ok(f.names.includes('workflow_list'), 'listing remains discoverable through the native read catalog');
+  assert.ok(f.agent.tools.some(tool => tool.name === 'tool_search'));
+});
+
+
+test('exact native authoring discovery returns current schemas without connector search', async () => {
+  let providerSearches = 0;
+  const names = ['workflow_create', 'workflow_update', 'space_save'];
+  const search = buildScopedLocalToolSearch(new Set(names), 'call_tool', undefined, [{
+    kind: 'authorized_composio',
+    search: async () => { providerSearches += 1; throw new Error('native lookup queried a provider'); },
+  }]);
+  for (const name of names) {
+    const result = JSON.parse(String(await search.invoke(new RunContext({}), JSON.stringify({
+      query: name, role_key: null, account_selection: null, limit: 8, cursor: null,
+    }))));
+    assert.equal(result.results[0]?.name, name);
+    assert.equal(result.results[0]?.carrier, 'call_tool');
+    assert.ok(result.schemas[name]?.properties, `${name} omitted its executable schema`);
+  }
+  assert.equal(providerSearches, 0);
 });

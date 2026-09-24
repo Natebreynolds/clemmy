@@ -144,6 +144,23 @@ test('watchdog ignores chatty output and only accepts exact reporter boundaries'
   assert.equal(progress.snapshot().lastProgressAt, 70);
 });
 
+test('watchdog retains global progress after a file-only TAP result uses its file ordinal', () => {
+  const progress = createIsolatedRunnerProgressTracker(0);
+  progress.observe('TAP version 13', 1);
+  progress.observe('ok 1 - first assertion', 2);
+  progress.observe('ok 2 - second assertion', 3);
+  progress.observe('1..0', 4);
+  progress.observe('# Subtest: src/example/empty.test.ts', 5);
+  // Node can number this by file while the following named tests keep their
+  // global assertion ordinal (observed as 7351 -> file 755 -> 7353 live).
+  assert.equal(progress.observe('ok 2 - src/example/empty.test.ts', 6), true);
+  assert.equal(progress.observe('ok 4 - next assertion', 7), true);
+  assert.equal(progress.snapshot().lastProgressAt, 7);
+  assert.equal(progress.observe('ok 4 - repeated chatter', 8), false);
+  assert.equal(progress.observe('ok 99 - out of sequence', 9), false);
+  assert.equal(progress.snapshot().lastProgressAt, 7);
+});
+
 test('repository test scripts route through the isolated runner', () => {
   const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
   const scripts = packageJson.scripts ?? {};

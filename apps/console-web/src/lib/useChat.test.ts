@@ -43,7 +43,7 @@ test('empty or reason-only conversation completion never fabricates Done or succ
   const empty = terminalCompletionPresentation({}, '');
   assert.equal(empty.status, 'failed');
   assert.doesNotMatch(empty.text, /^done[.!]?$/i);
-  assert.match(empty.text, /without a usable answer/i);
+  assert.match(empty.text, /didn.t come out with an answer worth giving you/i);
 
   const reasonOnly = terminalCompletionPresentation({ reason: 'model_exhausted' }, '');
   assert.equal(reasonOnly.status, 'failed');

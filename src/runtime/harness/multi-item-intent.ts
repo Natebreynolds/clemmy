@@ -185,6 +185,19 @@ function referencesCountedKind(text: string, kind: string | null): boolean {
   return new RegExp(`\\b(?:the|these|those|each|every)?\\s*${escaped}\\b`, 'i').test(text);
 }
 
+/** An inline numbered list is a structural universe, just like a line list.
+ * Require a sentence/list boundary and a complete 1..N sequence;
+ * parenthesized statistics, citations and skipped labels are not a list proof. */
+function inlineNumberedMembers(text: string): Array<{ index: number; body: string }> {
+  const markers = [...text.matchAll(/(?:^|[;:.!?\n])[ \t]*\((\d+)\)[ \t]+/g)];
+  if (markers.length < 3 || markers.some((marker, index) => Number(marker[1]) !== index + 1)) return [];
+  const members = markers.map((marker, index) => ({
+    index: marker.index!,
+    body: text.slice(marker.index! + marker[0].length, markers[index + 1]?.index ?? text.length).trim(),
+  }));
+  return members.every(member => member.body.length > 0) ? members : [];
+}
+
 export function detectMultiItemIntent(input: string): MultiItemIntent {
   try {
     const rawText = (typeof input === 'string' ? input : '').trim();
@@ -192,10 +205,11 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     if (text.length < 4) return NO_MULTI_ITEM;
     const actionText = positiveActionSignalText(text);
 
-    const listMatches = [...text.matchAll(new RegExp(LIST_ITEM_RE.source, LIST_ITEM_RE.flags))];
-    const listedBodies = listMatches.map((match) =>
-      (match[1] ?? match[0].replace(/^[ \t]*(?:\d+[.)]|[-*•–])\s+/, '')).trim(),
-    );
+    const lineMatches = [...text.matchAll(new RegExp(LIST_ITEM_RE.source, LIST_ITEM_RE.flags))];
+    const listMatches = lineMatches.length > 0
+      ? lineMatches.map(match => ({ index: match.index!, body: match[1].trim() }))
+      : inlineNumberedMembers(text);
+    const listedBodies = listMatches.map(match => match.body);
     const listPreamble = listMatches[0]?.index === undefined
       ? text
       : text.slice(0, listMatches[0].index);
