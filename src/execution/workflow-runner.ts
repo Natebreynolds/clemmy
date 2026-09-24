@@ -15697,6 +15697,80 @@ async function processOneRunFile(
         && blockedSteps.length === 0
         ? declaredRunGoal
         : null;
+      // JUDGE VIEW OF THE REVIEWED PROJECTION. A reviewed read run's
+      // deliverable is the host-produced projection of its retained read into
+      // the bound Space; the model never writes those records. The goal judge
+      // was shown only the step's opaque retained handle, so it could not see
+      // the records it was asked to verify. Live 2026-09-24 00:37Z
+      // (trigger-0a70cd32, the first approved documentation-inventory pilot):
+      // the read settled with structured evidence, the judge scored 1/5 with
+      // "no records list or count shown", and the run needed attention.
+      // Produce the lineage first (idempotent, replay-safe) and put its facts
+      // in the judge's evidence. The terminal publication gate below is
+      // unchanged: the projection still publishes only when the run needs no
+      // attention. A lineage that cannot be produced blocks the run exactly as
+      // the terminal did before.
+      const readProjectionAdmission = definitionResolution.workflowReadPilotAdmission
+        ?? definitionResolution.workflowRecurringReadAdmission;
+      const reviewedResultProjection = readProjectionAdmission?.resultProjection;
+      let reviewedProjectionLineage: Extract<
+        ReturnType<typeof produceCanonicalEntityWorkflowLineage>,
+        { status: 'ready' | 'replayed' }
+      > | null = null;
+      let reviewedProjectionEvidence = '';
+      if (reviewedResultProjection && blockedSteps.length === 0) {
+        const projectionStep = executionSteps.find(
+          (candidate) => candidate.id === readProjectionAdmission.nodeId,
+        );
+        const parsedProjectionPlan = parseWorkflowNodeInvocationPlan(projectionStep?.invocationPlan);
+        const retainedRun = readRunRecord(filePath);
+        if (
+          !projectionStep
+          || !parsedProjectionPlan.ok
+          || !parsedProjectionPlan.plan.resultProjection
+          || !retainedRun?.canonicalEntityWorkflowResultRoot
+          || typeof retainedRun.startedAt !== 'string'
+        ) {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: 'canonical_entity_result_lineage_unavailable: the successful read cannot publish without its exact reviewed plan, retained authority root, and run start receipt',
+          });
+        }
+        const produced = produceCanonicalEntityWorkflowLineage({
+          version: 1,
+          root: retainedRun.canonicalEntityWorkflowResultRoot,
+          invocationPlan: projectionStep.invocationPlan,
+          startedAt: retainedRun.startedAt,
+          proposedFinishedAt: new Date().toISOString(),
+        });
+        if (produced.status === 'blocked' || produced.status === 'not_applicable') {
+          throw new WorkflowHarnessBlockedSignal({
+            stepId: readProjectionAdmission.nodeId,
+            sessionId: readProjectionAdmission.workflowSessionId,
+            reason: produced.status === 'blocked'
+              ? `canonical_entity_result_projection_blocked:${produced.code}: ${produced.reason}`
+              : 'canonical_entity_result_projection_unrepresented: the reviewed dataset plan did not produce an exact projection contract',
+          });
+        }
+        reviewedProjectionLineage = produced;
+        const projection = parsedProjectionPlan.plan.resultProjection;
+        const root = retainedRun.canonicalEntityWorkflowResultRoot as { workspaceBinding?: { binding?: { workspaceId?: unknown } } };
+        const workspaceId = typeof root.workspaceBinding?.binding?.workspaceId === 'string'
+          ? root.workspaceBinding.binding.workspaceId
+          : '(bound Space)';
+        const fields = Array.isArray(projection.fields)
+          ? projection.fields.map((field) => `${field.field}${field.required ? '' : '?'}`)
+          : [];
+        reviewedProjectionEvidence = [
+          'REVIEWED RESULT PROJECTION (host-produced from the retained read under the approved contract; not model output):',
+          `- target Space: ${workspaceId}; entity kind: ${projection.entityKind}; dataset ${produced.datasetId}`,
+          `- records projected: ${produced.observationCount} (contract allows at most ${projection.bounds.maxRecords}); pages: ${produced.pageCount}`,
+          `- every projected record carries the contract fields ${fields.join(', ')}; the host fills the provenance fields from the settled read, and a record missing a required field cannot be projected`,
+          '- write scope: only this bound Space receives these records; the run performed no other write',
+          `- publication: the host publishes this exact projection as the run's terminal record once the run completes without needing attention (lineage ${produced.status})`,
+        ].join('\n');
+      }
       let goalVerdict: GoalValidationResult | null = null;
       let goalValidation: WorkflowRunGoalValidationV1 | null = null;
       let goalDecision: GoalRunDecision | null = null;
@@ -15713,7 +15787,7 @@ async function processOneRunFile(
           // gated save ran four seconds later, and this reviewer scored the
           // run 4/5 for "saved without your review" because it never saw the
           // approval.
-          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), humanDecisionBlocks(run.id).join('\n'), executionEvidence.summary].filter(Boolean).join("\n\n"),
+          evidenceText: [buildGoalEvidenceText(finalOutput, publicRawStepOutputs, { workflowName: workflow.name, runId: run.id }), reviewedProjectionEvidence, humanDecisionBlocks(run.id).join('\n'), executionEvidence.summary].filter(Boolean).join("\n\n"),
           // Structured outputs unlock the required-keys deterministic class —
           // key-presence criteria are checked in code, never by the judge
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).
@@ -16069,49 +16143,15 @@ async function processOneRunFile(
       throwIfWorkflowRunCancelled(run.id);
       let terminalFinishedAt = new Date().toISOString();
       let canonicalEntityWorkspaceProjectionClaim: unknown;
-      const readProjectionAdmission = definitionResolution.workflowReadPilotAdmission
-        ?? definitionResolution.workflowRecurringReadAdmission;
-      const reviewedResultProjection = readProjectionAdmission?.resultProjection;
-      if (!needsAttention && !goalRepursuing && reviewedResultProjection) {
-        const projectionStep = executionSteps.find(
-          (candidate) => candidate.id === readProjectionAdmission.nodeId,
-        );
-        const parsedProjectionPlan = parseWorkflowNodeInvocationPlan(projectionStep?.invocationPlan);
-        const retainedRun = readRunRecord(filePath);
-        if (
-          !projectionStep
-          || !parsedProjectionPlan.ok
-          || !parsedProjectionPlan.plan.resultProjection
-          || !retainedRun?.canonicalEntityWorkflowResultRoot
-          || typeof retainedRun.startedAt !== 'string'
-        ) {
-          throw new WorkflowHarnessBlockedSignal({
-            stepId: readProjectionAdmission.nodeId,
-            sessionId: readProjectionAdmission.workflowSessionId,
-            reason: 'canonical_entity_result_lineage_unavailable: the successful read cannot publish without its exact reviewed plan, retained authority root, and run start receipt',
-          });
-        }
-        const produced = produceCanonicalEntityWorkflowLineage({
-          version: 1,
-          root: retainedRun.canonicalEntityWorkflowResultRoot,
-          invocationPlan: projectionStep.invocationPlan,
-          startedAt: retainedRun.startedAt,
-          proposedFinishedAt: terminalFinishedAt,
-        });
-        if (produced.status === 'blocked' || produced.status === 'not_applicable') {
-          throw new WorkflowHarnessBlockedSignal({
-            stepId: readProjectionAdmission.nodeId,
-            sessionId: readProjectionAdmission.workflowSessionId,
-            reason: produced.status === 'blocked'
-              ? `canonical_entity_result_projection_blocked:${produced.code}: ${produced.reason}`
-              : 'canonical_entity_result_projection_unrepresented: the reviewed dataset plan did not produce an exact projection contract',
-          });
-        }
-        // On a post-receipt restart the retained completed receipt owns the
-        // timestamp, so the terminal projection is byte-stable and cannot
-        // conflict with its own lineage claim.
-        terminalFinishedAt = produced.finishedAt;
-        canonicalEntityWorkspaceProjectionClaim = produced.claim;
+      // The reviewed projection lineage was produced before the goal review
+      // (see JUDGE VIEW OF THE REVIEWED PROJECTION above). Same gate as
+      // before: it publishes only when the run needs no attention and is not
+      // re-pursuing. On a post-receipt restart the retained completed receipt
+      // owns the timestamp, so the terminal projection is byte-stable and
+      // cannot conflict with its own lineage claim.
+      if (!needsAttention && !goalRepursuing && reviewedProjectionLineage) {
+        terminalFinishedAt = reviewedProjectionLineage.finishedAt;
+        canonicalEntityWorkspaceProjectionClaim = reviewedProjectionLineage.claim;
       }
       const terminalProjection: QueuedRunRecord = {
         ...run,

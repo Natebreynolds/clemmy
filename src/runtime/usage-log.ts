@@ -929,11 +929,22 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
     frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
     brainFrames: 0, sideFrames: 0, sideInputTokens: 0, rebilledPrefixTokens: 0, appendedTokens: 0, prefixReuse: 0,
   };
-  const modelCounts = new Map<string, number>();
-  for (const ev of events) modelCounts.set(ev.model, (modelCounts.get(ev.model) ?? 0) + 1);
+  // The brain is the model that carried the turn's prompt bytes, not the one
+  // called most often: a turn's Jev routing calls (a few hundred tokens each)
+  // can outnumber the brain frames, and picking by count then reported the
+  // whole turn as side traffic with prefixReuse 0 (live 2026-09-23, Together
+  // GLM brain with eight Jev calls beside eight brain frames).
+  const modelPromptTokens = new Map<string, number>();
+  for (const ev of events) {
+    const canonical = canonicalCacheAccounting(ev);
+    modelPromptTokens.set(
+      ev.model,
+      (modelPromptTokens.get(ev.model) ?? 0) + canonical.cachedReadTokens + canonical.uncachedInputTokens,
+    );
+  }
   let brainModel = '';
-  for (const [model, count] of modelCounts) {
-    if (count > (modelCounts.get(brainModel) ?? 0)) brainModel = model;
+  for (const [model, tokens] of modelPromptTokens) {
+    if (tokens > (modelPromptTokens.get(brainModel) ?? -1)) brainModel = model;
   }
   let previousBrainPrompt: number | null = null;
   let reusable = 0;
