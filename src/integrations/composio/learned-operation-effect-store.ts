@@ -4,7 +4,8 @@
  * consulted by the pure slug classifier for operations whose name carries no
  * verb at all.
  *
- * Live 2026-09-24 (source 299433): `MONDAY_BOARDS` retrieves board data, but
+ * Live 2026-09-24 (source 299433): a project board listing on a freshly
+ * connected toolkit retrieves data, but
  * the slug has no read verb, so it classified as an external write, went
  * through the mutation consent gate, and a freshly connected app's first read
  * was refused. The curated documented-semantics table is exact provider

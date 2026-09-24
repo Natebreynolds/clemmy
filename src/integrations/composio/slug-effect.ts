@@ -290,7 +290,7 @@ export function composioSlugVerbEvidence(slug: string | null | undefined): Compo
   // Bare CALL/POST actions (no anchoring read verb) are outbound writes.
   if (tokens.some((token) => AMBIGUOUS_OBJECT_TOKENS.has(token))) return 'write';
   // No recognized read/write/ambiguous token at all: a pure noun endpoint such
-  // as SLACK_CONVERSATIONS_HISTORY, TWITTER_USER_TIMELINE or MONDAY_BOARDS.
+  // as SLACK_CONVERSATIONS_HISTORY or TWITTER_USER_TIMELINE, or a board listing.
   // Genuinely unknown from the name alone — a caller's declared
   // `sideEffect: read` is the best available signal, so an existing
   // declared-read workflow keeps validating (fold 2026-07-17 #4).

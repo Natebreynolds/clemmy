@@ -2093,7 +2093,7 @@ export async function acquireProvenLiveReadForSource(input: {
       // A generic operation (a raw API passthrough, an endpoint that reads and
       // writes) can never acquire a read-only proof, but it can be materialized
       // exactly from its live definition, as call_tool discovery already does.
-      // Live 2026-09-24 (source 299146): dataforseo__api_request came back
+      // Live 2026-09-24 (source 299146): a raw API passthrough came back
       // "carrier_unavailable" from the read acquisition although the server
       // was connected and the call went through by name a second later.
       try {
@@ -2521,7 +2521,7 @@ export function buildAuthorizedToolSearchCandidateSources(
       if (signal?.aborted) return [];
       // A noun-shaped operation learns its effect from its own description and
       // schema before anything routes on that effect (live 2026-09-24:
-      // MONDAY_BOARDS, a board read, was reviewed and refused as a write).
+      // a board listing, a read, was reviewed and refused as a write).
       try {
         await learnComposioOperationEffects(
           merged.slice(0, 20).map((candidate) => ({ slug: candidate.slug, description: candidate.description, inputSchema: candidate.inputParameters })),

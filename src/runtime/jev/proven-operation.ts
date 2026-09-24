@@ -148,7 +148,7 @@ function composioSlugsFromStrategy(toolsUsed: readonly string[]): string[] {
     if (local) continue;
     // A native MCP operation is server__operation. When the server shares its
     // name with a connected Composio toolkit (live 2026-09-24:
-    // dataforseo__docs_search beside DATAFORSEO_* actions) the uppercased id
+    // a docs search on a server whose name is also a connected toolkit) the uppercased id
     // also passes the slug shape test and was provisioned as a Composio
     // action that does not exist, so the read it named was never warmed.
     if (canonicalMcpToolIdentity(trimmed)) continue;
