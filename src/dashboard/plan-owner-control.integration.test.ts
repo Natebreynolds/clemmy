@@ -124,6 +124,16 @@ test('paired phone and desktop review and Execute either origin, preserving prin
         await new Promise(resolve => setTimeout(resolve, 20));
       }
       assert.ok(log.getLatestRunAttemptByRunId(f.sessionId, firstBody.runId)?.finishedAt);
+      if (controlSurface === 'desktop') {
+        const timings = log.listEvents(f.sessionId, { types: ['turn_phase_timings'] })
+          .filter(event => event.data.lane === 'desktop_admission');
+        assert.equal(timings.length, 1);
+        assert.equal(timings[0]!.data.sourceUserSeq, source!.seq);
+        const phases = timings[0]!.data.phases as Array<{ phase: string; elapsedMs: number }>;
+        assert.deepEqual(phases.map(row => row.phase), ['source_recorded', 'executor_started', 'before_bridge']);
+        assert.ok(phases.every((row, index) => row.elapsedMs >= 0
+          && (index === 0 || row.elapsedMs >= phases[index - 1]!.elapsedMs)));
+      }
       log.closeEventLog();
       const callsBeforeReplay = brainCalls;
       for (const surface of ['desktop', 'mobile'] as const) {

@@ -16732,6 +16732,11 @@ export function registerConsoleRoutes(
     // plan continuity, or background promotion). The receipt/run id makes this
     // exact-once across a lost 202 and daemon recovery; the attempt binding is
     // what lets /api/runs project only this turn instead of guessing by time.
+    const preparationStartedAt = performance.now();
+    const preparationMarks: Array<{ phase: string; elapsedMs: number }> = [];
+    const markPreparation = (phase: string) => preparationMarks.push({
+      phase, elapsedMs: Math.max(0, performance.now() - preparationStartedAt),
+    });
     let requestAcceptedUserEvent: HarnessEventRow | undefined;
     if (shouldSchedule && requestAttempt) {
       try {
@@ -16758,6 +16763,7 @@ export function registerConsoleRoutes(
           },
         }, { armRunInFlight: !acceptedApprovalDefersMarkerOwnership });
         requestAcceptedUserEvent = acceptedUserEvent;
+        markPreparation('source_recorded');
       } catch (err) {
         try { finishRunAttempt(requestAttempt, 'interrupted'); } catch { /* best effort */ }
         console.error('could not durably record the accepted chat turn:', err);
@@ -16993,6 +16999,7 @@ export function registerConsoleRoutes(
     };
 
     setImmediate(async () => {
+      markPreparation('executor_started');
       let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'completed';
       // HELD WORK KEEPS ITS OWNER. Set only when runConversation returned a
       // hold AND the durable recovery sidecar names this exact attempt, so the
@@ -17180,6 +17187,7 @@ export function registerConsoleRoutes(
         }
         if (!explicitTaskMode && !intent) {
           const continuityNotes: string[] = [];
+          markPreparation('before_continuity');
           const continuity = await routeOpenQuestionPlan({
             channel: 'desktop',
             input: turnInput,
@@ -17193,6 +17201,7 @@ export function registerConsoleRoutes(
               continuityNotes.push(message);
             },
           });
+          markPreparation('after_continuity');
           if (continuity.handled) {
             // Workflow-input continuity owns this accepted turn and has no
             // later brain response. Its deterministic note is therefore the
@@ -17392,6 +17401,15 @@ export function registerConsoleRoutes(
         // the "couldn't be structured" apology. The selected model still resolves
         // through RouterModelProvider, so Claude uses its subscription OAuth
         // adapter while sharing the host-owned turn/tool loop with Codex.
+        markPreparation('before_bridge');
+        try {
+          appendHarnessEvent({ sessionId, turn: requestAcceptedUserEvent.turn,
+            role: 'system', type: 'turn_phase_timings', data: {
+              sourceUserSeq: requestSourceUserSeq, lane: 'desktop_admission',
+              totalMs: Math.max(0, performance.now() - preparationStartedAt),
+              phases: preparationMarks,
+            } });
+        } catch { /* Diagnostics cannot change turn admission. */ }
         const response = await respondPreferHarness(
           'home',
           {

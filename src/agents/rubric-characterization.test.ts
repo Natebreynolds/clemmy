@@ -174,10 +174,12 @@ const GOLDEN = {
   // and asks once only if it cannot) — live, the model asked "which calendar?"
   // before any call while memory held the answer. The line was tightened by
   // what it grew so the action-lean rubric stays under its 5,500-byte ceiling.
-  instructions: { len: 31879, sha16: 'b0e0fde7e3ea1766' },
-  native: { len: 30986, sha16: '9887e20c1f4577a0' },
-  claudeBrain: { len: 8942, sha16: '62c88f5454af1a39' },
-  lean: { len: 10947, sha16: 'c51e0e3169d675f0' },
+  // 2026-09-24: retain read-scope semantics and shorten repeated readiness,
+  // consent and status wording; existing size ceilings are unchanged.
+  instructions: { len: 31829, sha16: '69eb4212bed8c8a1' },
+  native: { len: 30936, sha16: 'e13ee9cdb94fb22a' },
+  claudeBrain: { len: 8892, sha16: 'e81b768c1221880c' },
+  lean: { len: 10897, sha16: '2b45d178b1be2374' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
