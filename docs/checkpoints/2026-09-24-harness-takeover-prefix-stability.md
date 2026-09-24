@@ -168,3 +168,48 @@ Reading: the controlled session's own history (110k+ tokens) is now the dominant
 - **Not proven here:** a provider-failure path live (MCP server down during the read) — covered only by the blocked-status branch of the release pin; physical mobile routing; fresh/upgrade installer; long-horizon plan preservation; proactive surfaces.
 - Contract authoring quality: the reviewed text interpretation kept the markdown bullet in section_name (`prefix: ""`); fine for acceptance, worth a nudge in authoring.
 - No tag, push, or main merge. UI untouched.
+
+## 7. Cross-harness optimization wave — 2026-09-23 19:40 → 20:40 PT
+
+Installed: `d8362bf69` (receipts `/tmp/clem-history-patch` af92f465, `/tmp/clem-defer-patch` 38cc4a77, `/tmp/clem-defer2-patch` d8362bf6; rollbacks kept). No tag, push, merge; UI untouched.
+
+### Slice 1 — history sized by cost, not by window (af92f465)
+
+Cause, measured: the pilot session carried an 886 KB history into every frame — 451 KB the model's own earlier reasoning (36 items, largest 53 KB), 288 KB old tool results — with zero condenser events ever. Layer 1 was sized to the full 1M window on a caching wire (never before 300k), Layer 2 to 550k, and the preflight read a static table (128k) while compaction read the observed window (1M). Fixes: Layer 0 drops prior-turn reasoning at the between-turn boundary (lossless, no model call); Layer 1's lossless clip of old results uses an absolute budget on every wire; the preflight and compaction share one observed-window authority. Layers 2/3 keep the real window, so 1M models are never summarized early.
+
+Live, same heavy session, same question, same model:
+
+| Turn | Build | Wall s | Brain frames | History frame 1 | Largest prompt | Uncached | Answer |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 293703 | before | 282.4 | 5 | 118,109 | 121,449 | 295,037 | said the Space "holds nothing" (untrue) |
+| 293870 | slice 1 | 79.6 | 3 | 21,967 | 44,705 | 91,252 | 5 records, fields, caveats — correct |
+| 294013 | slices 1+2 | 42.2 | 3 | 25,669 | 48,801 | 90,722 | 5 records as a table with all four fields — correct |
+
+Condenser record for 293870: 121,374 → 21,551 tokens, 47 results clipped, 72 pairs collapsed, Layer 2 untouched.
+
+### Slice 2 — plan_task schema on demand (38cc4a77, d8362bf6)
+
+plan_task was called on 48 of 1,045 turns in the week yet advertised on 443 frames at ~3k tokens each, and its mid-turn enablement was the last prefix break on every wire. It now rides the prefix from frame one only when the turn is planning-primed (act route, or a planning catalog holding capabilities at build time); otherwise it is enabled but unadvertised, one `tool_search` (the structural lookup now returns a bounded schema handle) and one call away. Pins: deferred tool callable by name but off the wire when the doors exist, advertised when they are absent; the lookup handle redeems the complete current schema.
+
+Live fresh-session retrieve turn (293934): catalog byte-identical across all five frames, no join, 66 s. Ordinary host chat turns carry no accepted-route label, which is why the first route-only rule did not apply and was replaced by the evidence rule.
+
+### Review points from the owner's agents
+
+1. Heavy-conversation repeat: done above (294013); record accuracy verified against the canonical store (first five of the 13 raw lines, four fields, run_ref = proven run, source_ref = page receipt).
+2. Continuity after reduction: decisions live in durable stores (approvals, proposals, projections, run records, canonical entities) and in assistant messages and tool calls, all of which Layer 0/1 keep; Layer 1 stubs name the durable handle. Layer 2 and the SDK lane already discarded reasoning between turns. Evidence: after five daemon restarts and the reduction, the heavy session answered from durable state with the resolved card, the superseded occurrence and the records intact. Still owed: a pin that carries an approved plan, a user correction, a pending approval and a completed-write receipt across reduction + restart.
+3. Model rounds: 294013 was 3 brain frames for 4 calls — frame 2 re-issued the same two reads although frame 2's input already held both complete results (2.6 KB, 1.6 KB); the model's own reasoning says it re-read to be sure. The identical-call guardrail flagged it but is advisory. No `proven_operation_selected` fired for a question answered three times: retrieve turns do not record proven strategies, so Jev's routing had nothing to pick. Next: record proven read strategies for successful retrieve turns; on a proven pick, pin the exact tools and say discovery is done; answer an identical-args repeat from the retained result without a frame.
+4. Discovery cost: off the act route a plan that becomes necessary costs one structural lookup (≤2 KB) plus one schema redemption (~3k tokens once) instead of ~3k tokens on every frame of every turn; on act or planning-primed turns nothing changed. Verified by pin; live act-route verification is owed.
+
+### plan_task dependency trace (owner directive: consolidate or retire)
+
+What a plan_task settlement creates: an admitted, frozen action graph and expected-work contract for the accepted source; `actionExpectedWorkRequired(identity)` flips, which (a) moves the host root from graph-neutral to a frozen catalog snapshot, (b) makes `work_call` require an exact `requirement_id` and go proposal-free, (c) retires plan_task from the surface, (d) enables plan_step_result. The `fresh_plan_barrier` frame class forces it to lead its frame. References outside plan-tools.ts: host-turn-runner 39, plan-task-post-settlement 31, host-planned-resolution-coexistence 30, orchestrator 15, host-tool-invocation 12, work-call 11, admit-and-compile 11, plan-task-result-contract 11, host-no-progress-projection 8, tool-search 7, expected-work-delegation 5, attempt-settlement 5, 25 more files with 1–4 each.
+
+Callers: (1) Normal/act foreground turns with a primed planning catalog (`hostFreshPlanning`) — the model freezes its own multi-step contract mid-turn; (2) Execute mode — `acceptedPlanExecution` present, plan_task `{}` ACTIVATES the user-selected reviewed revision (a model round spent on a decision the user already made); (3) delegated workers — a child freezes its own contract with plan_task (expected-work-delegation, sub-agents). Native authoring (workflow_create/update, space_save) does not depend on it.
+
+Duplication with Plan mode → approved execution: both compile a proposal into an expected-work contract; Plan mode does it through publish_plan + user review, plan_task does it in-turn without review. The newer typed action path (`actionWork`, configure-typed-execution-runtime) already carries act turns without plan_task; plan_task remains the older progressive-planning-card route. Given the standing directives (gates at the write boundary, no approval cards, plan best-effort / execute judges), it is the legacy of the two.
+
+Staged retirement, each stage live-verified before the next:
+- Stage 1: Execute-mode activation happens host-side when the turn starts (the user already selected the revision); no plan_task call, no barrier frame. Verify Plan mode → Execute end to end and resume after restart mid-execution.
+- Stage 2: foreground act turns take the typed action path only; the orchestrator stops building plan_task when a typed contract can be derived; workers get their contract from the parent packet. Verify multi-operation write with consent, worker delegation, workflow authoring, no-progress recovery.
+- Stage 3: remove plan_task, plan-task-post-settlement, planned-resolution coexistence, result contract and the barrier frame class; keep the expected-work contract as the shared implementation. Verify the full journey set and restart/resume.
+Today's deferral is compatible with all three stages and costs nothing to unwind.
