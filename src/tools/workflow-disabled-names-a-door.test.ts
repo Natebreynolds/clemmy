@@ -1,32 +1,32 @@
-/** Run: node scripts/run-tests-isolated.mjs src/tools/workflow-disabled-names-a-door.test.ts
- *
- * A disabled or missing saved workflow must not end the turn.
- *
- * "Disabled" means do not run this saved DEFINITION — never "do not do this
- * work". Live 2026-09-03 run 29: a cold request matched a saved workflow, the
- * model was told only `Workflow "<name>" is disabled.`, and the turn ended on
- * that sentence with ZERO business calls on a request it was fully equipped to
- * carry out directly. Tenth instance that day of one property: the harness
- * holds the answer and does not say it.
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+
+import { disabledWorkflowRunMessage } from './workflow-verification-state.js';
 
 const ADMIT = readFileSync(new URL('./admit-named-workflow-run.ts', import.meta.url), 'utf8');
 const QUEUE = readFileSync(new URL('./workflow-run-queue.ts', import.meta.url), 'utf8');
 
 for (const [label, src] of [['admit', ADMIT], ['queue', QUEUE]]) {
-  test(`${label}: a disabled workflow names the direct door`, () => {
-    // Match on the message fragments, not one contiguous phrase: the strings
-    // are template concatenations split across lines.
-    const i = src.indexOf('so it will not be run');
-    assert.ok(i > 0, 'the disabled refusal must name that only the DEFINITION is off');
-    const block = src.slice(i, i + 600);
-    assert.match(block, /block the request/, 'the work is still doable');
-    assert.match(block, /tool_search/, 'and the door is named');
+  test(`${label}: a disabled saved workflow retains the requested execution and names its enablement door`, () => {
+    assert.match(src, /disabledWorkflowRunMessage\(/, 'both entry points share the recovery guidance');
+    const message = disabledWorkflowRunMessage('Quarterly refresh');
+    assert.match(message, /Quarterly refresh/);
+    assert.match(message, /no execution was queued/);
+    assert.match(message, /already authorized, use workflow_set_enabled/);
+    assert.match(message, /otherwise ask whether to enable/);
+    assert.match(message, /Do not substitute ad-hoc work or claim completion/);
   });
 }
+
+test('pending workflow verification names the existing run and preserves the requested business execution', () => {
+  const message = disabledWorkflowRunMessage('Quarterly refresh', 'verification-42');
+  assert.match(message, /verification-42/);
+  assert.match(message, /read-only steps and previews mutations/);
+  assert.match(message, /NOT been queued/);
+  assert.match(message, /After verification passes.*workflow_run/);
+  assert.match(message, /Do not recreate it, repeatedly enable it/);
+});
 
 test('admit: a missing workflow also names the direct door', () => {
   const i = ADMIT.indexOf('not found.');

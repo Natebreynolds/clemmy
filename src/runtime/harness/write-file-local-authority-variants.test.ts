@@ -138,11 +138,14 @@ test('unrecognized or malformed write modes never inherit local planning authori
   const invalid = [
     null,
     { path: 'report.txt', content: 'content', mode: 'truncate', append: null },
-    { path: 'report.txt', content: 'content', mode: undefined, append: null },
+    { path: 'report.txt', content: 'content', mode: 12, append: null },
     { path: 'report.txt', content: 'content', mode: 'append', append: 'true' },
   ];
 
   for (const args of invalid) {
     assert.equal(exactMatch(observed.definitions, args), null, JSON.stringify(args));
   }
+  assert.equal(exactMatch(observed.definitions,
+    { path: 'report.txt', content: 'content', mode: undefined, append: null })?.capabilityRef,
+  'cap:local:write_file:create', 'an omitted optional mode retains the safe create-only default');
 });

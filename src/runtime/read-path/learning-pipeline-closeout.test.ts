@@ -608,7 +608,7 @@ test('empty-args settlement from a superseded source remains capability-only', a
 
 // ─── warm turn shape (guard) ─────────────────────────────────────────────────
 
-test('a warm paraphrase crosses the real host plan/work carrier, dispatches once, and commits one terminal', async () => {
+test('a warm paraphrase crosses the real host work carrier without planning or discovery, dispatches once, and commits one terminal', async () => {
   const teachSession = freshSession('sess-warm-teach');
   acceptSource(teachSession, "what's on my calendar tomorrow?");
   await governedRead(teachSession, CAL_SLUG, { successful: true, data: { items: [{ id: 'e1' }] } });
@@ -786,39 +786,9 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
               `the host capability node did not expose its shared action carrier: ${JSON.stringify([...toolNames])}`);
             assert.equal(toolNames.has('composio_execute_tool'), false,
               'the stale direct connected-app carrier remained first-class beside work_call');
-            assert.equal(toolNames.has('plan_task'), true,
-              'the current exact connected-app definition did not reach fresh host planning');
             return [
-              toolCall('warm-calendar-plan', 'plan_task', {
-                preamble: 'I’ll check the current calendar for tomorrow.',
-                draft: {
-                  criteria: ['Return the current calendar events for tomorrow.'],
-                  cardinality: null,
-                  destination: null,
-                  topology: {
-                    version: 1,
-                    operations: [{
-                      id: 'read_calendar',
-                      effect: 'read',
-                      coverage: 'complete_set',
-                      dependsOn: [],
-                      dataFrom: [],
-                      cardinality: { kind: 'once' },
-                    }],
-                    universes: [],
-                  },
-                  bindings: [{
-                    operationId: 'read_calendar',
-                    role: 'source',
-                    capabilityRef: manifest.manifestId,
-                    evidence: ['payload'],
-                  }],
-                  deliverables: [],
-                  evidenceRequirements: ['payload'],
-                },
-              }),
               toolCall('warm-calendar-read', 'work_call', {
-                requirement_id: 'read_calendar',
+                requirement_id: manifest.manifestId,
                 universe_item_id: null,
                 universe_selector: null,
                 seal_amendment: null,
@@ -911,7 +881,8 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
     },
       async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
     responses += 1;
-    assert.notEqual(res.stoppedReason, 'error', `the warm host turn failed: ${JSON.stringify(res)}`);
+    assert.equal(dispatches, 1, JSON.stringify(observedToolResults));
+    assert.notEqual(res.stoppedReason, 'error', `the warm host turn failed: ${JSON.stringify({ res, events: eventlog.listEvents(sessionId).filter(event => event.type === 'run_failed' || event.type === 'guardrail_tripped') })}`);
     assert.match(res.text, /^Your calendar is ready\./, JSON.stringify(eventlog.listEvents(sessionId)));
     const completion = eventlog.listEvents(sessionId).find(event => event.type === 'conversation_completed');
     const completionRef = completion?.data.completionVerdictRef as Record<string, unknown> | undefined;
@@ -927,7 +898,7 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
     assert.ok(!res.text.includes(unavailableReason),
       'the operator reason is not pasted into the chat text');
     assert.match(res.text, /stands unreviewed/,
-      'the authored read result is preserved without presenting unavailable review as verification');
+      `the authored read result is preserved without presenting unavailable review as verification: ${JSON.stringify({res, completion})}`);
     assert.doesNotMatch(res.text, /accepting completion/,
       'the historical internal fail-open label is not a claim of successful completion');
   } finally {
@@ -961,8 +932,8 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
   assert.equal(directTransportBodies, 0,
     'the provider-neutral catalog transport bypassed the shared work_call/Composio carrier');
   assert.equal(modelSteps, 2, 'the host did not own exactly one call/result model cycle');
-  assert.equal(preambleDeliveries, 1,
-    'the one fresh plan preamble did not cross its awaited presentation port exactly once');
+  assert.equal(preambleDeliveries, 0, 'an independent learned read must not manufacture an execution plan');
+  assert.equal(events.filter(event => event.type === 'tool_called' && event.data.tool === 'plan_task').length, 0);
   assert.equal(events.filter((event) => event.type === 'conversation_completed').length, 1,
     'the host turn published more than one terminal');
   const terminal = events.find((event) => event.type === 'conversation_completed');
@@ -973,8 +944,8 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
   const judgment = events.find(event => event.id === verdict?.eventId);
   assert.equal(judgment?.type, 'goal_alignment_judged');
   assert.equal(judgment?.data.failedOpen, true, 'the public qualifier redeems the actual unavailable review');
-  assert.equal(terminal?.data.reason, 'blocked');
-  assert.equal(terminal?.data.delivered, false);
+  assert.equal(terminal?.data.reason, 'success');
+  assert.equal(terminal?.data.delivered, true);
   assert.equal(terminal?.data.verificationDetail, 'completion_review_failed_open');
   assert.equal(events.filter((event) => event.type === 'turn_graph_shadow').length, 0,
     'the host fixture manufactured legacy graph authority');
@@ -985,14 +956,10 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
      WHERE session_id = ?
      ORDER BY rowid
   `).all(sessionId), [{
-    logical_tool_call_id: 'warm-calendar-plan',
-    tool_name: 'plan_task',
-    state: 'settled',
-  }, {
     logical_tool_call_id: 'warm-calendar-read',
     tool_name: CAL_SLUG.toLowerCase(),
     state: 'settled',
-  }], 'the exact plan control must precede one logical business call');
+  }], 'one independent learned read settles without a synthetic plan control');
   assert.deepEqual(db.prepare(`
     SELECT state FROM physical_dispatches
      WHERE session_id = ? AND logical_tool_call_id = 'warm-calendar-read'

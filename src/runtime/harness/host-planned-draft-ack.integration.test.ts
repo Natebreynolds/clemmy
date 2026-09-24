@@ -176,7 +176,11 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.equal(primed.ok, true, JSON.stringify(primed));
   if (!primed.ok) throw new Error('fixture catalog must prime');
-  assert.ok(primed.planning.capabilities.some(cap => cap.id === CAPABILITY), 'the exact provider capability is published before planning');
+  const refs = await semantic.disclosePrimaryModelPlanningCapabilities({
+    authority: primed.planning.authority,
+    candidates: [{ name: OPERATION, carrier: 'work_call', sourceKind: 'authorized_composio', schema }],
+  });
+  assert.equal(refs[OPERATION], CAPABILITY, 'the exact provider capability is disclosed for this source before planning');
   const plan = brackets.wrapToolForHarness(buildPlanTaskTool({ planning: primed.planning }) as never);
   const work = brackets.wrapToolForHarness(buildWorkCall({ requireHostPlan: true, hostPlanningReady: () => true }) as never);
   const planArgs = {

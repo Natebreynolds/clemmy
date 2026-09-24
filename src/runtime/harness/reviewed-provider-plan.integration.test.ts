@@ -209,7 +209,11 @@ async function plannedDraftFixture(suffix: string, evidence: string[] = ['tool_r
       'another accepted request cannot borrow this discovery');
     }
   } else {
-    assert.ok(primed.planning.capabilities.some(cap => cap.id === CAPABILITY), 'the exact provider capability is published before planning');
+    const refs = await semantic.disclosePrimaryModelPlanningCapabilities({
+      authority: primed.planning.authority,
+      candidates: [{ name: OPERATION, carrier: 'work_call', sourceKind: 'authorized_composio', schema }],
+    });
+    assert.equal(refs[OPERATION], CAPABILITY, 'the exact provider capability is disclosed for this source before planning');
   }
   const planArgs = {
     preamble: 'Saving the three fixture drafts to your connected owner mailbox, without recipients, using plain text.',

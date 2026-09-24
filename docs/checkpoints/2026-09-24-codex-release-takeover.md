@@ -160,3 +160,133 @@ The watchdog itself lost the global result sequence at `ok 7351`, a file-only re
 Discovery-governor tests now assert that ordinary discovery preserves the stable tool prefix and retains discovery/dispatch carriers while plan_task stays on demand. The two missing-write graph-repair fixtures explicitly use the production Act surface, which supplies their planning schema from frame one; all prior missing-write, no-substitution, exact call count and no-graph-on-refusal assertions remain. This distinguishes schema acquisition from graph repair rather than restoring automatic schema growth. The whole governor file passes 13/13 (/private/tmp/clem-no-progress-green.log). The separate structural-control lookup test still proves full schema redemption from the returned handle; these pins are not a new installed JIT planning acceptance.
 
 Preserve and include the previously untracked 2026-09-23-efficient-agent-execution-brief.md as the historical owner-requested brief. Untracked docs participate in the source fingerprint, so leaving it untracked would make the installed candidate differ from a clean release checkout. Final builds and gates must follow the committed reviewed series. Remaining: unseen test tail, complete isolated suite, journeys, release/package/upgrade gates, installed live measurements and continuity/workflow checks, integration and tag. Windows production signing secrets are absent; the owner has a pending choice between supplying them and an unsigned private candidate. No Windows production release is cleared.
+
+## Follow-up: cache accounting and contract fixtures (2026-09-24)
+
+Candidate remains on harness/3.19, based on e9d682575. Installed app remains
+stopped at the e9d hotpatch; the changes below are NOT live accepted or tagged.
+
+- Found a real semantic fallback accounting defect: SDK cached input details
+  were discarded when the adapter did not record its own usage. The same
+  100-input/40-cached/10-output response debited 110 instead of 70 uncached-work
+  tokens. Preserve cache details through the configured semantic completion
+  and fallback recorder, retaining the existing exact-once adapter ownership.
+  Red: /private/tmp/clem-semantic-cache-red.log (fallback fails, adapter passes).
+  Green: /private/tmp/clem-semantic-cache-green.log, 9/9 including aggregate vs
+  detail-row duplication and multiple raw responses. This corrects accounting;
+  it does NOT reduce provider tokens or demonstrate latency savings.
+- Typecheck passed: /private/tmp/clem-refinement-typecheck.log.
+- Follow-up fixture group: /private/tmp/clem-fixture-contract-followup.log,
+  144/145 passed. The one remaining assertion expected the old missing-memory
+  reference wording. After aligning that assertion with the current explicit
+  durable-reference message, /private/tmp/clem-memory-contract-green.log is
+  24/24. Planned provider tests retain the fifty-write and reopen checks and
+  now supply current-source disclosure instead of assuming a global catalog.
+- Earlier purpose-ranking pin group remains 36/36 at
+  /private/tmp/clem-purpose-rank-green2.log; broader ranking verification owed.
+
+Remaining named failures are not waived: the loop exact-source collection
+fixture now reports a durable-memory episode / accepted graph semantic-input
+binding mismatch; the warm learned calendar fixture reports that the exact
+connected-app definition did not reach fresh host planning. Diagnostics:
+/private/tmp/clem-loop-warm-diagnostic.log. Neither completion authority nor
+memory checks have been weakened. Other named failures in the tail attribution
+ledger still need resolution before another full suite. No full green claimed.
+
+Do not promise a few-second judge from cache or lookup handles: actual reviewer
+prefix accounting differs from the previously reported brain prefix, and
+handles can add lookup turns. Reviewer racing changes model selection and cost;
+it remains unenabled. Keep watcher and judge gating intact. A rebuilt signed
+Terminal hotpatch, served fingerprint check, matched live measurements, full
+suite/journeys and release packaging gates are still owed before merge/tag.
+
+## Memory completion and warm read follow-up (2026-09-24)
+
+The previous loop diagnostics exposed TWO production defects, not just stale
+fixtures. Neither is hotpatched yet:
+
+1. Graph input hashes use trimmed original source bytes; memory intake stores
+   normalized whitespace. Comparing the normalized text against the graph hash
+   rejected valid multiline accepted requests. Bind the original bytes before
+   verifying the normalized durable episode/candidates. Red new pin:
+   /private/tmp/clem-memory-graph-whitespace-red.log. All eight intake tests
+   passed in /private/tmp/clem-memory-graph-whitespace-green.log; this also
+   cleared five previously failing loop completion tests.
+2. A queued auto-memory candidate (without a verified memory-only receipt)
+   allowed a bare acknowledgement to complete an unfinished action. Require
+   prepare-and-redeem of the exact memory receipt instead. The pure memory
+   classifier previously also demanded an explicit acknowledgement-only suffix;
+   pure declarative explicit remember requests now use the same receipt checks
+   without that extra wording. Secondary requests/actions/questions, storage
+   integrity checks and provenance checks remain. New positive and compound
+   negative pins cover the change. The exact-reply loop fixture now actually
+   performs zero work instead of injecting an unrelated fixture settlement.
+
+Warm read fixture migration: the old fixture forced plan_task for one calendar
+read. The current foreground contract allows the exact learned capability ref
+through work_call directly. The updated test retains one real governed provider
+crossing, no discovery, two model frames, one terminal, exact settlement and
+unavailable-review disclosure. No coordinated-plan coverage was removed from
+three/fifty-write tests. /private/tmp/clem-warm-current-contract-green.log: 1/1.
+The existing delivery contract can publish the result with an unreviewed notice;
+verified=false / failedOpen=true remain asserted. This is NOT live review proof.
+No orchestrator runtime change was retained from the diagnostic experiments.
+
+Broad intermediate check: /private/tmp/clem-memory-loop-ranking-broad.log,
+326/327 (the one failure was the pure-memory wording requirement above).
+Current broader memory/Claude-adapter/loop run:
+/private/tmp/clem-memory-completion-full-files.log, tool session 98581, still
+running at this checkpoint (355 named tests had progressed, no failures seen).
+Poll that exact handle or inspect its final summary; do not treat a partial log
+as a pass. Latest typecheck: /private/tmp/clem-memory-refinements-typecheck.log.
+Remaining tail failures in planning-card recovery, sealed CLI fixtures and
+schema/workflow guidance still need resolution. Full sweep, journeys, rebuild,
+installed live acceptance, merge and release remain owed. Windows signing
+choice remains unanswered. Installed app is still held stopped at e9d682575.
+
+Follow-up terminal evidence: session 98581 finished exit 0. The broad memory,
+Claude-adapter and loop run passed 421/421 with zero failures/cancellations/skips
+in 139.3 s. Typecheck session 42836 also finished exit 0. No running process from
+this memory check remains. The final fixture cleanup removed a diagnostic that
+called receipt preparation from an assertion; production receipt preparation
+and its explicit positive/negative intake pins remain covered.
+
+## Remaining tail failures closed before next full sweep (2026-09-24)
+
+All named tail-failure groups have targeted passing coverage now. Latest group:
+/private/tmp/clem-final-contract-files-green.log, 85/85, zero skips/failures;
+/private/tmp/clem-disclosure-nomination-pin.log, 1/1;
+/private/tmp/clem-release-refinements-typecheck.log, exit 0.
+
+A further framework defect emerged while migrating recovery fixtures: repacking
+one same-source disclosure filled empty card slots from the entire live catalog.
+The red assertion is in /private/tmp/clem-final-contract-files.log. Repacking now
+uses only the existing card plus exact request disclosures. Current-definition
+validation, continuation inheritance, cold tool discovery and selected-operation
+validation remain unchanged. The dedicated pin checks an empty initial card,
+one disclosed reader, an unrelated configured reader, and reopen stability.
+
+Fixture migrations are deliberate current-contract checks, not waived failures:
+- Recovery fixtures carry exact sealed provider definitions and same-source
+  disclosure instead of assuming automatic global inventory preload. The parent
+  continuation still binds the same objective digest and inherits its disclosed
+  operation; an unrelated new turn inherits nothing.
+- Reviewed-CLI publication retains NO optional externalDefinition, a producer-
+  sealed schema digest, strict revalidation and schema mutation rejection. Its
+  exact CLI resolution is nominated for the accepted source before priming.
+- Historical disclosure keeps the immutable initial snapshot unchanged; only
+  valid current same-source disclosures extend the working card. Retired
+  mutation/readback semantics remain excluded with zero provider bodies.
+- Disabled named-workflow guidance preserves the requested saved workflow and
+  uses authorized enable/verify/run, rather than silently substituting ad-hoc
+  work. Both entry points share the tested message helper.
+- Schema guidance now executes actual search and paginated local schema recovery
+  across exact/fixed/mixed/fallback carriers. Inline schemas require no extra
+  reads; omitted 100K+ schemas redeem losslessly with one provider search only.
+- Toolkit citation positive control now explicitly requests toolkit use; merely
+  mentioning a provider is not a request to bind it. Cited scope stays intact.
+
+Runtime series: 9bacb1991 memory completion, 962deaf8a semantic cache accounting,
+2bb14938a purpose ranking, c3a1139fb scoped planning-card repacking. Full candidate
+sweep/build/hotpatch/live acceptance still required; these targeted results do
+not constitute release approval. No tag/merge/push has occurred.

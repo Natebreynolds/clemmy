@@ -509,7 +509,7 @@ test('a reviewed-CLI step publishes the sealed catalog digest, revalidates again
   // manifest, the exact schema deposited in the contract cache, digest sealed
   // at registration by the producer.
   const manifest = capabilityManifests.attachSemanticContract({
-    version: 1, manifestId: `cap:fixture:reviewed-cli:${operationId}`, providerKind: 'reviewed_cli', operationId,
+    version: 1, manifestId: `cap:resolved:${operationId}`, providerKind: 'reviewed_cli', operationId,
     providerIdentity: '/usr/bin/fixture-cli', providerVersion: 'fixture-v1', operationVersion: '1',
     definitionFingerprint: sha256(`definition:${operationId}`), effect: 'read', accountId: 'reviewed_cli:host',
     idempotency: { required: false, policy: 'none' }, reconciliation: { supported: false, policy: 'none' },
@@ -536,6 +536,11 @@ test('a reviewed-CLI step publishes the sealed catalog digest, revalidates again
   const session = log.createSession({ id: 'reviewed-cli-publication', kind: 'chat' });
   const source = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Plan the reviewed CLI query.', taskMode: { version: 1, kind: 'plan' } } });
   const f = { sessionId: session.id, sourceUserSeq: source.seq };
+  const resolution = await import('../runtime/harness/capability-resolution.js');
+  resolution.recordAdmissionCapabilityResolution({ ...f, acceptedInput: 'Plan the reviewed CLI query.', entries: [{
+    kind: 'cli', identifier: operationId, intent: 'the current source selected this reviewed CLI query',
+    status: 'proven', connection: 'active', accountIdentity: manifest.accountId, effectClass: 'read',
+  }] });
   const primed = await semantic.primePrimaryModelPlanningCatalog(f);
   assert.ok(primed.ok, JSON.stringify(primed)); if (!primed.ok) return;
   const raw = () => ({ steps: [{ id: 'query', action: 'Run the reviewed query.', effect: 'read', capabilityRef: manifest.manifestId, staticArguments: { query: 'SELECT Id FROM Account' },

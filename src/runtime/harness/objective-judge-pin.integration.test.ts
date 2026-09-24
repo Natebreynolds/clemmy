@@ -115,7 +115,9 @@ for (const behavior of ['error', 'invalid', 'hung'] as const) {
     assert.equal(result.failure, behavior === 'hung' ? 'timeout' : behavior);
     assert.equal(result.routing?.modelId, 'claude-sonnet-5');
     assert.equal(result.routing?.selfJudge, false);
-    assert.deepEqual(calls, [{ provider: 'claude', modelId: 'claude-sonnet-5' }]);
+    assert.deepEqual(calls, Array.from({ length: behavior === 'invalid' ? 2 : 1 },
+      () => ({ provider: 'claude', modelId: 'claude-sonnet-5' })),
+    'only a malformed verdict gets one repair, on the same pinned reviewer');
     const metric = getJudgeMetricsSnapshot().lanes.find(lane => lane.lane === 'completion');
     assert.equal(metric?.lastOutcome, behavior === 'hung' ? 'timeout' : behavior);
   });
@@ -483,7 +485,14 @@ test('workflow report-back actual judge wire owns the parent source and captured
   assert.equal(wired[0].modelId, 'claude-sonnet-5');
   assert.equal(wired[0].sessionId, session.id);
   assert.equal(wired[0].source, source.seq);
-  assert.deepEqual(wired[0].usage, identity);
+  const attribution = wired[0].usage as Record<string, unknown>;
+  assert.equal(attribution.sessionId, identity.sessionId);
+  assert.equal(attribution.sourceUserSeq, identity.sourceUserSeq);
+  assert.equal(attribution.role, 'reviewer');
+  assert.equal(attribution.channel, 'judge:completion');
+  const components = attribution.promptComponents as Record<string, number>;
+  assert.ok(components.instructions > 0 && components.history > 0,
+    'the reviewer owns its measured request components as well as the parent source');
   const rows = metrics.openModelRouteMetricsDb().prepare(`SELECT session_id, role, requested_model,
     resolved_model FROM model_route_decisions WHERE session_id = ? AND role = 'judge'`).all(session.id) as Array<Record<string, unknown>>;
   assert.ok(rows.some(row => row.requested_model === 'claude-sonnet-5' && row.resolved_model === 'claude-sonnet-5'), JSON.stringify(rows));

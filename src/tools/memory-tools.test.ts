@@ -117,13 +117,13 @@ test('memory_read dereferences the fact and policy refs exposed by recall primer
   const factResult = await read!({ target: `fact:${stored.id}` });
   assert.equal(
     factResult.content[0]?.text,
-    `[fact:${stored.id}] project: The Clementine launch crew includes Avery, Jordan, and Morgan.`,
+    `[fact:${stored.id}] project: The Clementine launch crew includes Avery, Jordan, and Morgan.\nStatus: active.`,
   );
 
   const policyResult = await read!({ target: `policy:${stored.id}` });
   assert.equal(policyResult.content[0]?.text, factResult.content[0]?.text);
   const missing = await read!({ target: 'fact:999999' });
-  assert.equal(missing.content[0]?.text, 'Not found: fact:999999');
+  assert.equal(missing.content[0]?.text, 'Durable memory reference not found: fact:999999');
 });
 
 test('convert_to_markdown is exposed in the local MCP catalog', () => {

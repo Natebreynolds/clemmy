@@ -14,6 +14,7 @@ const { registerRecallTools } = await import('./recall-tools.js');
 const { createSession, closeEventLog, getToolOutput } = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { exactToolOutputForInvocation } = await import('../runtime/harness/tool-output-format.js');
+const { HostLocalReadSuccessResult } = await import('../runtime/harness/attempt-settlement.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 
 test.after(() => { closeEventLog(); rmSync(testHome, { recursive: true, force: true }); });
@@ -32,14 +33,15 @@ for (const preview of [null, 2_000, 80_000]) test(`read_file retains every recor
   writeFileSync(file, raw);
   const callId = `read-${session.id}`, nonce = randomUUID();
   const reader = getComputerTools().find(t => t.name === 'read_file') as unknown as {
-    invoke(context: unknown, input: string, details: unknown): Promise<string>;
+    invoke(context: unknown, input: string, details: unknown): Promise<unknown>;
   };
   const visible = await withToolOutputContext({ sessionId: session.id, callId, toolName: 'read_file', settlementNonce: nonce },
     () => reader.invoke({ context: { sessionId: session.id, turn: 1 } }, JSON.stringify({ path: file, max_chars: preview }), { toolCall: { callId } }));
   const parked = getToolOutput(session.id, callId);
   assert.equal(parked?.output.length, raw.length, 'the complete bytes must be parked before display clipping');
   assert.equal(parked?.output === raw, true, 'no injected widening note or missing tail');
-  assert.equal(exactToolOutputForInvocation({ sessionId: session.id, callId, toolName: 'read_file', compactResult: visible, settlementNonce: nonce }) === raw, true);
+  assert.ok(visible instanceof HostLocalReadSuccessResult, 'the SDK carries nominal read completion with the text');
+  assert.equal(exactToolOutputForInvocation({ sessionId: session.id, callId, toolName: 'read_file', compactResult: visible.output, settlementNonce: nonce }) === raw, true);
   closeEventLog();
   let query: ((args: unknown) => Promise<any>) | undefined;
   registerRecallTools({ tool: (name: string, _description: unknown, _schema: unknown, handler: any) => {
