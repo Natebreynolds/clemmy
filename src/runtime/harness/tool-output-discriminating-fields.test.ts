@@ -121,3 +121,23 @@ test('opaque per-record tokens never outrank the fields that answer — the live
   assert.ok(!tightText.includes('jPZmOK6sNU66'), 'an opaque etag must not consume a tight budget');
   assert.ok(!tightText.includes('AAMkAGE1M2IyNGNm'), 'an opaque id must not consume a tight budget');
 });
+
+test('reclaims omitted field syntax for small nested values without growing the projection budget', () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({
+    recordId: `row-${i}`, likes: 2, shares: 0, views: 113, missing: null,
+    text: `Retained record ${i}`, media: 'provider bytes '.repeat(900),
+    related: { text: `Actual nested caption ${i}`, value: 3 },
+  }));
+  const out = compactStructuredJsonToolOutput(JSON.stringify({ data: { items: rows } }), {
+    maxChars: 4000, exactOutputReceipt: 'r'.repeat(300),
+  });
+  assert.ok(out);
+  assert.ok(out.length <= 4000);
+  const projected = JSON.parse(out);
+  assert.equal(projected.data.items.length, rows.length);
+  for (const row of projected.data.items) {
+    assert.deepEqual([row.likes, row.shares, row.views, row.missing, row.related?.value], [2, 0, 113, null, 3]);
+    assert.equal(Object.hasOwn(row, 'media'), false, 'reclaimed bytes do not inflate omitted blobs');
+  }
+  assert.ok(projected.__clementine.projection.omittedObjectKeys > 0);
+});

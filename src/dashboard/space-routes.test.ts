@@ -663,7 +663,8 @@ test('manual refresh refuses a read-looking Composio source without a current re
     }));
     assert.equal(ref.status, 200);
     assert.equal(ref.body.results[0].ok, false);
-    assert.match(ref.body.results[0].error, /not provably read-only/i);
+    assert.match(ref.body.results[0].error, /exact read catalog preparation was refused/i);
+    assert.match(ref.body.results[0].error, /accepted_source_missing_or_changed/);
     assert.equal(providerBodies, 0);
     assert.equal(Object.hasOwn(ref.body.data, 'pull'), false);
     assert.equal(ref.body.data._meta.pull.ok, false);

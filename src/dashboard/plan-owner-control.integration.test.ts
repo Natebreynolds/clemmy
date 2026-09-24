@@ -76,7 +76,15 @@ test('paired phone and desktop review and Execute either origin, preserving prin
       const source = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
         data: { text: 'Prepare this exact test plan.', taskMode: { version: 1, kind: 'plan' }, userId: principalId } });
       const artifact = plans.publishPlanRevision({ sessionId, principalId, sourceUserSeq: source.seq,
-        fullText: `Complete ${origin} plan.\n${'Preserved detail. '.repeat(1500)}Exact tail.`, readiness: 'ready' });
+        fullText: `Complete ${origin} plan.\n${'Preserved detail. '.repeat(1500)}Exact tail.`, readiness: 'ready',
+        // This fixture reviews a reasoning-only plan. Tool-bearing plans need
+        // actual prepared capability bindings; absence of preparation is not ready.
+        structuredPlan: {
+          steps: [{ id: 'review', action: 'Review the preserved plan details and report the result.',
+            effect: 'none', capabilityRef: null, staticArguments: {}, dynamicBindings: [],
+            dependsOn: [], subagentRole: null, verification: 'The reply describes the reviewed details.' }],
+          preparedBindings: [], preparationIssues: [],
+        } });
       const ref = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
       return { sessionId, principalId, artifact, ref, taskMode: { version: 1 as const, kind: 'execute' as const, executeRef: ref } };
     };

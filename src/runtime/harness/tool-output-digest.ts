@@ -423,6 +423,7 @@ function compactJsonValue(
     ))
     .slice(0, MAX_STRUCTURED_PROJECTION_KEYS)
     .map(({ key }) => key);
+  const rankedKeys = keys;
   while (keys.length > 0) {
     const overhead = 2
       + Math.max(0, keys.length - 1)
@@ -430,8 +431,7 @@ function compactJsonValue(
     if (overhead + (keys.length * MIN_JSON_VALUE_CHARS) <= budget) break;
     keys = keys.slice(0, -1);
   }
-  stats.omittedObjectKeys += originalKeys.length - keys.length;
-  if (keys.length === 0) { stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
+  if (keys.length === 0) { stats.omittedObjectKeys += originalKeys.length; stats.omittedValues += 1; return OMITTED_JSON_VALUE; }
   const overhead = 2
     + Math.max(0, keys.length - 1)
     + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
@@ -443,11 +443,40 @@ function compactJsonValue(
     ? allocateJsonBudgetsInOrder(sizes, budget - overhead)
     : allocateJsonBudgets(sizes, budget - overhead);
   const compact: Record<string, unknown> = {};
+  const fieldStats = new Map<string, StructuredProjectionStats>();
+  const projectField = (key: string, available: number): unknown => {
+    const local: StructuredProjectionStats = { clippedStrings: 0, omittedArrayItems: 0,
+      omittedObjectKeys: 0, omittedValues: 0 };
+    const entry = compactJsonValue(record[key], available, local, depth + 1);
+    fieldStats.set(key, local);
+    return entry;
+  };
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
-    const entry = compactJsonValue(record[key], budgets[index]!, stats, depth + 1);
-    if (entry === OMITTED_JSON_VALUE) stats.omittedObjectKeys += 1;
-    else compact[key] = entry;
+    const entry = projectField(key, budgets[index]!);
+    if (entry !== OMITTED_JSON_VALUE) compact[key] = entry;
+  }
+  // Initial allocations reserve key syntax even for fields that cannot fit.
+  // Reuse that unspent space for omitted fields in the same ranked order.
+  // Existing values stay intact; source values, the total budget and ranking
+  // are unchanged. A small nested scalar need not force another recall turn.
+  for (const key of rankedKeys) {
+    if (Object.hasOwn(compact, key)) continue;
+    const keyCost = JSON.stringify(key).length + 1 + (Object.keys(compact).length ? 1 : 0);
+    const available = budget - jsonChars(compact) - keyCost;
+    if (available <= 0) continue;
+    // Reclaimed syntax space should recover whole scalars or structured
+    // descendants, not expand an already-omitted large text/blob field.
+    if (typeof record[key] === 'string' && jsonChars(record[key]) > available) continue;
+    const entry = projectField(key, available);
+    if (entry !== OMITTED_JSON_VALUE) compact[key] = entry;
+  }
+  stats.omittedObjectKeys += originalKeys.length - Object.keys(compact).length;
+  for (const local of fieldStats.values()) {
+    stats.clippedStrings += local.clippedStrings;
+    stats.omittedArrayItems += local.omittedArrayItems;
+    stats.omittedObjectKeys += local.omittedObjectKeys;
+    stats.omittedValues += local.omittedValues;
   }
   return Object.keys(compact).length > 0 ? compact : OMITTED_JSON_VALUE;
 }
