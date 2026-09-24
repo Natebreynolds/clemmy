@@ -1379,6 +1379,7 @@ export function registerToolSearchTool(
             // An explicitly expressed compound operation name precedes
             // descriptive coverage; acquisition/lifecycle priorities stay intact.
             || Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
+            || Number(right.purposeLeadMatch) - Number(left.purposeLeadMatch)
             || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
             || right.score - left.score
             || right.sourceRank - left.sourceRank

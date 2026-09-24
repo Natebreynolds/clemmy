@@ -340,14 +340,19 @@ function lexicalTokens(text: string): string[] {
 /** Deterministic lexical fallback when embeddings are off/unhealthy: token overlap
  *  between the query and the tool's name+one-liner. Keeps tool_search useful (and
  *  its tests hermetic) without a live embedding endpoint. */
-function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: ReadonlyMap<string, number>): {
+function lexicalRelevance(queryTokens: string[], queryLead: string | undefined, e: CatalogEntry, weights: ReadonlyMap<string, number>): {
   score: number;
+  purposeLeadMatch: boolean;
   fullLexicalCoverage: boolean;
   completeCompoundNameMatch: boolean;
 } {
-  if (queryTokens.length === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  if (queryTokens.length === 0) return { score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false };
   const descriptionTokens = new Set(lexicalTokens(e.oneLiner));
   const nameTokens = new Set(lexicalTokens(e.name));
+  // Long descriptions also name prerequisites and alternative operations.
+  // Keep those searchable, but prefer evidence in the operation's own name
+  // and opening purpose over incidental matches later in its documentation.
+  const purposeLead = lexicalTokens(e.oneLiner)[0];
   let covered = 0;
   let nameHits = 0;
   let queryWeight = 0;
@@ -357,7 +362,7 @@ function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: Reado
     if (nameTokens.has(q)) nameHits += weight;
     if (nameTokens.has(q) || descriptionTokens.has(q)) covered += weight;
   }
-  if (queryWeight === 0) return { score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  if (queryWeight === 0) return { score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false };
   // Coverage rewards the requested concepts; Dice similarity also accounts
   // for unrequested operation qualifiers. Merely adding more name tokens must
   // not make every reply/forward variant beat the matching base operation.
@@ -365,6 +370,7 @@ function lexicalRelevance(queryTokens: string[], e: CatalogEntry, weights: Reado
   const nameSimilarity = 2 * nameHits / (queryWeight + nameWeight);
   return {
     score: (covered / queryWeight + nameSimilarity) / 2,
+    purposeLeadMatch: Boolean(queryLead && (purposeLead === queryLead || nameTokens.has(queryLead))),
     // A compound operation identifier explicitly present in ordinary word
     // order is stronger lexical evidence than incidental description words.
     // A single generic token (including a repeated-token name) is insufficient.
@@ -419,11 +425,12 @@ export function rankCatalogLexically(
 export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   query: string,
   entries: readonly T[],
-): Array<T & { score: number; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean; namespaceMatch: boolean }> {
+): Array<T & { score: number; purposeLeadMatch: boolean; fullLexicalCoverage: boolean; completeCompoundNameMatch: boolean; namespaceMatch: boolean }> {
   const q = (query ?? '').trim();
-  if (!q) return entries.map((entry) => ({ ...entry, score: 0, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
+  if (!q) return entries.map((entry) => ({ ...entry, score: 0, purposeLeadMatch: false, fullLexicalCoverage: false, completeCompoundNameMatch: false, namespaceMatch: false }));
   const querySequence = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   const queryTokens = [...new Set(lexicalTokens(q))];
+  const queryLead = lexicalTokens(q.replace(/^(?:\[[^\]]+\]\s*)+/, ''))[0];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.
@@ -436,9 +443,10 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
     token, Math.log(1 + (entries.length - count + 0.5) / (count + 0.5)),
   ]));
   return entries
-    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, entry, weights), namespaceMatch: namesNamespace(querySequence, entry.namespace) }))
+    .map((entry) => ({ ...entry, ...lexicalRelevance(queryTokens, queryLead, entry, weights), namespaceMatch: namesNamespace(querySequence, entry.namespace) }))
     .sort((left, right) => Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
       || Number(right.namespaceMatch) - Number(left.namespaceMatch)
+      || Number(right.purposeLeadMatch) - Number(left.purposeLeadMatch)
       || Number(right.fullLexicalCoverage) - Number(left.fullLexicalCoverage)
       || right.score - left.score || left.name.localeCompare(right.name));
 }

@@ -337,6 +337,22 @@ test('lexical coverage remains advisory and cannot distinguish cross-tool prose 
   assert.equal(ranked.length, 2, 'ranking never removes a capability from discovery');
 });
 
+test('an operation purpose outranks a neighbor mentioning it as a prerequisite or alternative', () => {
+  for (const [query, target, purpose, neighbor, neighborPurpose] of [
+    ['read client record', 'ENTITY_LOOKUP', 'Read client record.', 'CLIENT_RECORD_EDIT',
+      'Edit a client record. Read client record first with ENTITY_LOOKUP; create a replacement only after review.'],
+    ['create client record', 'ENTITY_INSERT', 'Create client record.', 'CLIENT_RECORD_EXPORT',
+      'Export archived client record snapshots. To create client record use ENTITY_INSERT instead.'],
+  ] as const) {
+    const entries = [{ name: target, oneLiner: purpose }, { name: neighbor, oneLiner: neighborPurpose }];
+    for (const ordered of [entries, [...entries].reverse()]) {
+      const ranked = rankCatalogEntriesLexically(query, ordered);
+      assert.equal(ranked[0].name, target, query);
+      assert.equal(ranked.length, 2, 'ranking retains the alternative; it grants no authority');
+    }
+  }
+});
+
 
 test('a complete compound operation name in ordinary word order precedes incidental description coverage', () => {
   for (const fixture of [
