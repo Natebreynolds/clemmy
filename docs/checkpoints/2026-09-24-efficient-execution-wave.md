@@ -233,3 +233,8 @@ landed on `main`; it does not ship in the desktop app.
   journey differences.
 - The packaged-candidate smoke needs `build:mobile-web` and `build:console-web`
   in the clean worktree before it runs.
+- CI Test on main: four read-path files (capability routing, learned read loop,
+  learning closeout, verified memory closeout) pass every test and then never
+  exit on the Linux runner, so the file times out at 600 s; the CLI-setup
+  repair test assumes the Salesforce CLI is installed. Both pass on the owner's
+  machine.
