@@ -127,3 +127,17 @@ step outputs are not retained as reviewer-openable evidence; (2)
 `refused_pre_dispatch.refusalDetail` is clipped to ~150 characters in the event
 record, so the reviewer's actual reason is lost. Next natural check: the 16:00
 PT occurrence today.
+
+## WP5 stage 1 finding (branch wip/plan-host-activation, not on the candidate)
+
+A host-side activation of the user-selected reviewed draft cannot be a helper
+called before the turn: `settledPlanTaskActivationWinner` grants transition
+authority only to a settled `plan_task` logical call whose redeemed result says
+ok:true with its receipt, and the logical-call admission itself requires the
+accepted source's persisted turn graph, which for a host-owned turn is created
+inside the host call pipeline. The correct shape is a host-emitted frame-0
+canonical `plan_task {}` call through the same pipeline (admission, graph,
+settlement, receipt) with no model request, then the surface without
+`plan_task`. The WIP branch holds the helper, the loop hook, the instruction
+change and the pin updates; the integration pins fail on the graph precondition
+and were not weakened. Stage 1 stays owed.
