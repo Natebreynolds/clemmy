@@ -2317,10 +2317,18 @@ async function respondPreferHarnessOnce(
     );
   }
   let auth: { ok: boolean; reason?: string };
+  const runtimeConfigurationStartedAt = performance.now();
   try {
     auth = await configureImpl();
   } catch (err) {
     auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    try {
+      const source = durableSourceEventForRequest(request);
+      if (source) appendEvent({ sessionId: source.sessionId, turn: source.turn, role: 'system',
+        type: 'turn_phase_timings', data: { sourceUserSeq: source.seq, lane: 'runtime_configuration',
+          totalMs: Math.max(0, performance.now() - runtimeConfigurationStartedAt) } });
+    } catch { /* Diagnostics cannot change runtime admission. */ }
   }
   if (!auth.ok) {
     return await blockedPreRunResponse(
