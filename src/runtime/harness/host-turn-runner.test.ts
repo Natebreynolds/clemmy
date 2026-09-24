@@ -7,7 +7,7 @@
  * exactly once, and Runner.run is unreachable (a throwing stub proves it).
  * The model is stubbed — no Codex quota, no OPENAI_API_KEY.
  */
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -11544,16 +11544,22 @@ test('a deferLoading tool stays callable but leaves the schema block when the se
   assert.deepEqual(bareSurfaces[0], ['workspace_roots', 'memory_search']);
 });
 
-for (const variant of ['identical', 'mutation_between', 'undeclared'] as const) test(`an identical declared local read in the same accepted source is answered from its settled result (${variant})`, async t => {
+for (const variant of ['identical', 'mutation_between', 'external_change', 'undeclared'] as const) test(`an identical declared local read in the same accepted source is answered from its settled result (${variant})`, async t => {
   const keys = ['CLEMMY_TEST_ISOLATED_HOME', 'HARNESS_TOOL_BRACKETS'];
   const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   process.env.CLEMMY_TEST_ISOLATED_HOME = '1'; process.env.HARNESS_TOOL_BRACKETS = 'on';
   t.after(() => { for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key]; } });
   const fixture = acceptHostCanarySource(`settled-local-read-${variant}`, 'Summarise the notes file.');
   const readName = variant === 'undeclared' ? 'workflow_run_status' : 'read_file';
+  // The revision probe stats the real resource: a reusable read names a file
+  // that exists, and an outside edit between the two reads must be visible.
+  const notesDir = mkdtempSync(path.join(os.tmpdir(), 'clem-settled-read-'));
+  const notesPath = path.join(notesDir, 'notes.md');
+  writeFileSync(notesPath, 'three findings\n');
+  t.after(() => rmSync(notesDir, { recursive: true, force: true }));
   let reads = 0;
   const reader = brackets.wrapToolForHarness(tool({ name: readName, description: 'Read one local artifact.',
-    parameters: z.object({ path: z.string() }), execute: async ({ path }) => { reads += 1; return `NOTES(${path}) read #${reads}: three findings`; },
+    parameters: z.object({ path: z.string() }), execute: async ({ path: p }) => { reads += 1; return `NOTES(${p}) read #${reads}: three findings`; },
   }) as never);
   // A settled host-only local write between the two reads is changed state:
   // the second read must cross again (see interveningMutationOrSteer).
@@ -11562,12 +11568,25 @@ for (const variant of ['identical', 'mutation_between', 'undeclared'] as const) 
     parameters: z.object({ text: z.string() }), execute: async () => { writes += 1; return JSON.stringify({ ok: true, remembered: true }); },
   }) as never);
   const frames = [
-    [toolCall('settled-read-1', readName, { path: 'notes.md' })],
+    [toolCall('settled-read-1', readName, { path: notesPath })],
     ...(variant === 'mutation_between' ? [[toolCall('settled-write', 'memory_remember', { text: 'notes changed' })]] : []),
-    [toolCall('settled-read-2', readName, { path: 'notes.md' })],
+    [toolCall('settled-read-2', readName, { path: notesPath })],
     [textMsg('The notes hold three findings.')],
   ];
-  const model = scriptedRecordingModel(frames);
+  const scripted = scriptedRecordingModel(frames);
+  const model = {
+    ...scripted,
+    async getResponse(request: unknown) {
+      // Another session, run or editor changes the file after the first read
+      // settled and before the model asks again: the replay must be refused.
+      if (variant === 'external_change' && scripted.calls() === 1) {
+        const st = statSync(notesPath);
+        writeFileSync(notesPath, 'three findings, one retracted\n');
+        utimesSync(notesPath, st.atime, new Date(st.mtimeMs + 5_000));
+      }
+      return scripted.getResponse(request);
+    },
+  };
   const agent = { model, tools: [reader, writer] };
   bindHostCanarySurface(fixture, agent, [reader, writer]);
   const runner = throwingRunner();
@@ -11592,7 +11611,7 @@ for (const variant of ['identical', 'mutation_between', 'undeclared'] as const) 
     assert.equal(markers.length, 1);
     assert.equal(markers[0].data.replayTool, 'read_file');
   } else {
-    assert.equal(reads, 2, `${variant}: a fresh read is owed after a mutation or for an undeclared status read`);
+    assert.equal(reads, 2, `${variant}: a fresh read is owed after a mutation, an outside change, or for an undeclared status read`);
     assert.notEqual(returned[0].data.providerDispatched, false);
     assert.match(secondFrameInput, /read #2: three findings/);
     assert.doesNotMatch(secondFrameInput, /harness settled-read replay/);

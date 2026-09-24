@@ -24,6 +24,7 @@ import { settlementCarriesVerifiedData } from '../../memory/verified-read-learni
 import { getRuntimeEnv } from '../../config.js';
 import { registeredToolReadReuse } from '../../tools/tool-registry.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { readResourceRevision } from './read-resource-revision.js';
 import {
   getEvent,
   getRunAttemptSourceUserEvent,
@@ -293,7 +294,7 @@ export function formatSettledReadRepeatAdvisory(input: {
 }): string {
   const recovery = input.recoveredAcrossBehaviorScope
     ? 'The harness recovered the settled result from the earlier internal attempt for this same accepted request; no provider call was repeated.'
-    : 'This exact read already succeeded in the current internal turn; no provider call was repeated. Nothing in this request changed state since, so the bytes are current.';
+    : 'This exact read already succeeded in the current internal turn; no provider call was repeated. Nothing in this request changed state since and the resource revision recorded at that read still matches.';
   return `[harness settled-read replay] ${recovery} Use the ${input.toolSlug} result from call_id "${input.sourceCallId}" for the next step or answer naturally. Do not issue this exact read again in this accepted request.`;
 }
 
@@ -756,8 +757,14 @@ export function resolveSettledReadRepeat(
       if (localRead) {
         // A declared local read settles on its own success: the lifecycle row
         // recorded ok:false for refusals and failures, and a bounded read that
-        // was clipped at write is not exact authority.
+        // was clipped at write is not exact authority. Its bytes are current
+        // only while the resource revision recorded at settlement still holds;
+        // another session, run or editor moving the resource refuses the replay.
         if (returned.data.ok === false) return null;
+        const recordedRevision = nonEmptyString(returned.data.resourceRevision);
+        if (!recordedRevision) return null;
+        const currentArgs = unwrapRuntimeEffectiveToolIdentity(input.toolName, input.args).args;
+        if (readResourceRevision(currentSlug, currentArgs) !== recordedRevision) return null;
       } else {
         const settled = classifySettledDirectComposioRead({
           toolName: input.toolName,

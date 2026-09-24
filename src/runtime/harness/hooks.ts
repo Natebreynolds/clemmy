@@ -14,6 +14,7 @@ import {
 } from './tool-effect.js';
 import { mirrorExternalSendToFirstPartySurfaces } from './external-send-mirror.js';
 import { registeredToolReadReuse, registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { readResourceRevision } from './read-resource-revision.js';
 import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -510,6 +511,7 @@ export function attachEventLogHooks(
     const sourceAttribution = currentSourceAttribution();
     const replayToolName = typeof tool?.name === 'string' ? tool.name : '';
     const replayReadIdentity = accounting.toolSlug ?? accounting.effectiveTool ?? '';
+    const replayReadArguments = unwrapRuntimeEffectiveToolIdentity(replayToolName, details?.toolCall?.arguments).args;
     const settledReadReplay = physicalAttemptAuthoritative
       && callId
       && parentEventId
@@ -649,6 +651,15 @@ export function attachEventLogHooks(
             replayedFromCallId: settledReadReplay.sourceCallId,
             replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
           } : {}),
+          // The revision of the resource this read observed, so a later
+          // identical read in the same request can prove nothing outside the
+          // request moved it before its settled bytes are reused.
+          ...(accounting.effect === 'read' && !settledReadReplay && replayReadIdentity
+            ? (() => {
+                const revision = readResourceRevision(replayReadIdentity, replayReadArguments);
+                return revision ? { resourceRevision: revision } : {};
+              })()
+            : {}),
           result: clipToolResult(
             resultStr,
             maxResultChars,
