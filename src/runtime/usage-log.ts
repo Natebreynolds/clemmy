@@ -50,6 +50,11 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
+  /** Explicit request role (brain/worker/reviewer/router) and how it was
+   *  set (`explicit` call, attribution `scope`, `channel` convention, or
+   *  `unset`). Rollups group by this, never by model name or prompt size. */
+  role?: UsageRequestRole;
+  roleReason?: 'explicit' | 'scope' | 'channel' | 'unset';
   /**
    * DECLARED cache-accounting provenance, stamped by the model adapter that
    * owns the wire format — never guessed from magnitudes. 'inclusive':
@@ -412,10 +417,19 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
     : source;
 }
 
+/** Explicit request role for cost accounting. Set by the caller that knows
+ *  what the request IS; never inferred from model names or token sizes.
+ *  brain = the turn's foreground model; worker = a delegated child; reviewer =
+ *  judges, watchers, completion/goal reviews; router = Jev routing calls. */
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router';
+
 export interface ModelUsageAttributionContext {
   sessionId: string;
   sourceUserSeq: number;
   attemptId?: string;
+  /** Explicit role every model call inside this scope carries unless a
+   *  narrower scope or the recording call overrides it. */
+  role?: UsageRequestRole;
   /** Call-site lane for rows the SDK emits without one (a judge lane such as
    * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
    * `unknown / other` with no lane, so nothing about them could be ranked. */
@@ -450,9 +464,21 @@ export function withModelUsageAttribution<T>(
   return modelUsageAttributionStorage.run(context, work);
 }
 
+/** Role from an explicit channel convention only (`judge:*`, `watcher*`,
+ *  `jev*`); anything else is left unset rather than guessed. */
+export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
+  const value = (channel ?? '').trim().toLowerCase();
+  if (!value) return undefined;
+  if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
+  if (value.startsWith('jev')) return 'router';
+  return undefined;
+}
+
 export function recordModelUsage(args: {
   sessionId: string;
   channel?: string;
+  /** Explicit request role; wins over the attribution scope's role. */
+  role?: UsageRequestRole;
   model: string;
   /** Declared by the adapter that owns the wire format. Absent = 'unknown'
    *  (legacy): visible, uncertifiable, conservatively debited. */
@@ -523,6 +549,8 @@ export function recordModelUsage(args: {
   } catch { /* classification falls back to channel/prefix evidence */ }
   const channel = args.channel ?? attribution?.channel;
   const resolution = resolveUsageKind(source, { channel, sessionRowKind });
+  const role = args.role ?? attribution?.role ?? usageRoleFromChannel(channel);
+  const roleReason: NonNullable<UsageEvent['roleReason']> = args.role ? 'explicit' : attribution?.role ? 'scope' : role ? 'channel' : 'unset';
   const canonical = canonicalCacheAccounting(args);
   const hasExactAcceptedSource = source !== 'unknown'
     && Number.isSafeInteger(sourceUserSeq)
@@ -565,6 +593,8 @@ export function recordModelUsage(args: {
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
     channel,
+    ...(role ? { role } : {}),
+    roleReason,
     ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
@@ -946,6 +976,10 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
   for (const [model, tokens] of modelPromptTokens) {
     if (tokens > (modelPromptTokens.get(brainModel) ?? -1)) brainModel = model;
   }
+  // Explicit roles win over any inference: when the rows carry them, a brain
+  // frame is a row whose role says brain, whatever model served it.
+  const roleCarrying = events.some((ev) => ev.role === 'brain');
+  const isBrainFrame = (ev: UsageEvent): boolean => (roleCarrying ? ev.role === 'brain' : ev.model === brainModel);
   let previousBrainPrompt: number | null = null;
   let reusable = 0;
   let reused = 0;
@@ -957,7 +991,7 @@ export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEf
     out.uncachedInputTokens += canonical.uncachedInputTokens;
     out.outputTokens += ev.outputTokens ?? 0;
     out.maxInputTokens = Math.max(out.maxInputTokens, ev.inputTokens ?? 0);
-    if (ev.model !== brainModel) {
+    if (!isBrainFrame(ev)) {
       out.sideFrames += 1;
       out.sideInputTokens += canonical.cachedReadTokens + canonical.uncachedInputTokens;
       continue;

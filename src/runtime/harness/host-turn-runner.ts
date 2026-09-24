@@ -2328,6 +2328,9 @@ interface AdvertisedSurfaceMemory {
   shown: Map<string, unknown>;
 }
 const ADVERTISED_SURFACE_MEMORY_MAX = 512;
+/** Names one source may retain. A surface larger than this is a runaway JIT
+ *  set, not a cache lever; the oldest retained names are released first. */
+const ADVERTISED_SURFACE_NAMES_MAX = 128;
 const advertisedSurfaceMemories = new Map<string, AdvertisedSurfaceMemory>();
 function advertisedSurfaceMemoryFor(key: string): AdvertisedSurfaceMemory {
   const existing = advertisedSurfaceMemories.get(key);
@@ -2774,6 +2777,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const current = serializedTools(enabled);
     enabled.forEach((tool, index) => memory.shown.set(tool.name, current[index]));
     const enabledNames = new Set(enabled.map((tool) => tool.name));
+    // Bounded: release the oldest names that are not enabled right now.
+    for (const name of [...memory.shown.keys()]) {
+      if (memory.shown.size <= ADVERTISED_SURFACE_NAMES_MAX) break;
+      if (!enabledNames.has(name)) { memory.shown.delete(name); memory.position.delete(name); }
+    }
     retainedToolNames = new Set([...memory.shown.keys()].filter((name) => !enabledNames.has(name)));
     return [...memory.shown.entries()]
       .sort(([left], [right]) => (memory.position.get(left) ?? 0) - (memory.position.get(right) ?? 0))

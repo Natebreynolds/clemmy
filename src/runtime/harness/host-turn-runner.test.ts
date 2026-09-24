@@ -11411,3 +11411,84 @@ test('a tool that leaves the surface mid-turn stays advertised at its position a
   const refusal = results.find((text) => text.includes('not callable at this stage'));
   assert.ok(refusal, `the retired call is a typed effect-free refusal, got ${JSON.stringify(results)}`);
 });
+
+test('a retained tool re-enabled with its sealed schema keeps its place; a changed schema is refused by the sealed universe; a restart rebuilds first-seen order', async () => {
+  const { _resetAdvertisedSurfaceMemoryForTests } = await import('./host-turn-runner.js');
+  _resetAdvertisedSurfaceMemoryForTests();
+  const fixture = acceptHostCanarySource('surface-schema-sealed');
+  const build = (name: string, description: string) => brackets.wrapToolForHarness({
+    type: 'function', name, description,
+    parameters: { type: 'object', properties: {} },
+    invoke: async () => `${name} ran`, needsApproval: async () => false,
+  });
+  const first = build('workspace_roots', 'roots v1');
+  const second = build('task_list', 'tasks v1');
+  const gated = build('memory_search', 'search v1');
+  const surfaces: Array<Array<{ name: string; description: string }>> = [];
+  let call = 0;
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string; description?: string }> }) {
+      surfaces.push((request.tools ?? []).map((t) => ({ name: t.name ?? '', description: t.description ?? '' })));
+      call += 1;
+      return {
+        usage: {},
+        output: call === 1
+          ? [toolCall('c1', 'workspace_roots', {})]
+          : call === 2
+            ? [toolCall('c2', 'task_list', {})]
+            : call === 3
+              ? [toolCall('c3', 'memory_search', {})]
+              : [textMsg('schema held')],
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = {
+    model,
+    tools: [gated, first, second],
+    // Frame 1: gated enabled. Frame 2: disabled → retained. Frame 3+: enabled again.
+    getAllTools: async () => (call === 1 ? [first, second] : [gated, first, second]),
+  };
+  bindHostCanarySurface(fixture, agent, [first, second, gated]);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 6 });
+  assert.equal(outcome.finalOutput, 'schema held', JSON.stringify({ surfaces, history: outcome.history }).slice(0, 2500));
+  assert.deepEqual(surfaces[0].map((t) => t.name), ['memory_search', 'workspace_roots', 'task_list']);
+  assert.deepEqual(surfaces[1], surfaces[0], 'disabled: retained in place with the sealed schema');
+  assert.deepEqual(surfaces[2], surfaces[0], 're-enabled: same wire position, same sealed schema');
+
+  // A schema that changes within a source is not a retention question: the
+  // sealed capability universe refuses it before any model step, exactly as
+  // it did before retention existed.
+  _resetAdvertisedSurfaceMemoryForTests();
+  const drift = acceptHostCanarySource('surface-schema-drift');
+  const driftedGated = build('memory_search', 'search v2 — schema changed after sealing');
+  let driftCall = 0;
+  const driftModel = {
+    async getResponse() {
+      driftCall += 1;
+      return { usage: {}, output: driftCall === 1 ? [toolCall('d1', 'workspace_roots', {})] : [textMsg('should not be reached cleanly')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const driftAgent = { model: driftModel, tools: [gated, first], getAllTools: async () => (driftCall === 0 ? [gated, first] : [driftedGated, first]) };
+  bindHostCanarySurface(drift, driftAgent, [first, gated]);
+  const drifted = await runProductionHost(drift, driftAgent, undefined, { maxTurns: 4 });
+  assert.notEqual(drifted.finalOutput, 'should not be reached cleanly', 'a changed schema inside a sealed source is refused, never served');
+
+  // Restart: the process-local memory is gone; a fresh source starts from the
+  // configured first-seen order again, nothing is carried across.
+  _resetAdvertisedSurfaceMemoryForTests();
+  const fresh = acceptHostCanarySource('surface-after-restart');
+  const freshSurfaces: string[][] = [];
+  const freshModel = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      freshSurfaces.push((request.tools ?? []).map((t) => t.name ?? ''));
+      return { usage: {}, output: [textMsg('fresh')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const freshAgent = { model: freshModel, tools: [first, second], getAllTools: async () => [second, first] };
+  bindHostCanarySurface(fresh, freshAgent, [first, second]);
+  await runProductionHost(fresh, freshAgent);
+  assert.deepEqual(freshSurfaces[0], ['task_list', 'workspace_roots'], 'after a restart the order is the configured first-seen order, not a stale memory');
+});

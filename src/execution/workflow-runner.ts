@@ -8857,6 +8857,14 @@ async function verifyPendingRevisionOrRetry(ctx: StepExecutionContext, step: Wor
  *  replaces the trajectory-check call so tests exercise steer injection and
  *  silence deterministically without a live judge. */
 let workflowWatcherOverride: WatcherJudgeFn | null = null;
+/** Test seam: the pinned-goal judge the run-level goal review consults. */
+let workflowRunGoalJudgeForTests: NonNullable<Parameters<typeof validateWorkflowRunGoal>[1]> | null = null;
+export function _setWorkflowRunGoalJudgeForTests(
+  deps: NonNullable<Parameters<typeof validateWorkflowRunGoal>[1]> | null,
+): void {
+  workflowRunGoalJudgeForTests = deps;
+}
+
 export function _setWorkflowWatcherForTests(fn: WatcherJudgeFn | null): void {
   workflowWatcherOverride = fn;
 }
@@ -15718,6 +15726,7 @@ async function processOneRunFile(
         { status: 'ready' | 'replayed' }
       > | null = null;
       let reviewedProjectionEvidence = '';
+      let reviewedProjectionSummary = '';
       if (reviewedResultProjection && blockedSteps.length === 0) {
         const projectionStep = executionSteps.find(
           (candidate) => candidate.id === readProjectionAdmission.nodeId,
@@ -15770,6 +15779,7 @@ async function processOneRunFile(
           '- write scope: only this bound Space receives these records; the run performed no other write',
           `- publication: the host publishes this exact projection as the run's terminal record once the run completes without needing attention (lineage ${produced.status})`,
         ].join('\n');
+        reviewedProjectionSummary = `Projected ${produced.observationCount} ${projection.entityKind} record${produced.observationCount === 1 ? '' : 's'} into the ${workspaceId} Space, each with ${fields.join(', ')}, from the settled read (run ${run.id}).`;
       }
       let goalVerdict: GoalValidationResult | null = null;
       let goalValidation: WorkflowRunGoalValidationV1 | null = null;
@@ -15793,7 +15803,7 @@ async function processOneRunFile(
           // (live 2026-08-06 false alarm on scorpion-facebook-trends).
           stepOutputs: publicRawStepOutputs,
           readEvidence: executionEvidence.evidence,
-        });
+        }, workflowRunGoalJudgeForTests ?? {});
         const goalValidatedAt = new Date().toISOString();
         goalValidation = workflowGoalValidationReceipt({
           objective: runGoal.objective,
@@ -16348,9 +16358,15 @@ async function processOneRunFile(
         ...runArtifacts.urls,
       ].filter(Boolean);
       const producedLine = producedItems.length > 0 ? `\n\n📦 Produced: ${producedItems.join(' · ')}` : '';
+      // A reviewed read run's deliverable is its Space projection; say so in
+      // the report, or a clean run reads as "nothing new" (live 2026-09-24
+      // 01:36Z: five records projected, report said "routine read … nothing new").
+      const projectionLine = reviewedProjectionSummary && !needsAttention
+        ? `\n\n📚 ${reviewedProjectionSummary}`
+        : '';
       const successBody = isCompiledProjectRun
         ? baseSuccessBody
-        : `${baseSuccessBody}${producedLine}${failureSummary}${goalSummary}`;
+        : `${baseSuccessBody}${producedLine}${projectionLine}${failureSummary}${goalSummary}`;
       // Non-failing quality advisories (skill-execution misses + target-miss):
       // appended to whichever body we send so the deliverable is ALWAYS shown,
       // with a clear "review this" heads-up after it. Never replaces the body.

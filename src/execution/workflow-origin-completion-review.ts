@@ -134,7 +134,7 @@ export async function reviewWorkflowOriginCompletion(
     // Do not inherit a child lease, attempt, worker scope or tool allowance.
     const noToolAllowance = new ToolCallsCounter(1);
     noToolAllowance.increment(); // valid counter, with zero remaining tool calls
-    verdict = await withModelUsageAttribution(identity, () => withHarnessRunContext({
+    verdict = await withModelUsageAttribution({ ...identity, role: 'reviewer' }, () => withHarnessRunContext({
       ...identity, counter: noToolAllowance,
     }, () => judge(before.objective, reply, {
       fullSourceEvidence: true,

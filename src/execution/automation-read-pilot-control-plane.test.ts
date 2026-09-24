@@ -1832,3 +1832,127 @@ test('a queued projection whose run finished without proving the pilot re-opens 
   assert.ok(swept.runUnproven >= 1, `the sweep released this projection (sweeps are global): ${JSON.stringify(swept)}`);
   assert.equal(control.loadAutomationReadPilotProjection(registered.projection.projectionId)?.status, 'refused');
 });
+
+// Negative review then replay (owner ask 2026-09-24): the reviewed projection
+// lineage is produced BEFORE the goal judge. When the judge is negative the
+// dataset commit must stay unpublished, the projection must be released, the
+// re-request must mint a fresh card, and the second (clean) run must publish
+// its own dataset once and replay without duplicates.
+test('a negative goal review leaves the early dataset commit unpublished; the re-run publishes once and replays', async () => {
+  const original = JSON.parse(readFileSync(new URL('./fixtures/read-local-dataset-opportunity.json', import.meta.url), 'utf8')) as AutomationOpportunityV1;
+  const raw = JSON.parse(readFileSync(new URL('./fixtures/documentation-inventory-mcp-result.json', import.meta.url), 'utf8'));
+  const fixture = blankStateFixture('negative_review_replay', { dataset: true, opportunityOverride: original, resultOverride: raw,
+    inputSchemaOverride: { type: 'object', properties: {}, $schema: 'http://json-schema.org/draft-07/schema#' },
+  });
+  fixture.input.contract.arguments = {};
+  fixture.input.contract.workflowInputs = {};
+  fixture.input.workflowInputs = {};
+  const surface = chatPilotSurface(fixture);
+  const { projectionDigest: _digest, ...base } = fixture.input.contract.resultProjection!;
+  fixture.input.contract.workspaceOutputPhaseId = 'write-space';
+  fixture.input.contract.resultProjection = resultProjections.createWorkflowCanonicalEntityResultProjection({
+    ...base,
+    textInterpretation: { version: 1, kind: 'text_lines', field: 'section_name', prefix: '- ', whitespace: 'trim', blankLines: 'reject', maxSourceBytes: 10_000, maxSourceRecords: 50, selection: { kind: 'first', maxRecords: 5 } },
+    fields: [
+      { field: 'section_name', recordPath: 'section_name', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'observed_at', hostSource: 'page_settled_at', type: 'timestamp', required: true, sensitivity: 'public', confidence: 1 },
+      { field: 'run_ref', hostSource: 'workflow_run_id', type: 'string', required: true, sensitivity: 'internal', confidence: 1 },
+      { field: 'source_ref', hostSource: 'page_receipt_id', type: 'string', required: true, sensitivity: 'public', confidence: 1 },
+    ],
+    sourceRecord: { idPath: 'section_name', observedAt: { kind: 'page_settled_at' } },
+    identityRules: [{ ruleId: 'section-name', fields: ['section_name'], normalizers: ['case_fold', 'trim'], exactIdentifierNamespace: 'section-name' }],
+    resolutionPolicy: { ...base.resolutionPolicy, preferNewerAfterExactIdentity: ['observed_at', 'run_ref', 'source_ref'] },
+    bounds: { ...base.bounds, maxRecords: 5, maxRecordsPerPage: 5 },
+  });
+  const create = pilotToolJson(await surface.handlers.get('automation_read_pilot_workspace_create_request')!({ ...chatWorkspaceCreationRequest(fixture), phase_id: 'write-space', requirement_id: 'acceptance-space-write' }));
+  assert.equal(create.ok, true, JSON.stringify(create));
+  assert.equal(approvals.resolve(create.approval.approvalId, 'approved', 'operator.negative-review-workspace').ok, true);
+  const created = workspaceControl.reconcileAutomationReadPilotWorkspaceCreation(create.projection.projectionId);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok || !created.projection.selection) return;
+  fixture.input.contract.workspaceBindingSelection = created.projection.selection;
+  const bindingId = created.projection.selection.bindingId;
+  const datasetsBefore = eventlog.openEventLog; // (canonical store is separate; counted via entityStore below)
+  void datasetsBefore;
+
+  const requested = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  assert.equal(approvals.resolve(requested.approval.approvalId, 'approved', 'operator.negative-review-pilot').ok, true);
+  const queued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  if (!queued.ok || !queued.projection.runId) return;
+  const firstRunId = queued.projection.runId;
+
+  // 1. Negative judge. The judge must have been SHOWN the projection facts.
+  let judgeSawProjection = false;
+  let judgeCalls = 0;
+  let lastEvidence = '';
+  const negative = {
+    judge: async (_objective: string, evidenceText: string) => {
+      judgeCalls += 1; lastEvidence = evidenceText;
+      judgeSawProjection = /REVIEWED RESULT PROJECTION/.test(evidenceText) && /records projected: 5/.test(evidenceText);
+      return { done: false, reason: 'negative review under test' };
+    },
+    judgeCriteria: async (_objective: string, criteria: string[], evidenceText: string) => {
+      judgeCalls += 1; lastEvidence = evidenceText;
+      judgeSawProjection = /REVIEWED RESULT PROJECTION/.test(evidenceText) && /records projected: 5/.test(evidenceText);
+      return criteria.map((criterion) => ({ criterion, pass: false, note: 'negative review under test' }));
+    },
+  };
+  runner._setWorkflowRunGoalJudgeForTests(negative as never);
+  try {
+    await runner.processWorkflowRuns({} as ClementineAssistant);
+  } finally {
+    runner._setWorkflowRunGoalJudgeForTests(null);
+  }
+  assert.equal(judgeSawProjection, true, `the goal judge is shown the reviewed projection facts before it rules (calls=${judgeCalls}) evidence=${lastEvidence.slice(0, 1500)}`);
+  const firstRun = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${firstRunId}.json`), 'utf8'));
+  assert.equal(firstRun.needsAttention, true, JSON.stringify(firstRun).slice(0, 600));
+  assert.equal(firstRun.canonicalEntityWorkspaceProjectionClaim ?? null, null, 'a judged-negative run carries no publication claim');
+  assert.equal(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId), null, 'nothing published to the Space');
+  assert.equal(fixture.bodies(), 1);
+
+  // 2. Released and re-opened with a fresh card; the queued row was bound to the failed run.
+  const swept = control.reconcileAutomationReadPilotProjections({ limit: 100 });
+  assert.ok(swept.runUnproven >= 1, JSON.stringify(swept));
+  assert.equal(control.loadAutomationReadPilotProjection(requested.projection.projectionId)?.status, 'refused');
+  const reopened = pilotToolJson(await surface.handlers.get('automation_read_pilot_request')!(chatPilotRequest(fixture, surface.acquisitionRef)));
+  assert.equal(reopened.ok, true, JSON.stringify(reopened));
+  assert.equal(reopened.projection.projectionId, requested.projection.projectionId, 'same durable identity');
+  assert.notEqual(reopened.approval.approvalId, requested.approval.approvalId, 'a fresh card');
+  assert.equal(approvals.resolve(reopened.approval.approvalId, 'approved', 'operator.negative-review-pilot-2').ok, true);
+  const requeued = control.reconcileAutomationReadPilotProjection(requested.projection.projectionId);
+  assert.equal(requeued.ok, true, JSON.stringify(requeued));
+  if (!requeued.ok || !requeued.projection.runId) return;
+  assert.notEqual(requeued.projection.runId, firstRunId);
+
+  // 3. Clean judge: the second run publishes its own dataset once.
+  runner._setWorkflowRunGoalJudgeForTests({
+    judge: async () => ({ done: true, reason: 'all criteria met under test' }),
+    judgeCriteria: async (_objective: string, criteria: string[]) => criteria.map((criterion) => ({ criterion, pass: true, note: 'met under test' })),
+  } as never);
+  try {
+    await runner.processWorkflowRuns({} as ClementineAssistant);
+  } finally {
+    runner._setWorkflowRunGoalJudgeForTests(null);
+  }
+  const secondRun = JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, `${requeued.projection.runId}.json`), 'utf8'));
+  assert.equal(secondRun.terminalOutcome, 'succeeded', JSON.stringify(secondRun).slice(0, 600));
+  assert.match(JSON.stringify(secondRun), /Projected 5 documentation_section records into the .* Space/, 'the completion report names the projected records, never "nothing new"');
+  assert.equal(fixture.bodies(), 2, 'exactly one provider body per run');
+  const head = workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId);
+  assert.ok(head);
+  assert.equal(head.identity.runId, requeued.projection.runId, 'the Space head belongs to the clean run only');
+  assert.equal(head.records.canonicalRecordsCreated, 5);
+  const recordIds = entityStore.listCanonicalRecordIds({ datasetId: head.identity.datasetId }).items;
+  assert.equal(recordIds.length, 5);
+  for (const id of recordIds) {
+    const record = entityStore.getCanonicalRecord(head.identity.datasetId, id)!;
+    assert.equal(record.fields.run_ref!.evidence[0]!.value, requeued.projection.runId, 'no record cites the judged-negative run');
+  }
+  // 4. Replay: boot reconciliation and a second drain change nothing.
+  runner.reconcileCanonicalEntityWorkspaceProjectionClaims();
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  assert.equal(fixture.bodies(), 2);
+  assert.deepEqual(workspaceProjection.getCanonicalEntityWorkspaceProjectionHead(bindingId), head);
+});

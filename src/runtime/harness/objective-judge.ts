@@ -949,7 +949,7 @@ export async function runHedgedJudge<T>(
     const inherited = modelUsageAttributionStorage.getStore();
     const attempt = (r: BoundaryJudgeRouting) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
       { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
-        ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}` },
+        ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}`, role: 'reviewer' },
       () => runRoutedJudgeAttempt<T>(
         r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
       ),

@@ -6124,6 +6124,9 @@ async function runConversationWithinRuntimeConfig(
       sessionId: options.sessionId,
       sourceUserSeq,
       ...(options.runAttemptId ? { attemptId: options.runAttemptId } : {}),
+      // Explicit request role for accounting: a delegated worker child runs
+      // under a harness context that says so; everything else here is the brain.
+      role: harnessRunContextStorage.getStore()?.workerScope ? 'worker' : 'brain',
     },
     () => withTurnQueryVectorScope(async () => {
     let foregroundRelease: 'terminal' | 'transfer' | null = null;
@@ -13134,6 +13137,7 @@ export async function runConversationFromResume(opts: {
       sessionId: opts.sessionId,
       sourceUserSeq,
       ...(opts.runAttemptId ? { attemptId: opts.runAttemptId } : {}),
+      role: harnessRunContextStorage.getStore()?.workerScope ? 'worker' : 'brain',
     },
     async () => {
   try {

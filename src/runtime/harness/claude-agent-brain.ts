@@ -1824,6 +1824,7 @@ export async function respondViaClaudeAgentSdkBrain(
       sessionId,
       sourceUserSeq: acceptedSource.seq,
       attemptId: attempt.attemptId,
+      role: 'brain',
     }, () => respondViaClaudeAgentSdkBrainAttempt(surface, scopedRequest, attempt));
     if (response.stoppedReason === 'in-progress') {
       preserveAttemptOwnership = true;

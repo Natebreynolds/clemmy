@@ -70,6 +70,7 @@ export async function evaluateSystemOne(input: {
     recordModelUsage({
       sessionId: input.sessionId?.trim() || 'jev',
       channel: input.channel ?? 'jev',
+      role: 'router',
       model: result.ok ? result.model : TYPESAFE_MODEL,
       cacheDialect: 'none',
       inputTokens: result.ok ? result.usage.input_tokens : 0,
