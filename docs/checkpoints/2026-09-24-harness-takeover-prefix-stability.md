@@ -158,7 +158,7 @@ Installed now: `3230e3de8`, fingerprint `eb69d7619c58…`, receipts `/tmp/clem-r
 | 293783 status check, fresh session | 70.1 | 9 (5/2/2) | 83,775 | 119,935 | 20,214 | 4,928 | 6 | 0 |
 | pilot run `trigger-cbba991a` | 1.0 | 0 model frames | — | — | — | — | 1 read | 0 |
 
-Reading: the controlled session's own history (110k+ tokens) is now the dominant cost, not the harness: the same question costs 70 s / 84k uncached in a fresh session versus 282 s / 295k in the pilot session. Together GLM-5.3-Flash frames at 120k context took 66–98 s each. Together also misses the cache on a frame issued within ~1–2 s of the previous frame settling (frame 2 of 293783 and of 293628), and evicted once at 120k (frame 4 of 293703) with the input append-only — provider behavior, recorded, not ours.
+Reading: the controlled session's own history (110k+ tokens) is now the dominant cost, not the harness: the same question costs 70 s / 84k uncached in a fresh session versus 282 s / 295k in the pilot session. Together GLM-5.3-Flash frames at 120k context took 66–98 s each. Cache misses in these turns, attributed with scripts/measure-prefix-drift.mjs: frame 1 of each turn (new turn after minutes or a restart: expected); frame 2 of 293783 was plan_task joining mid-turn (our one remaining class, see §1); frame 4 of 293703 missed with every layer byte-identical and the input append-only — one provider-side miss at 120k context. 293628 had no mid-turn miss.
 
 ### Still open (release gates, reported separately from the fixes above)
 
