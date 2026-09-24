@@ -1546,6 +1546,8 @@ export async function provisionExactWorkflowProviderOperations(input: {
   sourceUserSeq: number;
   acceptedInput: string;
   operationIds: readonly string[];
+  /** Already-selected host manifest accounts. Refresh may not switch their identity. */
+  selectedAccounts?: readonly { operationId: string; accountId: string }[];
   signal?: AbortSignal;
   deadlineAt?: number;
 }, dependencies: ExactWorkflowProviderProvisionDependencies = {}): Promise<ExactWorkflowProviderProvisionResult> {
@@ -1655,6 +1657,10 @@ export async function provisionExactWorkflowProviderOperations(input: {
     };
   }
 
+  const selectedAccounts = new Map((input.selectedAccounts ?? []).map(entry => [
+    entry.operationId.trim().toUpperCase(), entry.accountId.trim(),
+  ]));
+  const sourceTokens = new Set(acceptedText.match(/[A-Za-z0-9_-]+/g) ?? []);
   const entries: CapabilityResolutionEntry[] = [];
   const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
   for (const operation of operationIds) {
@@ -1666,14 +1672,20 @@ export async function provisionExactWorkflowProviderOperations(input: {
     // the pinned judge (20–60 s) inside the 30 s provisioning deadline and
     // failed every run as "proof_publication_expired", with one connection.
     const routingEffect = classifyComposioSlugEffect(operation) === 'read' ? 'read' : 'write';
-    const routingKey = `${toolkit}:${routingEffect}`;
+    const selectedAccount = selectedAccounts.get(operation);
+    // Carry an explicit source-bound account through the same ordinary account
+    // reviewer. The manifest itself is not permission to select an account.
+    const nomination = selectedAccount && sourceTokens.has(selectedAccount)
+      ? { toolkit, identity: selectedAccount, source_quote: selectedAccount }
+      : undefined;
+    const routingKey = `${toolkit}:${routingEffect}:${selectedAccount ?? ''}`;
     let selection = routingByToolkit.get(routingKey);
     if (!selection) {
       const reviewStartedAt = Date.now();
       const routing = await awaitBounded({
         start: () => resolveSourceAccountRouting({
           sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
-          toolkit, operation, connections, effect: routingEffect,
+          toolkit, operation, connections, effect: routingEffect, nomination,
         }),
         ...reviewGuard,
       });
@@ -1700,6 +1712,13 @@ export async function provisionExactWorkflowProviderOperations(input: {
     }
     if (selection.kind !== 'resolved') {
       return { ok: false, code: 'connection_unavailable', identifier: operation };
+    }
+    if (selectedAccount && selection.connection.connectionId !== selectedAccount) {
+      return {
+        ok: false, code: 'account_selection_required', identifier: operation,
+        detail: 'selected_account_changed_during_refresh',
+        choices: [selectedAccount],
+      };
     }
     entries.push({
       intent: 'immutable workflow source names this exact operation',

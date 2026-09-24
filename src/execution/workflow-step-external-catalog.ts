@@ -93,6 +93,7 @@ export interface WorkflowStepExternalCatalogDependencies {
     sourceUserSeq: number;
     acceptedInput: string;
     operationIds: readonly string[];
+    selectedAccounts?: readonly { operationId: string; accountId: string }[];
     deadlineAt?: number;
   }) => Promise<ExactWorkflowProviderProvisionResult>;
 }
@@ -601,6 +602,8 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       )({
         ...input.acceptedSource,
         operationIds: reboundOperationIds,
+        selectedAccounts: selected.filter(entry => reboundOperationIds.includes(entry.manifest.operationId))
+          .map(entry => ({ operationId: entry.manifest.operationId, accountId: entry.manifest.accountId })),
         ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
       });
       if (!reprovisioned.ok) {
@@ -707,6 +710,8 @@ export async function prepareWorkflowStepExternalCatalog(input: {
       )({
         ...input.acceptedSource,
         operationIds: retryable,
+        selectedAccounts: selected.filter(entry => retryable.includes(entry.manifest.operationId))
+          .map(entry => ({ operationId: entry.manifest.operationId, accountId: entry.manifest.accountId })),
         ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
       });
       if (!republished.ok) {

@@ -310,3 +310,77 @@ test('exact JIT read provisioning uses checked conversation account continuity w
   assert.equal(foreign.ok, false);
   assert.equal(published, 1, 'a different principal cannot inherit account-routing proof');
 });
+
+test('workflow re-provisioning keeps its selected account when another active account is the default', async () => {
+  setup();
+  const other = { slug: 'outlook', connectionId: 'fixture-default-outlook', status: 'ACTIVE', accountEmail: 'default@other.invalid' };
+  const selected = { slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL };
+  const connections = [other, selected];
+  composio.__test__.setConnectedAccountsLoader(async () => connections.map(row => ({
+    id: row.connectionId, status: row.status, user_id: 'fixture-owner', toolkit: { slug: row.slug },
+    data: { user_info: { email: row.accountEmail } },
+  })));
+  const aliases = await import('../memory/account-alias-store.js');
+  aliases.rememberAccountAlias({ toolkit: 'outlook', label: routing.READ_DEFAULT_ACCOUNT_LABEL,
+    email: other.accountEmail, connectionId: other.connectionId });
+  let version = '20260903_00';
+  schemas._setToolSchemaLoaderForTests(async () => ({ ...definition(), providerOperationVersion: version }));
+  const seedText = `Read ${TARGET} from connection ${ACCOUNT}.`;
+  const seed = source(seedText);
+  resolution.recordAdmissionCapabilityResolution({ ...seed, acceptedInput: seedText, entries: [{
+    intent: 'selected read', kind: 'composio', identifier: TARGET, status: 'proven', connection: 'active',
+    accountIdentity: ACCOUNT, effectClass: 'read',
+  }] });
+  const seeded = await provisioning.registerProofProvisionedCapabilities(seed, {
+    allowedIdentifiers: [TARGET], expectedSchemaDigests: [{ identifier: TARGET, schemaDigest: contracts.digestSchema(INPUT) }],
+  });
+  const predecessor = seeded.registered.find(id => id.startsWith(`cap:resolved:${TARGET.toLowerCase()}`))!;
+  assert.ok(predecessor);
+  version = '20260922_00';
+  const turn = source(seedText);
+  const result = await sources.provisionExactWorkflowProviderOperations({
+    ...turn, acceptedInput: seedText, operationIds: [TARGET],
+    selectedAccounts: [{ operationId: TARGET, accountId: ACCOUNT }],
+  }, {
+    materializeExact: async () => [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }],
+    freshConnections: async () => connections,
+  });
+  assert.deepEqual(result, { ok: true });
+  const proof = resolution.provenCapabilityEntriesForTurn(turn).find(entry => entry.identifier === TARGET);
+  assert.equal(proof?.accountIdentity, ACCOUNT, 'refresh must not substitute the remembered default');
+  const store = manifests.peekCapabilityManifestStore()!;
+  assert.equal(store.list().find(row => row.manifest.manifestId === predecessor)?.manifest.lifecycle.state, 'superseded');
+  const current = store.list().filter(row => row.manifest.lifecycle.state === 'current' && row.manifest.operationId === TARGET);
+  assert.equal(current.length, 1);
+  assert.equal(current[0]!.manifest.accountId, ACCOUNT);
+  assert.equal(current[0]!.manifest.operationVersion, version);
+  assert.equal(businessCalls, 0);
+});
+
+for (const scenario of ['missing', 'unquoted', 'write-review-unavailable'] as const) {
+  test(`selected workflow account cannot silently fall back: ${scenario}`, async () => {
+    setup();
+    const other = { slug: 'outlook', connectionId: 'fixture-default-outlook', status: 'ACTIVE', accountEmail: 'default@other.invalid' };
+    const selected = { slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL };
+    const aliases = await import('../memory/account-alias-store.js');
+    aliases.rememberAccountAlias({ toolkit: 'outlook', label: routing.READ_DEFAULT_ACCOUNT_LABEL,
+      email: other.accountEmail, connectionId: other.connectionId });
+    if (scenario === 'write-review-unavailable') semanticPorts.installTurnSemanticModelPort(null);
+    const operation = scenario === 'write-review-unavailable' ? 'OUTLOOK_CREATE_DRAFT' : TARGET;
+    const text = scenario === 'unquoted' ? `Use ${operation}.` : `Use ${operation} with connection ${ACCOUNT}.`;
+    const turn = source(text);
+    let published = 0;
+    const result = await sources.provisionExactWorkflowProviderOperations({
+      ...turn, acceptedInput: text, operationIds: [operation],
+      selectedAccounts: [{ operationId: operation, accountId: ACCOUNT }],
+    }, {
+      materializeExact: async () => [{ toolkit: 'outlook', slug: operation, name: operation, score: 1, inputParameters: INPUT }],
+      freshConnections: async () => scenario === 'missing' ? [other] : [other, selected],
+      registerProof: async () => { published += 1; return { registered: [] }; },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'account_selection_required');
+    assert.equal(published, 0);
+    assert.equal(businessCalls, 0);
+  });
+}

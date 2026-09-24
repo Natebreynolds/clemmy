@@ -930,9 +930,10 @@ test('a label-only operation-version move re-provisions the stored manifest as i
   }, {
     manifestStore: store,
     catalogFactory: factory,
-    provisionExactOperations: async ({ operationIds }) => {
+    provisionExactOperations: async ({ operationIds, selectedAccounts }) => {
       provisioned += 1;
       assert.deepEqual(operationIds, ['OUTLOOK_LIST_EVENTS']);
+      assert.deepEqual(selectedAccounts, [{ operationId: stored.operationId, accountId: stored.accountId }]);
       // What exact provisioning does for a relabeled definition: install the
       // live definition as the recorded successor of the stored manifest.
       assert.equal(store.supersede(stored.manifestId, successor).ok, true);
